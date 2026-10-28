@@ -42,8 +42,13 @@ impl Sidebar {
     }
 
     /// A row's slot while it arrives or leaves; the row itself at rest.
-    pub(super) fn row_slot(row: AnyElement, presence: Presence, ghost: bool) -> AnyElement {
-        row_motion::slot(row, presence, SIDEBAR_NAV_ROW_HEIGHT, ghost)
+    pub(super) fn row_slot(
+        &self,
+        row: AnyElement,
+        presence: Presence,
+        ghost: bool,
+    ) -> AnyElement {
+        row_motion::slot(row, presence, self.session_row_height(), ghost)
     }
 }
 

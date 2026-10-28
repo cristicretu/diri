@@ -1016,6 +1016,7 @@ impl PrivateMode {
             1047 => Self::Named(NamedPrivateMode::ClearingAltScreen),
             2031 => Self::Named(NamedPrivateMode::ColorSchemeUpdates),
             2048 => Self::Named(NamedPrivateMode::InBandResize),
+            2027 => Self::Named(NamedPrivateMode::GraphemeClustering),
             _ => Self::Unknown(mode),
         }
     }
@@ -1084,6 +1085,9 @@ pub enum NamedPrivateMode {
     ColorSchemeUpdates = 2031,
     /// DIRI PATCH: in-band window resize notifications (`CSI 48 ; … t`).
     InBandResize = 2048,
+    /// Grapheme cluster widths by the first codepoint and variation
+    /// selectors, instead of the default `stringWidth`-compatible rule.
+    GraphemeClustering = 2027,
 }
 
 /// Mode for clearing line.

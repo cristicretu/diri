@@ -102,6 +102,14 @@ impl DetachedLeader {
         self.pid
     }
 
+    /// A descriptor that turns readable once the Agent has exited, so a
+    /// caller can wait for the exit alongside other descriptors and then
+    /// collect it with [`Self::wait`] without blocking.
+    #[must_use]
+    pub fn exit_descriptor(&self) -> RawFd {
+        self.watch.as_raw_fd()
+    }
+
     /// The exit, if it has happened. Never blocks.
     pub fn try_wait(&self) -> io::Result<Option<Exit>> {
         let mut state = self.state.lock().expect("detached leader");

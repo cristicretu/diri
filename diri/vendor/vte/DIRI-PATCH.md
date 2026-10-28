@@ -76,3 +76,10 @@ Test: `completed_synchronized_updates_are_counted`.
 14 (text area in pixels) and 18 (text area in cells). Image tools such as
 `chafa` and `timg` size their output from it. Only Diri's local Engine answers,
 and only for terminals that place inline images; others ignore it as before.
+
+## Mode 2027
+
+`NamedPrivateMode::GraphemeClustering` names DECSET 2027 so `Term` can set,
+reset and report it (DECRQM answers `1`/`2` instead of `0`). Parsing is
+otherwise unchanged; the width rules live in `alacritty_terminal`'s
+`term/grapheme.rs`.

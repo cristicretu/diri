@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Default Window Settings</key>
+	<string>Basic</string>
+	<key>Window Settings</key>
+	<dict>
+		<key>Basic</key>
+		<dict>
+			<key>Font</key>
+			<data>
+			YnBsaXN0MDDUAQIDBAUGGBtZJGFyY2hpdmVyWCRvYmplY3RzVCR0
+			b3BYJHZlcnNpb25fEA9OU0tleWVkQXJjaGl2ZXKkBwgRElUkbnVs
+			bNQJCgsMDQ4PEFYkY2xhc3NWTlNOYW1lVk5TU2l6ZVhOU2ZGbGFn
+			c4ADgAIjQCYAAAAAAAAQEF5TRk1vbm8tUmVndWxhctITFBUWWCRj
+			bGFzc2VzWiRjbGFzc25hbWWiFhdWTlNGb250WE5TT2JqZWN00Rka
+			VHJvb3SAARIAAYagCBEbJCkyRElPWF9mbXZ4eoOFlJmirbC3wMPI
+			ygAAAAAAAAEBAAAAAAAAABwAAAAAAAAAAAAAAAAAAADP
+			</data>
+			<key>name</key>
+			<string>Basic</string>
+			<key>type</key>
+			<string>Window Settings</string>
+		</dict>
+	</dict>
+</dict>
+</plist>

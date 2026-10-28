@@ -1,5 +1,6 @@
 //! GPUI grid rendering, terminal input encoding, selection, scrollback viewport, and find highlighting.
 
+pub mod accessibility;
 mod blocks;
 pub mod buffer;
 pub mod command_marks;

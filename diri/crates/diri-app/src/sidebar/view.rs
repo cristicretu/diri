@@ -1,4 +1,5 @@
 mod accounts;
+mod activity;
 mod arrivals;
 mod filter;
 mod hover_linger;
@@ -628,6 +629,19 @@ pub struct Sidebar {
     filter_open: bool,
     filter_focus: FocusHandle,
     filter_generation: u64,
+    /// The Activity filter (⌘.): only sessions that are working, waiting on
+    /// you, or hold news you have not seen, as two-line rows with their
+    /// state and age.
+    activity_filter: bool,
+    /// The earliest moment a shown age ("now", "7m") next reads differently,
+    /// gathered while the rows' props are built.
+    age_next: Option<u64>,
+    /// The one wake that re-reads ages, armed only while the Activity filter
+    /// shows one: the next age change, never a periodic tick.
+    age_wake: Option<(u64, Task<()>)>,
+    /// A fixed "now" for ages in headless fixtures, whose sessions are dated.
+    #[cfg(test)]
+    age_now: Option<u64>,
     /// Window-space row bounds from the latest prepaint. Keyboard navigation
     /// uses these to reveal only rows that actually crossed the viewport edge.
     row_bounds: Rc<RefCell<HashMap<SessionId, Bounds<Pixels>>>>,
@@ -885,6 +899,11 @@ impl Sidebar {
             filter_open: false,
             filter_focus: cx.focus_handle(),
             filter_generation: 0,
+            activity_filter: false,
+            age_next: None,
+            age_wake: None,
+            #[cfg(test)]
+            age_now: None,
             row_bounds: Rc::new(RefCell::new(HashMap::new())),
             pane_drop_area: None,
             pane_drop_bounds: None,
@@ -1563,16 +1582,15 @@ impl Sidebar {
         let grouping = store.preferences().sidebar_grouping;
         let ordering = store.preferences().sidebar_ordering;
         let recency_archives_expanded = store.preferences().sidebar_recency_archives_expanded
-            || !self.filter_query.text().trim().is_empty();
+            || self.filtering();
         let pinned = store
             .preferences()
             .sidebar_pinned_sessions
             .iter()
             .cloned()
             .collect();
-        let projection =
-            super::filter::filter_projection(store.sidebar_projection(), self.filter_query.text());
-        if !self.filter_query.text().trim().is_empty() {
+        let projection = self.visible_projection(store);
+        if self.filtering() {
             expanded_archives = projection
                 .projects
                 .iter()
@@ -2682,7 +2700,7 @@ impl Sidebar {
             .preferences()
             .sidebar_collapsed_projects
             .contains(&id)
-            && self.filter_query.text().trim().is_empty();
+            && !self.filtering();
         let project_for_click = group.project.clone();
         let project_root = group.project.root.clone();
         let project_host = group.host.clone();
@@ -3129,7 +3147,7 @@ impl Sidebar {
         if frame.reveal > 0.0 {
             let mut children = Vec::new();
             for (row, presence, ghost) in super::row_motion::paint_order(&rows, &slots) {
-                let height = SIDEBAR_NAV_ROW_HEIGHT * presence.height;
+                let height = self.session_row_height() * presence.height;
                 let margin = 2.0 * presence.height;
                 let moving = presence != super::row_motion::Presence::FULL || ghost;
                 if !self.place_row(
@@ -3165,7 +3183,7 @@ impl Sidebar {
                 );
                 // A leaving row does not keep the activity tick alive.
                 self.working_row_rendered &= !ghost || working;
-                let rendered = Self::row_slot(rendered, presence, ghost);
+                let rendered = self.row_slot(rendered, presence, ghost);
                 let rendered = if collapsed || ghost {
                     rendered
                 } else {
@@ -3359,7 +3377,7 @@ impl Sidebar {
             let slots = self.arrange_rows(bucket.label(), &bucket_rows);
             let mut children = Vec::new();
             for (row, presence, ghost) in super::row_motion::paint_order(&bucket_rows, &slots) {
-                let height = SIDEBAR_NAV_ROW_HEIGHT * presence.height;
+                let height = self.session_row_height() * presence.height;
                 let margin = 2.0 * presence.height;
                 let moving = presence != super::row_motion::Presence::FULL || ghost;
                 if !self.place_row((!ghost).then(|| row.id()), margin, height, moving) {
@@ -3382,7 +3400,7 @@ impl Sidebar {
                         .relative()
                         .child(rendered)
                         .child(
-                            crate::project_hue::row_tick(hue, SIDEBAR_NAV_ROW_HEIGHT)
+                            crate::project_hue::row_tick(hue, self.session_row_height())
                                 .debug_selector({
                                     let id = id.clone();
                                     move || format!("PROJECT_HUE_{}", id.0)
@@ -3391,7 +3409,7 @@ impl Sidebar {
                         .into_any_element(),
                     None => rendered,
                 };
-                let rendered = Self::row_slot(rendered, presence, ghost);
+                let rendered = self.row_slot(rendered, presence, ghost);
                 let rendered = if ghost {
                     rendered
                 } else {
@@ -3449,7 +3467,7 @@ impl Sidebar {
             .expect("session store lock poisoned")
             .preferences()
             .sidebar_recency_archives_expanded
-            || !self.filter_query.text().trim().is_empty();
+            || self.filtering();
         let count = archived.len();
         let mut section = div().flex_none().flex().flex_col().child(
             div()
@@ -3777,6 +3795,8 @@ impl Sidebar {
             ref drag_selection,
             migrating,
             activity_state,
+            ref blocker,
+            ref activity,
             panes,
             progress,
             marked,
@@ -3864,7 +3884,7 @@ impl Sidebar {
                 .id(format!("rename:{}", id.0))
                 .pl(px(Space::ROW_H))
                 .pr(px(Space::ROW_H))
-                .h(px(SIDEBAR_NAV_ROW_HEIGHT))
+                .h(px(self.session_row_height()))
                 .flex()
                 .items_center()
                 .gap(px(8.0))
@@ -3966,7 +3986,7 @@ impl Sidebar {
             // rows (New Agent, project headers).
             .pl(px(Space::ROW_H - 1.0))
             .pr(px(Space::ROW_H - 1.0))
-            .h(px(SIDEBAR_NAV_ROW_HEIGHT))
+            .h(px(self.session_row_height()))
             .flex()
             .items_center()
             .gap(px(8.0))
@@ -4119,7 +4139,17 @@ impl Sidebar {
                 colors,
             ))
             .child(
-                if let Some(range) = super::filter::label_match(&title, filter) {
+                {
+                    // A row waiting on a named question shows the question
+                    // in place of its title. Under Activity the question is
+                    // the second line instead, and a typed filter matches
+                    // titles, so both keep the title.
+                    let asking = blocker.is_some() && activity.is_none() && filter.trim().is_empty();
+                    let title = match blocker {
+                        Some(blocker) if asking => blocker.clone(),
+                        _ => title,
+                    };
+                    let element = if let Some(range) = super::filter::label_match(&title, filter) {
                     div()
                         .w(px(title_available_width))
                         .overflow_hidden()
@@ -4134,7 +4164,10 @@ impl Sidebar {
                             },
                         )]))
                         .into_any_element()
-                } else if let Some(settling) = self.settling_title(&id, title_available_width) {
+                } else if let Some(settling) = self
+                    .settling_title(&id, title_available_width)
+                    .filter(|_| !asking)
+                {
                     // The marquee's own box, so the title stays where it is.
                     div()
                         .min_w(px(0.0))
@@ -4157,6 +4190,32 @@ impl Sidebar {
                     )
                     .font_weight(Typo::ROW.weight)
                     .into_any_element()
+                };
+                    match activity {
+                        // Two lines ellipsize to the room they get rather
+                        // than scroll on hover.
+                        Some((line, age)) => activity_title(
+                            if filter.trim().is_empty() {
+                                div()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_size(px(Typo::ROW.size))
+                                    .font_weight(Typo::ROW.weight)
+                                    .text_color(title_color)
+                                    .child(display_title(session))
+                                    .into_any_element()
+                            } else {
+                                element
+                            },
+                            line,
+                            age.as_deref(),
+                            title_available_width,
+                            colors,
+                        ),
+                        None => element,
+                    }
                 },
             )
             .when(row.pinned, |element| element.child(pin_mark(colors)))
@@ -4367,7 +4426,7 @@ impl Sidebar {
             .preferences()
             .sidebar_expanded_archives
             .contains(&project_id)
-            || !self.filter_query.text().trim().is_empty();
+            || self.filtering();
         let targeted =
             self.ui.drag_target.as_deref() == Some(format!("archive:{}", project_id.0).as_str());
         let mut bucket = div()
@@ -8573,6 +8632,7 @@ impl Sidebar {
         self.reconcile_workspace_navigation(cx);
         self.fade_glass = self.colors().material() == diri_ui::Material::Glass;
         self.working_row_rendered = false;
+        self.age_next = None;
         self.animated_rows.clear();
         // Requests the next frame on the sidebar while a fade moves, so the
         // rows receive each step through their props.
@@ -8619,14 +8679,11 @@ impl Sidebar {
                 .cloned()
                 .collect();
             let recency_archives_expanded = store.preferences().sidebar_recency_archives_expanded
-                || !self.filter_query.text().trim().is_empty();
+                || self.filtering();
             // From the unfiltered list: a filter must not recolor anything.
             self.hues = store.project_hues();
             (
-                super::filter::filter_projection(
-                    store.sidebar_projection(),
-                    self.filter_query.text(),
-                ),
+                self.visible_projection(&mut store),
                 expanded,
                 selected,
                 grouping,
@@ -8635,7 +8692,7 @@ impl Sidebar {
                 recency_archives_expanded,
             )
         };
-        if !self.filter_query.text().trim().is_empty() {
+        if self.filtering() {
             expanded_archives = projection
                 .projects
                 .iter()
@@ -8796,6 +8853,7 @@ impl Sidebar {
         self.disclosure_tick = self.disclosure_animating;
         self.settle_row_window(window);
         self.schedule_activity_tick(cx);
+        self.schedule_age_wake(cx);
         self.schedule_title_tick();
         if self.disclosure_tick || self.title_tick || self.hover_trails.is_fading() {
             self.request_motion_frame(window, cx);
@@ -8871,7 +8929,7 @@ impl Sidebar {
                 .flex_col()
                 .child(self.new_agent_row(crate::held_hints::opacity(window, cx), colors, cx))
                 .children(self.todos_row(colors, cx));
-            if projection.projects.is_empty() && !self.filter_query.text().trim().is_empty() {
+            if projection.projects.is_empty() && self.filtering() {
                 body = body.child(
                     div()
                         .id("sidebar-filter-empty")
@@ -8881,7 +8939,13 @@ impl Sidebar {
                         .pt(px(18.0))
                         .text_size(px(Typo::META.size))
                         .text_color(colors.tertiary)
-                        .child(t("sidebar.filter_empty")),
+                        .child(
+                            if self.activity_filter && self.filter_query.text().trim().is_empty() {
+                                t("sidebar.activity_empty")
+                            } else {
+                                t("sidebar.filter_empty")
+                            },
+                        ),
                 );
             } else if projection.projects.is_empty() {
                 body = body.child(self.empty_state(colors, cx));
@@ -8935,7 +8999,21 @@ impl Sidebar {
             root = root.child(feedback);
         }
         if self.settings_nav.is_none() {
-            root = root.child(self.filter_control(colors, window, cx));
+            let pending = {
+                let store = self.store.read().expect("session store lock poisoned");
+                self.activity_pending(&store)
+            };
+            root = root.child(
+                div()
+                    .mx(px(Space::INSET))
+                    .mb(px(6.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(self.filter_control(colors, window, cx))
+                    .child(div().flex_1())
+                    .child(self.activity_toggle(pending, colors, cx)),
+            );
         }
         root = root.child(self.account_footer(colors, cx));
         if self.number_flows.running() {
@@ -10124,6 +10202,54 @@ fn read_toggle(session: &diri_proto::SessionRecord, notification_unread: bool) -
 
 /// Unread inbox entries share the completion mark, while active work and
 /// requests for input retain priority. There is never a second unread dot.
+/// A row's title over its Activity line: what it is doing or left for you,
+/// and the age right-aligned.
+fn activity_title(
+    title: AnyElement,
+    line: &str,
+    age: Option<&str>,
+    width: f32,
+    colors: SemanticColors,
+) -> AnyElement {
+    div()
+        .max_w(px(width))
+        .min_w(px(0.0))
+        .flex_1()
+        .overflow_hidden()
+        .flex()
+        .flex_col()
+        .gap(px(1.0))
+        .child(div().flex().items_center().overflow_hidden().child(title))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .text_size(px(Typo::META.size))
+                .child(
+                    div()
+                        .debug_selector(|| "session-activity-line".into())
+                        .min_w(px(0.0))
+                        .flex_1()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_color(colors.secondary)
+                        .child(line.to_owned()),
+                )
+                .when_some(age, |row, age| {
+                    row.child(
+                        div()
+                            .debug_selector(|| "session-activity-age".into())
+                            .flex_none()
+                            .text_color(colors.tertiary)
+                            .child(age.to_owned()),
+                    )
+                }),
+        )
+        .into_any_element()
+}
+
 fn sidebar_activity_state(state: StatusState, unread: bool) -> StatusState {
     match state {
         StatusState::Working | StatusState::NeedsInput { .. } => state,
@@ -10585,6 +10711,122 @@ mod tests {
         let (advanced, next) = step_working_marks(cx);
         assert!(advanced);
         assert_ne!(next, tiles);
+    }
+
+    /// The Activity filter narrows the same list to sessions that are
+    /// working or waiting, as two-line rows with their state and age; while
+    /// it shows ages, one wake re-reads them and re-renders only rows whose
+    /// text changed. Off, it costs nothing.
+    #[gpui::test]
+    fn activity_filter_lists_only_live_sessions_as_two_line_rows(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        sidebar.update(cx, |sidebar, _| sidebar.use_manual_title_clock());
+        cx.run_until_parked();
+        let listed = |cx: &mut VisualTestContext| {
+            sidebar.update(cx, |sidebar, _| {
+                let mut store = sidebar.store.write().expect("store");
+                let mut ids: Vec<String> = sidebar
+                    .visible_projection(&mut store)
+                    .ordered_sessions
+                    .iter()
+                    .map(|session| session.id.0.clone())
+                    .collect();
+                ids.sort();
+                ids
+            })
+        };
+        let everything = listed(cx);
+        assert!(sidebar.read_with(cx, |sidebar, _| sidebar.age_wake.is_none()));
+        assert!(cx.debug_bounds("session-activity-line").is_none());
+        // The waiting row reads its question in place of its title.
+        assert_eq!(row_bounds(&sidebar, cx, "preview-claude").size.height, px(30.0));
+
+        sidebar.update(cx, |sidebar, cx| sidebar.toggle_activity_filter(cx));
+        cx.run_until_parked();
+        let active = listed(cx);
+        assert!(active.len() < everything.len(), "{active:?}");
+        for id in ["preview-claude", "preview-question", "preview-codex"] {
+            assert!(active.contains(&id.to_owned()), "{id} works or waits: {active:?}");
+        }
+        for id in ["preview-sleeping", "preview-archived", "preview-shell"] {
+            assert!(!active.contains(&id.to_owned()), "{id} is quiet: {active:?}");
+        }
+        assert_eq!(
+            row_bounds(&sidebar, cx, "preview-claude").size.height,
+            px(super::activity::ACTIVITY_ROW_HEIGHT)
+        );
+        assert!(cx.debug_bounds("session-activity-line").is_some());
+        assert!(cx.debug_bounds("session-activity-age").is_some());
+        // One wake, armed for the next age change: never a periodic tick.
+        let armed = sidebar.read_with(cx, |sidebar, _| sidebar.age_wake.as_ref().map(|(at, _)| *at));
+        let now = wall_clock_millis() as u64;
+        assert!(armed.is_some_and(|at| at > now && at <= now + 86_400_000), "{armed:?}");
+
+        // Once rows have arrived and the folded project opened (its
+        // disclosure runs on the wall clock), a redraw with nothing new
+        // reuses every row.
+        super::titles::testing::advance(Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(400));
+        for _ in 0..2 {
+            sidebar.update(cx, |sidebar, cx| sidebar.store_changed(cx));
+            cx.run_until_parked();
+        }
+        render_probe::take();
+        sidebar.update(cx, |sidebar, cx| sidebar.store_changed(cx));
+        cx.run_until_parked();
+        assert_eq!(render_probe::take().0, 0, "unchanged rows are reused");
+
+        sidebar.update(cx, |sidebar, cx| sidebar.toggle_activity_filter(cx));
+        cx.run_until_parked();
+        assert_eq!(listed(cx), everything);
+        assert!(sidebar.read_with(cx, |sidebar, _| sidebar.age_wake.is_none()));
+        assert_eq!(row_bounds(&sidebar, cx, "preview-claude").size.height, px(30.0));
+    }
+
+    /// A question replaces only its own row's title, re-renders only that
+    /// row, and gives the title back once answered.
+    #[gpui::test]
+    fn a_blocker_retitles_only_its_own_row(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        sidebar.update(cx, |sidebar, _| sidebar.use_manual_title_clock());
+        cx.run_until_parked();
+        let id = SessionId::new("preview-cursor");
+        let record = sidebar.read_with(cx, |sidebar, _| {
+            sidebar.store.read().unwrap().sessions()[&id].as_ref().clone()
+        });
+        let mut asking = record.clone();
+        asking.status = diri_proto::SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Question);
+        asking.needs_input = Some(diri_proto::NeedsInputDetail {
+            kind: diri_proto::NeedsInputKind::Question,
+            source: diri_proto::NeedsInputSource::ProgramStatus,
+            tool_name: None,
+            summary: "Allow deploy to staging?".into(),
+            prompt_excerpt: None,
+            options: None,
+            risk_hint: diri_proto::RiskHint::Neutral,
+            occurred_at: diri_proto::DateMillis(1_750_000_000_000.0),
+            secret: false,
+        });
+        let shown = |cx: &mut VisualTestContext| {
+            sidebar.read_with(cx, |sidebar, cx| {
+                sidebar.session_row_views[&id].read(cx).props.blocker.clone()
+            })
+        };
+        assert_eq!(shown(cx), None);
+        render_probe::take();
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.store.write().unwrap().upsert_session(asking);
+            sidebar.store_changed(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(shown(cx).as_deref(), Some("Allow deploy to staging?"));
+        assert_eq!(render_probe::take().0, 1, "only the asking row renders");
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.store.write().unwrap().upsert_session(record);
+            sidebar.store_changed(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(shown(cx), None);
     }
 
     /// Held-⌘ hints fade in and out on cached session rows: the fade reaches
@@ -12691,6 +12933,12 @@ mod tests {
                     if let Ok(query) = std::env::var("DIRI_VISUAL_FILTER") {
                         sidebar.filter_open = true;
                         sidebar.filter_query.insert(&query);
+                    }
+                    // `DIRI_VISUAL_ACTIVITY=1` turns on the Activity filter,
+                    // with ages read against the fixture's own clock.
+                    if std::env::var_os("DIRI_VISUAL_ACTIVITY").is_some() {
+                        sidebar.activity_filter = true;
+                        sidebar.age_now = Some(1_750_000_000_000);
                     }
 
                     if std::env::var_os("DIRI_VISUAL_HOVER_PROJECT").is_some() {

@@ -44,3 +44,7 @@ harness = false
 [[bench]]
 name = "terminal_interactions"
 harness = false
+
+[[bench]]
+name = "history_depth"
+harness = false

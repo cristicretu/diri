@@ -1,8 +1,11 @@
 //! The shared holder manager: many independent holders in one detached
 //! process.
 //!
-//! One manager per holders directory hosts a [`HolderServer`] thread per
-//! session. The manager exits only after every hosted child has exited and an
+//! One manager per holders directory hosts a [`HolderServer`] per session.
+//! A hosted session holds no thread while it is idle: its lanes park on the
+//! process's shared reactor (see [`super::reactor`]), so a manager hosting
+//! a hundred idle shells runs a handful of threads, not seven hundred. The
+//! manager exits only after every hosted child has exited and an
 //! idle grace period has elapsed, so daemon crashes and upgrades never take a
 //! PTY with them. While any session is hosted there is no timer at all: the
 //! watchdog parks on a condvar and only counts down once the last session ends.
@@ -296,10 +299,33 @@ impl HolderManagerServer {
                         });
                 #[cfg(not(target_os = "macos"))]
                 let launcher: Option<super::server::AgentLauncher> = None;
+                // Ends the session's place in the hosted set; it runs once,
+                // whether the session finishes or never starts.
+                let release = {
+                    let session_id = session_id.clone();
+                    move || {
+                        let mut active = state.active.lock().expect("active");
+                        active.remove(&session_id);
+                        if active.is_empty() {
+                            state.set_idle(Some(Instant::now()));
+                        }
+                    }
+                };
+                // Starting can wait on launchd, so it happens off the accept
+                // loop. Once started the session needs no thread of its own:
+                // its lanes run on threads only while they have work.
+                let release = Arc::new(Mutex::new(Some(release)));
+                let on_failure = Arc::clone(&release);
                 std::thread::Builder::new()
                     .name(format!("holder-{session_id}"))
                     .spawn(move || {
-                        if let Err(error) = HolderServer::run_hosted(spec, guard, launcher.as_ref())
+                        let on_finish = Box::new(move || {
+                            if let Some(release) = release.lock().expect("release").take() {
+                                release();
+                            }
+                        });
+                        if let Err(error) =
+                            HolderServer::start_hosted(spec, guard, launcher.as_ref(), on_finish)
                         {
                             eprintln!("diri-holder manager: session {session_id}: {error}");
                             diri_telemetry::error_event!(
@@ -307,11 +333,9 @@ impl HolderManagerServer {
                                 session = diri_telemetry::id(&session_id),
                                 kind = crate::telemetry::holder_error_kind(&error),
                             );
-                        }
-                        let mut active = state.active.lock().expect("active");
-                        active.remove(&session_id);
-                        if active.is_empty() {
-                            state.set_idle(Some(Instant::now()));
+                            if let Some(release) = on_failure.lock().expect("release").take() {
+                                release();
+                            }
                         }
                     })
                     .map_err(|error| HolderError::io("spawn session holder", error))?;

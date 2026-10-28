@@ -310,6 +310,11 @@ unsafe fn build_classes() {
                 sel!(characterIndexForPoint:),
                 character_index_for_point as extern "C" fn(&Object, Sel, NSPoint) -> u64,
             );
+            // DIRI PATCH (accessibility focus): see `accessibility_focused_ui_element`.
+            decl.add_method(
+                sel!(accessibilityFocusedUIElement),
+                accessibility_focused_ui_element as extern "C" fn(&Object, Sel) -> id,
+            );
             decl.register()
         };
         BLURRED_VIEW_CLASS = {
@@ -2059,6 +2064,33 @@ extern "C" fn dealloc_window(this: &Object, _: Sel) {
     unsafe {
         drop_window_state(this);
         let _: () = msg_send![super(this, class!(NSWindow)), dealloc];
+    }
+}
+
+/// DIRI PATCH (accessibility focus). This view is the first responder but
+/// not an accessibility element, so AppKit reported the whole window as
+/// focused. A sibling view the host app placed beside it to stand for focused
+/// content (Diri's terminal text area) is reported instead; with none, the
+/// upstream behavior is unchanged. Runs only when an accessibility client asks.
+extern "C" fn accessibility_focused_ui_element(this: &Object, _: Sel) -> id {
+    unsafe {
+        let superview: id = msg_send![this, superview];
+        if superview != nil {
+            let subviews: id = msg_send![superview, subviews];
+            let count: usize = msg_send![subviews, count];
+            for index in 0..count {
+                let view: id = msg_send![subviews, objectAtIndex: index];
+                if std::ptr::eq(view.cast_const(), std::ptr::from_ref(this).cast()) {
+                    continue;
+                }
+                let element: BOOL = msg_send![view, isAccessibilityElement];
+                let focused: BOOL = msg_send![view, isAccessibilityFocused];
+                if element == YES && focused == YES {
+                    return view;
+                }
+            }
+        }
+        msg_send![super(this, class!(NSView)), accessibilityFocusedUIElement]
     }
 }
 

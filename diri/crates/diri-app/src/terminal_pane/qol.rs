@@ -13,6 +13,9 @@ pub(super) struct QolState {
     pub hover: Option<(usize, usize)>,
     hover_key: Option<(usize, usize, u64, i64, Option<u64>)>,
     pub hit: Option<ReferenceHit>,
+    /// The window row of the finished command's mark the pointer rests on,
+    /// in the gutter left of the grid; a click there selects its output.
+    pub gutter_mark: Option<usize>,
     pub pressed: Option<(ReferenceHit, (usize, usize))>,
     pub menu: Option<TerminalMenu>,
     pub copy_mode: Option<CopyMode>,
@@ -980,6 +983,80 @@ impl TerminalPane {
         .detach();
     }
 
+    /// Clear Screen and Scrollback. The view returns to the live edge first so
+    /// no fetched history is left on screen; the Engine's next grid is the
+    /// cleared one. Feedback only when nothing changed or it failed.
+    pub(super) fn clear_scrollback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        if !self.residents.contains_key(&id) {
+            return;
+        }
+        self.return_to_live(&id, cx);
+        let client = Arc::clone(self.runtime.client());
+        let request_id = id.clone();
+        let task = self
+            .tokio
+            .spawn(async move { client.clear_scrollback(&request_id).await });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
+                if this.selected_id().as_ref() != Some(&id) {
+                    return;
+                }
+                let message = match result {
+                    Ok(Ok(true)) => return,
+                    Ok(Ok(false)) => t("terminal.clear.alt_screen"),
+                    Ok(Err(diri_client::ClientError::Control(error)))
+                        if error.code == "terminal_clear_unsupported" =>
+                    {
+                        t("terminal.clear.remote_unsupported")
+                    }
+                    _ => t("terminal.clear.failed"),
+                };
+                this.show_terminal_feedback(message, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Reset Terminal: blanks the emulator and restores default modes for a
+    /// garbled screen, local or remote; the child keeps running.
+    pub(super) fn reset_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        if !self.residents.contains_key(&id) {
+            return;
+        }
+        self.return_to_live(&id, cx);
+        let client = Arc::clone(self.runtime.client());
+        let request_id = id.clone();
+        let task = self
+            .tokio
+            .spawn(async move { client.reset_terminal(&request_id).await });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
+                if this.selected_id().as_ref() != Some(&id) {
+                    return;
+                }
+                let message = match result {
+                    Ok(Ok(())) => return,
+                    Ok(Err(diri_client::ClientError::Control(error)))
+                        if error.code == "terminal_reset_unsupported" =>
+                    {
+                        t("terminal.reset.unsupported")
+                    }
+                    _ => t("terminal.reset.failed"),
+                };
+                this.show_terminal_feedback(message, window, cx);
+            });
+        })
+        .detach();
+    }
+
     /// Uses the same Engine RPC for local and remote history. A changing
     /// sequence aborts instead of exporting mismatched pages or jumping wrong.
     pub(super) fn read_terminal_history(
@@ -1006,6 +1083,138 @@ impl TerminalPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(next) = direction {
+            self.jump_to_prompt(next, miss, window, cx);
+        } else {
+            self.export_history(window, cx);
+        }
+    }
+
+    /// Scrolls the nearest shell prompt that way to the top of the window.
+    /// Rows this view already holds answer at once, with no Engine round
+    /// trip; only a prompt beyond them is searched for in the Engine's
+    /// history, outward from the window and no further than that prompt.
+    fn jump_to_prompt(
+        &mut self,
+        next: bool,
+        miss: PromptMiss,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use diri_term::command_marks::PromptSearch;
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        self.reset_qol_session(&id);
+        if self.qol.busy {
+            return;
+        }
+        let Some(resident) = self.residents.get(&id) else {
+            return;
+        };
+        match resident.element.held_prompt_target(next) {
+            PromptSearch::Found(target) => {
+                let rows = usize::from(resident.element.grid_rows());
+                resident.element.scroll_to_absolute(target, 0.0, rows);
+                self.pump_scrollback_fetch(&id, rows);
+                self.qol.feedback = None;
+                cx.notify();
+                return;
+            }
+            PromptSearch::Absent => {
+                self.prompt_missed(&id, miss, window, cx);
+                cx.notify();
+                return;
+            }
+            PromptSearch::Unknown => {}
+        }
+        let top_offset = resident.element.view_offset();
+        let generation = resident.attachment_generation;
+        let client = Arc::clone(self.runtime.client());
+        let request_id = id.clone();
+        let task = self.tokio.spawn(async move {
+            find_retained_prompt(&client, &request_id, top_offset, next).await
+        });
+        self.qol.busy = true;
+        let read_owner = Arc::new(());
+        self.qol.read_owner = Some(Arc::clone(&read_owner));
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
+                if this.selected_id().as_ref() != Some(&id)
+                    || this
+                        .qol
+                        .read_owner
+                        .as_ref()
+                        .is_none_or(|owner| !Arc::ptr_eq(owner, &read_owner))
+                {
+                    return;
+                }
+                this.qol.busy = false;
+                this.qol.read_owner = None;
+                if this.residents.get(&id).is_none_or(|resident| {
+                    resident.attachment_generation != generation
+                        || resident.element.view_offset() != top_offset
+                }) {
+                    this.show_terminal_feedback(t("terminal.history.terminal_changed"), window, cx);
+                    return;
+                }
+                match result {
+                    Ok(Ok(PromptFound {
+                        target: Some(target),
+                        live_start,
+                        total,
+                        sequence,
+                    })) => {
+                        if let Some(resident) = this.residents.get(&id) {
+                            let rows = usize::from(resident.element.grid_rows());
+                            resident
+                                .element
+                                .adopt_history_geometry(live_start, total, sequence, rows);
+                            resident.element.scroll_to_absolute(target, 0.0, rows);
+                            this.pump_scrollback_fetch(&id, rows);
+                        }
+                        this.qol.feedback = None;
+                    }
+                    Ok(Ok(PromptFound { target: None, .. })) => {
+                        this.prompt_missed(&id, miss, window, cx);
+                    }
+                    Ok(Err(message)) => this.show_terminal_feedback(message, window, cx),
+                    Err(_) => {
+                        this.show_terminal_feedback(t("terminal.history.read_failed"), window, cx)
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// What a prompt jump that found no prompt does; see [`PromptMiss`].
+    fn prompt_missed(
+        &mut self,
+        id: &SessionId,
+        miss: PromptMiss,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match miss {
+            PromptMiss::NeedsMarks => {
+                self.show_terminal_feedback(t("terminal.prompt.none"), window, cx);
+            }
+            PromptMiss::Say(message) => self.show_terminal_feedback(message, window, cx),
+            PromptMiss::Live => {
+                if let Some(resident) = self.residents.get(id) {
+                    let rows = usize::from(resident.element.grid_rows());
+                    resident.element.scroll_to_live(rows);
+                }
+                self.show_terminal_feedback(t("terminal.back_to_latest"), window, cx);
+            }
+        }
+    }
+
+    /// Writes every retained row to a text file and opens it.
+    fn export_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.selected_id() else {
             return;
         };
@@ -1022,25 +1231,15 @@ impl TerminalPane {
         let request_id = id.clone();
         let task = self.tokio.spawn(async move {
             let mut text = String::new();
-            let mut prompts = Vec::new();
-            let (live_start, total, sequence) =
-                read_retained_rows(&client, &request_id, |row, cells, metadata| {
-                    if cells
-                        .iter()
-                        .any(|cell| cell.style.contains(TermStyle::PROMPT_START))
-                    {
-                        prompts.push(row);
-                    }
-                    if direction.is_none() {
-                        append_export_row(&mut text, cells, metadata);
-                        if text.len() > 16 * 1024 * 1024 {
-                            return Err(t("terminal.history.too_large"));
-                        }
-                    }
-                    Ok(())
-                })
-                .await?;
-            Ok::<_, &'static str>((text, prompts, live_start, total, sequence))
+            read_retained_rows(&client, &request_id, |_, cells, metadata| {
+                append_export_row(&mut text, cells, metadata);
+                if text.len() > 16 * 1024 * 1024 {
+                    return Err(t("terminal.history.too_large"));
+                }
+                Ok(())
+            })
+            .await?;
+            Ok::<_, &'static str>(text)
         });
         self.qol.busy = true;
         self.show_terminal_feedback(t("terminal.history.reading"), window, cx);
@@ -1068,75 +1267,33 @@ impl TerminalPane {
                     return;
                 }
                 match result {
-                    Ok(Ok((text, prompts, live_start, total, sequence))) => {
-                        if let Some(next) = direction {
-                            let top = live_start - top_offset;
-                            let target = if next {
-                                prompts.into_iter().find(|row| *row > top)
-                            } else {
-                                prompts.into_iter().rev().find(|row| *row < top)
-                            };
-                            if let Some(target) = target {
-                                if let Some(resident) = this.residents.get(&id) {
-                                    let rows = usize::from(resident.element.grid_rows());
-                                    resident
-                                        .element
-                                        .adopt_history_geometry(live_start, total, sequence, rows);
-                                    resident.element.scroll_to_absolute(target, 0.0, rows);
-                                    this.pump_scrollback_fetch(&id, rows);
+                    Ok(Ok(text)) => {
+                        let saved = (|| -> std::io::Result<tempfile::NamedTempFile> {
+                            let mut file = tempfile::Builder::new()
+                                .prefix("diri-scrollback-")
+                                .suffix(".txt")
+                                .tempfile()?;
+                            file.write_all(text.as_bytes())?;
+                            file.flush()?;
+                            Ok(file)
+                        })();
+                        match saved {
+                            Ok(file) => {
+                                if let Ok(url) = url::Url::from_file_path(file.path()) {
+                                    cx.open_url(url.as_str());
                                 }
-                                this.qol.feedback = None;
-                            } else {
-                                match miss {
-                                    PromptMiss::NeedsMarks => this.show_terminal_feedback(
-                                        t("terminal.prompt.none"),
-                                        window,
-                                        cx,
-                                    ),
-                                    PromptMiss::Say(message) => {
-                                        this.show_terminal_feedback(message, window, cx);
-                                    }
-                                    PromptMiss::Live => {
-                                        if let Some(resident) = this.residents.get(&id) {
-                                            let rows = usize::from(resident.element.grid_rows());
-                                            resident.element.scroll_to_live(rows);
-                                        }
-                                        this.show_terminal_feedback(
-                                            t("terminal.back_to_latest"),
-                                            window,
-                                            cx,
-                                        );
-                                    }
-                                }
-                            }
-                        } else {
-                            let saved = (|| -> std::io::Result<tempfile::NamedTempFile> {
-                                let mut file = tempfile::Builder::new()
-                                    .prefix("diri-scrollback-")
-                                    .suffix(".txt")
-                                    .tempfile()?;
-                                file.write_all(text.as_bytes())?;
-                                file.flush()?;
-                                Ok(file)
-                            })();
-                            match saved {
-                                Ok(file) => {
-                                    if let Ok(url) = url::Url::from_file_path(file.path()) {
-                                        cx.open_url(url.as_str());
-                                    }
-                                    this.qol.export_files.push(file);
-                                    this.show_terminal_feedback(
-                                        t("terminal.history.opened"),
-                                        window,
-                                        cx,
-                                    );
-                                }
-                                Err(_) => this.show_terminal_feedback(
-                                    t("terminal.history.save_failed"),
+                                this.qol.export_files.push(file);
+                                this.show_terminal_feedback(
+                                    t("terminal.history.opened"),
                                     window,
                                     cx,
-                                ),
+                                );
                             }
+                            Err(_) => this.show_terminal_feedback(
+                                t("terminal.history.save_failed"),
+                                window,
+                                cx,
+                            ),
                         }
                     }
                     Ok(Err(message)) => this.show_terminal_feedback(message, window, cx),
@@ -1514,57 +1671,152 @@ const COMMAND_OUTPUT_MAX_CELLS: usize = 4 * 1024 * 1024;
 /// Reads all retained rows through the Engine RPC used for local and remote
 /// history alike, in order. A changing sequence aborts instead of mixing
 /// revisions. Returns the live start row, the rows read and the sequence.
+/// One validated page of retained rows.
+struct RowPage {
+    first: i64,
+    rows: Vec<Vec<GridCell>>,
+    metadata: Vec<RowMetadata>,
+    total: i64,
+    live_start: i64,
+    cols: i64,
+    sequence: u64,
+}
+
+/// Rows a page may hold: worst-case RLE plus base64 must fit one control
+/// response, even for wide, densely styled terminal rows.
+fn page_limit(cols: i64) -> i64 {
+    (diri_proto::FIND_CAPTURE_MAX_CELLS as i64 / cols.max(1)).clamp(1, 1024)
+}
+
+/// Reads up to `max_rows` retained rows from `first`, checked against the
+/// width and content sequence of earlier pages of the same read.
+async fn read_row_page(
+    client: &diri_client::DaemonClient,
+    id: &SessionId,
+    first: i64,
+    max_rows: i64,
+    earlier: Option<&RowPage>,
+) -> Result<RowPage, &'static str> {
+    let response = client
+        .read_scrollback_cells(id, first, max_rows)
+        .await
+        .map_err(|_| t("terminal.history.read_failed"))?;
+    if earlier.is_some_and(|page| page.sequence != response.content_seq) {
+        return Err(t("terminal.history.changed"));
+    }
+    let count = usize::try_from(response.row_count).map_err(|_| t("terminal.history.invalid"))?;
+    if count as i64 > max_rows
+        || response.first_row != first
+        || response.total_rows > 1_000_000
+        || !(1..=4096).contains(&response.cols)
+        || earlier.is_some_and(|page| page.cols != response.cols)
+        || (!response.metadata.is_empty() && response.metadata.len() != count)
+    {
+        return Err(t("terminal.history.invalid"));
+    }
+    let rows = GridRowCodec::decode_rows(&response.payload, count)
+        .map_err(|_| t("terminal.history.invalid"))?;
+    if rows.iter().any(|row| row.len() as i64 != response.cols) {
+        return Err(t("terminal.history.invalid"));
+    }
+    Ok(RowPage {
+        first,
+        rows,
+        metadata: response.metadata,
+        total: response.total_rows,
+        live_start: response.live_start_row,
+        cols: response.cols,
+        sequence: response.content_seq,
+    })
+}
+
 async fn read_retained_rows(
     client: &diri_client::DaemonClient,
     id: &SessionId,
     mut visit: impl FnMut(i64, &[GridCell], Option<&RowMetadata>) -> Result<(), &'static str>,
 ) -> Result<(i64, i64, u64), &'static str> {
     let mut first = 0_i64;
-    let mut sequence = None;
-    let mut live_start = 0;
     let mut page_rows = 1_i64;
-    let mut width = None;
+    let mut previous: Option<RowPage> = None;
     loop {
-        let response = client
-            .read_scrollback_cells(id, first, page_rows)
-            .await
-            .map_err(|_| t("terminal.history.read_failed"))?;
-        if sequence.is_some_and(|seq| seq != response.content_seq) {
-            return Err(t("terminal.history.changed"));
+        let page = read_row_page(client, id, first, page_rows, previous.as_ref()).await?;
+        page_rows = page_limit(page.cols);
+        for (index, row) in page.rows.iter().enumerate() {
+            visit(first + index as i64, row, page.metadata.get(index))?;
         }
-        sequence = Some(response.content_seq);
-        if first == 0 {
-            live_start = response.live_start_row;
-        }
-        let count =
-            usize::try_from(response.row_count).map_err(|_| t("terminal.history.invalid"))?;
-        if count as i64 > page_rows
-            || response.first_row != first
-            || response.total_rows > 1_000_000
-            || !(1..=4096).contains(&response.cols)
-            || width.is_some_and(|cols| cols != response.cols)
-            || (!response.metadata.is_empty() && response.metadata.len() != count)
-        {
-            return Err(t("terminal.history.invalid"));
-        }
-        width = Some(response.cols);
-        // Worst-case RLE plus base64 must fit one control response,
-        // even for wide, densely styled terminal rows.
-        page_rows = (diri_proto::FIND_CAPTURE_MAX_CELLS as i64 / response.cols).clamp(1, 1024);
-        let rows = GridRowCodec::decode_rows(&response.payload, count)
-            .map_err(|_| t("terminal.history.invalid"))?;
-        if rows.iter().any(|row| row.len() as i64 != response.cols) {
-            return Err(t("terminal.history.invalid"));
-        }
-        for (index, row) in rows.iter().enumerate() {
-            visit(first + index as i64, row, response.metadata.get(index))?;
-        }
-        first += count as i64;
-        if count == 0 || first >= response.total_rows {
-            break;
+        let count = page.rows.len() as i64;
+        first += count;
+        let done = count == 0 || first >= page.total;
+        let page = previous.get_or_insert(page);
+        if done {
+            return Ok((page.live_start, first, page.sequence));
         }
     }
-    Ok((live_start, first, sequence.unwrap_or_default()))
+}
+
+/// Where a prompt search over the Engine's retained rows landed.
+pub(super) struct PromptFound {
+    pub target: Option<i64>,
+    pub live_start: i64,
+    pub total: i64,
+    pub sequence: u64,
+}
+
+/// First page of an outward prompt search. Most prompts are a screen or two
+/// away, so the search starts small and widens.
+const PROMPT_SEARCH_FIRST_PAGE: i64 = 64;
+
+/// The prompt nearest a window whose top row is `top_offset` rows above the
+/// live screen, read outward from it page by page. Unlike an export it stops
+/// at the first prompt, so it reads as far as the prompt is, not the whole
+/// history.
+pub(super) async fn find_retained_prompt(
+    client: &diri_client::DaemonClient,
+    id: &SessionId,
+    top_offset: i64,
+    next: bool,
+) -> Result<PromptFound, &'static str> {
+    use diri_term::command_marks::starts_prompt;
+    // The live screen's place in the history numbers every other row.
+    let probe = read_row_page(client, id, 0, 1, None).await?;
+    let top = probe.live_start - top_offset;
+    let found = |target| PromptFound {
+        target,
+        live_start: probe.live_start,
+        total: probe.total,
+        sequence: probe.sequence,
+    };
+    let limit = page_limit(probe.cols);
+    let mut page_rows = PROMPT_SEARCH_FIRST_PAGE.min(limit);
+    if next {
+        let mut first = top + 1;
+        while first < probe.total {
+            let page = read_row_page(client, id, first, page_rows, Some(&probe)).await?;
+            if let Some(index) = page.rows.iter().position(|row| starts_prompt(row)) {
+                return Ok(found(Some(page.first + index as i64)));
+            }
+            if page.rows.is_empty() {
+                break;
+            }
+            first += page.rows.len() as i64;
+            page_rows = (page_rows * 4).min(limit);
+        }
+    } else {
+        let mut end = top.min(probe.total);
+        while end > 0 {
+            let first = (end - page_rows).max(0);
+            let page = read_row_page(client, id, first, end - first, Some(&probe)).await?;
+            if let Some(index) = page.rows.iter().rposition(|row| starts_prompt(row)) {
+                return Ok(found(Some(page.first + index as i64)));
+            }
+            if page.rows.is_empty() {
+                break;
+            }
+            end = first;
+            page_rows = (page_rows * 4).min(limit);
+        }
+    }
+    Ok(found(None))
 }
 
 /// The text of a command's output rows, without the blank lines a shell
