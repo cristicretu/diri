@@ -34,6 +34,9 @@ pub struct RowCodec<T> {
     /// with the default discriminant resets any cell to the default cell.
     /// `Cell` resets to the template's background and default attributes.
     encode: EncodeRows<T>,
+    /// `encode`, then leaves every row default cells with occupancy zero,
+    /// as `clear_row` would: for rows that are kept as spare allocations.
+    encode_recycled: fn(&mut [Row<T>]) -> Encoded,
     decode: fn(&[u8]) -> Vec<Row<T>>,
     resize_row: fn(&mut Row<T>, usize),
     /// Decompresses a payload once for single-row access by `reset_row`.
@@ -736,7 +739,17 @@ struct Block<T> {
 
 impl<T> Block<T> {
     fn new(rows: &[Row<T>], codec: RowCodec<T>) -> Self {
-        let encoded = (codec.encode)(rows);
+        Self::encoded(rows, (codec.encode)(rows))
+    }
+
+    /// A block of `rows`, which are left default cells with occupancy zero
+    /// (see [`RowCodec::encode_recycled`]).
+    fn recycling(rows: &mut [Row<T>], codec: RowCodec<T>) -> Self {
+        let encoded = (codec.encode_recycled)(rows);
+        Self::encoded(rows, encoded)
+    }
+
+    fn encoded(rows: &[Row<T>], encoded: Encoded) -> Self {
         Self {
             bytes: encoded.bytes,
             start: 0,
@@ -1874,20 +1887,18 @@ impl<T> CompactRows<T> {
                 .recent
                 .drain(self.recent.len() - self.block_rows..)
                 .collect();
-            let block = Block::new(&rows, self.codec);
             // Only full history recycles rows, and it does so one block at a
-            // time; keep one block of allocations for that. A row whose
-            // reset would keep cells that are not template cells is marked
-            // fully occupied, so `Row::reset` overwrites every cell. Others
-            // keep their occupancy and reset only the cells they wrote.
-            if self.spare.is_empty() {
-                for (index, row) in rows.iter_mut().enumerate() {
-                    if block.blank_on_reset >> index & 1 == 0 {
-                        row.occ = row.len();
-                    }
-                }
+            // time; keep one block of allocations for that. The encoder
+            // leaves them default cells, so recycling one writes nothing for
+            // the default template, and `Row::reset` overwrites every cell
+            // for any other.
+            let block = if self.spare.is_empty() {
+                let block = Block::recycling(&mut rows, self.codec);
                 self.spare = rows;
-            }
+                block
+            } else {
+                Block::new(&rows, self.codec)
+            };
             self.push_block_front(block);
         }
     }
@@ -1999,6 +2010,7 @@ impl<T> LineScan<T> {
 pub fn cell_codec() -> RowCodec<Cell> {
     RowCodec {
         encode: encode_cells,
+        encode_recycled: encode_recycled_cells,
         decode: decode_cells,
         resize_row: resize_cell_row,
         index: index_cells,
@@ -2277,34 +2289,115 @@ fn put_varint(out: &mut Vec<u8>, mut value: usize) {
     out.push(value as u8);
 }
 
-#[inline]
-fn push_scalar(text: &mut Vec<u8>, c: char) {
-    if c.is_ascii() {
-        text.push(c as u8);
-    } else {
-        text.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+/// Writes `c` as UTF-8 at `out` and returns how many bytes it took.
+///
+/// # Safety
+///
+/// `out` must be valid for writes of four bytes.
+#[inline(always)]
+unsafe fn write_scalar(out: *mut u8, c: char) -> usize {
+    let c = u32::from(c);
+    // SAFETY: the caller provides four writable bytes; each branch writes at
+    // most that many.
+    unsafe {
+        if c < 0x80 {
+            *out = c as u8;
+            1
+        } else if c < 0x800 {
+            *out = 0xc0 | (c >> 6) as u8;
+            *out.add(1) = 0x80 | (c & 0x3f) as u8;
+            2
+        } else if c < 0x1_0000 {
+            *out = 0xe0 | (c >> 12) as u8;
+            *out.add(1) = 0x80 | (c >> 6 & 0x3f) as u8;
+            *out.add(2) = 0x80 | (c & 0x3f) as u8;
+            3
+        } else {
+            *out = 0xf0 | (c >> 18) as u8;
+            *out.add(1) = 0x80 | (c >> 12 & 0x3f) as u8;
+            *out.add(2) = 0x80 | (c >> 6 & 0x3f) as u8;
+            *out.add(3) = 0x80 | (c & 0x3f) as u8;
+            4
+        }
     }
 }
 
-/// Appends the text of the leading cells that are ASCII and have the plain
-/// style `key`, and returns how many there were.
+/// Whether `cell` has no extra storage and the plain style `key` (see
+/// [`plain_style_key`]): it joins a plain run of that style.
+#[inline(always)]
+fn has_plain_style(cell: &Cell, key: u128) -> bool {
+    cell.extra.is_none() && plain_style_key(cell) == key
+}
+
+/// Appends the text of the leading cells of `cells` that have the plain
+/// style of `style` (see [`has_plain_style`]), and returns how many there
+/// were.
 ///
-/// Most of a history row is such a run. Writing into reserved capacity
-/// keeps the length out of memory between characters.
+/// Most of a history row is one such run. Named colors, the common case,
+/// are compared as such rather than through [`plain_style_key`].
 #[inline]
-fn extend_ascii_run(cells: &[Cell], key: u128, text: &mut Vec<u8>) -> usize {
-    text.reserve(cells.len());
+fn extend_plain_run(cells: &[Cell], style: &Cell, text: &mut Vec<u8>) -> usize {
+    let flags = style.flags;
+    match (style.fg, style.bg) {
+        (Color::Named(fg), Color::Named(bg)) => extend_run_with(cells, text, |cell| {
+            cell.extra.is_none()
+                && cell.flags == flags
+                && matches!(cell.fg, Color::Named(color) if color == fg)
+                && matches!(cell.bg, Color::Named(color) if color == bg)
+        }),
+        _ => {
+            let key = plain_style_key(style);
+            extend_run_with(cells, text, |cell| has_plain_style(cell, key))
+        },
+    }
+}
+
+/// Appends the text of the leading cells of `cells` that `joins`, and
+/// returns how many there were. The text goes straight into reserved
+/// capacity, so the length stays out of memory between characters.
+#[inline(always)]
+fn extend_run_with(cells: &[Cell], text: &mut Vec<u8>, joins: impl Fn(&Cell) -> bool) -> usize {
+    text.reserve(4 * cells.len());
+    let out = text.spare_capacity_mut().as_mut_ptr().cast::<u8>();
+    let mut written = 0;
     let mut count = 0;
-    for (cell, slot) in cells.iter().zip(text.spare_capacity_mut()) {
-        let c = u32::from(cell.c);
-        if c >= 0x80 || cell.extra.is_some() || plain_style_key(cell) != key {
+    for cell in cells {
+        if !joins(cell) {
             break;
         }
-        slot.write(c as u8);
+        // SAFETY: at most `cells.len()` scalars of four bytes are written
+        // into the capacity reserved above.
+        written += unsafe { write_scalar(out.add(written), cell.c) };
         count += 1;
     }
-    // SAFETY: the first `count` spare bytes were just written.
-    unsafe { text.set_len(text.len() + count) };
+    // SAFETY: the first `written` spare bytes were just written.
+    unsafe { text.set_len(text.len() + written) };
+    count
+}
+
+/// Appends the text of the leading wide characters of `cells`, each followed
+/// by its spacer (see [`is_wide_spacer_of`]), that have the plain style of
+/// `style`, and returns how many cells they took (twice the characters).
+#[inline]
+fn extend_wide_pairs(cells: &[Cell], style: &Cell, text: &mut Vec<u8>) -> usize {
+    text.reserve(2 * cells.len());
+    let out = text.spare_capacity_mut().as_mut_ptr().cast::<u8>();
+    let key = plain_style_key(style);
+    let spacer_key = plain_style_key(&wide_spacer(style));
+    let mut written = 0;
+    let mut count = 0;
+    for pair in cells.chunks_exact(2) {
+        let (wide, spacer) = (&pair[0], &pair[1]);
+        if !(has_plain_style(wide, key) && spacer.c == ' ' && has_plain_style(spacer, spacer_key)) {
+            break;
+        }
+        // SAFETY: at most `cells.len() / 2` scalars of four bytes are
+        // written into the capacity reserved above.
+        written += unsafe { write_scalar(out.add(written), wide.c) };
+        count += 2;
+    }
+    // SAFETY: the first `written` spare bytes were just written.
+    unsafe { text.set_len(text.len() + written) };
     count
 }
 
@@ -2504,29 +2597,112 @@ struct PendingRun {
 /// Encodes up to 64 rows into one compressed payload (see the block layout
 /// above).
 fn encode_cells(rows: &[Row<Cell>]) -> Encoded {
-    assert!(
-        rows.len() <= u64::BITS as usize,
-        "history blocks hold at most 64 rows"
-    );
-    let width = rows.first().map_or(0, Row::len);
-    let mut blank_on_reset = 0;
-    let mut table = StyleTable::default();
-    // The working buffers keep their capacity from one block to the next.
-    let (mut raw, mut text, mut runs, mut packed) = ENCODE_SCRATCH.take();
-    raw.clear();
-    raw.reserve(rows.iter().map(|row| row.len() + 8).sum::<usize>() + 64);
-    raw.extend_from_slice(&[0; 4]);
-    let mut floor = Some(1);
-    for (index, row) in rows.iter().enumerate() {
+    let mut encoder = BlockEncoder::new(rows);
+    for row in rows {
+        encoder.push(row, None);
+    }
+    encoder.finish()
+}
+
+/// [`encode_cells`], then leaves every row default cells with occupancy zero
+/// (see [`RowCodec::encode_recycled`]). Each row is cleared right after it
+/// is encoded, while its cells are still in cache, and a run of the default
+/// style only needs its characters cleared.
+fn encode_recycled_cells(rows: &mut [Row<Cell>]) -> Encoded {
+    let mut encoder = BlockEncoder::new(rows);
+    let mut runs = std::mem::take(&mut encoder.clear_runs);
+    for row in rows.iter_mut() {
+        runs.clear();
+        encoder.push(row, Some(&mut runs));
+        let mut start = 0;
+        for &(count, default_style) in &runs {
+            let cells = &mut row[..][start..start + count];
+            if default_style {
+                for cell in cells {
+                    cell.c = ' ';
+                }
+            } else {
+                cells.fill(Cell::default());
+            }
+            start += count;
+        }
+        // Every cell from `start` (the stored cells' end) on is a default
+        // cell already.
+        row.occ = 0;
+    }
+    encoder.clear_runs = runs;
+    encoder.finish()
+}
+
+/// Whether a run of `style` (without extra storage) is made of default
+/// cells once its characters are spaces.
+#[inline]
+fn is_default_style(style: &Cell) -> bool {
+    style.flags.is_empty()
+        && matches!(style.fg, Color::Named(NamedColor::Foreground))
+        && matches!(style.bg, Color::Named(NamedColor::Background))
+}
+
+/// One block being encoded, a row at a time.
+struct BlockEncoder {
+    width: usize,
+    index: usize,
+    blank_on_reset: u64,
+    floor: Option<usize>,
+    table: StyleTable,
+    raw: Vec<u8>,
+    text: Vec<u8>,
+    runs: Vec<u8>,
+    packed: Vec<u8>,
+    /// [`encode_recycled_cells`]'s runs of the row being cleared.
+    clear_runs: Vec<(usize, bool)>,
+}
+
+impl BlockEncoder {
+    fn new(rows: &[Row<Cell>]) -> Self {
+        assert!(
+            rows.len() <= u64::BITS as usize,
+            "history blocks hold at most 64 rows"
+        );
+        // The working buffers keep their capacity from one block to the next.
+        let (mut raw, text, runs, packed, clear_runs) = ENCODE_SCRATCH.take();
+        raw.clear();
+        raw.reserve(rows.iter().map(|row| row.len() + 8).sum::<usize>() + 64);
+        raw.extend_from_slice(&[0; 4]);
+        Self {
+            width: rows.first().map_or(0, Row::len),
+            index: 0,
+            blank_on_reset: 0,
+            floor: Some(1),
+            table: StyleTable::default(),
+            raw,
+            text,
+            runs,
+            packed,
+            clear_runs,
+        }
+    }
+
+    /// Encodes the next row. With `cleared`, also lists its stored cells as
+    /// runs: their length and whether they have the default style.
+    fn push(&mut self, row: &Row<Cell>, mut cleared: Option<&mut Vec<(usize, bool)>>) {
+        let Self {
+            table,
+            raw,
+            text,
+            runs,
+            ..
+        } = self;
         let cells = &row[..];
         let stored = row.content_len(Cell::is_default);
-        if cells.len() == width && width != 0 && row.occ >= stored {
-            blank_on_reset |= 1 << index;
+        if cells.len() == self.width && self.width != 0 && row.occ >= stored {
+            self.blank_on_reset |= 1 << self.index;
         }
-        floor = floor.map(|floor: usize| floor.max(stored));
-        put_varint(&mut raw, row.occ);
-        put_varint(&mut raw, cells.len());
-        put_varint(&mut raw, stored);
+        self.index += 1;
+        let mut floor = self.floor.map(|floor: usize| floor.max(stored));
+        put_varint(raw, row.occ);
+        put_varint(raw, cells.len());
+        put_varint(raw, stored);
         text.clear();
         runs.clear();
         let mut pending: Option<PendingRun> = None;
@@ -2540,75 +2716,67 @@ fn encode_cells(rows: &[Row<Cell>]) -> Encoded {
                 floor = None;
             }
             let id = table.id(cell);
-            push_scalar(&mut text, cell.c);
-            let mut end = start + 1;
-            let mut paired = false;
-            if cell.extra.is_none() {
-                let key = plain_style_key(cell);
-                if end < stored && is_wide_spacer_of(&cells[end], cell) {
-                    // Wide characters alternate with their spacers, which
-                    // would make every cell its own run.
-                    paired = true;
-                    end += 1;
-                    while end + 1 < stored {
-                        let (wide, spacer) = (&cells[end], &cells[end + 1]);
-                        if wide.extra.is_some()
-                            || plain_style_key(wide) != key
-                            || !is_wide_spacer_of(spacer, wide)
-                        {
-                            break;
-                        }
-                        push_scalar(&mut text, wide.c);
-                        end += 2;
-                    }
-                } else {
-                    loop {
-                        end += extend_ascii_run(&cells[end..stored], key, &mut text);
-                        // A character of the same style that is not ASCII.
-                        match cells[end..stored].first() {
-                            Some(next) if next.extra.is_none() && plain_style_key(next) == key => {
-                                push_scalar(&mut text, next.c);
-                                end += 1;
-                            }
-                            _ => break,
-                        }
-                    }
+            let (count, paired) = if cell.extra.is_some() {
+                text.reserve(4);
+                // SAFETY: four bytes were just reserved.
+                let written = unsafe {
+                    write_scalar(text.spare_capacity_mut().as_mut_ptr().cast(), cell.c)
+                };
+                // SAFETY: those bytes were just written.
+                unsafe { text.set_len(text.len() + written) };
+                (1, false)
+            } else if start + 1 < stored && is_wide_spacer_of(&cells[start + 1], cell) {
+                // Wide characters alternate with their spacers, which would
+                // make every cell its own run.
+                (extend_wide_pairs(&cells[start..stored], cell, text), true)
+            } else {
+                (extend_plain_run(&cells[start..stored], cell, text), false)
+            };
+            if let Some(cleared) = cleared.as_deref_mut() {
+                let default_style = !paired && cell.extra.is_none() && is_default_style(cell);
+                match cleared.last_mut() {
+                    Some(last) if last.1 == default_style => last.0 += count,
+                    _ => cleared.push((count, default_style)),
                 }
             }
             let code = id << 1 | u32::from(paired);
-            let count = end - start;
             match &mut pending {
                 Some(run) if run.code == code => run.count += count,
                 _ => {
                     if let Some(run) = pending.replace(PendingRun { code, count }) {
-                        put_varint(&mut runs, run.code as usize);
-                        put_varint(&mut runs, run.count);
+                        put_varint(runs, run.code as usize);
+                        put_varint(runs, run.count);
                     }
                 }
             }
-            start = end;
+            start += count;
         }
         if let Some(run) = pending {
-            put_varint(&mut runs, run.code as usize);
-            put_varint(&mut runs, run.count);
+            put_varint(runs, run.code as usize);
+            put_varint(runs, run.count);
         }
-        put_bytes(&mut raw, &text);
-        raw.extend_from_slice(&runs);
+        put_bytes(raw, text);
+        raw.extend_from_slice(runs);
+        self.floor = floor;
     }
-    let body = (raw.len() - 4) as u32;
-    raw[..4].copy_from_slice(&body.to_le_bytes());
-    put_varint(&mut raw, table.styles.len());
-    for style in &table.styles {
-        put_style(&mut raw, style);
-    }
-    // One allocation of the exact size, shared by the block from here on.
-    lz::compress_into(&raw, &mut packed);
-    let bytes = Arc::from(&packed[..]);
-    ENCODE_SCRATCH.set((raw, text, runs, packed));
-    Encoded {
-        bytes,
-        resize_floor: floor,
-        blank_on_reset,
+
+    fn finish(mut self) -> Encoded {
+        let raw = &mut self.raw;
+        let body = (raw.len() - 4) as u32;
+        raw[..4].copy_from_slice(&body.to_le_bytes());
+        put_varint(raw, self.table.styles.len());
+        for style in &self.table.styles {
+            put_style(raw, style);
+        }
+        // One allocation of the exact size, shared by the block from here on.
+        lz::compress_into(raw, &mut self.packed);
+        let bytes = Arc::from(&self.packed[..]);
+        ENCODE_SCRATCH.set((self.raw, self.text, self.runs, self.packed, self.clear_runs));
+        Encoded {
+            bytes,
+            resize_floor: self.floor,
+            blank_on_reset: self.blank_on_reset,
+        }
     }
 }
 
@@ -2618,13 +2786,16 @@ fn release_encode_scratch() {
     drop(ENCODE_SCRATCH.take());
 }
 
+type EncodeScratch = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<(usize, bool)>);
+
 thread_local! {
     /// [`encode_cells`]'s payload, row text, row run and compressed payload
     /// buffers, kept from one block to the next while output streams (about
     /// 20 KiB at 160 columns).
     #[allow(clippy::type_complexity)]
-    static ENCODE_SCRATCH: std::cell::Cell<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> =
-        const { std::cell::Cell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
+    static ENCODE_SCRATCH: std::cell::Cell<EncodeScratch> = const {
+        std::cell::Cell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()))
+    };
 }
 
 struct Reader<'a> {
@@ -4410,9 +4581,14 @@ mod tests {
         };
         let mut dense = Term::new(config.clone(), &Size, VoidListener);
         let mut compact = Term::new(config, &Size, VoidListener);
+        fn encode_recycled(rows: &mut [Row<Cell>]) -> Encoded {
+            ENCODED.with(|count| count.set(count.get() + 1));
+            encode_recycled_cells(rows)
+        }
         let mut codec = cell_codec();
         codec.decode = decode;
         codec.encode = encode;
+        codec.encode_recycled = encode_recycled;
         compact.grid_mut().raw.enable_compact(codec);
         let mut text = String::new();
         for n in 0..1500 {
