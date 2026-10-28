@@ -2019,15 +2019,15 @@ attributes (`?62;22c`, which kitten's probe waits on), and it sets the PTY's
 `ws_xpixel`/`ws_ypixel` from its cell size. The Engine still answers `OSC 7501`
 queries. Every other reply stays unanswered, as before, and the Holder keeps
 no queue of unanswered replies. A Holder from before minor 16 neither intercepts
-nor answers, so its programs see no support and keep working unchanged.
+nor answers, so its programs see no support and keep working unchanged. Minor
+19 (`query-replies-v1`, below) revises this: such a Holder answers every query.
 
 Local sessions answer more than this: XTVERSION, XTGETTCAP, DECRQSS, the kitty
 keyboard query, OSC 4/10/11/12 color queries from the App's palette
 (`terminal.configure`), `CSI ? 996 n` and DECSET 2031/2048 reports. That is
-opt-in on the shared screen (`with_host_replies`) and the Holder does not opt
-in, so a remote program still gets none of these replies and no OSC 4 color
-rewrite on the wire. Answering them remotely needs its own revision of this
-section. The shared emulator's state fixes (DECSTR, erase-in-line at a pending
+opt-in on the shared screen (`with_host_replies`). A minor 16 Holder does not
+opt in, so its programs get none of these replies and no OSC 4 color rewrite on
+the wire; a `query-replies-v1` Holder does (below). The shared emulator's state fixes (DECSTR, erase-in-line at a pending
 wrap, RIS clearing the title, modes 47 and 1047) reach Holders as ordinary
 emulator behavior with no protocol change.
 
@@ -2204,6 +2204,76 @@ codepoint widths until its session restarts; the Engine renders that Holder's
 grid as sent. Mode 2027 is parser state: it is not carried in snapshots or
 checkpoints, so after a Holder or Engine restart a program sees the default
 widths until it sets the mode again.
+
+## Query replies (protocol minor 19)
+
+Protocol minor 19 adds optional `query-replies-v1`. Minors 17 and 18 are
+`grid-resume-v1` and `terminal-styles-v1`; every one of these is gated by its
+own capability name, not by a minor range.
+
+Before it, a remote program's terminal queries were answered by nobody but
+the minor 16 image probes and the Engine's `OSC 7501` reply, so cursor
+position (`CSI 6 n`), status (`CSI 5 n`), DA2, DECRQM, `CSI 18 t`, color and
+color-scheme queries timed out, and shells, editors and agent CLIs waited on
+each timeout. The Engine's `OSC 7501` answer also arrived one WAN round trip
+after the Holder's immediate DA1, so the "status query, then DA1" support probe
+always read DA1 first and concluded the terminal had no support.
+
+A `query-replies-v1` Holder answers every query from its own emulator, the one
+shared `diri-terminal-state` parser, exactly as a local Engine session does:
+
+- **State-dependent replies** (CPR, DSR, DA1/DA2, DECRQM for every mode the
+  shared parser knows, XTWINOPS size reports, XTVERSION, XTGETTCAP, DECRQSS,
+  image probes, the in-band resize report of DECSET 2048) come from the Holder's
+  own grid, cursor and modes, so they are correct for the PTY that asked and
+  never cross the WAN. Modes the shared parser learns later (for example
+  grapheme clustering, 2027) are reported with no Holder protocol change.
+- **`OSC 7501` support queries** are answered by the Holder too, in stream
+  order with the emulator's replies, through a queries-only mode of the shared
+  OSC scanner that interprets no other product OSC (no alerts, clipboard, exit
+  reports or status records: the Engine still owns those). A support probe now
+  reads the status answer before DA1.
+- **Appearance-dependent replies** (OSC 4/10/11/12 colors, `CSI ? 996 n`, the
+  DECSET 2031 color-scheme report) come from a palette the Engine pushes in a
+  new `TerminalPalette` frame (kind 52, JSON `TerminalPalette`): after every
+  `ControlGranted`, and whenever the App's palette changes. The Holder keeps
+  the last one in memory for its lifetime, so a detached program is still
+  answered; before the first push colors stay unanswered, as before. A change of
+  light/dark is reported at once to a program that enabled DECSET 2031. A
+  palette push that meets a full Bridge is dropped; the next attach resends it.
+
+Replies go into the Holder's existing bounded input queue right after the
+output that asked, in one event loop with the PTY read and parse: a reply that
+does not fit is dropped and the program's query times out, as before; PTY
+reads never wait on it. The per-Holder cost is the stored palette (58 bytes)
+and the existing OSC scanner's empty state, with no heap allocation until a
+program sends an OSC; the queries-only scanner skips OSC payloads longer than
+16 bytes without buffering them.
+
+Negotiation is per controller attach, like `inline-images-v1`. The Engine
+never requires the capability. The Holder names it in `HelloAck` only to a
+controller at minor 19 or above; the Engine records it from each accepted
+`HelloAck`, clears it on every reconnect, and sends `TerminalPalette` only
+while it is recorded, because an older Holder closes the Bridge on the unknown
+frame kind. A Holder refuses `TerminalPalette` from a controller that did not
+negotiate it.
+
+Compatibility, both directions:
+
+- An older Holder (live Holders from earlier Helper builds keep running after
+  an upgrade) is never sent the frame, does not name the capability, and keeps
+  its minor 16 behavior: image probes only, with the Engine answering
+  `OSC 7501` a round trip later. Its sessions are not refused or restarted;
+  only Holders launched by the new Helper build answer queries.
+- A new Holder with an older Engine attached answers every query except
+  `OSC 7501`, which it leaves to that Engine so the program never receives
+  two answers. With no controller attached, nobody else could answer, so the
+  Holder answers `OSC 7501` too; an Engine that attaches later reads that
+  output as replay and answers nothing.
+
+The kitty keyboard query (`CSI ? u`) stays unanswered remotely: the Holder
+keeps the disabled keyboard parser, and enabling it is the separate
+`enhanced-keyboard-v1` input-owner change described above.
 
 ## Read-only output log ownership
 

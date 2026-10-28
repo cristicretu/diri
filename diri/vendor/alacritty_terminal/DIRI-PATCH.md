@@ -415,6 +415,45 @@ change and never republished the screen. `reset_state` (RIS, `ESC c`) also
 clears every color a program set, as xterm and libghostty do; upstream kept
 them across `reset`. No wire, checkpoint or protocol change.
 
+## Styles with extra storage by hash map
+
+`StyleTable::extra_id` found a style with extra storage (combining marks, an
+underline color, a hyperlink) by a linear scan of every such style already in
+the block. Output where each cell carries different marks (`kitten
+__benchmark__`'s unique Unicode: a letter and three combining marks per cell)
+gives a block of 64 rows at 120 columns about 7,700 such styles, so sealing
+it compared about 30 million entries: the unique Unicode workload fell from
+about 47 to about 10 MB/s with "Cheaper history encoding".
+
+- The first style with each hash sits in an `FxHasher` map, found or claimed
+  in one probe; a later, different style with the same hash goes to a short
+  collision list that is searched by hash and comparison as before. Ids are
+  handed out in the same order, so payloads are byte-identical.
+- The table is kept, emptied, in a thread-local between blocks next to the
+  encoding buffers (`STYLE_SCRATCH`) and released with them, so a stream of
+  such blocks does not regrow its map and list each time. It is emptied
+  before it is put back, so it holds no cell's extra storage between blocks.
+
+Tests: `styles_with_extra_storage_are_told_apart_on_a_hash_collision`,
+`blocks_of_unique_combining_marks_round_trip_one_after_another`, and the
+existing randomized codec tests.
+
+## Amortized history audits in debug builds
+
+Three debug assertions in `grid/compact.rs` re-derived history bookkeeping
+from scratch on every change: the deferred history's row, payload and
+eager-cell counts (a layout of every deferred line), the deferred line
+index's extra heap, and the stored payload bytes (every block). After a
+column change defers a full history, each new line evicts a deferred row, so
+a debug build (`cargo test`, development apps) walked every deferred line
+per line: 7.6–13 ms per line at 150,000 rows, against 9 µs before the
+resize. `audit_due` keeps the checks exact for collections up to 1,024 items
+(every unit test's) and otherwise runs them once per `len` calls, which is
+O(1) amortized. Release builds compile none of it; no behavior, wire,
+checkpoint or protocol change. Test:
+`lines_after_narrowing_a_full_history_cost_what_they_did_before`
+(`diri-terminal-state`); probe: `--bench narrow_history`.
+
 ## Test-only `observe` feature
 
 `observe = ["vte/observe"]` only forwards the vendored VTE's test-only OSC
