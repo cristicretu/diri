@@ -5695,6 +5695,7 @@ mod tests {
             title_source: Some(TitleSource::AgentProvided),
             tail_offset: 0,
             exited: false,
+            ran: None,
         }
     }
 
