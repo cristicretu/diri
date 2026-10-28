@@ -3770,6 +3770,16 @@ impl StoreRuntime {
         }
     }
 
+    /// [`Self::inert`] that keeps the store's effects, for tests that check
+    /// what a view asked the Engine to do.
+    #[cfg(test)]
+    pub(crate) fn inert_with_effects() -> (Self, mpsc::UnboundedReceiver<StoreEffect>) {
+        let runtime = Self::inert();
+        let (store, effects) = SessionStore::headless(Prefs::default());
+        *runtime.store.write().expect("session store lock poisoned") = store;
+        (runtime, effects)
+    }
+
     /// [`Self::inert`] talking to a private test Engine instead of the
     /// default socket, which may be the user's real Engine.
     #[cfg(all(test, target_os = "macos"))]

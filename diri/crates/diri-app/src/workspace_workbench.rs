@@ -2,6 +2,8 @@
 //! view per session owns geometry in the active window.
 mod commands;
 pub(crate) use commands::PaneCommand;
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use commands::best_fit_edge;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -1600,7 +1602,9 @@ impl Render for WorkspaceWorkbench {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use diri_proto::workspace::{TabId, WorkspaceId, WorkspaceRecord, WorkspaceSnapshot};
+    use crate::store::StoreEffect;
+    use diri_proto::AgentKind;
+    use diri_proto::workspace::{SpawnPane, TabId, WorkspaceId, WorkspaceRecord, WorkspaceSnapshot};
     use gpui::TestAppContext;
     use std::cell::Cell;
     use std::rc::Rc;
@@ -1756,6 +1760,66 @@ mod tests {
                 assert_eq!(workbench.mounted[&PaneId::new("a")].terminal, before);
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn splits_open_on_every_side_and_best_fit_cuts_the_longer_one(cx: &mut TestAppContext) {
+        let (runtime, effects) = StoreRuntime::inert_with_effects();
+        let runtime = Arc::new(runtime);
+        let mut effects = effects;
+        runtime.store.write().unwrap().hydrate(
+            crate::sidebar::SidebarPreviewFixture::make(crate::sidebar::PreviewScenario::Typical)
+                .list,
+        );
+        let wide = WorkspaceTab {
+            id: TabId::new("tab"),
+            title: None,
+            focused_pane: PaneId::new("a"),
+            zoomed_pane: None,
+            layout: LayoutNode::Pane {
+                id: PaneId::new("a"),
+                session_id: SessionId::new("preview-claude"),
+            },
+        };
+        let (_, tokio, columns) = fixture(false);
+        seed(&runtime, vec![wide.clone()], 1);
+        let window =
+            cx.add_window(|window, cx| WorkspaceWorkbench::new(runtime.clone(), tokio, window, cx));
+        let mut split = |tab: &WorkspaceTab, command: PaneCommand| {
+            window
+                .update(cx, |workbench, window, cx| {
+                    workbench.set_tab(tab.clone(), viewport(), window, cx);
+                    assert!(workbench.execute_command(command, window, cx));
+                })
+                .unwrap();
+            let placements = std::iter::from_fn(|| effects.try_recv().ok())
+                .filter_map(|effect| match effect {
+                    StoreEffect::SpawnPane { pane, params } => {
+                        assert_eq!(params.kind, AgentKind::SHELL);
+                        Some(pane)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let [SpawnPane::Beside { target, edge, .. }] = placements.as_slice() else {
+                panic!("one pane shell placed beside the focused pane: {placements:?}")
+            };
+            assert_eq!(target, &PaneId::new("a"));
+            *edge
+        };
+        for (command, edge) in [
+            (PaneCommand::Split(DockEdge::Left), DockEdge::Left),
+            (PaneCommand::Split(DockEdge::Top), DockEdge::Top),
+            (PaneCommand::Split(DockEdge::Right), DockEdge::Right),
+            (PaneCommand::Split(DockEdge::Bottom), DockEdge::Bottom),
+            // 900×600, wider than tall: a new column.
+            (PaneCommand::SplitBestFit, DockEdge::Right),
+        ] {
+            assert_eq!(split(&wide, command), edge, "{command:?}");
+        }
+        // `a` holds 60% of 900: 540×600 is taller than wide, so a new row.
+        seed(&runtime, vec![columns.clone()], 2);
+        assert_eq!(split(&columns, PaneCommand::SplitBestFit), DockEdge::Bottom);
     }
 
     #[test]

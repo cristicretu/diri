@@ -151,7 +151,10 @@
   "settings.resources.memory_limit_detail": "Freeze an idle session when its process tree reaches this size.",
   "settings.resources.session_limits": "Session limits",
   "settings.resources.title": "Resources",
+  "settings.terminal.auto_balance_panes": "Even out panes after a split or close",
+  "settings.terminal.auto_balance_panes_detail": "Give every pane in a tab the same share whenever one is added or closed. Off keeps the sizes you set.",
   "settings.terminal.file_links_detail": "The editor a clicked file path opens in.",
   "settings.terminal.mouse": "Mouse and selection",
+  "settings.terminal.panes": "Split panes",
   "settings.terminal.shell": "Shell"
 }

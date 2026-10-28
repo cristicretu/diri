@@ -42,6 +42,8 @@ mod split_pane_tests;
 mod pane_drag_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod pane_drag_frames;
+#[cfg(all(test, target_os = "macos"))]
+mod split_frames;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -5732,6 +5734,21 @@ impl Render for RootView {
             .on_action(
                 cx.listener(|this, _: &crate::commands::SplitPaneBelow, window, cx| {
                     this.run_command(CommandId::SplitPaneBelow, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::SplitPaneLeft, window, cx| {
+                    this.run_command(CommandId::SplitPaneLeft, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::SplitPaneAbove, window, cx| {
+                    this.run_command(CommandId::SplitPaneAbove, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::SplitPaneBestFit, window, cx| {
+                    this.run_command(CommandId::SplitPaneBestFit, window, cx);
                 }),
             )
             .on_action(

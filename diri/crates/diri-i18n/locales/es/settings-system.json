@@ -151,7 +151,10 @@
   "settings.resources.memory_limit_detail": "Congelar una sesión inactiva cuando su árbol de procesos alcance este tamaño.",
   "settings.resources.session_limits": "Límites de sesión",
   "settings.resources.title": "Recursos",
+  "settings.terminal.auto_balance_panes": "Igualar los paneles al dividir o cerrar",
+  "settings.terminal.auto_balance_panes_detail": "Da a cada panel de una pestaña el mismo espacio cuando se añade o se cierra uno. Desactivado, conserva los tamaños que elegiste.",
   "settings.terminal.file_links_detail": "El editor donde se abre una ruta de archivo al hacer clic.",
   "settings.terminal.mouse": "Ratón y selección",
+  "settings.terminal.panes": "Paneles divididos",
   "settings.terminal.shell": "Shell"
 }
