@@ -209,9 +209,13 @@ fn the_selection_goes_when_its_text_leaves_the_oldest_end_of_history() {
         assert_eq!(pane.selected(), "keep me", "after {printed} lines");
         pane.print("filler line\r\n".repeat(500));
         printed += 500;
-        assert!(printed <= 20_000, "never evicted");
+        assert!(
+            printed <= diri_terminal_state::HISTORY_ROW_CEILING + 20_000,
+            "never evicted"
+        );
     }
-    // The terminal keeps 10,000 rows of history.
+    // History is bounded by stored bytes, up to its row ceiling; repeated
+    // filler compresses, so eviction comes from the ceiling.
     assert!(printed > 9_000, "{printed}");
 }
 

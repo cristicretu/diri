@@ -22,7 +22,7 @@ impl Render for Fixture {
     }
 }
 
-fn terminal(text: &str) -> TerminalElement {
+fn terminal(text: &str, cell_width: f32) -> TerminalElement {
     let mut cells: Vec<GridCell> = text
         .chars()
         .map(|ch| {
@@ -38,7 +38,8 @@ fn terminal(text: &str) -> TerminalElement {
     let terminal = TerminalElement::with_buffer(GridBuffer::new(COLS, ROWS))
         .focused(true)
         .reduce_motion(true)
-        .font(gpui::font("Menlo"));
+        .font(gpui::font("Menlo"))
+        .cell_width_scale(cell_width);
     terminal.apply_damage(GridUpdate {
         cols: COLS,
         rows: ROWS,
@@ -62,10 +63,10 @@ fn a_cell_without_advance_does_not_shift_the_glyphs_after_it() {
         Arc::new(()),
         gpui_platform::current_headless_renderer,
     );
-    let mut draw = |text: &str| {
-        let terminal = terminal(text);
+    let mut draw = |text: &str, cell_width: f32| {
+        let terminal = terminal(text, cell_width);
         let window = cx
-            .open_window(gpui::size(px(300.0), px(40.0)), move |_, cx| {
+            .open_window(gpui::size(px(340.0), px(40.0)), move |_, cx| {
                 cx.new(|_| Fixture(terminal))
             })
             .expect("headless window");
@@ -73,23 +74,29 @@ fn a_cell_without_advance_does_not_shift_the_glyphs_after_it() {
         cx.capture_screenshot(window.into()).expect("screenshot")
     };
 
-    let blank = draw("shy  now. Don\u{2019}t stop this");
-    assert!(
-        blank.pixels().any(|pixel| pixel != blank.get_pixel(0, 0)),
-        "fixture rendered a blank frame"
-    );
-    for invisible in ['\u{00ad}', '\u{2028}'] {
-        let shifted = draw(&format!("shy{invisible} now. Don\u{2019}t stop this"));
-        let differing = shifted
-            .pixels()
-            .zip(blank.pixels())
-            .filter(|(a, b)| a != b)
-            .count();
-        assert_eq!(
-            differing,
-            0,
-            "U+{:04X} moved the glyphs after it off their cells",
-            u32::from(invisible)
+    // Widened and narrowed cells (Cell width) pin glyphs the same way.
+    for cell_width in [1.0, 1.15, 0.9] {
+        let blank = draw("shy  now. Don\u{2019}t stop this", cell_width);
+        assert!(
+            blank.pixels().any(|pixel| pixel != blank.get_pixel(0, 0)),
+            "fixture rendered a blank frame"
         );
+        for invisible in ['\u{00ad}', '\u{2028}'] {
+            let shifted = draw(
+                &format!("shy{invisible} now. Don\u{2019}t stop this"),
+                cell_width,
+            );
+            let differing = shifted
+                .pixels()
+                .zip(blank.pixels())
+                .filter(|(a, b)| a != b)
+                .count();
+            assert_eq!(
+                differing,
+                0,
+                "U+{:04X} moved the glyphs after it off their cells at {cell_width}x width",
+                u32::from(invisible)
+            );
+        }
     }
 }

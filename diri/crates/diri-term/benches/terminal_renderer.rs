@@ -31,6 +31,37 @@ fn terminal_build_log_scroll(cx: &mut BenchAppContext) {
     scroll(cx, plain_row);
 }
 
+/// The styled TUI with every font control engaged: Medium regular face,
+/// ExtraBold bold, Light italic, thickened strokes and 110% cells. Gates the
+/// same 90% shape-cache reuse as the default renderer.
+#[gpui::bench(fps = 120)]
+fn terminal_styled_tui_font_controls_scroll(cx: &mut BenchAppContext) {
+    let initial = build_frame(0, true, styled_row);
+    let frames = [
+        build_frame(1, false, styled_row),
+        build_frame(0, false, styled_row),
+    ];
+    scroll_terminal(
+        cx,
+        TerminalElement::with_buffer(GridBuffer::new(COLS, ROWS))
+            .focused(true)
+            .font(diri_term::glyphs::terminal_font_with_weight(
+                "Menlo", true, 500,
+            ))
+            .faces(diri_term::glyphs::TerminalFaces {
+                bold: 800,
+                italic: Some(300),
+            })
+            .glyph_raster(gpui::GlyphRasterStyle {
+                smoothing: true,
+                stroke: 2,
+            })
+            .cell_width_scale(1.1),
+        initial,
+        frames,
+    );
+}
+
 /// An agent TUI rather than a build log: coloured words, syntax-coloured code
 /// whose glyphs change colour without a gap, and block-element bars.
 #[gpui::bench(fps = 120)]
@@ -337,6 +368,15 @@ fn scroll_frames(cx: &mut BenchAppContext, frame: fn(usize, bool) -> GridUpdate)
 
 fn scroll_updates(cx: &mut BenchAppContext, initial: GridUpdate, frames: [GridUpdate; 2]) {
     let terminal = TerminalElement::with_buffer(GridBuffer::new(COLS, ROWS)).focused(true);
+    scroll_terminal(cx, terminal, initial, frames);
+}
+
+fn scroll_terminal(
+    cx: &mut BenchAppContext,
+    terminal: TerminalElement,
+    initial: GridUpdate,
+    frames: [GridUpdate; 2],
+) {
     terminal.apply_damage(initial);
 
     let mut window = cx.add_empty_window();
@@ -547,6 +587,7 @@ gpui::bench_group!(
     benches,
     terminal_build_log_scroll,
     terminal_styled_tui_scroll,
+    terminal_styled_tui_font_controls_scroll,
     terminal_framed_tui_scroll,
     terminal_icon_listing_scroll,
     terminal_diagnostics_scroll,

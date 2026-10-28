@@ -102,6 +102,12 @@ pub struct TerminalElement {
     /// Multiple of the font's natural line height; 1.0 paints rows exactly
     /// as tall as the font asks for.
     line_height_scale: f32,
+    /// Multiple of the font's advance; 1.0 is the font's own cell width.
+    cell_width_scale: f32,
+    /// The weights bold and italic cells are drawn in.
+    faces: crate::glyphs::TerminalFaces,
+    /// How glyphs rasterize: font smoothing and stroke thickening.
+    glyph_raster: gpui::GlyphRasterStyle,
     focus_handle: Option<FocusHandle>,
     text_input: Option<TextInputCallback>,
     ime_state: Arc<Mutex<TerminalImeState>>,
@@ -630,7 +636,7 @@ struct ElementSharedState {
     modes: Mutex<TerminalModes>,
     scroll_router: Mutex<ScrollRouter>,
     history_lines: Mutex<HistoryLineCache>,
-    metrics: Mutex<Option<(Font, u32, u32, CellMetrics)>>,
+    metrics: Mutex<Option<(Font, u32, u64, CellMetrics)>>,
     /// Behind its own `Arc` so the input handler and the blink wake can hold
     /// it without holding the rest of the view's state.
     cursor: Arc<Mutex<CursorDriver>>,
@@ -769,6 +775,7 @@ struct HistoryLineCache {
 struct HistoryShapeKey {
     theme_signature: u64,
     font_id: FontId,
+    faces: crate::glyphs::TerminalFaces,
     font_size_bits: u32,
     cell_width_bits: u32,
     visible_cols: usize,
@@ -937,6 +944,7 @@ fn align_scrolled_rows(cache: &mut [Option<CachedRow>], damage: &[ChangedRenderR
 struct RowRenderContext {
     theme_signature: u64,
     font_id: FontId,
+    faces: crate::glyphs::TerminalFaces,
     font_size_bits: u32,
     cell_width_bits: u32,
     line_height_bits: u32,
@@ -1084,6 +1092,9 @@ impl TerminalElement {
             font: terminal_font,
             font_size: px(13.0),
             line_height_scale: 1.0,
+            cell_width_scale: 1.0,
+            faces: crate::glyphs::TerminalFaces::default(),
+            glyph_raster: gpui::GlyphRasterStyle::default(),
             focus_handle: None,
             text_input: None,
             ime_state: Arc::new(Mutex::new(TerminalImeState::default())),
@@ -1192,6 +1203,27 @@ impl TerminalElement {
     #[must_use]
     pub fn line_height_scale(mut self, scale: f32) -> Self {
         self.line_height_scale = scale;
+        self
+    }
+
+    /// Widens (or narrows) every cell to `scale` times the font's advance.
+    #[must_use]
+    pub fn cell_width_scale(mut self, scale: f32) -> Self {
+        self.cell_width_scale = scale;
+        self
+    }
+
+    /// The weights bold and italic cells are drawn in.
+    #[must_use]
+    pub fn faces(mut self, faces: crate::glyphs::TerminalFaces) -> Self {
+        self.faces = faces;
+        self
+    }
+
+    /// Font smoothing and stroke thickening for this terminal's glyphs.
+    #[must_use]
+    pub fn glyph_raster(mut self, style: gpui::GlyphRasterStyle) -> Self {
+        self.glyph_raster = style;
         self
     }
 
@@ -2314,7 +2346,7 @@ impl TerminalElement {
                 byte_len += combining.len();
             }
 
-            let run_font = styled_font(&self.font, resolved);
+            let run_font = styled_font(&self.font, self.faces, resolved);
             let color = resolved.foreground.into();
             if let Some(previous) = runs.last_mut()
                 && previous.font == run_font
@@ -2362,7 +2394,7 @@ impl TerminalElement {
         let text = SharedString::from(format!("{ch}{combining}"));
         let run = TextRun {
             len: text.len(),
-            font: styled_font(&self.font, resolved),
+            font: styled_font(&self.font, self.faces, resolved),
             color: color.into(),
             background_color: None,
             underline: None,
@@ -2579,7 +2611,7 @@ fn paint_cursor_glyph(
             bounds.top() + metrics.y_for_row(row),
         );
         let _ = glyph.paint(
-            origin,
+            metrics.text_origin(origin),
             metrics.line_height,
             TextAlign::Left,
             None,
@@ -2749,7 +2781,8 @@ impl Element for TerminalElement {
 
         let started_at = Instant::now();
         let font_size_bits = f32::from(self.font_size).to_bits();
-        let scale_bits = self.line_height_scale.to_bits();
+        let scale_bits = (u64::from(self.line_height_scale.to_bits()) << 32)
+            | u64::from(self.cell_width_scale.to_bits());
         let metrics = {
             let mut cached = mutex_lock(&self.shared.metrics);
             if let Some((cached_font, cached_size, cached_scale, metrics)) = cached.as_ref()
@@ -2762,7 +2795,8 @@ impl Element for TerminalElement {
                 let font_id = window.text_system().resolve_font(&self.font);
                 let metrics =
                     CellMetrics::measure_font(window.text_system(), font_id, self.font_size)
-                        .with_line_height_scale(self.line_height_scale);
+                        .with_line_height_scale(self.line_height_scale)
+                        .with_cell_width_scale(self.cell_width_scale);
                 *cached = Some((self.font.clone(), font_size_bits, scale_bits, metrics));
                 metrics
             }
@@ -2872,6 +2906,7 @@ impl Element for TerminalElement {
             let key = HistoryShapeKey {
                 theme_signature: self.theme.signature(),
                 font_id: metrics.font_id,
+                faces: self.faces,
                 font_size_bits: f32::from(self.font_size).to_bits(),
                 cell_width_bits: f32::from(metrics.cell_width).to_bits(),
                 visible_cols,
@@ -2919,6 +2954,7 @@ impl Element for TerminalElement {
             let context = RowRenderContext {
                 theme_signature: self.theme.signature(),
                 font_id: metrics.font_id,
+                faces: self.faces,
                 font_size_bits: f32::from(self.font_size).to_bits(),
                 cell_width_bits: f32::from(metrics.cell_width).to_bits(),
                 line_height_bits: f32::from(metrics.line_height).to_bits(),
@@ -3339,6 +3375,7 @@ impl Element for TerminalElement {
                 }
             });
         }
+        let previous_raster = window.replace_glyph_raster_style(self.glyph_raster);
         window.with_content_mask(Some(ContentMask { bounds: content }), |window| {
             // Live path: rows come straight from the shared cache. Quads are
             // plain structs (a stack copy each) and `ShapedLine::paint` takes
@@ -3412,7 +3449,7 @@ impl Element for TerminalElement {
                         );
                     } else {
                         let _ = prepared.line.paint(
-                            origin,
+                            metrics.text_origin(origin),
                             metrics.line_height,
                             TextAlign::Left,
                             None,
@@ -3464,7 +3501,7 @@ impl Element for TerminalElement {
                     );
                 } else {
                     let _ = line.paint(
-                        origin,
+                        metrics.text_origin(origin),
                         metrics.line_height,
                         TextAlign::Left,
                         None,
@@ -3532,7 +3569,7 @@ impl Element for TerminalElement {
                         bounds.top() + metrics.y_for_row(cursor.row),
                     );
                     let _ = glyph.paint(
-                        origin,
+                        metrics.text_origin(origin),
                         metrics.line_height,
                         TextAlign::Left,
                         None,
@@ -3542,6 +3579,7 @@ impl Element for TerminalElement {
                 }
             }
         });
+        window.replace_glyph_raster_style(previous_raster);
 
         self.report_first_content_paint();
 
@@ -4034,7 +4072,7 @@ fn paint_line_around_cursor(
         );
         window.with_content_mask(Some(ContentMask { bounds: mask }), |window| {
             let _ = line.paint(
-                origin,
+                metrics.text_origin(origin),
                 metrics.line_height,
                 TextAlign::Left,
                 None,
@@ -4050,7 +4088,7 @@ fn paint_line_around_cursor(
         );
         window.with_content_mask(Some(ContentMask { bounds: mask }), |window| {
             let _ = line.paint(
-                origin,
+                metrics.text_origin(origin),
                 metrics.line_height,
                 TextAlign::Left,
                 None,
@@ -4133,14 +4171,8 @@ fn glyph_shifts<'a>(
         })
 }
 
-fn styled_font(base: &Font, style: ResolvedCellStyle) -> Font {
-    if style.bold {
-        base.clone().bold()
-    } else if style.italic {
-        base.clone().italic()
-    } else {
-        base.clone()
-    }
+fn styled_font(base: &Font, faces: crate::glyphs::TerminalFaces, style: ResolvedCellStyle) -> Font {
+    faces.styled(base, style.bold, style.italic)
 }
 
 /// Strong right-to-left scalars and explicit bidi controls: the presence of
@@ -5530,6 +5562,7 @@ mod history_cache_tests {
         HistoryShapeKey {
             theme_signature: 1,
             font_id: FontId(0),
+            faces: crate::glyphs::TerminalFaces::default(),
             font_size_bits: 13f32.to_bits(),
             cell_width_bits: 8f32.to_bits(),
             visible_cols: 80,
