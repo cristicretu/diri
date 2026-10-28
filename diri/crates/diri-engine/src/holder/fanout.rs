@@ -181,6 +181,7 @@ impl FrameQueue {
 
     /// Records that the subscriber took bytes from outside the queue, which
     /// keeps a pump waiting for room from giving up on it.
+    #[cfg(any(unix, test))]
     pub(super) fn note_progress(&self) {
         self.state.lock().expect("frame queue").progress += 1;
     }
@@ -191,6 +192,7 @@ impl FrameQueue {
         self.changed.notify_all();
     }
 
+    #[cfg(any(unix, test))]
     pub(super) fn is_closed(&self) -> bool {
         self.state.lock().expect("frame queue").closed
     }
