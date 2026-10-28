@@ -2908,6 +2908,11 @@ impl TerminalPane {
                     .filter(|plan| !plan.is_empty())
                     .map(|plan| plan.headline().into()),
                 importing_herdr: store.herdr().importing,
+                terminal_setup: store
+                    .terminal_setup()
+                    .plans()
+                    .first()
+                    .map(|plan| plan.source.name()),
             }
         };
         let canonical = Arc::clone(&self.runtime.store);
@@ -4914,6 +4919,7 @@ impl TerminalPane {
             .font(typeface.font.clone())
             .font_size(px(typeface.size))
             .line_height_scale(typeface.line_height)
+            .default_cursor(typeface.cursor)
             .focus_handle(self.focus.clone())
             .reduce_motion(cx.reduce_motion())
             .hovered_reference(self.qol.hit.clone());
@@ -6427,6 +6433,7 @@ struct TerminalType {
     font: gpui::Font,
     size: f32,
     line_height: f32,
+    cursor: diri_proto::grid::CursorStyle,
 }
 
 impl TerminalType {
@@ -6435,6 +6442,10 @@ impl TerminalType {
             font: crate::fonts::terminal_font(&prefs.terminal_font_family),
             size: prefs.terminal_font_size,
             line_height: prefs.terminal_line_height,
+            cursor: diri_proto::grid::CursorStyle {
+                shape: prefs.terminal_cursor_shape.to_grid(),
+                steady: !prefs.terminal_cursor_blink,
+            },
         }
     }
 

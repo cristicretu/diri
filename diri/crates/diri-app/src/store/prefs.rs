@@ -212,6 +212,39 @@ impl PaneDensity {
     }
 }
 
+/// The cursor a terminal draws until its program asks for another one
+/// (DECSCUSR). Block is what Diri always drew; a name this build does not
+/// know reads as Block.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TerminalCursorShape {
+    Bar,
+    Underline,
+    #[default]
+    #[serde(other)]
+    Block,
+}
+
+impl TerminalCursorShape {
+    pub const ALL: [Self; 3] = [Self::Block, Self::Bar, Self::Underline];
+
+    pub const fn to_grid(self) -> diri_proto::grid::CursorShape {
+        match self {
+            Self::Block => diri_proto::grid::CursorShape::Block,
+            Self::Bar => diri_proto::grid::CursorShape::Bar,
+            Self::Underline => diri_proto::grid::CursorShape::Underline,
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        crate::i18n::t(match self {
+            Self::Block => "settings.appearance.cursor_block",
+            Self::Bar => "settings.appearance.cursor_bar",
+            Self::Underline => "settings.appearance.cursor_underline",
+        })
+    }
+}
+
 /// Where a new Agent opened from a project (⌘T, New Agent) starts. Stored
 /// per project; a missing entry, or a name this build does not know, is the
 /// current checkout, which is what every project did before the choice.
@@ -425,6 +458,10 @@ const fn window_transparency_default() -> f32 {
     1.0
 }
 
+const fn terminal_cursor_blink_default() -> bool {
+    true
+}
+
 const fn terminal_line_height_default() -> f32 {
     1.0
 }
@@ -525,6 +562,12 @@ pub struct Prefs {
     #[serde(default = "terminal_line_height_default")]
     pub terminal_line_height: f32,
     pub terminal_copy_on_select: bool,
+    /// The cursor drawn while the program has not chosen one.
+    #[serde(default)]
+    pub terminal_cursor_shape: TerminalCursorShape,
+    /// Whether that default cursor blinks.
+    #[serde(default = "terminal_cursor_blink_default")]
+    pub terminal_cursor_blink: bool,
     /// Open a terminal URL on a plain click. When off, links still open with
     /// Command- or Control-click.
     pub terminal_open_links_on_click: bool,
@@ -673,6 +716,8 @@ impl Default for Prefs {
             terminal_font_family: String::new(),
             terminal_line_height: terminal_line_height_default(),
             terminal_copy_on_select: false,
+            terminal_cursor_shape: TerminalCursorShape::Block,
+            terminal_cursor_blink: true,
             terminal_open_links_on_click: true,
             terminal_hide_pointer: true,
             terminal_shell_integration: true,

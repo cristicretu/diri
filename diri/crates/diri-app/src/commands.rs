@@ -99,6 +99,7 @@ actions!(
         SelectNextAttentionSession,
         CheckForUpdates,
         ShowWhatsNew,
+        ImportTerminalSetup,
         ToggleReadAloud,
         ToggleReadThisTab,
         ReadOnlyThisTab,
@@ -215,6 +216,7 @@ pub enum CommandId {
     SelectNextAttentionSession,
     CheckForUpdates,
     ShowWhatsNew,
+    ImportTerminalSetup,
     ToggleReadAloud,
     ToggleReadThisTab,
     ReadOnlyThisTab,
@@ -958,6 +960,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         "whats new release highlights features changelog demo video tour"
     ),
     spec!(
+        ImportTerminalSetup,
+        "import-terminal-setup",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.import_terminal_setup.palette_title",
+        "arrow.down",
+        "import ghostty iterm iterm2 wezterm kitty alacritty terminal font theme cursor setup migrate"
+    ),
+    spec!(
         ToggleReadAloud,
         "toggle-read-aloud",
         Some("cmd-alt-s"),
@@ -1489,6 +1501,7 @@ impl CommandSpec {
             }
             CommandId::CheckForUpdates => KeyBinding::new(key, CheckForUpdates, context),
             CommandId::ShowWhatsNew => KeyBinding::new(key, ShowWhatsNew, context),
+            CommandId::ImportTerminalSetup => KeyBinding::new(key, ImportTerminalSetup, context),
             CommandId::ToggleReadAloud => KeyBinding::new(key, ToggleReadAloud, context),
             CommandId::ToggleReadThisTab => KeyBinding::new(key, ToggleReadThisTab, context),
             CommandId::ReadOnlyThisTab => KeyBinding::new(key, ReadOnlyThisTab, context),
@@ -2177,6 +2190,11 @@ impl CommandId {
                 description: t("command.show_whats_new.description"),
                 category: Application,
             },
+            Self::ImportTerminalSetup => ShortcutMetadata {
+                title: t("command.import_terminal_setup.title"),
+                description: t("command.import_terminal_setup.description"),
+                category: Application,
+            },
             Self::ToggleReadThisTab
             | Self::ReadOnlyThisTab
             | Self::ReadAllExceptThisTab
@@ -2306,6 +2324,7 @@ impl CommandId {
             Self::SelectNextAttentionSession => Box::new(SelectNextAttentionSession),
             Self::CheckForUpdates => Box::new(CheckForUpdates),
             Self::ShowWhatsNew => Box::new(ShowWhatsNew),
+            Self::ImportTerminalSetup => Box::new(ImportTerminalSetup),
             Self::ToggleReadAloud => Box::new(ToggleReadAloud),
             Self::ToggleReadThisTab => Box::new(ToggleReadThisTab),
             Self::ReadOnlyThisTab => Box::new(ReadOnlyThisTab),

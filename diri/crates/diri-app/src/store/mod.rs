@@ -2,6 +2,7 @@
 
 mod computer;
 mod herdr;
+mod terminal_setup;
 mod prefs;
 mod projection;
 mod residency;
@@ -41,7 +42,8 @@ use crate::switcher::{
 
 pub use prefs::{
     DictationShortcut, FileEditor, InspectorTab, InterfaceStyle, NewAgentStart, PaneDensity, Prefs,
-    SavedWindow, SidebarGrouping, SidebarOrdering, TabOrientation, TalkAnswer, UiLanguage,
+    SavedWindow, SidebarGrouping, SidebarOrdering, TabOrientation, TalkAnswer, TerminalCursorShape,
+    UiLanguage,
     WindowMaterial, WindowMode, WindowPlacement,
 };
 pub use projection::{SidebarProject, SidebarProjection, SidebarRow};
@@ -193,6 +195,8 @@ pub enum StoreEffect {
     },
     /// Open every planned herdr pane as a Diri session, in herdr's order.
     ImportHerdr(Vec<herdr::ImportStep>),
+    /// Read other terminals' configs off the main thread.
+    ScanTerminalSetup,
     /// Resume every session a restart ended, a few at a time.
     ResumeAll(Vec<SessionId>),
     /// Poll computer use setup while Settings or a permission guide shows it.
@@ -514,6 +518,7 @@ pub struct SessionStore {
     agent_install: Option<AgentKind>,
     computer: computer::ComputerSetupState,
     herdr: herdr::HerdrState,
+    terminal_setup: terminal_setup::TerminalSetupState,
     /// Attention states serving out their settle window, newest arming wins.
     /// Drained by the settle task in `StoreHandle`, which is what turns one of
     /// these into a chime and a banner — see `drain_settled_attention`.
@@ -619,6 +624,7 @@ impl SessionStore {
                 agent_install: None,
                 computer: computer::ComputerSetupState::default(),
                 herdr: herdr::HerdrState::default(),
+                terminal_setup: terminal_setup::TerminalSetupState::default(),
                 notification_feed,
                 attention_wake: Arc::new(Notify::new()),
                 terminal_clipboard: broadcast::channel(4).0,
@@ -3923,6 +3929,11 @@ impl StoreRuntime {
                                     state_store.write().expect("session store lock poisoned");
                                 store.hydrate(list);
                                 store.request_herdr_scan();
+                                // Only a first run shows the welcome that
+                                // offers it; Settings asks on its own.
+                                if store.sessions().is_empty() {
+                                    store.request_terminal_setup_scan();
+                                }
                                 store.snapshot()
                             };
                             state_snapshots.send_replace(snapshot);
@@ -4437,6 +4448,10 @@ async fn run_effects(
                 });
                 Ok(())
             }
+            StoreEffect::ScanTerminalSetup => {
+                tokio::spawn(terminal_setup::scan(Arc::clone(&store), change_tx.clone()));
+                Ok(())
+            }
             StoreEffect::ScanHerdr { tracked, imported } => {
                 tokio::spawn(herdr::scan(
                     tracked,
@@ -4667,6 +4682,8 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         StoreEffect::WatchComputer | StoreEffect::ComputerSetup(_) => return None,
         // Import outcomes, failures included, arrive as one summary banner.
         StoreEffect::ScanHerdr { .. } | StoreEffect::ImportHerdr(_) => return None,
+        // Applying happens in the store; the scan only reads.
+        StoreEffect::ScanTerminalSetup => return None,
         // So does a "Resume all" batch.
         StoreEffect::ResumeAll(_) => return None,
     };

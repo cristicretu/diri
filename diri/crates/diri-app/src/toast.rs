@@ -35,6 +35,8 @@ pub enum ToastCommand {
     RetryConnection,
     RetryAction,
     CopyDetails(String),
+    /// Put back the terminal settings an import replaced.
+    UndoTerminalImport,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

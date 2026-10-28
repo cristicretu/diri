@@ -140,6 +140,7 @@ enum SettingsMenu {
     TalkVoice,
     TalkAnswer,
     TalkTabs,
+    CursorShape,
 }
 
 /// Update channels, in menu order.
@@ -499,6 +500,10 @@ pub(crate) enum UtilitySurfacesEvent {
     RefreshUsageLimits,
     /// A What's New thumbnail was clicked: open the sheet on that highlight.
     ShowWhatsNew(usize),
+    /// Settings › General › Import: review another terminal's setup.
+    ShowTerminalImport,
+    /// Settings › General › Import: take the last import back.
+    UndoTerminalImport,
 }
 impl gpui::EventEmitter<UtilitySurfacesEvent> for UtilitySurfaces {}
 
@@ -1983,6 +1988,12 @@ impl UtilitySurfaces {
             self.refresh_release_notes(cx);
             self.load_whats_new_posters(cx);
         }
+        if self.settings_tab == SettingsTab::General {
+            self.store
+                .write()
+                .expect("session store lock poisoned")
+                .request_terminal_setup_scan();
+        }
         cx.notify();
     }
 
@@ -2085,10 +2096,9 @@ impl UtilitySurfaces {
             self.refresh_accounts(cx);
         }
         if tab == SettingsTab::General {
-            self.store
-                .write()
-                .expect("session store lock poisoned")
-                .request_herdr_scan();
+            let mut store = self.store.write().expect("session store lock poisoned");
+            store.request_herdr_scan();
+            store.request_terminal_setup_scan();
         }
         self.settings_search_active = false;
         if tab != SettingsTab::Usage {
@@ -5354,6 +5364,7 @@ impl UtilitySurfaces {
             SettingsMenu::UpdateChannel => (self.update_channel_options(colors, cx), 132.0),
             SettingsMenu::InterfaceStyle => (self.interface_style_options(colors, cx), 172.0),
             SettingsMenu::PaneDensity => (self.pane_density_options(colors, cx), 172.0),
+            SettingsMenu::CursorShape => (self.cursor_shape_options(colors, cx), 160.0),
             SettingsMenu::TalkVoice => (self.talk_voice_options(colors, cx), 400.0),
             SettingsMenu::TalkAnswer => (self.talk_answer_options(colors, cx), 204.0),
             SettingsMenu::TalkTabs => (self.talk_tabs_options(colors, cx), 204.0),
@@ -5705,6 +5716,45 @@ impl UtilitySurfaces {
             control = control.child(self.settings_menu_host(cx));
         }
         control.into_any_element()
+    }
+
+    fn cursor_shape_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let open = self.settings_menu == Some(SettingsMenu::CursorShape);
+        let mut control = div()
+            .relative()
+            .min_w(px(132.0))
+            .child(settings_select_button(
+                self.prefs.terminal_cursor_shape.title().to_owned(),
+                "cursor-shape-dropdown",
+                open,
+                SettingsMenu::CursorShape,
+                colors,
+                cx,
+            ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    fn cursor_shape_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for (index, choice) in crate::store::TerminalCursorShape::ALL.into_iter().enumerate() {
+            options = options.child(settings_choice_row(
+                format!("cursor-shape-option-{index}"),
+                choice.title().to_owned(),
+                choice == self.prefs.terminal_cursor_shape,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.settings_menu = None;
+                    this.update_prefs(move |prefs| prefs.terminal_cursor_shape = choice);
+                    cx.notify();
+                },
+            ));
+        }
+        options.into_any_element()
     }
 
     fn pane_density_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
@@ -6241,6 +6291,27 @@ impl UtilitySurfaces {
                         .child(row(
                             t("settings.appearance.line_height"),
                             line_height_control.into_any_element(),
+                        ))
+                        .child(setting_divider(colors))
+                        .child(row(
+                            t("settings.appearance.cursor"),
+                            self.cursor_shape_dropdown(cx),
+                        ))
+                        .child(setting_divider(colors))
+                        .child(toggle_row(
+                            t("settings.appearance.cursor_blink"),
+                            t("settings.appearance.cursor_blink_detail"),
+                            self.prefs.terminal_cursor_blink,
+                            "terminal_cursor_blink",
+                            colors,
+                            cx,
+                            |this, cx| {
+                                let enabled = !this.prefs.terminal_cursor_blink;
+                                this.update_prefs(move |prefs| {
+                                    prefs.terminal_cursor_blink = enabled;
+                                });
+                                cx.notify();
+                            },
                         )),
                     colors,
                 )),
@@ -11071,6 +11142,15 @@ mod tests {
                     .write()
                     .expect("preview store")
                     .set_herdr_plan(Some(plan));
+            }
+            // `DIRI_VISUAL_TERMINAL_SETUP=ghostty` seeds the Import section's
+            // terminal row with a scan of that test fixture.
+            if let Ok(fixture) = std::env::var("DIRI_VISUAL_TERMINAL_SETUP") {
+                runtime
+                    .store
+                    .write()
+                    .expect("preview store")
+                    .set_terminal_setup_scan(crate::terminal_import::fixture_scan(&fixture));
             }
             if std::env::var_os("DIRI_VISUAL_LIGHT").is_some() {
                 runtime

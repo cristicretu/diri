@@ -94,6 +94,7 @@ mod tab_navigation;
 mod tab_peek;
 mod tab_preview;
 mod telemetry;
+mod terminal_import;
 pub mod terminal_pane;
 mod text_input;
 mod toast;
