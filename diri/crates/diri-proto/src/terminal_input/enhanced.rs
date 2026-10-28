@@ -8,7 +8,9 @@ use std::fmt::Write;
 
 use serde::{Deserialize, Serialize};
 
-use super::{Key, KeyAction, KeyEvent, KeypadKey, Modifiers, NamedKey, TermInputModes, encode_key};
+use super::{
+    Key, KeyAction, KeyEvent, KeyLayout, KeypadKey, Modifiers, NamedKey, TermInputModes, encode_key,
+};
 
 /// Validated progressive enhancement flags, in the protocol's bit order.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -134,10 +136,16 @@ pub struct EnhancedKeyEvent {
 
 impl From<KeyEvent> for EnhancedKeyEvent {
     fn from(event: KeyEvent) -> Self {
+        // The protocol names a key by its unshifted character; Shift travels
+        // as a modifier and the shifted character as the alternate.
+        let key = match (event.key, event.layout.unshifted) {
+            (Key::Character(_), Some(unshifted)) => Key::Character(unshifted.to_string()),
+            (key, _) => key,
+        };
         Self {
-            key: EnhancedKey::Ordinary(event.key),
+            key: EnhancedKey::Ordinary(key),
             text: event.text,
-            shifted_key: None,
+            shifted_key: event.layout.shifted,
             base_layout_key: None,
         }
     }
@@ -210,8 +218,12 @@ pub fn encode(
 
     let chord = modifiers.bits() & 0b11_1110 != 0;
     let character = matches!(event.key, EnhancedKey::Ordinary(Key::Character(_)));
-    let raw_text = character && !all && !chord;
-    let csi = if all {
+    // A release that got this far was asked for (event types, and all-keys
+    // mode for the reset keys). Text keys report it too: their press was
+    // plain text, but the program still needs to see the key go up.
+    let release = action == KeyAction::Release;
+    let raw_text = character && !all && !chord && !release;
+    let csi = if all || release {
         true
     } else if reset_key {
         disambiguate && modifiers.bits() & 0b11_1111 != 0
@@ -229,6 +241,7 @@ pub fn encode(
                 &KeyEvent {
                     key: key.clone(),
                     text: event.text.clone(),
+                    layout: KeyLayout::default(),
                 },
                 modifiers.ordinary,
                 modes,
@@ -261,9 +274,11 @@ pub fn encode(
         .then_some(event.shifted_key)
         .flatten();
     let base = alternates.then_some(event.base_layout_key).flatten();
+    // Ctrl, Alt and Super chords type no text, so they carry none.
     let text = if all
         && flags.contains(KeyboardEnhancements::ASSOCIATED_TEXT)
         && action != KeyAction::Release
+        && modifiers.bits() & 0b1110 == 0
     {
         printable_text(event)
     } else {
@@ -363,6 +378,19 @@ fn named_code(key: NamedKey) -> (u32, char) {
         NamedKey::F10 => (21, '~'),
         NamedKey::F11 => (23, '~'),
         NamedKey::F12 => (24, '~'),
+        // F13-F24 are private-use codes 57376-57387, as F13-F35 are.
+        NamedKey::F13 => (57376, 'u'),
+        NamedKey::F14 => (57377, 'u'),
+        NamedKey::F15 => (57378, 'u'),
+        NamedKey::F16 => (57379, 'u'),
+        NamedKey::F17 => (57380, 'u'),
+        NamedKey::F18 => (57381, 'u'),
+        NamedKey::F19 => (57382, 'u'),
+        NamedKey::F20 => (57383, 'u'),
+        NamedKey::F21 => (57384, 'u'),
+        NamedKey::F22 => (57385, 'u'),
+        NamedKey::F23 => (57386, 'u'),
+        NamedKey::F24 => (57387, 'u'),
     }
 }
 
@@ -480,14 +508,20 @@ mod tests {
                 ),
                 b"A"
             );
-            assert!(
+            // A text key's press is its text, but its release is still
+            // reported when the program asked for event types.
+            assert_eq!(
                 bytes(
                     KeyEvent::character("a"),
                     Modifiers::default(),
                     flags,
                     KeyAction::Release
-                )
-                .is_empty()
+                ),
+                if flags & KeyboardEnhancements::EVENT_TYPES != 0 {
+                    b"\x1b[97;1:3u".as_slice()
+                } else {
+                    b""
+                }
             );
         }
     }

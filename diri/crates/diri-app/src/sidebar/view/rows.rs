@@ -64,6 +64,8 @@ pub(in crate::sidebar) struct SessionRowProps {
     /// How much of the hover fill a row the pointer just left still wears.
     /// It changes every frame of the fade, so only fading rows re-render.
     pub(super) hover_linger: f32,
+    /// The selection and hover look for the window's key status.
+    pub(super) look: crate::chrome_focus::ChromeLook,
 }
 
 pub(in crate::sidebar) struct SessionRowView {
@@ -77,6 +79,20 @@ pub(in crate::sidebar) struct SessionRowView {
 impl SessionRowView {
     pub(super) fn held_hint_for_test(&self) -> f32 {
         self.props.held_hint
+    }
+
+}
+
+// The window-key test that reads these compiles on every platform (Linux and
+// Windows CI run `clippy --all-targets`), so they must not be macOS-only.
+#[cfg(test)]
+impl SessionRowView {
+    pub(super) fn look_for_test(&self) -> crate::chrome_focus::ChromeLook {
+        self.props.look
+    }
+
+    pub(super) fn selected_for_test(&self) -> bool {
+        self.props.selected
     }
 }
 
@@ -158,6 +174,7 @@ impl Sidebar {
                 0.0
             },
             hover_linger: self.session_hover_linger(id),
+            look: self.chrome_look,
         }
     }
 

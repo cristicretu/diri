@@ -2992,3 +2992,163 @@ DIRI_AGENT_LAUNCHER=$PWD/target/debug/diri \
   cargo test -p diri-engine --test detached_agent -- --ignored
 ```
 
+
+## Output reaches the screen a frame sooner (2026-10-27)
+
+**What was measured.** One byte written to a `cat` terminal's TTY from
+outside (no key event, no input frame), timed to the screen. A capture of
+the installed 0.10.1 app put that at 38.9 ms median (p90 53.7, min 25.0); a
+reference terminal on the same Mac draws it in 18.5 ms. Both present at
+about 9 ms per frame, so Diri was spending about two extra frames.
+
+`examples/output_photon_probe.rs` (diri-term) reproduces the path with
+production code except the app chrome: a private in-process Engine, a real
+Holder, data-channel grid diffs, `TerminalElement`, the vendored GPUI window
+with its `CVDisplayLink`, and Metal, with `addPresentedHandler` for the time
+on glass. Its window is a non-activating panel kept almost entirely off
+screen. It alternates `x` with `\b \b`, like the original capture. The
+Engine's own hops come from `output_to_grid_latency_by_hop`
+(tests/keystroke_latency.rs).
+
+**Where the time went** (probe, before, p50):
+
+| hop | `x` | `\b \b` |
+| --- | ---: | ---: |
+| TTY write → Holder → Engine received | 0.06 ms | same |
+| Engine received → grid published | **9.0 ms** | **16–18 ms** |
+| published → client decoded → applied | 0.05 ms | same |
+| applied → frame starts (display-link wait) | **5–6 ms** | same |
+| draw + commit | 0.2 ms | same |
+| commit → presented (compositor) | 19 ms | same |
+
+- The held pump read a lone write off the Holder's stream and then waited
+  out the whole 8 ms batch ceiling for the empty poll that proves the burst
+  ended. Keystroke echoes skip that wait; output nobody typed for did not.
+- `\b \b` removes a cell, so it is held as a possible half-erased repaint
+  for up to 16 ms (`RepaintHold`). That hold is the flicker protection from
+  #67/#762 and is unchanged.
+- Only a keystroke's echo asked for an immediate frame; other output waited
+  for the next display-link tick.
+- Commit to on-glass is about two refreshes for any present on this Mac.
+  Neither `presentsWithTransaction` nor a third drawable changed it (both
+  19 ms). Turning `displaySyncEnabled` off cut it to ~5–10 ms but, under
+  continuous output, presented frames bunched (1.5 ms apart) with long gaps
+  in between, which would show as judder. That change was not made.
+
+**What changed.**
+
+- The held pump publishes a pending, non-destructive batch after 1 ms of
+  silence (`OUTPUT_QUIET`) instead of waiting out the 8 ms ceiling, provided
+  the last publication is at least one ceiling old. Continuous output is
+  still published at most once per 8 ms, and anything that lost content
+  still waits for its redraw. Writes that span several PTY reads, or several
+  writes issued back to back, still fold into one publication.
+- Every visible terminal change asks GPUI for an immediate frame, not only
+  a keystroke's echo. The platform still refuses while the last present is
+  under two refresh intervals old, so streams stay on the display link and
+  no frame is drawn that the link would not have drawn.
+
+**Results.** Engine, `output_to_grid_latency_by_hop`, release, 200 writes:
+TTY write → grid at client 9.11 → **1.57 ms** p50 (p95 9.42 → 4.93 ms).
+
+Probe, three interleaved rounds of 60 writes each, before / after (p50 per
+round; load average 170–410 from other builds):
+
+| | before | after |
+| --- | --- | --- |
+| `x`: write → presented | 37.4 / 40.3 / 37.3 ms | **27.5 / 26.5 / 27.3 ms** |
+| `\b \b`: write → presented | 48.1 / 46.9 / 46.0 ms | 43.7 / 43.6 / 43.8 ms |
+| all: write → presented | 43.0 / 43.5 / 43.2 ms | 37.2 / 36.5 / 35.9 ms |
+| `x`: write → grid decoded | 10.2 / 10.5 / 10.3 ms | **1.7 / 1.5 / 1.5 ms** |
+| applied → committed | 6.1 / 6.2 / 5.3 ms | **0.2 / 0.2 / 0.2 ms** |
+| commit → presented | 19.0 / 19.0 / 19.0 ms | 23.0 / 23.2 / 24.1 ms |
+
+The same probe filmed by ScreenCaptureKit at 120 Hz (the method of the
+original 38.9 ms figure: SCK `displayTime` minus write time), panel on screen
+and non-activating, blurred background like the default Glass window, three
+interleaved rounds of 80 writes each, p50 / p90 / min:
+
+| | before | after |
+| --- | --- | --- |
+| `x` | 21.9–22.3 / 26.4–28.8 / 15.3–16.1 ms | **9.9–11.2 / 14.3–16.9 / 4.9–5.8 ms** |
+| `\b \b` | 27.8–29.7 / 31.7–34.2 / 23.1–23.5 ms | 25.1–28.1 / 30.3–31.6 / 20.9–21.3 ms |
+| all | 25.0–25.9 / 31.2–32.3 ms | 21.3–23.3 / 29.1–29.9 ms |
+
+The probe has no app chrome, so it starts ~13 ms below the installed app
+(25.5 vs 38.9 ms before). That difference (a busy main thread, animations
+keeping the display link warm so immediate frames are refused) is not
+attributed here.
+
+The immediate frame removes the display-link wait, but a frame committed
+mid-interval still reaches the glass at the compositor's next deadline, so it
+gains ~2 ms net, not the ~5 ms wait. The Engine change is the larger part.
+
+**Footprint.** No per-session state beyond one `Option<Instant>` on the
+pump's stack, no new thread, timer or wakeup. An idle session's pump takes
+the same blocking wait as before (the quiet window applies only while a
+batch is pending), and an idle window draws nothing new: the immediate
+frame replaces the display-link frame that output would have caused anyway.
+
+**Not changed.** The 16 ms erase hold (flicker protection). The remote
+Helper's own 8 ms coalescing of unsolicited output (`diri-remote`
+`DIFF_COALESCE`) has the same leading-edge wait and is left for a Helper
+change. Display sync, drawable count and transaction presents stay as they
+were.
+
+```sh
+cargo build --release -p diri-engine --bin diri-holder
+DIRI_HOLDER_BIN=$CARGO_TARGET_DIR/release/diri-holder \
+  cargo run --release -p diri-term --example output_photon_probe -- --samples 60 --frames immediate --blur
+cargo test -p diri-engine --release --features latency-trace \
+  --test keystroke_latency output_to_grid -- --ignored --nocapture
+```
+
+## Line edits skip the erase hold (2026-10-28)
+
+**Premise check.** A full-window probe (#863) put an unsolicited `\b \b`
+written to a TTY at 32.7 ms to the screen against 16.8 ms for `x`, almost all
+of it the held pump's 16 ms erase hold (`RepaintHold`). A *typed* backspace,
+^W or ^U was already exempt (`EchoRequest::erases`, 0.2–0.3 ms to the attach),
+so the hold did not cost every typed backspace. It did cost every key whose
+answer shortens the line without being an editing key, and every line edit
+nobody typed for:
+
+**Rule.** A batch whose only row holding fewer cells than at the batch's start
+is the visible cursor's row, and that row still holds something, is a line
+edit (`HeadlessScreen::lost_cells_only_on_cursor_row`). It is batched like
+output that adds and counts as any key's answer. A hidden cursor
+(full-screen programs mid-draw), a cursor row cleared to nothing (`less`
+clearing `:` before its next page, a progress line cleared before its text),
+a scroll that shortened another row, or a resize keeps the hold. The remote
+Holder applies the same predicate to its 8 ms destructive coalescing.
+
+**Results.** `tests/erase_hold_probe.rs` (ignored; private Engine, real
+Holder, 100x30, data-channel attach, input → first changed published frame;
+two interleaved rounds per build, load average 14–31):
+
+| event | main p50 | branch p50 |
+| --- | ---: | ---: |
+| `\b \b` written to a `cat` TTY after a prompt | 18.2–18.3 ms | **1.4 ms** |
+| progress line rewritten shorter (one write) | 18.2–18.3 ms | **1.5–1.6 ms** |
+| bash / zsh Up onto a shorter history entry | 18.3–18.7 ms | **0.2–0.3 ms** |
+| fish letter that ends an autosuggestion | 18.3–18.5 ms | **0.3–0.5 ms** |
+| typed backspace, ^W, ^U (bash, zsh, fish) | 0.2–1.1 ms | 0.2–0.3 ms |
+| `clear`, `less` page, vim `dd` / `x` / ^F | unchanged (held where they lose rows) | unchanged |
+
+Half-repaint frames (a short-lived frame a row emptier than both neighbours,
+or a row that blinked): 0 on both builds for cat, bash, zsh, fish, vim, top
+and Claude Code; `less` 3 and 2 of ~38 frames on both builds (a page published
+mid-scroll, pre-existing). A first version without the "row still holds
+something" condition published `less`'s cleared prompt alone (6 extra
+flashes); `line_edit.rs` `a_prompt_row_cleared_for_its_redraw_is_still_held`
+guards that.
+
+**Footprint.** One `Vec<usize>` of row counts per screen (8 bytes per row,
+~240 B at 30 rows), refilled without allocating when a batch opens; the
+O(rows) check runs only once a batch has lost cells. No thread, timer or
+wakeup.
+
+```sh
+DIRI_ERASE_PROBE_CLAUDE=/path/to/isolated-claude.sh \
+  cargo test -p diri-engine --release --test erase_hold_probe -- --ignored --nocapture --test-threads=1
+```

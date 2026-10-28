@@ -3,18 +3,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
-use diri_proto::grid::{CommandEnd, GridCell, GridUpdate};
+use diri_proto::grid::{CommandEnd, CursorShape, GridCell, GridUpdate, StyleSpan, UnderlineKind};
 use diri_proto::terminal::MouseModes;
 use gpui::{
-    App, Bounds, ContentMask, Element, ElementId, FocusHandle, Font, FontFallbacks, FontId,
-    GlobalElementId, InputHandler, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels,
-    Point, ShapedLine, SharedString, Style, TextAlign, TextRun, UTF16Selection, Window, fill, font,
-    point, px, relative, size,
+    App, Bounds, ContentMask, Element, ElementId, FocusHandle, Font, FontId, GlobalElementId,
+    InputHandler, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels, Point, ShapedLine,
+    SharedString, Style, TextAlign, TextRun, UTF16Selection, Window, fill, point, px, relative,
+    size,
 };
 
 use crate::blocks::BlockGlyph;
 use crate::buffer::{ApplySummary, ChangedRenderRow, GridBuffer};
-use crate::cursor_motion::{CursorCell, CursorDamage, CursorDriver, CursorFrame, CursorSchedule};
+use crate::cursor_motion::{
+    CursorCell, CursorDamage, CursorDriver, CursorFrame, CursorPreferences, CursorSchedule,
+};
 use crate::find::{
     FindSnapshot, FindSpan, NavigationTarget, SearchJob, SearchRequest, SearchResult,
     TerminalFindModel,
@@ -108,6 +110,7 @@ pub struct TerminalElement {
     hovered_reference: Option<ReferenceHit>,
     reduce_motion: bool,
     cursor_hidden: bool,
+    cursor_preferences: CursorPreferences,
 }
 
 /// Selection and reading state only: deliberately does not retain an input
@@ -146,6 +149,178 @@ fn set_view_offset(
     changed
 }
 
+/// Where the grid was last painted, in window points from the top-left.
+/// `origin` is the top-left of window row 0, already shifted for a reading
+/// view resting between rows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AccessibilityGeometry {
+    pub origin: Point<Pixels>,
+    pub cell_width: Pixels,
+    pub line_height: Pixels,
+    /// Rows and columns on screen, at most the grid's.
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl AccessibilityGeometry {
+    /// Window-space rectangle of `cols` on window `row`.
+    #[must_use]
+    pub fn cell_rect(&self, row: usize, cols: std::ops::Range<u16>) -> Bounds<Pixels> {
+        Bounds::new(
+            point(
+                self.origin.x + self.cell_width * f32::from(cols.start),
+                self.origin.y + self.line_height * row as f32,
+            ),
+            size(
+                self.cell_width * f32::from(cols.end.saturating_sub(cols.start)),
+                self.line_height,
+            ),
+        )
+    }
+
+    /// The painted grid's window-space rectangle.
+    #[must_use]
+    pub fn bounds(&self) -> Bounds<Pixels> {
+        Bounds::new(
+            self.origin,
+            size(
+                self.cell_width * self.cols as f32,
+                self.line_height * self.rows as f32,
+            ),
+        )
+    }
+
+    /// The cell under a window-space point, clamped into the grid.
+    #[must_use]
+    pub fn cell_at(&self, position: Point<Pixels>) -> (usize, usize) {
+        let col = (f32::from(position.x - self.origin.x) / f32::from(self.cell_width)).floor();
+        let row = (f32::from(position.y - self.origin.y) / f32::from(self.line_height)).floor();
+        (
+            (row.max(0.0) as usize).min(self.rows.saturating_sub(1)),
+            (col.max(0.0) as usize).min(self.cols.saturating_sub(1)),
+        )
+    }
+}
+
+/// A weak read handle on one terminal view for an accessibility bridge.
+/// Holding it keeps nothing alive: once the view is gone every read is
+/// `None`. Reads take the same short locks a frame does.
+#[derive(Clone, Debug)]
+pub struct TerminalAccessibility {
+    buffer: std::sync::Weak<RwLock<GridBuffer>>,
+    shared: std::sync::Weak<ElementSharedState>,
+}
+
+impl TerminalAccessibility {
+    /// True when both handles still point at the same live view.
+    #[must_use]
+    pub fn same_view(&self, other: &Self) -> bool {
+        std::sync::Weak::ptr_eq(&self.shared, &other.shared)
+    }
+
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        self.shared.strong_count() > 0
+    }
+
+    /// Changes whenever the text, caret, selection or reading position a
+    /// snapshot would describe can have changed. Cheap: a few lock reads.
+    #[must_use]
+    pub fn revision(&self) -> Option<AccessibilityRevision> {
+        let buffer = self.buffer.upgrade()?;
+        let shared = self.shared.upgrade()?;
+        let buffer = read_lock(&buffer);
+        let viewport = mutex_lock(&shared.viewport);
+        let position = viewport.scroll_position();
+        Some(AccessibilityRevision {
+            generation: buffer.generation(),
+            cursor: (buffer.cursor.row, buffer.cursor.col, buffer.cursor.visible),
+            view_offset: viewport.view_offset(),
+            sub_row: position.fraction.to_bits(),
+            cache_seq: viewport.cache_seq(),
+            selection: mutex_lock(&shared.selection).range(),
+            rows: mutex_lock(&shared.accessibility_geometry).map(|geometry| geometry.rows),
+        })
+    }
+
+    #[must_use]
+    pub fn geometry(&self) -> Option<AccessibilityGeometry> {
+        let shared = self.shared.upgrade()?;
+        *mutex_lock(&shared.accessibility_geometry)
+    }
+
+    /// The rows on screen as text, with the caret (live view only) and the
+    /// part of the selection that is on screen.
+    #[must_use]
+    pub fn snapshot(&self) -> Option<crate::accessibility::AccessibilityText> {
+        use crate::accessibility::{AccessibilityText, VisiblePoint};
+        let buffer = self.buffer.upgrade()?;
+        let shared = self.shared.upgrade()?;
+        let buffer = read_lock(&buffer);
+        let viewport = mutex_lock(&shared.viewport);
+        let geometry = *mutex_lock(&shared.accessibility_geometry);
+        let rows = geometry.map_or(usize::from(buffer.rows), |geometry| geometry.rows);
+        let cols = geometry.map_or(usize::from(buffer.cols), |geometry| geometry.cols);
+        let composed: Vec<(Vec<GridCell>, diri_proto::grid::RowMetadata)> = (0..rows)
+            .map(|row| {
+                let mut cells = viewport.window_row(&buffer, row);
+                cells.truncate(cols);
+                let metadata = if viewport.is_reading() {
+                    viewport.row_metadata(&buffer, viewport.absolute_row(row))
+                } else {
+                    buffer.annotations.get(row).cloned().unwrap_or_default()
+                };
+                (cells, metadata)
+            })
+            .collect();
+        let cursor = (!viewport.is_reading() && usize::from(buffer.cursor.row) < rows).then_some(
+            VisiblePoint {
+                row: usize::from(buffer.cursor.row),
+                col: usize::from(buffer.cursor.col),
+            },
+        );
+        let to_visible = |point: SelectionPoint| -> Option<VisiblePoint> {
+            let row = viewport.window_row_for_absolute(point.row)?;
+            Some(if row < 0 {
+                VisiblePoint { row: 0, col: 0 }
+            } else if row as usize >= rows {
+                VisiblePoint {
+                    row: rows.saturating_sub(1),
+                    col: cols,
+                }
+            } else {
+                VisiblePoint {
+                    row: row as usize,
+                    col: point.col,
+                }
+            })
+        };
+        let selection = mutex_lock(&shared.selection)
+            .range()
+            .and_then(|range| Some((to_visible(range.start)?, to_visible(range.end)?)));
+        drop(viewport);
+        Some(AccessibilityText::from_rows(
+            composed
+                .iter()
+                .map(|(cells, metadata)| (cells.as_slice(), Some(metadata))),
+            cursor,
+            selection,
+        ))
+    }
+}
+
+/// See [`TerminalAccessibility::revision`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AccessibilityRevision {
+    generation: u64,
+    cursor: (u16, u16, bool),
+    view_offset: i64,
+    sub_row: u32,
+    cache_seq: Option<u64>,
+    selection: Option<crate::selection::SelectionRange>,
+    rows: Option<usize>,
+}
+
 impl TerminalDamageObserver {
     pub fn prepare(&self, update: &GridUpdate) {
         // Absolute rows keep a selection attached while the viewport moves,
@@ -163,6 +338,9 @@ impl TerminalDamageObserver {
         let live_start_row = viewport.live_start_row();
         let buffer = read_lock(&self.buffer);
         viewport.hold_reading_view(&buffer);
+        if buffer.cols != 0 && buffer.cols != update.cols {
+            viewport.note_width_change(&buffer, update.cols);
+        }
         let reading_held = viewport.is_reading();
         drop(viewport);
         let replaces_grid =
@@ -368,6 +546,9 @@ struct ElementSharedState {
     /// Window-space rect of the grid cursor's cell from the latest live
     /// prepaint, whether or not the caret itself is drawn.
     input_cell: Mutex<Option<Bounds<Pixels>>>,
+    /// Window-space grid origin, cell size and painted extent from the
+    /// latest prepaint, for an accessibility client asking where text is.
+    accessibility_geometry: Mutex<Option<AccessibilityGeometry>>,
     modes: Mutex<TerminalModes>,
     scroll_router: Mutex<ScrollRouter>,
     history_lines: Mutex<HistoryLineCache>,
@@ -606,6 +787,7 @@ fn tint_at(tints: &[Tint], column: usize) -> Option<gpui::Rgba> {
 struct CachedRow {
     cells: Vec<GridCell>,
     graphemes: Vec<(u16, String)>,
+    styles: Vec<StyleSpan>,
     tints: Vec<Tint>,
     background_quads: Vec<PaintQuad>,
     decoration_quads: Vec<PaintQuad>,
@@ -661,9 +843,11 @@ fn align_scrolled_rows(cache: &mut [Option<CachedRow>], damage: &[ChangedRenderR
     }
     for changed in [damage.first().unwrap(), damage.last().unwrap()] {
         if let Some(previous) = cache.iter().position(|entry| {
-            entry
-                .as_ref()
-                .is_some_and(|row| row.cells == changed.cells && row.graphemes == changed.graphemes)
+            entry.as_ref().is_some_and(|row| {
+                row.cells == changed.cells
+                    && row.graphemes == changed.graphemes
+                    && row.styles == changed.styles
+            })
         }) {
             let offset = (previous + cache.len() - changed.row) % cache.len();
             if offset != 0 {
@@ -767,6 +951,11 @@ struct CursorPaint {
     /// are the covered cells' glyphs in the cursor's text color, painted
     /// clipped to the block so the glyphs stay put and only the block moves.
     covered: Vec<CoveredGlyph>,
+    /// DECSCUSR shape. A bar or underline is a thin quad over the row's own
+    /// text: it inverts nothing.
+    shape: CursorShape,
+    /// The program asked for a cursor that does not blink.
+    steady: bool,
 }
 
 struct CoveredGlyph {
@@ -781,7 +970,7 @@ impl CursorPaint {
     /// The static cursor replaces its cell's text; a moving or translucent
     /// one is painted over the row's own text instead.
     fn replaces_text_at(&self, row: u16) -> bool {
-        self.row == row && self.frame.is_static()
+        self.shape == CursorShape::Block && self.row == row && self.frame.is_static()
     }
 }
 
@@ -802,6 +991,7 @@ impl TerminalElement {
                 selection_shimmer: Mutex::new(SelectionShimmer::default()),
                 find_highlights: Mutex::new(FindHighlights::default()),
                 input_cell: Mutex::new(None),
+                accessibility_geometry: Mutex::new(None),
                 modes: Mutex::new(TerminalModes::default()),
                 scroll_router: Mutex::new(ScrollRouter::default()),
                 history_lines: Mutex::new(HistoryLineCache::default()),
@@ -827,6 +1017,7 @@ impl TerminalElement {
             suspended: false,
             hovered_reference: None,
             reduce_motion: false,
+            cursor_preferences: CursorPreferences::default(),
             cursor_hidden: false,
         }
     }
@@ -841,6 +1032,21 @@ impl TerminalElement {
     #[must_use]
     pub fn with_buffer(buffer: GridBuffer) -> Self {
         Self::new(Arc::new(RwLock::new(buffer)))
+    }
+
+    /// A weak handle an accessibility bridge reads this view through.
+    #[must_use]
+    pub fn accessibility(&self) -> TerminalAccessibility {
+        TerminalAccessibility {
+            buffer: Arc::downgrade(&self.buffer),
+            shared: Arc::downgrade(&self.shared),
+        }
+    }
+
+    /// Records where the grid is painted, which prepaint does every frame.
+    /// For hosts and tests that place the grid without painting it.
+    pub fn note_accessibility_geometry(&self, geometry: AccessibilityGeometry) {
+        *mutex_lock(&self.shared.accessibility_geometry) = Some(geometry);
     }
 
     #[must_use]
@@ -962,6 +1168,14 @@ impl TerminalElement {
     #[must_use]
     pub fn reduce_motion(mut self, reduce_motion: bool) -> Self {
         self.reduce_motion = reduce_motion;
+        self
+    }
+
+    /// The user's cursor shape, blink speed, and whether programs may
+    /// change the shape.
+    #[must_use]
+    pub fn cursor_preferences(mut self, preferences: CursorPreferences) -> Self {
+        self.cursor_preferences = preferences;
         self
     }
 
@@ -1442,6 +1656,13 @@ impl TerminalElement {
             .shift(f32::from(line_height), scale_factor))
     }
 
+    /// True while a reading view is finding its place after a column change;
+    /// see [`ScrollbackViewport::note_width_change`].
+    #[must_use]
+    pub fn scrollback_relocating(&self) -> bool {
+        mutex_lock(&self.shared.viewport).relocating()
+    }
+
     pub fn begin_scrollback_fetch(&self, visible_rows: usize) -> Option<ScrollbackRequest> {
         mutex_lock(&self.shared.viewport).begin_fetch(visible_rows)
     }
@@ -1468,9 +1689,26 @@ impl TerminalElement {
     }
 
     pub fn drag_selection(&self, col: usize, window_row: usize) {
+        self.drag_selection_to_edge(col, col, window_row);
+    }
+
+    /// A pointer drag: `col` is the cell under the pointer and `edge` the
+    /// cell boundary nearest it, `0..=cols`. See
+    /// [`TerminalSelection::drag_in_view_to_edge`].
+    ///
+    /// [`TerminalSelection::drag_in_view_to_edge`]: crate::selection::TerminalSelection::drag_in_view_to_edge
+    pub fn drag_selection_to_edge(&self, col: usize, edge: usize, window_row: usize) {
         let viewport = mutex_lock(&self.shared.viewport);
         let buffer = read_lock(&self.buffer);
-        mutex_lock(&self.shared.selection).drag_in_view(&viewport, &buffer, window_row, col);
+        mutex_lock(&self.shared.selection)
+            .drag_in_view_to_edge(&viewport, &buffer, window_row, col, edge);
+    }
+
+    /// Keyboard copy mode: selects from the cell [`Self::begin_selection`]
+    /// started at through this one, both included.
+    pub fn drag_selection_cells(&self, col: usize, window_row: usize) {
+        let row = mutex_lock(&self.shared.viewport).absolute_row(window_row);
+        mutex_lock(&self.shared.selection).drag_cells_to(SelectionPoint { row, col });
     }
 
     pub fn begin_rectangle_selection(&self, col: usize, row: usize) {
@@ -1538,6 +1776,52 @@ impl TerminalElement {
         })
     }
 
+    /// The shell prompt nearest the top of the window, above it or below it,
+    /// read from the rows this view already holds: the live screen and any
+    /// history fetched for reading. [`PromptSearch::Unknown`] means the
+    /// answer lies in rows not held here, as does every answer while the view
+    /// has no history geometry to number rows by.
+    ///
+    /// [`PromptSearch::Unknown`]: crate::command_marks::PromptSearch::Unknown
+    #[must_use]
+    pub fn held_prompt_target(&self, next: bool) -> crate::command_marks::PromptSearch {
+        let viewport = mutex_lock(&self.shared.viewport);
+        if !viewport.geometry_known() {
+            return crate::command_marks::PromptSearch::Unknown;
+        }
+        let buffer = read_lock(&self.buffer);
+        let end = viewport
+            .live_start_row()
+            .saturating_add(i64::from(buffer.rows));
+        crate::command_marks::nearest_prompt(viewport.absolute_row(0), next, 0, end, |row| {
+            viewport.stored_row(&buffer, row)
+        })
+    }
+
+    /// The finished command whose prompt mark is drawn on a window row, and
+    /// its output: what a click on that mark selects.
+    #[must_use]
+    pub fn command_output_marked_at(
+        &self,
+        window_row: usize,
+    ) -> Option<crate::command_marks::CommandOutput> {
+        let viewport = mutex_lock(&self.shared.viewport);
+        let buffer = read_lock(&self.buffer);
+        let row = viewport.absolute_row(window_row);
+        let cells = viewport.stored_row(&buffer, row)?;
+        let col = cells.iter().position(|cell| {
+            cell.style
+                .contains(diri_proto::grid::TermStyle::PROMPT_START)
+        })?;
+        crate::command_marks::command_output_at(
+            SelectionPoint { row, col },
+            COMMAND_OUTPUT_SEARCH_ROWS,
+            |row| viewport.stored_row(&buffer, row),
+        )
+        // Only an end with a status draws a mark to click.
+        .filter(|output| output.status != CommandEnd::Unknown)
+    }
+
     /// Selects a range of absolute cells, as a programmatic selection: no
     /// sheen, and the caller copies it if it wants to.
     pub fn select_range(&self, start: SelectionPoint, end: SelectionPoint) {
@@ -1551,8 +1835,12 @@ impl TerminalElement {
     #[must_use]
     pub fn link_at(&self, col: usize, window_row: usize) -> Option<String> {
         match self.reference_at(col, window_row) {
-            Some(TerminalReference::Url(url)) => Some(url),
-            Some(TerminalReference::File(_)) | None => None,
+            Some(TerminalReference::Url(url))
+                if crate::link_scheme::kind(&url) == Some(crate::link_scheme::LinkKind::Web) =>
+            {
+                Some(url)
+            }
+            Some(TerminalReference::Url(_) | TerminalReference::File(_)) | None => None,
         }
     }
 
@@ -1583,7 +1871,7 @@ impl TerminalElement {
             if diri_proto::inline_image::is_anchor(&link.uri) {
                 return None;
             }
-            return reference_from_run(&link.uri).map(|reference| ReferenceHit {
+            return reference_from_link_uri(&link.uri).map(|reference| ReferenceHit {
                 reference,
                 spans: vec![(absolute_row, usize::from(link.start), usize::from(link.end))],
             });
@@ -1851,7 +2139,7 @@ impl TerminalElement {
     fn prepare_row(
         &self,
         cells: Vec<GridCell>,
-        graphemes: Vec<(u16, String)>,
+        (graphemes, styles): (Vec<(u16, String)>, Vec<StyleSpan>),
         tints: Vec<Tint>,
         row: u16,
         grid: SpriteGrid,
@@ -1866,6 +2154,7 @@ impl TerminalElement {
             grid,
             self.theme,
             &tints,
+            &styles,
             &mut background_quads,
             &mut decoration_quads,
             &mut sprite_shapes,
@@ -1874,6 +2163,7 @@ impl TerminalElement {
         CachedRow {
             cells,
             graphemes,
+            styles,
             tints,
             background_quads,
             decoration_quads,
@@ -2029,6 +2319,8 @@ impl TerminalElement {
             driver.rest();
             return None;
         };
+        driver.motion.set_steady(cursor.steady);
+        driver.motion.set_blink(self.cursor_preferences.blink);
         let cell = CursorCell {
             col: cursor.col,
             row: cursor.row,
@@ -2073,6 +2365,11 @@ impl TerminalElement {
                 cursor.glyph =
                     self.shape_glyph_under_cursor(cell, combining, color, metrics, window);
             }
+            drop(cache);
+            return Some(cursor);
+        }
+        if cursor.shape != CursorShape::Block {
+            // A bar or underline covers no glyph to invert.
             drop(cache);
             return Some(cursor);
         }
@@ -2265,39 +2562,15 @@ fn note_cursor_damage(
     );
 }
 
-#[cfg(target_os = "macos")]
+/// Diri's own default; the app passes the user's family through
+/// [`TerminalElement::font`].
 fn default_terminal_font() -> Font {
-    let mut terminal_font = font(".SF NS Mono");
-    terminal_font.fallbacks = Some(FontFallbacks::from_fonts(
-        [
-            "Menlo",
-            "Apple Symbols",
-            "STIX Two Math",
-            "Apple Color Emoji",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect(),
-    ));
-    terminal_font
-}
-
-#[cfg(not(target_os = "macos"))]
-fn default_terminal_font() -> Font {
-    let mut terminal_font = font("monospace");
-    terminal_font.fallbacks = Some(FontFallbacks::from_fonts(
-        [
-            "Noto Sans Mono",
-            "DejaVu Sans Mono",
-            "Noto Sans Symbols 2",
-            "STIX Two Math",
-            "Noto Color Emoji",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect(),
-    ));
-    terminal_font
+    let family = if cfg!(target_os = "macos") {
+        ".SF NS Mono"
+    } else {
+        "monospace"
+    };
+    crate::glyphs::terminal_font(family, true)
 }
 
 impl IntoElement for TerminalElement {
@@ -2348,6 +2621,7 @@ impl Element for TerminalElement {
         if self.suspended {
             mutex_lock(&self.shared.find_highlights).current_bounds = None;
             *mutex_lock(&self.shared.input_cell) = None;
+            *mutex_lock(&self.shared.accessibility_geometry) = None;
             mutex_lock(&self.shared.row_cache).clear();
             mutex_lock(&self.shared.render_generations).clear();
             *mutex_lock(&self.shared.render_context) = None;
@@ -2380,6 +2654,7 @@ impl Element for TerminalElement {
         if grid_is_empty {
             mutex_lock(&self.shared.find_highlights).current_bounds = None;
             *mutex_lock(&self.shared.input_cell) = None;
+            *mutex_lock(&self.shared.accessibility_geometry) = None;
             return TerminalPrepaintState {
                 started_at: None,
                 prepaint_time: Duration::ZERO,
@@ -2559,12 +2834,14 @@ impl Element for TerminalElement {
                 let absolute = viewport.absolute_row(row_index);
                 viewport.window_row_into(&buffer, row_index, &mut cells);
                 cells.truncate(visible_cols);
+                let styles = viewport.row_styles(&buffer, absolute);
                 append_row_quads(
                     &cells,
                     row_index as u16,
                     grid,
                     self.theme,
                     tints,
+                    styles,
                     &mut background_quads,
                     &mut decoration_quads,
                     &mut sprite_shapes,
@@ -2643,6 +2920,7 @@ impl Element for TerminalElement {
                     && let Some(prepared) = cache[changed.row].as_mut()
                     && prepared.cells == changed.cells
                     && prepared.graphemes == changed.graphemes
+                    && prepared.styles == changed.styles
                     && prepared.tints == row_tints[changed.row]
                 {
                     // Shapes are independent of row position. Backgrounds and
@@ -2657,7 +2935,7 @@ impl Element for TerminalElement {
                 misses += 1;
                 cache[changed.row] = Some(self.prepare_row(
                     changed.cells,
-                    changed.graphemes,
+                    (changed.graphemes, changed.styles),
                     row_tints[changed.row].clone(),
                     changed.row as u16,
                     grid,
@@ -2674,9 +2952,10 @@ impl Element for TerminalElement {
                     continue;
                 }
                 misses += 1;
-                let (cells, graphemes) = (prepared.cells.clone(), prepared.graphemes.clone());
+                let cells = prepared.cells.clone();
+                let annotations = (prepared.graphemes.clone(), prepared.styles.clone());
                 cache[row] =
-                    Some(self.prepare_row(cells, graphemes, tints, row as u16, grid, window));
+                    Some(self.prepare_row(cells, annotations, tints, row as u16, grid, window));
             }
             cache_misses = misses;
             cache_hits = visible_rows as u64 - misses;
@@ -2775,6 +3054,13 @@ impl Element for TerminalElement {
             window.request_animation_frame();
         }
 
+        *mutex_lock(&self.shared.accessibility_geometry) = Some(AccessibilityGeometry {
+            origin: point(bounds.left(), bounds.top() - scroll_shift),
+            cell_width: metrics.cell_width,
+            line_height: metrics.line_height,
+            rows: painted_rows,
+            cols: visible_cols,
+        });
         *mutex_lock(&self.shared.input_cell) = (!viewport.is_reading()
             && usize::from(cursor.row) < visible_rows
             && usize::from(cursor.col) < visible_cols)
@@ -2810,39 +3096,45 @@ impl Element for TerminalElement {
                 .as_ref()
                 .and_then(|row| tint_at(&row.tints, usize::from(cursor.col)));
             let (cursor_fill, cursor_text) = self.theme.cursor_colors(cell, cursor_tint);
-            let visible = self.theme.resolve_cell(cell).visible;
+            let style = self.cursor_preferences.resolve(cursor.style);
+            let shape = style.shape;
+            let block = shape == CursorShape::Block;
+            // A bar or underline glyph is drawn by the row itself.
+            let visible = block && self.theme.resolve_cell(cell).visible;
             Some(CursorPaint {
                 row: cursor.row,
                 col: cursor.col,
                 cols: cursor_cols,
                 quad: fill(
-                    Bounds::new(
-                        origin,
-                        size(
-                            metrics.cell_width * f32::from(cursor_cols),
-                            metrics.line_height,
-                        ),
-                    ),
+                    cursor_bounds(shape, origin, metrics, cursor_cols, window.scale_factor()),
                     cursor_fill,
                 ),
                 outline: None,
                 text: cursor_text,
-                glyph: self.shape_cursor_glyph(
-                    cell,
-                    cursor_text,
-                    cache[usize::from(cursor.row)]
-                        .as_ref()
-                        .and_then(|row| row.graphemes.iter().find(|(col, _)| *col == cursor.col))
-                        .map_or("", |(_, text)| text.as_str()),
-                    metrics,
-                    window,
-                ),
+                glyph: if block {
+                    self.shape_cursor_glyph(
+                        cell,
+                        cursor_text,
+                        cache[usize::from(cursor.row)]
+                            .as_ref()
+                            .and_then(|row| {
+                                row.graphemes.iter().find(|(col, _)| *col == cursor.col)
+                            })
+                            .map_or("", |(_, text)| text.as_str()),
+                        metrics,
+                        window,
+                    )
+                } else {
+                    None
+                },
                 block: visible
                     .then(|| BlockGlyph::from_scalar(cell.scalar))
                     .flatten(),
                 sprite: visible.then(|| Sprite::from_scalar(cell.scalar)).flatten(),
                 frame: CursorFrame::REST,
                 covered: Vec::new(),
+                shape,
+                steady: style.steady,
             })
         } else {
             None
@@ -3305,6 +3597,33 @@ fn record_paint(cost: Duration, cache_misses: u64, grid: impl FnOnce() -> (u16, 
     }
 }
 
+/// The cursor's fill for a DECSCUSR shape at the cell whose top-left is
+/// `origin`. A bar and an underline are twice a light stroke (the sprites'
+/// stem weight), snapped to whole device pixels so they never blur.
+fn cursor_bounds(
+    shape: CursorShape,
+    origin: Point<Pixels>,
+    metrics: CellMetrics,
+    cols: u16,
+    scale_factor: f32,
+) -> Bounds<Pixels> {
+    let width = metrics.cell_width * f32::from(cols);
+    let scale = if scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    let stroke = px(2.0 * crate::sprites::light_thickness(metrics, scale) / scale);
+    match shape {
+        CursorShape::Block => Bounds::new(origin, size(width, metrics.line_height)),
+        CursorShape::Bar => Bounds::new(origin, size(stroke, metrics.line_height)),
+        CursorShape::Underline => Bounds::new(
+            point(origin.x, origin.y + metrics.line_height - stroke),
+            size(width, stroke),
+        ),
+    }
+}
+
 /// Focus no longer decides whether the cursor is painted, only how: filled in
 /// the pane that holds the keyboard, outlined in every other. A cursor the
 /// program hid (DECTCEM) stays hidden in both, and a thumbnail has none.
@@ -3360,6 +3679,7 @@ fn append_row_quads(
     grid: SpriteGrid,
     theme: TermTheme,
     tints: &[Tint],
+    styles: &[StyleSpan],
     background_quads: &mut Vec<PaintQuad>,
     decoration_quads: &mut Vec<PaintQuad>,
     sprite_shapes: &mut Vec<AntialiasedShape>,
@@ -3368,15 +3688,16 @@ fn append_row_quads(
     // Plain terminal output is overwhelmingly default-background text with
     // no decorations. Recognize the entire row in one cheap pass instead of
     // scanning it once for backgrounds and again for decorations.
-    let is_plain = row.iter().all(|cell| {
-        !cell.style.contains(diri_proto::grid::TermStyle::INVERSE)
-            && is_default_background(cell.bg)
-            && !cell.style.contains(diri_proto::grid::TermStyle::UNDERLINE)
-            && !cell
-                .style
-                .contains(diri_proto::grid::TermStyle::CROSSED_OUT)
-            && !is_procedural(cell.scalar)
-    });
+    let is_plain = styles.is_empty()
+        && row.iter().all(|cell| {
+            !cell.style.contains(diri_proto::grid::TermStyle::INVERSE)
+                && is_default_background(cell.bg)
+                && !cell.style.contains(diri_proto::grid::TermStyle::UNDERLINE)
+                && !cell
+                    .style
+                    .contains(diri_proto::grid::TermStyle::CROSSED_OUT)
+                && !is_procedural(cell.scalar)
+        });
     if is_plain {
         return;
     }
@@ -3450,60 +3771,167 @@ fn append_row_quads(
         origin,
         metrics,
         theme,
-        tints,
+        (tints, styles),
         decoration_quads,
+        sprite_shapes,
     );
 }
 
+/// How one cell is decorated, after its span (if any) and visibility.
+#[derive(Clone, Copy, PartialEq)]
+struct Decoration {
+    foreground: gpui::Rgba,
+    underline: UnderlineKind,
+    underline_color: gpui::Rgba,
+    strikethrough: bool,
+    overline: bool,
+}
+
+impl Decoration {
+    fn of(
+        cell: GridCell,
+        span: Option<&StyleSpan>,
+        tint: Option<gpui::Rgba>,
+        theme: TermTheme,
+    ) -> Self {
+        let style = theme.resolve_cell_under(cell, tint);
+        let underline = match span {
+            Some(span) if style.visible => span.underline,
+            _ if style.underline => UnderlineKind::Single,
+            _ => UnderlineKind::None,
+        };
+        Self {
+            foreground: style.foreground,
+            underline,
+            underline_color: span
+                .and_then(|span| span.underline_color)
+                .map_or(style.foreground, |packed| {
+                    theme.resolve_color(diri_proto::grid::TermColor::unpack(packed), false)
+                }),
+            strikethrough: style.strikethrough,
+            overline: style.visible && span.is_some_and(|span| span.overline),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.underline == UnderlineKind::None && !self.strikethrough && !self.overline
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn append_decoration_quads(
     row: &[GridCell],
     row_index: u16,
     origin: Point<Pixels>,
     metrics: CellMetrics,
     theme: TermTheme,
-    tints: &[Tint],
+    (tints, styles): (&[Tint], &[StyleSpan]),
     quads: &mut Vec<PaintQuad>,
+    shapes: &mut Vec<AntialiasedShape>,
 ) {
+    // Spans are sorted; walk them alongside the columns.
+    let mut spans = styles.iter().peekable();
+    let mut span_at = |col: usize| {
+        while spans.next_if(|span| usize::from(span.end) <= col).is_some() {}
+        spans
+            .peek()
+            .copied()
+            .filter(|span| usize::from(span.start) <= col)
+    };
     let mut col = 0;
     while col < row.len() {
-        let style = theme.resolve_cell_under(row[col], tint_at(tints, col));
-        if !style.underline && !style.strikethrough {
+        let decoration = Decoration::of(row[col], span_at(col), tint_at(tints, col), theme);
+        if decoration.is_empty() {
             col += 1;
             continue;
         }
         let mut end = col + 1;
-        while end < row.len() {
-            let next = theme.resolve_cell_under(row[end], tint_at(tints, end));
-            if next.foreground != style.foreground
-                || next.underline != style.underline
-                || next.strikethrough != style.strikethrough
-            {
-                break;
-            }
+        while end < row.len()
+            && Decoration::of(row[end], span_at(end), tint_at(tints, end), theme) == decoration
+        {
             end += 1;
         }
         let x = origin.x + metrics.cell_width * col as f32;
         let width = metrics.cell_width * (end - col) as f32;
         let row_top = origin.y + metrics.y_for_row(row_index);
-        if style.underline {
-            quads.push(fill(
-                Bounds::new(
-                    point(x, row_top + metrics.line_height - px(1.5)),
-                    size(width, px(1.0)),
-                ),
-                style.foreground,
-            ));
-        }
-        if style.strikethrough {
+        append_underline(
+            decoration.underline,
+            (x, width, col..end),
+            row_top,
+            metrics,
+            decoration.underline_color,
+            quads,
+            shapes,
+        );
+        if decoration.strikethrough {
             quads.push(fill(
                 Bounds::new(
                     point(x, row_top + metrics.line_height * 0.55),
                     size(width, px(1.0)),
                 ),
-                style.foreground,
+                decoration.foreground,
+            ));
+        }
+        if decoration.overline {
+            quads.push(fill(
+                Bounds::new(point(x, row_top), size(width, px(1.0))),
+                decoration.foreground,
             ));
         }
         col = end;
+    }
+}
+
+/// The underline of one run. The single underline is the one Diri always
+/// drew; the others share its baseline so a change of kind never jumps.
+fn append_underline(
+    kind: UnderlineKind,
+    (x, width, columns): (Pixels, Pixels, std::ops::Range<usize>),
+    row_top: Pixels,
+    metrics: CellMetrics,
+    color: gpui::Rgba,
+    quads: &mut Vec<PaintQuad>,
+    shapes: &mut Vec<AntialiasedShape>,
+) {
+    let line = |y: Pixels, x: Pixels, width: Pixels| {
+        fill(Bounds::new(point(x, y), size(width, px(1.0))), color)
+    };
+    let baseline = row_top + metrics.line_height - px(1.5);
+    match kind {
+        UnderlineKind::None => {}
+        UnderlineKind::Single => quads.push(line(baseline, x, width)),
+        UnderlineKind::Double => {
+            quads.push(line(baseline, x, width));
+            quads.push(line(baseline - px(2.0), x, width));
+        }
+        // One dot per two logical pixels, on a grid anchored to the cell so
+        // neighbouring runs continue the same pattern.
+        UnderlineKind::Dotted => {
+            let dots = (f32::from(width) / 2.0).floor() as usize;
+            quads.extend((0..dots).map(|dot| line(baseline, x + px(dot as f32 * 2.0), px(1.0))));
+        }
+        // One dash per cell, centred, half the cell wide.
+        UnderlineKind::Dashed => {
+            let dash = metrics.cell_width * 0.5;
+            quads.extend(columns.enumerate().map(|(index, _)| {
+                line(
+                    baseline,
+                    x + metrics.cell_width * index as f32 + metrics.cell_width * 0.25,
+                    dash,
+                )
+            }));
+        }
+        // GPUI's wavy underline: one primitive, three strokes tall, ending on
+        // the single underline's baseline.
+        UnderlineKind::Curly => shapes.push(AntialiasedShape::Wave {
+            origin: point(x, baseline + px(1.0) - px(3.0)),
+            width,
+            style: gpui::UnderlineStyle {
+                thickness: px(1.0),
+                color: Some(color.into()),
+                wavy: true,
+            },
+        }),
     }
 }
 
@@ -3706,7 +4134,7 @@ fn url_from_run(run: &str) -> Option<String> {
     } else if stripped.starts_with("www.") && stripped["www.".len()..].contains('.') {
         Some(format!("https://{stripped}"))
     } else {
-        None
+        crate::link_scheme::app_link(stripped, false).map(str::to_owned)
     }
 }
 
@@ -3842,6 +4270,19 @@ fn trim_reference_run(run: &str) -> &str {
     run.trim()
         .trim_start_matches(['(', '[', '{', '<', '\'', '"'])
         .trim_end_matches(['.', ',', ';', ':', ')', ']', '}', '\'', '"', '>', '!', '?'])
+}
+
+/// A program's explicit OSC 8 target: any allowed scheme, not only the ones
+/// plain text is trusted to spell.
+fn reference_from_link_uri(uri: &str) -> Option<TerminalReference> {
+    if crate::link_scheme::scheme(uri).is_some_and(|scheme| crate::link_scheme::is_blocked(&scheme))
+    {
+        return None;
+    }
+    if let Some(link) = crate::link_scheme::app_link(uri, true) {
+        return Some(TerminalReference::Url(link.to_owned()));
+    }
+    reference_from_run(uri)
 }
 
 fn reference_from_run(run: &str) -> Option<TerminalReference> {
@@ -4017,6 +4458,7 @@ mod block_tests {
                 SpriteGrid::new(point(px(2.0), px(3.0)), metrics, 1.0),
                 TermTheme::default(),
                 &[],
+                &[],
                 &mut backgrounds,
                 &mut foregrounds,
                 &mut Vec::new(),
@@ -4046,6 +4488,157 @@ mod block_tests {
         }
     }
 
+    fn decorated(styles: &[StyleSpan]) -> (Vec<PaintQuad>, Vec<AntialiasedShape>) {
+        let metrics =
+            CellMetrics::from_measurements(px(8.0), px(12.0), px(4.0), px(0.0), FontId(0));
+        let cell = GridCell::new(
+            'x' as u32,
+            TermColor::Ansi(2),
+            TermColor::DefaultInverted,
+            TermStyle::UNDERLINE,
+        );
+        let (mut backgrounds, mut foregrounds, mut shapes) = (Vec::new(), Vec::new(), Vec::new());
+        append_row_quads(
+            &[cell; 4],
+            0,
+            SpriteGrid::new(Point::default(), metrics, 1.0),
+            TermTheme::DIRIJOR_DARK,
+            &[],
+            styles,
+            &mut backgrounds,
+            &mut foregrounds,
+            &mut shapes,
+        );
+        assert!(backgrounds.is_empty());
+        (foregrounds, shapes)
+    }
+
+    fn span(underline: UnderlineKind) -> StyleSpan {
+        StyleSpan {
+            start: 0,
+            end: 4,
+            underline,
+            underline_color: None,
+            overline: false,
+        }
+    }
+
+    #[test]
+    fn underline_kinds_have_their_own_geometry() {
+        let theme = TermTheme::DIRIJOR_DARK;
+        let green = theme.resolve_color(TermColor::Ansi(2), false);
+        // No span: the single underline Diri always drew, one quad.
+        let (single, shapes) = decorated(&[]);
+        assert!(shapes.is_empty());
+        assert_eq!(single.len(), 1);
+        let baseline = single[0].bounds.origin.y;
+        assert_eq!(single[0].bounds.size.width, px(32.0));
+        // A span saying "single" draws the same pixels.
+        assert_eq!(decorated(&[span(UnderlineKind::Single)]).0.len(), 1);
+        assert_eq!(
+            decorated(&[span(UnderlineKind::Single)]).0[0].bounds,
+            single[0].bounds
+        );
+
+        let (double, _) = decorated(&[span(UnderlineKind::Double)]);
+        assert_eq!(double.len(), 2);
+        assert_eq!(double[0].bounds.origin.y, baseline);
+        assert_eq!(double[1].bounds.origin.y, baseline - px(2.0));
+
+        let (dashed, _) = decorated(&[span(UnderlineKind::Dashed)]);
+        assert_eq!(dashed.len(), 4, "one dash per cell");
+        assert!(dashed.iter().all(|quad| quad.bounds.size.width == px(4.0)));
+
+        let (dotted, _) = decorated(&[span(UnderlineKind::Dotted)]);
+        assert_eq!(dotted.len(), 16, "a dot every two pixels");
+
+        let (quads, curly) = decorated(&[span(UnderlineKind::Curly)]);
+        assert!(quads.is_empty());
+        let [AntialiasedShape::Wave { width, style, .. }] = &curly[..] else {
+            panic!("one wave");
+        };
+        assert_eq!(*width, px(32.0));
+        assert!(style.wavy);
+        assert_eq!(style.color, Some(green.into()));
+    }
+
+    #[test]
+    fn underline_color_and_overline_follow_their_span() {
+        let theme = TermTheme::DIRIJOR_DARK;
+        let red = TermColor::Rgb(224, 108, 117);
+        let (quads, _) = decorated(&[StyleSpan {
+            start: 1,
+            end: 3,
+            underline: UnderlineKind::Single,
+            underline_color: Some(red.packed()),
+            overline: true,
+        }]);
+        // Cell 0 and 3 keep the foreground underline; 1..3 get a red one and
+        // an overline at the top of the row.
+        let colored: Vec<_> = quads
+            .iter()
+            .filter(|quad| {
+                quad.background == fill(quad.bounds, theme.resolve_color(red, false)).background
+            })
+            .collect();
+        assert_eq!(colored.len(), 1);
+        assert_eq!(colored[0].bounds.origin.x, px(8.0));
+        assert_eq!(colored[0].bounds.size.width, px(16.0));
+        let overline: Vec<_> = quads
+            .iter()
+            .filter(|quad| quad.bounds.origin.y == px(0.0))
+            .collect();
+        assert_eq!(overline.len(), 1);
+        assert_eq!(overline[0].bounds.size.width, px(16.0));
+    }
+
+    #[test]
+    fn an_overline_alone_leaves_the_plain_row_fast_path() {
+        let metrics =
+            CellMetrics::from_measurements(px(8.0), px(12.0), px(4.0), px(0.0), FontId(0));
+        let cell = GridCell::new(
+            'x' as u32,
+            TermColor::Default,
+            TermColor::DefaultInverted,
+            TermStyle::empty(),
+        );
+        let mut foregrounds = Vec::new();
+        append_row_quads(
+            &[cell; 2],
+            0,
+            SpriteGrid::new(Point::default(), metrics, 1.0),
+            TermTheme::DIRIJOR_DARK,
+            &[],
+            &[StyleSpan {
+                start: 0,
+                end: 2,
+                overline: true,
+                ..StyleSpan::default()
+            }],
+            &mut Vec::new(),
+            &mut foregrounds,
+            &mut Vec::new(),
+        );
+        assert_eq!(foregrounds.len(), 1);
+    }
+
+    #[test]
+    fn cursor_shapes_are_snapped_strokes() {
+        let metrics =
+            CellMetrics::from_measurements(px(8.0), px(12.0), px(4.0), px(0.0), FontId(0));
+        let origin = point(px(16.0), px(32.0));
+        let block = cursor_bounds(CursorShape::Block, origin, metrics, 2, 2.0);
+        assert_eq!(block.size, size(px(16.0), metrics.line_height));
+        let bar = cursor_bounds(CursorShape::Bar, origin, metrics, 2, 2.0);
+        assert_eq!(bar.origin, origin);
+        // Twice the light stroke: 8 px * 2x / 8 = 2 device px, doubled.
+        assert_eq!(bar.size.width, px(2.0));
+        assert_eq!(bar.size.height, metrics.line_height);
+        let underline = cursor_bounds(CursorShape::Underline, origin, metrics, 2, 2.0);
+        assert_eq!(underline.size, size(px(16.0), px(2.0)));
+        assert_eq!(underline.bottom(), origin.y + metrics.line_height);
+    }
+
     #[test]
     fn a_bar_of_one_block_in_one_colour_is_one_quad() {
         let metrics =
@@ -4073,6 +4666,7 @@ mod block_tests {
             SpriteGrid::new(point(px(0.0), px(0.0)), metrics, 1.0),
             TermTheme::DIRIJOR_DARK,
             &[],
+            &[],
             &mut backgrounds,
             &mut foregrounds,
             &mut Vec::new(),
@@ -4096,6 +4690,7 @@ mod block_tests {
             2,
             grid,
             theme,
+            &[],
             &[],
             &mut backgrounds,
             &mut foregrounds,
@@ -4202,6 +4797,7 @@ mod block_tests {
                             AntialiasedShape::Polygon { color, .. } => {
                                 assert_eq!(*color, foreground.into());
                             }
+                            AntialiasedShape::Wave { .. } => unreachable!("no underline"),
                         }
                     }
                     let terminal = TerminalElement::with_buffer(GridBuffer::default());
@@ -4244,6 +4840,7 @@ mod block_tests {
                     0,
                     SpriteGrid::new(Point::default(), metrics, 1.0),
                     theme,
+                    &[],
                     &[],
                     &mut backgrounds,
                     &mut foregrounds,
@@ -4506,6 +5103,7 @@ mod link_tests {
                 .iter()
                 .map(|y| diri_proto::grid::ChangedRow::new(*y, vec![super::GridCell::BLANK; 8]))
                 .collect(),
+            cursor_style: Default::default(),
         }
     }
 
@@ -4724,6 +5322,14 @@ mod link_tests {
         assert_eq!(url_from_run("not-a-url"), None);
         assert_eq!(url_from_run("www."), None);
         assert_eq!(url_from_run("http:/broken"), None);
+        // App links in plain text need `scheme://` or a mail address.
+        assert_eq!(url_from_run("ssh://forge,").as_deref(), Some("ssh://forge"));
+        assert_eq!(
+            url_from_run("<mailto:me@example.com>").as_deref(),
+            Some("mailto:me@example.com")
+        );
+        assert_eq!(url_from_run("localhost:3000"), None);
+        assert_eq!(url_from_run("javascript://alert(1)"), None);
     }
 
     #[test]
@@ -4799,11 +5405,15 @@ mod link_tests {
             ("fe80::1", None),
             ("[::1]:8080", None),
             ("2001:db8::ff00:42:8329", None),
-            ("ftp://example.com/a.txt", None),
             ("Finished", None),
         ] {
             assert_eq!(reference_from_run(run), expected, "{run}");
         }
+        // Other schemes are app links, which the host asks about first.
+        assert_eq!(
+            reference_from_run("ftp://example.com/a.txt"),
+            Some(TerminalReference::Url("ftp://example.com/a.txt".to_owned()))
+        );
         // URLs keep winning over the file reading of their path.
         assert_eq!(
             reference_from_run("https://example.com/src/app.rs:42"),
@@ -5005,6 +5615,7 @@ mod selection_repaint_tests {
                 .iter()
                 .map(|(y, text)| ChangedRow::new(*y, row(text)))
                 .collect(),
+            cursor_style: Default::default(),
         }
     }
 
@@ -5012,6 +5623,97 @@ mod selection_repaint_tests {
         let element = TerminalElement::with_buffer(GridBuffer::new(COLS, ROWS));
         element.apply_damage(update(true, &[(0, "zero"), (1, "one"), (2, "two")]));
         element
+    }
+
+    /// A row whose first cell carries `marks`.
+    fn marked(text: &str, marks: TermStyle) -> Vec<GridCell> {
+        let mut cells = row(text);
+        cells[0].style |= marks;
+        cells
+    }
+
+    /// Eight rows of history under the three live rows, with prompts on
+    /// history rows 2 and 6: `ls` printed one row and exited 0.
+    fn history_with_prompts(skip: Option<i64>) -> TerminalElement {
+        let element = populated_element();
+        let history = |absolute: i64| match absolute {
+            2 => marked("$ ls", TermStyle::PROMPT_START),
+            3 => marked("a.txt", TermStyle::OUTPUT_START),
+            4 => marked("$", TermStyle::COMMAND_SUCCEEDED | TermStyle::PROMPT_START),
+            6 => marked("$ make", TermStyle::PROMPT_START),
+            _ => row("text"),
+        };
+        // Fetched in two pieces around a row that never arrived.
+        let gap = skip.unwrap_or(8);
+        let mut viewport = mutex_lock(&element.shared.viewport);
+        viewport.apply_rows(
+            (0..gap).map(history).collect(),
+            0,
+            8,
+            11,
+            1,
+            usize::from(ROWS),
+        );
+        if gap < 8 {
+            viewport.apply_rows(
+                (gap + 1..8).map(history).collect(),
+                gap + 1,
+                8,
+                11,
+                1,
+                usize::from(ROWS),
+            );
+        }
+        drop(viewport);
+        element
+    }
+
+    #[test]
+    fn prompt_jumps_are_answered_from_held_rows_without_a_read() {
+        use crate::command_marks::PromptSearch;
+        let element = history_with_prompts(None);
+        // The window's top is history row 5.
+        element.set_view_offset(3, usize::from(ROWS));
+        assert_eq!(element.held_prompt_target(false), PromptSearch::Found(4));
+        assert_eq!(element.held_prompt_target(true), PromptSearch::Found(6));
+        element.set_view_offset(8, usize::from(ROWS));
+        assert_eq!(element.held_prompt_target(false), PromptSearch::Absent);
+        element.set_view_offset(2, usize::from(ROWS));
+        assert_eq!(
+            element.held_prompt_target(true),
+            PromptSearch::Absent,
+            "the live screen below holds no prompt"
+        );
+
+        // A row that was never fetched is not guessed past.
+        let element = history_with_prompts(Some(5));
+        element.set_view_offset(2, usize::from(ROWS));
+        assert_eq!(element.held_prompt_target(false), PromptSearch::Unknown);
+
+        // Without history geometry rows have no numbers to search by.
+        let element = populated_element();
+        assert_eq!(element.held_prompt_target(false), PromptSearch::Unknown);
+    }
+
+    #[test]
+    fn a_command_mark_selects_the_output_of_its_command() {
+        let element = history_with_prompts(None);
+        // History row 2, the `ls` prompt, at the top of the window.
+        element.set_view_offset(6, usize::from(ROWS));
+        let output = element.command_output_marked_at(0).unwrap();
+        assert_eq!(
+            output.start,
+            crate::selection::SelectionPoint { row: 3, col: 0 }
+        );
+        assert_eq!(
+            output.end,
+            crate::selection::SelectionPoint { row: 4, col: 0 }
+        );
+        assert_eq!(output.status, diri_proto::grid::CommandEnd::Succeeded);
+        // The output row has no mark, and `make` has not finished.
+        assert_eq!(element.command_output_marked_at(1), None);
+        element.set_view_offset(2, usize::from(ROWS));
+        assert_eq!(element.command_output_marked_at(0), None);
     }
 
     #[test]
@@ -5184,6 +5886,21 @@ mod selection_repaint_tests {
         assert_eq!(hit.spans, vec![(0, 0, 5)]);
         assert!(element.reference_hit_at(5, 0).is_none());
         frame.changed_rows[0].metadata.links[0].uri = "javascript:alert(1)".into();
+        element.apply_damage(frame.clone());
+        assert!(element.reference_hit_at(2, 0).is_none());
+        // An app link is a link; the host decides whether to ask.
+        frame.changed_rows[0].metadata.links[0].uri = "vscode://file/a.rs:1".into();
+        element.apply_damage(frame.clone());
+        assert_eq!(
+            element
+                .reference_hit_at(2, 0)
+                .unwrap()
+                .reference
+                .destination(),
+            "vscode://file/a.rs:1"
+        );
+        assert_eq!(element.link_at(2, 0), None, "link_at stays web-only");
+        frame.changed_rows[0].metadata.links[0].uri = "data:text/html,x".into();
         element.apply_damage(frame);
         assert!(element.reference_hit_at(2, 0).is_none());
     }
@@ -5505,6 +6222,7 @@ mod live_scroll_cache_tests {
                 Some(CachedRow {
                     cells: cells(ch),
                     graphemes: Vec::new(),
+                    styles: Vec::new(),
                     tints: Vec::new(),
                     background_quads: vec![fill(
                         Bounds::new(point(px(3.), px(row as f32 * 20.)), size(px(80.), px(20.))),
@@ -5532,6 +6250,7 @@ mod live_scroll_cache_tests {
                 generation: 1,
                 cells: cells(ch),
                 graphemes: Vec::new(),
+                styles: Vec::new(),
             })
             .collect()
     }

@@ -107,7 +107,10 @@ Holder-port notes, for whoever wires the daemon:
   first client size settles — 120ms debounce per proposal, 400ms fallback
   for viewless spawns — so TUI banners render at the real width. Input
   typed before the exec queues and flushes right after it, and a kill
-  inside the window means the child never exists.
+  inside the window means the child never exists. (2026-10-27: the
+  debounce is gone. The first client size launches at once, and a spawn
+  whose size is already known — named by the App, or the size a pane last
+  reported — launches without waiting; later sizes are ordinary resizes.)
 - **A markerless holder death** (SIGKILL of the holder itself) is caught by a
   ~2s liveness probe in the held pump, so a session cannot look alive forever.
 - **Initial-prompt injection is verified** (2026-08-07), porting Swift's

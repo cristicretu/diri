@@ -259,3 +259,65 @@ fn malformed_launch_fails_before_creating_work() {
             .is_empty()
     );
 }
+
+/// A command's run is timed from its exec to its exit, so the app can keep
+/// the tab of one that failed as it started (and close a quick success), and
+/// `--keep-open` is carried on the record for any exit.
+#[test]
+fn command_runs_are_timed_and_keep_open_is_recorded() {
+    let fixture = Fixture::new();
+    let run = |args: &[&str]| -> Value {
+        let spawned = fixture.json(args);
+        let id = spawned["id"].as_str().unwrap().to_owned();
+        let waited = fixture.json(&[
+            "session",
+            "wait",
+            &id,
+            "--until",
+            "exited",
+            "--timeout",
+            "10",
+            "--json",
+        ]);
+        assert_eq!(waited["timedOut"], false);
+        fixture.json(&["session", "get", &id, "--json"])
+    };
+    let failed = run(&[
+        "session",
+        "run",
+        "--json",
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo boom >&2; exit 3",
+    ]);
+    assert_eq!(failed["status"]["exited"]["_0"]["code"], 3);
+    assert!(failed["commandRun"].get("keepOpen").is_none());
+    let ran = failed["commandRun"]["ranMs"].as_u64().expect("timed");
+    assert!(ran < 5_000, "ran {ran} ms");
+
+    let missing = run(&["session", "run", "--json", "--", "diri-no-such-tool-xyz"]);
+    assert_eq!(missing["status"]["exited"]["_0"]["code"], 127);
+    let id = missing["id"].as_str().unwrap();
+    let screen = fixture.json(&["session", "read", id, "--json"]);
+    assert!(
+        screen["lines"].as_array().unwrap().iter().any(|line| line
+            .as_str()
+            .unwrap()
+            .contains("diri-no-such-tool-xyz: command not found")),
+        "{screen}"
+    );
+
+    let kept = run(&[
+        "session",
+        "run",
+        "--keep-open",
+        "--json",
+        "--",
+        "/usr/bin/true",
+    ]);
+    assert_eq!(kept["status"]["exited"]["_0"]["code"], 0);
+    assert_eq!(kept["commandRun"]["keepOpen"], true);
+    let kept: diri_proto::SessionRecord = serde_json::from_value(kept).unwrap();
+    assert!(kept.command_keeps_tab(), "--keep-open keeps even a success");
+}

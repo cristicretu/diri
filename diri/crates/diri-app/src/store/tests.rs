@@ -30,7 +30,7 @@ fn pid(value: &str) -> ProjectId {
 }
 
 pub(super) fn session(value: &str, project: &str, created: f64) -> SessionRecord {
-    SessionRecord {
+    SessionRecord { command_run: None,
         attention_state: None,
         id: id(value),
         kind: AgentKind::CLAUDE_CODE,
@@ -65,6 +65,7 @@ pub(super) fn session(value: &str, project: &str, created: f64) -> SessionRecord
         pull_requests: None,
         listening_ports: None,
         foreground_agent: None,
+        foreground_program: None,
         terminal_cwd: None,
         agent_workspace: None,
         note_id: None,
@@ -3020,8 +3021,13 @@ async fn a_rejected_close_restores_the_retained_session_and_allows_a_retry() {
 
     let listed = visible_ids(&mut store.write().unwrap());
     assert_eq!(listed.len(), 2);
-    store.write().unwrap().request_close(vec![id("one")]);
-    assert_eq!(visible_ids(&mut store.write().unwrap()), vec![id("two")]);
+    {
+        // Close and look under one lock: the fake Engine rejects at once, and
+        // its reply could otherwise restore the row before the check.
+        let mut store = store.write().unwrap();
+        store.request_close(vec![id("one")]);
+        assert_eq!(visible_ids(&mut store), vec![id("two")]);
+    }
 
     eventually("the rejection is reported", || {
         store.read().unwrap().action_failure().is_some()
@@ -3800,6 +3806,49 @@ fn a_reveal_request_selects_the_session() {
 }
 
 #[test]
+fn an_agents_window_change_names_it_once_and_unknown_actors_stay_silent() {
+    let mut agent = session("fix-auth", "p", 1.0);
+    agent.title_source = TitleSource::UserRename;
+    let mut gone = session("old", "p", 2.0);
+    gone.archived_at = Some(DateMillis(3.0));
+    let mut note = session("plan", "p", 3.0);
+    note.kind = AgentKind::NOTE;
+    let (mut store, mut effects) = hydrated(
+        vec![agent.clone(), gone.clone(), note.clone()],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+    let acted = |actor: &str, action: &str, seq: u64| EventEnvelope {
+        name: diri_proto::EventName::AGENT_ACTION.into(),
+        params: serde_json::json!({ "sessionID": actor, "action": action }),
+        seq,
+    };
+    let banners = |effects: &mut mpsc::UnboundedReceiver<StoreEffect>| -> Vec<crate::toast::Toast> {
+        drain(effects)
+            .into_iter()
+            .filter_map(|effect| match effect {
+                StoreEffect::StatusTransition(transition) => transition.in_app_banner,
+                _ => None,
+            })
+            .collect()
+    };
+    // Nothing a user sees as store state changes: no sidebar rebuild.
+    assert!(!store.handle_event(acted(&agent.id.0, "zoom_pane", 2)));
+    let shown = banners(&mut effects);
+    assert_eq!(shown.len(), 1);
+    assert!(shown[0].ambient, "the Agent notice, not a feedback toast");
+    assert_eq!(shown[0].message, "fix-auth: Zoom pane");
+    // Unknown, archived, and future actions are dropped, never shown as ids.
+    store.handle_event(acted("s_gone", "zoom_pane", 3));
+    store.handle_event(acted(&gone.id.0, "split_pane", 4));
+    store.handle_event(acted(&agent.id.0, "teleport_pane", 5));
+    // Work started from a note is the person's own action.
+    store.handle_event(acted(&note.id.0, "new_tab", 6));
+    assert!(banners(&mut effects).is_empty());
+}
+
+#[test]
 fn an_agents_api_request_waits_for_the_window_to_open_it() {
     let agent = session("codex", "p", 1.0);
     let (mut store, _effects) = hydrated(
@@ -4259,6 +4308,55 @@ mod split_panes {
         assert!(store.pane_group(&id("two")).is_none());
     }
 
+    /// A pane shell dragged into another agent's tab joins that tab's row:
+    /// focusing it keeps that row selected and the row folds it in.
+    #[test]
+    fn a_pane_shell_moved_to_another_tab_belongs_to_that_tab() {
+        let (mut store, _) = split_store();
+        store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
+            revision: 2,
+            workspaces: vec![WorkspaceRecord {
+                project_id: None,
+                id: WorkspaceId::new("w"),
+                name: "Project".into(),
+                selected_tab: Some(TabId::new("u")),
+                tabs: vec![
+                    WorkspaceTab {
+                        id: TabId::new("t"),
+                        title: None,
+                        focused_pane: PaneId::new("agent"),
+                        zoomed_pane: None,
+                        layout: leaf("agent", "one"),
+                    },
+                    WorkspaceTab {
+                        id: TabId::new("u"),
+                        title: None,
+                        focused_pane: PaneId::new("terminal"),
+                        zoomed_pane: None,
+                        layout: LayoutNode::Split {
+                            id: SplitId::new("s"),
+                            axis: LayoutAxis::Horizontal,
+                            fraction: 0.5,
+                            first: Box::new(leaf("other", "two")),
+                            second: Box::new(leaf("terminal", "shown")),
+                        },
+                    },
+                ],
+            }],
+            ..Default::default()
+        });
+        assert_eq!(store.pane_owner(&id("shown")), id("two"));
+        let (panes, shells) = store.pane_group(&id("two")).unwrap();
+        assert_eq!(panes, 2);
+        assert_eq!(
+            shells.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            vec![id("shown")]
+        );
+        assert!(store.pane_group(&id("one")).is_none());
+        // Unplaced, a shell still belongs to its parent.
+        assert_eq!(store.pane_owner(&id("hidden")), id("one"));
+    }
+
     #[test]
     fn hidden_pane_shell_is_the_newest_running_unplaced_one() {
         let (mut store, _) = split_store();
@@ -4348,4 +4446,23 @@ fn read_aloud_can_pick_one_tab_or_all_but_one() {
     assert!(store.tab_reads_aloud(&SessionId("later".into())));
     store.set_read_aloud(a.id.clone(), ReadAloudChoice::All);
     assert!(store.reads_aloud(&a.id) && store.reads_aloud(&b.id));
+}
+
+#[cfg(unix)]
+#[test]
+fn preferences_are_owner_only_even_over_an_older_world_readable_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let folder = directory.path().join("Application Support/diri");
+    let path = folder.join("prefs.json");
+    Prefs::default().save(&path).unwrap();
+    assert_eq!(mode(&path), 0o600);
+    assert_eq!(mode(&folder), 0o700);
+
+    let stale = path.with_extension("json.tmp");
+    std::fs::write(&stale, b"{").unwrap();
+    std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
+    Prefs::default().save(&path).unwrap();
+    assert_eq!(mode(&path), 0o600);
 }
