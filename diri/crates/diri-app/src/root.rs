@@ -12696,6 +12696,9 @@ mod tests {
         });
     }
 
+    // Traffic lights exist only on macOS; elsewhere the leading lane is the
+    // platform's own (none on Linux, the window icon on Windows).
+    #[cfg(target_os = "macos")]
     #[gpui::test]
     fn the_hidden_sidebar_button_clears_the_traffic_lights_in_both_densities(
         cx: &mut gpui::TestAppContext,

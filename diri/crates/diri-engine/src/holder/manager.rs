@@ -139,7 +139,7 @@ impl HolderManagerServer {
     }
 
     pub fn run(&self) -> HolderResult<()> {
-        std::fs::create_dir_all(&self.paths.directory)
+        diri_platform::private::create_dir_all(&self.paths.directory)
             .map_err(|error| HolderError::io("create holders directory", error))?;
         // Before any PTY or listener exists, so the guard inherits nothing.
         // A guard that fails to start costs only crash cleanup, not sessions.
@@ -418,13 +418,8 @@ fn stop_listener(state: &State) {
 
 fn write_pid_file(path: &Path) -> HolderResult<()> {
     let contents = format!("{}\n", std::process::id());
-    std::fs::write(path, contents).map_err(|error| HolderError::io("write pid file", error))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    diri_platform::private::write(path, contents)
+        .map_err(|error| HolderError::io("write pid file", error))
 }
 
 /// Development managers: once the Engine that checked in last has exited and
@@ -490,6 +485,26 @@ mod tests {
 
     use super::{HolderManagerServer, State, watch_idle};
     use crate::holder::{HolderManagerClient, HolderManagerPaths};
+
+    #[cfg(unix)]
+    #[test]
+    fn manager_pid_files_and_directories_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let holders = temp.path().join("holders");
+        crate::holder::launcher::LaunchLock::acquire(&{
+            diri_platform::private::create_dir_all(&holders).unwrap();
+            holders.join("launch.lock")
+        })
+        .unwrap();
+        let pid = holders.join("manager.pid");
+        super::write_pid_file(&pid).unwrap();
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&holders), 0o700);
+        assert_eq!(mode(&pid), 0o600);
+        assert_eq!(mode(&holders.join("launch.lock")), 0o600);
+    }
 
     /// A watchdog over a manager with no listener to close.
     fn watchdog(state: &Arc<State>, idle_timeout: Duration) -> std::thread::JoinHandle<()> {
