@@ -453,6 +453,7 @@ O(1) amortized. Release builds compile none of it; no behavior, wire,
 checkpoint or protocol change. Test:
 `lines_after_narrowing_a_full_history_cost_what_they_did_before`
 (`diri-terminal-state`); probe: `--bench narrow_history`.
+
 ## SGR-Pixels mouse (DECSET 1016)
 
 `TermMode::SGR_PIXEL_MOUSE` (bit 26) records DECSET 1016. It is one of the
