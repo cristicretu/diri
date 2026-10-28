@@ -86,7 +86,7 @@ impl OutputLog {
         read_only: bool,
     ) -> io::Result<Self> {
         if !read_only {
-            fs::create_dir_all(dir)?;
+            diri_platform::private::create_dir_all(dir)?;
         }
         let mut log = Self::view(dir, session_id, ring_capacity, disk_capacity, read_only);
         log.open_or_recover()?;

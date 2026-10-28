@@ -101,7 +101,9 @@ requests fail explicitly when that state is unavailable. Desktop arrows and
 Home/End retain their historical normal-cursor CSI encoding for these legacy
 sessions instead of disabling navigation after an upgrade. This compatibility
 choice does not claim or persist known modes; observed application-cursor modes
-always override it. Keypad input still requires observed modes. Controller and
+always override it. Keypad keys type their characters in every legacy mode
+(DECKPAM is observed but, as on a Num Lock keypad, changes no bytes), so they
+need no observed modes; kitty-flag programs get keypad key codes. Controller and
 enhanced-keyboard admission checks remain enforced by the Engine.
 
 Local app/client `Modes` frames retain their existing first byte and gain an
@@ -691,7 +693,13 @@ wire mode byte retains its historical any-mouse bit and uses previously unused
 bits for those details. A live protocol 1.3 Holder exposes only the historical
 bit, so the Engine preserves those details as unknown: it does not synthesize
 button or motion reports, while wheel intent remains encoded by that Holder's
-authoritative parser. Scrollback is bounded to 4 MiB and served on demand
+authoritative parser. A `Scroll` frame for a program on the alternate screen
+that does not read the mouse becomes Up/Down arrow keys (alternate scroll,
+DECSET 1007, cursor-key mode honoured) in Helper builds that include it; an
+older live Holder keeps ignoring that wheel. No frame or capability changes.
+A controller encodes wheel reports for a program whose mouse details it
+knows, with modifiers and the sideways axis, and sends them as mouse input
+like its clicks. Scrollback is bounded to 4 MiB and served on demand
 through `Scroll`. Raw output is bounded to 32 MiB.
 
 On-demand history reads use the Engine's bounded background-request pool. The
@@ -712,7 +720,14 @@ interval, so a background program's lone line leaves the Holder about 1.4 ms
 after it is written rather than 8 ms. Output that never pauses for 1 ms is
 still published at most once per 8 ms, and a batch that leaves fewer filled
 cells than the last publication (an erase whose redraw may follow) keeps the
-whole 8 ms interval. This is a Holder-only timing rule with no protocol change
+whole 8 ms interval. The exception is a line edit: when the only row holding
+fewer cells than at the last publication is the row of the visible cursor (a
+backspace-erase, a kill to end of line, a progress line rewritten shorter),
+no redraw is coming, so the diff goes out on the leading edge like output
+that adds. Hidden cursors (full-screen programs mid-draw), scrolls that shorten
+other rows and resizes keep the hold. The local Engine pump applies the same
+predicate (`HeadlessScreen::lost_cells_only_on_cursor_row`, shared through
+`diri-terminal-state`). This is a Holder-only timing rule with no protocol change
 or capability; Holders launched by older Helper builds keep the 8 ms trailing
 wait until their session is relaunched with a new Helper. If a destructive repaint
 temporarily removes screen content, the Holder instead gives its redraw bytes up
@@ -873,16 +888,21 @@ at 80). Discard only oldest history when either limit is reached. Once the byte
 allowance evicts, each new line recycles the oldest row, as at the row ceiling;
 when stored history falls 1/16 below the allowance, history grows again.
 Visible cells, cell-extra heap allocations, temporary codec/read/reflow work and
-caller-owned response buffers are separate from this allowance. Reflow can alter
-physical row count and the deferred line index, and therefore evict oldest rows
-under the same allowance. History capacity no longer shrinks merely because the
-terminal becomes wider. The Remote Helper uses the same core, so its scrollback
-stays bounded by the same 4 MiB.
+caller-owned response buffers are separate from this allowance. A resize does
+not evict by row count: when re-wrapping needs more physical rows (a narrower
+screen, or fewer screen rows), the row limit rises to the rows the reflow
+produced, up to four times the ceiling, and returns toward the ceiling as
+widening, a clear or the byte allowance leave fewer rows. New output then
+recycles the oldest row at that limit; the byte allowance still bounds what a
+reflow stores. History capacity no longer shrinks merely because the terminal
+becomes wider. The Remote Helper uses the same core, so its scrollback stays
+bounded by the same 4 MiB.
 
 Exports taken under the screen lock carry only the newest 10,000 history rows:
-the Engine checkpoint (so adoption after an Engine restart restores those rows)
-and the whole-text `session.read_scrollback` (its `firstRow` marks the start).
-Deeper rows remain readable through paged scrollback reads.
+the Engine checkpoint (so adoption after an Engine restart restores those rows,
+within read admission) and the whole-text `session.read_scrollback` (its
+`firstRow` marks the start). Deeper rows remain readable through paged
+scrollback reads.
 
 History reads decode bounded row blocks and release caches at exclusive borrow
 boundaries. Resizing untouched hard lines retains compressed payloads and pads

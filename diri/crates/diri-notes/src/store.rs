@@ -179,7 +179,7 @@ impl NoteStore {
 
     pub fn open(dir: impl Into<PathBuf>) -> io::Result<Self> {
         let dir = dir.into();
-        fs::create_dir_all(&dir)?;
+        diri_platform::private::create_dir_all(&dir)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -345,16 +345,12 @@ impl NoteStore {
     /// read-modify-write and released when the returned file drops. Not
     /// reentrant: never take it twice on one thread.
     fn lock(&self) -> io::Result<fs::File> {
-        let file = fs::OpenOptions::new()
+        let file = diri_platform::private::options()
             .create(true)
             .truncate(false)
             .write(true)
             .open(self.dir.join(LOCK_FILE))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        }
+        diri_platform::private::restrict(&file)?;
         file.lock()?;
         Ok(file)
     }
@@ -363,15 +359,10 @@ impl NoteStore {
         let path = self.path_for(id)?;
         let tmp = self.dir.join(format!(".{id}.{}.tmp", nonce()));
         let result = (|| {
-            let mut file = fs::OpenOptions::new()
+            let mut file = diri_platform::private::options()
                 .write(true)
                 .create_new(true)
                 .open(&tmp)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                file.set_permissions(fs::Permissions::from_mode(0o600))?;
-            }
             file.write_all(contents.as_bytes())?;
             file.sync_data()?;
             fs::rename(&tmp, &path)
@@ -441,13 +432,13 @@ impl NoteStore {
             ));
         }
         let folder = self.dir.join(ASSETS_DIR).join(id);
-        fs::create_dir_all(&folder)?;
+        diri_platform::private::create_dir_all(&folder)?;
         let name = format!("{:016x}.{extension}", fnv1a(bytes));
         let path = folder.join(&name);
         if !path.exists() {
             let tmp = folder.join(format!(".{name}.{}.tmp", nonce()));
             let result = (|| {
-                let mut file = fs::OpenOptions::new()
+                let mut file = diri_platform::private::options()
                     .write(true)
                     .create_new(true)
                     .open(&tmp)?;
@@ -532,7 +523,7 @@ impl NoteStore {
     pub fn trash(&self, id: &str) -> io::Result<PathBuf> {
         let path = self.path_for(id)?;
         let trash = self.dir.join(TRASH_DIR);
-        fs::create_dir_all(&trash)?;
+        diri_platform::private::create_dir_all(&trash)?;
         let target = trash.join(format!("{id}.md"));
         fs::rename(&path, &target)?;
         Ok(target)
@@ -1092,6 +1083,25 @@ mod asset_tests {
         assert!(store.save_asset(&id, png, "exe").is_err());
         assert!(store.save_asset("../x", png, "png").is_err());
         assert!(store.save_asset(&id, b"", "png").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notes_pictures_and_trash_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes");
+        let store = NoteStore::open(&notes).unwrap();
+        let (id, _) = store.create(Document::new("T", Vec::new()), None).unwrap();
+        let asset = store.save_asset(&id, b"\x89PNG fake", "png").unwrap();
+        let asset = store.resolve_asset(&asset).unwrap();
+        assert_eq!(mode(&asset), 0o600);
+        assert_eq!(mode(asset.parent().unwrap()), 0o700);
+        assert_eq!(mode(&notes.join(ASSETS_DIR)), 0o700);
+        let trashed = store.trash(&id).unwrap();
+        assert_eq!(mode(trashed.parent().unwrap()), 0o700);
+        assert_eq!(mode(&trashed), 0o600);
     }
 
     #[test]

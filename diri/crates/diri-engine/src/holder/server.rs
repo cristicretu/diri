@@ -193,7 +193,7 @@ impl HolderServer {
 
         let socket_path = Path::new(&spec.socket_path).to_path_buf();
         if let Some(parent) = socket_path.parent() {
-            std::fs::create_dir_all(parent)
+            diri_platform::private::create_dir_all(parent)
                 .map_err(|error| HolderError::io("create socket directory", error))?;
         }
 
@@ -1236,13 +1236,8 @@ fn current_stat_without_identity(shared: &Shared) -> HolderStat {
 
 fn write_pid_file(path: &str) -> HolderResult<()> {
     let contents = format!("{}\n", std::process::id());
-    std::fs::write(path, contents).map_err(|error| HolderError::io("write pid file", error))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    diri_platform::private::write(Path::new(path), contents)
+        .map_err(|error| HolderError::io("write pid file", error))
 }
 
 /// Blocks until the watched child has exited, leaving it unreaped.

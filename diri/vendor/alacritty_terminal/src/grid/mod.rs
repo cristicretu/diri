@@ -146,6 +146,12 @@ impl Grid<crate::term::cell::Cell> {
         self.raw.enable_compact(compact::cell_codec());
     }
 
+    /// Call before reading every history row in order: deferred reflow is
+    /// then stored a block at a time instead of built whole by the first read.
+    pub fn prepare_history_read(&mut self) {
+        self.raw.prepare_history_read();
+    }
+
     /// Reclaim decoded history only after callers have released their borrows.
     pub fn release_history_read_cache(&mut self) {
         self.raw.release_read_cache();
@@ -161,6 +167,11 @@ impl Grid<crate::term::cell::Cell> {
     /// Drop the rows kept for recycling; an idle terminal needs none.
     pub fn release_history_spare_rows(&mut self) {
         self.raw.release_spare_rows();
+    }
+
+    /// Release history caches and spare allocations once output is idle.
+    pub fn release_idle_history(&mut self) {
+        self.raw.release_idle();
     }
 
     /// Discard the oldest history beyond `budget` stored bytes.

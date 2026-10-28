@@ -3252,3 +3252,53 @@ DIRI_HOLDER_BIN=$CARGO_TARGET_DIR/release/diri-holder \
 cargo test -p diri-engine --release --features latency-trace \
   --test keystroke_latency output_to_grid -- --ignored --nocapture
 ```
+
+## Line edits skip the erase hold (2026-10-28)
+
+**Premise check.** A full-window probe (#863) put an unsolicited `\b \b`
+written to a TTY at 32.7 ms to the screen against 16.8 ms for `x`, almost all
+of it the held pump's 16 ms erase hold (`RepaintHold`). A *typed* backspace,
+^W or ^U was already exempt (`EchoRequest::erases`, 0.2–0.3 ms to the attach),
+so the hold did not cost every typed backspace. It did cost every key whose
+answer shortens the line without being an editing key, and every line edit
+nobody typed for:
+
+**Rule.** A batch whose only row holding fewer cells than at the batch's start
+is the visible cursor's row, and that row still holds something, is a line
+edit (`HeadlessScreen::lost_cells_only_on_cursor_row`). It is batched like
+output that adds and counts as any key's answer. A hidden cursor
+(full-screen programs mid-draw), a cursor row cleared to nothing (`less`
+clearing `:` before its next page, a progress line cleared before its text),
+a scroll that shortened another row, or a resize keeps the hold. The remote
+Holder applies the same predicate to its 8 ms destructive coalescing.
+
+**Results.** `tests/erase_hold_probe.rs` (ignored; private Engine, real
+Holder, 100x30, data-channel attach, input → first changed published frame;
+two interleaved rounds per build, load average 14–31):
+
+| event | main p50 | branch p50 |
+| --- | ---: | ---: |
+| `\b \b` written to a `cat` TTY after a prompt | 18.2–18.3 ms | **1.4 ms** |
+| progress line rewritten shorter (one write) | 18.2–18.3 ms | **1.5–1.6 ms** |
+| bash / zsh Up onto a shorter history entry | 18.3–18.7 ms | **0.2–0.3 ms** |
+| fish letter that ends an autosuggestion | 18.3–18.5 ms | **0.3–0.5 ms** |
+| typed backspace, ^W, ^U (bash, zsh, fish) | 0.2–1.1 ms | 0.2–0.3 ms |
+| `clear`, `less` page, vim `dd` / `x` / ^F | unchanged (held where they lose rows) | unchanged |
+
+Half-repaint frames (a short-lived frame a row emptier than both neighbours,
+or a row that blinked): 0 on both builds for cat, bash, zsh, fish, vim, top
+and Claude Code; `less` 3 and 2 of ~38 frames on both builds (a page published
+mid-scroll, pre-existing). A first version without the "row still holds
+something" condition published `less`'s cleared prompt alone (6 extra
+flashes); `line_edit.rs` `a_prompt_row_cleared_for_its_redraw_is_still_held`
+guards that.
+
+**Footprint.** One `Vec<usize>` of row counts per screen (8 bytes per row,
+~240 B at 30 rows), refilled without allocating when a batch opens; the
+O(rows) check runs only once a batch has lost cells. No thread, timer or
+wakeup.
+
+```sh
+DIRI_ERASE_PROBE_CLAUDE=/path/to/isolated-claude.sh \
+  cargo test -p diri-engine --release --test erase_hold_probe -- --ignored --nocapture --test-threads=1
+```
