@@ -2,7 +2,7 @@
   "_notice": "Screen rules authored from live captures of aider 0.86.2 (PTY runs; gitignore/model-warning/create-file confirms, request spinner, bare and ask-mode prompts). Every predicate below matches text aider actually painted; nothing is guessed from docs.",
   "schemaVersion": 2,
   "id": "aider",
-  "version": "2026.08.05.2",
+  "version": "2026.10.28.1",
   "statusModel": "full",
   "agent": {
     "id": "aider",
@@ -54,7 +54,7 @@
       "region": "bottom_non_empty_lines",
       "regionLines": 3,
       "when": {
-        "regex": "(?i)\\(y\\)es/\\(n\\)o[\\s\\S]*:\\s*$"
+        "regex": "(?i)\\(\\n?y\\n?\\)\\n?e\\n?s\\n?/\\n?\\(\\n?n\\n?\\)\\n?o[^\\[]*\\[[^\\]]{1,16}\\]\\n?:\\s*$"
       },
       "flags": [
         "visible_blocker"
@@ -64,8 +64,8 @@
         "regionLines": 6,
         "maxChars": 400
       },
-      "_notice": "Every aider confirm goes through the same prompt: 'Create new file? (Y)es/(N)o [Yes]:', 'Add .aider* to .gitignore (recommended)? (Y)es/(N)o [Yes]:', 'Open documentation url for more info? (Y)es/(N)o/(D)on't ask again [Yes]:', and the (A)ll/(S)kip-all file variants \u2014 all contain '(Y)es/(N)o'. Explicit capture because aider draws no prompt box, so the default prompt_box_body capture would come back empty.",
-      "_anchorNotice": "The trailing ':' anchor is what separates a PENDING confirm from an answered one. aider leaves the answered line on screen ('\u2026 [Yes]: y') and the spinner only repaints its own row, so a plain substring over the bottom lines kept this priority-1000 rule winning over the spinner for the whole model wait \u2014 i.e. 'needs input' fired again right after the user answered. Whole-region `regex` rather than `lineRegex` so a confirm that wraps (long paths in the (A)ll/(S)kip-all variant) still matches with '(Y)es/(N)o' on one row and the colon on the next; the anchor then means 'the prompt is the bottom-most thing painted', which is exactly when it is pending."
+      "_notice": "Every aider confirm goes through the same prompt: 'Create new file? (Y)es/(N)o [Yes]:', 'Add .aider* to .gitignore (recommended)? (Y)es/(N)o [Yes]:', 'Open documentation url for more info? (Y)es/(N)o/(D)on't ask again [Yes]:', and the (A)ll/(S)kip all file variants \u2014 aider 0.86.2 io.confirm_ask builds every one as '<question> (Y)es/(N)o[/(A)ll/(S)kip all][/(D)on't ask again] [<default>]: '. Explicit capture because aider draws no prompt box, so the default prompt_box_body capture would come back empty.",
+      "_anchorNotice": "Pending means the prompt's own '[<default>]:' is the bottom-most thing painted. aider leaves the answered line on screen ('\u2026 [Yes]: y') and keeps painting below it, so the bracket after '(N)o' must be the FIRST '[' after it ([^\\[]*) and be followed by nothing but the colon. The earlier '(y)es/(n)o[\\s\\S]*:\\s*$' let [\\s\\S]* run from the answered confirm to any later row ending in ':' \u2014 the follow-up request after 'Add file to the chat? \u2026 [Yes]: y' streams 'Here is the fix:' (captured) and read as needs-input mid-turn. Whole-region `regex` because the confirm wraps at any column, including inside the literal ('\u2026 info? (Y' / ')es/(N)o/(D)on't ask again [Yes]:' captured at 40 columns), hence the optional '\\n' between every character the wrap can split."
     },
     {
       "id": "working-spinner",
@@ -85,9 +85,9 @@
       "region": "bottom_non_empty_lines",
       "regionLines": 1,
       "when": {
-        "lineRegex": "^\\s*[-\\\\|/]\\s+(?:Waiting for|Generating commit message with)\\s"
+        "lineRegex": "^\\s*(?:#=|=#)\\s+(?:Waiting for|Generating commit message with)\\s"
       },
-      "_notice": "Defensive, NOT from a capture: aider's spinner falls back to an ASCII palette when stdout's encoding can't carry the block glyphs, and the block rule above is the only signal that says 'working' (streaming itself matches nothing). Deliberately scoped to the single bottom-most line and to a leading palette char, so it cannot fire on scrollback or on prose the model streamed \u2014 a text-only match here would outrank the idle prompt and strand the session in 'working', which is worse than the gap it covers. If the fallback layout turns out to differ, this rule is inert rather than wrong."
+      "_notice": "aider's spinner draws its ASCII frames ('#=' / '=#' sweeping a 10-column field, aider/waiting.py) when its unicode probe fails, and renders them as the block pair otherwise; captured with only that probe forced off ('      =#   Waiting for openai/fake'). The block rule above is the only other signal that says 'working' (streaming itself matches nothing). Scoped to the single bottom-most line, the scanner pair and the spinner's own text, so it cannot fire on scrollback or on prose the model streamed \u2014 a text-only match here would outrank the idle prompt and strand the session in 'working'."
     },
     {
       "id": "idle-prompt",
@@ -96,9 +96,9 @@
       "region": "bottom_non_empty_lines",
       "regionLines": 1,
       "when": {
-        "lineRegex": "^\\s*[a-z]*>\\s*$"
+        "lineRegex": "^\\s*(?:(?:architect|ask|context|diff|diff-fenced|editor-diff|editor-diff-fenced|editor-whole|func|help|patch|udiff|udiff-simple|whole)(?: multi)?|multi)?>\\s*$"
       },
-      "_notice": "Ready prompt is a bare '>' in code mode and '<mode>>' after /chat-mode ('ask>  ' captured live, trailing spaces included) \u2014 mode names are lowercase words (code, ask, architect, help, context), hence [a-z]*. No '-' in the class: it made '->' and '-->' read as the prompt, so a streamed Rust signature or the close of an HTML comment landing on the bottom row flipped the session to idle mid-turn. Scoped to the single bottom non-blank line so quoted '>' lines in scrollback cannot fire it \u2014 a lone '>' blockquote row streamed as the last line is still indistinguishable from the prompt, which is the one case this rule cannot separate.",
+      "_notice": "Ready prompt is '[<edit format>][ multi]> ' (aider 0.86.2 io.get_input): a bare '>' when the coder uses the model's default format, otherwise the format name ('diff>', 'ask>  ', 'diff-fenced>', 'diff-fenced multi>' all captured live). The formats are listed exactly rather than as a word class: [a-z]* missed the hyphenated formats and the multiline suffix, while a wider class would read a streamed 'string>' or 'html>' row as the prompt and flip the session to idle mid-turn. Scoped to the single bottom non-blank line so quoted '>' lines in scrollback cannot fire it \u2014 a lone '>' blockquote row streamed as the last line is still indistinguishable from the prompt, which is the one case this rule cannot separate.",
       "_debounceNotice": "Worth knowing when tuning any of these rules: because streaming matches nothing, the reducer never sees a 'working' screen observation mid-turn, and goWorking() is the only thing that cancels idle candidacy. A false idle here is therefore NOT reset the way it is for other agents \u2014 it accumulates toward idleConfirmations. Keep this predicate exact."
     }
   ]

@@ -1,0 +1,24 @@
+Add .aider* to .gitignore (recommended)? (Y)es/(N)o [Yes]:
+Added .aider* to .gitignore
+Warning for openai/fake: Unknown context window size and costs, using sane
+defaults.
+You can skip this check with --no-show-model-warnings
+
+https://aider.chat/docs/llms/warnings.html
+Open documentation url for more info? (Y)es/(N)o/(D)on't ask again [Yes]: n
+
+Aider v0.86.2
+Model: openai/fake with diff edit format
+Git repo: .git with 1 files
+Repo-map: disabled
+────────────────────────────────────────────────────────────────────────────────
+diff> MENTION notes please
+
+Please add notes.txt to the chat so I can edit it.
+
+
+Tokens: 2.3k sent, 13 received.
+
+notes.txt
+Add file to the chat? (Y)es/(N)o/(D)on't ask again [Yes]: y
+Here is the fix:

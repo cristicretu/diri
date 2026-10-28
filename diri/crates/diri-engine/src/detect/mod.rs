@@ -282,92 +282,6 @@ mod tests {
         engine
     }
 
-    /// Synthetic examples based on aider.json, not captured user sessions.
-    #[test]
-    fn aider_unanswered_and_wrapped_confirmations_match_permission() {
-        let engine = engine();
-        for lines in [
-            vec!["Create new file? (Y)es/(N)o [Yes]:"],
-            vec![
-                "░█ Waiting for openai/model",
-                "Add files? (Y)es/(N)o/(A)ll/(S)kip-all",
-                "[Yes]:",
-            ],
-        ] {
-            let snapshot = ScreenSnapshot::from_lines(lines.clone());
-            let observation = engine
-                .evaluate(&snapshot, "aider")
-                .expect("synthetic pending Aider confirmation should match");
-            assert_eq!(
-                (observation.state, observation.matched_rule_id.as_str()),
-                (ManifestState::BlockedPermission, "confirm-prompt"),
-                "{lines:#?}"
-            );
-            assert_eq!(observation.prompt_excerpt, Some(lines.join("\n")));
-        }
-    }
-
-    /// Synthetic examples based on aider.json, not captured user sessions.
-    #[test]
-    fn aider_answered_confirmation_yields_to_working_spinner() {
-        let engine = engine();
-        for spinner in [
-            "░█ Waiting for openai/model",
-            "  █░ Generating commit message with model",
-        ] {
-            for lines in [
-                vec![spinner],
-                vec!["Create new file? (Y)es/(N)o [Yes]: y", spinner],
-            ] {
-                let observation = engine
-                    .evaluate(&ScreenSnapshot::from_lines(lines.clone()), "aider")
-                    .expect("synthetic Aider spinner should match");
-                assert_eq!(
-                    (observation.state, observation.matched_rule_id.as_str()),
-                    (ManifestState::Working, "working-spinner"),
-                    "{lines:#?}"
-                );
-                assert_eq!(observation.prompt_excerpt, None);
-            }
-        }
-    }
-
-    /// Synthetic examples based on aider.json, not captured user sessions.
-    #[test]
-    fn aider_bottom_row_prompts_match_idle() {
-        let engine = engine();
-        for prompt in [">", "ask>  "] {
-            let observation = engine
-                .evaluate(
-                    &ScreenSnapshot::from_lines(["Response complete.", prompt]),
-                    "aider",
-                )
-                .expect("synthetic Aider bottom-row prompt should match");
-            assert_eq!(
-                (observation.state, observation.matched_rule_id.as_str()),
-                (ManifestState::Idle, "idle-prompt"),
-                "{prompt:?}"
-            );
-        }
-    }
-
-    /// Synthetic examples based on aider.json, not captured user sessions.
-    #[test]
-    fn aider_arrows_and_quoted_prompt_above_last_row_do_not_match_idle() {
-        let engine = engine();
-        for lines in [
-            vec!["->"],
-            vec!["-->"],
-            vec![">", "Response continues here."],
-        ] {
-            assert_eq!(
-                engine.evaluate(&ScreenSnapshot::from_lines(lines.clone()), "aider"),
-                None,
-                "synthetic non-prompt screen must not match: {lines:#?}"
-            );
-        }
-    }
-
     #[test]
     fn claude_live_work_outranks_its_visible_input_box() {
         let engine = engine();
@@ -1045,6 +959,136 @@ mod tests {
                 (actual.state, actual.matched_rule_id.as_str()),
                 (state, rule_id),
                 "{text}"
+            );
+        }
+    }
+
+    /// Visible grids captured from aider 0.86.2 in an 80- or 40-column PTY
+    /// against a scripted local OpenAI-compatible API; `working_ascii` forces
+    /// only aider's unicode probe off. Before these rules an answered confirm
+    /// read as pending again once a later row ended in ':' (the follow-up
+    /// request streams "Here is the fix:"), a confirm wrapped inside `(Y)es`
+    /// never read as blocked, the hyphenated edit-format and `multi` prompts
+    /// never read as idle, and the ASCII spinner rule matched a palette aider
+    /// does not draw.
+    #[test]
+    fn aider_rules_match_the_screens_aider_draws() {
+        let engine = engine();
+        let cases = [
+            (
+                include_str!("../../tests/fixtures/aider_screens/confirm_docs.txt"),
+                Some((ManifestState::BlockedPermission, "confirm-prompt")),
+            ),
+            (
+                include_str!("../../tests/fixtures/aider_screens/confirm_docs_wrapped.txt"),
+                Some((ManifestState::BlockedPermission, "confirm-prompt")),
+            ),
+            (
+                include_str!("../../tests/fixtures/aider_screens/confirm_gitignore_wrapped.txt"),
+                Some((ManifestState::BlockedPermission, "confirm-prompt")),
+            ),
+            (
+                include_str!("../../tests/fixtures/aider_screens/confirm_add_file.txt"),
+                Some((ManifestState::BlockedPermission, "confirm-prompt")),
+            ),
+            (
+                include_str!("../../tests/fixtures/aider_screens/working_request.txt"),
+                Some((ManifestState::Working, "working-spinner")),
+            ),
+            (
+                include_str!("../../tests/fixtures/aider_screens/answered_spinner.txt"),
+                Some((ManifestState::Working, "working-spinner")),
+            ),
+            (
+                include_str!("../../tests/fixtures/aider_screens/working_ascii.txt"),
+                Some((ManifestState::Working, "working-spinner-ascii")),
+            ),
+            // Streaming matches nothing, so the reducer keeps Working.
+            (
+                include_str!("../../tests/fixtures/aider_screens/answered_then_colon.txt"),
+                None,
+            ),
+            (
+                include_str!("../../tests/fixtures/aider_screens/denied_then_idle.txt"),
+                Some((ManifestState::Idle, "idle-prompt")),
+            ),
+            (
+                include_str!("../../tests/fixtures/aider_screens/idle_after_reply.txt"),
+                Some((ManifestState::Idle, "idle-prompt")),
+            ),
+            (
+                include_str!("../../tests/fixtures/aider_screens/idle_ask.txt"),
+                Some((ManifestState::Idle, "idle-prompt")),
+            ),
+            (
+                include_str!("../../tests/fixtures/aider_screens/idle_diff_fenced.txt"),
+                Some((ManifestState::Idle, "idle-prompt")),
+            ),
+            (
+                include_str!("../../tests/fixtures/aider_screens/idle_multi.txt"),
+                Some((ManifestState::Idle, "idle-prompt")),
+            ),
+        ];
+        for (text, expected) in cases {
+            let actual = engine.evaluate(
+                &ScreenSnapshot::from_lines(text.lines().map(str::to_owned)),
+                "aider",
+            );
+            assert_eq!(
+                actual
+                    .as_ref()
+                    .map(|actual| (actual.state, actual.matched_rule_id.as_str())),
+                expected,
+                "{text}"
+            );
+            if let Some(actual) =
+                actual.filter(|actual| actual.state == ManifestState::BlockedPermission)
+            {
+                let excerpt = actual.prompt_excerpt.expect("confirm excerpt");
+                let prompt = text.trim_end().lines().last().unwrap();
+                assert!(excerpt.ends_with(prompt), "{excerpt}");
+            }
+        }
+
+        // The subject aider prints above a confirm is part of the question.
+        let excerpt = engine
+            .evaluate(
+                &ScreenSnapshot::from_lines(
+                    include_str!("../../tests/fixtures/aider_screens/confirm_add_file.txt")
+                        .lines()
+                        .map(str::to_owned),
+                ),
+                "aider",
+            )
+            .and_then(|observation| observation.prompt_excerpt)
+            .unwrap();
+        assert!(
+            excerpt
+                .ends_with("notes.txt\nAdd file to the chat? (Y)es/(N)o/(D)on't ask again [Yes]:"),
+            "{excerpt}"
+        );
+
+        // Rows a reply can stream onto the bottom of the screen. Synthetic:
+        // none of them may read as a pending confirm, the prompt or the
+        // spinner. A lone '>' row stays indistinguishable from the prompt.
+        let answered = "Add file to the chat? (Y)es/(N)o/(D)on't ask again [Yes]: y";
+        for lines in [
+            vec![answered],
+            vec!["Create new file? (Y)es/(N)o [Yes]: n"],
+            vec![answered, "items[0]:"],
+            vec![answered, "Applying edit to src/main.rs:"],
+            vec!["->"],
+            vec!["-->"],
+            vec!["    string>"],
+            vec!["html>"],
+            vec![">", "Response continues here."],
+            vec!["- Waiting for review on the PR"],
+            vec!["| Generating commit message with care |"],
+        ] {
+            assert_eq!(
+                engine.evaluate(&ScreenSnapshot::from_lines(lines.clone()), "aider"),
+                None,
+                "{lines:#?}"
             );
         }
     }
