@@ -27,38 +27,20 @@ fn wait_until(what: &str, mut predicate: impl FnMut() -> bool) {
 /// startup alone has a wider budget than the 30 s every later step gets. A timeout reports what the Holder had
 /// on screen and whether its child is still running, so a stuck pipeline is
 /// told apart from a slow interpreter.
-fn wait_for_first_output(
-    what: &str,
-    session: &Session,
-    client: &HolderClient,
-    logs: &Path,
-    needle: &str,
-) {
+fn wait_for_first_output(what: &str, session: &Session, client: &HolderClient, needle: &str) {
     let started = Instant::now();
     let deadline = started + Duration::from_secs(120);
-    let mut first_bytes: Option<(Duration, String)> = None;
     loop {
-        if first_bytes.is_none()
-            && let Some(bytes) = first_log_bytes(logs)
-        {
-            first_bytes = Some((started.elapsed(), bytes));
-        }
         let screen = session.screen_lines().join("\n");
         if screen.contains(needle) {
-            eprintln!(
-                "{what} after {:?}; the child's first output after {:?}; log head now: {:?}",
-                started.elapsed(),
-                first_bytes,
-                first_log_bytes(logs),
-            );
+            eprintln!("{what} after {:?}", started.elapsed());
             return;
         }
         if Instant::now() >= deadline {
             let stat = client.stat();
             panic!(
-                "timed out waiting for {what} after {:?}; first output: {first_bytes:?}; \
-                 holder alive: {}; (child pid, child alive, bytes the child wrote): {:?}; \
-                 screen:\n{}",
+                "timed out waiting for {what} after {:?}; holder alive: {}; \
+                 (child pid, child alive, bytes the child wrote): {:?}; screen:\n{}",
                 started.elapsed(),
                 client.is_alive(),
                 stat.map(|stat| (stat.child_pid, stat.alive, stat.log_offset)),
@@ -67,16 +49,6 @@ fn wait_for_first_output(
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-}
-
-/// The first bytes the child wrote, escaped, from the session's output log.
-fn first_log_bytes(logs: &Path) -> Option<String> {
-    let mut head = Vec::new();
-    for entry in std::fs::read_dir(logs).ok()?.flatten() {
-        let bytes = std::fs::read(entry.path()).ok()?;
-        head.extend(bytes.into_iter().take(240));
-    }
-    (!head.is_empty()).then(|| head.escape_ascii().to_string())
 }
 
 fn engine() -> Arc<ManifestEngine> {
@@ -168,13 +140,7 @@ fn a_native_session_is_adopted_with_the_same_identity_screen_and_input() {
     let script = "Write-Output 'ready'; while ($null -ne ($line = [Console]::ReadLine())) { Write-Output ('seen:' + $line) }";
     let session = Session::spawn(spec(root.path(), &holder, script), Arc::clone(&engine)).unwrap();
     let cleanup = Cleanup::new(&holder);
-    wait_for_first_output(
-        "PowerShell ready",
-        &session,
-        &cleanup.client,
-        &root.path().join("logs"),
-        "ready",
-    );
+    wait_for_first_output("PowerShell ready", &session, &cleanup.client, "ready");
     session.write_input(b"before\r").unwrap();
     wait_until("input evaluated", || {
         session.screen_lines().join("\n").contains("seen:before")
@@ -216,13 +182,7 @@ fn holder_failure_kills_the_native_job_including_a_grandchild() {
     let script = "$child = Start-Process powershell.exe -ArgumentList '-NoLogo','-NoProfile','-Command','Start-Sleep -Seconds 120' -PassThru; Write-Output 'tree-ready'; Start-Sleep -Seconds 120";
     let session = Session::spawn(spec(root.path(), &holder, script), engine()).unwrap();
     let cleanup = Cleanup::new(&holder);
-    wait_for_first_output(
-        "child tree ready",
-        &session,
-        &cleanup.client,
-        &root.path().join("logs"),
-        "tree-ready",
-    );
+    wait_for_first_output("child tree ready", &session, &cleanup.client, "tree-ready");
     let leader = cleanup.client.stat().unwrap().child_pid;
     let mut identities = Vec::new();
     wait_until("live child and grandchild identities", || {
