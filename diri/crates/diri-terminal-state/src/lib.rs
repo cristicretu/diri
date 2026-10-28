@@ -325,6 +325,18 @@ fn validate_grid(grid: &GridUpdate) -> Result<(), MirrorError> {
     Ok(())
 }
 
+/// How [`HeadlessScreen::text_lines`] reads; all off reads like
+/// [`HeadlessScreen::lines`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TextOptions {
+    /// Join soft-wrapped rows into the line the program wrote.
+    pub unwrap: bool,
+    /// Keep colours and attributes as SGR escape sequences.
+    pub ansi: bool,
+    /// Include retained history above the screen, oldest first.
+    pub scrollback: bool,
+}
+
 /// Screen text and hyperlink targets for the artifact scanner; see
 /// [`HeadlessScreen::link_source`].
 #[derive(Clone, Debug, Default)]
@@ -520,6 +532,10 @@ pub struct HeadlessScreen {
     /// its cursor (neovim entering insert mode) must still advance
     /// `content_seq`, or the attach pump withholds the frame.
     cursor_style: CursorStyle,
+    /// The parser's color generation at the last settle. A program that only
+    /// recolors (OSC 4/10/11) moves no cell, and must still advance
+    /// `content_seq` or the attach pump withholds the recolored frame.
+    colors_generation: u64,
 
     /// Diff baseline for [`grid_update`]: the cells last handed out, so the
     /// next call sends only changed rows.
@@ -597,6 +613,7 @@ impl HeadlessScreen {
             unsolicited: Vec::new(),
             title_changed: false,
             cursor_style: CursorStyle::default(),
+            colors_generation: 0,
             last_cells: Vec::new(),
             last_annotations: Vec::new(),
             last_grid_cols: 0,
@@ -696,6 +713,45 @@ impl HeadlessScreen {
         reset.palette = self.palette;
         reset.content_seq = self.content_seq.saturating_add(1);
         *self = reset;
+    }
+
+    /// Clear Screen and Scrollback, the ⌘K of other terminals: history goes,
+    /// and the line the cursor is on (from where the program started it, if
+    /// it wrapped) moves to the top with everything above it dropped, so a
+    /// shell's prompt and whatever was typed at it stay. Modes, title and
+    /// the child are untouched.
+    ///
+    /// In the alternate screen this does nothing and returns false: a
+    /// full-screen program owns that screen and would not repaint it.
+    ///
+    /// Like [`Self::reset`] the owner must order it with output and durable
+    /// replay; the content revision always advances.
+    pub fn clear_scrollback(&mut self) -> bool {
+        use alacritty_terminal::vte::ansi::{ClearMode, Handler};
+        if self.is_alt_screen() {
+            return false;
+        }
+        let cursor = self.term.grid().cursor.point.line.0.max(0) as usize;
+        let cols = self.geometry.cols;
+        let mut top = cursor;
+        while top > 0
+            && cols > 0
+            && self.term.grid()[Line(top as i32 - 1)][Column(cols - 1)]
+                .flags
+                .contains(Flags::WRAPLINE)
+        {
+            top -= 1;
+        }
+        if top > 0 {
+            self.term.scroll_up(top);
+            self.term.move_up(top);
+        }
+        // Clearing history damages the whole screen, so the next
+        // publication is full.
+        self.term.clear_screen(ClearMode::Saved);
+        self.settle();
+        self.content_seq = self.content_seq.saturating_add(1);
+        true
     }
 
     pub fn reset_notification_sequence(&mut self) {
@@ -908,6 +964,12 @@ impl HeadlessScreen {
         if cursor_style != self.cursor_style {
             self.cursor_style = cursor_style;
             content_changed = true;
+        }
+        // Only a host screen publishes program colors (`palette_overrides`).
+        let colors_generation = self.term.colors_generation();
+        if colors_generation != self.colors_generation {
+            self.colors_generation = colors_generation;
+            content_changed |= self.host_replies;
         }
         if self.row_digests.len() != rows || self.row_filled_cells.len() != rows {
             self.rebuild_content_cache();
@@ -1528,6 +1590,14 @@ impl HeadlessScreen {
                     self.term.grid_mut()[line][Column(usize::from(*x))].push_zerowidth(ch);
                 }
             }
+            // The cells came back with the plain underline bit; the spans
+            // say which underline, in which color, and the overline.
+            for span in &metadata.styles {
+                let end = usize::from(span.end).min(self.geometry.cols);
+                for x in usize::from(span.start)..end {
+                    restore_decoration(&mut self.term.grid_mut()[line][Column(x)], span);
+                }
+            }
             self.finish_history_read_batch(index + 1, index + 1 == count);
         }
         #[cfg(feature = "compact-history")]
@@ -1930,6 +2000,7 @@ impl HeadlessScreen {
         // they never crowd out a link. Past it a span is dropped and its
         // cells keep the plain underline bit.
         let mut style_used = 0;
+        let overrides = palette_overrides(self.host_replies, &self.term);
         let source = &grid[line];
         for x in 0..self.geometry.cols {
             let cell = &source[Column(x)];
@@ -1942,7 +2013,13 @@ impl HeadlessScreen {
             if cell.flags.intersects(SPAN_FLAGS)
                 || (extra && cell.flags.intersects(Flags::ALL_UNDERLINES))
             {
-                push_style_span(&mut result.styles, cell, x as u16, &mut style_used, budget);
+                push_style_span(
+                    &mut result.styles,
+                    (cell, overrides),
+                    x as u16,
+                    &mut style_used,
+                    budget,
+                );
             }
             if !extra {
                 continue;
@@ -2030,6 +2107,132 @@ impl HeadlessScreen {
             }
         }
         text.trim_end().to_string()
+    }
+
+    /// The screen, and with [`TextOptions::scrollback`] the retained history
+    /// above it, as text for a reader rather than a renderer: an agent or a
+    /// script reading another session's output. With every option off this
+    /// is exactly [`Self::lines`].
+    ///
+    /// [`TextOptions::unwrap`] rejoins rows the terminal soft-wrapped at its
+    /// width, so a URL, path, JSON value or stack frame longer than the pane
+    /// arrives as the one line the program wrote. A hard newline still ends
+    /// a line, and trailing blanks are trimmed only where a line really ends.
+    ///
+    /// [`TextOptions::ansi`] keeps colours and attributes as SGR sequences,
+    /// emitted only where the style changes and reset at each line's end so
+    /// any line can be printed on its own.
+    pub fn text_lines(&mut self, options: TextOptions) -> Vec<String> {
+        let rows = self.geometry.rows;
+        let history = if options.scrollback {
+            self.term.grid().history_size()
+        } else {
+            0
+        };
+        let total = history + rows;
+        let mut lines = Vec::with_capacity(total);
+        let mut logical = String::new();
+        for index in 0..total {
+            let line = Line(index as i32 - history as i32);
+            let continues = options.unwrap && index + 1 < total && self.row_wraps(line);
+            self.push_row_text(line, options.ansi, continues, &mut logical);
+            if !continues {
+                lines.push(std::mem::take(&mut logical));
+            }
+            if options.scrollback {
+                self.finish_history_read_batch(index + 1, index + 1 == total);
+            }
+        }
+        while lines.last().is_some_and(|line| line.trim().is_empty()) {
+            lines.pop();
+        }
+        lines
+    }
+
+    /// Whether the program's line runs on past the end of `line`.
+    fn row_wraps(&self, line: Line) -> bool {
+        let cols = self.geometry.cols;
+        cols > 0
+            && self.term.grid()[line][Column(cols - 1)]
+                .flags
+                .contains(Flags::WRAPLINE)
+    }
+
+    /// Appends one row's text to `out`; trailing blanks are kept only when
+    /// the line continues onto the next row.
+    fn push_row_text(&self, line: Line, ansi: bool, keep_trailing: bool, out: &mut String) {
+        let source = &self.term.grid()[line];
+        let cols = self.geometry.cols;
+        let spacer = Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
+        if !ansi {
+            let start = out.len();
+            for column in 0..cols {
+                let cell = &source[Column(column)];
+                if cell.flags.intersects(spacer) {
+                    continue;
+                }
+                out.push(cell.c);
+                if let Some(combining) = cell.zerowidth() {
+                    out.extend(combining.iter().copied());
+                }
+            }
+            if !keep_trailing {
+                let kept = start + out[start..].trim_end().len();
+                out.truncate(kept);
+            }
+            return;
+        }
+        let end = if keep_trailing {
+            cols
+        } else {
+            (0..cols)
+                .rev()
+                .find(|&column| {
+                    let cell = &source[Column(column)];
+                    !cell.flags.intersects(spacer)
+                        && (!(cell.c.is_whitespace() || cell.c == '\0')
+                            || cell.zerowidth().is_some())
+                })
+                .map_or(0, |column| column + 1)
+        };
+        let visual = |cell: &GridCell| {
+            (
+                cell.fg,
+                cell.bg,
+                TermStyle::from_bits_retain(cell.style.bits() & 0xff),
+            )
+        };
+        let plain = visual(&GridCell::BLANK);
+        let mut current = plain;
+        for column in 0..end {
+            let cell = &source[Column(column)];
+            if cell.flags.intersects(spacer) {
+                continue;
+            }
+            let mut wire = wire_cell(cell);
+            // The wire folds BOLD and DIM together (`DIM_BOLD` holds both
+            // bits); a reader gets the attributes the program set.
+            let mut bits = wire.style.bits() & !(TermStyle::BOLD.bits() | TermStyle::DIM.bits());
+            if cell.flags.contains(Flags::BOLD) {
+                bits |= TermStyle::BOLD.bits();
+            }
+            if cell.flags.contains(Flags::DIM) {
+                bits |= TermStyle::DIM.bits();
+            }
+            wire.style = TermStyle::from_bits_retain(bits);
+            let style = visual(&wire);
+            if style != current {
+                out.push_str(&sgr(&wire, None));
+                current = style;
+            }
+            out.push(if cell.c == '\0' { ' ' } else { cell.c });
+            if let Some(combining) = cell.zerowidth() {
+                out.extend(combining.iter().copied());
+            }
+        }
+        if current != plain {
+            out.push_str("\x1b[0m");
+        }
     }
 
     /// What a link scanner needs from the screen and the newest `history_rows`
@@ -2425,19 +2628,30 @@ fn wire_cell(cell: &alacritty_terminal::term::cell::Cell) -> GridCell {
     )
 }
 
-/// Colors 0–255 a program redefined with OSC 4, when it has, so grids show
-/// them as the RGB the program chose. `None`, the usual case, costs one scan
-/// of 256 entries per publication and nothing per cell.
+/// The last color index cells are painted with: 0–255, then the default
+/// foreground (OSC 10) and background (OSC 11).
+const PAINTED_COLORS: usize = NamedColor::Background as usize + 1;
+
+/// Colors a program redefined, when it has: 0–255 with OSC 4 and the default
+/// foreground and background with OSC 10/11, so grids show them as the RGB
+/// the program chose. `None`, the usual case, costs one scan of 258 entries
+/// per publication and nothing per cell.
 fn palette_overrides(host_replies: bool, term: &Term<Collector>) -> Option<&Colors> {
     let colors = term.colors();
-    (host_replies && (0..256).any(|index| colors[index].is_some())).then_some(colors)
+    (host_replies && (0..PAINTED_COLORS).any(|index| colors[index].is_some())).then_some(colors)
 }
 
 fn apply_palette(cell: &mut GridCell, colors: &Colors) {
+    // The wire's `Default` and `DefaultInverted` are the default foreground
+    // and background; each slot only ever holds its own one.
     let resolve = |color: &mut TermColor| {
-        if let TermColor::Ansi(index) = *color
-            && let Some(rgb) = colors[usize::from(index)]
-        {
+        let index = match *color {
+            TermColor::Ansi(index) => usize::from(index),
+            TermColor::Default => NamedColor::Foreground as usize,
+            TermColor::DefaultInverted => NamedColor::Background as usize,
+            TermColor::Rgb(..) => return,
+        };
+        if let Some(rgb) = colors[index] {
             *color = TermColor::Rgb(rgb.r, rgb.g, rgb.b);
         }
     };
@@ -2495,8 +2709,10 @@ fn wire_color(color: Color) -> TermColor {
     }
 }
 
-/// The decoration of `cell` beyond the style bits, if it needs a span.
-fn cell_decoration(cell: &Cell) -> Option<StyleSpan> {
+/// The decoration of `cell` beyond the style bits, if it needs a span. An
+/// indexed underline color a program redefined (`overrides`) is sent as the
+/// RGB it chose, like the cell's own colors.
+fn cell_decoration(cell: &Cell, overrides: Option<&Colors>) -> Option<StyleSpan> {
     let flags = cell.flags;
     let underline = if flags.contains(Flags::UNDERCURL) {
         UnderlineKind::Curly
@@ -2514,7 +2730,14 @@ fn cell_decoration(cell: &Cell) -> Option<StyleSpan> {
     // SGR 58 alone draws nothing; `Default` is the foreground anyway.
     let underline_color = cell
         .underline_color()
-        .map(|color| wire_color(color).packed())
+        .map(|color| match (wire_color(color), overrides) {
+            (TermColor::Ansi(index), Some(colors)) => colors[usize::from(index)]
+                .map_or(TermColor::Ansi(index), |rgb| {
+                    TermColor::Rgb(rgb.r, rgb.g, rgb.b)
+                }),
+            (color, _) => color,
+        })
+        .map(TermColor::packed)
         .filter(|packed| *packed != TermColor::Default.packed() && !underline.is_none());
     let overline = flags.contains(Flags::OVERLINE);
     let plain = matches!(underline, UnderlineKind::None | UnderlineKind::Single)
@@ -2532,12 +2755,12 @@ fn cell_decoration(cell: &Cell) -> Option<StyleSpan> {
 /// Extends the last span or starts one for the cell at `x`.
 fn push_style_span(
     spans: &mut Vec<StyleSpan>,
-    cell: &Cell,
+    (cell, overrides): (&Cell, Option<&Colors>),
     x: u16,
     used: &mut usize,
     budget: usize,
 ) {
-    let Some(mut span) = cell_decoration(cell) else {
+    let Some(mut span) = cell_decoration(cell, overrides) else {
         return;
     };
     if let Some(last) = spans.last_mut()
@@ -2823,6 +3046,25 @@ fn restore_semantic_flags(target: &mut Cell, source: GridCell) {
     }
 }
 
+/// Puts a row's decoration span back on one restored cell.
+fn restore_decoration(cell: &mut Cell, span: &StyleSpan) {
+    let underline = match span.underline {
+        UnderlineKind::None => Flags::empty(),
+        UnderlineKind::Single => Flags::UNDERLINE,
+        UnderlineKind::Double => Flags::DOUBLE_UNDERLINE,
+        UnderlineKind::Curly => Flags::UNDERCURL,
+        UnderlineKind::Dotted => Flags::DOTTED_UNDERLINE,
+        UnderlineKind::Dashed => Flags::DASHED_UNDERLINE,
+    };
+    cell.flags.remove(Flags::ALL_UNDERLINES);
+    cell.flags.insert(underline);
+    cell.flags.set(Flags::OVERLINE, span.overline);
+    cell.set_underline_color(
+        span.underline_color
+            .map(|packed| emulator_color(TermColor::unpack(packed))),
+    );
+}
+
 fn emulator_cell(cell: GridCell) -> Cell {
     let mut flags = Flags::empty();
     if cell.style.contains(TermStyle::BOLD) {
@@ -2830,6 +3072,9 @@ fn emulator_cell(cell: GridCell) -> Cell {
     }
     if cell.style.contains(TermStyle::UNDERLINE) {
         flags.insert(Flags::UNDERLINE);
+    }
+    if cell.style.contains(TermStyle::BLINK) {
+        flags.insert(Flags::BLINK);
     }
     if cell.style.contains(TermStyle::INVERSE) {
         flags.insert(Flags::INVERSE);
@@ -3308,6 +3553,54 @@ mod tests {
     }
 
     #[test]
+    fn clear_scrollback_keeps_the_cursor_line_and_drops_everything_above() {
+        let mut screen = HeadlessScreen::new(10, 4);
+        for n in 0..8 {
+            screen.feed(format!("out {n}\r\n").as_bytes());
+        }
+        // A prompt whose typed command wrapped onto a second row.
+        screen.feed(b"$ echo abcdefgh");
+        let seq = screen.content_seq();
+        assert!(screen.scrollback().first_row == 0 && screen.scrollback().visible_start_row > 0);
+        assert!(screen.clear_scrollback());
+        assert_eq!(screen.lines(), ["$ echo abc", "defgh"]);
+        assert_eq!(screen.cursor(), (5, 1, true));
+        let after = screen.scrollback();
+        assert_eq!(after.visible_start_row, 0, "history is gone");
+        assert!(screen.content_seq() > seq);
+        // Typing continues where it was.
+        screen.feed(b"!\r\nnext");
+        assert_eq!(screen.lines(), ["$ echo abc", "defgh!", "next"]);
+    }
+
+    #[test]
+    fn clear_scrollback_at_the_top_still_drops_history() {
+        let mut screen = HeadlessScreen::new(10, 3);
+        screen.feed(b"a\r\nb\r\nc\r\nd\r\n\x1b[H\x1b[2J$ ");
+        assert!(screen.scrollback().visible_start_row > 0);
+        let seq = screen.content_seq();
+        assert!(screen.clear_scrollback());
+        assert_eq!(screen.scrollback().visible_start_row, 0);
+        assert_eq!(screen.lines(), ["$"]);
+        assert!(
+            screen.content_seq() > seq,
+            "a history-only change still publishes"
+        );
+    }
+
+    #[test]
+    fn clear_scrollback_leaves_the_alternate_screen_alone() {
+        let mut screen = HeadlessScreen::new(10, 3);
+        screen.feed(b"a\r\nb\r\nc\r\nd\r\n\x1b[?1049h\x1b[HTUI");
+        let seq = screen.content_seq();
+        assert!(!screen.clear_scrollback());
+        assert_eq!(screen.lines(), ["TUI"]);
+        assert_eq!(screen.content_seq(), seq);
+        screen.feed(b"\x1b[?1049l");
+        assert!(screen.scrollback().visible_start_row > 0, "history kept");
+    }
+
+    #[test]
     fn link_source_rejoins_wrapped_rows_and_keeps_hyperlinks_and_history() {
         let mut screen = HeadlessScreen::new(20, 4);
         screen.feed(b"first https://a.dev/0123456789abcdef end\r\n");
@@ -3334,6 +3627,69 @@ mod tests {
         let (at, uri) = &source.hyperlinks[0];
         assert_eq!(uri, "https://github.com/o/r/pull/9");
         assert!(source.text[*at..].starts_with("PR #9"));
+    }
+
+    #[test]
+    fn text_lines_with_no_options_reads_like_lines() {
+        let mut screen = HeadlessScreen::new(10, 4);
+        screen.feed(b"abcdefghijKLM  \r\n\x1b[31mred\x1b[0m \xe4\xb8\xad\r\n");
+        assert_eq!(screen.text_lines(TextOptions::default()), screen.lines());
+        assert_eq!(screen.lines(), ["abcdefghij", "KLM", "red \u{4e2d}"]);
+    }
+
+    #[test]
+    fn text_lines_unwrap_rejoins_soft_wraps_but_not_hard_newlines() {
+        let mut screen = HeadlessScreen::new(10, 6);
+        // 24 columns of path wrap twice; the space at a wrap boundary is
+        // part of the line, the blanks after a hard newline are not.
+        screen.feed(b"/a/b/c/d/e f/h/i/j/k/l/m\r\nshort   \r\n0123456789\r\nnext");
+        let unwrap = TextOptions {
+            unwrap: true,
+            ..TextOptions::default()
+        };
+        assert_eq!(
+            screen.text_lines(unwrap),
+            ["/a/b/c/d/e f/h/i/j/k/l/m", "short", "0123456789", "next"]
+        );
+    }
+
+    #[test]
+    fn text_lines_unwrap_reaches_into_history_and_across_the_screen_edge() {
+        let mut screen = HeadlessScreen::new(8, 3);
+        screen.feed(b"https://example.com/long/path\r\nx\r\ny\r\nz");
+        let visible = TextOptions {
+            unwrap: true,
+            ..TextOptions::default()
+        };
+        // Only the URL's tail is on screen.
+        assert_eq!(screen.text_lines(visible), ["x", "y", "z"]);
+        let all = TextOptions {
+            scrollback: true,
+            ..visible
+        };
+        assert_eq!(
+            screen.text_lines(all),
+            ["https://example.com/long/path", "x", "y", "z"]
+        );
+    }
+
+    #[test]
+    fn text_lines_ansi_keeps_style_changes_and_resets_each_line() {
+        let mut screen = HeadlessScreen::new(20, 3);
+        screen.feed(b"ok \x1b[1;31mFAIL\x1b[0m done\r\n\x1b[32mgreen\r\nplain");
+        let ansi = TextOptions {
+            ansi: true,
+            ..TextOptions::default()
+        };
+        assert_eq!(
+            screen.text_lines(ansi),
+            [
+                "ok \x1b[0;1;38;5;1;49mFAIL\x1b[0;39;49m done",
+                "\x1b[0;38;5;2;49mgreen\x1b[0m",
+                // SGR 32 is still in force: the program never reset it.
+                "\x1b[0;38;5;2;49mplain\x1b[0m",
+            ]
+        );
     }
 
     #[test]
@@ -4516,6 +4872,118 @@ mod qol_tests {
         let rows = GridRowCodec::decode_rows(&history.payload, history.row_count as usize).unwrap();
         assert_eq!(weights(&rows[0]), BOLD_FAINT_BOTH_STYLES);
     }
+    /// A local Engine screen: the one that shows colors programs set.
+    fn host(cols: usize, rows: usize) -> HeadlessScreen {
+        HeadlessScreen::new(cols, rows).with_host_replies("test")
+    }
+
+    #[test]
+    fn a_recolor_alone_advances_the_sequence_and_reaches_the_diff() {
+        let mut screen = host(20, 2);
+        screen.feed(b"\x1b[31mred\x1b[0m plain \x1b[4:3;58;5;1mcurly\x1b[0m");
+        screen.grid_update(true);
+        let before = screen.content_seq();
+
+        // OSC 4 moves no cell. The Engine publishes only when the sequence
+        // moves, so the text already on screen must change color with it.
+        screen.feed(b"\x1b]4;1;rgb:12/34/56\x1b\\");
+        assert!(screen.content_seq() > before, "a recolor is a new frame");
+        let recolored = screen.grid_update(false);
+        assert_eq!(recolored.changed_rows.len(), 1);
+        assert_eq!(
+            recolored.changed_rows[0].cells[0].fg,
+            TermColor::Rgb(0x12, 0x34, 0x56)
+        );
+        // So does an underline drawn in that color.
+        assert_eq!(
+            recolored.changed_rows[0].metadata.styles[0].underline_color,
+            Some(TermColor::Rgb(0x12, 0x34, 0x56).packed())
+        );
+
+        // Setting the same color again is not a change; resetting it is.
+        let same = screen.content_seq();
+        screen.feed(b"\x1b]4;1;rgb:12/34/56\x1b\\");
+        assert_eq!(screen.content_seq(), same);
+        screen.feed(b"\x1b]104;1\x1b\\");
+        assert!(screen.content_seq() > same);
+        assert_eq!(
+            screen.grid_update(false).changed_rows[0].cells[0].fg,
+            TermColor::Ansi(1)
+        );
+
+        // A screen that does not show program colors has no new frame.
+        let mut mirror = HeadlessScreen::new(20, 2);
+        mirror.feed(b"\x1b[31mred");
+        let before = mirror.content_seq();
+        mirror.feed(b"\x1b]4;1;rgb:12/34/56\x1b\\");
+        assert_eq!(mirror.content_seq(), before);
+    }
+
+    #[test]
+    fn default_colors_set_with_osc_10_and_11_paint_default_cells() {
+        let mut screen = host(20, 2);
+        screen.feed(b"plain \x1b[7minverse\x1b[0m \x1b[31;42mred\x1b[0m");
+        screen.grid_update(true);
+        let before = screen.content_seq();
+        screen.feed(b"\x1b]10;rgb:ff/80/00\x1b\\\x1b]11;rgb:00/00/40\x07");
+        assert!(screen.content_seq() > before);
+        let fg = TermColor::Rgb(0xff, 0x80, 0x00);
+        let bg = TermColor::Rgb(0x00, 0x00, 0x40);
+        let update = screen.grid_update(false);
+        let cells = &update.changed_rows[0].cells;
+        // Plain text, the blanks after it, and inverse video (which swaps
+        // the two) all use the program's defaults; explicit colors do not.
+        assert_eq!((cells[0].fg, cells[0].bg), (fg, bg));
+        assert_eq!((cells[19].fg, cells[19].bg), (fg, bg));
+        assert_eq!((cells[6].fg, cells[6].bg), (fg, bg));
+        assert!(cells[6].style.contains(TermStyle::INVERSE));
+        assert_eq!(
+            (cells[14].fg, cells[14].bg),
+            (TermColor::Ansi(1), TermColor::Ansi(2))
+        );
+        // History shows them too.
+        screen.feed(b"\r\n\r\n");
+        let history = screen.scrollback_cells(0, 1);
+        let rows = GridRowCodec::decode_rows(&history.payload, 1).unwrap();
+        assert_eq!((rows[0][0].fg, rows[0][0].bg), (fg, bg));
+
+        // OSC 110/111 give the theme its defaults back.
+        screen.feed(b"\x1b]110\x1b\\\x1b]111\x1b\\");
+        let cells = screen.full_snapshot().changed_rows[0].cells.clone();
+        assert_eq!(
+            (cells[0].fg, cells[0].bg),
+            (TermColor::Default, TermColor::DefaultInverted)
+        );
+    }
+
+    #[test]
+    fn reset_forgets_the_colors_a_program_set() {
+        let mut screen = host(20, 2);
+        screen.feed(b"\x1b]4;1;rgb:12/34/56\x1b\\\x1b]11;rgb:00/00/40\x1b\\");
+        screen.feed(b"\x1bc\x1b[31mred");
+        let cell = screen.full_snapshot().changed_rows[0].cells[0];
+        assert_eq!(
+            (cell.fg, cell.bg),
+            (TermColor::Ansi(1), TermColor::DefaultInverted)
+        );
+    }
+
+    #[test]
+    fn restored_history_keeps_blink_and_decorations() {
+        let mut screen = HeadlessScreen::new(20, 2);
+        screen.feed(b"\x1b[5mblink\x1b[0m \x1b[4:3;58:2::1:2:3mcurly\x1b[0m \x1b[53;4:2mover\x1b[0m\r\n\r\n\r\n");
+        let history = screen.history_snapshot();
+        let metadata = screen.history_metadata();
+        let grid = screen.full_snapshot();
+        let mut restored = HeadlessScreen::new(20, 2);
+        assert!(restored.restore(&history, &grid, false, false, MouseModes::OFF));
+        restored.restore_history_metadata(&metadata);
+        assert_eq!(restored.history_snapshot(), history);
+        assert_eq!(restored.history_metadata(), metadata);
+        assert!(history[0][0].style.contains(TermStyle::BLINK));
+        assert_eq!(metadata[0].styles.len(), 2);
+    }
+
     #[test]
     fn hyperlink_only_changes_advance_sequence_and_survive_mirror_reseed() {
         let mut screen = HeadlessScreen::new(40, 4);

@@ -170,6 +170,14 @@
   "settings.terminal.app_links_detail_none": "Diri asks before opening ssh, mailto, editor and other app links.",
   "settings.terminal.app_links_remove": "{scheme} ✕",
   "settings.terminal.file_links_detail": "The editor a clicked file path opens in.",
+  "settings.terminal.keyboard": "Keyboard",
   "settings.terminal.mouse": "Mouse and selection",
+  "settings.terminal.option_automatic": "Automatic",
+  "settings.terminal.option_both": "Both",
+  "settings.terminal.option_key": "Option key as Meta",
+  "settings.terminal.option_key_detail": "Esc + key, so ⌥B moves back a word. Automatic does this on US layouts only.",
+  "settings.terminal.option_left": "Left Option",
+  "settings.terminal.option_off": "Off",
+  "settings.terminal.option_right": "Right Option",
   "settings.terminal.shell": "Shell"
 }

@@ -275,6 +275,7 @@ pub fn is_lifecycle_method(method: &str) -> bool {
             | Method::SESSION_HIBERNATE
             | Method::SESSION_WAKE
             | Method::SESSION_RESET_TERMINAL
+            | Method::SESSION_CLEAR_SCROLLBACK
             | Method::SESSION_REPARENT_WORKTREE
             | Method::SESSION_SEND_TEXT
             | Method::ACCOUNT_SWITCH_ALL

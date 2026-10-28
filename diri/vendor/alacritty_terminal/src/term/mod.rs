@@ -416,6 +416,11 @@ pub struct Term<T> {
     /// Modified terminal colors.
     colors: Colors,
 
+    /// DIRI PATCH: advances whenever a color cells are painted with (0–255
+    /// and the default foreground and background) changes, so a recolor that
+    /// moves no cell is still noticed.
+    colors_generation: u64,
+
     /// Current style of the cursor.
     cursor_style: Option<CursorStyle>,
 
@@ -617,6 +622,7 @@ impl<T> Term<T> {
             vi_mode_cursor: Default::default(),
             cursor_style: Default::default(),
             colors: color::Colors::default(),
+            colors_generation: 0,
             title_stack: Default::default(),
             is_focused: Default::default(),
             selection: Default::default(),
@@ -1301,6 +1307,12 @@ impl<T> Term<T> {
 
     pub fn colors(&self) -> &Colors {
         &self.colors
+    }
+
+    /// DIRI PATCH: see `colors_generation`. The cursor color does not count;
+    /// no cell is painted with it.
+    pub fn colors_generation(&self) -> u64 {
+        self.colors_generation
     }
 
     /// Insert a linebreak at the current cursor position.
@@ -2131,6 +2143,7 @@ impl<T: EventListener> Handler for Term<T> {
         // Damage terminal if the color changed and it's not the cursor.
         if index != NamedColor::Cursor as usize && self.colors[index] != Some(color) {
             self.mark_fully_damaged();
+            self.colors_generation += 1;
         }
 
         self.colors[index] = Some(color);
@@ -2161,6 +2174,7 @@ impl<T: EventListener> Handler for Term<T> {
         // Damage terminal if the color changed and it's not the cursor.
         if index != NamedColor::Cursor as usize && self.colors[index].is_some() {
             self.mark_fully_damaged();
+            self.colors_generation += 1;
         }
 
         self.colors[index] = None;
@@ -2326,6 +2340,12 @@ impl<T: EventListener> Handler for Term<T> {
         // DIRI PATCH: RIS resets the title too; listeners track it by event.
         if self.title.take().is_some() {
             self.event_proxy.send_event(Event::ResetTitle);
+        }
+        // DIRI PATCH: and the colors a program set with OSC 4/10/11/12, as
+        // xterm and libghostty do: `reset` restores the configured palette.
+        if (0..color::COUNT).any(|index| self.colors[index].is_some()) {
+            self.colors = color::Colors::default();
+            self.colors_generation += 1;
         }
         self.selection = None;
         self.vi_mode_cursor = Default::default();

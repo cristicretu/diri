@@ -925,6 +925,8 @@ pub struct TerminalViewport {
 pub struct TerminalPane {
     #[cfg(test)]
     pub(crate) render_count: usize,
+    /// How the last key press read Option, for its release.
+    last_option_key: OptionKey,
     /// Hosts the note when this pane's session is a note Session: a note has
     /// no PTY, so the pane shows the editor and never attaches.
     note: Option<Entity<crate::notes::NotePane>>,
@@ -1243,6 +1245,7 @@ impl TerminalPane {
         let mut pane = Self {
             #[cfg(test)]
             render_count: 0,
+            last_option_key: OptionKey::Meta,
             note: None,
             pending_note_block: None,
             window_store,
@@ -4281,7 +4284,20 @@ impl TerminalPane {
             cx.propagate();
             return;
         }
-        let option = OptionKey::for_layout(cx.keyboard_layout().id());
+        let option_choice = self
+            .runtime
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .terminal_option_as_meta;
+        let option = OptionKey::resolve(
+            option_choice,
+            cx.keyboard_layout().id(),
+            physical_modifier_flags(),
+        );
+        // A release reuses its press's reading: a key-up carries no flags.
+        self.last_option_key = option;
         let Some(mapped) = terminal_key_event(event, option) else {
             cx.propagate();
             return;
@@ -4374,7 +4390,7 @@ impl TerminalPane {
         if !reports_key_releases(resident.keyboard) || resident.find.is_some() {
             return;
         }
-        let option = OptionKey::for_layout(cx.keyboard_layout().id());
+        let option = self.last_option_key;
         let Some((mut term_event, mut modifiers)) =
             terminal_keystroke_event(&event.keystroke, option)
         else {
@@ -6073,6 +6089,18 @@ impl TerminalPane {
                 },
             ))
             .on_action(
+                cx.listener(|this, _: &crate::commands::ClearScrollback, window, cx| {
+                    this.clear_scrollback(window, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::ResetTerminal, window, cx| {
+                    this.reset_terminal(window, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_action(
                 cx.listener(|this, _: &crate::commands::NextPrompt, window, cx| {
                     this.read_terminal_history(Some(true), window, cx);
                     cx.stop_propagation();
@@ -6407,7 +6435,41 @@ enum OptionKey {
     Compose,
 }
 
+/// macOS's device-dependent modifier bits telling which Option is held
+/// (`NX_DEVICELALTKEYMASK`, `NX_DEVICERALTKEYMASK`).
+const LEFT_OPTION_FLAG: u64 = 0x20;
+const RIGHT_OPTION_FLAG: u64 = 0x40;
+
 impl OptionKey {
+    /// The Settings choice for this keystroke. `physical` is the raw
+    /// modifier flags of the key event being dispatched, which carry the
+    /// left/right Option bits GPUI's modifiers fold together; without them
+    /// (a replayed event) a one-sided choice falls back to the layout rule.
+    fn resolve(
+        choice: crate::store::OptionAsMeta,
+        layout_id: &str,
+        physical: Option<u64>,
+    ) -> Self {
+        use crate::store::OptionAsMeta;
+        let side = match choice {
+            OptionAsMeta::Automatic => return Self::for_layout(layout_id),
+            OptionAsMeta::Both => return Self::Meta,
+            OptionAsMeta::Off => return Self::Compose,
+            OptionAsMeta::Left => LEFT_OPTION_FLAG,
+            OptionAsMeta::Right => RIGHT_OPTION_FLAG,
+        };
+        match physical {
+            Some(flags) if flags & (LEFT_OPTION_FLAG | RIGHT_OPTION_FLAG) != 0 => {
+                if flags & side != 0 {
+                    Self::Meta
+                } else {
+                    Self::Compose
+                }
+            }
+            _ => Self::for_layout(layout_id),
+        }
+    }
+
     fn for_layout(layout_id: &str) -> Self {
         // Off macOS, Alt is a real Alt key; AltGr composition arrives without
         // the alt modifier.
@@ -6439,6 +6501,18 @@ fn option_meta_text(keystroke: &gpui::Keystroke) -> String {
         return key.to_ascii_uppercase();
     }
     key.to_owned()
+}
+
+/// Raw modifier flags of the key event dispatching right now, if any.
+fn physical_modifier_flags() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        gpui_macos::current_physical_key().map(|(_, flags)| flags)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
 }
 
 fn terminal_key_event(
@@ -12249,6 +12323,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Settings › Terminal › Option key: one side, both, none, or the layout
+    /// rule. Left and right are told apart by the event's device flags.
+    #[test]
+    fn option_as_meta_setting_picks_meta_per_side() {
+        use crate::store::OptionAsMeta;
+        let german = "com.apple.keylayout.German";
+        let us = "com.apple.keylayout.US";
+        // Raw flags as AppKit reports ⌥ held: the device-independent Option
+        // bit plus the side's device bit.
+        let left = Some(0x8_0000 | LEFT_OPTION_FLAG);
+        let right = Some(0x8_0000 | RIGHT_OPTION_FLAG);
+        let resolve = OptionKey::resolve;
+        assert_eq!(resolve(OptionAsMeta::Both, german, left), OptionKey::Meta);
+        assert_eq!(resolve(OptionAsMeta::Off, us, left), OptionKey::Compose);
+        assert_eq!(resolve(OptionAsMeta::Left, german, left), OptionKey::Meta);
+        assert_eq!(resolve(OptionAsMeta::Left, us, right), OptionKey::Compose);
+        assert_eq!(resolve(OptionAsMeta::Right, us, left), OptionKey::Compose);
+        assert_eq!(resolve(OptionAsMeta::Right, german, right), OptionKey::Meta);
+        // Without device flags a one-sided choice falls back to the layout.
+        for side in [OptionAsMeta::Left, OptionAsMeta::Right] {
+            assert_eq!(resolve(side, us, None), OptionKey::for_layout(us));
+            assert_eq!(resolve(side, german, Some(0x8_0000)), OptionKey::for_layout(german));
+        }
+        assert_eq!(
+            resolve(OptionAsMeta::Automatic, german, left),
+            OptionKey::for_layout(german)
+        );
+
+        // End to end: left ⌥B as Meta is readline's backward-word, right ⌥L
+        // types the layout's `@`.
+        assert_eq!(
+            option_bytes(&option_key("alt-b", Some("∫")), resolve(OptionAsMeta::Left, german, left)),
+            b"\x1bb"
+        );
+        assert_eq!(
+            option_bytes(&option_key("alt-l", Some("@")), resolve(OptionAsMeta::Left, german, right)),
+            b"@"
+        );
     }
 
     /// US layouts keep Option as Meta, and Meta now means the key itself:

@@ -290,3 +290,13 @@ cells of the newest sealed block (`RowCodec::clear_row`). Column changes keep
 stored rows when only the oldest block is partial, and the deferred line index
 reserves exact capacity and tracks its extras' heap incrementally (the history
 bound measures storage after every eviction).
+
+## Program colors: a generation, and RIS resets them
+
+`Term` keeps `colors_generation`, advanced whenever `set_color` or
+`reset_color` changes a color cells are painted with (0–255 and the dynamic
+foreground and background; not the cursor). A program that recolors with
+OSC 4/10/11 changes no cell, so without it the host's change detection saw no
+change and never republished the screen. `reset_state` (RIS, `ESC c`) also
+clears every color a program set, as xterm and libghostty do; upstream kept
+them across `reset`. No wire, checkpoint or protocol change.

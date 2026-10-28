@@ -134,6 +134,7 @@ enum SettingsMenu {
     HibernateAfter,
     MemoryLimit,
     FileEditor,
+    OptionAsMeta,
     UpdateChannel,
     InterfaceStyle,
     PaneDensity,
@@ -165,6 +166,26 @@ const FILE_EDITOR_OPTIONS: [crate::store::FileEditor; 5] = [
     crate::store::FileEditor::Zed,
     crate::store::FileEditor::DefaultApp,
 ];
+
+/// Option key choices, in menu order.
+const OPTION_AS_META_OPTIONS: [crate::store::OptionAsMeta; 5] = [
+    crate::store::OptionAsMeta::Automatic,
+    crate::store::OptionAsMeta::Left,
+    crate::store::OptionAsMeta::Right,
+    crate::store::OptionAsMeta::Both,
+    crate::store::OptionAsMeta::Off,
+];
+
+fn option_as_meta_label(choice: crate::store::OptionAsMeta) -> &'static str {
+    use crate::store::OptionAsMeta;
+    crate::i18n::t(match choice {
+        OptionAsMeta::Automatic => "settings.terminal.option_automatic",
+        OptionAsMeta::Left => "settings.terminal.option_left",
+        OptionAsMeta::Right => "settings.terminal.option_right",
+        OptionAsMeta::Both => "settings.terminal.option_both",
+        OptionAsMeta::Off => "settings.terminal.option_off",
+    })
+}
 
 fn file_editor_label(choice: crate::store::FileEditor) -> String {
     use crate::store::FileEditor;
@@ -5353,6 +5374,7 @@ impl UtilitySurfaces {
             SettingsMenu::HibernateAfter => (self.hibernate_options(colors, cx), 172.0),
             SettingsMenu::MemoryLimit => (self.memory_options(colors, cx), 132.0),
             SettingsMenu::FileEditor => (self.file_editor_options(colors, cx), 204.0),
+            SettingsMenu::OptionAsMeta => (self.option_as_meta_options(colors, cx), 204.0),
             SettingsMenu::UpdateChannel => (self.update_channel_options(colors, cx), 132.0),
             SettingsMenu::InterfaceStyle => (self.interface_style_options(colors, cx), 172.0),
             SettingsMenu::PaneDensity => (self.pane_density_options(colors, cx), 172.0),
@@ -5897,6 +5919,45 @@ impl UtilitySurfaces {
                 "update-channel-dropdown",
                 open,
                 SettingsMenu::UpdateChannel,
+                colors,
+                cx,
+            ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    fn option_as_meta_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for (index, choice) in OPTION_AS_META_OPTIONS.into_iter().enumerate() {
+            options = options.child(settings_choice_row(
+                format!("option-as-meta-option-{index}"),
+                option_as_meta_label(choice),
+                choice == self.prefs.terminal_option_as_meta,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.settings_menu = None;
+                    this.update_prefs(move |prefs| prefs.terminal_option_as_meta = choice);
+                    cx.notify();
+                },
+            ));
+        }
+        options.into_any_element()
+    }
+
+    fn option_as_meta_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let open = self.settings_menu == Some(SettingsMenu::OptionAsMeta);
+        let mut control = div()
+            .relative()
+            .min_w(px(160.0))
+            .child(settings_select_button(
+                option_as_meta_label(self.prefs.terminal_option_as_meta),
+                "option-as-meta-dropdown",
+                open,
+                SettingsMenu::OptionAsMeta,
                 colors,
                 cx,
             ));
@@ -6483,6 +6544,18 @@ impl UtilitySurfaces {
                         )),
                     colors,
                 ))
+                .when(cfg!(target_os = "macos"), |page| {
+                    page.child(setting_section(
+                        t("settings.terminal.keyboard"),
+                        div().flex().flex_col().child(setting_row(
+                            t("settings.terminal.option_key"),
+                            t("settings.terminal.option_key_detail"),
+                            self.option_as_meta_dropdown(cx),
+                            colors,
+                        )),
+                        colors,
+                    ))
+                })
                 .child(setting_section(
                     t("settings.terminal.shell"),
                     div()
