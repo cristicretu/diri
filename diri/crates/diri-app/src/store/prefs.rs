@@ -313,6 +313,27 @@ pub enum FileEditor {
     Automatic,
 }
 
+/// Which Option keys a terminal treats as Meta (`ESC` + key, readline's
+/// `M-b`) rather than as the key that types the layout's characters.
+/// Stored by name; an unknown name reads as `Automatic`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OptionAsMeta {
+    /// Left Option is Meta, right Option types characters.
+    Left,
+    /// Right Option is Meta, left Option types characters.
+    Right,
+    /// Both Option keys are Meta.
+    Both,
+    /// Neither: Option types the layout's characters.
+    Off,
+    /// Meta on US layouts, characters on layouts that need Option to type
+    /// ASCII. Last because serde's catch-all must be.
+    #[default]
+    #[serde(other)]
+    Automatic,
+}
+
 impl WindowMaterial {
     pub const fn to_ui(self) -> diri_ui::Material {
         match self {
@@ -609,6 +630,9 @@ pub struct Prefs {
     /// Where a clicked `file:line` reference in terminal output opens.
     #[serde(default)]
     pub terminal_file_editor: FileEditor,
+    /// Which Option keys are Meta in a terminal.
+    #[serde(default)]
+    pub terminal_option_as_meta: OptionAsMeta,
     /// Start a new terminal in the directory the last terminal was in,
     /// instead of its project's root. Missing files pick this up as on.
     #[serde(default = "terminal_follows_last_directory_default")]
@@ -765,6 +789,7 @@ impl Default for Prefs {
             terminal_cursor_follows_programs: true,
             terminal_shell_integration: true,
             terminal_file_editor: FileEditor::Automatic,
+            terminal_option_as_meta: OptionAsMeta::Automatic,
             terminal_follows_last_directory: true,
             terminal_paste_protection: false,
             window_material: WindowMaterial::Glass,
@@ -1137,6 +1162,29 @@ mod tests {
         restored.follow_system_theme = false;
         assert!(!restored.apply_system_theme(false));
         assert_eq!(restored.terminal_theme, "dirijor-dark");
+    }
+
+    #[test]
+    fn option_as_meta_defaults_to_automatic_and_round_trips() {
+        let legacy: Prefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.terminal_option_as_meta, OptionAsMeta::Automatic);
+        let unknown: Prefs =
+            serde_json::from_str(r#"{"terminalOptionAsMeta":"middle"}"#).unwrap();
+        assert_eq!(unknown.terminal_option_as_meta, OptionAsMeta::Automatic);
+        for choice in [
+            OptionAsMeta::Left,
+            OptionAsMeta::Right,
+            OptionAsMeta::Both,
+            OptionAsMeta::Off,
+        ] {
+            let prefs = Prefs {
+                terminal_option_as_meta: choice,
+                ..Prefs::default()
+            };
+            let restored: Prefs =
+                serde_json::from_slice(&serde_json::to_vec(&prefs).unwrap()).unwrap();
+            assert_eq!(restored.terminal_option_as_meta, choice);
+        }
     }
 
     #[test]

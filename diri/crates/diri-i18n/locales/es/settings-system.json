@@ -164,6 +164,14 @@
   "settings.resources.session_limits": "Límites de sesión",
   "settings.resources.title": "Recursos",
   "settings.terminal.file_links_detail": "El editor donde se abre una ruta de archivo al hacer clic.",
+  "settings.terminal.keyboard": "Teclado",
   "settings.terminal.mouse": "Ratón y selección",
+  "settings.terminal.option_automatic": "Automático",
+  "settings.terminal.option_both": "Ambas",
+  "settings.terminal.option_key": "Opción como Meta",
+  "settings.terminal.option_key_detail": "Esc + tecla, así ⌥B retrocede una palabra. Automático solo lo hace en distribuciones de EE. UU.",
+  "settings.terminal.option_left": "Opción izquierda",
+  "settings.terminal.option_off": "Desactivado",
+  "settings.terminal.option_right": "Opción derecha",
   "settings.terminal.shell": "Shell"
 }

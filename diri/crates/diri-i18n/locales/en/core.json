@@ -34,7 +34,7 @@
   "settings.keywords.schedules": "schedules scheduled tasks cron timer daily weekdays every morning run later catch up missed sleep wake open at login keep awake",
   "settings.keywords.shortcuts": "shortcuts keyboard bindings hotkeys commands keys navigation sessions workspace terminal",
   "settings.keywords.skills": "skills catalogue catalog instructions personal project plugins search SKILL.md",
-  "settings.keywords.terminal": "terminal copy selection select links click file editor open pointer mouse cursor paste protection shell integration zsh bash prompt marks last folder directory default terminal man",
+  "settings.keywords.terminal": "terminal copy selection select links click file editor open pointer mouse cursor paste protection shell integration zsh bash prompt marks last folder directory default terminal man keyboard option alt meta esc layout",
   "settings.keywords.usage": "usage cost tokens spending cache savings model daily claude codex",
   "settings.keywords.voice": "voice speech speak read aloud talk tts dictation answer wispr flow kokoro listen microphone",
   "settings.keywords.whats_new": "what's new whats new release notes latest version changes features improvements",
