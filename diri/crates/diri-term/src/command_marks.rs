@@ -123,6 +123,52 @@ pub fn command_output_at<'a>(
     None
 }
 
+/// What a search for the nearest prompt mark found.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PromptSearch {
+    /// The absolute row of the nearest prompt that way.
+    Found(i64),
+    /// Every row that way was read and none starts a prompt.
+    Absent,
+    /// A row that way is not held here, so a fuller copy must answer.
+    Unknown,
+}
+
+/// Whether a row holds the start of a shell prompt.
+#[inline]
+#[must_use]
+pub fn starts_prompt(cells: &[GridCell]) -> bool {
+    cells
+        .iter()
+        .any(|cell| cell.style.contains(TermStyle::PROMPT_START))
+}
+
+/// The prompt nearest to `from`, strictly above it (`next == false`) or
+/// strictly below it, among rows `first..end`. Reads outward one row at a
+/// time and stops at the first prompt, so its cost is the distance to that
+/// prompt, not the length of the history. A row `row` cannot supply makes the
+/// answer [`PromptSearch::Unknown`] instead of a guess.
+pub fn nearest_prompt<'a>(
+    from: i64,
+    next: bool,
+    first: i64,
+    end: i64,
+    row: impl Fn(i64) -> Option<&'a [GridCell]>,
+) -> PromptSearch {
+    let step = if next { 1 } else { -1 };
+    let mut absolute = from.saturating_add(step);
+    while absolute >= first && absolute < end {
+        let Some(cells) = row(absolute) else {
+            return PromptSearch::Unknown;
+        };
+        if starts_prompt(cells) {
+            return PromptSearch::Found(absolute);
+        }
+        absolute += step;
+    }
+    PromptSearch::Absent
+}
+
 /// The rows of a command's output, cut to the output's first and last cells.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct OutputRows {
@@ -187,6 +233,58 @@ impl LastCommandOutput {
     #[must_use]
     pub fn finish(self) -> Option<OutputRows> {
         self.last.filter(|last| !last.rows.is_empty())
+    }
+}
+
+/// Finds the same output as [`LastCommandOutput`] over the whole history
+/// while reading it backward from the live end, page by page, so the read
+/// stops a page or two above the newest finished command instead of
+/// covering every retained row.
+///
+/// After each page the rows held so far are read forward. Any output found
+/// there is the newest one overall: a newer output would have to start above
+/// these rows, but the end found here closes every output started before it.
+/// When nothing is found, rows below the topmost held prompt can no longer
+/// matter (an output that crossed that prompt was abandoned by it), so only
+/// rows up to that prompt row are kept. That bounds what is held to about
+/// one command's rows.
+#[derive(Default)]
+pub struct NewestCommandOutput {
+    /// Held rows in reading order, the first one being the topmost read.
+    rows: std::collections::VecDeque<(Vec<GridCell>, Option<RowMetadata>)>,
+    cells: usize,
+}
+
+impl NewestCommandOutput {
+    /// Feeds the page of rows directly above every row fed so far, in
+    /// reading order. Returns the newest finished output once it is known.
+    pub fn push_page_above(
+        &mut self,
+        page: impl DoubleEndedIterator<Item = (Vec<GridCell>, Option<RowMetadata>)>,
+    ) -> Option<OutputRows> {
+        for row in page.rev() {
+            self.cells += row.0.len();
+            self.rows.push_front(row);
+        }
+        let mut last = LastCommandOutput::default();
+        for (cells, metadata) in &self.rows {
+            last.push_row(cells, metadata.as_ref());
+        }
+        if let Some(output) = last.finish() {
+            return Some(output);
+        }
+        if let Some(prompt) = self.rows.iter().position(|(cells, _)| starts_prompt(cells)) {
+            for (cells, _) in self.rows.drain(prompt + 1..) {
+                self.cells -= cells.len();
+            }
+        }
+        None
+    }
+
+    /// Cells held between pages, to bound the read.
+    #[must_use]
+    pub fn held_cells(&self) -> usize {
+        self.cells
     }
 }
 
@@ -358,5 +456,113 @@ mod tests {
         let output = last.finish().unwrap();
         assert_eq!(output.rows.len(), 2, "the end's own row holds no output");
         assert_eq!(output.rows[0].0[0].scalar, u32::from('a'));
+    }
+    #[test]
+    fn the_newest_output_read_backward_matches_a_full_forward_read() {
+        let histories: Vec<Vec<Vec<GridCell>>> = vec![
+            session(),
+            rows(&["{A}$ ls", "{C}a", "b", "{0}{A}$"]),
+            // The newest end has no output of its own (an empty command),
+            // so the answer is the older one.
+            rows(&["{A}$ ls", "{C}a", "b", "{0}{A}$", "{?}{A}$", "{?}{A}$", ""]),
+            // An output abandoned by a prompt before it ended.
+            rows(&["{A}$ cat", "{C}one", "two", "{0}{A}$ x", "{C}lost", "{A}$"]),
+            // A whole command on one row, then a long running one.
+            rows(&[
+                "{A}$ x{C}out{0}",
+                "{A}$ make",
+                "{C}building",
+                "more",
+                "more",
+            ]),
+            // No finished command at all.
+            rows(&["{A}$ make", "{C}building", "more"]),
+            rows(&["plain", "text"]),
+            rows(&[]),
+        ];
+        for history in &histories {
+            let mut forward = LastCommandOutput::default();
+            for row in history {
+                forward.push_row(row, None);
+            }
+            let expected = forward.finish();
+            for page in 1..=history.len().max(1) {
+                let mut backward = NewestCommandOutput::default();
+                let mut end = history.len();
+                let mut found = None;
+                while end > 0 && found.is_none() {
+                    let first = end.saturating_sub(page);
+                    found = backward
+                        .push_page_above(history[first..end].iter().map(|row| (row.clone(), None)));
+                    end = first;
+                }
+                assert_eq!(found, expected, "page {page} of {history:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_backward_read_stops_near_the_newest_command_and_holds_little() {
+        let mut history = vec![];
+        for _ in 0..1_000 {
+            history.extend(rows(&["{A}$ ls", "{C}a", "b"]));
+            history.extend(rows(&["{0}"]));
+        }
+        history.extend(rows(&["{A}$ make", "{C}building", "more"]));
+        let mut backward = NewestCommandOutput::default();
+        let mut end = history.len();
+        let mut read = 0;
+        let output = loop {
+            let first = end.saturating_sub(2);
+            read += end - first;
+            if let Some(output) =
+                backward.push_page_above(history[first..end].iter().map(|row| (row.clone(), None)))
+            {
+                break output;
+            }
+            end = first;
+        };
+        assert_eq!(output.rows.len(), 2);
+        assert!(read <= 8, "read {read} of {} rows", history.len());
+
+        // With no finished command, what is held stays one command's rows.
+        let mut backward = NewestCommandOutput::default();
+        for _ in 0..1_000 {
+            assert!(
+                backward
+                    .push_page_above(
+                        rows(&["{A}$ sleep", "{C}waiting"])
+                            .into_iter()
+                            .map(|row| (row, None))
+                    )
+                    .is_none()
+            );
+            assert!(backward.held_cells() <= 2 * 12);
+        }
+    }
+
+    #[test]
+    fn the_nearest_prompt_is_read_outward_and_never_guessed() {
+        let session = session();
+        let all = lookup(&session);
+        assert_eq!(nearest_prompt(5, false, 0, 6, &all), PromptSearch::Found(4));
+        assert_eq!(nearest_prompt(4, false, 0, 6, &all), PromptSearch::Found(3));
+        assert_eq!(nearest_prompt(3, false, 0, 6, &all), PromptSearch::Found(0));
+        assert_eq!(nearest_prompt(0, false, 0, 6, &all), PromptSearch::Absent);
+        assert_eq!(nearest_prompt(0, true, 0, 6, &all), PromptSearch::Found(3));
+        assert_eq!(nearest_prompt(4, true, 0, 6, &all), PromptSearch::Absent);
+        // A gap in the held rows stops the search before it guesses past it.
+        let held = |row: i64| (row != 2).then(|| session[row as usize].as_slice());
+        assert_eq!(nearest_prompt(3, false, 0, 6, held), PromptSearch::Unknown);
+        assert_eq!(nearest_prompt(1, true, 0, 6, held), PromptSearch::Unknown);
+        assert_eq!(nearest_prompt(4, false, 0, 6, held), PromptSearch::Found(3));
+        // Rows outside `first..end` are never asked for.
+        assert_eq!(
+            nearest_prompt(2, false, 1, 6, |row| {
+                assert!(row >= 1, "asked for row {row}");
+                Some(session[row as usize].as_slice())
+            }),
+            PromptSearch::Absent
+        );
     }
 }

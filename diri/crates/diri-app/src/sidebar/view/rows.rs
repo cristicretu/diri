@@ -47,6 +47,11 @@ pub(in crate::sidebar) struct SessionRowProps {
     pub(super) drag_selection: Option<Vec<SessionId>>,
     pub(super) migrating: bool,
     pub(super) activity_state: StatusState,
+    /// What the row says instead of its title while it waits on a named
+    /// question or permission (`session_presentation::blocker_line`).
+    pub(super) blocker: Option<String>,
+    /// Under the Activity filter, the second line: the state and its age.
+    pub(super) activity: Option<(String, Option<String>)>,
     /// Panes in this row's tab, when it is split.
     pub(super) panes: usize,
     /// Terminal progress, when the session reports any.
@@ -70,7 +75,7 @@ pub(in crate::sidebar) struct SessionRowProps {
 
 pub(in crate::sidebar) struct SessionRowView {
     sidebar: WeakEntity<Sidebar>,
-    props: SessionRowProps,
+    pub(super) props: SessionRowProps,
     #[cfg(all(test, target_os = "macos"))]
     pub(super) renders: usize,
 }
@@ -81,6 +86,12 @@ impl SessionRowView {
         self.props.held_hint
     }
 
+}
+
+// The window-key test that reads these compiles on every platform (Linux and
+// Windows CI run `clippy --all-targets`), so they must not be macOS-only.
+#[cfg(test)]
+impl SessionRowView {
     pub(super) fn look_for_test(&self) -> crate::chrome_focus::ChromeLook {
         self.props.look
     }
@@ -120,7 +131,7 @@ impl Sidebar {
     ) -> SessionRowProps {
         let session = &row.session;
         let id = &session.id;
-        let (selected, multi, drag_selection, migrating, unread, pane_group) = {
+        let (selected, multi, drag_selection, migrating, activity_state, pane_group, unseen) = {
             let mut store = self.store.write().expect("session store lock poisoned");
             (
                 // While the To-dos page covers the workbench, no row is the
@@ -129,16 +140,35 @@ impl Sidebar {
                 store.sidebar_selection().contains(id),
                 (store.sidebar_selection().len() > 1).then(|| store.sidebar_selection_ordered()),
                 store.migrating().contains(id),
-                store.notifications().session_unread(id),
+                // One row per tab: it shows its most urgent pane.
+                super::activity::row_state(&store, session),
                 store.pane_group(id),
+                self.activity_filter
+                    .then(|| store.notifications().latest_unread(id).cloned())
+                    .flatten(),
             )
         };
         let (panes, shells) = pane_group.unwrap_or_default();
-        // One row per tab: it shows its most urgent pane.
-        let activity_state = shells.iter().fold(
-            sidebar_activity_state(status_state(session, migrating), unread),
-            |state, shell| most_urgent(state, status_state(shell, false)),
-        );
+        // The pane that makes the row ask: the row's own session, unless a
+        // split pane is the one waiting.
+        let asking = std::iter::once(&**session)
+            .chain(shells.iter().map(|shell| &**shell))
+            .find(|pane| matches!(status_state(pane, false), StatusState::NeedsInput { .. }))
+            .unwrap_or(&**session);
+        let blocker = crate::session_presentation::blocker_line(asking);
+        let activity = self.activity_filter.then(|| {
+            let line = crate::session_presentation::activity_line(
+                asking,
+                activity_state,
+                unseen.as_ref(),
+            );
+            let age = line.since_ms.map(|since| {
+                let (label, next) = crate::session_presentation::age_label(since, self.age_now());
+                self.note_age_change(next);
+                label
+            });
+            (line.text, age)
+        });
         SessionRowProps {
             row: row.clone(),
             shortcut,
@@ -150,6 +180,8 @@ impl Sidebar {
             drag_selection,
             migrating,
             activity_state,
+            blocker,
+            activity,
             panes,
             progress: crate::progress_mark::face(session, self.activity_frame, reduce_motion),
             marked: self.ui.delegation_mark.as_ref() == Some(id),
@@ -230,10 +262,11 @@ impl Sidebar {
         if working {
             self.animated_rows.push(view.downgrade());
         }
+
         view.cached(
             gpui::StyleRefinement::default()
                 .w_full()
-                .h(px(SIDEBAR_NAV_ROW_HEIGHT))
+                .h(px(self.session_row_height()))
                 .flex_none(),
         )
         .force_render_if(force || changed)

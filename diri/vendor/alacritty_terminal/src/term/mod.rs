@@ -28,9 +28,16 @@ use crate::vte::ansi::{
 
 pub mod cell;
 pub mod color;
+mod grapheme;
+mod grapheme_table;
 pub mod keyboard;
 pub mod search;
-mod spacing_marks;
+
+/// Columns `text` takes as this terminal lays it out by default: the grapheme
+/// cluster widths of Bun's `stringWidth`, which Claude Code assumes.
+pub fn grapheme_width(text: &str) -> usize {
+    grapheme::str_width(text, false)
+}
 
 /// Minimum number of columns.
 ///
@@ -83,6 +90,8 @@ bitflags! {
         const COLOR_SCHEME_UPDATES    = 1 << 23;
         /// DIRI PATCH: DECSET 2048, in-band resize reports.
         const IN_BAND_RESIZE          = 1 << 24;
+        /// DECSET 2027: grapheme cluster widths by the clustering rule.
+        const GRAPHEME_CLUSTERING     = 1 << 25;
         const MOUSE_MODE              = Self::MOUSE_REPORT_CLICK.bits() | Self::MOUSE_MOTION.bits() | Self::MOUSE_DRAG.bits();
         const KITTY_KEYBOARD_PROTOCOL = Self::DISAMBIGUATE_ESC_CODES.bits()
                                       | Self::REPORT_EVENT_TYPES.bits()
@@ -381,6 +390,11 @@ pub struct Term<T> {
     /// Terminal focus controlling the cursor shape.
     pub is_focused: bool,
 
+    /// Tests only: write wide characters the way `input` did before
+    /// `write_wide_pair`, to check it against.
+    #[cfg(test)]
+    reference_wide_writes: bool,
+
     /// Cursor for keyboard selection.
     pub vi_mode_cursor: ViModeCursor,
 
@@ -415,6 +429,11 @@ pub struct Term<T> {
 
     /// Modified terminal colors.
     colors: Colors,
+
+    /// DIRI PATCH: advances whenever a color cells are painted with (0–255
+    /// and the default foreground and background) changes, so a recolor that
+    /// moves no cell is still noticed.
+    colors_generation: u64,
 
     /// Current style of the cursor.
     cursor_style: Option<CursorStyle>,
@@ -507,15 +526,76 @@ pub enum Osc52 {
 }
 
 impl<T> Term<T> {
+    /// Release the primary grid's history caches once output is idle.
     #[cfg(feature = "compact-history")]
-    pub fn bound_primary_history_storage(&mut self, budget: usize) {
+    pub fn release_idle_history(&mut self) {
         if self.mode.contains(TermMode::ALT_SCREEN) {
             self.inactive_grid
                 .as_mut()
                 .expect("primary grid")
-                .bound_history_storage(budget);
+                .release_idle_history();
         } else {
-            self.grid.bound_history_storage(budget);
+            self.grid.release_idle_history();
+        }
+    }
+
+    /// DIRI PATCH: history rows of the primary screen, also while the
+    /// alternate screen is shown.
+    pub fn primary_history_size(&self) -> usize {
+        match (
+            &self.inactive_grid,
+            self.mode.contains(TermMode::ALT_SCREEN),
+        ) {
+            (Some(primary), true) => primary.history_size(),
+            _ => self.grid.history_size(),
+        }
+    }
+
+    /// DIRI PATCH: changes only the history row limit, as `set_options` does
+    /// for `scrolling_history`, without its damage and title side effects. A
+    /// lower limit drops the oldest rows; the limit survives a reset.
+    pub fn set_scrolling_history(&mut self, limit: usize) {
+        self.config.scrolling_history = limit;
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            self.inactive_grid
+                .as_mut()
+                .expect("alternate screen retains the primary grid")
+                .update_history(limit);
+        } else {
+            self.grid.update_history(limit);
+        }
+    }
+
+    /// Bound primary history to `budget` stored bytes. The configured
+    /// `scrolling_history` is only a ceiling: see
+    /// [`Grid::bound_history_storage`].
+    #[cfg(feature = "compact-history")]
+    pub fn bound_primary_history_storage(&mut self, budget: usize) {
+        let ceiling = self.config.scrolling_history;
+        self.primary_grid_mut()
+            .bound_history_storage(budget, ceiling);
+    }
+
+    /// Keep the primary history's recycled rows across history bounds until
+    /// [`Term::release_primary_history_spare_rows`]: see
+    /// [`Grid::keep_history_spare_rows`].
+    #[cfg(feature = "compact-history")]
+    pub fn keep_primary_history_spare_rows(&mut self, keep: bool) {
+        self.primary_grid_mut().keep_history_spare_rows(keep);
+    }
+
+    /// Drop the primary history's recycled rows.
+    #[cfg(feature = "compact-history")]
+    pub fn release_primary_history_spare_rows(&mut self) {
+        self.primary_grid_mut().release_history_spare_rows();
+    }
+
+    #[cfg(feature = "compact-history")]
+    fn primary_grid_mut(&mut self) -> &mut Grid<Cell> {
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            self.inactive_grid.as_mut().expect("primary grid")
+        } else {
+            &mut self.grid
         }
     }
 
@@ -570,8 +650,11 @@ impl<T> Term<T> {
             vi_mode_cursor: Default::default(),
             cursor_style: Default::default(),
             colors: color::Colors::default(),
+            colors_generation: 0,
             title_stack: Default::default(),
             is_focused: Default::default(),
+            #[cfg(test)]
+            reference_wide_writes: false,
             selection: Default::default(),
             title: Default::default(),
             mode: Default::default(),
@@ -862,6 +945,13 @@ impl<T> Term<T> {
         self.vi_mode_cursor.point.line += delta;
 
         let is_alt = self.mode.contains(TermMode::ALT_SCREEN);
+        // Reflow may change the physical row count; only the configured
+        // ceiling limits it by rows. The caller's byte bound trims afterwards.
+        #[cfg(feature = "compact-history")]
+        {
+            let ceiling = self.config.scrolling_history;
+            self.primary_grid_mut().restore_history_limit(ceiling);
+        }
         self.grid.resize(!is_alt, num_lines, num_cols);
         if let Some(inactive_grid) = self.inactive_grid.as_mut() {
             inactive_grid.resize(is_alt, num_lines, num_cols);
@@ -1249,6 +1339,12 @@ impl<T> Term<T> {
         &self.colors
     }
 
+    /// DIRI PATCH: see `colors_generation`. The cursor color does not count;
+    /// no cell is painted with it.
+    pub fn colors_generation(&self) -> u64 {
+        self.colors_generation
+    }
+
     /// Insert a linebreak at the current cursor position.
     #[inline]
     fn wrapline(&mut self)
@@ -1273,6 +1369,56 @@ impl<T> Term<T> {
         self.grid.cursor.point.column = Column(0);
         self.grid.cursor.input_needs_wrap = false;
         self.damage_cursor();
+    }
+
+    /// DIRI PATCH: writes the wide character `c` and its spacer at the
+    /// cursor, leaving the cursor on the spacer, when neither cell is part of
+    /// an earlier wide character. Exactly the two `write_at_cursor` calls of
+    /// `input`, with the row looked up once; returns false, writing nothing,
+    /// when they would also have to clear an old wide character.
+    #[inline]
+    fn write_wide_pair(&mut self, c: char) -> bool {
+        #[cfg(test)]
+        if self.reference_wide_writes {
+            return false;
+        }
+        let point = self.grid.cursor.point;
+        if point.column.0 + 1 >= self.columns() {
+            return false;
+        }
+        let row = &self.grid[point.line];
+        let wide = Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER;
+        if row[point.column].flags.intersects(wide) || row[point.column + 1].flags.intersects(wide)
+        {
+            return false;
+        }
+        // Non-ASCII characters and the spacer's blank map to themselves in
+        // every charset, but keep the mapping `write_at_cursor` applies.
+        let charset = self.grid.cursor.charsets[self.active_charset];
+        let (c, blank) = (charset.map(c), charset.map(' '));
+        let template = &self.grid.cursor.template;
+        let (fg, bg, flags, extra) = (
+            template.fg,
+            template.bg,
+            template.flags,
+            template.extra.clone(),
+        );
+        let row = &mut self.grid[point.line];
+        let [glyph, spacer] = &mut row[point.column..point.column + 2] else {
+            unreachable!("two cells")
+        };
+        glyph.c = c;
+        glyph.fg = fg;
+        glyph.bg = bg;
+        glyph.flags = flags | Flags::WIDE_CHAR | (glyph.flags & Flags::SHELL_MARKS);
+        glyph.extra = extra.clone();
+        spacer.c = blank;
+        spacer.fg = fg;
+        spacer.bg = bg;
+        spacer.flags = flags | Flags::WIDE_CHAR_SPACER | (spacer.flags & Flags::SHELL_MARKS);
+        spacer.extra = extra;
+        self.grid.cursor.point.column += 1;
+        true
     }
 
     /// Write `c` to the cell at the cursor position.
@@ -1322,6 +1468,238 @@ impl<T> Term<T> {
         cursor_cell.bg = bg;
         cursor_cell.flags = flags;
         cursor_cell.extra = extra;
+    }
+
+    /// Adds `c` to the grapheme cluster in the cell before the cursor when no
+    /// cluster boundary separates them, resizing that cell when the cluster's
+    /// width changes (`❤` + VS16 becomes two columns, a second regional
+    /// indicator makes a two-column flag). Returns false when `c` starts a
+    /// new cluster or takes columns of its own.
+    ///
+    /// The cluster is read back from the cell, so no state outlives a cursor
+    /// move: a cell holds one cluster's codepoints in order.
+    fn continue_cluster(&mut self, c: char, info: grapheme::Info) -> bool
+    where
+        T: EventListener,
+    {
+        // Real clusters hold a handful of codepoints; past this a run of
+        // joiners stops growing one cell without bound.
+        const MAX_CLUSTER_CHARS: usize = 32;
+
+        let point = self.grid.cursor.point;
+        let mut column = point.column;
+        if !self.grid.cursor.input_needs_wrap {
+            if column.0 == 0 {
+                return false;
+            }
+            column -= 1;
+        }
+        let line = point.line;
+        if self.grid[line][column]
+            .flags
+            .contains(Flags::WIDE_CHAR_SPACER)
+        {
+            if column.0 == 0 {
+                return false;
+            }
+            column -= 1;
+        }
+        let cell = &self.grid[line][column];
+        if cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            return false;
+        }
+        let zerowidth = cell.zerowidth().unwrap_or(&[]);
+        if zerowidth.len() >= MAX_CLUSTER_CHARS {
+            return false;
+        }
+        // Cheap rejections before replaying the cell, for runs of marks and
+        // emoji. A codepoint rejected here lands exactly as it would after a
+        // cluster boundary: a zero-width mark on this cell, anything else in
+        // cells of its own.
+        let clustering = self.mode.contains(TermMode::GRAPHEME_CLUSTERING);
+        let first = grapheme::Info::of(cell.c);
+        let base = first.class();
+        if !grapheme::is_presentation_mark(c) {
+            let alone_presents = grapheme::Cluster::new(cell.c, first).presentation();
+            if info.width() == 0 {
+                // A mark changes no width, except that a second codepoint
+                // makes a lone regional indicator a two-column cluster.
+                if !(zerowidth.is_empty() && alone_presents) {
+                    return false;
+                }
+            } else if !clustering
+                && !matches!(
+                    info.class(),
+                    grapheme::Class::RegionalIndicator
+                        | grapheme::Class::EmojiModifier
+                        | grapheme::Class::ExtendedPictographic
+                        | grapheme::Class::EmojiModifierBase
+                )
+                && !alone_presents
+                && !zerowidth.iter().any(|&z| grapheme::sets_presentation(z))
+            {
+                // By default a codepoint with columns keeps them unless an
+                // emoji rule decides the cluster's width.
+                return false;
+            }
+        }
+        match info.class() {
+            grapheme::Class::ExtendedPictographic
+            | grapheme::Class::EmojiModifierBase
+            | grapheme::Class::IndicConsonant
+                if zerowidth.is_empty() =>
+            {
+                return false;
+            }
+            grapheme::Class::RegionalIndicator
+                if !zerowidth.is_empty() || base != grapheme::Class::RegionalIndicator =>
+            {
+                return false;
+            }
+            _ => (),
+        }
+
+        // Replay the cell's cluster to recover the break state.
+        let mut cluster = grapheme::Cluster::new(cell.c, first);
+        let mut previous = base;
+        let mut state = grapheme::BreakState::Default;
+        for &z in zerowidth {
+            let z_info = grapheme::Info::of(z);
+            if grapheme::breaks(previous, z_info.class(), &mut state) {
+                // The cell holds a zero-width cluster after its own (a stray
+                // mark); leave it alone.
+                return false;
+            }
+            cluster.add(z, z_info);
+            previous = z_info.class();
+        }
+        if grapheme::breaks(previous, info.class(), &mut state) {
+            return false;
+        }
+
+        let before = cluster.width(clustering);
+        cluster.add(c, info);
+        let after = cluster.width(clustering);
+        // By default a joined codepoint with columns of its own (a spacing
+        // mark, a second Hangul lead) keeps its own cells: the cluster is as
+        // wide as the sum of its codepoints, which per-cell layout gives.
+        if !clustering && info.width() > 0 && !cluster.presentation() {
+            return false;
+        }
+
+        let cell_width = if cell.flags.contains(Flags::WIDE_CHAR) {
+            2
+        } else {
+            1
+        };
+        self.grid[line][column].push_zerowidth(c);
+        if after != before && before == cell_width {
+            match after {
+                2 => self.widen_cluster(line, column),
+                1 => self.narrow_cluster(line, column),
+                _ => (),
+            }
+        }
+        true
+    }
+
+    /// Turns the one-column cluster at `column`, just before the cursor (or
+    /// under a cursor waiting to wrap), into a two-column one.
+    fn widen_cluster(&mut self, line: Line, column: Column)
+    where
+        T: EventListener,
+    {
+        let columns = self.columns();
+        if columns < 2 {
+            return;
+        }
+        if column.0 + 1 >= columns {
+            // No room on this row: the cluster moves to the next one, as a
+            // wide character that does not fit would have.
+            if !self.mode.contains(TermMode::LINE_WRAP) {
+                return;
+            }
+            let cluster = self.grid[line][column].clone();
+            self.grid.cursor.input_needs_wrap = false;
+            self.grid.cursor.point.column = column;
+            self.grid
+                .cursor
+                .template
+                .flags
+                .insert(Flags::LEADING_WIDE_CHAR_SPACER);
+            self.write_at_cursor(' ');
+            self.grid
+                .cursor
+                .template
+                .flags
+                .remove(Flags::LEADING_WIDE_CHAR_SPACER);
+            self.damage.content_changed(line);
+            self.wrapline();
+            self.grid.cursor.template.flags.insert(Flags::WIDE_CHAR);
+            self.write_at_cursor(cluster.c);
+            self.grid.cursor.template.flags.remove(Flags::WIDE_CHAR);
+            let shell_marks = self.grid.cursor_cell().flags & Flags::SHELL_MARKS;
+            let target = self.grid.cursor_cell();
+            *target = cluster;
+            target.flags.remove(Flags::SHELL_MARKS | Flags::WRAPLINE);
+            target.flags.insert(Flags::WIDE_CHAR | shell_marks);
+        } else {
+            self.grid[line][column].flags.insert(Flags::WIDE_CHAR);
+            self.grid.cursor.input_needs_wrap = false;
+            self.grid.cursor.point.column = column;
+        }
+
+        // The spacer takes the next column, shifting the row in insert mode.
+        self.grid.cursor.point.column += 1;
+        let spacer = self.grid.cursor.point.column;
+        if self.mode.contains(TermMode::INSERT) && spacer.0 + 1 < columns {
+            let cursor_line = self.grid.cursor.point.line;
+            let row = &mut self.grid[cursor_line][..];
+            for col in (spacer.0..columns - 1).rev() {
+                row.swap(col + 1, col);
+            }
+        }
+        self.grid
+            .cursor
+            .template
+            .flags
+            .insert(Flags::WIDE_CHAR_SPACER);
+        self.write_at_cursor(' ');
+        self.grid
+            .cursor
+            .template
+            .flags
+            .remove(Flags::WIDE_CHAR_SPACER);
+        if self.grid.cursor.point.column + 1 < columns {
+            self.grid.cursor.point.column += 1;
+        } else {
+            self.grid.cursor.input_needs_wrap = true;
+        }
+    }
+
+    /// Turns the two-column cluster at `column` into a one-column one (text
+    /// presentation under mode 2027), freeing its spacer.
+    fn narrow_cluster(&mut self, line: Line, column: Column) {
+        let spacer_column = column + 1;
+        if spacer_column.0 >= self.columns()
+            || !self.grid[line][spacer_column]
+                .flags
+                .contains(Flags::WIDE_CHAR_SPACER)
+        {
+            return;
+        }
+        self.grid[line][column].flags.remove(Flags::WIDE_CHAR);
+        let spacer = &mut self.grid[line][spacer_column];
+        spacer.flags.remove(Flags::WIDE_CHAR_SPACER);
+        spacer.c = ' ';
+        if self.grid.cursor.input_needs_wrap && self.grid.cursor.point.column == spacer_column {
+            self.grid.cursor.input_needs_wrap = false;
+        } else {
+            self.grid.cursor.point.column = spacer_column;
+        }
     }
 
     #[inline]
@@ -1385,32 +1763,46 @@ impl<T: EventListener> Handler for Term<T> {
                 continue;
             }
             let count = (columns - point.column.0).min(bytes.len() - index);
-            // Overwriting a wide character or spacer also clears its partner
-            // cells; stop the segment there and let `input` do that.
-            let count = self.grid[point.line][point.column..point.column + count]
-                .iter()
-                .position(|cell| {
-                    cell.flags
+            let charset = self.grid.cursor.charsets[self.active_charset];
+            let template = &self.grid.cursor.template;
+            let (fg, bg, flags) = (template.fg, template.bg, template.flags);
+            let extra = template.extra.clone();
+            let text = &bytes[index..index + count];
+            // One pass over the cells: overwriting a wide character or spacer
+            // also clears its partner cells, so the segment stops there and
+            // `input` does that. Occupancy rises over the written cells, as
+            // per-cell writes raise it.
+            let count = self.grid[point.line].write_from(point.column.0, |cells| {
+                let mut written = 0;
+                for (cell, &byte) in cells.iter_mut().zip(text) {
+                    if cell
+                        .flags
                         .intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER)
-                })
-                .unwrap_or(count);
+                    {
+                        break;
+                    }
+                    cell.c = match charset {
+                        StandardCharset::Ascii => char::from(byte),
+                        charset => charset.map(char::from(byte)),
+                    };
+                    cell.fg = fg;
+                    cell.bg = bg;
+                    cell.flags = flags | (cell.flags & Flags::SHELL_MARKS);
+                    // Most cells and templates have no extra storage; skip
+                    // the reference count when both are empty.
+                    if extra.is_some() || cell.extra.is_some() {
+                        cell.extra = extra.clone();
+                    }
+                    written += 1;
+                }
+                written
+            });
             if count == 0 {
                 self.input(char::from(bytes[index]));
                 index += 1;
                 continue;
             }
             let end = point.column + count;
-            let charset = self.grid.cursor.charsets[self.active_charset];
-            let template = self.grid.cursor.template.clone();
-            // Range indexing raises occupancy to `end`, as per-cell writes do.
-            let cells = &mut self.grid[point.line][point.column..end];
-            for (cell, &byte) in cells.iter_mut().zip(&bytes[index..index + count]) {
-                cell.c = charset.map(char::from(byte));
-                cell.fg = template.fg;
-                cell.bg = template.bg;
-                cell.flags = template.flags | (cell.flags & Flags::SHELL_MARKS);
-                cell.extra = template.extra.clone();
-            }
             index += count;
             if end.0 < columns {
                 self.grid.cursor.point.column = end;
@@ -1421,16 +1813,46 @@ impl<T: EventListener> Handler for Term<T> {
         }
     }
 
+    /// DIRI PATCH: characters beyond ASCII, none a C1 control.
+    ///
+    /// Equivalent to `input` for each character. A wide character that
+    /// continues no cluster and fits on the row is written here with its
+    /// spacer, without a call per character; anything else takes `input`.
+    #[inline(never)]
+    fn input_text(&mut self, text: &str) {
+        for c in text.chars() {
+            let info = grapheme::Info::of(c);
+            if info.width() == 2
+                && !grapheme::may_join(c, info)
+                && !self.grid.cursor.input_needs_wrap
+                && !self.mode.contains(TermMode::INSERT)
+                && self.write_wide_pair(c)
+            {
+                if self.grid.cursor.point.column + 1 < self.columns() {
+                    self.grid.cursor.point.column += 1;
+                } else {
+                    self.grid.cursor.input_needs_wrap = true;
+                }
+                continue;
+            }
+            self.input(c);
+        }
+    }
+
     /// A character to be displayed.
     #[inline(never)]
     fn input(&mut self, c: char) {
-        // Number of cells the char will occupy. Spacing marks join the
-        // previous cell, the way Claude Code measures them.
-        let width = match c.width() {
-            Some(1) if spacing_marks::is_spacing_mark(c) => 0,
-            Some(width) => width,
-            None => return,
-        };
+        // Controls never reach the grid.
+        if c < ' ' || ('\u{7F}'..'\u{A0}').contains(&c) {
+            return;
+        }
+        // Number of cells the char will occupy, as Claude Code (Bun's
+        // `stringWidth`) measures it; see `grapheme`.
+        let info = grapheme::Info::of(c);
+        if grapheme::may_join(c, info) && self.continue_cluster(c, info) {
+            return;
+        }
+        let width = info.width();
 
         // Handle zero-width characters.
         if width == 0 {
@@ -1495,24 +1917,26 @@ impl<T: EventListener> Handler for Term<T> {
                 }
             }
 
-            // Write full width glyph to current cursor cell.
-            self.grid.cursor.template.flags.insert(Flags::WIDE_CHAR);
-            self.write_at_cursor(c);
-            self.grid.cursor.template.flags.remove(Flags::WIDE_CHAR);
+            if !self.write_wide_pair(c) {
+                // Write full width glyph to current cursor cell.
+                self.grid.cursor.template.flags.insert(Flags::WIDE_CHAR);
+                self.write_at_cursor(c);
+                self.grid.cursor.template.flags.remove(Flags::WIDE_CHAR);
 
-            // Write spacer to cell following the wide glyph.
-            self.grid.cursor.point.column += 1;
-            self.grid
-                .cursor
-                .template
-                .flags
-                .insert(Flags::WIDE_CHAR_SPACER);
-            self.write_at_cursor(' ');
-            self.grid
-                .cursor
-                .template
-                .flags
-                .remove(Flags::WIDE_CHAR_SPACER);
+                // Write spacer to cell following the wide glyph.
+                self.grid.cursor.point.column += 1;
+                self.grid
+                    .cursor
+                    .template
+                    .flags
+                    .insert(Flags::WIDE_CHAR_SPACER);
+                self.write_at_cursor(' ');
+                self.grid
+                    .cursor
+                    .template
+                    .flags
+                    .remove(Flags::WIDE_CHAR_SPACER);
+            }
         }
 
         if self.grid.cursor.point.column + 1 < columns {
@@ -2077,6 +2501,7 @@ impl<T: EventListener> Handler for Term<T> {
         // Damage terminal if the color changed and it's not the cursor.
         if index != NamedColor::Cursor as usize && self.colors[index] != Some(color) {
             self.mark_fully_damaged();
+            self.colors_generation += 1;
         }
 
         self.colors[index] = Some(color);
@@ -2107,6 +2532,7 @@ impl<T: EventListener> Handler for Term<T> {
         // Damage terminal if the color changed and it's not the cursor.
         if index != NamedColor::Cursor as usize && self.colors[index].is_some() {
             self.mark_fully_damaged();
+            self.colors_generation += 1;
         }
 
         self.colors[index] = None;
@@ -2272,6 +2698,12 @@ impl<T: EventListener> Handler for Term<T> {
         // DIRI PATCH: RIS resets the title too; listeners track it by event.
         if self.title.take().is_some() {
             self.event_proxy.send_event(Event::ResetTitle);
+        }
+        // DIRI PATCH: and the colors a program set with OSC 4/10/11/12, as
+        // xterm and libghostty do: `reset` restores the configured palette.
+        if (0..color::COUNT).any(|index| self.colors[index].is_some()) {
+            self.colors = color::Colors::default();
+            self.colors_generation += 1;
         }
         self.selection = None;
         self.vi_mode_cursor = Default::default();
@@ -2458,6 +2890,7 @@ impl<T: EventListener> Handler for Term<T> {
                 self.event_proxy.send_event(Event::CursorBlinkingChange);
             }
             NamedPrivateMode::SyncUpdate => (),
+            NamedPrivateMode::GraphemeClustering => self.mode.insert(TermMode::GRAPHEME_CLUSTERING),
             NamedPrivateMode::LegacyAltScreen => {
                 if !self.mode.contains(TermMode::ALT_SCREEN) {
                     self.swap_alt_screen(AltScreen::Shared);
@@ -2528,6 +2961,7 @@ impl<T: EventListener> Handler for Term<T> {
                 self.event_proxy.send_event(Event::CursorBlinkingChange);
             }
             NamedPrivateMode::SyncUpdate => (),
+            NamedPrivateMode::GraphemeClustering => self.mode.remove(TermMode::GRAPHEME_CLUSTERING),
             NamedPrivateMode::LegacyAltScreen => {
                 if self.mode.contains(TermMode::ALT_SCREEN) {
                     self.swap_alt_screen(AltScreen::Shared);
@@ -2588,6 +3022,9 @@ impl<T: EventListener> Handler for Term<T> {
                     self.mode.contains(TermMode::BRACKETED_PASTE).into()
                 }
                 NamedPrivateMode::SyncUpdate => ModeState::Reset,
+                NamedPrivateMode::GraphemeClustering => {
+                    self.mode.contains(TermMode::GRAPHEME_CLUSTERING).into()
+                }
                 NamedPrivateMode::ColumnMode => ModeState::NotSupported,
                 NamedPrivateMode::LegacyAltScreen | NamedPrivateMode::ClearingAltScreen => {
                     self.mode.contains(TermMode::ALT_SCREEN).into()
@@ -3265,6 +3702,44 @@ mod tests {
         assert_eq!(replies.lock().unwrap().last().unwrap(), "\x1b[?5u");
         parser.advance(&mut term, b"\x1bc\x1b[?u");
         assert_eq!(replies.lock().unwrap().last().unwrap(), "\x1b[?0u");
+    }
+
+    #[test]
+    fn a_coloured_line_widened_and_then_recycled_clears_its_old_columns() {
+        // A line scrolled in under a red background is red blanks above an
+        // occupancy of zero. Widening appends default cells; recycling the
+        // row for a new line must still clear the red ones, or they show up
+        // on an unrelated line.
+        for compact in [false, true] {
+            let mut term = Term::new(
+                Config {
+                    scrolling_history: 4,
+                    ..Config::default()
+                },
+                &TermSize::new(10, 2),
+                VoidListener,
+            );
+            #[cfg(feature = "compact-history")]
+            if compact {
+                term.grid_mut().enable_compact_history();
+            }
+            let mut parser: crate::vte::ansi::Processor = crate::vte::ansi::Processor::new();
+            parser.advance(&mut term, b"\x1b[41m\r\n\r\n\x1b[0m");
+            term.resize(TermSize::new(20, 2));
+            parser.advance(&mut term, b"\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\nx");
+            let grid = term.grid();
+            for line in -(grid.history_size() as i32)..2 {
+                for cell in &grid[Line(line)][..] {
+                    assert_eq!(
+                        cell.bg,
+                        Color::Named(NamedColor::Background),
+                        "compact {compact} line {line}"
+                    );
+                }
+            }
+            #[cfg(not(feature = "compact-history"))]
+            let _ = compact;
+        }
     }
 
     #[test]
@@ -4463,6 +4938,128 @@ mod ascii_run_tests {
                         })
                         .collect();
                     bulk.input_ascii(&text);
+                    for c in text.chars() {
+                        single.input(c);
+                    }
+                }
+                assert_same(&bulk, &single, step);
+                #[cfg(feature = "compact-history")]
+                {
+                    bulk.grid_mut().release_history_read_cache();
+                    single.grid_mut().release_history_read_cache();
+                }
+            }
+        }
+    }
+
+    /// `input_text` must equal `input` per character across wrapping,
+    /// insert mode, charsets, wide characters, hyperlinks, prompt marks,
+    /// scroll regions and the alternate screen.
+    #[test]
+    fn non_ascii_runs_match_per_character_input() {
+        for (compact, columns, lines) in [(false, 13, 5), (true, 17, 7), (false, 2, 3)] {
+            let size = TermSize::new(columns, lines);
+            let config = Config {
+                scrolling_history: 40,
+                ..Config::default()
+            };
+            let mut bulk = Term::new(config.clone(), &size, VoidListener);
+            let mut single = Term::new(config, &size, VoidListener);
+            single.reference_wide_writes = true;
+            #[cfg(feature = "compact-history")]
+            if compact {
+                bulk.grid_mut().enable_compact_history();
+                single.grid_mut().enable_compact_history();
+            }
+            #[cfg(not(feature = "compact-history"))]
+            let _ = compact;
+            let mut bulk_parser: Processor = Processor::new();
+            let mut single_parser: Processor = Processor::new();
+            let sequences: &[&str] = &[
+                "\r\n",
+                "\r",
+                "\n",
+                "\t",
+                "\x08",
+                "\x1b[4h",
+                "\x1b[4l",
+                "\x1b[?7l",
+                "\x1b[?7h",
+                "\x1b(0",
+                "\x1b(B",
+                "\x1b)0\x0e",
+                "\x0f",
+                "\x1b[31;1m",
+                "\x1b[38;2;1;2;3;48;5;17m",
+                "\x1b[0m",
+                "\x1b[4:3m\x1b[58;5;9m",
+                "\x1b]8;id=x;https://example.invalid\x07",
+                "\x1b]8;;\x07",
+                "\x1b]133;A\x07",
+                "\x1b]133;B\x07",
+                "\x1b]133;C\x07",
+                "\x1b]133;D;1\x07",
+                "界",
+                "界界",
+                "\u{301}",
+                "é",
+                "\x1b[2K",
+                "\x1b[3@",
+                "\x1b[2P",
+                "\x1b[3X",
+                "\x1b[H",
+                "\x1b[3;4H",
+                "\x1b[99;99H",
+                "\x1b[1;1H\x1b[2;3r",
+                "\x1b[r",
+                "\x1b[2S",
+                "\x1b[1T",
+                "\x1b7",
+                "\x1b8",
+                "\x1b[?1049h",
+                "\x1b[?1049l",
+                "\x1b[?6h",
+                "\x1b[?6l",
+                "\x1b#8",
+                "\x1bc",
+                "\x1b]133;A\x07",
+                "\x1b]133;B\x07",
+                "\x1b]133;D;0\x07",
+                "\x1b[?2027h",
+                "\x1b[?2027l",
+            ];
+            // Wide characters (CJK, emoji, a fullwidth form), joiners and
+            // marks that continue a cluster, and narrow characters beyond
+            // ASCII.
+            let pool: Vec<char> =
+                "界日本語한국어Ａ😀👍🏽❤\u{FE0F}\u{200D}🧑\u{1F4BB}🇷🇴\u{301}\u{20E3}कि\u{AD}é✓—★"
+                    .chars()
+                    .collect();
+            let mut seed = 0x2545_f491_4f6c_dd1du64;
+            for step in 0..6000 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                if seed % 3 == 0 {
+                    let sequence = sequences[(seed >> 8) as usize % sequences.len()];
+                    bulk_parser.advance(&mut bulk, sequence.as_bytes());
+                    single_parser.advance(&mut single, sequence.as_bytes());
+                } else {
+                    let length = 1 + (seed >> 12) as usize % (3 * columns);
+                    let text: String = (0..length)
+                        .map(|index| {
+                            let value = (seed >> (index % 40)) as usize ^ index;
+                            // Mostly wide characters, as CJK output is, with
+                            // narrow ones between so wide characters land on
+                            // every column and over cells of every kind.
+                            match value % 4 {
+                                0 => pool[(value >> 2) % pool.len()],
+                                1 => char::from(b'a' + (value >> 2) as u8 % 26),
+                                _ => pool[(value >> 2) % 7],
+                            }
+                        })
+                        .collect();
+                    bulk.input_text(&text);
                     for c in text.chars() {
                         single.input(c);
                     }

@@ -114,9 +114,37 @@ impl<T> Storage<T> {
     }
 
     #[cfg(feature = "compact-history")]
+    pub fn prepare_history_read(&mut self) {
+        if let Some(compact) = &mut self.compact {
+            compact.prepare_history_read();
+        }
+    }
+
+    #[cfg(feature = "compact-history")]
     pub fn release_read_cache(&mut self) {
         if let Some(compact) = &mut self.compact {
             compact.release_read_cache();
+        }
+    }
+
+    #[cfg(feature = "compact-history")]
+    pub fn keep_spare_rows(&mut self, keep: bool) {
+        if let Some(compact) = &mut self.compact {
+            compact.keep_spare_rows(keep);
+        }
+    }
+
+    #[cfg(feature = "compact-history")]
+    pub fn release_spare_rows(&mut self) {
+        if let Some(compact) = &mut self.compact {
+            compact.release_spare_rows();
+        }
+    }
+
+    #[cfg(feature = "compact-history")]
+    pub fn release_idle(&mut self) {
+        if let Some(compact) = &mut self.compact {
+            compact.release_idle();
         }
     }
 

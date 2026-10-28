@@ -44,6 +44,7 @@ actions!(
         ToggleQuickOpen,
         ToggleHistory,
         ToggleNotifications,
+        ToggleActivity,
         ToggleOverview,
         ToggleTabPeek,
         ReviewLaunches,
@@ -70,6 +71,9 @@ actions!(
         MovePaneRight,
         MovePaneUp,
         MovePaneDown,
+        MovePaneToNewTab,
+        MovePaneToNextTab,
+        MovePaneToPreviousTab,
         OpenWorktrees,
         NewNote,
         ShowTodos,
@@ -99,6 +103,7 @@ actions!(
         SelectNextAttentionSession,
         CheckForUpdates,
         ShowWhatsNew,
+        ImportTerminalSetup,
         ToggleReadAloud,
         ToggleReadThisTab,
         ReadOnlyThisTab,
@@ -145,6 +150,8 @@ actions!(
         PreviousPrompt,
         NextPrompt,
         CopyLastCommandOutput,
+        ClearScrollback,
+        ResetTerminal,
     ]
 );
 
@@ -165,6 +172,7 @@ pub enum CommandId {
     ToggleQuickOpen,
     ToggleHistory,
     ToggleNotifications,
+    ToggleActivity,
     ToggleOverview,
     ToggleTabPeek,
     ReviewLaunches,
@@ -191,6 +199,9 @@ pub enum CommandId {
     MovePaneRight,
     MovePaneUp,
     MovePaneDown,
+    MovePaneToNewTab,
+    MovePaneToNextTab,
+    MovePaneToPreviousTab,
     OpenWorktrees,
     NewNote,
     ShowTodos,
@@ -215,6 +226,7 @@ pub enum CommandId {
     SelectNextAttentionSession,
     CheckForUpdates,
     ShowWhatsNew,
+    ImportTerminalSetup,
     ToggleReadAloud,
     ToggleReadThisTab,
     ReadOnlyThisTab,
@@ -250,6 +262,8 @@ pub enum CommandId {
     PreviousPrompt,
     NextPrompt,
     CopyLastCommandOutput,
+    ClearScrollback,
+    ResetTerminal,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -723,6 +737,36 @@ pub const COMMANDS: &[CommandSpec] = &[
         "workspace move pane down dock"
     ),
     spec!(
+        MovePaneToNewTab,
+        "move-pane-to-new-tab",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.move_pane_to_new_tab.palette_title",
+        "rectangle.split.2x1",
+        "workspace move pane new tab break detach"
+    ),
+    spec!(
+        MovePaneToNextTab,
+        "move-pane-to-next-tab",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.move_pane_to_next_tab.palette_title",
+        "rectangle.split.2x1",
+        "workspace move pane next tab join"
+    ),
+    spec!(
+        MovePaneToPreviousTab,
+        "move-pane-to-previous-tab",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.move_pane_to_previous_tab.palette_title",
+        "rectangle.split.2x1",
+        "workspace move pane previous tab join"
+    ),
+    spec!(
         NewNote,
         "new-note",
         Some("cmd-alt-n"),
@@ -938,6 +982,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         "inbox unread alerts attention"
     ),
     spec!(
+        ToggleActivity,
+        "toggle-activity",
+        Some("cmd-."),
+        Some("⌘."),
+        Some(APP_CONTEXT),
+        "command.toggle_activity.palette_title",
+        "waveform.circle",
+        "activity working waiting blocked finished status filter"
+    ),
+    spec!(
         CheckForUpdates,
         "check-for-updates",
         None,
@@ -956,6 +1010,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         "command.show_whats_new.palette_title",
         "sparkles",
         "whats new release highlights features changelog demo video tour"
+    ),
+    spec!(
+        ImportTerminalSetup,
+        "import-terminal-setup",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.import_terminal_setup.palette_title",
+        "arrow.down",
+        "import ghostty iterm iterm2 wezterm kitty alacritty terminal font theme cursor setup migrate"
     ),
     spec!(
         ToggleReadAloud,
@@ -1247,6 +1311,27 @@ pub const COMMANDS: &[CommandSpec] = &[
         "doc.on.doc",
         "terminal shell command output copy last osc 133"
     ),
+    // ⌘K is the palette here, so Clear takes the shifted chord.
+    spec!(
+        ClearScrollback,
+        "terminal-clear-scrollback",
+        Some("cmd-shift-k"),
+        Some("⇧⌘K"),
+        Some(TERMINAL_CONTEXT),
+        "command.clear_scrollback.palette_title",
+        "trash",
+        "terminal clear screen scrollback history wipe clean cls"
+    ),
+    spec!(
+        ResetTerminal,
+        "terminal-reset",
+        None,
+        None,
+        Some(TERMINAL_CONTEXT),
+        "command.reset_terminal.palette_title",
+        "arrow.counterclockwise",
+        "terminal reset garbled broken modes emulator stty sane"
+    ),
 ];
 
 pub fn command(id: CommandId) -> &'static CommandSpec {
@@ -1426,6 +1511,7 @@ impl CommandSpec {
             CommandId::ToggleQuickOpen => KeyBinding::new(key, ToggleQuickOpen, context),
             CommandId::ToggleHistory => KeyBinding::new(key, ToggleHistory, context),
             CommandId::ToggleNotifications => KeyBinding::new(key, ToggleNotifications, context),
+            CommandId::ToggleActivity => KeyBinding::new(key, ToggleActivity, context),
             CommandId::ToggleOverview => KeyBinding::new(key, ToggleOverview, context),
             CommandId::ReviewLaunches => KeyBinding::new(key, ReviewLaunches, context),
             CommandId::ToggleTabPeek => KeyBinding::new(key, ToggleTabPeek, context),
@@ -1452,6 +1538,9 @@ impl CommandSpec {
             CommandId::MovePaneRight => KeyBinding::new(key, MovePaneRight, context),
             CommandId::MovePaneUp => KeyBinding::new(key, MovePaneUp, context),
             CommandId::MovePaneDown => KeyBinding::new(key, MovePaneDown, context),
+            CommandId::MovePaneToNewTab => KeyBinding::new(key, MovePaneToNewTab, context),
+            CommandId::MovePaneToNextTab => KeyBinding::new(key, MovePaneToNextTab, context),
+            CommandId::MovePaneToPreviousTab => KeyBinding::new(key, MovePaneToPreviousTab, context),
 
             CommandId::OpenWorktrees => KeyBinding::new(key, OpenWorktrees, context),
             CommandId::NewNote => KeyBinding::new(key, NewNote, context),
@@ -1489,6 +1578,7 @@ impl CommandSpec {
             }
             CommandId::CheckForUpdates => KeyBinding::new(key, CheckForUpdates, context),
             CommandId::ShowWhatsNew => KeyBinding::new(key, ShowWhatsNew, context),
+            CommandId::ImportTerminalSetup => KeyBinding::new(key, ImportTerminalSetup, context),
             CommandId::ToggleReadAloud => KeyBinding::new(key, ToggleReadAloud, context),
             CommandId::ToggleReadThisTab => KeyBinding::new(key, ToggleReadThisTab, context),
             CommandId::ReadOnlyThisTab => KeyBinding::new(key, ReadOnlyThisTab, context),
@@ -1532,6 +1622,8 @@ impl CommandSpec {
             CommandId::CopyLastCommandOutput => {
                 KeyBinding::new(key, CopyLastCommandOutput, context)
             }
+            CommandId::ClearScrollback => KeyBinding::new(key, ClearScrollback, context),
+            CommandId::ResetTerminal => KeyBinding::new(key, ResetTerminal, context),
         }
     }
 }
@@ -1743,6 +1835,118 @@ pub fn shortcut_conflict(
     })
 }
 
+/// The keymap a person sees is two layers: the shipped defaults in
+/// [`COMMANDS`], then the shortcuts they recorded ([`ShortcutOverrides`],
+/// persisted in preferences). An entry is `Some(key)` to rebind, `None` to
+/// unbind; no entry means the default. These edits are the only way either
+/// recorder (the palette's and Settings') changes that top layer, so both
+/// resolve a clash the same way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShortcutResolution {
+    /// Take the key; the command holding it keeps whatever else it has.
+    Replace,
+    /// Take the key and give the holder this command's previous shortcut.
+    Swap,
+}
+
+/// A recorded key another command already performs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShortcutClash {
+    pub binding: String,
+    pub holder: CommandId,
+    /// The global show-Diri hotkey is registered with the system by its
+    /// physical key, so only its own Settings row may move it.
+    pub can_replace: bool,
+    /// Only when this command had a shortcut to hand over.
+    pub can_swap: bool,
+}
+
+fn same_keystroke(a: &str, b: &str) -> bool {
+    match (Keystroke::parse(a), Keystroke::parse(b)) {
+        (Ok(a), Ok(b)) => a.modifiers == b.modifiers && a.key == b.key,
+        _ => false,
+    }
+}
+
+/// Binds `binding` to `id` in the user layer. Without a `resolution` a clash
+/// is returned for the caller to show; with one it is resolved.
+pub fn assign_shortcut(
+    overrides: &ShortcutOverrides,
+    id: CommandId,
+    binding: &str,
+    resolution: Option<ShortcutResolution>,
+) -> Result<ShortcutOverrides, ShortcutClash> {
+    let previous = command(id).effective_keystrokes(overrides);
+    let mut next = overrides.clone();
+    if let Some(holder) = shortcut_conflict(id, binding, overrides) {
+        let clash = ShortcutClash {
+            binding: binding.to_owned(),
+            holder: holder.id,
+            can_replace: holder.id != CommandId::ShowApp,
+            can_swap: holder.id != CommandId::ShowApp
+                && id != CommandId::ShowApp
+                && !previous.is_empty(),
+        };
+        let handed_over = match resolution {
+            Some(ShortcutResolution::Replace) if clash.can_replace => holder
+                .effective_keystrokes(overrides)
+                .into_iter()
+                .find(|key| !same_keystroke(key, binding)),
+            Some(ShortcutResolution::Swap) if clash.can_swap => previous.first().cloned(),
+            _ => return Err(clash),
+        };
+        next.insert(holder.stable_id.to_owned(), handed_over);
+    }
+    next.insert(command(id).stable_id.to_owned(), Some(binding.to_owned()));
+    Ok(without_default_entries(next))
+}
+
+/// Unbinds `id`: it keeps its row everywhere but performs on no key.
+pub fn unassign_shortcut(overrides: &ShortcutOverrides, id: CommandId) -> ShortcutOverrides {
+    let mut next = overrides.clone();
+    next.insert(command(id).stable_id.to_owned(), None);
+    without_default_entries(next)
+}
+
+/// Drops `id`'s recorded shortcut so the default shows through again. A
+/// default another command has since taken stays with that command, so a
+/// reset never makes one key perform two actions.
+pub fn reset_shortcut(overrides: &ShortcutOverrides, id: CommandId) -> ShortcutOverrides {
+    let spec = command(id);
+    let mut next = overrides.clone();
+    next.remove(spec.stable_id);
+    let defaults = spec.effective_keystrokes(&next);
+    let free: Vec<String> = defaults
+        .iter()
+        .filter(|key| shortcut_conflict(id, key, &next).is_none())
+        .cloned()
+        .collect();
+    if free.len() != defaults.len() {
+        next.insert(spec.stable_id.to_owned(), free.into_iter().next());
+    }
+    without_default_entries(next)
+}
+
+/// An entry that restates what the defaults already do is not a change.
+/// Dropping it keeps "Reset all (n)" honest and lets a swap made twice read
+/// as unmodified again.
+fn without_default_entries(mut overrides: ShortcutOverrides) -> ShortcutOverrides {
+    let ids: Vec<String> = overrides.keys().cloned().collect();
+    for id in ids {
+        if !COMMANDS.iter().any(|spec| spec.stable_id == id) {
+            continue;
+        }
+        let mut without = overrides.clone();
+        without.remove(&id);
+        if COMMANDS.iter().all(|spec| {
+            spec.effective_keystrokes(&without) == spec.effective_keystrokes(&overrides)
+        }) {
+            overrides = without;
+        }
+    }
+    overrides
+}
+
 impl CommandId {
     /// The title, description and group Settings › Shortcuts shows, in the
     /// interface language.
@@ -1807,6 +2011,11 @@ impl CommandId {
             Self::ToggleNotifications => ShortcutMetadata {
                 title: t("command.toggle_notifications.title"),
                 description: t("command.toggle_notifications.description"),
+                category: Navigation,
+            },
+            Self::ToggleActivity => ShortcutMetadata {
+                title: t("command.toggle_activity.title"),
+                description: t("command.toggle_activity.description"),
                 category: Navigation,
             },
             Self::SelectNextAttentionSession => ShortcutMetadata {
@@ -1952,6 +2161,21 @@ impl CommandId {
             Self::MovePaneDown => ShortcutMetadata {
                 title: t("command.move_pane_down.title"),
                 description: t("command.move_pane_down.description"),
+                category: Workspace,
+            },
+            Self::MovePaneToNewTab => ShortcutMetadata {
+                title: t("command.move_pane_to_new_tab.title"),
+                description: t("command.move_pane_to_new_tab.description"),
+                category: Workspace,
+            },
+            Self::MovePaneToNextTab => ShortcutMetadata {
+                title: t("command.move_pane_to_next_tab.title"),
+                description: t("command.move_pane_to_next_tab.description"),
+                category: Workspace,
+            },
+            Self::MovePaneToPreviousTab => ShortcutMetadata {
+                title: t("command.move_pane_to_previous_tab.title"),
+                description: t("command.move_pane_to_previous_tab.description"),
                 category: Workspace,
             },
             Self::ToggleTabPeek => ShortcutMetadata {
@@ -2157,6 +2381,16 @@ impl CommandId {
                 description: t("command.copy_last_command_output.description"),
                 category: ShortcutCategory::Terminal,
             },
+            Self::ClearScrollback => ShortcutMetadata {
+                title: t("command.clear_scrollback.title"),
+                description: t("command.clear_scrollback.description"),
+                category: ShortcutCategory::Terminal,
+            },
+            Self::ResetTerminal => ShortcutMetadata {
+                title: t("command.reset_terminal.title"),
+                description: t("command.reset_terminal.description"),
+                category: ShortcutCategory::Terminal,
+            },
             Self::CopySelection => ShortcutMetadata {
                 title: t("command.copy_selection.title"),
                 description: t("command.copy_selection.description"),
@@ -2175,6 +2409,11 @@ impl CommandId {
             Self::ShowWhatsNew => ShortcutMetadata {
                 title: t("command.show_whats_new.title"),
                 description: t("command.show_whats_new.description"),
+                category: Application,
+            },
+            Self::ImportTerminalSetup => ShortcutMetadata {
+                title: t("command.import_terminal_setup.title"),
+                description: t("command.import_terminal_setup.description"),
                 category: Application,
             },
             Self::ToggleReadThisTab
@@ -2255,6 +2494,7 @@ impl CommandId {
             Self::ToggleQuickOpen => Box::new(ToggleQuickOpen),
             Self::ToggleHistory => Box::new(ToggleHistory),
             Self::ToggleNotifications => Box::new(ToggleNotifications),
+            Self::ToggleActivity => Box::new(ToggleActivity),
             Self::ToggleOverview => Box::new(ToggleOverview),
             Self::ToggleTabPeek => Box::new(ToggleTabPeek),
             Self::ReviewLaunches => Box::new(ReviewLaunches),
@@ -2281,6 +2521,9 @@ impl CommandId {
             Self::MovePaneRight => Box::new(MovePaneRight),
             Self::MovePaneUp => Box::new(MovePaneUp),
             Self::MovePaneDown => Box::new(MovePaneDown),
+            Self::MovePaneToNewTab => Box::new(MovePaneToNewTab),
+            Self::MovePaneToNextTab => Box::new(MovePaneToNextTab),
+            Self::MovePaneToPreviousTab => Box::new(MovePaneToPreviousTab),
 
             Self::OpenWorktrees => Box::new(OpenWorktrees),
             Self::NewNote => Box::new(NewNote),
@@ -2306,6 +2549,7 @@ impl CommandId {
             Self::SelectNextAttentionSession => Box::new(SelectNextAttentionSession),
             Self::CheckForUpdates => Box::new(CheckForUpdates),
             Self::ShowWhatsNew => Box::new(ShowWhatsNew),
+            Self::ImportTerminalSetup => Box::new(ImportTerminalSetup),
             Self::ToggleReadAloud => Box::new(ToggleReadAloud),
             Self::ToggleReadThisTab => Box::new(ToggleReadThisTab),
             Self::ReadOnlyThisTab => Box::new(ReadOnlyThisTab),
@@ -2341,6 +2585,8 @@ impl CommandId {
             Self::PreviousPrompt => Box::new(PreviousPrompt),
             Self::NextPrompt => Box::new(NextPrompt),
             Self::CopyLastCommandOutput => Box::new(CopyLastCommandOutput),
+            Self::ClearScrollback => Box::new(ClearScrollback),
+            Self::ResetTerminal => Box::new(ResetTerminal),
         }
     }
 }
@@ -2442,6 +2688,169 @@ mod tests {
                 .effective_keystrokes(&overrides)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn recorded_shortcuts_layer_over_defaults_and_reset_back_to_them() {
+        let defaults = ShortcutOverrides::new();
+        let sidebar = command(CommandId::ToggleSidebar);
+        assert_eq!(sidebar.effective_keystrokes(&defaults), vec![test_chords("cmd-b")]);
+
+        let rebound = assign_shortcut(
+            &defaults,
+            CommandId::ToggleSidebar,
+            &test_chords("cmd-alt-y"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(rebound.len(), 1);
+        assert_eq!(sidebar.effective_keystrokes(&rebound), vec![test_chords("cmd-alt-y")]);
+        assert!(sidebar.is_overridden(&rebound));
+
+        let unbound = unassign_shortcut(&rebound, CommandId::ToggleSidebar);
+        assert!(sidebar.effective_keystrokes(&unbound).is_empty());
+        assert_eq!(sidebar.shortcut_label_for(&unbound), None);
+
+        let reset = reset_shortcut(&unbound, CommandId::ToggleSidebar);
+        assert!(reset.is_empty(), "a reset leaves no user entry behind");
+        assert_eq!(sidebar.effective_keystrokes(&reset), vec![test_chords("cmd-b")]);
+
+        // Recording the default itself is not a change either.
+        assert!(
+            assign_shortcut(&rebound, CommandId::ToggleSidebar, &test_chords("cmd-b"), None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_clash_names_the_holder_and_saves_nothing_until_resolved() {
+        let defaults = ShortcutOverrides::new();
+        let clash = assign_shortcut(
+            &defaults,
+            CommandId::ToggleSidebar,
+            &test_chords("cmd-n"),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(clash.holder, CommandId::OpenLauncher);
+        assert_eq!(clash.binding, test_chords("cmd-n"));
+        assert!(clash.can_replace && clash.can_swap);
+
+        // An unbound command has nothing to hand over, so it cannot swap.
+        let unbound = unassign_shortcut(&defaults, CommandId::ToggleSidebar);
+        let clash = assign_shortcut(
+            &unbound,
+            CommandId::ToggleSidebar,
+            &test_chords("cmd-n"),
+            Some(ShortcutResolution::Swap),
+        )
+        .unwrap_err();
+        assert!(clash.can_replace && !clash.can_swap);
+    }
+
+    #[test]
+    fn replace_takes_the_key_and_leaves_the_holder_unbound() {
+        let replaced = assign_shortcut(
+            &ShortcutOverrides::new(),
+            CommandId::ToggleSidebar,
+            &test_chords("cmd-n"),
+            Some(ShortcutResolution::Replace),
+        )
+        .unwrap();
+        assert_eq!(
+            command(CommandId::ToggleSidebar).effective_keystrokes(&replaced),
+            vec![test_chords("cmd-n")]
+        );
+        assert!(
+            command(CommandId::OpenLauncher)
+                .effective_keystrokes(&replaced)
+                .is_empty()
+        );
+        assert!(shortcut_conflict(CommandId::ToggleSidebar, &test_chords("cmd-n"), &replaced).is_none());
+    }
+
+    #[test]
+    fn replace_leaves_the_holder_its_other_keys() {
+        let replaced = assign_shortcut(
+            &ShortcutOverrides::new(),
+            CommandId::ToggleSidebar,
+            &platform_keystroke(CommandId::ZoomIn, "cmd-+").unwrap(),
+            Some(ShortcutResolution::Replace),
+        )
+        .unwrap();
+        let zoom = command(CommandId::ZoomIn).effective_keystrokes(&replaced);
+        assert_eq!(zoom.len(), 1);
+        assert!(same_keystroke(&zoom[0], &platform_keystroke(CommandId::ZoomIn, "cmd-=").unwrap()));
+    }
+
+    #[test]
+    fn swap_trades_keys_and_swapping_back_restores_the_defaults() {
+        let swapped = assign_shortcut(
+            &ShortcutOverrides::new(),
+            CommandId::ToggleSidebar,
+            &test_chords("cmd-n"),
+            Some(ShortcutResolution::Swap),
+        )
+        .unwrap();
+        assert_eq!(
+            command(CommandId::ToggleSidebar).effective_keystrokes(&swapped),
+            vec![test_chords("cmd-n")]
+        );
+        assert_eq!(
+            command(CommandId::OpenLauncher).effective_keystrokes(&swapped),
+            vec![test_chords("cmd-b")]
+        );
+        let back = assign_shortcut(
+            &swapped,
+            CommandId::ToggleSidebar,
+            &test_chords("cmd-b"),
+            Some(ShortcutResolution::Swap),
+        )
+        .unwrap();
+        assert!(back.is_empty(), "{back:?}");
+    }
+
+    #[test]
+    fn a_reset_never_takes_a_default_back_from_its_new_owner() {
+        // Sidebar's ⌘B went to New Session; resetting Sidebar must not make
+        // ⌘B perform both.
+        let taken = assign_shortcut(
+            &ShortcutOverrides::new(),
+            CommandId::OpenLauncher,
+            &test_chords("cmd-b"),
+            Some(ShortcutResolution::Replace),
+        )
+        .unwrap();
+        let reset = reset_shortcut(&taken, CommandId::ToggleSidebar);
+        assert!(
+            command(CommandId::ToggleSidebar)
+                .effective_keystrokes(&reset)
+                .is_empty()
+        );
+        assert_eq!(
+            command(CommandId::OpenLauncher).effective_keystrokes(&reset),
+            vec![test_chords("cmd-b")]
+        );
+        // Once the owner gives it up, the reset gets it back.
+        let released = reset_shortcut(&reset, CommandId::OpenLauncher);
+        let reset = reset_shortcut(&released, CommandId::ToggleSidebar);
+        assert!(reset.is_empty(), "{reset:?}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_global_hotkey_is_never_taken_from_outside_its_settings_row() {
+        let overrides = ShortcutOverrides::from([("show-app".into(), Some("cmd-alt-space".into()))]);
+        let clash = assign_shortcut(
+            &overrides,
+            CommandId::ToggleSidebar,
+            "cmd-alt-space",
+            Some(ShortcutResolution::Replace),
+        )
+        .unwrap_err();
+        assert_eq!(clash.holder, CommandId::ShowApp);
+        assert!(!clash.can_replace && !clash.can_swap);
     }
 
     #[test]
@@ -2614,6 +3023,19 @@ mod tests {
             command(CommandId::SelectNextSession).keystroke,
             Some("cmd-}")
         );
+    }
+
+    #[test]
+    fn clear_and_reset_are_terminal_commands_in_the_palette() {
+        let clear = command(CommandId::ClearScrollback);
+        // ⌘K stays the palette; Clear takes the shifted chord, terminal only.
+        assert_eq!(command(CommandId::ToggleCommandPalette).keystroke, Some("cmd-k"));
+        assert_eq!(clear.keystroke, Some("cmd-shift-k"));
+        assert_eq!(clear.context, Some(TERMINAL_CONTEXT));
+        let reset = command(CommandId::ResetTerminal);
+        assert_eq!(reset.keystroke, None, "reset is palette and menu only");
+        assert_eq!(reset.context, Some(TERMINAL_CONTEXT));
+        assert!(clear.palette.is_some() && reset.palette.is_some());
     }
 
     #[test]

@@ -123,6 +123,15 @@ impl Replay {
             .count()
     }
 
+    /// A Claude hook, parsed from its payload the way the Engine parses it.
+    fn hook(&mut self, event: &str, payload: serde_json::Value) -> ReducerOutcome {
+        self.step();
+        let (signal, meta) =
+            crate::hooks::parse_claude_hook(event, &payload, self.now).expect("modelled hook");
+        self.reducer
+            .reduce_identified(signal, meta.identity, self.now)
+    }
+
     fn events(&self, kind: AttentionKind) -> usize {
         self.reducer
             .attention_state()
@@ -336,4 +345,226 @@ fn removal_reasons_reach_the_evidence() {
             .and_then(|e| e.matched_rule_id.as_deref()),
         Some("removed:reset")
     );
+}
+
+/// Claude Code 2.1.312 with one background subagent running, captured
+/// 2026-10-27: the root record stays `working` until the subagent's record
+/// clears, and `done` follows only once all of it is over.
+mod background {
+    pub const WORKING_TOOL: &[u8] = b"\x1b]7501;state=working:app=claude-code:msg=UnVubmluZyBzbGVlcCAzNSBhbmQgcmVwbHlpbmcgb2s=\x07";
+    pub const AGENT: &[u8] = b"\x1b]7501;state=working:app=claude-code:id=a59741d8bd32f0e49:title=UnVuIHNsZWVwIDM1IGFuZCByZXBseSBvaw==\x07";
+    pub const AGENT_CLEAR: &[u8] = b"\x1b]7501;state=clear:id=a59741d8bd32f0e49\x07";
+}
+
+/// The `Stop` payload Claude Code 2.1.312 sends (paths and ids replaced),
+/// with `background_tasks` as it reports a still-running subagent.
+fn stop_payload(last_message: &str, background_running: bool) -> serde_json::Value {
+    let tasks = if background_running {
+        serde_json::json!([{"id": "a59741d8bd32f0e49", "type": "subagent", "status": "running",
+            "description": "Run the migration", "agent_type": "general-purpose"}])
+    } else {
+        serde_json::json!([])
+    };
+    serde_json::json!({
+        "session_id": "8d2c128b-bd49-4562-a87a-8bfb8a10f11c",
+        "transcript_path": "/tmp/t.jsonl",
+        "cwd": "/tmp/project",
+        "permission_mode": "default",
+        "hook_event_name": "Stop",
+        "stop_hook_active": false,
+        "last_assistant_message": last_message,
+        "background_tasks": tasks,
+        "session_crons": [],
+    })
+}
+
+fn prompt_payload() -> serde_json::Value {
+    serde_json::json!({"session_id": "8d2c128b-bd49-4562-a87a-8bfb8a10f11c",
+        "hook_event_name": "UserPromptSubmit", "prompt": "go"})
+}
+
+/// A turn that starts a background subagent and then ends on a question.
+fn background_turn(replay: &mut Replay) {
+    replay.feed(claude::IDLE);
+    replay.submit();
+    replay.hook("UserPromptSubmit", prompt_payload());
+    replay.feed(claude::WORKING);
+    replay.feed(background::WORKING_TOOL);
+    replay.feed(background::AGENT);
+    assert_eq!(*replay.reducer.status(), SessionStatus::Working);
+}
+
+/// The owner's "it waits for input and we miss it": an orchestrating Claude
+/// launches background agents and hands the turn back with a question. Its
+/// program status stays `working` for as long as the agents run, so the tab
+/// read Working, for minutes, while Claude waited on the user.
+#[test]
+fn a_turn_ending_on_a_question_during_background_work_needs_input() {
+    let mut replay = Replay::new(Authority::HooksPrimary, "claude-code");
+    background_turn(&mut replay);
+
+    let outcome = replay.hook(
+        "Stop",
+        stop_payload(
+            "I started the migration agent in the background.\n\nShould I also update the **docs**?",
+            true,
+        ),
+    );
+    assert_eq!(
+        outcome.status_change,
+        Some(SessionStatus::NeedsInput(NeedsInputKind::Question))
+    );
+    let detail = outcome.needs_input.expect("question");
+    assert_eq!(detail.source, diri_proto::NeedsInputSource::ClaudeStopHook);
+    assert_eq!(detail.summary, "Should I also update the **docs**?");
+    assert!(!outcome.turn_completed, "the background work is not done");
+    assert_eq!(replay.unresolved(AttentionKind::Request), 1);
+
+    // The program keeps reporting the background agent's work, and Claude
+    // reminds that it is still running: neither answers the question.
+    let outcome = replay.feed(claude::WORKING);
+    assert_eq!(outcome.status_change, None);
+    replay.hook(
+        "Notification",
+        serde_json::json!({"session_id": "8d2c128b-bd49-4562-a87a-8bfb8a10f11c",
+            "hook_event_name": "Notification", "notification_type": "idle_prompt",
+            "background_tasks": [{"status": "running"}]}),
+    );
+    assert_eq!(
+        *replay.reducer.status(),
+        SessionStatus::NeedsInput(NeedsInputKind::Question)
+    );
+
+    // The user answers: a new turn.
+    replay.submit();
+    let outcome = replay.hook("UserPromptSubmit", prompt_payload());
+    assert_eq!(outcome.status_change, Some(SessionStatus::Working));
+    assert_eq!(replay.unresolved(AttentionKind::Request), 0);
+
+    // The agent finishes; Claude reports its result.
+    replay.feed(background::AGENT_CLEAR);
+    let outcome = replay.feed(claude::DONE);
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(outcome.turn_completed);
+}
+
+/// The background agent finishing first starts Claude's next turn on its
+/// own (its report arrives as a prompt): the question is superseded.
+#[test]
+fn a_background_result_supersedes_the_question() {
+    let mut replay = Replay::new(Authority::HooksPrimary, "claude-code");
+    background_turn(&mut replay);
+    replay.hook("Stop", stop_payload("Want me to run the tests too?", true));
+    replay.feed(background::AGENT_CLEAR);
+    let outcome = replay.hook("UserPromptSubmit", prompt_payload());
+    assert_eq!(outcome.status_change, Some(SessionStatus::Working));
+    assert_eq!(replay.unresolved(AttentionKind::Request), 0);
+    let outcome = replay.feed(claude::DONE);
+    assert!(outcome.turn_completed);
+}
+
+/// A turn that hands back no question while its agents run is still the
+/// agents' work: Working, as before, and nothing raised.
+#[test]
+fn background_work_without_a_question_stays_working() {
+    for last in [
+        "I started the migration agent in the background. I'll report back when it finishes.",
+        "Launched:\n\n```sh\nmake migrate # done?\n```",
+        "",
+    ] {
+        let mut replay = Replay::new(Authority::HooksPrimary, "claude-code");
+        background_turn(&mut replay);
+        let outcome = replay.hook("Stop", stop_payload(last, true));
+        assert_eq!(outcome.needs_input, None, "{last:?}");
+        assert_eq!(*replay.reducer.status(), SessionStatus::Working, "{last:?}");
+        assert_eq!(replay.unresolved(AttentionKind::Request), 0);
+    }
+}
+
+/// With nothing left running, a turn that ends on a question is a finished
+/// turn, Done as it always was, whichever of the hook and the report lands
+/// first.
+#[test]
+fn a_question_with_nothing_in_the_background_is_still_done() {
+    for hook_first in [true, false] {
+        let mut replay = Replay::new(Authority::HooksPrimary, "claude-code");
+        replay.feed(claude::IDLE);
+        replay.submit();
+        replay.hook("UserPromptSubmit", prompt_payload());
+        replay.feed(claude::WORKING);
+        let mut completed = false;
+        if hook_first {
+            let outcome = replay.hook("Stop", stop_payload("Shall I open a PR?", false));
+            assert_eq!(outcome.needs_input, None);
+        }
+        completed |= replay.feed(claude::DONE).turn_completed;
+        if !hook_first {
+            let outcome = replay.hook("Stop", stop_payload("Shall I open a PR?", false));
+            assert_eq!(outcome.needs_input, None);
+        }
+        assert!(completed);
+        assert_eq!(*replay.reducer.status(), SessionStatus::Idle);
+        assert_eq!(replay.unresolved(AttentionKind::Request), 0);
+        assert_eq!(replay.unresolved(AttentionKind::Completion), 1);
+    }
+}
+
+/// A real blocker after the question replaces it, and is cleared by the
+/// program as usual.
+#[test]
+fn a_blocker_replaces_the_turn_end_question() {
+    let mut replay = Replay::new(Authority::HooksPrimary, "claude-code");
+    background_turn(&mut replay);
+    replay.hook("Stop", stop_payload("Should I continue?", true));
+    let outcome = replay.feed(claude::BLOCKED);
+    assert_eq!(
+        outcome.status_change,
+        Some(SessionStatus::NeedsInput(NeedsInputKind::Permission))
+    );
+    let outcome = replay.feed(claude::WORKING);
+    assert_eq!(outcome.status_change, Some(SessionStatus::Working));
+}
+
+/// Without `OSC 7501` (an older Claude, or an Engine restart that lost the
+/// records), hooks and the screen read the same turn the same way.
+#[test]
+fn hooks_alone_raise_the_turn_end_question() {
+    let mut replay = Replay::new(Authority::HooksPrimary, "claude-code");
+    replay.submit();
+    replay.hook("UserPromptSubmit", prompt_payload());
+    assert_eq!(*replay.reducer.status(), SessionStatus::Working);
+    let outcome = replay.hook("Stop", stop_payload("Which branch should I use?", true));
+    assert_eq!(
+        outcome.status_change,
+        Some(SessionStatus::NeedsInput(NeedsInputKind::Question))
+    );
+    // Claude's footer then reads "Waiting for 1 background agent to finish".
+    replay.step();
+    let outcome = replay.reducer.reduce(
+        StatusSignal::Screen(crate::detect::ScreenObservation {
+            state: crate::detect::ManifestState::Working,
+            matched_rule_id: "working-background-agents".into(),
+            priority: 880,
+            content_seq: 7,
+            prompt_excerpt: None,
+            options: None,
+            stale_after_submit: false,
+            turn_started: false,
+        }),
+        replay.now,
+    );
+    assert_eq!(outcome.status_change, None);
+    // An `agent_completed` reminder with work still running.
+    replay.hook(
+        "Notification",
+        serde_json::json!({"session_id": "8d2c128b-bd49-4562-a87a-8bfb8a10f11c",
+            "hook_event_name": "Notification", "notification_type": "agent_completed",
+            "background_tasks": [{"status": "running"}]}),
+    );
+    assert_eq!(
+        *replay.reducer.status(),
+        SessionStatus::NeedsInput(NeedsInputKind::Question)
+    );
+    let outcome = replay.hook("UserPromptSubmit", prompt_payload());
+    assert_eq!(outcome.status_change, Some(SessionStatus::Working));
 }

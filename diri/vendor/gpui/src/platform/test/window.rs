@@ -37,6 +37,18 @@ pub(crate) struct TestWindowState {
     is_fullscreen: bool,
 }
 
+/// DIRI PATCH (test scale factor): the scale factor test windows report,
+/// 2.0 (Retina) unless [`set_test_window_scale_factor`] changed it.
+static TEST_WINDOW_SCALE_FACTOR: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0x4000_0000);
+
+/// DIRI PATCH (test scale factor): makes test and headless windows report
+/// `scale` (1.0 renders a non-Retina display). Read on every frame, so set it
+/// before opening the window it should apply to.
+pub fn set_test_window_scale_factor(scale: f32) {
+    TEST_WINDOW_SCALE_FACTOR.store(scale.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
 #[derive(Clone)]
 pub struct TestWindow(pub(crate) Rc<Mutex<TestWindowState>>);
 
@@ -148,7 +160,8 @@ impl PlatformWindow for TestWindow {
     }
 
     fn scale_factor(&self) -> f32 {
-        2.0
+        // DIRI PATCH (test scale factor): headless renders of 1x displays.
+        f32::from_bits(TEST_WINDOW_SCALE_FACTOR.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     fn appearance(&self) -> WindowAppearance {

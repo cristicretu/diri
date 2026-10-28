@@ -1,9 +1,15 @@
+#[path = "dirijor/completion.rs"]
+mod completion;
 #[path = "dirijor/notes.rs"]
 mod notes;
 #[path = "dirijor/organization.rs"]
 mod organization;
 #[path = "dirijor/script.rs"]
 mod script;
+#[path = "dirijor/spec.rs"]
+mod spec;
+#[path = "dirijor/verbs.rs"]
+mod verbs;
 
 use std::collections::BTreeMap;
 #[cfg(not(unix))]
@@ -63,9 +69,14 @@ fn run(arguments: &[String]) -> Result<(), CliError> {
         print_help();
         return Ok(());
     };
+    if let Some(help) = verbs::help_for(arguments) {
+        println!("{help}");
+        return Ok(());
+    }
     match command {
         "help" | "--help" | "-h" => {
             print_help();
+            println!("\n{}", verbs::HELP);
             Ok(())
         }
         "hook" => hook(arguments.get(1).map(String::as_str)),
@@ -79,6 +90,19 @@ fn run(arguments: &[String]) -> Result<(), CliError> {
         "send" => script::send(arguments.get(1..).unwrap_or_default()),
         "capture" => script::capture(arguments.get(1..).unwrap_or_default()),
         "run" => script::run(arguments.get(1..).unwrap_or_default()),
+        "send-key" => verbs::send_key(arguments.get(1..).unwrap_or_default()),
+        "split" => verbs::split(arguments.get(1..).unwrap_or_default()),
+        "wait" => verbs::wait(arguments.get(1..).unwrap_or_default()),
+        "kill" => verbs::kill(arguments.get(1..).unwrap_or_default()),
+        "focus" => verbs::focus(arguments.get(1..).unwrap_or_default()),
+        "zoom" => verbs::zoom(arguments.get(1..).unwrap_or_default()),
+        "move" => verbs::move_pane(arguments.get(1..).unwrap_or_default()),
+        "swap" => verbs::swap(arguments.get(1..).unwrap_or_default()),
+        "resize" => verbs::resize(arguments.get(1..).unwrap_or_default()),
+        "whoami" => verbs::whoami(arguments.get(1..).unwrap_or_default()),
+        "version" | "--version" | "-V" => verbs::version(arguments.get(1..).unwrap_or_default()),
+        "completion" => completion::run(arguments.get(1..).unwrap_or_default()),
+        "__complete" => completion::complete(arguments.get(1..).unwrap_or_default()),
         "activity" => activity(arguments.get(1..).unwrap_or_default()),
         "session" => session(arguments.get(1..).unwrap_or_default()),
         "worktree" => worktree(arguments.get(1..).unwrap_or_default()),
@@ -435,8 +459,11 @@ fn session(arguments: &[String]) -> Result<(), CliError> {
             }
         });
     match action {
-        "list" => session_list(rest, false),
+        "list" | "ls" => session_list(rest, false),
         "get" => session_get(rest),
+        "inspect" => verbs::session_inspect(rest),
+        "rename" => verbs::session_rename(rest),
+        "close" => verbs::session_close(rest),
         "process" => session_process(rest),
         "terminal-title" => session_terminal_title(rest),
         "reset-terminal" => session_reset_terminal(rest),
@@ -1059,9 +1086,9 @@ fn session_run_params(arguments: &[String]) -> Result<(Value, bool), CliError> {
                 params["keepOpen"] = json!(true);
                 continue;
             }
-            "--cwd" => "cwd",
+            "--cwd" | "-c" => "cwd",
             "--host" => "host",
-            "--title" | "--name" => "title",
+            "--title" | "--name" | "--label" => "title",
             _ => {
                 return Err(CliError::failure(format!(
                     "unknown session run option {option:?}; {usage}"
@@ -1147,6 +1174,7 @@ fn session_release(arguments: &[String]) -> Result<(), CliError> {
         .ok_or_else(|| CliError::failure("session release requires a target"))?;
     let sessions = sessions()?;
     let record = resolve_session(&target, &sessions)?;
+    verbs::authorize_release(record)?;
     request(
         Method::SESSION_KILL,
         json!({"sessionID": record.id.0}),
@@ -1352,6 +1380,7 @@ fn events(arguments: &[String]) -> Result<(), CliError> {
                 .and_then(|raw| raw.parse::<f64>().ok())
                 .unwrap_or(600.0);
             let session = option_value(rest, "--session")
+                .or_else(|| option_value(rest, "-s"))
                 .map(|target| {
                     let known = sessions()?;
                     Ok::<_, CliError>(resolve_session(&target, &known)?.id.0.clone())
@@ -1398,7 +1427,9 @@ fn events(arguments: &[String]) -> Result<(), CliError> {
                 .and_then(|raw| raw.parse::<f64>().ok())
                 .unwrap_or(86_400.0);
             let known = sessions()?;
-            let session_filters = repeated_option(rest, "--session")
+            let mut session_targets = repeated_option(rest, "--session");
+            session_targets.extend(repeated_option(rest, "-s"));
+            let session_filters = session_targets
                 .iter()
                 .map(|target| resolve_session(target, &known).map(|record| record.id.0.clone()))
                 .collect::<Result<Vec<_>, _>>()?;

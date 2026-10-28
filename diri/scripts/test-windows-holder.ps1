@@ -17,11 +17,24 @@ $body = @"
 `$ErrorActionPreference = 'Stop'
 Set-Location $(Quote $PWD.Path)
 try {
+  # Windows PowerShell's first launch on a fresh runner is cold. Pay for it
+  # once here, and log what it cost, rather than inside a test's deadline.
+  `$warm = [Diagnostics.Stopwatch]::StartNew()
+  # WMI hands this wrapper no PATHEXT, so start it by full path through .NET.
+  `$warmup = [Diagnostics.Process]::new()
+  `$warmup.StartInfo.FileName = Join-Path `$env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+  `$warmup.StartInfo.Arguments = '-NoLogo -NoProfile -NonInteractive -Command exit'
+  `$warmup.StartInfo.UseShellExecute = `$false
+  `$warmup.StartInfo.CreateNoWindow = `$true
+  `$null = `$warmup.Start()
+  if (!`$warmup.WaitForExit(120000)) { `$warmup.Kill(`$true) }
+  `$warmup.Dispose()
+  "Windows PowerShell warm-up: `$([int]`$warm.Elapsed.TotalMilliseconds) ms" | Out-File -Append -FilePath $(Quote $log)
   # Start-Process -Wait creates its own restrictive tracking Job. Use the
   # plain .NET process API so this wrapper does not recreate the CI constraint.
   `$test = [Diagnostics.Process]::new()
   `$test.StartInfo.FileName = $(Quote $artifacts[0])
-  `$test.StartInfo.Arguments = '--test-threads=1'
+  `$test.StartInfo.Arguments = '--test-threads=1 --nocapture'
   `$test.StartInfo.UseShellExecute = `$false
   `$test.StartInfo.CreateNoWindow = `$true
   `$test.StartInfo.RedirectStandardOutput = `$true
@@ -29,8 +42,8 @@ try {
   `$null = `$test.Start()
   `$stdout = `$test.StandardOutput.ReadToEndAsync()
   `$stderr = `$test.StandardError.ReadToEndAsync()
-  if (!`$test.WaitForExit(240000)) { `$test.Kill(`$true); throw 'Holder test binary timed out' }
-  [IO.File]::WriteAllText($(Quote $log), `$stdout.GetAwaiter().GetResult())
+  if (!`$test.WaitForExit(360000)) { `$test.Kill(`$true); throw 'Holder test binary timed out' }
+  [IO.File]::AppendAllText($(Quote $log), `$stdout.GetAwaiter().GetResult())
   [IO.File]::WriteAllText($(Quote $errors), `$stderr.GetAwaiter().GetResult())
   [IO.File]::WriteAllText($(Quote $result), [string]`$test.ExitCode)
   `$test.Dispose()
@@ -61,7 +74,7 @@ $process = [Diagnostics.Process]::GetProcessById([int]$created.ProcessId)
 # Acquire the process handle now; timeout cleanup must not act on a reused PID.
 $null = $process.Handle
 try {
-  if (!$process.WaitForExit(300000)) {
+  if (!$process.WaitForExit(420000)) {
     $process.Kill($true)
     throw 'Standalone Holder tests timed out'
   }
