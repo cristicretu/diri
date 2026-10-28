@@ -431,3 +431,26 @@ unchanged).
 `observe = ["vte/observe"]` only forwards the vendored VTE's test-only OSC
 totals (see its DIRI-PATCH.md) so `diri-terminal-state`'s `bench-verify`
 feature can reach them. No source change.
+
+## Styles with extra storage by hash map
+
+`StyleTable::extra_id` found a style with extra storage (combining marks, an
+underline color, a hyperlink) by a linear scan of every such style already in
+the block. Output where each cell carries different marks (`kitten
+__benchmark__`'s unique Unicode: a letter and three combining marks per cell)
+gives a block of 64 rows at 120 columns about 7,700 such styles, so sealing
+it compared about 30 million entries: the unique Unicode workload fell from
+about 47 to about 10 MB/s with "Cheaper history encoding".
+
+- The first style with each hash sits in an `FxHasher` map, found or claimed
+  in one probe; a later, different style with the same hash goes to a short
+  collision list that is searched by hash and comparison as before. Ids are
+  handed out in the same order, so payloads are byte-identical.
+- The table is kept, emptied, in a thread-local between blocks next to the
+  encoding buffers (`STYLE_SCRATCH`) and released with them, so a stream of
+  such blocks does not regrow its map and list each time. It is emptied
+  before it is put back, so it holds no cell's extra storage between blocks.
+
+Tests: `styles_with_extra_storage_are_told_apart_on_a_hash_collision`,
+`blocks_of_unique_combining_marks_round_trip_one_after_another`, and the
+existing randomized codec tests.

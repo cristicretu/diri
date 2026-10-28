@@ -4,6 +4,7 @@
 //! remain valid until exclusive access is regained. Cache reclamation therefore
 //! requires `&mut self`; it never evicts behind an outstanding shared reference.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2385,9 +2386,13 @@ struct StyleTable {
     /// Plain style keys by id order, searched on a cache miss while short.
     plain: Vec<(u128, u32)>,
     plain_map: HashMap<u128, u32, FxBuild>,
-    /// Styles with extra storage by hash; equal hashes are told apart by
-    /// comparing with the stored style.
-    extra: Vec<(u64, u32)>,
+    /// Styles with extra storage by hash: the first style with each hash.
+    /// A block of unique combining marks holds thousands of these, so a
+    /// linear search made encoding quadratic in the block's cells.
+    extra: HashMap<u64, u32, FxBuild>,
+    /// Later styles whose hash equals an earlier, different style's; told
+    /// apart by comparing with the stored style.
+    extra_collisions: Vec<(u64, u32)>,
     /// The last extra style seen, by its shared storage: cells written with
     /// one template (a hyperlink, an underline color) share it.
     last_extra: Option<(*const CellExtra, u32)>,
@@ -2400,7 +2405,8 @@ impl Default for StyleTable {
             recent: [(0, 0); Self::SLOTS],
             plain: Vec::new(),
             plain_map: HashMap::default(),
-            extra: Vec::new(),
+            extra: HashMap::default(),
+            extra_collisions: Vec::new(),
             last_extra: None,
         }
     }
@@ -2409,6 +2415,17 @@ impl Default for StyleTable {
 impl StyleTable {
     const SLOTS: usize = 32;
     const LINEAR_PLAIN: usize = 32;
+
+    /// Empties the table for the next block, keeping its capacity.
+    fn clear(&mut self) {
+        self.styles.clear();
+        self.recent = [(0, 0); Self::SLOTS];
+        self.plain.clear();
+        self.plain_map.clear();
+        self.extra.clear();
+        self.extra_collisions.clear();
+        self.last_extra = None;
+    }
 
     fn push(&mut self, cell: &Cell) -> u32 {
         let mut style = cell.clone();
@@ -2476,20 +2493,31 @@ impl StyleTable {
         hash_style(cell, &mut hasher);
         let hash = hasher.finish();
         let styles = &self.styles;
-        let found = self.extra.iter().find(|&&(entry, id)| {
-            entry == hash && {
-                let style = &styles[id as usize];
-                plain_style_key(style) == plain_style_key(cell) && style.extra == cell.extra
+        let same = |id: u32| {
+            let style = &styles[id as usize];
+            plain_style_key(style) == plain_style_key(cell) && style.extra == cell.extra
+        };
+        // The id a new style gets; one map probe finds or claims the hash.
+        let next = styles.len() as u32;
+        let found = match self.extra.entry(hash) {
+            Entry::Vacant(slot) => {
+                slot.insert(next);
+                None
             }
-        });
-        let id = match found {
-            Some(&(_, id)) => id,
-            None => {
-                let id = self.push(cell);
-                self.extra.push((hash, id));
-                id
+            Entry::Occupied(slot) if same(*slot.get()) => Some(*slot.get()),
+            Entry::Occupied(_) => {
+                let found = self
+                    .extra_collisions
+                    .iter()
+                    .find(|&&(entry, id)| entry == hash && same(id))
+                    .map(|&(_, id)| id);
+                if found.is_none() {
+                    self.extra_collisions.push((hash, next));
+                }
+                found
             }
         };
+        let id = found.unwrap_or_else(|| self.push(cell));
         self.last_extra = Some((shared, id));
         id
     }
@@ -2510,8 +2538,9 @@ fn encode_cells(rows: &[Row<Cell>]) -> Encoded {
     );
     let width = rows.first().map_or(0, Row::len);
     let mut blank_on_reset = 0;
-    let mut table = StyleTable::default();
-    // The working buffers keep their capacity from one block to the next.
+    // The working buffers and the style table keep their capacity from one
+    // block to the next.
+    let mut table = STYLE_SCRATCH.take();
     let (mut raw, mut text, mut runs, mut packed) = ENCODE_SCRATCH.take();
     raw.clear();
     raw.reserve(rows.iter().map(|row| row.len() + 8).sum::<usize>() + 64);
@@ -2605,6 +2634,9 @@ fn encode_cells(rows: &[Row<Cell>]) -> Encoded {
     lz::compress_into(&raw, &mut packed);
     let bytes = Arc::from(&packed[..]);
     ENCODE_SCRATCH.set((raw, text, runs, packed));
+    // Emptied now so the scratch table holds no cell's extra storage.
+    table.clear();
+    STYLE_SCRATCH.set(table);
     Encoded {
         bytes,
         resize_floor: floor,
@@ -2612,10 +2644,12 @@ fn encode_cells(rows: &[Row<Cell>]) -> Encoded {
     }
 }
 
-/// Frees [`ENCODE_SCRATCH`]: whatever keeps spare rows only while output
-/// streams keeps these the same way, so an idle terminal holds neither.
+/// Frees [`ENCODE_SCRATCH`] and [`STYLE_SCRATCH`]: whatever keeps spare rows
+/// only while output streams keeps these the same way, so an idle terminal
+/// holds neither.
 fn release_encode_scratch() {
     drop(ENCODE_SCRATCH.take());
+    drop(STYLE_SCRATCH.take());
 }
 
 thread_local! {
@@ -2625,6 +2659,12 @@ thread_local! {
     #[allow(clippy::type_complexity)]
     static ENCODE_SCRATCH: std::cell::Cell<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> =
         const { std::cell::Cell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
+
+    /// [`encode_cells`]'s style table, empty between blocks. A block of
+    /// unique combining marks holds a style per cell (about 7,700 at 120
+    /// columns), and regrowing its map and list for every block showed in
+    /// profiles of such output.
+    static STYLE_SCRATCH: std::cell::Cell<StyleTable> = std::cell::Cell::new(StyleTable::default());
 }
 
 struct Reader<'a> {
@@ -3197,6 +3237,55 @@ mod tests {
         }
         assert_codec_round_trip(&[row.clone(), Row::new(600), row]);
         assert_codec_round_trip(&[]);
+    }
+
+    #[test]
+    fn styles_with_extra_storage_are_told_apart_on_a_hash_collision() {
+        let mut first = Cell::default();
+        first.push_zerowidth('\u{301}');
+        let mut second = Cell::default();
+        second.push_zerowidth('\u{302}');
+        let hash = |cell: &Cell| {
+            let mut hasher = FxHasher::default();
+            hash_style(cell, &mut hasher);
+            hasher.finish()
+        };
+        let mut table = StyleTable::default();
+        assert_eq!(table.extra_id(&first), 0);
+        // Pretend `second` hashes like `first`: its hash now names style 0.
+        table.extra.insert(hash(&second), 0);
+        table.last_extra = None;
+        assert_eq!(table.extra_id(&second), 1);
+        table.last_extra = None;
+        assert_eq!(table.extra_id(&second), 1);
+        assert_eq!(table.extra_collisions, vec![(hash(&second), 1)]);
+        assert_eq!(table.styles.len(), 2);
+        table.clear();
+        assert!(table.styles.is_empty() && table.extra.is_empty());
+        assert!(table.extra_collisions.is_empty() && table.last_extra.is_none());
+    }
+
+    #[test]
+    fn blocks_of_unique_combining_marks_round_trip_one_after_another() {
+        // A style per cell, as `kitten __benchmark__`'s unique Unicode
+        // writes; the second block reuses the first's emptied style table.
+        for offset in [0u32, 7] {
+            let rows: Vec<Row<Cell>> = (0..64u32)
+                .map(|line| {
+                    let mut row = Row::<Cell>::new(120);
+                    for (column, cell) in row[..].iter_mut().enumerate() {
+                        let mut q = line * 120 + column as u32 + offset;
+                        cell.c = 'a';
+                        for _ in 0..3 {
+                            cell.push_zerowidth(char::from_u32(0x300 + q % 0x70).unwrap());
+                            q /= 0x70;
+                        }
+                    }
+                    row
+                })
+                .collect();
+            assert_codec_round_trip(&rows);
+        }
     }
 
     #[test]
