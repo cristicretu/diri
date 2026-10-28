@@ -10,7 +10,10 @@
 //! The final sequence has literals only.
 
 const MIN_MATCH: usize = 4;
-const HASH_BITS: u32 = 12;
+const HASH_BITS: u32 = 11;
+/// How fast probing speeds up through bytes without matches (see
+/// [`compress_into`]).
+const SKIP_SHIFT: u32 = 3;
 const WINDOW: usize = u16::MAX as usize;
 /// Matches never start in the final bytes, so the literal tail always exists
 /// and a match search never reads past the input.
@@ -97,42 +100,52 @@ pub(super) fn compress(input: &[u8]) -> Vec<u8> {
 }
 
 /// [`compress`] into `out`, replacing what it held and keeping its capacity.
+///
+/// Each miss lengthens the step to the next probe (one more byte every
+/// `1 << SKIP_SHIFT` misses), so text without repeats costs a fraction of a
+/// probe per byte. A match found after a skip is first extended backwards,
+/// which recovers the bytes the skip stepped over.
 pub(super) fn compress_into(input: &[u8], out: &mut Vec<u8>) {
     out.clear();
     out.reserve(input.len() / 2 + 16);
     put_varint(out, input.len());
-    let mut table = [u32::MAX; 1 << HASH_BITS];
-    let mut anchor = 0;
-    let mut position = 0;
     let limit = input.len().saturating_sub(TAIL);
+    if limit == 0 {
+        emit(out, input, None);
+        return;
+    }
+    // Zero is a valid candidate: every candidate's bytes are compared before
+    // a match is taken, so an empty slot costs one comparison.
+    let mut table = [0u32; 1 << HASH_BITS];
+    table[hash(read_u32(input, 0))] = 0;
+    let mut anchor = 0;
+    let mut position = 1;
     let mut misses = 0usize;
     while position < limit {
         let value = read_u32(input, position);
         let slot = &mut table[hash(value)];
-        let candidate = *slot as usize;
+        let mut candidate = *slot as usize;
         *slot = position as u32;
-        if candidate >= position
-            || position - candidate > WINDOW
-            || read_u32(input, candidate) != value
-        {
+        if position - candidate > WINDOW || read_u32(input, candidate) != value {
             misses += 1;
-            position += 1 + (misses >> 6);
+            position += 1 + (misses >> SKIP_SHIFT);
             continue;
         }
         misses = 0;
-        let len = MIN_MATCH + match_length(input, candidate + MIN_MATCH, position + MIN_MATCH);
-        emit(
-            out,
-            &input[anchor..position],
-            Some((position - candidate, len)),
-        );
+        let forward = MIN_MATCH + match_length(input, candidate + MIN_MATCH, position + MIN_MATCH);
+        let mut start = position;
+        while start > anchor && candidate > 0 && input[start - 1] == input[candidate - 1] {
+            start -= 1;
+            candidate -= 1;
+        }
+        let len = forward + (position - start);
+        emit(out, &input[anchor..start], Some((start - candidate, len)));
+        position = start + len;
         // Index one position inside the match so repeated structure keeps
         // finding recent candidates without hashing every byte.
-        if position + len - 2 < limit {
-            let inner = position + len - 2;
-            table[hash(read_u32(input, inner))] = inner as u32;
+        if position - 2 < limit {
+            table[hash(read_u32(input, position - 2))] = (position - 2) as u32;
         }
-        position += len;
         anchor = position;
     }
     emit(out, &input[anchor..], None);

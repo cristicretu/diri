@@ -307,8 +307,17 @@ struct Feeder {
 
 impl Feeder {
     fn new() -> Self {
+        Self::with(screen())
+    }
+
+    /// Per-character input instead of runs: the unoptimized reference.
+    fn per_character() -> Self {
+        Self::with(screen().with_per_character_input())
+    }
+
+    fn with(screen: HeadlessScreen) -> Self {
         Self {
-            screen: screen(),
+            screen,
             replies: Vec::new(),
             notifications: Vec::new(),
             clipboard: Vec::new(),
@@ -459,6 +468,136 @@ fn assert_same(expected: &Observed, actual: &Observed, how: &str) {
         context(&e),
         context(&a)
     );
+}
+
+fn observe_per_character<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> Observed {
+    let mut feeder = Feeder::per_character();
+    for chunk in chunks {
+        feeder.feed(chunk);
+    }
+    feeder.observe()
+}
+
+/// Text that stresses writing runs of cells: ASCII and wide characters
+/// reaching the right margin at every column, combining and spacing marks,
+/// emoji with modifiers, ZWJ sequences and variation selectors, overwrites of
+/// wide characters and their spacers, insert mode, autowrap off, the line
+/// drawing charset, shell marks, links and colors, C1 controls and invalid
+/// UTF-8.
+fn text_stream(seed: u64, pieces: usize) -> Vec<u8> {
+    const TEXT: &[&str] = &[
+        "abc",
+        "The quick brown fox",
+        "~!@#",
+        " ",
+        "漢字",
+        "界",
+        "ｈｉ",
+        "é",
+        "e\u{301}",
+        "a\u{301}\u{302}\u{303}",
+        "\u{9b2}\u{9cb}",
+        "\u{e01}\u{e33}",
+        "👍🏽",
+        "👩\u{200d}💻",
+        "❤\u{fe0f}",
+        "\u{1f1fa}\u{1f1f8}",
+        "ß→€",
+        "\u{a0}",
+        "\u{ad}",
+        "\u{200b}",
+        "한국어",
+        "ｶﾀｶﾅ",
+        "\u{301}",
+        "\u{200d}",
+        "\u{fe0f}",
+        "❤",
+        "\u{1f3fd}",
+        "1\u{fe0f}\u{20e3}",
+        "\u{1100}\u{1161}\u{11a8}",
+        "\u{915}\u{94d}\u{937}",
+        "\u{1f1f7}",
+        "\x1b[?2027h",
+        "\x1b[?2027l",
+    ];
+    const CONTROLS: &[&[u8]] = &[
+        b"\r\n",
+        b"\r",
+        b"\n",
+        b"\t",
+        b"\x08",
+        b"\x08\x08",
+        b"\x1b[4h",
+        b"\x1b[4l",
+        b"\x1b[?7l",
+        b"\x1b[?7h",
+        b"\x1b(0",
+        b"\x1b(B",
+        b"\x1b[31;1m",
+        b"\x1b[0m",
+        b"\x1b[3@",
+        b"\x1b[2P",
+        b"\x1b[3X",
+        b"\x1b[2K",
+        b"\x1b[H",
+        b"\x1b]8;;https://example.invalid\x07",
+        b"\x1b]8;;\x07",
+        b"\x1b]133;A\x07",
+        b"\x1b]133;B\x07",
+        b"\x1b]133;C\x07",
+        b"\x1b[2b",
+        b"\xc2\x85",
+        b"\xc2\x9b2C",
+        b"\xff",
+        b"\xe6\x97",
+        b"\x7f",
+        b"\x1b[1;1H\x1b[3;8r",
+        b"\x1b[r",
+    ];
+    let mut rng = Rng(seed);
+    let mut out = Vec::new();
+    for _ in 0..pieces {
+        match rng.below(6) {
+            0 => out.extend_from_slice(CONTROLS[rng.below(CONTROLS.len())]),
+            // Land the next text anywhere, including the last two columns.
+            1 => out.extend_from_slice(
+                format!(
+                    "\x1b[{};{}H",
+                    1 + rng.below(ROWS),
+                    COLS - rng.below(COLS.min(6))
+                )
+                .as_bytes(),
+            ),
+            _ => {
+                for _ in 0..1 + rng.below(12) {
+                    out.extend_from_slice(TEXT[rng.below(TEXT.len())].as_bytes());
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn runs_parse_the_same_as_per_character_input() {
+    for seed in 1..=16u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x2545_f491_4f6c_dd1d) | 1);
+        for stream in [text_stream(seed, 3_000), dense_stream(seed)] {
+            let reference = observe_per_character(stream.chunks(1));
+            assert_same(&reference, &observe_chunks([&stream[..]]), "runs, one shot");
+            assert_same(
+                &reference,
+                &observe_per_character([&stream[..]]),
+                "per character, one shot",
+            );
+            let chunks = random_chunks(&stream, &mut rng, 4096);
+            assert_same(
+                &reference,
+                &observe_chunks(chunks),
+                &format!("runs, seed {seed}"),
+            );
+        }
+    }
 }
 
 #[test]
@@ -647,4 +786,127 @@ fn state_after_hundreds_of_events_in_one_read_survives() {
     );
     assert_eq!(screen.title(), Some("kept"));
     assert_eq!(screen.take_replies(), b"\x1b[0n".repeat(300));
+}
+
+/// Hand-made and random escape soups from an independent review
+/// (`fixtures/adversarial-gen.py`, seed 922; the inputs over 64 KiB are left
+/// out): C1 controls, CAN/SUB inside every string type, OSC 8 and titles
+/// with odd terminators, DCS queries, notifications, Kitty uploads chunked,
+/// padded, URL-safe, whitespace-wrapped, invalid and interleaved with text,
+/// iTerm2 images, REP and CSI edge cases. Each must end in the same state in
+/// one read, a byte at a time, split in two anywhere, and in random reads.
+#[test]
+fn adversarial_inputs_parse_the_same_however_they_are_read() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/adversarial");
+    let mut paths: Vec<_> = std::fs::read_dir(&dir)
+        .expect("fixtures")
+        .map(|entry| entry.expect("entry").path())
+        .collect();
+    paths.sort();
+    assert!(paths.len() >= 40, "fixtures missing: {}", paths.len());
+    // The pump hands over only the newest clipboard write of a read (two in
+    // one read set the clipboard once, to the second), so how many arrive
+    // depends on reads; the clipboard's final contents must not.
+    let observe_chunks = |chunks: Vec<&[u8]>| {
+        let mut observed = observe_chunks(chunks);
+        observed.clipboard = observed.clipboard.pop().into_iter().collect();
+        observed
+    };
+    for path in paths {
+        let name = path
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .into_owned();
+        let stream = std::fs::read(&path).expect("fixture");
+        let expected = observe_chunks(vec![&stream[..]]);
+        assert_same(
+            &expected,
+            &observe_chunks(stream.chunks(1).collect()),
+            &format!("{name} a byte at a time"),
+        );
+        // Every split for small inputs; for larger ones every split in the
+        // first 256 bytes and 256 spread through the rest.
+        let splits: Vec<usize> = if stream.len() <= 6_000 {
+            (1..stream.len()).collect()
+        } else {
+            (1..256)
+                .chain((0..256).map(|i| 256 + i * (stream.len() - 256) / 256))
+                .collect()
+        };
+        for split in splits {
+            assert_same(
+                &expected,
+                &observe_chunks(vec![&stream[..split], &stream[split..]]),
+                &format!("{name} split at {split} of {}", stream.len()),
+            );
+        }
+        let mut rng = Rng(stream.len() as u64 | 1);
+        for round in 0..4 {
+            assert_same(
+                &expected,
+                &observe_chunks(random_chunks(&stream, &mut rng, 4096)),
+                &format!("{name} random reads, round {round}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn can_or_sub_cancels_an_image_command_like_any_other_string() {
+    // The parser drops an APC at CAN or SUB, executes the byte and goes on
+    // with what follows. With images on, the Kitty command is cut out before
+    // the parser sees it; the text after it must still print, and the DCS
+    // query after that must be cancelled by its own SUB, not answered.
+    let stream = b"\x1b_Gf=32,s=1,v=1;AAAA\x18tail\x1bP+q54\x1a!\x1b_Gi=3;AA\x1amore";
+    let mut parser_only =
+        HeadlessScreen::new_with_keyboard_enhancements(COLS, ROWS).with_host_replies("diri-test");
+    parser_only.feed(stream);
+    let with_images = observe_chunks([&stream[..]]);
+    assert!(
+        with_images.link_text.starts_with("tail!more"),
+        "{:?}",
+        with_images.link_text
+    );
+    assert!(
+        parser_only.row_text(0).starts_with("tail!more"),
+        "{:?}",
+        parser_only.row_text(0)
+    );
+    let mut screen = screen();
+    screen.feed(stream);
+    assert_eq!(screen.row_text(0), parser_only.row_text(0));
+    assert_eq!(screen.take_replies(), parser_only.take_replies());
+    assert_eq!(screen.inline_image_bytes(), 0);
+    for split in 1..stream.len() {
+        assert_same(
+            &with_images,
+            &observe_chunks([&stream[..split], &stream[split..]]),
+            &format!("split at {split}"),
+        );
+    }
+}
+
+#[test]
+fn can_or_sub_ends_an_inline_image_osc_like_any_other_osc() {
+    // The parser dispatches an OSC at CAN or SUB, then executes the byte. An
+    // iTerm2 image ended that way is shown, and the text after it prints.
+    let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0\x1f\x15\xc4\x89\0\0\0\rIDATx\x9cc\xf8\x0f\0\0\x01\x01\0\x05\x18\xd8N\0\0\0\0IEND\xaeB`\x82";
+    let mut stream = b"\x1b]1337;File=inline=1:".to_vec();
+    stream.extend_from_slice(base64(png).as_bytes());
+    stream.extend_from_slice(b"\x18after");
+    let expected = observe_chunks([&stream[..]]);
+    assert!(expected.image_bytes > 0, "the image was stored");
+    assert!(
+        expected.link_text.contains("after"),
+        "{:?}",
+        expected.link_text
+    );
+    for split in 1..stream.len() {
+        assert_same(
+            &expected,
+            &observe_chunks([&stream[..split], &stream[split..]]),
+            &format!("split at {split}"),
+        );
+    }
 }

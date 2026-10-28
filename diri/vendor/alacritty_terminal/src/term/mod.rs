@@ -1371,6 +1371,220 @@ impl<T> Term<T> {
         self.damage_cursor();
     }
 
+    /// DIRI PATCH: `input` for a character that is not a control, with its
+    /// `info` already looked up.
+    #[inline(never)]
+    fn input_measured(&mut self, c: char, info: grapheme::Info)
+    where
+        T: EventListener,
+    {
+        if grapheme::may_join(c, info) && self.continue_cluster(c, info) {
+            return;
+        }
+        let width = info.width();
+
+        // Handle zero-width characters.
+        if width == 0 {
+            // Get previous column.
+            let mut column = self.grid.cursor.point.column;
+            if !self.grid.cursor.input_needs_wrap {
+                column.0 = column.saturating_sub(1);
+            }
+
+            // Put zerowidth characters over first fullwidth character cell.
+            let line = self.grid.cursor.point.line;
+            if self.grid[line][column]
+                .flags
+                .contains(Flags::WIDE_CHAR_SPACER)
+            {
+                column.0 = column.saturating_sub(1);
+            }
+
+            self.grid[line][column].push_zerowidth(c);
+            return;
+        }
+
+        // Move cursor to next line.
+        if self.grid.cursor.input_needs_wrap {
+            self.wrapline();
+        }
+
+        // If in insert mode, first shift cells to the right.
+        let columns = self.columns();
+        if self.mode.contains(TermMode::INSERT) && self.grid.cursor.point.column + width < columns {
+            let line = self.grid.cursor.point.line;
+            let col = self.grid.cursor.point.column;
+            let row = &mut self.grid[line][..];
+
+            for col in (col.0..(columns - width)).rev() {
+                row.swap(col + width, col);
+            }
+        }
+
+        if width == 1 {
+            self.write_at_cursor(c);
+        } else {
+            if self.grid.cursor.point.column + 1 >= columns {
+                if self.mode.contains(TermMode::LINE_WRAP) {
+                    // Insert placeholder before wide char if glyph does not fit in this row.
+                    self.grid
+                        .cursor
+                        .template
+                        .flags
+                        .insert(Flags::LEADING_WIDE_CHAR_SPACER);
+                    self.write_at_cursor(' ');
+                    self.grid
+                        .cursor
+                        .template
+                        .flags
+                        .remove(Flags::LEADING_WIDE_CHAR_SPACER);
+                    self.wrapline();
+                } else {
+                    // Prevent out of bounds crash when linewrapping is disabled.
+                    self.grid.cursor.input_needs_wrap = true;
+                    return;
+                }
+            }
+
+            if !self.write_wide_pair(c) {
+                // Write full width glyph to current cursor cell.
+                self.grid.cursor.template.flags.insert(Flags::WIDE_CHAR);
+                self.write_at_cursor(c);
+                self.grid.cursor.template.flags.remove(Flags::WIDE_CHAR);
+
+                // Write spacer to cell following the wide glyph.
+                self.grid.cursor.point.column += 1;
+                self.grid
+                    .cursor
+                    .template
+                    .flags
+                    .insert(Flags::WIDE_CHAR_SPACER);
+                self.write_at_cursor(' ');
+                self.grid
+                    .cursor
+                    .template
+                    .flags
+                    .remove(Flags::WIDE_CHAR_SPACER);
+            }
+        }
+
+        if self.grid.cursor.point.column + 1 < columns {
+            self.grid.cursor.point.column += 1;
+        } else {
+            self.grid.cursor.input_needs_wrap = true;
+        }
+    }
+
+    /// DIRI PATCH: writes the characters of `text` from byte `start` that
+    /// start a cluster of their own and fit in the cursor row, as `input`
+    /// would, and returns where it stopped. Writes one character through
+    /// `input` when none can take this path.
+    #[inline]
+    fn input_row_segment(&mut self, text: &str, start: usize) -> usize
+    where
+        T: EventListener,
+    {
+        // Columns of a character that starts a cluster of its own and takes
+        // one or two columns, as `input` measures it; `None` for anything
+        // that may join the cluster before it or is zero-width.
+        #[inline(always)]
+        fn own_width(c: char, info: grapheme::Info) -> Option<usize> {
+            if grapheme::may_join(c, info) {
+                return None;
+            }
+            match info.width() {
+                width @ (1 | 2) => Some(width),
+                _ => None,
+            }
+        }
+        let first = text[start..]
+            .chars()
+            .next()
+            .expect("start is on a char boundary");
+        if first < '\u{A0}' {
+            // ASCII or a C1 control, from a caller other than the parser.
+            self.input(first);
+            return start + first.len_utf8();
+        }
+        let first_info = grapheme::Info::of(first);
+        if own_width(first, first_info).is_none() {
+            // Marks and joiners, one at a time, as `input` takes them.
+            self.input_measured(first, first_info);
+            return start + first.len_utf8();
+        }
+        let columns = self.columns();
+        let point = self.grid.cursor.point;
+        let mut column = point.column.0;
+        let mut index = start;
+        let mut wrap = false;
+        #[cfg(test)]
+        let fast = !self.reference_wide_writes;
+        #[cfg(not(test))]
+        let fast = true;
+        if fast && !self.grid.cursor.input_needs_wrap && !self.mode.contains(TermMode::INSERT) {
+            let charset = self.grid.cursor.charsets[self.active_charset];
+            let template = &self.grid.cursor.template;
+            let (fg, bg, flags) = (template.fg, template.bg, template.flags);
+            let extra = template.extra.clone();
+            let spacer = charset.map(' ');
+            let row = &mut self.grid[point.line];
+            for c in text[start..].chars() {
+                if c < '\u{A0}' {
+                    break;
+                }
+                let Some(width) = own_width(c, grapheme::Info::of(c)) else {
+                    break;
+                };
+                if column + width > columns {
+                    break;
+                }
+                // Overwriting a wide character or spacer also clears its
+                // partner cells; leave that to `input`.
+                let wide = Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER;
+                if row[Column(column)].flags.intersects(wide)
+                    || (width == 2 && row[Column(column + 1)].flags.intersects(wide))
+                {
+                    break;
+                }
+                let cells = &mut row[Column(column)..Column(column + width)];
+                let cell = &mut cells[0];
+                cell.c = charset.map(c);
+                cell.fg = fg;
+                cell.bg = bg;
+                cell.extra = extra.clone();
+                if width == 1 {
+                    cell.flags = flags | (cell.flags & Flags::SHELL_MARKS);
+                } else {
+                    cell.flags = flags | Flags::WIDE_CHAR | (cell.flags & Flags::SHELL_MARKS);
+                    let cell = &mut cells[1];
+                    cell.c = spacer;
+                    cell.fg = fg;
+                    cell.bg = bg;
+                    cell.flags =
+                        flags | Flags::WIDE_CHAR_SPACER | (cell.flags & Flags::SHELL_MARKS);
+                    cell.extra = extra.clone();
+                }
+                index += c.len_utf8();
+                column += width;
+                if column == columns {
+                    wrap = true;
+                    break;
+                }
+            }
+        }
+        if index == start {
+            self.input_measured(first, first_info);
+            return start + first.len_utf8();
+        }
+        if wrap {
+            self.grid.cursor.point.column = Column(columns - 1);
+            self.grid.cursor.input_needs_wrap = true;
+        } else {
+            self.grid.cursor.point.column = Column(column);
+        }
+        index
+    }
+
     /// DIRI PATCH: writes the wide character `c` and its spacer at the
     /// cursor, leaving the cursor on the spacer, when neither cell is part of
     /// an earlier wide character. Exactly the two `write_at_cursor` calls of
@@ -1815,27 +2029,18 @@ impl<T: EventListener> Handler for Term<T> {
 
     /// DIRI PATCH: characters beyond ASCII, none a C1 control.
     ///
-    /// Equivalent to `input` for each character. A wide character that
-    /// continues no cluster and fits on the row is written here with its
-    /// spacer, without a call per character; anything else takes `input`.
+    /// Equivalent to `input` for each character. Characters that start a
+    /// grapheme cluster of their own and take one or two columns are written
+    /// straight into the cursor row, a row segment at a time, while they fit
+    /// and land on no wide character or spacer, with no wrap pending and
+    /// insert mode off. Anything else (marks, joiners, variation selectors,
+    /// emoji modifiers, regional indicators, a wide character at the margin,
+    /// a pending wrap) takes `input`, cluster rules included.
     #[inline(never)]
     fn input_text(&mut self, text: &str) {
-        for c in text.chars() {
-            let info = grapheme::Info::of(c);
-            if info.width() == 2
-                && !grapheme::may_join(c, info)
-                && !self.grid.cursor.input_needs_wrap
-                && !self.mode.contains(TermMode::INSERT)
-                && self.write_wide_pair(c)
-            {
-                if self.grid.cursor.point.column + 1 < self.columns() {
-                    self.grid.cursor.point.column += 1;
-                } else {
-                    self.grid.cursor.input_needs_wrap = true;
-                }
-                continue;
-            }
-            self.input(c);
+        let mut index = 0;
+        while index < text.len() {
+            index = self.input_row_segment(text, index);
         }
     }
 
@@ -1848,102 +2053,7 @@ impl<T: EventListener> Handler for Term<T> {
         }
         // Number of cells the char will occupy, as Claude Code (Bun's
         // `stringWidth`) measures it; see `grapheme`.
-        let info = grapheme::Info::of(c);
-        if grapheme::may_join(c, info) && self.continue_cluster(c, info) {
-            return;
-        }
-        let width = info.width();
-
-        // Handle zero-width characters.
-        if width == 0 {
-            // Get previous column.
-            let mut column = self.grid.cursor.point.column;
-            if !self.grid.cursor.input_needs_wrap {
-                column.0 = column.saturating_sub(1);
-            }
-
-            // Put zerowidth characters over first fullwidth character cell.
-            let line = self.grid.cursor.point.line;
-            if self.grid[line][column]
-                .flags
-                .contains(Flags::WIDE_CHAR_SPACER)
-            {
-                column.0 = column.saturating_sub(1);
-            }
-
-            self.grid[line][column].push_zerowidth(c);
-            return;
-        }
-
-        // Move cursor to next line.
-        if self.grid.cursor.input_needs_wrap {
-            self.wrapline();
-        }
-
-        // If in insert mode, first shift cells to the right.
-        let columns = self.columns();
-        if self.mode.contains(TermMode::INSERT) && self.grid.cursor.point.column + width < columns {
-            let line = self.grid.cursor.point.line;
-            let col = self.grid.cursor.point.column;
-            let row = &mut self.grid[line][..];
-
-            for col in (col.0..(columns - width)).rev() {
-                row.swap(col + width, col);
-            }
-        }
-
-        if width == 1 {
-            self.write_at_cursor(c);
-        } else {
-            if self.grid.cursor.point.column + 1 >= columns {
-                if self.mode.contains(TermMode::LINE_WRAP) {
-                    // Insert placeholder before wide char if glyph does not fit in this row.
-                    self.grid
-                        .cursor
-                        .template
-                        .flags
-                        .insert(Flags::LEADING_WIDE_CHAR_SPACER);
-                    self.write_at_cursor(' ');
-                    self.grid
-                        .cursor
-                        .template
-                        .flags
-                        .remove(Flags::LEADING_WIDE_CHAR_SPACER);
-                    self.wrapline();
-                } else {
-                    // Prevent out of bounds crash when linewrapping is disabled.
-                    self.grid.cursor.input_needs_wrap = true;
-                    return;
-                }
-            }
-
-            if !self.write_wide_pair(c) {
-                // Write full width glyph to current cursor cell.
-                self.grid.cursor.template.flags.insert(Flags::WIDE_CHAR);
-                self.write_at_cursor(c);
-                self.grid.cursor.template.flags.remove(Flags::WIDE_CHAR);
-
-                // Write spacer to cell following the wide glyph.
-                self.grid.cursor.point.column += 1;
-                self.grid
-                    .cursor
-                    .template
-                    .flags
-                    .insert(Flags::WIDE_CHAR_SPACER);
-                self.write_at_cursor(' ');
-                self.grid
-                    .cursor
-                    .template
-                    .flags
-                    .remove(Flags::WIDE_CHAR_SPACER);
-            }
-        }
-
-        if self.grid.cursor.point.column + 1 < columns {
-            self.grid.cursor.point.column += 1;
-        } else {
-            self.grid.cursor.input_needs_wrap = true;
-        }
+        self.input_measured(c, grapheme::Info::of(c));
     }
 
     #[inline]

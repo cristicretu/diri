@@ -1,8 +1,8 @@
 # Diri VTE patch
 
 Source: crates.io `vte` 0.15.0, copied from the Cargo registry. Original
-Apache-2.0/MIT licenses and upstream tests are retained. There are six
-production changes. The first is `SyncState::default`: its byte buffer starts empty instead of reserving
+Apache-2.0/MIT licenses and upstream tests are retained. Each production
+change has a section below. The first is `SyncState::default`: its byte buffer starts empty instead of reserving
 the 2 MiB synchronization limit for every terminal, including idle shells.
 
 Original crates.io archive SHA-256:
@@ -124,3 +124,46 @@ soups of printable runs, controls, DEL, C1 in both encodings, valid,
 truncated and invalid UTF-8 and escapes of every kind, fed whole and in
 pieces of 1 to 40 bytes. `printable_runs_end_at_the_first_byte_outside_space_to_tilde`
 checks the word test for every byte value at every offset.
+
+### Characters beyond ASCII validated in the same pass
+
+A stretch of bytes at or above 0x80 was still read three times: once to find
+the next ASCII byte, once by `str::from_utf8`, and once more to split it at C1
+controls. `non_ascii_run_end` now validates and ends the run in one pass, with
+exactly `from_utf8`'s acceptance (overlongs, surrogates and code points past
+U+10FFFF rejected), stopping at the next ASCII byte, C1 control (`C2 80` to
+`C2 9F`, executed as before) or invalid or incomplete sequence; three-byte
+characters (CJK, kana, Hangul) take a short path. The run goes to
+`print_text` as before. Invalid and incomplete UTF-8 still goes through the
+error handling above, unchanged, starting where the run stopped.
+
+`Parser::set_per_character_print` (and `Processor::set_per_character_print`,
+both hidden) hands ground text to `print` one character at a time instead of
+`print_ascii`/`print_text` runs, everything else unchanged. Diri's
+`diri-terminal-state` uses it as the reference that its run paths, and the
+`vt_workloads` bench, are checked against.
+
+Upstream bug, fixed here: a C1 control completed across reads (`C2` at the end
+of one read, `85` at the start of the next) was printed as a character, where
+a whole read executes it. REP then repeated it instead of the character before,
+so the screen depended on where the read split. `advance_partial_utf8` now
+executes a completed C1.
+
+Tests: `non_ascii_runs_end_where_from_utf8_and_c1_end_them` (300,000 byte
+strings built from UTF-8 edge bytes, against `from_utf8`),
+`per_character_print_dispatches_the_same_characters`,
+`a_c1_control_split_across_reads_is_executed`, `split_utf8_c1_control_executes_as_whole`, and
+`single_scan_ground_and_csi_match_the_bytewise_parser` above.
+
+## Test-only OSC observation
+
+Feature `observe` (off by default; no product crate enables it) adds
+`vte::observe`: per-thread totals of `osc_dispatch` calls, their parameters
+and parameter bytes, and, when turned on with `observe::reset(true)`, an
+order-sensitive FNV-1a checksum of every parameter byte. `vt_workloads`
+compares these with a reference parse, because an OSC nothing reads (the
+long-escapes workload is OSC 6) leaves no terminal state that would expose a
+parser skipping its body. Without the feature the dispatch path is unchanged.
+
+Test: `diri-terminal-state`'s `tests/osc_observe.rs`
+(`cargo test -p diri-terminal-state --features bench-verify --test osc_observe`).

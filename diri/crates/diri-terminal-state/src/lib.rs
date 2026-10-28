@@ -16,6 +16,10 @@
 mod inline_images;
 mod notifications;
 mod program_status;
+/// Per-thread totals of the OSCs the parser dispatched (benchmark
+/// verification only).
+#[cfg(feature = "bench-verify")]
+pub use alacritty_terminal::vte::observe as osc_observe;
 pub use inline_images::{
     DEFAULT_CELL_PIXELS, STORE_BUDGET_BYTES as INLINE_IMAGE_BUDGET_BYTES, StoredImage,
 };
@@ -678,6 +682,16 @@ impl HeadlessScreen {
     pub fn release_idle_memory(&mut self) {
         #[cfg(feature = "compact-history")]
         self.term.release_primary_history_spare_rows();
+    }
+
+    /// Parses printable text one character at a time, through the
+    /// emulator's per-character input, instead of as runs. The resulting
+    /// state is identical; benches and tests use it as the reference the
+    /// run paths are checked against.
+    #[doc(hidden)]
+    pub fn with_per_character_input(mut self) -> Self {
+        self.parser.set_per_character_print(true);
+        self
     }
 
     /// Opt in only where this screen is the terminal the program talks to

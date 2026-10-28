@@ -405,6 +405,62 @@ old way (`reference_wide_writes`), across wrapping, insert mode, charsets,
 hyperlinks, prompt marks, mode 2027, scroll regions and the alternate screen;
 `ascii_runs_match_per_character_input` covers the one-pass writer.
 
+### Characters beyond ASCII a row segment at a time
+
+`input_text` now writes every character that starts a grapheme cluster of its
+own and takes one or two columns (by the same `grapheme::Info` lookup `input`
+makes) straight into the cursor row, narrow ones included, with the row
+looked up once per segment instead of once per character. A segment ends at
+anything `input` must decide: a character that may join the cluster before it
+(marks, ZWJ, variation selectors, keycaps, emoji modifiers, regional
+indicators, Indic and Hangul continuations), a zero-width character, a wide
+character at the right margin, a cell that belongs to an earlier wide
+character, a pending wrap or insert mode. That character goes through `input`
+(`input_measured`, which reuses the lookup already made), so #840's widths and
+cluster rules are unchanged. Cells, spacers, prompt marks, template colors,
+flags and hyperlinks, occupancy, cursor and wrap state are those of `input`;
+damage is left to cursor damage, as `input` leaves it.
+
+Tests: `non_ascii_runs_match_per_character_input` above, and
+`diri-terminal-state`'s `runs_parse_the_same_as_per_character_input`, which
+compares the Engine screen's whole observable state after streams that put
+every kind of character at every column near the margin (with insert mode,
+autowrap off, the line-drawing charset, overwritten wide characters, mode
+2027, C1 controls and invalid UTF-8) against per-character input a byte at a
+time.
+
+## History sealing at the parser's pace
+
+In a sustained flood every retained row is encoded into a history block once,
+and that encoding cost about as much as parsing (ASCII at 120x80: LZ 30%,
+`encode_cells` 26%, `Row::reset` 11% of the time). Three changes, same
+payload layout:
+
+- **LZ skips faster through text without repeats.** A miss now lengthens the
+  step to the next probe by one byte every 8 misses (it was every 64), and a
+  match found after a skip is first extended backwards over the bytes the
+  skip stepped over. The hash table is 2,048 `u32` slots, zero-filled (it was
+  4,096 filled with `u32::MAX`); an empty slot costs one comparison. The
+  decoder is unchanged. On the kitten captures the compressor runs about 2.5x
+  faster on ASCII and 1.7x on Unicode, and payloads grow 0.9% (ASCII), 1.8%
+  (Unicode) and 1.4% (`git log -p`).
+- **Runs scanned without a style key per cell.** A plain run of named colors
+  (the common case) compares colors and flags directly instead of building
+  `plain_style_key` for every cell; other colors still use the key. Wide
+  pairs do the same. Text goes straight into reserved capacity, non-ASCII
+  characters included (they were copied through `encode_utf8`).
+- **A recycled row is cleared while the encoder has it.** The rows of a block
+  kept as spare allocations (`RowCodec::encode_recycled`) are cleared to
+  default cells right after each is encoded, with occupancy zero: a run of
+  the default style only needs its characters reset. Recycling one then
+  writes nothing for the default template (`Row::reset` still overwrites
+  every cell for any other template, as the last cell's background differs).
+  Before, the whole row was reset when it was taken.
+
+Tests: `assert_codec_round_trip` (used by every codec test) also checks that
+`encode_recycled_cells` writes the same payload and leaves default rows with
+occupancy zero; the LZ round-trip test covers the new matcher.
+
 ## Program colors: a generation, and RIS resets them
 
 `Term` keeps `colors_generation`, advanced whenever `set_color` or
@@ -437,3 +493,9 @@ about 47 to about 10 MB/s with "Cheaper history encoding".
 Tests: `styles_with_extra_storage_are_told_apart_on_a_hash_collision`,
 `blocks_of_unique_combining_marks_round_trip_one_after_another`, and the
 existing randomized codec tests.
+
+## Test-only `observe` feature
+
+`observe = ["vte/observe"]` only forwards the vendored VTE's test-only OSC
+totals (see its DIRI-PATCH.md) so `diri-terminal-state`'s `bench-verify`
+feature can reach them. No source change.
