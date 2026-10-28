@@ -303,6 +303,28 @@ stored rows when only the oldest block is partial, and the deferred line index
 reserves exact capacity and tracks its extras' heap incrementally (the history
 bound measures storage after every eviction).
 
+## History kept is independent of read boundaries
+
+The history budget used to measure allocation capacities, the rows not yet
+sealed into a block as they stood when the bound ran, and the oldest block's
+decode index; and `Grid::bound_history_storage` lowered the row limit to the
+rows kept after an eviction until storage fell 1/16 below the budget. All of
+these depend on when the bound runs, which is once per read, so how much
+history a terminal kept depended on how its output was split into reads (a
+64 KiB-read parse and a byte-at-a-time parse of the same 64 MB differed by
+hundreds of rows). Capacities also never shrank as narrowed deferred lines were
+evicted, so narrowing deep wide-character history evicted most of it.
+
+`CompactRows::history_storage_bytes` now counts live bytes as a function of the
+history alone: index lengths instead of capacities, the unsealed rows as the
+full block they grow into between seals (once history exists), and not the
+decode index (a cache that exists only while full history recycles rows). The
+bound shrinks the block and deferred-line indexes when their capacity exceeds
+twice their length plus 64, so uncounted slack stays bounded. The row limit
+stays at the ceiling. The kept rows are then the newest that fit, whenever the
+bound runs. Tests: `bounded_history_does_not_depend_on_read_boundaries`, and
+`narrowing_deep_wide_character_history_keeps_it` in `diri-terminal-state`.
+
 ## Cheaper history encoding
 
 History encoding was half of the session thread while output streamed. Four
@@ -399,3 +421,25 @@ them across `reset`. No wire, checkpoint or protocol change.
 public (and `#[doc(hidden)]`) so the core v2 prototype in
 `diri-terminal-state` measures widths and clusters with the same tables
 instead of a copy. Visibility only; no behavior change.
+## Styles with extra storage by hash map
+
+`StyleTable::extra_id` found a style with extra storage (combining marks, an
+underline color, a hyperlink) by a linear scan of every such style already in
+the block. Output where each cell carries different marks (`kitten
+__benchmark__`'s unique Unicode: a letter and three combining marks per cell)
+gives a block of 64 rows at 120 columns about 7,700 such styles, so sealing
+it compared about 30 million entries: the unique Unicode workload fell from
+about 47 to about 10 MB/s with "Cheaper history encoding".
+
+- The first style with each hash sits in an `FxHasher` map, found or claimed
+  in one probe; a later, different style with the same hash goes to a short
+  collision list that is searched by hash and comparison as before. Ids are
+  handed out in the same order, so payloads are byte-identical.
+- The table is kept, emptied, in a thread-local between blocks next to the
+  encoding buffers (`STYLE_SCRATCH`) and released with them, so a stream of
+  such blocks does not regrow its map and list each time. It is emptied
+  before it is put back, so it holds no cell's extra storage between blocks.
+
+Tests: `styles_with_extra_storage_are_told_apart_on_a_hash_collision`,
+`blocks_of_unique_combining_marks_round_trip_one_after_another`, and the
+existing randomized codec tests.
