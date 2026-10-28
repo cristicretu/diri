@@ -1,5 +1,78 @@
 # diri performance record
 
+## History encoding and per-read costs: Engine parse +25% (2026-10-27)
+
+The Engine session thread is the limit when output floods a held session: on
+the `catbench` 100 MB mixed log (plain, SGR/truecolor and CJK lines, 160×50)
+it was busy for the whole run, about half of it encoding scrollback history.
+
+**What changed.**
+
+- History encoding (`vendor/alacritty_terminal/src/grid/compact.rs`; see
+  DIRI-PATCH "Cheaper history encoding"): wide characters and their spacers
+  are encoded as pairs, so a CJK line is a few runs instead of one per cell;
+  the search for a row's last non-default cell starts at its occupancy, so
+  a short line in a wide row is not scanned to its end (`Row::grow` now keeps
+  that rule true, which also fixes coloured blanks surviving a recycled line);
+  style lookups hit a 32-slot cache; runs, text and styles are written without
+  intermediate copies.
+- Per-read costs (`diri-terminal-state`): the Engine keeps the rows history
+  recycles across reads and drops them when the checkpoint timer fires after
+  output goes quiet (they used to be dropped after every read, so most lines
+  allocated a fresh row); row fingerprints stop at a row's last non-default
+  cell and cache the two styles a wide-character run alternates between; the
+  notification scanner skips CSI introducers and DCS/APC bodies with `memchr`
+  instead of a state step per byte (a string that never ends no longer makes
+  it scan every later byte).
+
+**Same-machine feed, 100 MiB files, `feedbench … 64k`**, median of 3
+interleaved runs, CPU time (instructions):
+
+| Log | main (before #840) | #830 + #840 + #845 | branch |
+| --- | ---: | ---: | ---: |
+| mixed (`big.log`) | 871 ms (19.8 G) | 871 ms (19.8 G) | **692 ms (15.6 G)** |
+| emoji-dense | 1239 ms (28.2 G) | 1592 ms (32.9 G) | **1065 ms (24.9 G)** |
+| Indic | 1279 ms (29.0 G) | 1509 ms (31.8 G) | **959 ms (26.2 G)** |
+
+**End to end, `catbench`** (held session, Holder, Engine, attached client
+until its grid shows the last line), 6 interleaved rounds at load 3–5, next
+to a reference terminal multiplexer on an isolated server with one attached
+stream (its column is the last raw byte reaching that client, unparsed). The
+instrumented builds also count the bytes the Engine parsed:
+
+| Path | PTY drain, median (min) | Last line at client, median (min) | Engine parsed | Engine thread CPU | Parse rate |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Reference | 0.662 s (0.655) | 0.661 s (0.654) | all, in its server | server 0.75 s | — |
+| main (before #840) | 0.487 s (0.483) | 0.696 s (0.689) | 80.6 of 105.8 MB, every run | 0.66 s | 122 MB/s |
+| #830 + #840 + #845 | 0.504 s (0.474) | 0.693 s (0.679) | 80.6 MB, every run | 0.65 s | 123 MB/s |
+| branch, all parsed (3 runs) | 0.508 s | 0.722 s (0.717) | 105.8 MB | 0.69 s | 153 MB/s |
+| branch, as main (3 runs) | 0.476 s | 0.542 s (0.538) | 80.6 MB | 0.52 s | 154 MB/s |
+
+When the Engine falls further behind than the session log keeps, it resumes
+at the oldest byte kept and skips the rest (25.2 MB here); main does that in
+every run. The branch parses 25% more per second, so in half the runs it keeps up and
+parses everything. **Parsing everything, it still trails the reference by
+about 9% (0.72 against 0.66 s)**; skipping the same bytes as main, it finishes
+first (0.54 s). The reference spends 0.75 s of server CPU on the same log.
+
+Footprint: no thread, timer or idle work. While output streams, the Engine
+keeps at most one block of recycled rows (128 KiB of cells) between reads;
+they are dropped a second after output stops. The Remote Holder keeps the
+old behaviour. History stays bounded at 4 MiB; rows retained under it
+(`history_depth`): agent transcript 80 cols 127,548 → 124,799, 200 cols
+70,543 → 72,479, cargo 200 cols 117,487 → 117,583, others unchanged. Feed rate
+in the same bench: cargo 121 → 141 MB/s, `seq` 51 → 95 MB/s at 80 columns.
+
+`scripts/terminal-perf-gate.sh` passes; held input-to-grid median 385–414 µs
+on both the base and the branch (3 runs each), Holder input stream p50 14 µs /
+p95 15 µs.
+
+Measured and not done: moving block encoding to another thread (a fifth of the
+session thread) would break the one-owner rule for terminal state, hold raw
+rows across threads and add a thread per streaming session; a smaller LZ hash
+table for small blocks, a single-pass field-compare run scan, and a scalar ESC
+search before `memchr` changed no cycle counts.
+
 ## History depth bounded by stored bytes (2026-10-27)
 
 History used to stop at 10,000 rows even though compressed rows used under
@@ -41,6 +114,83 @@ per line within the budget: narrowing and widening an 80-column agent
 transcript at capacity kept 96,015 of 127,548 rows (base kept 6,429 of 10,000).
 Hard-line output loses nothing. Measured while other agents loaded the machine
 (load average 18–30); timings are single runs, alternated base/branch.
+## `cat` of a 100 MB log, end to end through a held session (2026-10-27)
+
+`catbench` (new example) measures the path a user waits on: a private Engine
+`ControlServer`, a private Holder manager, a held session that `cat`s the
+file, and an attached data-channel client that decodes every grid frame
+until its grid shows the file's last line. The child waits on a FIFO before
+`cat` and reports `cat`'s return on another, so the PTY drain and the
+client's final grid are timed separately. Nothing touches an installed app.
+
+Payload: 104,857,622 B, plain, SGR/truecolor and CJK lines in rotation, at
+160×50. Apple M4 Max, release builds, load average 15–27 from unrelated
+builds. Eight interleaved rounds; each row ran once per round. "Reference"
+is a reference terminal multiplexer on an isolated server with one attached
+data stream; its stream carries raw PTY bytes, so its column is the time the
+last byte reached the client, before that client parses anything.
+
+| Path | Drain, median (min) | Last line at client, median (min) | CPU |
+| --- | ---: | ---: | --- |
+| Raw PTY, Python 64 KiB reads, no parsing | 0.560 s (0.528) | — | reader 0.33–0.37 s |
+| Reference, attached | 0.687 s (0.664) | 0.687 s (0.664), unparsed | server 0.78 s |
+| Diri `main` | 0.690 s (0.609) | 0.793 s (0.714) | Engine 0.79 s, Holder 0.53 s, client 0.002 s |
+| Diri branch | 0.675 s (0.605) | 0.847 s (0.718) | Engine 0.83 s, Holder 0.53 s, client 0.002 s |
+
+The branch difference is inside the noise: the medians moved both ways
+across repeated A/B/B/A batches, and the minimums agree. Earlier figures of
+"~71 MB/s through a PTY" and "~118 MB/s parse" came from a single-thread
+harness on a machine at load 60–140; the real path, quiet, finishes in
+0.71–0.73 s (144–147 MB/s).
+
+**Where the time goes.** The Engine session thread is the bottleneck: its
+CPU time equals the time to the final grid (0.71 s of 0.72 s in quiet runs),
+while the Holder drains the PTY ahead of it.
+
+- Engine session thread, `sample` of the real path: 91% in
+  `feed_with_history`, 3% in the OSC notification scan, 2.6% in the exit-marker
+  scan (removed below), the rest in frame reads.
+- Inside the feed, history storage is half the work. `feedbench` on the same
+  log: 19.8 G instructions, 110 MB/s CPU with the 10,000-row compact history;
+  10.0 G, 212 MB/s with history off. Of the history half, timed per call:
+  row encoding 332 ms, LZ 64 ms, recycling resets 58 ms per 100 MB. Every row
+  that scrolls past is encoded once and evicted 10,000 rows later, about 7 ms
+  into this burst.
+- Parsing proper (VT state, SGR, UTF-8, damage and fingerprints) is the other
+  half; `Term::input_ascii`, `Term::input` and `from_utf8` lead it.
+- Attach pump: about 2% of one thread, 40–52 grid frames (2.1–2.8 MB) per
+  100 MB. Client decode: 2–3 ms. Diff construction is not a cost here.
+- Holder: 0.45–0.55 s, 85% of it system time. A macOS PTY read returns
+  about 1 KiB, so 103k batches each paid one `poll`, one read and one
+  `EAGAIN` read (instrumented count), plus a queue wake.
+
+**Changed.** The exit-marker scan that every output byte passes through in
+the Engine pump now finds its `]` anchor with `memchr` instead of a
+byte-at-a-time `position`; it leaves the profile. `memchr` was already in the
+dependency graph through `diri-terminal-state` and the vendored parser. A
+randomized test checks the scan against a window-by-window search.
+
+**Measured and not done.**
+
+- Single-pass history encoding (runs, text and UTF-8 in one walk, cheaper
+  default-cell and same-style checks): −2.7% instructions, +1% cycles. No gain.
+- Encoding history lazily cannot skip work unless all 10,000 rows stay raw
+  (about 39 MB at 160 columns per streaming session), which is the per-session
+  memory this design exists to avoid.
+- Skipping diff construction while output outruns publication: diffs already
+  cost ~2% and only the latest grid is published.
+- Fewer Holder syscalls: blocking reads would lose the exit wake; lingering
+  for more bytes adds output latency.
+
+Footprint: none. No thread, timer, buffer or idle work was added.
+
+`scripts/terminal-perf-gate.sh` passes on the branch: held input-to-grid
+median 177 µs, local 72 µs, Holder input stream p50 12 µs / p95 19 µs.
+
+```sh
+cargo build --release -p diri-engine --bin diri-holder --example catbench
+DIRI_HOLDER_BIN=target/release/diri-holder target/release/examples/catbench <log> 160 50 3
+```
 
 ## Resource growth over a long session: explained, not leaked (2026-09-30)
 
