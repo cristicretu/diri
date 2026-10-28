@@ -67,6 +67,10 @@ pub(crate) fn install(
     if cx.has_global::<ApplicationNotifications>() {
         return;
     }
+    #[cfg(target_os = "macos")]
+    if !preview && let Some(mtm) = objc2_foundation::MainThreadMarker::new() {
+        crate::macos::dock_menu::install(mtm, Arc::clone(&services.store.store));
+    }
     if !preview {
         let mut copies = services
             .store
@@ -122,8 +126,7 @@ pub(crate) fn install(
             .store
             .read()
             .expect("store")
-            .notifications()
-            .unread_count(),
+            .dock_badge_count(),
     );
     cx.set_global(ApplicationNotifications {
         #[cfg(any(target_os = "macos", windows))]
@@ -155,11 +158,22 @@ pub(crate) fn install(
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     };
-                    let (deliver, active) = {
+                    // Rechecked here: the session may have been read, muted
+                    // or brought to front since the transition was queued.
+                    let (deliver, audible, bounce, active) = {
                         let store = services.store.store.read().expect("store");
-                        (event.notification.as_ref().is_none_or(|request|store.should_deliver_notification(request)), store.app_is_active())
+                        (
+                            event.notification.as_ref().is_none_or(|request| store.should_deliver_notification(request)),
+                            event.notification.as_ref().is_none_or(|request| store.should_play_sound(request)),
+                            event.notification.as_ref().is_some_and(|request| store.should_bounce_dock(request)),
+                            store.app_is_active(),
+                        )
                     };
-                    if let Some(sound) = event.sound.filter(|_|deliver) {
+                    #[cfg(target_os = "macos")]
+                    if bounce { crate::macos::dock_menu::bounce(); }
+                    #[cfg(not(target_os = "macos"))]
+                    let _ = bounce;
+                    if let Some(sound) = event.sound.filter(|_| audible) {
                         let sound = match sound {
                             NotificationSound::NeedsInput => StatusSound::NeedsInput,
                             NotificationSound::Done => StatusSound::Done,
@@ -178,7 +192,7 @@ pub(crate) fn install(
                 change = changes.recv() => {
                     if matches!(change, Err(tokio::sync::broadcast::error::RecvError::Closed)) { break; }
                     #[cfg(target_os = "macos")]
-                    notifier.set_badge(services.store.store.read().expect("store").notifications().unread_count());
+                    notifier.set_badge(services.store.store.read().expect("store").dock_badge_count());
                 }
             }
             // Keep the application task tied to GPUI's lifetime, including

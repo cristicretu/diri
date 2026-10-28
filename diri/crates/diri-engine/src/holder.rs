@@ -55,6 +55,8 @@ pub mod server;
 mod fanout;
 #[cfg(unix)]
 mod log_feed;
+#[cfg(unix)]
+pub(crate) mod reactor;
 
 pub use client::{HolderClient, HolderManagerClient, HolderOutputStream};
 

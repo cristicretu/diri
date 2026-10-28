@@ -81,7 +81,9 @@ pub use keystroke::*;
 pub(crate) use test::*;
 
 #[cfg(any(test, feature = "test-support"))]
-pub use test::{TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream};
+pub use test::{
+    TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream, set_test_window_scale_factor,
+};
 
 #[cfg(any(test, feature = "bench"))]
 pub use bench_dispatcher::BenchDispatcher;
@@ -1147,6 +1149,12 @@ pub trait PlatformTextSystem: Send + Sync {
     /// Returns the dilation level to use for a glyph painted in the given color.
     fn glyph_dilation_for_color(&self, _color: Hsla) -> u8 {
         0
+    }
+    /// DIRI PATCH (font faces): the weight and style of every face
+    /// `font`'s family resolves to, exactly as `font_id` matches them. Empty
+    /// where the platform can't tell.
+    fn font_faces(&self, _font: &Font) -> Vec<(crate::FontWeight, crate::FontStyle)> {
+        Vec::new()
     }
 }
 
