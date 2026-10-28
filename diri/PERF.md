@@ -115,84 +115,6 @@ transcript at capacity kept 96,015 of 127,548 rows (base kept 6,429 of 10,000).
 Hard-line output loses nothing. Measured while other agents loaded the machine
 (load average 18–30); timings are single runs, alternated base/branch.
 
-## `cat` of a 100 MB log, end to end through a held session (2026-10-27)
-
-`catbench` (new example) measures the path a user waits on: a private Engine
-`ControlServer`, a private Holder manager, a held session that `cat`s the
-file, and an attached data-channel client that decodes every grid frame
-until its grid shows the file's last line. The child waits on a FIFO before
-`cat` and reports `cat`'s return on another, so the PTY drain and the
-client's final grid are timed separately. Nothing touches an installed app.
-
-Payload: 104,857,622 B, plain, SGR/truecolor and CJK lines in rotation, at
-160×50. Apple M4 Max, release builds, load average 15–27 from unrelated
-builds. Eight interleaved rounds; each row ran once per round. "Reference"
-is a reference terminal multiplexer on an isolated server with one attached
-data stream; its stream carries raw PTY bytes, so its column is the time the
-last byte reached the client, before that client parses anything.
-
-| Path | Drain, median (min) | Last line at client, median (min) | CPU |
-| --- | ---: | ---: | --- |
-| Raw PTY, Python 64 KiB reads, no parsing | 0.560 s (0.528) | — | reader 0.33–0.37 s |
-| Reference, attached | 0.687 s (0.664) | 0.687 s (0.664), unparsed | server 0.78 s |
-| Diri `main` | 0.690 s (0.609) | 0.793 s (0.714) | Engine 0.79 s, Holder 0.53 s, client 0.002 s |
-| Diri branch | 0.675 s (0.605) | 0.847 s (0.718) | Engine 0.83 s, Holder 0.53 s, client 0.002 s |
-
-The branch difference is inside the noise: the medians moved both ways
-across repeated A/B/B/A batches, and the minimums agree. Earlier figures of
-"~71 MB/s through a PTY" and "~118 MB/s parse" came from a single-thread
-harness on a machine at load 60–140; the real path, quiet, finishes in
-0.71–0.73 s (144–147 MB/s).
-
-**Where the time goes.** The Engine session thread is the bottleneck: its
-CPU time equals the time to the final grid (0.71 s of 0.72 s in quiet runs),
-while the Holder drains the PTY ahead of it.
-
-- Engine session thread, `sample` of the real path: 91% in
-  `feed_with_history`, 3% in the OSC notification scan, 2.6% in the exit-marker
-  scan (removed below), the rest in frame reads.
-- Inside the feed, history storage is half the work. `feedbench` on the same
-  log: 19.8 G instructions, 110 MB/s CPU with the 10,000-row compact history;
-  10.0 G, 212 MB/s with history off. Of the history half, timed per call:
-  row encoding 332 ms, LZ 64 ms, recycling resets 58 ms per 100 MB. Every row
-  that scrolls past is encoded once and evicted 10,000 rows later, about 7 ms
-  into this burst.
-- Parsing proper (VT state, SGR, UTF-8, damage and fingerprints) is the other
-  half; `Term::input_ascii`, `Term::input` and `from_utf8` lead it.
-- Attach pump: about 2% of one thread, 40–52 grid frames (2.1–2.8 MB) per
-  100 MB. Client decode: 2–3 ms. Diff construction is not a cost here.
-- Holder: 0.45–0.55 s, 85% of it system time. A macOS PTY read returns
-  about 1 KiB, so 103k batches each paid one `poll`, one read and one
-  `EAGAIN` read (instrumented count), plus a queue wake.
-
-**Changed.** The exit-marker scan that every output byte passes through in
-the Engine pump now finds its `]` anchor with `memchr` instead of a
-byte-at-a-time `position`; it leaves the profile. `memchr` was already in the
-dependency graph through `diri-terminal-state` and the vendored parser. A
-randomized test checks the scan against a window-by-window search.
-
-**Measured and not done.**
-
-- Single-pass history encoding (runs, text and UTF-8 in one walk, cheaper
-  default-cell and same-style checks): −2.7% instructions, +1% cycles. No gain.
-- Encoding history lazily cannot skip work unless all 10,000 rows stay raw
-  (about 39 MB at 160 columns per streaming session), which is the per-session
-  memory this design exists to avoid.
-- Skipping diff construction while output outruns publication: diffs already
-  cost ~2% and only the latest grid is published.
-- Fewer Holder syscalls: blocking reads would lose the exit wake; lingering
-  for more bytes adds output latency.
-
-Footprint: none. No thread, timer, buffer or idle work was added.
-
-`scripts/terminal-perf-gate.sh` passes on the branch: held input-to-grid
-median 177 µs, local 72 µs, Holder input stream p50 12 µs / p95 19 µs.
-
-```sh
-cargo build --release -p diri-engine --bin diri-holder --example catbench
-DIRI_HOLDER_BIN=target/release/diri-holder target/release/examples/catbench <log> 160 50 3
-```
-
 ## Resource growth over a long session: explained, not leaked (2026-09-30)
 
 Local telemetry from one 0.8.10 install (4.7 h, one `health` sample a
@@ -3253,6 +3175,55 @@ DIRI_HOLDER_BIN=$CARGO_TARGET_DIR/release/diri-holder \
 cargo test -p diri-engine --release --features latency-trace \
   --test keystroke_latency output_to_grid -- --ignored --nocapture
 ```
+
+## Idle sessions hold no threads (2026-10-27)
+
+With #839 an idle session cost no wakeups, but it still kept threads blocked
+for its whole life: seven in the Holder manager (control socket, PTY reader,
+log writer, exit watch, input lane, and an output writer plus a hangup
+watcher per subscriber) and one Engine pump. At 100 idle shells that was 702
+manager threads and 102 Engine threads.
+
+**What changed.** Each process has one readiness thread (`holder/reactor.rs`:
+kqueue on macOS, epoll on Linux, one-shot registrations). A Holder lane keeps
+its thread while it has work and hands its descriptor to the reactor after
+2 s idle (500 ms for the control socket, whose requests are one-shot); the
+next event starts a thread again. The exit watch is a reactor registration
+from the start. An idle held Engine pump (the #839 park point) moves its loop
+state off the stack and hands its own kqueue to the reactor, with the 300 s
+backstop as a kqueue timer; a frame, a hangup, the doorbell or the timer
+resumes it on a new thread. At any moment exactly one party owns each lane's
+descriptor or a pump's state. The input lane keeps interactive QoS; other
+lanes run at the QoS sessions were started with, not the reactor's.
+
+**Numbers.** `idlebench <n> 0 30 40` (interactive `zsh -f`, real
+`diri-holder --manager`), base (#839) and branch alternated, two rounds, load
+2.6–8. Idle values after 35 s; latencies are p95 of both rounds.
+
+| | n=1 base → branch | n=10 | n=100 |
+|---|---|---|---|
+| Engine threads | 3 → 3 | 12 → 3 | 102 → 3 |
+| Manager threads | 9 → 3 | 72 → 3 | 702 → 3 |
+| Manager footprint | 1.6 → 1.4 MB | 4.3 → 2.3 MB | 28.2–28.4 → 6.8 MB |
+| Engine footprint | 5.3–5.8 → 5.6–5.9 MB | 7.7–8.8 → 7.8–8.0 MB | 32.2–32.5 → 32.7 MB |
+| Manager fds | 15 → 15 | 105 → 96 | 1005 → 906 |
+| Idle 30 s: syscalls Engine / manager | 13 / 0 → 13 / 0 | same | 13 / 0 → 13 / 0 |
+| Echo after 40 s idle | 0.05–0.40 → 0.39–0.49 ms | 0.33–1.25 → 0.36–0.52 ms | 0.46–0.47 → 0.52–0.57 ms |
+| Command output after idle | 0.33–0.40 → 0.42–0.48 ms | 0.52–1.02 → 0.45–0.66 ms | 0.54–0.64 → 0.79–0.84 ms |
+| Echo while typing (keys 50 ms apart) | 0.70–0.79 → 0.53–0.70 ms | 0.57–0.73 → 0.63–0.72 ms | 0.79 → 0.86 ms |
+
+The first keystroke after an idle period pays for thread starts in both
+processes: about +0.06–0.1 ms on echo p95 and +0.2 ms on the first command
+output at n=100. Active typing is within run-to-run noise. Engine memory does
+not move: its pump threads' stacks were mostly untouched pages. Parking is a
+one-time transition (about 5 syscalls per lane), not a tick.
+
+`fleetbench payload 32 MiB, 160×50`, three alternating rounds: 1 session
+84.0/94.3/90.4 → 94.0/92.6/95.1 MB/s, 4 sessions 137.2/142.4/140.5 →
+138.0/142.8/137.5 MB/s. Throughput is unchanged; streaming lanes never park.
+
+Not changed: remote and direct (non-held) Engine pumps, and the ~2 Engine
+threads per attached pane.
 
 ## Line edits skip the erase hold (2026-10-28)
 

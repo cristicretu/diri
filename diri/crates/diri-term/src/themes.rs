@@ -106,6 +106,13 @@ pub fn add_imported(theme: TermTheme) {
     set_imported(themes);
 }
 
+/// Takes one imported theme out of the registry (its file was removed).
+pub fn remove_imported(id: &str) {
+    if let Ok(mut imported) = IMPORTED.write() {
+        imported.retain(|theme| theme.id != id);
+    }
+}
+
 #[must_use]
 pub fn is_imported(id: &str) -> bool {
     id.starts_with(IMPORTED_PREFIX)

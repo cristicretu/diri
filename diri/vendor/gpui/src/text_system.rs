@@ -342,6 +342,13 @@ impl TextSystem {
             .rasterize_glyph(params, raster_bounds)
     }
 
+    /// DIRI PATCH (font faces): the weight and style of every face of
+    /// `font`'s family, as font selection sees them. A weight from this list
+    /// selects exactly that face. Loads the family if it isn't yet.
+    pub fn font_faces(&self, font: &Font) -> Vec<(FontWeight, FontStyle)> {
+        self.platform_text_system.font_faces(font)
+    }
+
     /// Returns the dilation level to use for a glyph painted in the given color.
     pub(crate) fn glyph_dilation_for_color(&self, color: Hsla) -> u8 {
         self.platform_text_system.glyph_dilation_for_color(color)
@@ -1013,6 +1020,34 @@ impl TextRun {
 #[repr(C)]
 pub struct GlyphId(pub u32);
 
+/// DIRI PATCH (glyph raster style): how glyphs painted inside
+/// [`Window::with_glyph_raster_style`](crate::Window::with_glyph_raster_style)
+/// are rasterized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GlyphRasterStyle {
+    /// Let the platform thicken glyphs by their colour's luminance (macOS
+    /// font smoothing; on unless the user turned `AppleFontSmoothing` off).
+    pub smoothing: bool,
+    /// Extra outline stroke in quarters of a device pixel, up to
+    /// [`GlyphRasterStyle::MAX_STROKE`].
+    pub stroke: u8,
+}
+
+impl GlyphRasterStyle {
+    /// The widest stroke: one device pixel, half on each side of the outline,
+    /// which still fits the one-pixel margin glyph tiles are rasterized with.
+    pub const MAX_STROKE: u8 = 4;
+}
+
+impl Default for GlyphRasterStyle {
+    fn default() -> Self {
+        Self {
+            smoothing: true,
+            stroke: 0,
+        }
+    }
+}
+
 /// Parameters for rendering a glyph, used as cache keys for raster bounds.
 ///
 /// This struct identifies a specific glyph rendering configuration including
@@ -1029,6 +1064,10 @@ pub struct RenderGlyphParams {
     pub is_emoji: bool,
     pub subpixel_rendering: bool,
     pub dilation: u8,
+    /// DIRI PATCH (glyph raster style): extra outline stroke, in quarters of
+    /// a device pixel, drawn around the glyph to thicken thin strokes. Zero
+    /// is upstream's plain fill. Platforms that cannot stroke ignore it.
+    pub stroke: u8,
 }
 
 impl Eq for RenderGlyphParams {}
@@ -1043,6 +1082,7 @@ impl Hash for RenderGlyphParams {
         self.is_emoji.hash(state);
         self.subpixel_rendering.hash(state);
         self.dilation.hash(state);
+        self.stroke.hash(state);
     }
 }
 

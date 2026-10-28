@@ -17,13 +17,13 @@ const REVISION_CONFLICT: &str = "workspace_revision_conflict";
 
 /// Where a session is shown: its tab (and that tab's workspace) and pane.
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct Placement {
-    pub(super) workspace_id: WorkspaceId,
-    pub(super) tab_id: TabId,
-    pub(super) pane_id: PaneId,
+pub struct Placement {
+    pub workspace_id: WorkspaceId,
+    pub tab_id: TabId,
+    pub pane_id: PaneId,
 }
 
-pub(super) fn edge(value: &str) -> Result<DockEdge, String> {
+pub fn edge(value: &str) -> Result<DockEdge, String> {
     match value {
         "right" => Ok(DockEdge::Right),
         "down" => Ok(DockEdge::Bottom),
@@ -67,7 +67,7 @@ fn pane_session(node: &LayoutNode, pane: &PaneId) -> Option<String> {
 
 /// Every pane that shows `session`, the selected tab of a workspace first
 /// (the same preference the Engine uses to dock a pane shell by its parent).
-pub(super) fn placements(snapshot: &WorkspaceSnapshot, session: &str) -> Vec<Placement> {
+pub fn placements(snapshot: &WorkspaceSnapshot, session: &str) -> Vec<Placement> {
     let mut found: Vec<(bool, Placement)> = Vec::new();
     for workspace in &snapshot.workspaces {
         for tab in &workspace.tabs {
@@ -90,7 +90,7 @@ pub(super) fn placements(snapshot: &WorkspaceSnapshot, session: &str) -> Vec<Pla
     found.into_iter().map(|(_, placement)| placement).collect()
 }
 
-pub(super) fn locate(snapshot: &WorkspaceSnapshot, session: &str) -> Result<Placement, String> {
+pub fn locate(snapshot: &WorkspaceSnapshot, session: &str) -> Result<Placement, String> {
     placements(snapshot, session).into_iter().next().ok_or_else(|| {
         format!(
             "session {session} is not shown in any tab; open it in Diri first, or move it beside a shown session with manage_layout split"
@@ -108,7 +108,7 @@ fn find_tab<'a>(snapshot: &'a WorkspaceSnapshot, tab: &TabId) -> Option<&'a Work
 
 /// The mutation `manage_layout split` sends: move the session's own pane
 /// when it is shown somewhere (preferring the anchor's tab), else add a pane.
-pub(super) fn split_mutation(
+pub fn split_mutation(
     snapshot: &WorkspaceSnapshot,
     session: &str,
     anchor: &str,
@@ -138,11 +138,7 @@ pub(super) fn split_mutation(
 }
 
 /// An agent-readable tab: the split tree in session ids, with titles.
-pub(super) fn tab_view(
-    snapshot: &WorkspaceSnapshot,
-    tab_id: &TabId,
-    sessions: &[SessionRecord],
-) -> Value {
+pub fn tab_view(snapshot: &WorkspaceSnapshot, tab_id: &TabId, sessions: &[SessionRecord]) -> Value {
     let Some((workspace, tab)) = snapshot.workspaces.iter().find_map(|workspace| {
         workspace
             .tabs
