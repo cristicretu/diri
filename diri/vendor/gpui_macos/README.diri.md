@@ -77,3 +77,15 @@ between captures, so it adds no resident memory.
 renderer cleared to transparent, as a transparent window's is, so a capture
 keeps the alpha of glass chrome. The site clip recorder uses it; GPUI's test
 window ignores `set_background_appearance`, so there is no other way to ask.
+
+The accessibility focus patch (`accessibility_focused_ui_element` on
+`GPUIView`) lets a host app name the focused content for VoiceOver. `GPUIView`
+is the window's first responder but not an accessibility element, so AppKit
+reported the whole window as focused. The patch returns a sibling view in the
+same superview that is an accessibility element and reports itself focused,
+which is how Diri's terminal text area (`diri-app/src/macos/terminal_accessibility.rs`)
+receives VoiceOver's keyboard focus. With no such sibling it calls NSView's
+implementation, so upstream behavior is unchanged. It runs only when an
+accessibility client asks. `diri-app`'s `terminal_accessibility_appkit` test
+installs this exact method on a plain view and checks the window's focused
+element.

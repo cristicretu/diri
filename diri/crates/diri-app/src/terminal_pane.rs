@@ -4901,6 +4901,13 @@ impl TerminalPane {
             }
             return centered_message(t("terminal.preparing"), "", colors).into_any_element();
         };
+        #[cfg(target_os = "macos")]
+        crate::macos::sync_terminal_accessibility(
+            window,
+            &resident.element,
+            self.focus.is_focused(window),
+            crate::switcher::display_title_str(session),
+        );
         let element = resident
             .element
             .clone()

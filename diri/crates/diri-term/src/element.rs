@@ -146,6 +146,178 @@ fn set_view_offset(
     changed
 }
 
+/// Where the grid was last painted, in window points from the top-left.
+/// `origin` is the top-left of window row 0, already shifted for a reading
+/// view resting between rows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AccessibilityGeometry {
+    pub origin: Point<Pixels>,
+    pub cell_width: Pixels,
+    pub line_height: Pixels,
+    /// Rows and columns on screen, at most the grid's.
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl AccessibilityGeometry {
+    /// Window-space rectangle of `cols` on window `row`.
+    #[must_use]
+    pub fn cell_rect(&self, row: usize, cols: std::ops::Range<u16>) -> Bounds<Pixels> {
+        Bounds::new(
+            point(
+                self.origin.x + self.cell_width * f32::from(cols.start),
+                self.origin.y + self.line_height * row as f32,
+            ),
+            size(
+                self.cell_width * f32::from(cols.end.saturating_sub(cols.start)),
+                self.line_height,
+            ),
+        )
+    }
+
+    /// The painted grid's window-space rectangle.
+    #[must_use]
+    pub fn bounds(&self) -> Bounds<Pixels> {
+        Bounds::new(
+            self.origin,
+            size(
+                self.cell_width * self.cols as f32,
+                self.line_height * self.rows as f32,
+            ),
+        )
+    }
+
+    /// The cell under a window-space point, clamped into the grid.
+    #[must_use]
+    pub fn cell_at(&self, position: Point<Pixels>) -> (usize, usize) {
+        let col = (f32::from(position.x - self.origin.x) / f32::from(self.cell_width)).floor();
+        let row = (f32::from(position.y - self.origin.y) / f32::from(self.line_height)).floor();
+        (
+            (row.max(0.0) as usize).min(self.rows.saturating_sub(1)),
+            (col.max(0.0) as usize).min(self.cols.saturating_sub(1)),
+        )
+    }
+}
+
+/// A weak read handle on one terminal view for an accessibility bridge.
+/// Holding it keeps nothing alive: once the view is gone every read is
+/// `None`. Reads take the same short locks a frame does.
+#[derive(Clone, Debug)]
+pub struct TerminalAccessibility {
+    buffer: std::sync::Weak<RwLock<GridBuffer>>,
+    shared: std::sync::Weak<ElementSharedState>,
+}
+
+impl TerminalAccessibility {
+    /// True when both handles still point at the same live view.
+    #[must_use]
+    pub fn same_view(&self, other: &Self) -> bool {
+        std::sync::Weak::ptr_eq(&self.shared, &other.shared)
+    }
+
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        self.shared.strong_count() > 0
+    }
+
+    /// Changes whenever the text, caret, selection or reading position a
+    /// snapshot would describe can have changed. Cheap: a few lock reads.
+    #[must_use]
+    pub fn revision(&self) -> Option<AccessibilityRevision> {
+        let buffer = self.buffer.upgrade()?;
+        let shared = self.shared.upgrade()?;
+        let buffer = read_lock(&buffer);
+        let viewport = mutex_lock(&shared.viewport);
+        let position = viewport.scroll_position();
+        Some(AccessibilityRevision {
+            generation: buffer.generation(),
+            cursor: (buffer.cursor.row, buffer.cursor.col, buffer.cursor.visible),
+            view_offset: viewport.view_offset(),
+            sub_row: position.fraction.to_bits(),
+            cache_seq: viewport.cache_seq(),
+            selection: mutex_lock(&shared.selection).range(),
+            rows: mutex_lock(&shared.accessibility_geometry).map(|geometry| geometry.rows),
+        })
+    }
+
+    #[must_use]
+    pub fn geometry(&self) -> Option<AccessibilityGeometry> {
+        let shared = self.shared.upgrade()?;
+        *mutex_lock(&shared.accessibility_geometry)
+    }
+
+    /// The rows on screen as text, with the caret (live view only) and the
+    /// part of the selection that is on screen.
+    #[must_use]
+    pub fn snapshot(&self) -> Option<crate::accessibility::AccessibilityText> {
+        use crate::accessibility::{AccessibilityText, VisiblePoint};
+        let buffer = self.buffer.upgrade()?;
+        let shared = self.shared.upgrade()?;
+        let buffer = read_lock(&buffer);
+        let viewport = mutex_lock(&shared.viewport);
+        let geometry = *mutex_lock(&shared.accessibility_geometry);
+        let rows = geometry.map_or(usize::from(buffer.rows), |geometry| geometry.rows);
+        let cols = geometry.map_or(usize::from(buffer.cols), |geometry| geometry.cols);
+        let composed: Vec<(Vec<GridCell>, diri_proto::grid::RowMetadata)> = (0..rows)
+            .map(|row| {
+                let mut cells = viewport.window_row(&buffer, row);
+                cells.truncate(cols);
+                let metadata = if viewport.is_reading() {
+                    viewport.row_metadata(&buffer, viewport.absolute_row(row))
+                } else {
+                    buffer.annotations.get(row).cloned().unwrap_or_default()
+                };
+                (cells, metadata)
+            })
+            .collect();
+        let cursor = (!viewport.is_reading() && usize::from(buffer.cursor.row) < rows).then_some(
+            VisiblePoint {
+                row: usize::from(buffer.cursor.row),
+                col: usize::from(buffer.cursor.col),
+            },
+        );
+        let to_visible = |point: SelectionPoint| -> Option<VisiblePoint> {
+            let row = viewport.window_row_for_absolute(point.row)?;
+            Some(if row < 0 {
+                VisiblePoint { row: 0, col: 0 }
+            } else if row as usize >= rows {
+                VisiblePoint {
+                    row: rows.saturating_sub(1),
+                    col: cols,
+                }
+            } else {
+                VisiblePoint {
+                    row: row as usize,
+                    col: point.col,
+                }
+            })
+        };
+        let selection = mutex_lock(&shared.selection)
+            .range()
+            .and_then(|range| Some((to_visible(range.start)?, to_visible(range.end)?)));
+        drop(viewport);
+        Some(AccessibilityText::from_rows(
+            composed
+                .iter()
+                .map(|(cells, metadata)| (cells.as_slice(), Some(metadata))),
+            cursor,
+            selection,
+        ))
+    }
+}
+
+/// See [`TerminalAccessibility::revision`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AccessibilityRevision {
+    generation: u64,
+    cursor: (u16, u16, bool),
+    view_offset: i64,
+    sub_row: u32,
+    cache_seq: Option<u64>,
+    selection: Option<crate::selection::SelectionRange>,
+    rows: Option<usize>,
+}
+
 impl TerminalDamageObserver {
     pub fn prepare(&self, update: &GridUpdate) {
         // Absolute rows keep a selection attached while the viewport moves,
@@ -368,6 +540,9 @@ struct ElementSharedState {
     /// Window-space rect of the grid cursor's cell from the latest live
     /// prepaint, whether or not the caret itself is drawn.
     input_cell: Mutex<Option<Bounds<Pixels>>>,
+    /// Window-space grid origin, cell size and painted extent from the
+    /// latest prepaint, for an accessibility client asking where text is.
+    accessibility_geometry: Mutex<Option<AccessibilityGeometry>>,
     modes: Mutex<TerminalModes>,
     scroll_router: Mutex<ScrollRouter>,
     history_lines: Mutex<HistoryLineCache>,
@@ -806,6 +981,7 @@ impl TerminalElement {
                 selection_shimmer: Mutex::new(SelectionShimmer::default()),
                 find_highlights: Mutex::new(FindHighlights::default()),
                 input_cell: Mutex::new(None),
+                accessibility_geometry: Mutex::new(None),
                 modes: Mutex::new(TerminalModes::default()),
                 scroll_router: Mutex::new(ScrollRouter::default()),
                 history_lines: Mutex::new(HistoryLineCache::default()),
@@ -845,6 +1021,21 @@ impl TerminalElement {
     #[must_use]
     pub fn with_buffer(buffer: GridBuffer) -> Self {
         Self::new(Arc::new(RwLock::new(buffer)))
+    }
+
+    /// A weak handle an accessibility bridge reads this view through.
+    #[must_use]
+    pub fn accessibility(&self) -> TerminalAccessibility {
+        TerminalAccessibility {
+            buffer: Arc::downgrade(&self.buffer),
+            shared: Arc::downgrade(&self.shared),
+        }
+    }
+
+    /// Records where the grid is painted, which prepaint does every frame.
+    /// For hosts and tests that place the grid without painting it.
+    pub fn note_accessibility_geometry(&self, geometry: AccessibilityGeometry) {
+        *mutex_lock(&self.shared.accessibility_geometry) = Some(geometry);
     }
 
     #[must_use]
@@ -2358,6 +2549,7 @@ impl Element for TerminalElement {
         if self.suspended {
             mutex_lock(&self.shared.find_highlights).current_bounds = None;
             *mutex_lock(&self.shared.input_cell) = None;
+            *mutex_lock(&self.shared.accessibility_geometry) = None;
             mutex_lock(&self.shared.row_cache).clear();
             mutex_lock(&self.shared.render_generations).clear();
             *mutex_lock(&self.shared.render_context) = None;
@@ -2390,6 +2582,7 @@ impl Element for TerminalElement {
         if grid_is_empty {
             mutex_lock(&self.shared.find_highlights).current_bounds = None;
             *mutex_lock(&self.shared.input_cell) = None;
+            *mutex_lock(&self.shared.accessibility_geometry) = None;
             return TerminalPrepaintState {
                 started_at: None,
                 prepaint_time: Duration::ZERO,
@@ -2767,6 +2960,13 @@ impl Element for TerminalElement {
             window.request_animation_frame();
         }
 
+        *mutex_lock(&self.shared.accessibility_geometry) = Some(AccessibilityGeometry {
+            origin: point(bounds.left(), bounds.top() - scroll_shift),
+            cell_width: metrics.cell_width,
+            line_height: metrics.line_height,
+            rows: painted_rows,
+            cols: visible_cols,
+        });
         *mutex_lock(&self.shared.input_cell) = (!viewport.is_reading()
             && usize::from(cursor.row) < visible_rows
             && usize::from(cursor.col) < visible_cols)
