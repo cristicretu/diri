@@ -10,6 +10,10 @@ license.workspace = true
 # retained only for storage differential tests and allocation comparisons.
 default = ["compact-history"]
 compact-history = ["alacritty_terminal/compact-history"]
+# Benchmark verification only, never in a product build: the parser counts
+# and checksums each OSC body it dispatches and the image store logs each
+# image it stores, so `vt_workloads` can compare every run with a reference.
+bench-verify = ["alacritty_terminal/observe"]
 
 [dependencies]
 alacritty_terminal.workspace = true
@@ -24,6 +28,8 @@ diri-pty.workspace = true
 diri-platform.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# SHA-256 of payloads, images and state in the benchmark's golden check.
+sha2.workspace = true
 
 [[bench]]
 name = "terminal_throughput"
@@ -48,6 +54,7 @@ harness = false
 [[bench]]
 name = "vt_workloads"
 harness = false
+required-features = ["bench-verify"]
 
 [[bench]]
 name = "history_depth"

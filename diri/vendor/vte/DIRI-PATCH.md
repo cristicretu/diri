@@ -154,3 +154,20 @@ strings built from UTF-8 edge bytes, against `from_utf8`),
 `per_character_print_dispatches_the_same_characters`,
 `a_c1_control_split_across_reads_is_executed`, and
 `single_scan_ground_and_csi_match_the_bytewise_parser` above.
+
+## Test-only OSC observation
+
+Feature `observe` (off by default; no product crate enables it) adds
+`vte::observe`: per-thread totals of `osc_dispatch` calls, their parameters
+and parameter bytes, and, when turned on with `observe::reset(true)`, an
+order-sensitive FNV-1a checksum of every parameter byte. `vt_workloads`
+compares these with a reference parse, because an OSC nothing reads (the
+long-escapes workload is OSC 6) leaves no terminal state that would expose a
+parser skipping its body. Without the feature the dispatch path is unchanged.
+
+Test: `diri-terminal-state`'s `tests/osc_observe.rs`
+(`cargo test -p diri-terminal-state --features bench-verify --test osc_observe`).
+
+The same split-C1 fix also came with #927 (`partial_dispatch`); this branch's
+`print_or_execute` above is that fix, and #927's test
+`split_utf8_c1_control_executes_as_whole` runs here too.

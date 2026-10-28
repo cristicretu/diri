@@ -50,6 +50,9 @@ ansi = [
 default = ["std"]
 serde = ["dep:serde"]
 std = ["memchr/std"]
+# DIRI PATCH: test-only count and checksum of every OSC dispatch
+# (`vte::observe`), for benchmarks that must prove each body was parsed.
+observe = ["std"]
 
 [lib]
 name = "vte"
