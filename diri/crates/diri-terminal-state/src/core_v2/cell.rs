@@ -131,3 +131,153 @@ impl Style {
         }
     }
 }
+
+/// Writes `cells[k] = src[k] | high` for every `k` (printable ASCII into
+/// fresh cells; `high` carries the style). `cells` and `src` have the same
+/// length.
+#[inline(always)]
+pub fn fill_bytes(cells: &mut [Cell], src: &[u8], high: u64) {
+    debug_assert_eq!(cells.len(), src.len());
+    let n = src.len().min(cells.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Sixteen cells per step, the last step overlapping the one before
+        // (the overlap is written twice with the same values); eight at a
+        // time below sixteen.
+        if n >= 16 {
+            let mut k = 0;
+            while k + 16 <= n {
+                // SAFETY: `k + 16 <= n`.
+                unsafe { neon::fill16(cells.as_mut_ptr().add(k), src.as_ptr().add(k), high) };
+                k += 16;
+            }
+            if k < n {
+                // SAFETY: `n >= 16`.
+                unsafe {
+                    neon::fill16(
+                        cells.as_mut_ptr().add(n - 16),
+                        src.as_ptr().add(n - 16),
+                        high,
+                    )
+                };
+            }
+            return;
+        }
+        if n >= 8 {
+            // SAFETY: `8 <= n`, so both windows are in bounds.
+            unsafe {
+                neon::fill8(cells.as_mut_ptr(), src.as_ptr(), high);
+                neon::fill8(cells.as_mut_ptr().add(n - 8), src.as_ptr().add(n - 8), high);
+            }
+            return;
+        }
+    }
+    for (cell, &byte) in cells[..n].iter_mut().zip(&src[..n]) {
+        cell.0 = byte as u64 | high;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use super::Cell;
+    use std::arch::aarch64::*;
+
+    /// Table indices that spread two source bytes into two u64 lanes (an
+    /// index past the table reads as zero).
+    const SPREAD: [[u8; 16]; 8] = {
+        let mut t = [[0xFFu8; 16]; 8];
+        let mut j = 0;
+        while j < 8 {
+            t[j][0] = 2 * j as u8;
+            t[j][8] = 2 * j as u8 + 1;
+            j += 1;
+        }
+        t
+    };
+
+    /// Sixteen cells from sixteen bytes.
+    ///
+    /// # Safety
+    /// `dst` has room for sixteen cells and `src` holds sixteen bytes.
+    #[inline(always)]
+    pub unsafe fn fill16(dst: *mut Cell, src: *const u8, high: u64) {
+        // SAFETY: NEON is baseline on aarch64; the caller bounds the
+        // pointers.
+        unsafe {
+            let v = vld1q_u8(src);
+            let fill = vdupq_n_u64(high);
+            let dst = dst as *mut u64;
+            for (j, spread) in SPREAD.iter().enumerate() {
+                let lanes = vreinterpretq_u64_u8(vqtbl1q_u8(v, vld1q_u8(spread.as_ptr())));
+                vst1q_u64(dst.add(2 * j), vorrq_u64(lanes, fill));
+            }
+        }
+    }
+
+    /// Eight cells from eight bytes.
+    ///
+    /// # Safety
+    /// `dst` has room for eight cells and `src` holds eight bytes.
+    #[inline(always)]
+    pub unsafe fn fill8(dst: *mut Cell, src: *const u8, high: u64) {
+        // SAFETY: as `fill16`, over eight bytes.
+        unsafe {
+            let v = vcombine_u8(vld1_u8(src), vdup_n_u8(0));
+            let fill = vdupq_n_u64(high);
+            let dst = dst as *mut u64;
+            for (j, spread) in SPREAD[..4].iter().enumerate() {
+                let lanes = vreinterpretq_u64_u8(vqtbl1q_u8(v, vld1q_u8(spread.as_ptr())));
+                vst1q_u64(dst.add(2 * j), vorrq_u64(lanes, fill));
+            }
+        }
+    }
+}
+
+/// `cells.fill(cell)`, sixteen bytes per store.
+#[inline(always)]
+pub fn fill_cells(cells: &mut [Cell], cell: Cell) {
+    let mut pairs = cells.chunks_exact_mut(2);
+    for pair in &mut pairs {
+        // SAFETY: two cells are sixteen bytes in bounds; `Cell` is a
+        // transparent u64 with no invalid bit patterns.
+        unsafe { (pair.as_mut_ptr() as *mut [u64; 2]).write_unaligned([cell.0, cell.0]) };
+    }
+    for c in pairs.into_remainder() {
+        *c = cell;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fill_bytes_writes_every_length() {
+        let src: Vec<u8> = (0..64u8).map(|b| b' ' + b).collect();
+        for n in 0..=40 {
+            for start in 0..3 {
+                let mut cells = vec![Cell(0xDEAD); n + 6];
+                fill_bytes(&mut cells[start..start + n], &src[..n], 7 << STYLE_SHIFT);
+                for (k, cell) in cells.iter().enumerate() {
+                    let want = if (start..start + n).contains(&k) {
+                        src[k - start] as u64 | 7 << STYLE_SHIFT
+                    } else {
+                        0xDEAD
+                    };
+                    assert_eq!(cell.0, want, "n {n} start {start} cell {k}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fill_cells_writes_every_length() {
+        for n in 0..20 {
+            let mut cells = vec![Cell(1); n + 2];
+            fill_cells(&mut cells[1..1 + n], Cell(9));
+            assert_eq!(cells[0], Cell(1));
+            assert!(cells[1..1 + n].iter().all(|c| *c == Cell(9)));
+            assert_eq!(cells[n + 1], Cell(1));
+        }
+    }
+}

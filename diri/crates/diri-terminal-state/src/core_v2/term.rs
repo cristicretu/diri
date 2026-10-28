@@ -14,7 +14,10 @@ use alacritty_terminal::vte::ansi::{
     Attr, ClearMode, Handler, LineClearMode, Mode, NamedMode, NamedPrivateMode, PrivateMode,
 };
 
-use super::cell::{CLUSTER, Cell, GRAPHEME, LEADING, MARKS, SPACER, STYLE_SHIFT, Style, WIDE};
+use super::cell::{
+    CLUSTER, Cell, GRAPHEME, LEADING, MARKS, SPACER, STYLE_SHIFT, Style, WIDE, fill_bytes,
+    fill_cells,
+};
 use super::page::{Clusters, Pages, RowMeta, push_mark};
 use super::text::{Tables, tables};
 
@@ -580,7 +583,7 @@ impl Core {
         let row = &mut page.cells[r * cols..(r + 1) * cols];
         let occ = meta.occ as usize;
         if x > occ {
-            row[occ..x].fill(Cell::blank(meta.fill));
+            fill_cells(&mut row[occ..x], Cell::blank(meta.fill));
         }
         let overlap = occ.clamp(x, x + n) - x;
         let mut written = n;
@@ -599,9 +602,7 @@ impl Core {
             }
         }
         if written == n {
-            for (cell, &byte) in row[x + overlap..x + n].iter_mut().zip(&seg[overlap..]) {
-                cell.0 = byte as u64 | style;
-            }
+            fill_bytes(&mut row[x + overlap..x + n], &seg[overlap..], style);
         }
         if written > 0 {
             let id = (style >> STYLE_SHIFT) as u16;
@@ -640,7 +641,7 @@ impl Core {
         let row = &mut page.cells[r * cols..(r + 1) * cols];
         let occ = meta.occ as usize;
         if x0 > occ {
-            row[occ..x0].fill(Cell::blank(meta.fill));
+            fill_cells(&mut row[occ..x0], Cell::blank(meta.fill));
         }
         let text = &mut page.text;
         let id = (style >> STYLE_SHIFT) as u16;
@@ -649,14 +650,28 @@ impl Core {
         if log && occ > 0 {
             text.blanks(r, x0 - occ);
         }
+        // Tokens are written unchecked into room for every cell left on
+        // the row, and counted towards the row once at the end.
+        let log_from = text.len();
+        if log {
+            text.reserve_cells(cols - x0);
+        }
         let mut x = x0;
         let mut i = 0;
         let mut marked = false;
         let mut cps = [0u32; 16];
+        // After a vector run that stopped at a character it rejected, that
+        // character goes to the scalar decode directly.
+        let mut rejected = false;
         'row: while i < bytes.len() && x < cols {
-            if bytes.len() - i >= 48 && cols - x >= 4 {
+            if !std::mem::take(&mut rejected)
+                && bytes.len() - i >= 48
+                && cols - x >= 4
+                && bytes[i] & 0xF0 == 0xE0
+            {
                 let found = tables.wide_run16(&bytes[i..], &mut cps);
                 let fits = found.min((cols - x) / 2);
+                rejected = found > 0 && fits == found && found < 16;
                 if fits > 0 && x >= occ {
                     // Fresh cells: nothing to keep or clear.
                     let (glyph, spacer) = (WIDE | style, ' ' as u64 | SPACER | style);
@@ -665,7 +680,8 @@ impl Core {
                         pair[1].0 = spacer;
                     }
                     if log {
-                        text.chars3(r, &cps[..fits], &bytes[i..i + 3 * fits]);
+                        // SAFETY: room for the row's cells was reserved.
+                        unsafe { text.put_chars3(&cps, fits, &bytes[i..]) };
                     }
                     x += 2 * fits;
                     i += 3 * fits;
@@ -708,7 +724,7 @@ impl Core {
                         push_mark(row, &mut page.clusters, base, c);
                         marked = true;
                         if log {
-                            text.mark(r, &bytes[i..i + len]);
+                            text.put_mark(&bytes[i..i + len], cols - x);
                         }
                         i += len;
                         continue;
@@ -735,10 +751,14 @@ impl Core {
                 row[x + 1].0 = ' ' as u64 | SPACER | style | (old2 & MARKS);
             }
             if log {
-                text.char(r, cp as u64, &bytes[i..i + len]);
+                // SAFETY: room for the row's cells was reserved.
+                unsafe { text.put_char(cp as u64, &bytes[i..]) };
             }
             x += width;
             i += len;
+        }
+        if log {
+            text.add_to_row(r, log_from);
         }
         if x > x0 || x0 > occ || marked {
             // Written cells, or at least the blanks of the gap before x0.

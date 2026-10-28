@@ -12,8 +12,12 @@
 //!
 //! On aarch64, runs of three-byte characters (CJK, kana, Hangul) are
 //! classified sixteen at a time with NEON: a structure load splits lead and
-//! continuation bytes, and a 1024-bit map says which 64-codepoint blocks are
-//! entirely two-column, non-joining characters.
+//! continuation bytes, and two 2048-bit maps over 32-codepoint blocks say
+//! which codepoints are two-column, non-joining characters: one for all but
+//! the block's first codepoint, one for that first codepoint. So CJK
+//! punctuation (U+3001.., U+FF01..) stays in the vector runs while the
+//! marks and holes next to it do not. Other targets use the same maps one
+//! character at a time.
 
 use std::sync::OnceLock;
 
@@ -22,8 +26,11 @@ use alacritty_terminal::term::grapheme::{Info, may_join};
 pub struct Tables {
     /// Two bits per BMP codepoint.
     cp2: Box<[u8; 0x4000]>,
-    /// One bit per 64-codepoint BMP block: every codepoint is class 2.
-    wide_blocks: [u8; 128],
+    /// One bit per 32-codepoint BMP block: codepoints 1..32 of the block
+    /// are all class 2.
+    wide_rest: [u8; 256],
+    /// One bit per 32-codepoint BMP block: its first codepoint is class 2.
+    wide_first: [u8; 256],
 }
 
 pub fn tables() -> &'static Tables {
@@ -51,23 +58,34 @@ fn class_of(cp: u32) -> u8 {
 
 fn build() -> Tables {
     let mut cp2 = Box::new([0u8; 0x4000]);
-    let mut wide_blocks = [0u8; 128];
-    for block in 0..1024u32 {
-        let mut all_wide = true;
-        for cp in block * 64..block * 64 + 64 {
+    let mut wide_rest = [0u8; 256];
+    let mut wide_first = [0u8; 256];
+    for block in 0..2048u32 {
+        let mut rest = true;
+        for cp in block * 32..block * 32 + 32 {
             let class = class_of(cp);
-            all_wide &= class == 2;
+            if cp % 32 != 0 {
+                rest &= class == 2;
+            }
             cp2[(cp >> 2) as usize] |= class << ((cp & 3) * 2);
         }
-        // Surrogates never decode, so their blocks may count as wide.
-        if (0xD800 >> 6..0xE000 >> 6).contains(&block) {
-            all_wide = false;
+        let first = class_of(block * 32) == 2;
+        // Surrogates and overlong forms never decode as valid, and must not
+        // pass the vector path's check (which does not look for them).
+        let invalid = block * 32 < 0x800 || (0xD800..0xE000).contains(&(block * 32));
+        let bit = 1 << (block & 7);
+        if rest && !invalid {
+            wide_rest[(block >> 3) as usize] |= bit;
         }
-        if all_wide {
-            wide_blocks[(block >> 3) as usize] |= 1 << (block & 7);
+        if first && !invalid {
+            wide_first[(block >> 3) as usize] |= bit;
         }
     }
-    Tables { cp2, wide_blocks }
+    Tables {
+        cp2,
+        wide_rest,
+        wide_first,
+    }
 }
 
 impl Tables {
@@ -101,6 +119,19 @@ impl Tables {
         }
     }
 
+    /// Whether the vector path takes three-byte character `cp`: by the two
+    /// 32-codepoint maps, always a two-column, non-joining character.
+    #[inline(always)]
+    pub fn vector_accepts(&self, cp: u32) -> bool {
+        let block = (cp >> 5) as usize;
+        let map = if cp & 31 == 0 {
+            &self.wide_first
+        } else {
+            &self.wide_rest
+        };
+        (0x800..0x1_0000).contains(&cp) && map[block >> 3] & (1 << (block & 7)) != 0
+    }
+
     #[inline(always)]
     fn class(&self, cp: u32) -> u8 {
         (self.cp2[(cp >> 2) as usize] >> ((cp & 3) * 2)) & 3
@@ -128,37 +159,47 @@ impl Tables {
                     vceqq_u8(vandq_u8(b2, vdupq_n_u8(0xC0)), vdupq_n_u8(0x80)),
                 ),
             );
-            // Block = (b0 & 0xF) << 6 | (b1 & 0x3F); its byte in the map is
-            // block >> 3 (0..128), its bit block & 7 == b1 & 7.
+            // Block = cp >> 5; its byte in a map is cp >> 8 =
+            // (b0 & 0xF) << 4 | (b1 & 0x3F) >> 2 (0..256, four 64-byte
+            // lookups, an index past a table reading as zero), its bit
+            // (cp >> 5) & 7 = (b1 & 3) << 1 | (b2 >> 5) & 1.
             let index = vorrq_u8(
-                vshlq_n_u8::<3>(vandq_u8(b0, vdupq_n_u8(0x0F))),
-                vshrq_n_u8::<3>(vandq_u8(b1, vdupq_n_u8(0x3F))),
+                vshlq_n_u8::<4>(vandq_u8(b0, vdupq_n_u8(0x0F))),
+                vshrq_n_u8::<2>(vandq_u8(b1, vdupq_n_u8(0x3F))),
             );
-            let map = &self.wide_blocks;
-            let low = vqtbl4q_u8(
-                uint8x16x4_t(
-                    vld1q_u8(map.as_ptr()),
-                    vld1q_u8(map.as_ptr().add(16)),
-                    vld1q_u8(map.as_ptr().add(32)),
-                    vld1q_u8(map.as_ptr().add(48)),
-                ),
-                index,
-            );
-            let high = vqtbl4q_u8(
-                uint8x16x4_t(
-                    vld1q_u8(map.as_ptr().add(64)),
-                    vld1q_u8(map.as_ptr().add(80)),
-                    vld1q_u8(map.as_ptr().add(96)),
-                    vld1q_u8(map.as_ptr().add(112)),
-                ),
-                // Indices below 64 wrap past 191 and read as zero.
-                vsubq_u8(index, vdupq_n_u8(64)),
-            );
+            let lookup = |map: &[u8; 256]| {
+                let t = map.as_ptr();
+                let part = |at: usize| {
+                    uint8x16x4_t(
+                        vld1q_u8(t.add(at)),
+                        vld1q_u8(t.add(at + 16)),
+                        vld1q_u8(t.add(at + 32)),
+                        vld1q_u8(t.add(at + 48)),
+                    )
+                };
+                vorrq_u8(
+                    vorrq_u8(
+                        vqtbl4q_u8(part(0), index),
+                        vqtbl4q_u8(part(64), vsubq_u8(index, vdupq_n_u8(64))),
+                    ),
+                    vorrq_u8(
+                        vqtbl4q_u8(part(128), vsubq_u8(index, vdupq_n_u8(128))),
+                        vqtbl4q_u8(part(192), vsubq_u8(index, vdupq_n_u8(192))),
+                    ),
+                )
+            };
+            // The first codepoint of a block (b2 & 0x1F == 0) reads the
+            // other map.
+            let first = vceqq_u8(vandq_u8(b2, vdupq_n_u8(0x1F)), vdupq_n_u8(0));
+            let map = vbslq_u8(first, lookup(&self.wide_first), lookup(&self.wide_rest));
             let bit = vshlq_u8(
                 vdupq_n_u8(1),
-                vreinterpretq_s8_u8(vandq_u8(b1, vdupq_n_u8(7))),
+                vreinterpretq_s8_u8(vorrq_u8(
+                    vshlq_n_u8::<1>(vandq_u8(b1, vdupq_n_u8(3))),
+                    vandq_u8(vshrq_n_u8::<5>(b2), vdupq_n_u8(1)),
+                )),
             );
-            let ok = vandq_u8(lead, vtstq_u8(vorrq_u8(low, high), bit));
+            let ok = vandq_u8(lead, vtstq_u8(map, bit));
             // Four mask bits per lane; count the leading accepted lanes.
             let mask = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(
                 vreinterpretq_u16_u8(ok),
@@ -198,11 +239,11 @@ impl Tables {
             if b0 & 0xF0 != 0xE0 || b1 & 0xC0 != 0x80 || b2 & 0xC0 != 0x80 {
                 return k;
             }
-            let block = ((b0 & 0x0F) as usize) << 6 | (b1 & 0x3F) as usize;
-            if self.wide_blocks[block >> 3] & (1 << (block & 7)) == 0 {
+            let cp = ((b0 & 0x0F) as u32) << 12 | ((b1 & 0x3F) as u32) << 6 | (b2 & 0x3F) as u32;
+            if !self.vector_accepts(cp) {
                 return k;
             }
-            *slot = ((b0 & 0x0F) as u32) << 12 | ((b1 & 0x3F) as u32) << 6 | (b2 & 0x3F) as u32;
+            *slot = cp;
         }
         16
     }
@@ -225,6 +266,65 @@ mod tests {
                 .expect("valid");
             assert_eq!((decoded, len), (cp, c.len_utf8()));
             assert_eq!(class, class_of(cp), "{cp:#x}");
+        }
+    }
+
+    #[test]
+    fn the_vector_path_takes_only_two_column_non_joining_characters() {
+        let tables = tables();
+        let mut taken = 0;
+        for cp in 0x800u32..0x1_0000 {
+            let class = char::from_u32(cp).map_or(0, |_| class_of(cp));
+            if tables.vector_accepts(cp) {
+                assert_eq!(class, 2, "{cp:#x}");
+                taken += 1;
+            }
+        }
+        assert!(taken > 40_000, "{taken}");
+        // The punctuation the 64-codepoint map used to send to the scalar
+        // path, and the holes beside it.
+        for (cp, want) in [
+            (0x3001, true),
+            (0x3002, true),
+            (0xFF0C, true),
+            (0xFF00, false),
+            (0x302A, false),
+            (0x3040, false),
+            (0x3041, true),
+        ] {
+            assert_eq!(tables.vector_accepts(cp), want, "{cp:#x}");
+        }
+        // NEON and scalar agree with `vector_accepts` on every three-byte
+        // character, sixteen at a time, at every lane.
+        let mut out = [0u32; 16];
+        for start in (0x800u32..0x1_0000 - 16).step_by(7) {
+            if (start..start + 16).any(|cp| char::from_u32(cp).is_none()) {
+                continue;
+            }
+            let mut bytes = Vec::new();
+            for k in 0..16 {
+                let cp = start + k;
+                let c = char::from_u32(cp).expect("a scalar");
+                let mut buf = [0u8; 4];
+                bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+            if bytes.len() != 48 {
+                continue;
+            }
+            let want = (0..16u32)
+                .take_while(|&k| {
+                    char::from_u32(start + k).is_some() && tables.vector_accepts(start + k)
+                })
+                .count();
+            assert_eq!(tables.wide_run16(&bytes, &mut out), want, "{start:#x}");
+            for (k, &cp) in out[..want].iter().enumerate() {
+                assert_eq!(cp, start + k as u32);
+            }
+        }
+        // Surrogates and overlong forms, which do not decode, never pass.
+        for bad in [[0xEDu8, 0xA0, 0x80], [0xE0, 0x80, 0x80], [0xE0, 0x9F, 0xBF]] {
+            let bytes: Vec<u8> = bad.iter().copied().cycle().take(48).collect();
+            assert_eq!(tables.wide_run16(&bytes, &mut out), 0, "{bad:x?}");
         }
     }
 
@@ -258,16 +358,16 @@ mod tests {
         let bytes = text.as_bytes();
         let count = tables.wide_run16(&bytes[..48], &mut out);
         {
-            // 漢字 are CJK; か falls in a block with combining marks.
+            // 漢字かな交じ stay in the run (か shares a 32-codepoint block
+            // with the hole U+3040 but is not its first codepoint); り
+            // shares one with the marks U+3099 and U+309A.
             let expected = text
                 .chars()
                 .take(16)
-                .take_while(|&c| {
-                    let cp = c as u32;
-                    (0..64).all(|i| class_of((cp & !63) + i) == 2)
-                })
+                .take_while(|&c| tables.vector_accepts(c as u32))
                 .count();
             assert_eq!(count, expected);
+            assert_eq!(count, 6, "CJK and kana stay in the run");
             for (i, c) in text.chars().take(count).enumerate() {
                 assert_eq!(out[i], c as u32);
             }

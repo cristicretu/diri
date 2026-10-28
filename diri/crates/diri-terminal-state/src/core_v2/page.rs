@@ -318,16 +318,96 @@ impl TextLog {
         self.spans[row].1 += bytes.len() as u32;
     }
 
-    /// Tokens of `cps`, three-byte characters whose UTF-8 is `utf8`.
+    // ---- the text path's writers ----
+    //
+    // `write_text_segment` reserves room for every cell it may still write
+    // ([`TextLog::reserve_cells`]), writes tokens without capacity checks,
+    // and adds the bytes to the row once ([`TextLog::add_to_row`]). A
+    // character takes at most four bytes per cell; a mark reserves again.
+
+    /// Room for the tokens of `cells` more cells (four bytes each).
     #[inline(always)]
-    pub fn chars3(&mut self, row: usize, cps: &[u32], utf8: &[u8]) {
-        debug_assert_eq!(utf8.len(), cps.len() * 3);
-        self.bytes.reserve(utf8.len());
+    pub fn reserve_cells(&mut self, cells: usize) {
+        self.bytes.reserve(4 * cells + 32);
+    }
+
+    /// Bytes in the arena.
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Whether the arena is empty.
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Counts the `bytes` written since the arena held `from` towards `row`.
+    #[inline(always)]
+    pub fn add_to_row(&mut self, row: usize, from: usize) {
+        self.spans[row].1 += (self.bytes.len() - from) as u32;
+    }
+
+    /// A character's token (see [`TextLog::char`]) for the character
+    /// whose UTF-8 starts `utf8` (which may run on past it), covering one
+    /// or two cells.
+    ///
+    /// # Safety
+    /// [`TextLog::reserve_cells`] covered the cells written since.
+    #[inline(always)]
+    pub unsafe fn put_char(&mut self, cp: u64, utf8: &[u8]) {
+        debug_assert!(self.bytes.capacity() - self.bytes.len() >= 4);
         let len = self.bytes.len();
-        // SAFETY: at most three bytes per character were reserved.
+        let index = cp.wrapping_sub(CJK_BASE);
+        let (word, n) = if index < CJK_END - CJK_BASE {
+            (
+                CJK_LEADS[(index >> 8) as usize] as u32 | (index as u32 & 0xFF) << 8,
+                2,
+            )
+        } else if let Some(&word) = utf8.first_chunk::<4>() {
+            // The bytes after the character are written past it and
+            // overwritten later (or left past the vector's end).
+            (u32::from_le_bytes(word), len_of(utf8[0]))
+        } else {
+            let n = len_of(utf8[0]);
+            let mut word = 0u32;
+            for (k, &b) in utf8[..n].iter().enumerate() {
+                word |= (b as u32) << (8 * k);
+            }
+            (word, n)
+        };
+        // SAFETY: four bytes of room (the caller's reservation); `n` of
+        // them join the vector.
+        unsafe {
+            (self.bytes.as_mut_ptr().add(len) as *mut u32).write_unaligned(word.to_le());
+            self.bytes.set_len(len + n);
+        }
+    }
+
+    /// Tokens of `cps`, two-column three-byte characters whose UTF-8 is
+    /// `utf8`.
+    ///
+    /// # Safety
+    /// As [`TextLog::put_char`]: their `2 * cps.len()` cells are reserved.
+    #[inline(always)]
+    pub unsafe fn put_chars3(&mut self, cps: &[u32; 16], n: usize, utf8: &[u8]) {
+        debug_assert!(n <= 16 && utf8.len() >= 3 * n);
+        let len = self.bytes.len();
+        debug_assert!(self.bytes.capacity() - len >= 8 * n);
+        // SAFETY: 8 * n bytes of room; at most 3 * n are written, or 32
+        // when n >= 4.
         let ptr = unsafe { self.bytes.as_mut_ptr().add(len) };
+        #[cfg(target_arch = "aarch64")]
+        if n >= 4
+            && let Some(()) = unsafe { cjk_codes16(cps, ptr) }
+        {
+            // SAFETY: 2 * n of the 32 bytes written are tokens.
+            unsafe { self.bytes.set_len(len + 2 * n) };
+            return;
+        }
         let mut w = 0;
-        for (k, &cp) in cps.iter().enumerate() {
+        for (k, &cp) in cps[..n].iter().enumerate() {
             let index = (cp as u64).wrapping_sub(CJK_BASE);
             unsafe {
                 if index < CJK_END - CJK_BASE {
@@ -342,14 +422,15 @@ impl TextLog {
         }
         // SAFETY: `w` bytes were written within the reserved capacity.
         unsafe { self.bytes.set_len(len + w) };
-        self.spans[row].1 += w as u32;
     }
 
-    /// A zero-width mark on the cell before the row's last token.
+    /// A zero-width mark (its UTF-8) on the cell before; keeps room for
+    /// `cells` more cells.
     #[inline]
-    pub fn mark(&mut self, row: usize, utf8: &[u8]) {
-        self.push(row, T_MARK);
-        self.small(row, utf8);
+    pub fn put_mark(&mut self, utf8: &[u8], cells: usize) {
+        self.bytes.push(T_MARK);
+        self.bytes.extend_from_slice(utf8);
+        self.reserve_cells(cells);
     }
 
     pub fn leading(&mut self, row: usize) {
@@ -366,6 +447,80 @@ impl TextLog {
         self.spans.fill((INVALID, 0));
     }
 }
+
+/// The length of the UTF-8 sequence led by valid lead byte `b0`.
+#[inline(always)]
+fn len_of(b0: u8) -> usize {
+    1 + (b0 >= 0xC0) as usize + (b0 >= 0xE0) as usize + (b0 >= 0xF0) as usize
+}
+
+/// Writes the two-byte codes of sixteen characters, all of them from
+/// U+4E00 on (see [`CJK_LEADS`]), as 32 bytes at `out`; `None` (writing
+/// nothing) when any is outside that range.
+///
+/// # Safety
+/// `out` has room for 32 bytes.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn cjk_codes16(cps: &[u32; 16], out: *mut u8) -> Option<()> {
+    use std::arch::aarch64::*;
+    // SAFETY: NEON is baseline on aarch64; the loads read `cps` and the
+    // lead table, the store writes the caller's 32 bytes.
+    unsafe {
+        let base = vdupq_n_u32(CJK_BASE as u32);
+        let span = vdupq_n_u32((CJK_END - CJK_BASE) as u32);
+        let p = cps.as_ptr();
+        let (a, b, c, d) = (
+            vsubq_u32(vld1q_u32(p), base),
+            vsubq_u32(vld1q_u32(p.add(4)), base),
+            vsubq_u32(vld1q_u32(p.add(8)), base),
+            vsubq_u32(vld1q_u32(p.add(12)), base),
+        );
+        let inside = vandq_u32(
+            vandq_u32(vcltq_u32(a, span), vcltq_u32(b, span)),
+            vandq_u32(vcltq_u32(c, span), vcltq_u32(d, span)),
+        );
+        if vminvq_u32(inside) == 0 {
+            return None;
+        }
+        let narrow = |x: uint32x4_t, y: uint32x4_t| vcombine_u16(vmovn_u32(x), vmovn_u32(y));
+        let (lo16, hi16) = (narrow(a, b), narrow(c, d));
+        let low = vcombine_u8(vmovn_u16(lo16), vmovn_u16(hi16));
+        let high = vcombine_u8(vshrn_n_u16::<8>(lo16), vshrn_n_u16::<8>(hi16));
+        let t = CJK_LEADS_PADDED.as_ptr();
+        let first = uint8x16x4_t(
+            vld1q_u8(t),
+            vld1q_u8(t.add(16)),
+            vld1q_u8(t.add(32)),
+            vld1q_u8(t.add(48)),
+        );
+        let second = uint8x16x3_t(
+            vld1q_u8(t.add(64)),
+            vld1q_u8(t.add(80)),
+            vld1q_u8(t.add(96)),
+        );
+        // Indices 0..64 read the first table, 64..100 the second (an
+        // index past a table reads as zero).
+        let lead = vorrq_u8(
+            vqtbl4q_u8(first, high),
+            vqtbl3q_u8(second, vsubq_u8(high, vdupq_n_u8(64))),
+        );
+        vst2q_u8(out, uint8x16x2_t(lead, low));
+        Some(())
+    }
+}
+
+/// [`CJK_LEADS`] padded to 112 bytes for table lookups.
+#[cfg(target_arch = "aarch64")]
+const CJK_LEADS_PADDED: [u8; 112] = {
+    let mut t = [0u8; 112];
+    let mut i = 0;
+    while i < 100 {
+        t[i] = CJK_LEADS[i];
+        i += 1;
+    }
+    t
+};
 
 pub struct Page {
     /// Changes whenever the page is (re)initialised, so a pen can cache
