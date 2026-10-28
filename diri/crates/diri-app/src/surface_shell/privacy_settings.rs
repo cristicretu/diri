@@ -270,7 +270,7 @@ impl UtilitySurfaces {
                         cx,
                         |this, cx| {
                             if let Some(folder) = &this.privacy.settings.folder {
-                                let _ = std::fs::create_dir_all(folder);
+                                let _ = diri_platform::private::create_dir_all(folder);
                                 cx.reveal_path(folder);
                             }
                         },

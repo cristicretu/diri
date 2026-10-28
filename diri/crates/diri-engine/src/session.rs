@@ -4268,7 +4268,7 @@ fn scan_artifacts_if_due(
     }
     *last_scan_at = Some(std::time::Instant::now());
     let (seq, source) = {
-        let screen = shared.screen.lock().expect("screen");
+        let mut screen = shared.screen.lock().expect("screen");
         let seq = screen.content_seq();
         if seq == *last_scan_seq {
             return;
@@ -6951,12 +6951,13 @@ fn persist_checkpoint(
     marker_buffer: &[u8],
     last_key: &mut Option<CheckpointKey>,
 ) {
-    let (key, checkpoint) = capture_checkpoint(shared, offset, marker_buffer);
+    let (key, checkpoint, history) = capture_checkpoint_with(shared, offset, marker_buffer, true);
     if last_key.as_ref() == Some(&key) {
         return;
     }
+    let (rows, payload) = history.unwrap_or_default();
     // A failed write must not stop the session; the checkpoint is a cache.
-    if checkpoint.write_atomically(path).is_ok() {
+    if checkpoint.write_with_history(path, rows, &payload).is_ok() {
         *last_key = Some(key);
     }
 }
@@ -6967,8 +6968,25 @@ fn capture_checkpoint(
     offset: u64,
     marker_buffer: &[u8],
 ) -> (CheckpointKey, crate::checkpoint::ScreenCheckpoint) {
+    let (key, checkpoint, _) = capture_checkpoint_with(shared, offset, marker_buffer, false);
+    (key, checkpoint)
+}
+
+/// With `encode_history`, history is returned encoded (row count, payload)
+/// and the checkpoint's `history` is empty: rows are encoded as they are
+/// read, so a full-history checkpoint never holds a cell copy of every row.
+fn capture_checkpoint_with(
+    shared: &Shared,
+    offset: u64,
+    marker_buffer: &[u8],
+    encode_history: bool,
+) -> (
+    CheckpointKey,
+    crate::checkpoint::ScreenCheckpoint,
+    Option<(usize, Vec<u8>)>,
+) {
     let (
-        history,
+        (history, encoded),
         history_metadata,
         grid,
         alt_screen,
@@ -6979,8 +6997,13 @@ fn capture_checkpoint(
         keyboard_snapshot,
     ) = {
         let mut screen = shared.screen.lock().expect("screen");
+        let (history, encoded) = if encode_history {
+            (Vec::new(), Some(screen.history_payload()))
+        } else {
+            (screen.history_snapshot(), None)
+        };
         (
-            screen.history_snapshot(),
+            (history, encoded),
             screen.history_metadata(),
             screen.full_snapshot(),
             screen.is_alt_screen(),
@@ -7021,7 +7044,7 @@ fn capture_checkpoint(
         bracketed_paste,
         mouse,
     };
-    (key, checkpoint)
+    (key, checkpoint, encoded)
 }
 
 /// Wakes the held pump the moment the holder appends to the log, instead of
@@ -8439,7 +8462,10 @@ if mkdir first 2>/dev/null; then
   cat reset.bin snapshot.bin
   while [ ! -f disconnect ]; do sleep 0.01; done
 else
-  cat <&0 > second-stdin.bin &
+  # dash (Linux /bin/sh) points an async list's stdin at /dev/null even
+  # with an explicit `<&0`, so hand the bridge's stdin over on fd 3.
+  exec 3<&0
+  cat <&3 > second-stdin.bin &
   while [ ! -f reconnect ]; do sleep 0.01; done
   cat hello.bin modes.bin reset.bin snapshot.bin
   while [ ! -f finish ]; do sleep 0.01; done
@@ -8576,12 +8602,17 @@ fi
             // The reconnect offered grid-resume-v1 for the grid it held. This
             // Holder answered without it (as one predating the capability
             // does), and the snapshot that followed seeded the session.
-            let Some(RemoteMessage::Hello(second)) = RemoteCodec::new()
-                .feed(&std::fs::read(temp.path().join("second-stdin.bin")).unwrap())
-                .unwrap()
-                .into_iter()
-                .next()
-            else {
+            // The fixture's background `cat` copies stdin to the file on its
+            // own schedule, so wait for the whole Hello frame to land.
+            let reconnect_hello = || {
+                RemoteCodec::new()
+                    .feed(&std::fs::read(temp.path().join("second-stdin.bin")).ok()?)
+                    .ok()?
+                    .into_iter()
+                    .next()
+            };
+            wait_for("reconnect Hello recorded", || reconnect_hello().is_some());
+            let Some(RemoteMessage::Hello(second)) = reconnect_hello() else {
                 panic!("reconnect Hello");
             };
             let offered = second.grid_resume.expect("resume offered");
