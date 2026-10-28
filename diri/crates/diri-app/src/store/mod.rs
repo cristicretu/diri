@@ -40,7 +40,7 @@ use crate::switcher::{
 };
 
 pub use prefs::{
-    DictationShortcut, FileEditor, InspectorTab, InterfaceStyle, NewAgentStart, PaneDensity, Prefs,
+    CursorBlinkPref, CursorShapePref, DictationShortcut, FileEditor, InspectorTab, InterfaceStyle, NewAgentStart, OptionAsMeta, PaneDensity, Prefs,
     SavedWindow, SidebarGrouping, SidebarOrdering, TabOrientation, TalkAnswer, UiLanguage,
     WindowMaterial, WindowMode, WindowPlacement,
 };
@@ -1887,6 +1887,29 @@ impl SessionStore {
         self.reconcile_navigation();
     }
 
+    /// An Agent changed the window through Diri's tools: name it. Only
+    /// requests stamped with an actor reach here, and the app never stamps
+    /// its own, so the person's input is never announced back to them. An
+    /// actor this window does not know (archived, or not yet listed) stays
+    /// silent rather than showing an id; a note actor is the person.
+    fn agent_acted(&mut self, event: diri_proto::agent_action::AgentActionEvent) {
+        let Some(actor) = self
+            .sessions
+            .get(&event.session_id)
+            // A note acts only when the person starts work from it.
+            .filter(|session| !session.is_archived() && !session.is_note())
+        else {
+            return;
+        };
+        let notice = crate::agent_notice::notice(actor, event.action);
+        self.emit(StoreEffect::StatusTransition(StatusTransition {
+            dismiss: Vec::new(),
+            sound: None,
+            notification: None,
+            in_app_banner: Some(notice),
+        }));
+    }
+
     /// Applies a daemon event and reports whether any UI-visible store state
     /// changed. The daemon can repeat snapshots and also carries events for
     /// direct consumers such as terminal attachments; neither should rebuild
@@ -1919,6 +1942,15 @@ impl SessionStore {
                     serde_json::from_value::<diri_proto::SessionOpenApiRequestParams>(event.params)
                 {
                     self.accept_api_request(params);
+                }
+                return StoreEventChange::None;
+            }
+            EventName::AGENT_ACTION => {
+                if let Ok(event) = serde_json::from_value::<
+                    diri_proto::agent_action::AgentActionEvent,
+                >(event.params)
+                {
+                    self.agent_acted(event);
                 }
                 return StoreEventChange::None;
             }
@@ -2966,13 +2998,53 @@ impl SessionStore {
     }
 
     /// The session a pane belongs to in the sidebar: a pane shell's parent,
-    /// otherwise the session itself.
+    /// otherwise the session itself. A pane shell moved into a tab its
+    /// parent is not in belongs to that tab's first session with a row, so
+    /// the tab stays one row and focusing the shell keeps that row selected.
     pub fn pane_owner(&self, session: &SessionId) -> SessionId {
-        self.sessions
+        use diri_proto::workspace::LayoutNode;
+        fn leaves<'a>(node: &'a LayoutNode, out: &mut Vec<&'a SessionId>) {
+            match node {
+                LayoutNode::Pane { session_id, .. } => out.push(session_id),
+                LayoutNode::Split { first, second, .. } => {
+                    leaves(first, out);
+                    leaves(second, out);
+                }
+            }
+        }
+        let Some(parent) = self
+            .sessions
             .get(session)
             .filter(|record| is_auxiliary_terminal(record))
             .and_then(|record| record.parent.clone())
-            .unwrap_or_else(|| session.clone())
+        else {
+            return session.clone();
+        };
+        let Some(snapshot) = self.workspaces.snapshot() else {
+            return parent;
+        };
+        let mut panes = Vec::new();
+        for tab in snapshot.workspaces.iter().flat_map(|w| &w.tabs) {
+            if !matches!(tab.layout, LayoutNode::Split { .. }) {
+                continue;
+            }
+            panes.clear();
+            leaves(&tab.layout, &mut panes);
+            if !panes.contains(&session) {
+                continue;
+            }
+            if panes.contains(&&parent) {
+                return parent;
+            }
+            if let Some(head) = panes.iter().find(|id| {
+                self.sessions
+                    .get(**id)
+                    .is_some_and(|record| !is_auxiliary_terminal(record))
+            }) {
+                return (*head).clone();
+            }
+        }
+        parent
     }
 
     /// The tab that shows `owner`, as its sidebar row sums it up: how many
@@ -3002,7 +3074,7 @@ impl SessionStore {
                     .iter()
                     .filter_map(|id| self.sessions.get(*id))
                     .filter(|session| {
-                        session.parent.as_ref() == Some(owner) && is_auxiliary_terminal(session)
+                        is_auxiliary_terminal(session) && self.pane_owner(&session.id) == *owner
                     })
                     .cloned()
                     .collect();
@@ -3010,6 +3082,29 @@ impl SessionStore {
             }
         }
         None
+    }
+
+    /// The layout of the split tab that shows `session`, if any.
+    pub fn split_layout_of(
+        &self,
+        session: &SessionId,
+    ) -> Option<&diri_proto::workspace::LayoutNode> {
+        use diri_proto::workspace::LayoutNode;
+        fn shows(node: &LayoutNode, session: &SessionId) -> bool {
+            match node {
+                LayoutNode::Pane { session_id, .. } => session_id == session,
+                LayoutNode::Split { first, second, .. } => {
+                    shows(first, session) || shows(second, session)
+                }
+            }
+        }
+        self.workspaces
+            .snapshot()?
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.tabs)
+            .map(|tab| &tab.layout)
+            .find(|layout| matches!(layout, LayoutNode::Split { .. }) && shows(layout, session))
     }
 
     /// The newest running pane shell of `owner` that no tab shows: one

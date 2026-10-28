@@ -835,6 +835,48 @@ fn mutate(
                 return Err(missing());
             }
             destination.focused_pane = tree::panes(&incoming)[0].clone();
+            // The moved pane shows: zoom on another pane would hide it.
+            destination.zoomed_pane = None;
+        }
+        BreakPane { tab_id, pane_id } => {
+            let (workspace_index, tab_index) = state
+                .workspaces
+                .iter()
+                .enumerate()
+                .find_map(|(w, workspace)| {
+                    workspace
+                        .tabs
+                        .iter()
+                        .position(|tab| tab.id == tab_id)
+                        .map(|t| (w, t))
+                })
+                .ok_or_else(missing)?;
+            let source = &mut state.workspaces[workspace_index].tabs[tab_index];
+            let node = LayoutNodeId::Pane(pane_id.clone());
+            let incoming = tree::find(&source.layout, &node)
+                .cloned()
+                .ok_or_else(missing)?;
+            let (remaining, _) = tree::take(source.layout.clone(), &node);
+            let Some(remaining) = remaining else {
+                return Err(invalid("a tab's only pane is already its own tab"));
+            };
+            source.layout = remaining;
+            if source.zoomed_pane.as_ref() == Some(&pane_id) {
+                source.zoomed_pane = None;
+            }
+            let new_tab = TabId(new_id("tab")?);
+            let workspace = &mut state.workspaces[workspace_index];
+            workspace.tabs.insert(
+                tab_index + 1,
+                WorkspaceTab {
+                    id: new_tab.clone(),
+                    title: None,
+                    layout: incoming,
+                    focused_pane: pane_id,
+                    zoomed_pane: None,
+                },
+            );
+            workspace.selected_tab = Some(new_tab);
         }
         SwapPanes {
             first_tab,
@@ -1005,6 +1047,101 @@ mod tests {
         let document: Value = serde_json::from_slice(&std::fs::read(&f.path).unwrap()).unwrap();
         assert_eq!(document["sessions"], serde_json::json!([]));
         assert_eq!(document["projects"][0]["future"], "preserved");
+    }
+
+    /// A pane dragged out of a split lands in a tab of its own right after
+    /// the source tab, keeping its pane id (the mounted terminal and its
+    /// session never restart); the source keeps the rest of its tree.
+    #[test]
+    fn break_pane_lifts_a_pane_into_the_next_tab_and_keeps_its_identity() {
+        let mut f = Fixture::new();
+        let workspace = f.create_workspace("Work");
+        let (first, first_pane) = f.create_tab(workspace.clone(), 0);
+        let (last, _) = f.create_tab(workspace, 1);
+        f.apply(SplitPane {
+            tab_id: first.clone(),
+            target: first_pane.clone(),
+            session_id: SessionId::new("session_2"),
+            edge: DockEdge::Right,
+        });
+        let added = f.snapshot.workspaces[0].tabs[0].focused_pane.clone();
+        f.apply(ZoomPane {
+            tab_id: first.clone(),
+            pane_id: Some(added.clone()),
+        });
+        f.apply(BreakPane {
+            tab_id: first.clone(),
+            pane_id: added.clone(),
+        });
+        let tabs = &f.snapshot.workspaces[0].tabs;
+        assert_eq!(tabs.len(), 3);
+        assert_eq!(tabs[0].id, first);
+        assert_eq!(tabs[2].id, last, "the new tab sits right after its source");
+        assert_eq!(
+            tabs[0].layout,
+            LayoutNode::Pane {
+                id: first_pane.clone(),
+                session_id: SessionId::new("session_0"),
+            }
+        );
+        assert_eq!(tabs[0].zoomed_pane, None);
+        assert_eq!(tabs[0].focused_pane, first_pane);
+        assert_eq!(
+            tabs[1].layout,
+            LayoutNode::Pane {
+                id: added.clone(),
+                session_id: SessionId::new("session_2"),
+            }
+        );
+        assert_eq!(tabs[1].focused_pane, added);
+        assert_eq!(
+            f.snapshot.workspaces[0].selected_tab,
+            Some(tabs[1].id.clone())
+        );
+        // A lone pane already is its own tab.
+        f.reject(
+            BreakPane {
+                tab_id: first,
+                pane_id: first_pane,
+            },
+            "invalid_workspace",
+        );
+    }
+
+    /// A pane moved into a zoomed tab is shown, not hidden behind the zoom.
+    #[test]
+    fn move_node_into_a_zoomed_tab_unzooms_it() {
+        let mut f = Fixture::new();
+        let workspace = f.create_workspace("Work");
+        let (first, first_pane) = f.create_tab(workspace.clone(), 0);
+        let (second, second_pane) = f.create_tab(workspace, 1);
+        f.apply(SplitPane {
+            tab_id: first.clone(),
+            target: first_pane.clone(),
+            session_id: SessionId::new("session_2"),
+            edge: DockEdge::Right,
+        });
+        let added = f.snapshot.workspaces[0].tabs[0].focused_pane.clone();
+        f.apply(SplitPane {
+            tab_id: second.clone(),
+            target: second_pane.clone(),
+            session_id: SessionId::new("session_3"),
+            edge: DockEdge::Bottom,
+        });
+        f.apply(ZoomPane {
+            tab_id: second.clone(),
+            pane_id: Some(second_pane.clone()),
+        });
+        f.apply(MoveNode {
+            source_tab: first,
+            node: LayoutNodeId::Pane(added.clone()),
+            destination_tab: second,
+            target: second_pane,
+            edge: DockEdge::Left,
+        });
+        let destination = &f.snapshot.workspaces[0].tabs[1];
+        assert_eq!(destination.zoomed_pane, None);
+        assert_eq!(destination.focused_pane, added);
     }
 
     #[test]

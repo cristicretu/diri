@@ -21,6 +21,36 @@ fn wait_until(what: &str, mut predicate: impl FnMut() -> bool) {
     }
 }
 
+/// Waits for a fresh session's first output. Windows PowerShell's first
+/// launches on a hosted x64 runner are slow (a passing run spends ~25 s per
+/// test, and ~40% of runs timed out at 30 s waiting for the first line), so
+/// startup alone has a wider budget than the 30 s every later step gets. A timeout reports what the Holder had
+/// on screen and whether its child is still running, so a stuck pipeline is
+/// told apart from a slow interpreter.
+fn wait_for_first_output(what: &str, session: &Session, client: &HolderClient, needle: &str) {
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(120);
+    loop {
+        let screen = session.screen_lines().join("\n");
+        if screen.contains(needle) {
+            eprintln!("{what} after {:?}", started.elapsed());
+            return;
+        }
+        if Instant::now() >= deadline {
+            let stat = client.stat();
+            panic!(
+                "timed out waiting for {what} after {:?}; holder alive: {}; \
+                 (child pid, child alive, bytes the child wrote): {:?}; screen:\n{}",
+                started.elapsed(),
+                client.is_alive(),
+                stat.map(|stat| (stat.child_pid, stat.alive, stat.log_offset)),
+                screen.trim_end(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn engine() -> Arc<ManifestEngine> {
     Arc::new(
         ManifestEngine::load_dir(&diri_engine::detect::bundled_manifest_dir())
@@ -110,9 +140,7 @@ fn a_native_session_is_adopted_with_the_same_identity_screen_and_input() {
     let script = "Write-Output 'ready'; while ($null -ne ($line = [Console]::ReadLine())) { Write-Output ('seen:' + $line) }";
     let session = Session::spawn(spec(root.path(), &holder, script), Arc::clone(&engine)).unwrap();
     let cleanup = Cleanup::new(&holder);
-    wait_until("PowerShell ready", || {
-        session.screen_lines().join("\n").contains("ready")
-    });
+    wait_for_first_output("PowerShell ready", &session, &cleanup.client, "ready");
     session.write_input(b"before\r").unwrap();
     wait_until("input evaluated", || {
         session.screen_lines().join("\n").contains("seen:before")
@@ -154,9 +182,7 @@ fn holder_failure_kills_the_native_job_including_a_grandchild() {
     let script = "$child = Start-Process powershell.exe -ArgumentList '-NoLogo','-NoProfile','-Command','Start-Sleep -Seconds 120' -PassThru; Write-Output 'tree-ready'; Start-Sleep -Seconds 120";
     let session = Session::spawn(spec(root.path(), &holder, script), engine()).unwrap();
     let cleanup = Cleanup::new(&holder);
-    wait_until("child tree ready", || {
-        session.screen_lines().join("\n").contains("tree-ready")
-    });
+    wait_for_first_output("child tree ready", &session, &cleanup.client, "tree-ready");
     let leader = cleanup.client.stat().unwrap().child_pid;
     let mut identities = Vec::new();
     wait_until("live child and grandchild identities", || {
