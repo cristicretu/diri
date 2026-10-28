@@ -2679,6 +2679,14 @@ impl TerminalPane {
         if !applied {
             return;
         }
+        // A column change re-wrapped history under a reader; its view finds
+        // its place again from the daemon's rows.
+        if let Some(resident) = self.residents.get(&id)
+            && resident.element.scrollback_relocating()
+        {
+            let visible_rows = usize::from(resident.last_size.1.max(1));
+            self.pump_scrollback_fetch(&id, visible_rows);
+        }
         // Visibility/occlusion is GPUI's job (display-link stops when the
         // window is truly hidden). `is_window_active` is only OS focus, so
         // gating on it freezes a still-visible window on another monitor.
@@ -10995,6 +11003,62 @@ mod tests {
             cols: 8,
             content_seq: seq,
         }
+    }
+
+    fn blank_grid(cols: u16, rows: u16) -> GridUpdate {
+        GridUpdate {
+            cols,
+            rows,
+            cursor_col: 0,
+            cursor_row: 0,
+            cursor_visible: true,
+            is_full_snapshot: true,
+            changed_rows: (0..rows)
+                .map(|y| diri_proto::grid::ChangedRow::new(y, vec![GridCell::default(); cols.into()]))
+                .collect(),
+            cursor_style: Default::default(),
+        }
+    }
+
+    /// The new grid of a column change is what tells a reading view its rows
+    /// were re-wrapped; the pane has to start the fetches that find its place,
+    /// because no wheel event will.
+    #[gpui::test]
+    fn a_column_change_under_a_reader_fetches_its_place(cx: &mut TestAppContext) {
+        const ROWS: usize = 10;
+        let runtime = Arc::new(StoreRuntime::inert());
+        // Never driven: the fetch the pane starts stays in flight.
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let session = fixture_session();
+        {
+            let mut store = runtime.store.write().expect("session store lock poisoned");
+            store.upsert_session(session.clone());
+            store.select(session.id.clone());
+        }
+        let runtime_for_view = Arc::clone(&runtime);
+        let (pane, cx) = cx.add_window_view(move |window, cx| {
+            TerminalPane::new(runtime_for_view, tokio, window, cx)
+        });
+        pane.update_in(cx, |pane, window, cx| {
+            pane.apply_grid_updates(session.id.clone(), [blank_grid(8, ROWS as u16)], window, cx);
+            let resident = &pane.residents[&session.id];
+            resident.element.adopt_history_geometry(100, 110, 1, ROWS);
+            assert!(resident.element.set_view_offset(10, ROWS));
+            assert!(!resident.element.scrollback_relocating());
+
+            pane.apply_grid_updates(session.id.clone(), [blank_grid(6, ROWS as u16)], window, cx);
+            let element = &pane.residents[&session.id].element;
+            assert!(element.scrollback_relocating());
+            assert!(
+                element.begin_scrollback_fetch(ROWS).is_none(),
+                "the geometry probe is already in flight"
+            );
+        });
     }
 
     #[gpui::test]

@@ -163,6 +163,9 @@ impl TerminalDamageObserver {
         let live_start_row = viewport.live_start_row();
         let buffer = read_lock(&self.buffer);
         viewport.hold_reading_view(&buffer);
+        if buffer.cols != 0 && buffer.cols != update.cols {
+            viewport.note_width_change(&buffer, update.cols);
+        }
         let reading_held = viewport.is_reading();
         drop(viewport);
         let replaces_grid =
@@ -1444,6 +1447,13 @@ impl TerminalElement {
         px(mutex_lock(&self.shared.viewport)
             .scroll_position()
             .shift(f32::from(line_height), scale_factor))
+    }
+
+    /// True while a reading view is finding its place after a column change;
+    /// see [`ScrollbackViewport::note_width_change`].
+    #[must_use]
+    pub fn scrollback_relocating(&self) -> bool {
+        mutex_lock(&self.shared.viewport).relocating()
     }
 
     pub fn begin_scrollback_fetch(&self, visible_rows: usize) -> Option<ScrollbackRequest> {
