@@ -1916,6 +1916,17 @@ impl TerminalElement {
         })
     }
 
+    /// The live line under the grid cursor, from its OSC 133 marks: whether
+    /// a shell prompt is waiting there with nothing typed.
+    #[must_use]
+    pub fn prompt_line(&self) -> crate::command_marks::PromptLine {
+        let buffer = read_lock(&self.buffer);
+        let cursor = buffer.cursor;
+        crate::command_marks::prompt_line(usize::from(cursor.row), usize::from(cursor.col), |row| {
+            buffer.row(row)
+        })
+    }
+
     /// The shell prompt nearest the top of the window, above it or below it,
     /// read from the rows this view already holds: the live screen and any
     /// history fetched for reading. [`PromptSearch::Unknown`] means the
