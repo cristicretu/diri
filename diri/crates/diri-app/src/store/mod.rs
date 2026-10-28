@@ -1742,6 +1742,7 @@ impl SessionStore {
                 &self.prefs.terminal_theme,
                 self.prefs.interface_style(),
             )),
+            shell_command: self.prefs.terminal_shell_argv(),
         }
     }
 

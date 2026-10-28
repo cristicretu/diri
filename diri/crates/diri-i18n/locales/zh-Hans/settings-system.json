@@ -153,5 +153,12 @@
   "settings.resources.title": "资源",
   "settings.terminal.file_links_detail": "点击文件路径时用来打开的编辑器。",
   "settings.terminal.mouse": "鼠标与选择",
-  "settings.terminal.shell": "Shell"
+  "settings.terminal.shell": "Shell",
+  "settings.terminal.shell_command": "新终端命令",
+  "settings.terminal.shell_command_custom": "直接运行 {command}，不经过 shell。远程主机使用其自身的 shell。",
+  "settings.terminal.shell_command_edit": "编辑…",
+  "settings.terminal.shell_command_login": "你的登录 shell。远程主机始终使用其自身的 shell。",
+  "settings.terminal.shell_command_placeholder": "zsh -l、nix develop、tmux new -A -s main",
+  "settings.terminal.shell_command_reset": "使用登录 shell",
+  "settings.terminal.shell_command_save": "保存"
 }
