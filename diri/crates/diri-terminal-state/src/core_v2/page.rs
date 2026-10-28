@@ -349,25 +349,48 @@ impl TextLog {
         self.spans[row].1 += (self.bytes.len() - from) as u32;
     }
 
-    /// A character's token (see [`TextLog::char`]) for the character
-    /// whose UTF-8 starts `utf8` (which may run on past it), covering one
-    /// or two cells.
+    /// The write cursor: the end of the arena. Tokens written through it
+    /// join the arena at [`TextLog::commit`]; nothing else may touch the
+    /// arena in between.
+    #[inline(always)]
+    pub fn cursor(&mut self) -> *mut u8 {
+        let len = self.bytes.len();
+        // SAFETY: `len` is within the allocation.
+        unsafe { self.bytes.as_mut_ptr().add(len) }
+    }
+
+    /// Takes the bytes written through a cursor up to `end` into the arena.
     ///
     /// # Safety
-    /// [`TextLog::reserve_cells`] covered the cells written since.
+    /// `end` came from [`TextLog::cursor`] and the `put_*` writers, within
+    /// the reserved room, with every byte up to it written.
     #[inline(always)]
-    pub unsafe fn put_char(&mut self, cp: u64, utf8: &[u8]) {
-        debug_assert!(self.bytes.capacity() - self.bytes.len() >= 4);
-        let len = self.bytes.len();
-        let index = cp.wrapping_sub(CJK_BASE);
-        let (word, n) = if index < CJK_END - CJK_BASE {
-            (
-                CJK_LEADS[(index >> 8) as usize] as u32 | (index as u32 & 0xFF) << 8,
-                2,
-            )
-        } else if let Some(&word) = utf8.first_chunk::<4>() {
+    pub unsafe fn commit(&mut self, end: *mut u8) {
+        // SAFETY: as documented.
+        unsafe {
+            let len = end.offset_from(self.bytes.as_ptr()) as usize;
+            debug_assert!(len <= self.bytes.capacity());
+            self.bytes.set_len(len);
+        }
+    }
+
+    /// A character's token (see [`TextLog::char`]) for the character
+    /// whose UTF-8 starts `utf8` (which may run on past it), covering one
+    /// or two cells; returns the cursor past it. The cursor stays in a
+    /// register through a row's writes, so tokens do not wait on the
+    /// arena's length in memory.
+    ///
+    /// # Safety
+    /// `at` is a cursor with four bytes of room ([`TextLog::reserve_cells`]
+    /// covered the cells written since).
+    #[inline(always)]
+    pub unsafe fn put_char(at: *mut u8, cp: u64, utf8: &[u8]) -> *mut u8 {
+        // Without branches on the kind of character, which alternates
+        // unpredictably in mixed text: both tokens are computed and one
+        // is kept.
+        let (utf, utf_len) = if let Some(&word) = utf8.first_chunk::<4>() {
             // The bytes after the character are written past it and
-            // overwritten later (or left past the vector's end).
+            // overwritten later (or left past the arena's end).
             (u32::from_le_bytes(word), len_of(utf8[0]))
         } else {
             let n = len_of(utf8[0]);
@@ -377,51 +400,52 @@ impl TextLog {
             }
             (word, n)
         };
-        // SAFETY: four bytes of room (the caller's reservation); `n` of
-        // them join the vector.
+        let (word, n) = select_cjk(cp, utf, utf_len);
+        // SAFETY: four bytes of room; `n` of them are the token.
         unsafe {
-            (self.bytes.as_mut_ptr().add(len) as *mut u32).write_unaligned(word.to_le());
-            self.bytes.set_len(len + n);
+            (at as *mut u32).write_unaligned(word.to_le());
+            at.add(n)
         }
     }
 
-    /// Tokens of `cps`, two-column three-byte characters whose UTF-8 is
-    /// `utf8`.
+    /// Tokens of the first `n` of `cps`, two-column three-byte characters
+    /// whose UTF-8 is `utf8`, at cursor `ptr`; returns the cursor past them.
     ///
     /// # Safety
-    /// As [`TextLog::put_char`]: their `2 * cps.len()` cells are reserved.
+    /// As [`TextLog::put_char`]: their `2 * n` cells are reserved.
     #[inline(always)]
-    pub unsafe fn put_chars3(&mut self, cps: &[u32; 16], n: usize, utf8: &[u8]) {
+    pub unsafe fn put_chars3(ptr: *mut u8, cps: &[u32; 16], n: usize, utf8: &[u8]) -> *mut u8 {
         debug_assert!(n <= 16 && utf8.len() >= 3 * n);
-        let len = self.bytes.len();
-        debug_assert!(self.bytes.capacity() - len >= 8 * n);
-        // SAFETY: 8 * n bytes of room; at most 3 * n are written, or 32
-        // when n >= 4.
-        let ptr = unsafe { self.bytes.as_mut_ptr().add(len) };
+        // SAFETY: 8 * n + 32 bytes of room; at most 3 * n + 16 or 32 are
+        // written.
         #[cfg(target_arch = "aarch64")]
         if n >= 4
-            && let Some(()) = unsafe { cjk_codes16(cps, ptr) }
+            && let Some(()) = unsafe { cjk_codes16(cps, n, ptr) }
         {
-            // SAFETY: 2 * n of the 32 bytes written are tokens.
-            unsafe { self.bytes.set_len(len + 2 * n) };
-            return;
+            // 2 * n of the 32 bytes written are tokens.
+            return unsafe { ptr.add(2 * n) };
         }
+        // Mixed with other three-byte characters (CJK punctuation, kana).
+        #[cfg(target_arch = "aarch64")]
+        if utf8.len() >= 48 {
+            // SAFETY: 48 source bytes; room for 3 * n + 16 bytes (the
+            // reservation is 8 * n + 32).
+            let w = unsafe { mixed_codes16(cps, n, utf8.as_ptr(), ptr) };
+            // `w` token bytes were written.
+            return unsafe { ptr.add(w) };
+        }
+        // Four bytes stored per character, two or three kept.
         let mut w = 0;
         for (k, &cp) in cps[..n].iter().enumerate() {
-            let index = (cp as u64).wrapping_sub(CJK_BASE);
-            unsafe {
-                if index < CJK_END - CJK_BASE {
-                    ptr.add(w).write(CJK_LEADS[(index >> 8) as usize]);
-                    ptr.add(w + 1).write(index as u8);
-                    w += 2;
-                } else {
-                    std::ptr::copy_nonoverlapping(utf8.as_ptr().add(3 * k), ptr.add(w), 3);
-                    w += 3;
-                }
-            }
+            let src = &utf8[3 * k..3 * k + 3];
+            let utf = u16::from_le_bytes([src[0], src[1]]) as u32 | (src[2] as u32) << 16;
+            let (word, step) = select_cjk(cp as u64, utf, 3);
+            // SAFETY: at most 3 * k + 4 <= 8 * n bytes past `ptr`.
+            unsafe { (ptr.add(w) as *mut u32).write_unaligned(word.to_le()) };
+            w += step;
         }
-        // SAFETY: `w` bytes were written within the reserved capacity.
-        unsafe { self.bytes.set_len(len + w) };
+        // `w` token bytes were written.
+        unsafe { ptr.add(w) }
     }
 
     /// A zero-width mark (its UTF-8) on the cell before; keeps room for
@@ -448,21 +472,33 @@ impl TextLog {
     }
 }
 
+/// A character's token as a little-endian word and its length: the
+/// two-byte CJK code from U+4E00 on, otherwise `utf` (its UTF-8, `len`
+/// bytes), chosen without a branch.
+#[inline(always)]
+fn select_cjk(cp: u64, utf: u32, len: usize) -> (u32, usize) {
+    let index = cp.wrapping_sub(CJK_BASE);
+    let cjk = index < CJK_END - CJK_BASE;
+    let lead = CJK_LEADS[((index >> 8) as usize).min(CJK_LEADS.len() - 1)] as u32;
+    let code = lead | (index as u32 & 0xFF) << 8;
+    if cjk { (code, 2) } else { (utf, len) }
+}
+
 /// The length of the UTF-8 sequence led by valid lead byte `b0`.
 #[inline(always)]
 fn len_of(b0: u8) -> usize {
     1 + (b0 >= 0xC0) as usize + (b0 >= 0xE0) as usize + (b0 >= 0xF0) as usize
 }
 
-/// Writes the two-byte codes of sixteen characters, all of them from
-/// U+4E00 on (see [`CJK_LEADS`]), as 32 bytes at `out`; `None` (writing
-/// nothing) when any is outside that range.
+/// Writes the two-byte codes of sixteen characters as 32 bytes at `out`
+/// when the first `n` are all from U+4E00 on (see [`CJK_LEADS`]); `None`
+/// (writing nothing) otherwise. Only the first `2 * n` bytes are tokens.
 ///
 /// # Safety
 /// `out` has room for 32 bytes.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn cjk_codes16(cps: &[u32; 16], out: *mut u8) -> Option<()> {
+unsafe fn cjk_codes16(cps: &[u32; 16], n: usize, out: *mut u8) -> Option<()> {
     use std::arch::aarch64::*;
     // SAFETY: NEON is baseline on aarch64; the loads read `cps` and the
     // lead table, the store writes the caller's 32 bytes.
@@ -476,9 +512,20 @@ unsafe fn cjk_codes16(cps: &[u32; 16], out: *mut u8) -> Option<()> {
             vsubq_u32(vld1q_u32(p.add(8)), base),
             vsubq_u32(vld1q_u32(p.add(12)), base),
         );
+        // Lanes from `n` on hold whatever the run stopped at: they pass.
+        let lane = |at: u32| {
+            let ids: [u32; 4] = [at, at + 1, at + 2, at + 3];
+            vcgeq_u32(vld1q_u32(ids.as_ptr()), vdupq_n_u32(n as u32))
+        };
         let inside = vandq_u32(
-            vandq_u32(vcltq_u32(a, span), vcltq_u32(b, span)),
-            vandq_u32(vcltq_u32(c, span), vcltq_u32(d, span)),
+            vandq_u32(
+                vorrq_u32(vcltq_u32(a, span), lane(0)),
+                vorrq_u32(vcltq_u32(b, span), lane(4)),
+            ),
+            vandq_u32(
+                vorrq_u32(vcltq_u32(c, span), lane(8)),
+                vorrq_u32(vcltq_u32(d, span), lane(12)),
+            ),
         );
         if vminvq_u32(inside) == 0 {
             return None;
@@ -509,6 +556,118 @@ unsafe fn cjk_codes16(cps: &[u32; 16], out: *mut u8) -> Option<()> {
         Some(())
     }
 }
+
+/// Tokens of the first `n` of sixteen two-column three-byte characters
+/// (`cps`, whose UTF-8 is the 48 bytes at `utf8`): the two-byte code from
+/// U+4E00 on, the UTF-8 otherwise. Returns the bytes written at `out`
+/// (beyond them, up to 16 more bytes are scratch).
+///
+/// Each lane makes three bytes (code and a byte to drop, or UTF-8); four
+/// lanes at a time are compacted with a table shuffle chosen by which of
+/// them are CJK.
+///
+/// # Safety
+/// `utf8` holds 48 bytes; `out` has room for `3 * n + 16` bytes.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn mixed_codes16(cps: &[u32; 16], n: usize, utf8: *const u8, out: *mut u8) -> usize {
+    use std::arch::aarch64::*;
+    debug_assert!(n <= 16);
+    // SAFETY: NEON is baseline on aarch64; loads stay in `cps`, `utf8` and
+    // the tables, stores in `lanes` and the caller's room.
+    unsafe {
+        let src = vld3q_u8(utf8);
+        let base = vdupq_n_u32(CJK_BASE as u32);
+        let span = vdupq_n_u32((CJK_END - CJK_BASE) as u32);
+        let p = cps.as_ptr();
+        let (a, b, c, d) = (
+            vsubq_u32(vld1q_u32(p), base),
+            vsubq_u32(vld1q_u32(p.add(4)), base),
+            vsubq_u32(vld1q_u32(p.add(8)), base),
+            vsubq_u32(vld1q_u32(p.add(12)), base),
+        );
+        let in16 = |x: uint32x4_t, y: uint32x4_t| {
+            vcombine_u16(vmovn_u32(vcltq_u32(x, span)), vmovn_u32(vcltq_u32(y, span)))
+        };
+        let cjk = vcombine_u8(vmovn_u16(in16(a, b)), vmovn_u16(in16(c, d)));
+        let narrow = |x: uint32x4_t, y: uint32x4_t| vcombine_u16(vmovn_u32(x), vmovn_u32(y));
+        let (lo16, hi16) = (narrow(a, b), narrow(c, d));
+        let low = vcombine_u8(vmovn_u16(lo16), vmovn_u16(hi16));
+        // Out-of-range lanes index past the tables (zero); `cjk` drops them.
+        let high = vcombine_u8(vshrn_n_u16::<8>(lo16), vshrn_n_u16::<8>(hi16));
+        let t = CJK_LEADS_PADDED.as_ptr();
+        let first = uint8x16x4_t(
+            vld1q_u8(t),
+            vld1q_u8(t.add(16)),
+            vld1q_u8(t.add(32)),
+            vld1q_u8(t.add(48)),
+        );
+        let second = uint8x16x3_t(
+            vld1q_u8(t.add(64)),
+            vld1q_u8(t.add(80)),
+            vld1q_u8(t.add(96)),
+        );
+        let lead = vorrq_u8(
+            vqtbl4q_u8(first, high),
+            vqtbl3q_u8(second, vsubq_u8(high, vdupq_n_u8(64))),
+        );
+        let mut lanes = [0u8; 64];
+        vst3q_u8(
+            lanes.as_mut_ptr(),
+            uint8x16x3_t(vbslq_u8(cjk, lead, src.0), vbslq_u8(cjk, low, src.1), src.2),
+        );
+        // One bit per lane: CJK.
+        let bits = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(
+            cjk,
+        ))));
+        let mut w = 0;
+        let mut g = 0;
+        while 4 * g < n {
+            let mask = (0..4).fold(0usize, |m, j| {
+                m | (((bits >> (16 * g + 4 * j)) & 1) as usize) << j
+            });
+            let (shuffle, kept) = &COMPACT4[mask];
+            let taken = (n - 4 * g).min(4);
+            let group = vld1q_u8(lanes.as_ptr().add(12 * g));
+            vst1q_u8(out.add(w), vqtbl1q_u8(group, vld1q_u8(shuffle.as_ptr())));
+            // Only the lanes below `n` count.
+            w += if taken == 4 {
+                *kept as usize
+            } else {
+                let partial = mask & ((1 << taken) - 1);
+                3 * taken - partial.count_ones() as usize
+            };
+            g += 1;
+        }
+        w
+    }
+}
+
+/// For each 4-bit mask of CJK lanes among four three-byte lane groups:
+/// the shuffle that keeps bytes 0 and 1 of every lane and byte 2 of the
+/// others, in order, and how many bytes it keeps.
+#[cfg(target_arch = "aarch64")]
+const COMPACT4: [([u8; 16], u8); 16] = {
+    let mut t = [([0xFFu8; 16], 0u8); 16];
+    let mut mask = 0;
+    while mask < 16 {
+        let mut k = 0;
+        let mut j = 0;
+        while j < 4 {
+            t[mask].0[k] = 3 * j as u8;
+            t[mask].0[k + 1] = 3 * j as u8 + 1;
+            k += 2;
+            if mask & (1 << j) == 0 {
+                t[mask].0[k] = 3 * j as u8 + 2;
+                k += 1;
+            }
+            j += 1;
+        }
+        t[mask].1 = k as u8;
+        mask += 1;
+    }
+    t
+};
 
 /// [`CJK_LEADS`] padded to 112 bytes for table lookups.
 #[cfg(target_arch = "aarch64")]
