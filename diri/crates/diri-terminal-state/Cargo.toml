@@ -10,6 +10,9 @@ license.workspace = true
 # retained only for storage differential tests and allocation comparisons.
 default = ["compact-history"]
 compact-history = ["alacritty_terminal/compact-history"]
+# Prototype of the page-based terminal core (docs/core-v2.md). Off by
+# default and not used by the Engine or the Remote Helper.
+core-v2 = []
 
 [dependencies]
 alacritty_terminal.workspace = true
@@ -24,6 +27,8 @@ diri-pty.workspace = true
 diri-platform.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# SHA-256 for the core v2 bench's golden digests; already in the lockfile.
+sha2.workspace = true
 
 [[bench]]
 name = "terminal_throughput"
@@ -52,3 +57,7 @@ harness = false
 [[bench]]
 name = "history_depth"
 harness = false
+
+[[example]]
+name = "core_v2_bench"
+required-features = ["core-v2"]

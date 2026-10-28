@@ -392,3 +392,10 @@ OSC 4/10/11 changes no cell, so without it the host's change detection saw no
 change and never republished the screen. `reset_state` (RIS, `ESC c`) also
 clears every color a program set, as xterm and libghostty do; upstream kept
 them across `reset`. No wire, checkpoint or protocol change.
+
+## Public grapheme module
+
+`term::grapheme` (`Info`, `Class`, `Cluster`, `breaks`, `may_join`, …) is
+public (and `#[doc(hidden)]`) so the core v2 prototype in
+`diri-terminal-state` measures widths and clusters with the same tables
+instead of a copy. Visibility only; no behavior change.

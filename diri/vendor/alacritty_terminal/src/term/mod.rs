@@ -28,7 +28,9 @@ use crate::vte::ansi::{
 
 pub mod cell;
 pub mod color;
-mod grapheme;
+/// DIRI PATCH: public for the core-v2 prototype in `diri-terminal-state`.
+#[doc(hidden)]
+pub mod grapheme;
 mod grapheme_table;
 pub mod keyboard;
 pub mod search;
