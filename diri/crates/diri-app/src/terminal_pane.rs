@@ -1403,8 +1403,7 @@ impl TerminalPane {
                     .store
                     .read()
                     .expect("session store lock poisoned");
-                let prefs = store.preferences();
-                crate::fonts::terminal_font(&prefs.terminal_font_family, prefs.terminal_ligatures)
+                crate::fonts::terminal_font_from(store.preferences())
             };
             let generation = self.next_attachment_generation;
             self.next_attachment_generation = self.next_attachment_generation.wrapping_add(1);
@@ -2958,6 +2957,11 @@ impl TerminalPane {
                     .filter(|plan| !plan.is_empty())
                     .map(|plan| plan.headline().into()),
                 importing_herdr: store.herdr().importing,
+                terminal_setup: store
+                    .terminal_setup()
+                    .plans()
+                    .first()
+                    .map(|plan| plan.source.name()),
             }
         };
         let canonical = Arc::clone(&self.runtime.store);
@@ -4423,17 +4427,22 @@ impl TerminalPane {
         }
     }
 
-    /// Starts the next queued scrollback fetch for `id`, if the viewport wants
-    /// one and none is in flight. Called from wheel events AND from fetch
+    /// Starts the queued scrollback fetches for `id` the viewport wants, up to
+    /// its in-flight limit. Called from wheel events AND from fetch
     /// completion: a fast wheel burst queues the next window while a fetch is
     /// in flight, and nothing else would ever start it — the stranded queue
     /// painted as a transient blank region in deep scrollback.
     fn pump_scrollback_fetch(&mut self, id: &SessionId, visible_rows: usize) {
+        // Up to `MAX_FETCHES_IN_FLIGHT` windows go out at once.
+        while self.start_scrollback_fetch(id, visible_rows) {}
+    }
+
+    fn start_scrollback_fetch(&mut self, id: &SessionId, visible_rows: usize) -> bool {
         let Some(resident) = self.residents.get_mut(id) else {
-            return;
+            return false;
         };
         let Some(request) = resident.element.begin_scrollback_fetch(visible_rows) else {
-            return;
+            return false;
         };
         let generation = resident.attachment_generation;
         let client = Arc::clone(self.runtime.client());
@@ -4457,6 +4466,7 @@ impl TerminalPane {
                 }
             }
         });
+        true
     }
 
     /// Learns how much history sits above a live view whose scroller knob is
@@ -5196,6 +5206,9 @@ impl TerminalPane {
             .font(typeface.font.clone())
             .font_size(px(typeface.size))
             .line_height_scale(typeface.line_height)
+            .cell_width_scale(typeface.cell_width)
+            .faces(typeface.faces)
+            .glyph_raster(typeface.raster)
             .focus_handle(self.focus.clone())
             .reduce_motion(cx.reduce_motion())
             .cursor_preferences(cursor_preferences)
@@ -6907,23 +6920,27 @@ struct TerminalType {
     font: gpui::Font,
     size: f32,
     line_height: f32,
+    cell_width: f32,
+    faces: diri_term::glyphs::TerminalFaces,
+    raster: gpui::GlyphRasterStyle,
 }
 
 impl TerminalType {
     fn from_prefs(prefs: &crate::store::Prefs) -> Self {
         Self {
-            font: crate::fonts::terminal_font(
-                &prefs.terminal_font_family,
-                prefs.terminal_ligatures,
-            ),
+            font: crate::fonts::terminal_font_from(prefs),
             size: prefs.terminal_font_size,
             line_height: prefs.terminal_line_height,
+            cell_width: f32::from(prefs.terminal_cell_width) / 100.0,
+            faces: crate::fonts::terminal_faces(prefs),
+            raster: crate::fonts::glyph_raster(prefs),
         }
     }
 
     fn metrics(&self, window: &Window) -> CellMetrics {
         CellMetrics::measure(window.text_system(), &self.font, px(self.size))
             .with_line_height_scale(self.line_height)
+            .with_cell_width_scale(self.cell_width)
     }
 }
 

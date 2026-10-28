@@ -9,16 +9,22 @@
 //!
 //! `only` runs a single configuration, so whole-process counters such as
 //! `/usr/bin/time -l` instructions retired describe it: `4k`, `16k`, `64k`,
-//! `whole`, `engine4k` or `engine64k`.
+//! `whole`, `engine1k`, `engine4k`, `engine64k` or `engine512k`. The `engine`
+//! configurations set the screen up as a local Engine session does: a live
+//! Holder frame is about a kilobyte, and a pump that is behind reads about
+//! 512 KiB of log at a time.
 
 use diri_engine::screen::HeadlessScreen;
 use std::time::Instant;
 
 fn bench(label: &str, data: &[u8], chunk: usize, cols: usize, rows: usize, engine: bool) -> f64 {
-    // The local Engine also scans for OSC notifications; the Remote Helper
-    // does not.
+    // The local Engine also scans for OSC notifications and keeps image
+    // anchors; the Remote Helper does neither.
     let mut screen = if engine {
-        HeadlessScreen::new(cols, rows).with_notifications()
+        HeadlessScreen::new(cols, rows)
+            .with_notifications()
+            .with_inline_images()
+            .keeping_spare_rows_until_idle()
     } else {
         HeadlessScreen::new(cols, rows)
     };
@@ -70,6 +76,8 @@ fn main() {
             "whole" => (data.len(), false),
             "engine4k" => (4 << 10, true),
             "engine64k" => (64 << 10, true),
+            "engine1k" => (1 << 10, true),
+            "engine512k" => (512 << 10, true),
             other => panic!("unknown configuration {other}"),
         };
         bench(&only, &data, chunk, cols, rows, engine);

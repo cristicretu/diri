@@ -296,3 +296,38 @@ and `working_mark_step_cost` in `crates/diri-app/src/root.rs`. Files:
 `src/svg_renderer.rs` (`load_asset`), `src/app.rs`. Re-apply on a GPUI bump by
 re-adding the window field, the post-swap `collect` in `Window::draw`, the
 idle branch of the request-frame callback, and `paint_animated_svg`.
+
+## Glyph raster style, font faces and test scale factor
+
+Terminal font controls (Settings › Appearance › Font) need three things GPUI
+did not expose.
+
+**Glyph raster style.** `GlyphRasterStyle { smoothing, stroke }` and
+`Window::with_glyph_raster_style` / `Window::replace_glyph_raster_style` set
+how glyphs painted in that scope rasterize. `paint_glyph` reads it: with
+`smoothing` off the colour-derived dilation is 0, and `stroke` (quarters of a
+device pixel, at most `GlyphRasterStyle::MAX_STROKE` = 4) is copied into the
+new `RenderGlyphParams::stroke` field. The field is part of the params' hash
+and equality, so glyph tiles of different styles never share an atlas entry,
+and text outside the scope keeps the default (smoothing on, no stroke), which
+is byte-for-byte upstream's path. The macOS rasterizer
+(`vendor/gpui_macos/src/text_system.rs`) draws the normal fill and then, when
+`stroke > 0`, a second `CGTextStroke` pass with round joins, and widens the
+raster bounds by one more device pixel. Other platforms ignore `stroke`.
+
+**Font faces.** `TextSystem::font_faces(&Font)` returns the weight and style
+of every face `font`'s family resolves to (the same candidates `font_id`
+matches against; default empty on platforms that don't implement
+`PlatformTextSystem::font_faces`). The macOS `font_id` also snaps a requested
+weight within 1.0 of a face's weight onto that face, so a weight stored
+rounded (a face at 529.97 saved as 530) still selects it rather than the next
+heavier face CSS matching would choose.
+
+**Test scale factor.** `set_test_window_scale_factor(f32)` (test-support)
+makes test and headless windows report that scale factor instead of the fixed
+2.0, for 1x (non-Retina) headless renders.
+
+Files: `src/text_system.rs`, `src/window.rs`, `src/platform.rs`,
+`src/platform/test.rs`, `src/platform/test/window.rs` (all marked
+`DIRI PATCH (glyph raster style)`, `(font faces)` or `(test scale factor)`).
+Tests: `crates/diri-term/tests/font_controls.rs`.

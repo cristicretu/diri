@@ -1459,7 +1459,28 @@ extern "C" fn menu_will_open(this: &mut Object, _: Sel, _: id) {
     }
 }
 
+// DIRI PATCH (on-demand Dock menu): AppKit asks for the Dock menu each time
+// the person opens it. A provider builds it then, from current state, so the
+// app keeps no menu up to date while nobody looks at it.
+thread_local! {
+    static DOCK_MENU_PROVIDER: std::cell::RefCell<Option<Box<dyn Fn() -> *mut std::ffi::c_void>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// DIRI PATCH (on-demand Dock menu): answer `applicationDockMenu:` by calling
+/// `provider` on the main thread, which returns an `NSMenu *` the caller keeps
+/// alive (or null to fall back to the menu from `set_dock_menu`). The provider
+/// must not call this function.
+pub fn set_dock_menu_provider(provider: Option<Box<dyn Fn() -> *mut std::ffi::c_void>>) {
+    DOCK_MENU_PROVIDER.with(|slot| *slot.borrow_mut() = provider);
+}
+
 extern "C" fn handle_dock_menu(this: &mut Object, _: Sel, _: id) -> id {
+    let provided =
+        DOCK_MENU_PROVIDER.with(|slot| slot.borrow().as_ref().map(|provider| provider()));
+    if let Some(menu) = provided.filter(|menu| !menu.is_null()) {
+        return menu as id;
+    }
     unsafe {
         let platform = get_mac_platform(this);
         let state = platform.0.lock();
