@@ -513,6 +513,12 @@ pub fn hex_string(color: Rgba) -> String {
     )
 }
 
+/// xterm's sixteen colors, which every reader here fills unset slots with.
+#[must_use]
+pub fn xterm_ansi() -> [Rgba; 16] {
+    DEFAULT_ANSI.map(hex)
+}
+
 /// xterm's palette, for the slots a file leaves out.
 const DEFAULT_ANSI: [u32; 16] = [
     0x000000, 0xcd0000, 0x00cd00, 0xcdcd00, 0x0000ee, 0xcd00cd, 0x00cdcd, 0xe5e5e5, 0x7f7f7f,

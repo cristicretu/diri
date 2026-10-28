@@ -86,12 +86,12 @@ bitflags! {
         const REPORT_ALTERNATE_KEYS   = 1 << 20;
         const REPORT_ALL_KEYS_AS_ESC  = 1 << 21;
         const REPORT_ASSOCIATED_TEXT  = 1 << 22;
-        /// DECSET 2027: grapheme cluster widths by the clustering rule.
-        const GRAPHEME_CLUSTERING     = 1 << 25;
         /// DIRI PATCH: DECSET 2031, color-scheme change reports.
         const COLOR_SCHEME_UPDATES    = 1 << 23;
         /// DIRI PATCH: DECSET 2048, in-band resize reports.
         const IN_BAND_RESIZE          = 1 << 24;
+        /// DECSET 2027: grapheme cluster widths by the clustering rule.
+        const GRAPHEME_CLUSTERING     = 1 << 25;
         const MOUSE_MODE              = Self::MOUSE_REPORT_CLICK.bits() | Self::MOUSE_MOTION.bits() | Self::MOUSE_DRAG.bits();
         const KITTY_KEYBOARD_PROTOCOL = Self::DISAMBIGUATE_ESC_CODES.bits()
                                       | Self::REPORT_EVENT_TYPES.bits()
