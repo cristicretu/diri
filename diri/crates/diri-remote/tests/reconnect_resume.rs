@@ -889,6 +889,7 @@ fn resume_outside_the_window_falls_back_to_a_full_snapshot() {
                 is_full_snapshot: true,
                 changed_rows: Vec::new(),
                 cursor_style: Default::default(),
+                history: None,
             },
             false,
             false,

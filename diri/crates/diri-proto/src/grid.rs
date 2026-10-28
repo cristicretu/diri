@@ -410,6 +410,50 @@ impl ChangedRow {
     }
 }
 
+/// Where the primary screen's history stood when a grid was published
+/// (`grid-history-v1`).
+///
+/// Both counts are absolute, so a client compares any two publications it
+/// applied, across coalesced, discarded or reseeded diffs:
+/// `(origin + rows) - (origin' + rows')` lines scrolled into history between
+/// them, and `origin - origin'` of the oldest left it. History row `i` of a
+/// `session.read_scrollback_cells` reply made at the same moment is
+/// `origin + i` of everything the terminal has held, so `rows` is that
+/// reply's `liveStartRow`.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct GridHistory {
+    /// Rows that have left history from its oldest end (evicted or cleared).
+    pub origin: u64,
+    /// Rows history holds: the absolute row the live grid starts at.
+    pub rows: u64,
+}
+
+impl GridHistory {
+    /// Every row this terminal has pushed into history.
+    #[must_use]
+    pub const fn pushed(self) -> u64 {
+        self.origin.saturating_add(self.rows)
+    }
+
+    /// Lines that scrolled into history after `earlier`, and how many rows
+    /// left it from its oldest end, when this position can follow `earlier`
+    /// on the same screen. `None` when either count went backwards: a new
+    /// terminal (Engine restart, Holder replacement) or a reflow.
+    #[must_use]
+    pub const fn since(self, earlier: Self) -> Option<(u64, u64)> {
+        if self.origin < earlier.origin || self.pushed() < earlier.pushed() {
+            return None;
+        }
+        Some((
+            self.pushed() - earlier.pushed(),
+            self.origin - earlier.origin,
+        ))
+    }
+}
+
+/// Grid flag bit 6: a [`GridHistory`] follows the changed rows.
+const HISTORY_FLAG: u8 = 1 << 6;
+
 /// Grid geometry, cursor state, and either a full snapshot or changed rows.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GridUpdate {
@@ -422,6 +466,10 @@ pub struct GridUpdate {
     pub changed_rows: Vec<ChangedRow>,
     /// DECSCUSR shape and blink; see [`CursorStyle`].
     pub cursor_style: CursorStyle,
+    /// The primary screen's history position, for a `grid-history-v1` peer.
+    /// `None` on the alternate screen, which has no history, and from a
+    /// publisher or for a peer without it.
+    pub history: Option<GridHistory>,
 }
 
 impl GridUpdate {
@@ -437,8 +485,10 @@ impl GridUpdate {
     }
 
     /// The update as a peer without `terminal-styles-v1` sees it: no
-    /// decoration spans and the default cursor.
+    /// decoration spans and the default cursor. A legacy peer never has
+    /// `grid-history-v1` either.
     pub fn strip_styles(&mut self) {
+        self.history = None;
         self.cursor_style = CursorStyle::default();
         for row in &mut self.changed_rows {
             row.metadata.styles.clear();
@@ -448,7 +498,13 @@ impl GridUpdate {
     /// The exact bytes a pre-`terminal-styles-v1` Engine produced for this
     /// screen. Equivalent to `strip_styles` then `encode`, without a copy.
     pub fn encode_without_styles(&self) -> Result<Vec<u8>, GridCodecError> {
-        self.encode_with(false)
+        self.encode_with(false, false)
+    }
+
+    /// The styled form for a peer without `grid-history-v1`: the exact bytes
+    /// [`Self::encode`] produced before history positions existed.
+    pub fn encode_without_history(&self) -> Result<Vec<u8>, GridCodecError> {
+        self.encode_with(true, false)
     }
     /// Folds a newer contiguous update into this one while preserving the
     /// exact final grid. The newest row wins; a new snapshot or geometry
@@ -463,6 +519,8 @@ impl GridUpdate {
         self.cursor_row = newer.cursor_row;
         self.cursor_visible = newer.cursor_visible;
         self.cursor_style = newer.cursor_style;
+        // Absolute, so the newest position describes the folded update.
+        self.history = newer.history;
         for row in newer.changed_rows {
             // Decoding intentionally accepts duplicate row ids. Sequential
             // application makes the last one authoritative, so remove every
@@ -475,12 +533,12 @@ impl GridUpdate {
         self.changed_rows.sort_by_key(|row| row.y);
     }
 
-    /// The full form, `terminal-styles-v1` included.
+    /// The full form, `terminal-styles-v1` and `grid-history-v1` included.
     pub fn encode(&self) -> Result<Vec<u8>, GridCodecError> {
-        self.encode_with(true)
+        self.encode_with(true, true)
     }
 
-    fn encode_with(&self, styles: bool) -> Result<Vec<u8>, GridCodecError> {
+    fn encode_with(&self, styles: bool, history: bool) -> Result<Vec<u8>, GridCodecError> {
         let row_count = u16::try_from(self.changed_rows.len())
             .map_err(|_| GridCodecError::TooManyRows(self.changed_rows.len()))?;
         let mut encoded = Vec::new();
@@ -502,11 +560,20 @@ impl GridUpdate {
         if styles {
             flags |= self.cursor_style.flag_bits();
         }
+        let position = self.history.filter(|_| history);
+        if position.is_some() {
+            flags |= HISTORY_FLAG;
+        }
         encoded.push(flags);
         put_u16(&mut encoded, row_count);
         for row in &self.changed_rows {
             put_u16(&mut encoded, row.y);
             GridRowCodec::append_row(&row.cells, &mut encoded)?;
+        }
+        // Before the annotation block, whose length must end the payload.
+        if let Some(position) = position {
+            put_varint(&mut encoded, position.origin);
+            put_varint(&mut encoded, position.rows);
         }
         if has_metadata {
             if self
@@ -567,6 +634,14 @@ impl GridUpdate {
             let cells = GridRowCodec::read_row_from_cursor(&mut cursor)?;
             changed_rows.push(ChangedRow::new(y, cells));
         }
+        let history = if flags & HISTORY_FLAG != 0 {
+            Some(GridHistory {
+                origin: cursor.varint()?,
+                rows: cursor.varint()?,
+            })
+        } else {
+            None
+        };
         if flags & 4 != 0 {
             if cursor.u8()? != 1 {
                 return Err(GridCodecError::InvalidMetadata);
@@ -601,6 +676,7 @@ impl GridUpdate {
             is_full_snapshot: flags & 2 != 0,
             changed_rows,
             cursor_style: CursorStyle::from_flag_bits(flags & CursorStyle::MASK),
+            history,
         })
     }
 
@@ -775,6 +851,18 @@ impl<'a> Cursor<'a> {
         Self { payload, offset }
     }
 
+    fn varint(&mut self) -> Result<u64, GridCodecError> {
+        let mut value = 0_u64;
+        for shift in (0..64).step_by(7) {
+            let byte = self.u8()?;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+        Err(GridCodecError::InvalidMetadata)
+    }
+
     fn u8(&mut self) -> Result<u8, GridCodecError> {
         self.take::<1>().map(|bytes| bytes[0])
     }
@@ -802,6 +890,15 @@ impl<'a> Cursor<'a> {
         self.offset += N;
         Ok(bytes)
     }
+}
+
+/// LEB128: one byte below 128, at most ten for a `u64`.
+fn put_varint(encoded: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        encoded.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    encoded.push(value as u8);
 }
 
 fn put_u16(encoded: &mut Vec<u8>, value: u16) {
@@ -895,6 +992,7 @@ mod tests {
                 ],
             )],
             cursor_style: Default::default(),
+            history: None,
         };
         let expected = vec![
             0, 3, 0, 1, 0, 2, 0, 0, 3, 0, 1, // header
@@ -922,6 +1020,7 @@ mod tests {
                 ChangedRow::new(1, blank.clone()),
             ],
             cursor_style: Default::default(),
+            history: None,
         };
         let mut row_zero = blank.clone();
         row_zero[0].scalar = u32::from('a');
@@ -934,6 +1033,7 @@ mod tests {
             is_full_snapshot: false,
             changed_rows: vec![ChangedRow::new(0, row_zero)],
             cursor_style: Default::default(),
+            history: None,
         };
         let mut row_one = blank;
         row_one[0].scalar = u32::from('b');
@@ -946,6 +1046,7 @@ mod tests {
             is_full_snapshot: false,
             changed_rows: vec![ChangedRow::new(1, row_one)],
             cursor_style: Default::default(),
+            history: None,
         };
 
         let mut sequential = Vec::new();
@@ -1011,6 +1112,7 @@ mod tests {
                 is_full_snapshot: random.bool(),
                 changed_rows,
                 cursor_style: Default::default(),
+                history: None,
             };
             let encoded = update.encode().unwrap();
             assert_eq!(GridUpdate::decode(&encoded).unwrap(), update, "case {case}");
@@ -1039,6 +1141,7 @@ mod tests {
                 ChangedRow::new(2, vec![red]),
             ],
             cursor_style: Default::default(),
+            history: None,
         };
         let mut buffer = vec![red; 100];
         full.apply(&mut buffer);
@@ -1080,6 +1183,7 @@ mod tests {
             is_full_snapshot: true,
             changed_rows: vec![ChangedRow::new(0, vec![GridCell::BLANK])],
             cursor_style: Default::default(),
+            history: None,
         }
         .encode()
         .unwrap();
@@ -1175,8 +1279,147 @@ mod annotation_tests {
             is_full_snapshot: true,
             changed_rows: vec![row],
             cursor_style: Default::default(),
+            history: None,
         }
     }
+    #[test]
+    fn history_positions_round_trip_and_cost_a_few_bytes() {
+        for metadata in [false, true] {
+            let mut grid = annotated();
+            if !metadata {
+                grid = grid.without_annotations();
+            }
+            let plain = grid.encode().unwrap();
+            for (position, extra) in [
+                (GridHistory { origin: 0, rows: 0 }, 2),
+                (
+                    GridHistory {
+                        origin: 0,
+                        rows: 9_976,
+                    },
+                    3,
+                ),
+                (
+                    GridHistory {
+                        origin: 3_000_000,
+                        rows: 10_000,
+                    },
+                    6,
+                ),
+                (
+                    GridHistory {
+                        origin: u64::MAX - 1,
+                        rows: u64::MAX,
+                    },
+                    20,
+                ),
+            ] {
+                grid.history = Some(position);
+                let bytes = grid.encode().unwrap();
+                assert_eq!(bytes.len(), plain.len() + extra, "{position:?}");
+                assert_ne!(bytes[8] & HISTORY_FLAG, 0);
+                assert_eq!(GridUpdate::decode(&bytes).unwrap(), grid);
+                // A peer without grid-history-v1 gets exactly what it got
+                // before: no flag, no bytes, the same styled form.
+                assert_eq!(grid.encode_without_history().unwrap(), plain);
+                assert_eq!(bytes[8] & !HISTORY_FLAG, plain[8]);
+                // And the legacy form never carries it.
+                let legacy = GridUpdate::decode(&grid.encode_without_styles().unwrap()).unwrap();
+                assert_eq!(legacy.history, None);
+                // Without styles to drop, legacy and styled are one form,
+                // which lets the Engine encode a single stripped copy.
+                assert!(!grid.has_style_extensions());
+                assert_eq!(grid.encode_without_styles().unwrap(), plain);
+            }
+        }
+    }
+
+    #[test]
+    fn a_truncated_history_position_fails_to_decode() {
+        let mut grid = annotated().without_annotations();
+        grid.history = Some(GridHistory {
+            origin: 1 << 40,
+            rows: 300,
+        });
+        let bytes = grid.encode().unwrap();
+        for cut in 1..=7 {
+            assert!(
+                GridUpdate::decode(&bytes[..bytes.len() - cut]).is_err(),
+                "{cut}"
+            );
+        }
+        // Eleven continuation bytes is no u64.
+        let mut overlong = grid.encode_without_history().unwrap();
+        overlong[8] |= HISTORY_FLAG;
+        overlong.extend_from_slice(&[0xff; 11]);
+        assert!(GridUpdate::decode(&overlong).is_err());
+    }
+
+    #[test]
+    fn history_positions_measure_what_scrolled_and_what_left() {
+        let before = GridHistory {
+            origin: 5,
+            rows: 100,
+        };
+        assert_eq!(
+            GridHistory {
+                origin: 5,
+                rows: 103
+            }
+            .since(before),
+            Some((3, 0))
+        );
+        // At the row limit, three new lines recycle the three oldest.
+        assert_eq!(
+            GridHistory {
+                origin: 8,
+                rows: 100
+            }
+            .since(before),
+            Some((3, 3))
+        );
+        // A clear: nothing scrolled, all of it left.
+        assert_eq!(
+            GridHistory {
+                origin: 105,
+                rows: 0
+            }
+            .since(before),
+            Some((0, 100))
+        );
+        // A new terminal or a reflow does not follow.
+        assert_eq!(
+            GridHistory {
+                origin: 0,
+                rows: 200
+            }
+            .since(before),
+            None
+        );
+        assert_eq!(
+            GridHistory {
+                origin: 5,
+                rows: 90
+            }
+            .since(before),
+            None
+        );
+    }
+
+    #[test]
+    fn coalescing_keeps_the_newest_history_position() {
+        let mut older = annotated();
+        older.history = Some(GridHistory { origin: 0, rows: 4 });
+        let mut newer = annotated().without_annotations();
+        newer.is_full_snapshot = false;
+        newer.history = Some(GridHistory { origin: 0, rows: 9 });
+        older.coalesce(newer.clone());
+        assert_eq!(older.history, newer.history);
+        newer.history = None;
+        older.coalesce(newer);
+        assert_eq!(older.history, None);
+    }
+
     #[test]
     fn annotations_round_trip_and_old_wire_stays_readable() {
         let grid = annotated();
@@ -1288,6 +1531,7 @@ mod annotation_tests {
             is_full_snapshot: true,
             changed_rows: vec![ChangedRow::new(0, vec![GridCell::BLANK; 8])],
             cursor_style: CursorStyle::default(),
+            history: None,
         };
         let plain = only.encode().unwrap();
         only.changed_rows[0].metadata.styles = styled().changed_rows[0].metadata.styles.clone();

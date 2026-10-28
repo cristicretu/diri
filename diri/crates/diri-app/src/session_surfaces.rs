@@ -1705,6 +1705,7 @@ impl SessionSurfaces {
                                 })
                                 .collect(),
                             cursor_style: Default::default(),
+                            history: None,
                         });
                         Some(element)
                     });
@@ -2397,6 +2398,7 @@ mod tests {
                         is_full_snapshot: true,
                         changed_rows: vec![],
                         cursor_style: Default::default(),
+                        history: None,
                     };
                     stream
                         .get_mut()

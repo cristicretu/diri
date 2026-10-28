@@ -296,6 +296,7 @@ mod tests {
                 is_full_snapshot: full,
                 changed_rows: vec![ChangedRow::new(row, vec![cell; 4])],
                 cursor_style: Default::default(),
+                history: None,
             })
             .unwrap(),
         )

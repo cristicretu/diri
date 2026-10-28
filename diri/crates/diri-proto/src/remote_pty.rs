@@ -18,7 +18,9 @@ use crate::grid::{GridCodecError, GridUpdate};
 use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 18;
+pub const PROTOCOL_MINOR: u16 = 19;
+/// `grid-history-v1`: grids carry the primary screen's history position.
+pub const GRID_HISTORY_PROTOCOL_MINOR: u16 = 19;
 pub const GRID_RESUME_PROTOCOL_MINOR: u16 = 17;
 /// Minor 17 belongs to `grid-resume-v1`; styles are negotiated by name.
 pub const TERMINAL_STYLES_PROTOCOL_MINOR: u16 = 18;
@@ -125,6 +127,11 @@ pub enum RemoteCapability {
     /// underline color and overline spans in row annotations.
     #[serde(rename = "terminal-styles-v1")]
     TerminalStyles,
+    /// Every primary-screen grid carries the history position
+    /// ([`crate::grid::GridHistory`]), so a client can keep a selection on
+    /// text that scrolls into history. Only with `terminal-styles-v1`.
+    #[serde(rename = "grid-history-v1")]
+    GridHistory,
     IncrementalGrid,
     ProcessExit,
     Signal,
@@ -171,6 +178,7 @@ impl RemoteCapability {
             Self::InlineImages => "inline-images-v1",
             Self::GridResume => "grid-resume-v1",
             Self::TerminalStyles => "terminal-styles-v1",
+            Self::GridHistory => "grid-history-v1",
             Self::FullSnapshot => "full-snapshot",
             Self::IncrementalGrid => "incremental-grid",
             Self::ProcessExit => "process-exit",
@@ -241,6 +249,7 @@ pub const ANNOTATED_HOLDER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::InlineImages,
     RemoteCapability::GridResume,
     RemoteCapability::TerminalStyles,
+    RemoteCapability::GridHistory,
 ];
 pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::ProcessFacts,
@@ -266,6 +275,7 @@ pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::InlineImages,
     RemoteCapability::GridResume,
     RemoteCapability::TerminalStyles,
+    RemoteCapability::GridHistory,
 ];
 
 /// Authentication bearer shared only by the local Engine and one Holder.
@@ -2094,6 +2104,7 @@ mod tests {
                 is_full_snapshot: true,
                 changed_rows: vec![ChangedRow::new(0, vec![GridCell::BLANK; 2])],
                 cursor_style: Default::default(),
+                history: None,
             },
         }
     }
@@ -2737,9 +2748,29 @@ mod usage_tests {
     }
 
     #[test]
+    fn grid_history_is_an_optional_minor_19_capability() {
+        const {
+            assert!(GRID_HISTORY_PROTOCOL_MINOR == PROTOCOL_MINOR);
+            assert!(GRID_HISTORY_PROTOCOL_MINOR > TERMINAL_STYLES_PROTOCOL_MINOR);
+        }
+        assert_eq!(
+            serde_json::to_string(&RemoteCapability::GridHistory).unwrap(),
+            "\"grid-history-v1\""
+        );
+        assert_eq!(RemoteCapability::GridHistory.wire_name(), "grid-history-v1");
+        assert!(!PHASE_ONE_HOLDER_CAPABILITIES.contains(&RemoteCapability::GridHistory));
+        assert!(ANNOTATED_HOLDER_CAPABILITIES.contains(&RemoteCapability::GridHistory));
+        // An older peer reads the name as a capability it does not know.
+        assert_eq!(
+            serde_json::from_str::<RemoteCapability>("\"grid-history-v2\"").unwrap(),
+            RemoteCapability::Unknown
+        );
+    }
+
+    #[test]
     fn terminal_styles_is_an_optional_minor_18_capability() {
         const {
-            assert!(TERMINAL_STYLES_PROTOCOL_MINOR == PROTOCOL_MINOR);
+            assert!(TERMINAL_STYLES_PROTOCOL_MINOR < PROTOCOL_MINOR);
             assert!(TERMINAL_STYLES_PROTOCOL_MINOR > INLINE_IMAGES_PROTOCOL_MINOR);
         }
         assert_eq!(

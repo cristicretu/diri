@@ -513,6 +513,7 @@ mod tests {
             is_full_snapshot: full,
             changed_rows,
             cursor_style: Default::default(),
+            history: None,
         }
     }
 

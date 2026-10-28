@@ -245,6 +245,7 @@ fn terminal_theme_fade_redraw(cx: &mut BenchAppContext) {
         is_full_snapshot: true,
         changed_rows,
         cursor_style: Default::default(),
+        history: None,
     });
 
     let mut window = cx.add_empty_window();
@@ -487,6 +488,7 @@ fn build_frame(
         is_full_snapshot,
         changed_rows,
         cursor_style: Default::default(),
+        history: None,
     }
 }
 

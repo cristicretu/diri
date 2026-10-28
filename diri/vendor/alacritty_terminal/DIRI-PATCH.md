@@ -261,3 +261,14 @@ absolutely after multi-column clusters, so it is unaffected. Lookup is a binary
 search over 152 ranges, only for width-1 non-ASCII characters. No wire,
 checkpoint or protocol change; the parser source is part of the Remote Helper
 Build ID. Test: `spacing_vowel_signs_share_their_base_cell_like_claude_code`.
+
+## Stable history rows
+
+`Grid` counts the rows that leave history from its oldest end (`history_origin`):
+rows a full scroll region recycles at the row limit, rows `update_history`
+trims, `bound_history_storage` evictions and `clear_history`. `history_origin +
+index` therefore names a history row stably while output evicts older rows.
+Diri publishes it with each primary-screen grid diff (`grid-history-v1`) so a
+client can keep a selection on text that scrolls into history. One `u64` per
+grid, no per-row cost; not serialized. Resizes that reflow history renumber rows
+as before.

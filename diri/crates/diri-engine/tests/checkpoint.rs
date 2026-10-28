@@ -153,6 +153,7 @@ fn synthetic_grid(text: &str) -> GridUpdate {
         is_full_snapshot: true,
         changed_rows: rows,
         cursor_style: Default::default(),
+        history: None,
     }
 }
 

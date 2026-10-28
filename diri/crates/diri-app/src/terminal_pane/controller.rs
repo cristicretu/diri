@@ -1003,6 +1003,7 @@ mod tests {
                     2
                 ],
             )],
+            history: None,
         }
     }
 

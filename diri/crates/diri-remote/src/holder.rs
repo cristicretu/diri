@@ -1264,6 +1264,21 @@ impl Holder {
             ));
         }
         connection.terminal_styles = styles_requested;
+        // History positions ride the styled grid only, by name, from a minor
+        // that defines them. Anyone else gets the exact styled bytes.
+        let history_requested = hello
+            .required_capabilities
+            .contains(&diri_proto::remote_pty::RemoteCapability::GridHistory);
+        if history_requested
+            && (hello.protocol.minor < diri_proto::remote_pty::GRID_HISTORY_PROTOCOL_MINOR
+                || !styles_requested)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "grid-history-v1 requires protocol minor 19 and terminal-styles-v1",
+            ));
+        }
+        connection.grid_history = history_requested;
         connection.inline_images =
             hello.protocol.minor >= diri_proto::remote_pty::INLINE_IMAGES_PROTOCOL_MINOR;
         ensure_keyboard_controller(self.screen.input_keyboard_state(), enhanced_keyboard)?;
@@ -1792,6 +1807,8 @@ struct Connection {
     enhanced_keyboard: bool,
     terminal_reset: bool,
     terminal_styles: bool,
+    /// The controller asked for `grid-history-v1`.
+    grid_history: bool,
     /// The controller speaks `inline-images-v1`: it may read images, and
     /// image anchors in the grid are meaningful to it.
     inline_images: bool,
@@ -1811,6 +1828,7 @@ impl Connection {
             enhanced_keyboard: false,
             terminal_reset: false,
             terminal_styles: false,
+            grid_history: false,
             inline_images: false,
             reset_state: None,
             protocol_minor: 0,
@@ -1840,6 +1858,16 @@ impl Connection {
                     }
                 }
                 RemoteMessage::ScrollbackResponse(value) => value.result.metadata.clear(),
+                _ => {}
+            }
+        }
+        if !self.grid_history {
+            match &mut message {
+                RemoteMessage::HelloAck(value) => value.capabilities.retain(|capability| {
+                    *capability != diri_proto::remote_pty::RemoteCapability::GridHistory
+                }),
+                RemoteMessage::FullSnapshot(value) => value.grid.history = None,
+                RemoteMessage::GridDelta(value) => value.grid.history = None,
                 _ => {}
             }
         }
@@ -2359,6 +2387,7 @@ mod tests {
                 is_full_snapshot: true,
                 changed_rows: Vec::new(),
                 cursor_style: Default::default(),
+                history: None,
             };
             grid.is_full_snapshot = true;
             grid.changed_rows.push(row);
@@ -2418,6 +2447,7 @@ mod tests {
                     shape: CursorShape::Bar,
                     steady: true,
                 },
+                history: None,
             };
             connection
                 .queue(RemoteMessage::FullSnapshot(FullSnapshot {
@@ -2445,6 +2475,79 @@ mod tests {
                 snapshot.grid.cursor_style.shape == CursorShape::Bar,
                 capable
             );
+        }
+    }
+
+    #[test]
+    fn history_positions_reach_only_controllers_that_asked_for_them() {
+        let mut screen = diri_terminal_state::HeadlessScreen::new(8, 2);
+        screen.feed(b"one\r\ntwo\r\nthree");
+        let snapshot = screen.grid_update(true);
+        assert!(snapshot.history.is_some());
+        screen.feed(b"\r\nfour");
+        let delta = screen.grid_update(false);
+        for (minor, styles, history) in [(18, true, false), (19, true, false), (19, true, true)] {
+            let (stream, _peer) = UnixStream::pair().unwrap();
+            let mut connection = Connection::new(stream);
+            connection.protocol_minor = minor;
+            connection.terminal_styles = styles;
+            connection.grid_history = history;
+            connection
+                .queue(RemoteMessage::HelloAck(HelloAck {
+                    protocol: diri_proto::remote_pty::ProtocolVersion::CURRENT,
+                    holder_build_id: "holder".into(),
+                    session_incarnation: "incarnation".into(),
+                    capabilities: ANNOTATED_HOLDER_CAPABILITIES.to_vec(),
+                    controller_epoch: 1,
+                    process_state: diri_proto::remote_pty::RemoteProcessState::Running { pid: 7 },
+                    child_identity: None,
+                    output_offset: 0,
+                    snapshot_sequence: 1,
+                    foreground_pid: None,
+                    grid_resume: None,
+                }))
+                .unwrap();
+            connection
+                .queue(RemoteMessage::FullSnapshot(FullSnapshot {
+                    sequence: 1,
+                    alt_screen: false,
+                    bracketed_paste: false,
+                    mouse: Default::default(),
+                    grid: snapshot.clone(),
+                }))
+                .unwrap();
+            connection
+                .queue(RemoteMessage::GridDelta(
+                    diri_proto::remote_pty::GridDelta {
+                        sequence: 2,
+                        alt_screen: false,
+                        bracketed_paste: false,
+                        mouse: Default::default(),
+                        grid: delta.clone(),
+                    },
+                ))
+                .unwrap();
+            let messages = RemoteCodec::new().feed(&connection.outbound).unwrap();
+            let mut grids = 0;
+            for message in &messages {
+                match message {
+                    RemoteMessage::HelloAck(ack) => assert_eq!(
+                        ack.capabilities
+                            .contains(&diri_proto::remote_pty::RemoteCapability::GridHistory),
+                        history
+                    ),
+                    RemoteMessage::FullSnapshot(value) => {
+                        grids += 1;
+                        assert_eq!(value.grid.history.is_some(), history);
+                    }
+                    RemoteMessage::GridDelta(value) => {
+                        grids += 1;
+                        assert_eq!(value.grid.history, delta.history.filter(|_| history));
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(grids, 2, "minor {minor}");
         }
     }
 

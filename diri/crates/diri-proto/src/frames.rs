@@ -183,6 +183,11 @@ impl Frame {
         Ok(Self::new(FrameType::Grid, update.encode()?))
     }
 
+    /// The styled grid for a client without `grid-history-v1`.
+    pub fn grid_without_history(update: &GridUpdate) -> Result<Self, GridCodecError> {
+        Ok(Self::new(FrameType::Grid, update.encode_without_history()?))
+    }
+
     /// The grid as a client from before `terminal-styles-v1` decodes it.
     pub fn grid_without_styles(update: &GridUpdate) -> Result<Self, GridCodecError> {
         Ok(Self::new(FrameType::Grid, update.encode_without_styles()?))

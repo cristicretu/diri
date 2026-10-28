@@ -84,6 +84,7 @@ fn full_frame(cols: u16, rows: u16, offset: usize, wide: bool) -> GridUpdate {
             })
             .collect(),
         cursor_style: Default::default(),
+        history: None,
     }
 }
 

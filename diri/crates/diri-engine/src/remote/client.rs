@@ -227,6 +227,9 @@ impl RemoteSessionClient {
                 required_capabilities
                     .push(diri_proto::remote_pty::RemoteCapability::TerminalStyles);
             }
+            if self.helper.protocol.minor >= diri_proto::remote_pty::GRID_HISTORY_PROTOCOL_MINOR {
+                required_capabilities.push(diri_proto::remote_pty::RemoteCapability::GridHistory);
+            }
             let hello = RemoteMessage::Hello(Hello {
                 protocol: ProtocolVersion::CURRENT,
                 local_build_id: format!("engine-{}", env!("CARGO_PKG_VERSION")),
