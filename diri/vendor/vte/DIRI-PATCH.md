@@ -211,6 +211,8 @@ parser skipping its body. Both dispatch paths record: `osc_dispatch` and
 the in-place `osc_finish_in_place`. Without the feature the dispatch paths
 are unchanged.
 
+parser skipping its body. Without the feature the dispatch path is unchanged.
+
 Test: `diri-terminal-state`'s `tests/osc_observe.rs`
 (`cargo test -p diri-terminal-state --features bench-verify --test osc_observe`).
 
