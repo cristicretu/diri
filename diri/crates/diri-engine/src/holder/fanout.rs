@@ -56,8 +56,11 @@ pub(super) enum Pushed {
     Queued,
     /// Queued, and no writer is running: the caller must start one.
     WakeWriter,
-    /// The subscriber is gone or still full after the patience ran out.
-    Refused,
+    /// The subscriber is gone; nothing was queued.
+    Closed,
+    /// The queue stayed full while the subscriber took nothing for the whole
+    /// patience; nothing was queued, so the same bytes can be offered again.
+    Stalled,
 }
 
 /// What a writer waiting with a deadline got.
@@ -110,12 +113,17 @@ impl FrameQueue {
     /// log, which has every byte.
     #[cfg(any(windows, test))]
     pub(super) fn push(&self, offset: u64, bytes: &[u8], patience: Duration) -> bool {
-        self.offer(offset, bytes, patience) != Pushed::Refused
+        matches!(
+            self.offer(offset, bytes, patience),
+            Pushed::Queued | Pushed::WakeWriter
+        )
     }
 
     /// [`Self::push`], also saying whether a writer has to be started for the
-    /// frame: the queue's writer ends when it has been idle, and the push that
-    /// finds none is the one that starts the next.
+    /// frame (the queue's writer ends when it has been idle, and the push that
+    /// finds none is the one that starts the next), and telling apart a
+    /// subscriber that is gone from one that has merely taken nothing for
+    /// `patience`.
     pub(super) fn offer(&self, offset: u64, bytes: &[u8], patience: Duration) -> Pushed {
         let mut state = self.state.lock().expect("frame queue");
         if !state.closed && state.queued >= self.capacity {
@@ -129,7 +137,7 @@ impl FrameQueue {
                     remaining = patience;
                 }
                 if remaining.is_zero() {
-                    return Pushed::Refused;
+                    return Pushed::Stalled;
                 }
                 let (guard, _) = self
                     .changed
@@ -139,7 +147,7 @@ impl FrameQueue {
             }
         }
         if state.closed {
-            return Pushed::Refused;
+            return Pushed::Closed;
         }
         let was_empty = state.frames.is_empty();
         state.queued += bytes.len();
@@ -333,6 +341,26 @@ mod tests {
             started.elapsed() < Duration::from_millis(500),
             "push should give up at its deadline, not hang"
         );
+    }
+
+    #[test]
+    fn a_stalled_offer_queues_nothing_and_can_be_offered_again() {
+        let queue = FrameQueue::new(1);
+        // The first frame asks for a writer; this test plays the writer.
+        assert_eq!(queue.offer(0, b"a", Duration::ZERO), Pushed::WakeWriter);
+        assert_eq!(
+            queue.offer(1, b"b", Duration::from_millis(10)),
+            Pushed::Stalled
+        );
+        assert_eq!(queue.try_pop(), Some((0, b"a".to_vec())));
+        assert!(
+            queue.try_pop().is_none(),
+            "the stalled bytes were not queued"
+        );
+        assert_eq!(queue.offer(1, b"b", Duration::ZERO), Pushed::Queued);
+        assert_eq!(queue.try_pop(), Some((1, b"b".to_vec())));
+        queue.close();
+        assert_eq!(queue.offer(2, b"c", Duration::ZERO), Pushed::Closed);
     }
 
     #[test]
@@ -627,7 +655,7 @@ mod tests {
                 match queue.offer(offset, &chunk, patience) {
                     Pushed::Queued => {}
                     Pushed::WakeWriter => start_writer(rng.next()),
-                    Pushed::Refused => break,
+                    Pushed::Closed | Pushed::Stalled => break,
                 }
                 accepted.extend_from_slice(&chunk);
                 offset += length as u64;
