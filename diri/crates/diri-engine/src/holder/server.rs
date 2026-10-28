@@ -20,7 +20,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 
@@ -56,24 +56,23 @@ const MAX_SIGNAL: i32 = 65;
 /// a count of frames allowed.
 const OUTPUT_QUEUE_BYTES: usize = 1 << 20;
 
-/// How long the pump waits for a full subscriber queue while the subscriber
-/// takes nothing, before giving up on it.
+/// How often a pump waiting on a full subscriber queue that takes nothing
+/// looks up to see whether it should stop waiting.
 ///
-/// A subscriber that is still reading — the queue, or its log backlog — is
-/// waited for: the daemon is where the session's terminal state is parsed, so
-/// output must not outrun it, exactly as a terminal emulator's own PTY reads
-/// pace a program. A subscriber dropped here lets the program run free until
-/// it resubscribes, and if the log rotates past it meanwhile, those bytes are
-/// never parsed.
-///
-/// So this has to outlast one parse pass of a busy daemon (half a megabyte:
-/// a few milliseconds in a release build, a hundred in a debug one, more on a
-/// loaded machine), while still bounding how long a hung daemon can hold a
-/// program's output: once, for this long, after which it runs free.
+/// A connected subscriber is never given up on for being slow: the daemon is
+/// where the session's terminal state is parsed, so output must not outrun
+/// it, exactly as a terminal emulator's own PTY reads pace a program, and a
+/// dropped subscriber lets the program lap the log. Only a dying session
+/// stops waiting (see [`broadcast_output`]), after this long without
+/// progress. A subscriber that is gone releases the pump at once.
 const OUTPUT_SEND_PATIENCE: Duration = Duration::from_millis(500);
 
 /// Buffer for one subscriber's socket writes.
 const OUTPUT_WRITE_BUFFER: usize = 256 << 10;
+
+/// Sessions whose pump reads in blocking mode from its first read.
+#[cfg(test)]
+static FORCE_STREAMING_READS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Live holders, so a test can inspect the state `run` builds for itself.
 #[cfg(test)]
@@ -125,11 +124,21 @@ struct Shared {
     /// incarnations' bytes and bytes attributable to THIS child.
     epoch_offset: u64,
     finished: AtomicBool,
+    /// Set once the tree has been told to die. Its remaining output is no
+    /// longer held for a stalled subscriber; see [`broadcast_output`].
+    killing: AtomicBool,
     /// Self-pipe the exit path writes to once `finished` is set. It is what
     /// lets a running pump wait on the PTY without a deadline short of its
     /// idle park, and still notice the exit at once. Both ends live here so
     /// the write can never meet a closed pipe.
     pump_wake: (std::io::PipeReader, std::io::PipeWriter),
+    /// Whether the pump is sleeping in `read` on a streaming PTY rather than
+    /// in `poll`, which decides the master's `O_NONBLOCK` flag (see
+    /// [`super::pty_read`]).
+    read_mode: super::pty_read::ReadMode,
+    /// How many times the pump switched to streaming reads, for tests.
+    #[cfg(test)]
+    streaming_reads: std::sync::atomic::AtomicUsize,
     /// Every return from the pump's wait, so a test can prove a silent
     /// session leaves it parked.
     #[cfg(test)]
@@ -209,13 +218,14 @@ struct OutputFanout {
 /// One attached daemon's view of the output stream.
 ///
 /// Delivery is bounded and off the pump's thread: a subscriber that keeps up
-/// costs the pump a channel send, and one that does not is dropped rather than
-/// allowed to stall the PTY. A dropped subscriber loses nothing, because every
-/// byte is in the log it will fall back to.
+/// costs the pump a channel send, and one that falls behind pauses the PTY
+/// until it catches up (see [`broadcast_output`]). One that hangs up loses
+/// nothing, because every byte is in the log it will fall back to.
 ///
 /// Its writer thread exists only while frames flow: it ends after
 /// [`reactor::LANE_IDLE`] with nothing to send, and the next frame starts
 /// another. A hangup is noticed by the reactor, not by a thread per socket.
+#[derive(Clone)]
 struct OutputSubscriber {
     frames: Arc<super::fanout::FrameQueue>,
     link: Arc<SubscriberLink>,
@@ -390,7 +400,11 @@ impl HolderServer {
             log_tail: AtomicU64::new(epoch_offset),
             epoch_offset,
             finished: AtomicBool::new(false),
+            killing: AtomicBool::new(false),
             pump_wake,
+            read_mode: super::pty_read::ReadMode::default(),
+            #[cfg(test)]
+            streaming_reads: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             pump_wakeups: std::sync::atomic::AtomicUsize::new(0),
             pump: Mutex::new(PumpLane {
@@ -849,8 +863,8 @@ fn peer_readable(
                 .subscribers
                 .retain(|subscriber| !Arc::ptr_eq(&subscriber.frames, &frames));
         };
-        // The pump can hold the fan-out for a while offering a frame; the
-        // reactor must not wait on it.
+        // The fan-out lock is only ever held briefly (the pump waits on a
+        // full queue without it), but the reactor must not wait on it at all.
         if let Ok(mut fanout) = shared.output.try_lock() {
             prune(&mut fanout);
         } else {
@@ -908,11 +922,31 @@ fn pump_pty(shared: &Arc<Shared>) {
     let Some(mut reader) = shared.pump.lock().expect("pump").reader.take() else {
         return;
     };
+    if STREAMING_READS {
+        super::pty_read::install_interrupt();
+    }
     let idle = reactor::lane_idle();
     let mut log = LogLane::default();
     let mut buffer = vec![0u8; 64 << 10];
+    let mut subscribers = Vec::new();
     loop {
-        let quiet = pump_until_quiet(shared, &mut reader, &mut log, &mut buffer, idle);
+        let quiet = pump_until_quiet(
+            shared,
+            &mut reader,
+            &mut log,
+            &mut buffer,
+            &mut subscribers,
+            idle,
+        );
+        // The description stays nonblocking once the turn ends: a parked PTY
+        // is watched by `poll`, and the exit path's final drain must not wait
+        // for bytes that never come.
+        if shared.read_mode.is_blocking() {
+            let pty = shared.pty.lock().expect("pty");
+            shared
+                .read_mode
+                .set_blocking(&pty, reader.as_raw_fd(), false);
+        }
         // Every queued byte must reach the log before the pump lets go: the
         // exit path writes the marker straight after joining this thread,
         // and a byte still in flight would land after it. Parked, the writer
@@ -938,33 +972,57 @@ fn pump_until_quiet(
     reader: &mut crate::pty::PtyStream,
     log: &mut LogLane,
     buffer: &mut [u8],
+    subscribers: &mut Vec<OutputSubscriber>,
     idle: Option<Duration>,
 ) -> bool {
     use std::os::fd::AsRawFd as _;
+    let fd = reader.as_raw_fd();
+    let mut streak = super::pty_read::Streak::default();
+    // Whether the next wait is a `read` sleeping on the PTY (streaming) or a
+    // wait that also sees the exit wake and the idle deadline (everything
+    // else). A turn ends only from the latter, so a parked PTY is never left
+    // blocking.
+    let mut blocking = false;
+    // A test can hold the pump in streaming reads from the start, to prove
+    // what happens to a pump asleep in `read`.
+    #[cfg(test)]
+    let forced = STREAMING_READS
+        && FORCE_STREAMING_READS
+            .lock()
+            .expect("forced")
+            .contains(&shared.spec.session_id);
+    #[cfg(not(test))]
+    let forced = false;
+    if forced {
+        let pty = shared.pty.lock().expect("pty");
+        blocking = shared.read_mode.set_blocking(&pty, fd, true);
+    }
     loop {
         if shared.finished.load(Ordering::SeqCst) {
             return false;
         }
-        let readable = reactor::wait_readable(
-            reader.as_raw_fd(),
-            Some(shared.pump_wake.0.as_raw_fd()),
-            idle,
-        );
-        #[cfg(test)]
-        shared.pump_wakeups.fetch_add(1, Ordering::SeqCst);
-        match readable {
-            Ok(reactor::Readiness::Ready) => {}
-            Ok(reactor::Readiness::Woken) => continue,
-            Ok(reactor::Readiness::Idle) => return true,
-            Err(_) => return false,
+        if !blocking {
+            let readable = reactor::wait_readable(fd, Some(shared.pump_wake.0.as_raw_fd()), idle);
+            #[cfg(test)]
+            shared.pump_wakeups.fetch_add(1, Ordering::SeqCst);
+            match readable {
+                Ok(reactor::Readiness::Ready) => {}
+                Ok(reactor::Readiness::Woken) => continue,
+                Ok(reactor::Readiness::Idle) => return true,
+                Err(_) => return false,
+            }
         }
         // A PTY hands over about a kilobyte per read, so appending per read
         // pays the log's per-chunk costs a thousand times for every megabyte.
         // Bytes already queued in the kernel are folded into one append
         // instead: the reads happen either way, and nothing waits on bytes
         // that have not arrived, so this batches without adding latency.
+        //
+        // A streaming read sleeps until bytes arrive, so it is made once:
+        // a second one would hold the bytes already read until more came.
         let mut filled = 0;
         let mut eof = false;
+        let mut interrupted = false;
         loop {
             match reader.read(&mut buffer[filled..]) {
                 Ok(0) => {
@@ -973,12 +1031,25 @@ fn pump_until_quiet(
                 }
                 Ok(count) => {
                     filled += count;
-                    if filled == buffer.len() {
+                    if blocking || filled == buffer.len() {
                         break;
                     }
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                // Polling: the queue is drained. Streaming: a writer has the
+                // description nonblocking for a moment; whichever, the next
+                // wait is a poll.
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    interrupted = blocking;
+                    break;
+                }
+                // Streaming: the exit path's signal, or any other; `finished`
+                // says which.
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                    if blocking {
+                        interrupted = true;
+                        break;
+                    }
+                }
                 Err(_) => {
                     eof = true;
                     break;
@@ -991,7 +1062,7 @@ fn pump_until_quiet(
             // this ordering is what decouples display latency from filesystem
             // throughput.
             let chunk = &buffer[..filled];
-            broadcast_output(shared, chunk);
+            broadcast_output(shared, chunk, subscribers);
             // Bytes read are handed on even if `finished` was just set: the
             // exit path joins this thread before writing the marker, so
             // nothing can land beyond it — but a byte consumed from the kernel
@@ -1001,6 +1072,25 @@ fn pump_until_quiet(
         if eof || shared.finished.load(Ordering::SeqCst) {
             return false;
         }
+        if interrupted && filled == 0 {
+            // Nothing read: wait once more, without ending the streak, so a
+            // write landing mid-stream costs one wait.
+            blocking = false;
+            continue;
+        }
+        let streaming = forced || (STREAMING_READS && streak.after_read(filled, blocking));
+        // Never waits on the PTY lock: a switch that does not happen now
+        // leaves the pump in a mode that is merely slower, or a read that
+        // sleeps until the next output, which the exit path interrupts.
+        if streaming != shared.read_mode.is_blocking()
+            && let Ok(pty) = shared.pty.try_lock()
+            && shared.read_mode.set_blocking(&pty, fd, streaming)
+            && streaming
+        {
+            #[cfg(test)]
+            shared.streaming_reads.fetch_add(1, Ordering::SeqCst);
+        }
+        blocking = shared.read_mode.is_blocking();
     }
 }
 
@@ -1085,57 +1175,131 @@ fn append_log(shared: &Shared, bytes: &[u8]) {
 
 /// Hands one chunk of PTY output to every attached subscriber.
 ///
-/// A subscriber that takes nothing for [`OUTPUT_SEND_PATIENCE`] is dropped.
-/// That bound is the whole point: waiting a little applies the backpressure a
-/// single-process terminal gets for free, so output cannot race arbitrarily far
-/// ahead of the screen that renders it — and giving up keeps a wedged or dead
-/// daemon from stalling the PTY. Anything a dropped subscriber misses is in the
-/// log, which is where it resumes.
-fn broadcast_output(shared: &Arc<Shared>, frame: &[u8]) {
-    use super::fanout::Pushed;
-    let mut fanout = shared.output.lock().expect("output");
-    let offset = fanout.next_offset;
-    // Advanced whether or not anyone is listening: a subscriber that arrives
-    // later is told to start here, and must not be told an offset that skipped
-    // bytes already handed out.
-    fanout.next_offset += frame.len() as u64;
-    if fanout.subscribers.is_empty() {
-        return;
+/// A subscriber is the Engine, which owns the session's terminal state, so a
+/// byte it never takes is a byte its screen, scrollback and status detection
+/// never see. The pump therefore waits for it for as long as it stays
+/// connected: when it falls behind, the PTY goes unread and the kernel pauses
+/// the program, exactly as a terminal emulator's own reads pace a program. A
+/// slow parse pass on a loaded machine — measured at close to a second — must
+/// not be mistaken for a dead Engine, because a dropped subscriber lets the
+/// program run free and lap the log, and those bytes are then gone.
+///
+/// A subscriber is dropped only when it is gone (hung up, or its socket
+/// failed), or when it has taken nothing for [`OUTPUT_SEND_PATIENCE`] after
+/// the child was told to die or has exited. A killed leader on macOS cannot
+/// finish exiting until its terminal is read, so the dying session's last
+/// output is not held for a stalled Engine; it is bounded by what the kernel
+/// buffered, and is in the log, which is where the Engine resumes.
+///
+/// No lock is held while waiting, so subscribing, a hangup's prune and
+/// control requests never queue behind a slow Engine: a subscriber arriving
+/// meanwhile is quoted the offset after this chunk, and reads this chunk from
+/// the log.
+///
+/// `subscribers` is the pump's scratch list, reused so a chunk costs no
+/// allocation; it is left empty.
+fn broadcast_output(shared: &Arc<Shared>, frame: &[u8], subscribers: &mut Vec<OutputSubscriber>) {
+    let offset = {
+        let mut fanout = shared.output.lock().expect("output");
+        let offset = fanout.next_offset;
+        // Advanced whether or not anyone is listening: a subscriber that
+        // arrives later is told to start here, and must not be told an offset
+        // that skipped bytes already handed out.
+        fanout.next_offset += frame.len() as u64;
+        if fanout.subscribers.is_empty() {
+            return;
+        }
+        subscribers.extend(fanout.subscribers.iter().cloned());
+        offset
+    };
+    let mut dropped = false;
+    for subscriber in subscribers.drain(..) {
+        if offer_frame(shared, &subscriber, offset, frame) {
+            continue;
+        }
+        dropped = true;
     }
-    fanout.subscribers.retain(|subscriber| {
-        let release = match subscriber.frames.offer(offset, frame, OUTPUT_SEND_PATIENCE) {
-            Pushed::Queued => return true,
+    if dropped {
+        shared
+            .output
+            .lock()
+            .expect("output")
+            .subscribers
+            .retain(|subscriber| !subscriber.frames.is_closed());
+    }
+}
+
+/// Offers one frame to a subscriber, waiting for room for as long as it stays
+/// connected; see [`broadcast_output`].
+///
+/// Returns false when the subscriber is dropped. Its queue is then closed,
+/// and its socket released here when no writer is running to do it.
+fn offer_frame(
+    shared: &Arc<Shared>,
+    subscriber: &OutputSubscriber,
+    offset: u64,
+    frame: &[u8],
+) -> bool {
+    use super::fanout::Pushed;
+    let mut paced_since: Option<std::time::Instant> = None;
+    loop {
+        match subscriber.frames.offer(offset, frame, OUTPUT_SEND_PATIENCE) {
+            Pushed::Queued => {}
             // Its writer ended while the session was quiet; start the next.
-            Pushed::WakeWriter => match spawn_writer(shared, subscriber, 0..0) {
-                Ok(()) => return true,
-                // Nobody serves it now, so the release is ours.
-                Err(_) => {
+            Pushed::WakeWriter => {
+                if spawn_writer(shared, subscriber, 0..0).is_err() {
+                    // Nobody serves it now, so the release is ours.
                     subscriber.frames.close();
-                    true
+                    subscriber.link.finish();
+                    return false;
                 }
-            },
-            Pushed::Refused => {
-                if !subscriber.frames.is_closed() {
+            }
+            Pushed::Closed => {
+                release_subscriber(subscriber);
+                return false;
+            }
+            Pushed::Stalled => {
+                if shared.finished.load(Ordering::SeqCst) || shared.killing.load(Ordering::SeqCst) {
                     diri_telemetry::warn_event!(
                         "holder.subscriber_dropped",
                         session = diri_telemetry::id(&shared.spec.session_id),
                         offset = offset,
                     );
+                    release_subscriber(subscriber);
+                    return false;
                 }
-                // Closing is what makes dropping visible. Letting the
-                // subscriber go only releases this end of the queue; a writer
-                // would keep the socket open, and the daemon would wait for
-                // frames that are never coming instead of falling back to the
-                // log. A running writer sees the close and releases it; with
-                // none running, the release is ours.
-                subscriber.frames.close()
+                // Still connected, so still the session's owner: keep the
+                // program paused rather than skip what it prints.
+                paced_since.get_or_insert_with(|| {
+                    std::time::Instant::now()
+                        .checked_sub(OUTPUT_SEND_PATIENCE)
+                        .unwrap_or_else(std::time::Instant::now)
+                });
+                continue;
             }
-        };
-        if release {
-            subscriber.link.finish();
         }
-        false
-    });
+        if let Some(since) = paced_since {
+            diri_telemetry::event!(
+                "holder.output_paced",
+                session = diri_telemetry::id(&shared.spec.session_id),
+                offset = offset,
+                ms = since.elapsed(),
+            );
+        }
+        return true;
+    }
+}
+
+/// Closes a dropped subscriber's queue. Closing is what makes dropping
+/// visible: letting the subscriber go only releases this end of the queue; a
+/// writer would keep the socket open, and the daemon would wait for frames
+/// that are never coming instead of falling back to the log. A running writer
+/// sees the close and releases the socket; with none running, the release is
+/// ours.
+fn release_subscriber(subscriber: &OutputSubscriber) {
+    if subscriber.frames.close() {
+        subscriber.link.finish();
+    }
 }
 
 /// Writes a resumed subscriber's backlog, `range`, from the log, as frames
@@ -1200,6 +1364,16 @@ fn write_log_backlog(
     true
 }
 
+/// Whether a streaming PTY is read in blocking mode (see
+/// [`super::pty_read`]). Only macOS hands over a kilobyte per read; Linux
+/// reads keep the polling path they were measured with.
+const STREAMING_READS: bool = cfg!(target_os = "macos");
+
+/// How close together two frames must be for the second to count as
+/// streaming output, and how long a streaming frame waits for the next one
+/// before it is flushed alone (see [`write_output`]).
+const STREAMING_FLUSH_GAP: Duration = Duration::from_micros(100);
+
 /// Writes frames to one subscriber until it goes, the queue closes, or it has
 /// had nothing to send for [`reactor::LANE_IDLE`] (the next frame then starts
 /// a new writer). The buffer is always flushed before the writer waits, so
@@ -1214,6 +1388,7 @@ fn write_output(
     let idle = reactor::lane_idle();
     let mut stream = std::io::BufWriter::with_capacity(OUTPUT_WRITE_BUFFER, &link.stream);
     let mut queued: Option<super::fanout::Frame> = None;
+    let mut last_write: Option<Instant> = None;
     let replayed = backlog.is_empty() || write_log_backlog(&mut stream, holder, frames, backlog);
     if replayed {
         loop {
@@ -1247,7 +1422,23 @@ fn write_output(
             // Flushed only once nothing else is waiting, so a burst coalesces into
             // few writes while a lone chunk still leaves immediately. The frame
             // taken here is carried to the next turn, never dropped.
-            match frames.try_pop() {
+            //
+            // While output streams, though, the next frame is a PTY read away,
+            // and flushing each kilobyte cost a write system call per read: a
+            // third of the Holder's time in a flood. A frame written within
+            // [`STREAMING_FLUSH_GAP`] of the one before waits that long for its
+            // successor before flushing alone. Typing and prompts, whose frames
+            // are further apart, still leave at once.
+            let streaming =
+                last_write.is_some_and(|at: Instant| at.elapsed() < STREAMING_FLUSH_GAP);
+            let next = frames.try_pop().or_else(|| {
+                if !streaming {
+                    return None;
+                }
+                frames.linger(STREAMING_FLUSH_GAP)
+            });
+            last_write = Some(Instant::now());
+            match next {
                 Some(next) => queued = Some(next),
                 None => {
                     if stream.flush().is_err() {
@@ -1406,6 +1597,18 @@ fn finish_holder(shared: &Shared) -> Option<Box<dyn FnOnce() + Send>> {
         lane.thread.take()
     };
     if let Some(pump) = pump {
+        // A pump streaming reads is asleep in `read`, where the pipe cannot reach
+        // it. The leader's exit revokes its terminal, which usually ends that
+        // read by itself; whatever still holds the PTY open, a signal interrupts
+        // it. One landing between two reads is lost, so it is repeated until the
+        // pump is gone.
+        if shared.read_mode.is_blocking() {
+            use std::os::unix::thread::JoinHandleExt;
+            while !pump.is_finished() {
+                super::pty_read::interrupt(pump.as_pthread_t());
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
         let _ = pump.join();
     }
 
@@ -1623,6 +1826,9 @@ fn handle(shared: &Shared, request: &HolderRequest) -> HolderResult<HolderRespon
                     "signal requires a valid sig".into(),
                 ));
             }
+            if signal == libc::SIGKILL {
+                shared.killing.store(true, Ordering::SeqCst);
+            }
             let tree = if signal == libc::SIGCONT {
                 let frozen = shared.frozen.lock().expect("frozen").clone();
                 process_tree::resume(shared.child_pid, &frozen)
@@ -1646,6 +1852,7 @@ fn handle(shared: &Shared, request: &HolderRequest) -> HolderResult<HolderRespon
         }
 
         HolderOperation::KillTree => {
+            shared.killing.store(true, Ordering::SeqCst);
             process_tree::kill_tree(shared.child_pid);
             Ok(HolderResponse::success())
         }
@@ -1702,6 +1909,9 @@ fn write_pty(shared: &Shared, data: &[u8]) -> HolderResult<()> {
         .writer()
         .map_err(|error| HolderError::io("PTY writer", error))?;
     let fd = writer.as_raw_fd();
+    // A streaming pump keeps the description blocking; a write must still
+    // give up on a child that stopped reading its input.
+    let _flags = shared.read_mode.nonblocking_for_write(&pty, fd);
     let mut written = 0;
     while written < data.len() {
         // SAFETY: plain write(2) on an owned fd with an in-bounds slice.
@@ -2084,19 +2294,25 @@ mod tests {
         assert!(stream.resumed());
         assert_eq!(stream.start_offset(), 0);
 
+        // Compared without carriage returns: under load a macOS terminal
+        // whose output queue fills between the CR and LF of its newline
+        // translation can emit the CR twice. Every number, in order, is what
+        // shows nothing was skipped.
         let expected: Vec<u8> = (1..=400_000)
-            .flat_map(|n| format!("{n}\r\n").into_bytes())
+            .flat_map(|n| format!("{n}\n").into_bytes())
             .collect();
+        let mut text: Vec<u8> = Vec::with_capacity(expected.len());
         let mut received = Vec::with_capacity(expected.len());
         let mut run = Vec::new();
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        while received.len() < expected.len() {
+        while text.len() < expected.len() {
             assert!(std::time::Instant::now() < deadline, "stream stalled");
             // A reader far slower than `seq`, in small bites.
             match stream.next_run_into(Duration::from_millis(500), 16 << 10, &mut run) {
                 Ok(Some(at)) => {
                     assert_eq!(at, received.len() as u64, "frames are contiguous");
                     received.extend_from_slice(&run);
+                    text.extend(run.iter().filter(|&&byte| byte != b'\r'));
                 }
                 Ok(None) => {}
                 Err(error) => panic!(
@@ -2107,11 +2323,163 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(received == expected, "every byte, in order");
+        assert!(text == expected, "every byte, in order");
 
         client.kill_tree().expect("kill-tree");
         wait_until("holder finished", || server.is_finished());
         server.join().expect("join").expect("clean holder exit");
+    }
+
+    /// The Engine's parse can stall for longer than the Holder's patience on
+    /// a loaded machine: close to a second between reads was measured. A
+    /// program flooding meanwhile must be held, not run past the Engine, or
+    /// its output laps the log and the Engine resumes at the oldest kept byte.
+    #[test]
+    fn a_subscriber_stalled_past_the_patience_still_gets_every_byte() {
+        let root = tempfile::tempdir().unwrap();
+        // A quarter-megabyte log and ten times that printed as fast as `seq`
+        // can, so a program allowed to run free laps it many times over.
+        // It starts only once subscribed, and without echoing the go-ahead:
+        // `ready` says echo is off, since a go-ahead typed before `stty` ran
+        // would be echoed into the stream (a loaded machine can start the
+        // shell that late).
+        let mut spec = held(
+            root.path(),
+            "s_stall",
+            "stty -echo; echo ready; read go; seq 1 400000; exec sleep 30",
+        );
+        spec.disk_capacity = 256 << 10;
+        let client = HolderClient::new(&spec.socket_path);
+        let server = std::thread::spawn(move || HolderServer::run(spec));
+        wait_until("holder ready", || client.is_alive());
+
+        // Compared without carriage returns: under load a macOS terminal
+        // whose output queue fills between the CR and LF of its newline
+        // translation can emit the CR twice. Every number, in order, is what
+        // shows nothing was skipped.
+        let expected: Vec<u8> = std::iter::once(b"ready\n".to_vec())
+            .chain((1..=400_000).map(|n| format!("{n}\n").into_bytes()))
+            .flatten()
+            .collect();
+        let mut text: Vec<u8> = Vec::with_capacity(expected.len());
+        let mut received: Vec<u8> = Vec::with_capacity(expected.len());
+        let mut run = Vec::new();
+        let mut stream = client
+            .open_output_stream_from(0)
+            .expect("subscribe")
+            .expect("output stream supported");
+        assert_eq!(stream.start_offset(), 0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !text.starts_with(b"ready\n") {
+            assert!(std::time::Instant::now() < deadline, "shell never ready");
+            if let Some(at) = stream
+                .next_run_into(Duration::from_millis(500), 64 << 10, &mut run)
+                .expect("ready")
+            {
+                assert_eq!(at, received.len() as u64, "frames are contiguous");
+                received.extend_from_slice(&run);
+                text.extend(run.iter().filter(|&&byte| byte != b'\r'));
+            }
+        }
+        client.write(b"\n").expect("start the flood");
+        let mut stalls = 0;
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while text.len() < expected.len() {
+            assert!(std::time::Instant::now() < deadline, "stream stalled");
+            // Three parse passes that each take three patiences, spread
+            // through the flood.
+            if stalls < 3 && received.len() >= (stalls + 1) * (512 << 10) {
+                stalls += 1;
+                std::thread::sleep(OUTPUT_SEND_PATIENCE * 3);
+            }
+            match stream.next_run_into(Duration::from_millis(500), 64 << 10, &mut run) {
+                Ok(Some(at)) => {
+                    assert_eq!(at, received.len() as u64, "frames are contiguous");
+                    received.extend_from_slice(&run);
+                    text.extend(run.iter().filter(|&&byte| byte != b'\r'));
+                }
+                Ok(None) => {}
+                // What the Engine does when a subscription ends: subscribe
+                // again from the first byte it has not parsed.
+                Err(_) => {
+                    stream = client
+                        .open_output_stream_from(received.len() as u64)
+                        .expect("resubscribe")
+                        .expect("output stream supported");
+                    assert_eq!(
+                        stream.start_offset(),
+                        received.len() as u64,
+                        "the log rotated past the subscriber: output was skipped"
+                    );
+                }
+            }
+        }
+        assert_eq!(stalls, 3);
+        assert!(text == expected, "every byte, in order");
+
+        client.kill_tree().expect("kill-tree");
+        wait_until("holder finished", || server.is_finished());
+        server.join().expect("join").expect("clean holder exit");
+    }
+
+    /// Pacing is for an Engine that is still there. One that hangs up lets the
+    /// program run on into the log, and a session killed under a stalled one
+    /// still drains and exits — on macOS a killed leader cannot finish
+    /// exiting until its terminal has been read.
+    #[test]
+    fn a_paced_session_runs_on_when_its_engine_leaves_and_still_dies_when_killed() {
+        let root = tempfile::tempdir().unwrap();
+        let mut spec = held(
+            root.path(),
+            "s_paced",
+            "stty -echo; read go; while :; do printf '0123456789012345678901234567890123456789\\r\\n'; done",
+        );
+        spec.disk_capacity = 256 << 10;
+        let client = HolderClient::new(&spec.socket_path);
+        let server = std::thread::spawn(move || HolderServer::run(spec));
+        wait_until("holder ready", || client.is_alive());
+        let log_offset = || client.stat().expect("stat").log_offset;
+
+        // Subscribed, and never reading: once the queue and the socket are
+        // full, the program is held where it is.
+        let stalled = client
+            .open_output_stream()
+            .expect("subscribe")
+            .expect("output stream supported");
+        client.write(b"\n").expect("start the flood");
+        // Filling the queue, the socket and the PTY takes longer on a loaded
+        // machine, so the hold is found by waiting for the log to settle; a
+        // program running free never does, and passes the bound instead.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut held_at = log_offset();
+        loop {
+            std::thread::sleep(OUTPUT_SEND_PATIENCE * 2);
+            let now = log_offset();
+            if now == held_at {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the program ran past its Engine");
+            assert!(now < 8 << 20, "held only after {now} bytes");
+            held_at = now;
+        }
+        assert!(held_at < 8 << 20, "held only after {held_at} bytes");
+
+        // The Engine goes away: nothing is waited for any more.
+        drop(stalled);
+        wait_until("the program running free", || {
+            log_offset() > held_at + (4 << 20)
+        });
+
+        // Stalled again, and the session is closed meanwhile.
+        let stalled = client
+            .open_output_stream()
+            .expect("resubscribe")
+            .expect("output stream supported");
+        std::thread::sleep(OUTPUT_SEND_PATIENCE * 3);
+        client.kill_tree().expect("kill-tree");
+        wait_until("holder finished", || server.is_finished());
+        server.join().expect("join").expect("clean holder exit");
+        drop(stalled);
     }
 
     #[test]
@@ -2255,6 +2623,142 @@ mod tests {
         wait_until("holder finished", || server.is_finished());
         server.join().expect("join").expect("clean holder exit");
         wait_until("lanes gone", || live_lanes::count("s_lanes") == 0);
+    }
+
+    /// Reads every byte a subscriber is sent until `until` appears.
+    fn read_stream_until(stream: &mut crate::holder::HolderOutputStream, until: &[u8]) -> Vec<u8> {
+        let mut received = Vec::new();
+        let mut run = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !received.windows(until.len()).any(|window| window == until) {
+            assert!(Instant::now() < deadline, "stream stalled");
+            if let Some(at) = stream
+                .next_run_into(Duration::from_millis(200), 1 << 20, &mut run)
+                .expect("stream")
+            {
+                assert_eq!(at, received.len() as u64, "frames are contiguous");
+                received.extend_from_slice(&run);
+            }
+        }
+        received
+    }
+
+    /// A flood puts the pump to sleep in `read`, which drains a macOS PTY
+    /// faster than waiting in `poll`; the short read that ends it puts the
+    /// pump back in `poll`, where a silent session costs no wakeups and the
+    /// exit wake reaches it. Nothing is lost on either switch.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_flood_is_read_asleep_in_read_and_a_pause_returns_the_pump_to_poll() {
+        let root = tempfile::tempdir().unwrap();
+        // `cat` of a file outruns any reader, so every read finds the
+        // kernel's queue full; `seq` itself would trickle.
+        let lines = root.path().join("lines.txt");
+        let text: String = (1..=200_000).map(|n| format!("{n}\n")).collect();
+        std::fs::write(&lines, &text).unwrap();
+        let mut spec = held(
+            root.path(),
+            "s_stream",
+            &format!(
+                "cat '{}'; sleep 0.3; echo __PAUSE__; exec sleep 30",
+                lines.display()
+            ),
+        );
+        spec.disk_capacity = 64 << 20;
+        let client = HolderClient::new(&spec.socket_path);
+        let server = std::thread::spawn(move || HolderServer::run(spec));
+        wait_until("holder ready", || client.is_alive());
+        let mut stream = client
+            .open_output_stream_from(0)
+            .expect("subscribe")
+            .expect("output stream supported");
+        let shared = running("s_stream");
+
+        let received = read_stream_until(&mut stream, b"__PAUSE__\r\n");
+        // The macOS terminal driver itself repeats a `\r` where a write
+        // meets a full output queue, whoever reads it, so carriage returns
+        // are left out of the comparison; every other byte must be there.
+        let received: Vec<u8> = received.into_iter().filter(|&b| b != b'\r').collect();
+        let mut expected = text.into_bytes();
+        expected.extend_from_slice(b"__PAUSE__\n");
+        assert!(received == expected, "every byte, in order");
+        assert!(
+            shared.streaming_reads.load(Ordering::SeqCst) >= 1,
+            "a flood is read in blocking mode"
+        );
+        wait_until("pump back in poll", || !shared.read_mode.is_blocking());
+
+        let pump_before = shared.pump_wakeups.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            shared.pump_wakeups.load(Ordering::SeqCst),
+            pump_before,
+            "a paused session wakes nothing"
+        );
+
+        drop(shared);
+        client.kill_tree().expect("kill-tree");
+        wait_until("holder finished", || server.is_finished());
+        server.join().expect("join").expect("clean holder exit");
+    }
+
+    /// A pump asleep in `read` still delivers output at once, input still
+    /// gives up on a child that never reads it instead of waiting forever,
+    /// and the exit path still stops the pump.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_pump_asleep_in_read_still_echoes_bounds_input_and_sees_the_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let spec = held(root.path(), "s_forced", "exec cat");
+        FORCE_STREAMING_READS
+            .lock()
+            .expect("forced")
+            .push("s_forced".into());
+        let client = HolderClient::new(&spec.socket_path);
+        let server = std::thread::spawn(move || HolderServer::run(spec));
+        wait_until("holder ready", || client.is_alive());
+        let shared = running("s_forced");
+        wait_until("pump asleep in read", || shared.read_mode.is_blocking());
+
+        let mut stream = client
+            .open_output_stream()
+            .expect("subscribe")
+            .expect("output stream supported");
+        let started = Instant::now();
+        client.write(b"echo-me\n").expect("write");
+        // The terminal's echo, then `cat`'s own copy: only the second proves
+        // `sh` has become `cat`. A stop sent while `sh` is still exec'ing can
+        // be lost, leaving a `cat` that drains everything typed below.
+        read_stream_until(&mut stream, b"echo-me\r\necho-me");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(shared.read_mode.is_blocking(), "a write puts the flag back");
+
+        // Stop the reader of the input, then type far more than the kernel
+        // takes: the write has to give up rather than hold the PTY lock.
+        // The leader is `cat` itself (`exec cat`).
+        let cat = shared.child_pid;
+        // SAFETY: plain kill(2) on the child this test's session spawned.
+        unsafe { libc::kill(cat, libc::SIGSTOP) };
+        // A stop is delivered asynchronously: until `cat` has actually
+        // stopped it can still drain the input, and the write then succeeds.
+        wait_until("cat stopped", || {
+            std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &cat.to_string()])
+                .output()
+                .is_ok_and(|out| out.stdout.trim_ascii().starts_with(b"T"))
+        });
+        let started = Instant::now();
+        assert!(client.write(&b"x\n".repeat(128 << 10)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // SAFETY: as above.
+        unsafe { libc::kill(cat, libc::SIGCONT) };
+
+        drop(shared);
+        let started = Instant::now();
+        client.kill_tree().expect("kill-tree");
+        wait_until("holder finished", || server.is_finished());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        server.join().expect("join").expect("clean holder exit");
     }
 
     /// Closing a session must not wait out the SIGKILL grace just because

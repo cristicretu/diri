@@ -303,6 +303,108 @@ stored rows when only the oldest block is partial, and the deferred line index
 reserves exact capacity and tracks its extras' heap incrementally (the history
 bound measures storage after every eviction).
 
+## History kept is independent of read boundaries
+
+The history budget used to measure allocation capacities, the rows not yet
+sealed into a block as they stood when the bound ran, and the oldest block's
+decode index; and `Grid::bound_history_storage` lowered the row limit to the
+rows kept after an eviction until storage fell 1/16 below the budget. All of
+these depend on when the bound runs, which is once per read, so how much
+history a terminal kept depended on how its output was split into reads (a
+64 KiB-read parse and a byte-at-a-time parse of the same 64 MB differed by
+hundreds of rows). Capacities also never shrank as narrowed deferred lines were
+evicted, so narrowing deep wide-character history evicted most of it.
+
+`CompactRows::history_storage_bytes` now counts live bytes as a function of the
+history alone: index lengths instead of capacities, the unsealed rows as the
+full block they grow into between seals (once history exists), and not the
+decode index (a cache that exists only while full history recycles rows). The
+bound shrinks the block and deferred-line indexes when their capacity exceeds
+twice their length plus 64, so uncounted slack stays bounded. The row limit
+stays at the ceiling. The kept rows are then the newest that fit, whenever the
+bound runs. Tests: `bounded_history_does_not_depend_on_read_boundaries`, and
+`narrowing_deep_wide_character_history_keeps_it` in `diri-terminal-state`.
+
+## Cheaper history encoding
+
+History encoding was half of the session thread while output streamed. Four
+changes, measured on a 100 MB mixed log at 160 columns:
+
+- **Wide characters as pairs.** A run of wide characters alternated with their
+  spacers, so every CJK cell was its own run and its own style lookup. A run
+  whose code has the low bit set ("paired") now alternates wide characters of
+  its style with the exact spacers `Term::input` writes after them (same
+  colors, wide flag swapped for the spacer flag, a blank character, no extra
+  storage); each pair takes one character of text. Anything else (a spacer
+  with its own style or character, a lone spacer, a wide character with marks)
+  is encoded as before.
+- **Stored cells bounded by occupancy.** Finding a row's last non-default
+  cell scanned every blank column of a short line in a wide row. Every cell at
+  or after `Row::occ` equals the last cell, so `Row::content_len` starts at
+  `occ` when that cell and the one at `occ` are default cells. `Row::grow`
+  now counts the old columns as occupied when the last cell is not a default
+  cell (blanks a coloured template left), which keeps that rule true after a
+  widening; before, `Row::reset` left those coloured blanks behind on a
+  recycled line. Debug builds assert the rule wherever it is used.
+- **Style lookups in one probe.** A 32-slot direct-mapped cache sits in front
+  of the block's style table (a colored log cycles through more than the 16
+  styles the linear scan held), and styles with extra storage are found by
+  hash and comparison without cloning the cell.
+- **Fewer passes and allocations.** Runs and text are found in one walk per
+  row, the runs are written as they end (they stop where they cover the
+  stored cells, so no run count), and the style table follows the rows behind
+  a `u32` body length instead of being copied in front of them. The grapheme
+  break helpers that `Term::input` replays per joining codepoint are inlined.
+
+Payloads never leave the process, so the layout change needs no version. The
+layout is documented above `FxHasher` in `grid/compact.rs`.
+
+The spare rows a seal leaves for recycling are still released at every history
+bound by default. An owner that bounds history after every small read can keep
+them (`Grid::keep_history_spare_rows`) and release them once output goes quiet
+(`Grid::release_history_spare_rows`); otherwise most lines allocate and clear a
+fresh row. They stay uncounted, and at most one block of rows.
+
+Tests: `wide_character_pairs_round_trip_with_their_spacers`,
+`spare_rows_survive_history_bounds_until_released`,
+`a_coloured_line_widened_and_then_recycled_clears_its_old_columns` (fails
+before the `grow` change), and the existing randomized codec and storage
+tests, whose synthetic rows now keep the occupancy rule (`obey_occupancy`).
+
+## Fewer passes per printed cell
+
+Measured on a 107 MB log of plain, truecolor SGR and CJK lines (`feedbench`,
+64 KiB feeds): 14.4 G instructions before, 11.5 G after, for the same grid.
+
+- **`input_ascii` in one pass.** The segment used to be scanned for wide cells
+  and then written; now each cell is checked and written in the same loop
+  (`Row::write_from` raises occupancy only over the cells written, as indexing
+  each written range did). The ASCII charset skips the mapping call, and a
+  cell whose old and new extra storage are both empty skips the reference
+  count.
+- **Wide characters written as pairs.** `Term::write_wide_pair` writes a wide
+  character and its spacer with one row lookup, when neither cell belongs to
+  an earlier wide character (otherwise the old two `write_at_cursor` calls
+  clear its partner). `Handler::input_text` (from the vendored VTE) loops over
+  a run of characters beyond ASCII and takes that path for each wide
+  character that continues no cluster, without a call per character;
+  everything else goes to `input`.
+- **History encoding.** An ASCII run of one plain style is copied into the row
+  text through reserved capacity (`extend_ascii_run`), keeping the length out
+  of memory between characters. The payload, text, run and compressed-payload
+  buffers are reused across blocks (thread-local), and a block's bytes are
+  one exact-size `Arc<[u8]>` instead of a shrinking reallocation and a copy.
+- **LZ bounds checks.** `read_u32` is one checked load, and `match_length`
+  slices both runs once so its loops index without checks. Its result is
+  unchanged (`match_length_agrees_with_a_bytewise_scan`), so payloads are
+  byte-identical.
+
+Tests: `non_ascii_runs_match_per_character_input` compares `input_text` with
+`input` per character, with the second terminal writing wide characters the
+old way (`reference_wide_writes`), across wrapping, insert mode, charsets,
+hyperlinks, prompt marks, mode 2027, scroll regions and the alternate screen;
+`ascii_runs_match_per_character_input` covers the one-pass writer.
+
 ## Program colors: a generation, and RIS resets them
 
 `Term` keeps `colors_generation`, advanced whenever `set_color` or
@@ -312,3 +414,26 @@ OSC 4/10/11 changes no cell, so without it the host's change detection saw no
 change and never republished the screen. `reset_state` (RIS, `ESC c`) also
 clears every color a program set, as xterm and libghostty do; upstream kept
 them across `reset`. No wire, checkpoint or protocol change.
+
+## Styles with extra storage by hash map
+
+`StyleTable::extra_id` found a style with extra storage (combining marks, an
+underline color, a hyperlink) by a linear scan of every such style already in
+the block. Output where each cell carries different marks (`kitten
+__benchmark__`'s unique Unicode: a letter and three combining marks per cell)
+gives a block of 64 rows at 120 columns about 7,700 such styles, so sealing
+it compared about 30 million entries: the unique Unicode workload fell from
+about 47 to about 10 MB/s with "Cheaper history encoding".
+
+- The first style with each hash sits in an `FxHasher` map, found or claimed
+  in one probe; a later, different style with the same hash goes to a short
+  collision list that is searched by hash and comparison as before. Ids are
+  handed out in the same order, so payloads are byte-identical.
+- The table is kept, emptied, in a thread-local between blocks next to the
+  encoding buffers (`STYLE_SCRATCH`) and released with them, so a stream of
+  such blocks does not regrow its map and list each time. It is emptied
+  before it is put back, so it holds no cell's extra storage between blocks.
+
+Tests: `styles_with_extra_storage_are_told_apart_on_a_hash_collision`,
+`blocks_of_unique_combining_marks_round_trip_one_after_another`, and the
+existing randomized codec tests.

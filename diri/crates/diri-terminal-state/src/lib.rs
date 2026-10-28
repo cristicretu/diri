@@ -25,7 +25,7 @@ pub use program_status::{
     QUERY_REPLY as PROGRAM_STATUS_QUERY_REPLY,
 };
 
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::Dimensions;
@@ -426,17 +426,51 @@ impl Dimensions for Geometry {
     }
 }
 
-/// Collects the events the emulator emits. Only the title is interesting.
+/// Collects the events the emulator emits while it parses one read.
+///
+/// The title and the answers owed to the program must survive however much
+/// output one read carries: a bounded queue that drops when full lost the
+/// title a program set after a few dozen bells or mode toggles in the same
+/// read, and the replies to queries past the bound, so the final state
+/// depended on where reads happened to split. Events nothing reads (bells,
+/// mouse-cursor and blink notices) are not kept at all, the title keeps only
+/// its latest value, and replies are bounded by [`MAX_PENDING_EVENTS`] per
+/// parse, a backstop that no program answering its own queries reaches.
 #[derive(Clone)]
-struct Collector(SyncSender<Event>);
+struct Collector(Arc<Mutex<Inbox>>);
 
-const EVENT_QUEUE_CAPACITY: usize = 64;
+#[derive(Default)]
+struct Inbox {
+    /// The last title change since the previous drain.
+    title: Option<Event>,
+    /// Everything else that is answered, in order.
+    events: Vec<Event>,
+}
+
+/// Reply-producing events kept per drain; beyond it a flood of queries in
+/// one read goes unanswered rather than growing without bound.
+const MAX_PENDING_EVENTS: usize = 1 << 16;
 
 impl EventListener for Collector {
     fn send_event(&self, event: Event) {
-        // A full channel means nobody is draining it, which is not worth
-        // failing a session over.
-        let _ = self.0.try_send(event);
+        match event {
+            Event::Title(_) | Event::ResetTitle => {
+                self.0.lock().expect("terminal events").title = Some(event);
+            }
+            Event::PtyWrite(_)
+            | Event::TextAreaSizeRequest(_)
+            | Event::CellSizeRequest(_)
+            | Event::ColorRequest(..)
+            | Event::ColorSchemeRequest
+            | Event::InBandResize => {
+                let mut inbox = self.0.lock().expect("terminal events");
+                if inbox.events.len() < MAX_PENDING_EVENTS {
+                    inbox.events.push(event);
+                }
+            }
+            // Bells, mouse-cursor, blink and other notices: nothing reads them.
+            _ => {}
+        }
     }
 }
 
@@ -449,7 +483,9 @@ pub struct HeadlessScreen {
     keyboard_enhancements_known: bool,
     term: Term<Collector>,
     parser: Processor,
-    events: Receiver<Event>,
+    events: Arc<Mutex<Inbox>>,
+    /// Drained events, kept to reuse the allocation.
+    drained_events: Vec<Event>,
     geometry: Geometry,
 
     title: Option<String>,
@@ -516,6 +552,10 @@ pub struct HeadlessScreen {
     /// Whether the title moved since the last settle, tracked where it is
     /// assigned so no per-chunk clone is needed to notice.
     title_changed: bool,
+    /// Keep the rows history recycles for new lines from one read to the
+    /// next, until [`HeadlessScreen::release_idle_memory`]; see
+    /// [`HeadlessScreen::keeping_spare_rows_until_idle`].
+    keep_spare_rows: bool,
     /// The DECSCUSR cursor at the last settle. A program that only changes
     /// its cursor (neovim entering insert mode) must still advance
     /// `content_seq`, or the attach pump withholds the frame.
@@ -551,14 +591,14 @@ impl HeadlessScreen {
             cols: cols.max(1),
             rows: rows.max(1),
         };
-        let (sender, events) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+        let events = Arc::new(Mutex::new(Inbox::default()));
         let config = Config {
             kitty_keyboard,
             scrolling_history: history_line_limit(geometry.cols),
             default_cursor_style: DEFAULT_CURSOR,
             ..Config::default()
         };
-        let term = Term::new(config, &geometry, Collector(sender));
+        let term = Term::new(config, &geometry, Collector(Arc::clone(&events)));
         #[cfg(feature = "compact-history")]
         let term = {
             let mut term = term;
@@ -570,6 +610,7 @@ impl HeadlessScreen {
             term,
             parser: Processor::new(),
             events,
+            drained_events: Vec::new(),
             geometry,
             title: None,
             progress_state: None,
@@ -600,6 +641,7 @@ impl HeadlessScreen {
             palette: None,
             unsolicited: Vec::new(),
             title_changed: false,
+            keep_spare_rows: false,
             cursor_style: CursorStyle::default(),
             colors_generation: 0,
             last_cells: Vec::new(),
@@ -615,6 +657,27 @@ impl HeadlessScreen {
     pub fn with_notifications(mut self) -> Self {
         self.notifications = Some(Default::default());
         self
+    }
+
+    /// Keeps the rows that history recycles for new lines from one feed to
+    /// the next, for an owner that feeds every small read and calls
+    /// [`HeadlessScreen::release_idle_memory`] once output goes quiet.
+    ///
+    /// History seals rows into compressed blocks and reuses their cells for
+    /// the next lines. By default those spare rows are dropped after every
+    /// feed, so an idle terminal holds none; output arriving a kilobyte at a
+    /// time then allocates and clears a fresh row for most lines. Kept, they
+    /// cost at most one block of rows (128 KiB of cells) while output streams.
+    pub fn keeping_spare_rows_until_idle(mut self) -> Self {
+        self.keep_spare_rows = true;
+        self
+    }
+
+    /// Releases memory only streaming output needs (the spare rows kept by
+    /// [`HeadlessScreen::keeping_spare_rows_until_idle`]).
+    pub fn release_idle_memory(&mut self) {
+        #[cfg(feature = "compact-history")]
+        self.term.release_primary_history_spare_rows();
     }
 
     /// Opt in only where this screen is the terminal the program talks to
@@ -689,6 +752,7 @@ impl HeadlessScreen {
             reset.set_cell_pixels(cell_pixels.0, cell_pixels.1);
         }
         reset.image_replies_only = self.image_replies_only;
+        reset.keep_spare_rows = self.keep_spare_rows;
         if self.host_replies {
             let version = self
                 .term
@@ -832,12 +896,20 @@ impl HeadlessScreen {
     /// Parses all terminal bytes while excluding a replay prefix from product
     /// notifications. A partial historical OSC cannot leak into live output.
     pub fn feed_with_history(&mut self, bytes: &[u8], historical_bytes: usize) {
-        self.scan_progress(bytes);
+        // Colors and cursor moves are nearly every escape in bulk output. When
+        // they are the only ones, no side scanner below can find anything, so
+        // they are skipped instead of each looking at every escape.
+        let csi_only = only_csi_escapes(bytes);
+        if !(csi_only && self.progress_carry.is_empty()) {
+            self.scan_progress(bytes);
+        }
         if let Some(parser) = &mut self.notifications {
             if historical_bytes != 0 {
                 parser.reset_sequence();
             }
-            parser.feed(&bytes[historical_bytes.min(bytes.len())..]);
+            if !(csi_only && parser.is_idle()) {
+                parser.feed(&bytes[historical_bytes.min(bytes.len())..]);
+            }
             // An `OSC 7501` support query is answered ahead of the emulator's
             // replies for the same chunk. Programs detect support by sending
             // the query and then a device-attributes request, and read an
@@ -848,7 +920,7 @@ impl HeadlessScreen {
                 self.replies.append(&mut parser.replies);
             }
         }
-        self.advance_with_images(bytes, historical_bytes);
+        self.advance_with_images(bytes, historical_bytes, csi_only);
         self.settle();
     }
 
@@ -910,6 +982,8 @@ impl HeadlessScreen {
     fn settle(&mut self) {
         #[cfg(feature = "compact-history")]
         {
+            self.term
+                .keep_primary_history_spare_rows(self.keep_spare_rows);
             self.term
                 .bound_primary_history_storage(HISTORY_STORAGE_BUDGET_BYTES);
             // A limit a resize raised follows history back down (widening,
@@ -2186,7 +2260,13 @@ impl HeadlessScreen {
     }
 
     fn drain_events(&mut self) {
-        while let Ok(event) = self.events.try_recv() {
+        let mut drained = std::mem::take(&mut self.drained_events);
+        let title = {
+            let mut inbox = self.events.lock().expect("terminal events");
+            std::mem::swap(&mut inbox.events, &mut drained);
+            inbox.title.take()
+        };
+        for event in title.into_iter().chain(drained.drain(..)) {
             match event {
                 Event::Title(title) => {
                     let title = Some(title);
@@ -2261,6 +2341,7 @@ impl HeadlessScreen {
                 _ => {}
             }
         }
+        self.drained_events = drained;
     }
 
     /// Takes the answers owed to the child. The pump writes these to the PTY
@@ -2317,8 +2398,11 @@ impl HeadlessScreen {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let grid = self.term.grid();
         let source = &grid[Line(row as i32)];
-        let cells = &source[..];
-        let cells = &cells[..self.geometry.cols.min(cells.len())];
+        let width = self.geometry.cols.min(source.len());
+        // Default cells after the content add only their count, so a short
+        // line in a wide row hashes its text, not the blank rest of the row.
+        let content = source.content_len(Cell::is_default).min(width);
+        let cells = &source[..][..content];
         let mut state = RowHashState::default();
         let mut lanes = [
             0xcbf2_9ce4_8422_2325u64,
@@ -2344,7 +2428,7 @@ impl HeadlessScreen {
         for (offset, cell) in remainder.iter().enumerate() {
             lanes[offset] = fold_mix(lanes[offset], state.word(column + offset, cell));
         }
-        let mut digest = fold_mix(state.marks, cells.len() as u64);
+        let mut digest = fold_mix(state.marks, (width as u64) << 32 | content as u64);
         for lane in lanes {
             digest = fold_mix(digest, lane);
         }
@@ -2667,10 +2751,13 @@ struct RowHashState {
     /// Links and zero-width marks are rare; they fold into their own lane.
     marks: u64,
     previous_link: Option<alacritty_terminal::term::cell::Hyperlink>,
-    /// The wire style is derived only when the raw style changes, which
-    /// consecutive cells rarely do.
+    /// The wire style is derived only for a raw style not seen in the last
+    /// two: consecutive cells rarely change it, and a run of wide characters
+    /// alternates between the character's style and its spacer's.
     raw_style: u128,
     style_hash: u64,
+    other_raw_style: u128,
+    other_style_hash: u64,
 }
 
 impl Default for RowHashState {
@@ -2681,6 +2768,8 @@ impl Default for RowHashState {
             previous_link: None,
             raw_style: u128::MAX,
             style_hash: 0,
+            other_raw_style: u128::MAX,
+            other_style_hash: 0,
         }
     }
 }
@@ -2696,8 +2785,12 @@ impl RowHashState {
         }
         let raw = raw_style_key(cell);
         if raw != self.raw_style {
-            self.raw_style = raw;
-            self.style_hash = style_word(cell.flags, cell.fg, cell.bg);
+            std::mem::swap(&mut self.raw_style, &mut self.other_raw_style);
+            std::mem::swap(&mut self.style_hash, &mut self.other_style_hash);
+            if raw != self.raw_style {
+                self.raw_style = raw;
+                self.style_hash = style_word(cell.flags, cell.fg, cell.bg);
+            }
         }
         let character = cell.c;
         self.filled += usize::from(character != ' ' && character != '\0');
@@ -2898,6 +2991,37 @@ fn append_color(color: TermColor, foreground: bool, codes: &mut Vec<String>) {
     }
 }
 
+/// Whether every ESC in `bytes` introduces a CSI (`ESC [`), and the last
+/// byte is not an ESC whose next byte is still to come.
+///
+/// Eight bytes are tested at a time, each against its successor: a byte is
+/// an ESC not followed by `[` exactly where the masks below disagree.
+fn only_csi_escapes(bytes: &[u8]) -> bool {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const LOW: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    // The high bit of each byte of `word` that equals `byte`.
+    let equal = |word: u64, byte: u8| {
+        let t = word ^ (ONES * u64::from(byte));
+        !(((t & LOW).wrapping_add(LOW)) | t | LOW)
+    };
+    let mut at = 0;
+    while at + 9 <= bytes.len() {
+        let word = u64::from_le_bytes(bytes[at..at + 8].try_into().expect("eight bytes"));
+        let next = u64::from_le_bytes(bytes[at + 1..at + 9].try_into().expect("eight bytes"));
+        if equal(word, 0x1b) & !equal(next, b'[') != 0 {
+            return false;
+        }
+        at += 8;
+    }
+    while at < bytes.len() {
+        if bytes[at] == 0x1b && bytes.get(at + 1) != Some(&b'[') {
+            return false;
+        }
+        at += 1;
+    }
+    true
+}
+
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
         return None;
@@ -3013,6 +3137,83 @@ fn emulator_color(color: TermColor) -> Color {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn only_csi_escapes_matches_a_bytewise_check() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..20_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let length = (seed % 40) as usize;
+            let bytes: Vec<u8> = (0..length)
+                .map(|index| b"\x1b\x1b[[]_a\x9b"[(seed >> (index % 56)) as usize % 8])
+                .collect();
+            let expected = bytes
+                .iter()
+                .enumerate()
+                .all(|(index, &byte)| byte != 0x1b || bytes.get(index + 1) == Some(&b'['));
+            assert_eq!(super::only_csi_escapes(&bytes), expected, "{bytes:?}");
+        }
+    }
+
+    /// Chunks of colored output skip the progress, notification and image
+    /// scanners. Wherever the chunk boundaries fall, what they find must not
+    /// change.
+    #[test]
+    fn side_scanners_find_the_same_reports_however_output_is_split() {
+        let pieces: &[&[u8]] = &[
+            b"\x1b[31mred\x1b[0m ",
+            b"plain ",
+            b"\r\n",
+            b"\x1b]9;4;1;40\x07",
+            b"\x1b]9;4;2;70\x1b\\",
+            b"\x1b]9;done\x07",
+            b"\x1b]777;notify;title;body\x07",
+            b"\x1b]133;A\x07",
+            b"\x1b]133;D;0\x07",
+            b"\x1b_Ga=T,f=24,s=1,v=1;AAAA\x1b\\",
+            b"\x1b[38;2;1;2;3mx",
+            b"\x1b",
+        ];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let observe = |screen: &mut super::HeadlessScreen| {
+            (
+                screen.progress(),
+                screen.progress_reports(),
+                format!("{:?}", screen.take_notifications()),
+                screen.shell_phase(),
+                screen.take_replies(),
+                screen.lines(),
+            )
+        };
+        for _ in 0..200 {
+            let stream: Vec<u8> = (0..60)
+                .flat_map(|_| pieces[next() as usize % pieces.len()].iter().copied())
+                .collect();
+            let screen = || {
+                super::HeadlessScreen::new(30, 6)
+                    .with_notifications()
+                    .with_inline_images()
+            };
+            let mut whole = screen();
+            whole.feed(&stream);
+            let mut split = screen();
+            let mut at = 0;
+            while at < stream.len() {
+                let end = (at + 1 + next() as usize % 24).min(stream.len());
+                split.feed(&stream[at..end]);
+                at = end;
+            }
+            assert_eq!(observe(&mut split), observe(&mut whole), "{stream:?}");
+        }
+    }
+
+    #[test]
     fn keyboard_mode_only_changes_leave_cells_unchanged_and_reset_independently() {
         let mut screen = super::HeadlessScreen::new(20, 3);
         screen.feed(b"unchanged");
@@ -3111,6 +3312,27 @@ mod tests {
         fn take_fingerprinted_rows(&self) -> usize {
             self.fingerprinted_rows
                 .swap(0, std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[test]
+    fn fingerprints_see_cells_after_the_text() {
+        // Fingerprints hash a row's text and stop at its last non-default
+        // cell; whatever changes after the text must still change them.
+        let mut screen = HeadlessScreen::new(40, 3);
+        screen.feed(b"short");
+        let mut seq = screen.content_seq();
+        for change in [
+            &b"\x1b[1;30H\x1b[41m \x1b[0m"[..],
+            b"\x1b[1;30H ",
+            b"\x1b[1;40Hz",
+            b"\x1b[1;40H\x1b[K",
+            b"\x1b[1;20H\x1b]8;;https://example.invalid\x07 \x1b]8;;\x07",
+        ] {
+            screen.feed(change);
+            assert_ne!(screen.content_seq(), seq, "{change:?}");
+            seq = screen.content_seq();
+            screen.assert_fingerprints_current(0);
         }
     }
 
@@ -4160,6 +4382,57 @@ mod tests {
     #[cfg(feature = "compact-history")]
     fn line_number(text: &str) -> Option<usize> {
         text.rsplit_once("line ")?.1.get(..7)?.parse().ok()
+    }
+
+    /// Narrowing a deep history of wide-character lines re-wraps it rather
+    /// than evicting it. Its deferred line index used to count at capacity,
+    /// which evicting never gave back, so 150,000 rows became 73,777 here
+    /// (about 150 at 100,001 rows of 40-column CJK prose).
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn narrowing_deep_wide_character_history_keeps_it() {
+        const WIDE: &[char] = &['漢', '字', '行', '日', '本', '語', '中', '文', '書', '道'];
+        let line = |n: usize| {
+            // 36 wide characters after the number: two rows at 80 columns.
+            let text: String = (0..36)
+                .map(|i| WIDE[(n / 10 + i * 7 + n) % WIDE.len()])
+                .collect();
+            format!("line {n:07}{text}\r\n")
+        };
+        let mut screen = HeadlessScreen::new(80, 24);
+        let lines = 100_024;
+        let log: String = (0..lines).map(line).collect();
+        for chunk in log.as_bytes().chunks(64 * 1024) {
+            screen.feed(chunk);
+        }
+        let before = screen.history_rows();
+        assert!(before > 50_000, "{before} rows before narrowing");
+        screen.resize(40, 24);
+        let after = screen.history_rows();
+        assert!(
+            after >= before,
+            "{before} rows became {after} after narrowing"
+        );
+        assert!(screen.history_storage_bytes() <= HISTORY_STORAGE_BUDGET_BYTES);
+        // More output keeps it: lines evict in proportion.
+        let more: String = (lines..lines + 2_000).map(line).collect();
+        screen.feed(more.as_bytes());
+        assert!(
+            screen.history_rows() + 4_000 >= after,
+            "{} rows",
+            screen.history_rows()
+        );
+        // The newest history line is one of those just above the screen.
+        let rows = screen.history_rows() as i64;
+        let newest = history_text(&mut screen, rows - 4, 4)
+            .iter()
+            .filter_map(|text| text.strip_prefix("line ")?.get(..7)?.parse::<usize>().ok())
+            .max();
+        let newest = newest.expect("numbered history rows");
+        assert!(
+            (lines + 2_000 - 24..lines + 2_000).contains(&newest),
+            "newest history line {newest}"
+        );
     }
 
     #[cfg(feature = "compact-history")]

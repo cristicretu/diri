@@ -236,6 +236,58 @@ impl LastCommandOutput {
     }
 }
 
+/// Finds the same output as [`LastCommandOutput`] over the whole history
+/// while reading it backward from the live end, page by page, so the read
+/// stops a page or two above the newest finished command instead of
+/// covering every retained row.
+///
+/// After each page the rows held so far are read forward. Any output found
+/// there is the newest one overall: a newer output would have to start above
+/// these rows, but the end found here closes every output started before it.
+/// When nothing is found, rows below the topmost held prompt can no longer
+/// matter (an output that crossed that prompt was abandoned by it), so only
+/// rows up to that prompt row are kept. That bounds what is held to about
+/// one command's rows.
+#[derive(Default)]
+pub struct NewestCommandOutput {
+    /// Held rows in reading order, the first one being the topmost read.
+    rows: std::collections::VecDeque<(Vec<GridCell>, Option<RowMetadata>)>,
+    cells: usize,
+}
+
+impl NewestCommandOutput {
+    /// Feeds the page of rows directly above every row fed so far, in
+    /// reading order. Returns the newest finished output once it is known.
+    pub fn push_page_above(
+        &mut self,
+        page: impl DoubleEndedIterator<Item = (Vec<GridCell>, Option<RowMetadata>)>,
+    ) -> Option<OutputRows> {
+        for row in page.rev() {
+            self.cells += row.0.len();
+            self.rows.push_front(row);
+        }
+        let mut last = LastCommandOutput::default();
+        for (cells, metadata) in &self.rows {
+            last.push_row(cells, metadata.as_ref());
+        }
+        if let Some(output) = last.finish() {
+            return Some(output);
+        }
+        if let Some(prompt) = self.rows.iter().position(|(cells, _)| starts_prompt(cells)) {
+            for (cells, _) in self.rows.drain(prompt + 1..) {
+                self.cells -= cells.len();
+            }
+        }
+        None
+    }
+
+    /// Cells held between pages, to bound the read.
+    #[must_use]
+    pub fn held_cells(&self) -> usize {
+        self.cells
+    }
+}
+
 /// Columns `start..end` of a row. Cells before `start` become empty cells
 /// (scalar 0, which text export skips) so grapheme columns in the metadata
 /// stay valid.
@@ -259,6 +311,95 @@ fn cut(
         last.style = TermStyle::from_bits_retain(last.style.bits() & !TermStyle::SOFT_WRAP.bits());
     }
     (row, metadata.cloned())
+}
+
+/// What the line under the cursor is, read from the OSC 133 marks on the
+/// screen. Decides whether typing a command there runs it in the shell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptLine {
+    /// A shell prompt whose input start (`B`) is marked and has nothing
+    /// typed before the cursor.
+    Empty,
+    /// A marked prompt with text typed after its input start.
+    Typed,
+    /// A shell prompt (`A`, or the last command's `D`) with no input-start
+    /// mark, so typed text cannot be told from the prompt (fish).
+    Unknown,
+    /// A command line is running (`C` with no `D` since).
+    Busy,
+    /// No marks on screen before the cursor.
+    Unmarked,
+}
+
+/// Reads [`PromptLine`] backwards from the cursor through the screen rows.
+/// The cursor's own cell counts for its marks, not its text: an empty
+/// prompt parks the cursor on the cell its `B` was written to. A prompt
+/// drawn inside a running command line (fish's `read`: `C`, then `A` with
+/// no `D`) is that command asking for input, so it reads as busy.
+pub fn prompt_line<'a>(
+    cursor_row: usize,
+    cursor_col: usize,
+    row: impl Fn(usize) -> Option<&'a [GridCell]>,
+) -> PromptLine {
+    let mut typed = false;
+    // The prompt's verdict, once its `B` or `A` is found, and whether its
+    // `A` has been passed yet.
+    let mut verdict: Option<PromptLine> = None;
+    let mut passed_prompt_start = false;
+    for line in (0..=cursor_row).rev() {
+        let Some(cells) = row(line) else {
+            break;
+        };
+        let end = if line == cursor_row {
+            (cursor_col + 1).min(cells.len())
+        } else {
+            cells.len()
+        };
+        for (col, cell) in cells[..end].iter().enumerate().rev() {
+            let style = cell.style;
+            let ended = style.command_end().is_some();
+            let prompt = style.contains(TermStyle::PROMPT_START);
+            let output = style.contains(TermStyle::OUTPUT_START);
+            let Some(found) = verdict else {
+                let before_cursor = line < cursor_row || col < cursor_col;
+                if before_cursor && cell.scalar != 0 && cell.scalar != u32::from(' ') {
+                    typed = true;
+                }
+                if style.contains(TermStyle::INPUT_START) {
+                    verdict = Some(if typed {
+                        PromptLine::Typed
+                    } else {
+                        PromptLine::Empty
+                    });
+                } else if prompt || ended {
+                    verdict = Some(PromptLine::Unknown);
+                    passed_prompt_start = true;
+                } else if output {
+                    return PromptLine::Busy;
+                }
+                if verdict.is_some() && ended {
+                    return verdict.unwrap_or(PromptLine::Unmarked);
+                }
+                continue;
+            };
+            if !passed_prompt_start {
+                if prompt {
+                    passed_prompt_start = true;
+                    if ended {
+                        return found;
+                    }
+                }
+                continue;
+            }
+            if output && !ended && !prompt {
+                return PromptLine::Busy;
+            }
+            if output || ended || prompt {
+                return found;
+            }
+        }
+    }
+    verdict.unwrap_or(PromptLine::Unmarked)
 }
 
 #[cfg(test)]
@@ -285,6 +426,7 @@ mod tests {
                         assert_eq!(chars.next(), Some('}'));
                         pending |= match mark {
                             'A' => TermStyle::PROMPT_START,
+                            'B' => TermStyle::INPUT_START,
                             'C' => TermStyle::OUTPUT_START,
                             '0' => TermStyle::COMMAND_SUCCEEDED,
                             '1' => TermStyle::COMMAND_FAILED,
@@ -405,6 +547,145 @@ mod tests {
         assert_eq!(output.rows.len(), 2, "the end's own row holds no output");
         assert_eq!(output.rows[0].0[0].scalar, u32::from('a'));
     }
+
+    fn prompt_at(lines: &[&str], row: usize, col: usize) -> PromptLine {
+        let rows = rows(lines);
+        prompt_line(row, col, |line| rows.get(line).map(Vec::as_slice))
+    }
+
+    #[test]
+    fn a_marked_empty_prompt_is_ready_for_a_command() {
+        // bash/zsh with shell integration: A, prompt text, B where input
+        // starts; the cursor sits on the B cell.
+        assert_eq!(prompt_at(&["{A}~/w $ {B}"], 0, 8), PromptLine::Empty);
+        // A finished command above does not matter; the new prompt does.
+        let screen = ["{A}$ {B}ls", "{C}a b", "{0}{A}$ {B}"];
+        assert_eq!(prompt_at(&screen, 2, 2), PromptLine::Empty);
+        // A two-line prompt: A on the line above, B on the cursor's line.
+        assert_eq!(
+            prompt_at(&["{A}~/w main", "> {B}"], 1, 2),
+            PromptLine::Empty
+        );
+    }
+
+    #[test]
+    fn typed_text_at_a_marked_prompt_is_not_overwritten() {
+        assert_eq!(prompt_at(&["{A}$ {B}git st"], 0, 8), PromptLine::Typed);
+        // Text after the cursor alone (an autosuggestion) is not typed.
+        assert_eq!(prompt_at(&["{A}$ {B}git status"], 0, 2), PromptLine::Empty);
+    }
+
+    #[test]
+    fn fish_prompts_without_an_input_mark_are_unknown() {
+        assert_eq!(prompt_at(&["{0}{A}~/w> "], 0, 5), PromptLine::Unknown);
+        assert_eq!(prompt_at(&["{A}~/w> echo"], 0, 9), PromptLine::Unknown);
+    }
+
+    #[test]
+    fn a_running_command_or_unmarked_screen_is_refused() {
+        let running = ["{A}$ {B}vim", "{C}~", "~"];
+        assert_eq!(prompt_at(&running, 2, 1), PromptLine::Busy);
+        // An agent started from the shell is a running command line.
+        assert_eq!(
+            prompt_at(&["{A}$ {B}claude", "{C}> "], 1, 2),
+            PromptLine::Busy
+        );
+        assert_eq!(
+            prompt_at(&["plain output", "$ "], 1, 2),
+            PromptLine::Unmarked
+        );
+        // fish's `read` inside a running command: `A` after `C`, no `D`.
+        let read = ["{A}~> {C}read x", "{A}read> "];
+        assert_eq!(prompt_at(&read, 1, 6), PromptLine::Busy);
+        // The same prompt after the command ended is the shell's own.
+        let idle = ["{A}~> {C}true", "{0}{A}~> "];
+        assert_eq!(prompt_at(&idle, 1, 3), PromptLine::Unknown);
+    }
+
+    #[test]
+    fn the_newest_output_read_backward_matches_a_full_forward_read() {
+        let histories: Vec<Vec<Vec<GridCell>>> = vec![
+            session(),
+            rows(&["{A}$ ls", "{C}a", "b", "{0}{A}$"]),
+            // The newest end has no output of its own (an empty command),
+            // so the answer is the older one.
+            rows(&["{A}$ ls", "{C}a", "b", "{0}{A}$", "{?}{A}$", "{?}{A}$", ""]),
+            // An output abandoned by a prompt before it ended.
+            rows(&["{A}$ cat", "{C}one", "two", "{0}{A}$ x", "{C}lost", "{A}$"]),
+            // A whole command on one row, then a long running one.
+            rows(&[
+                "{A}$ x{C}out{0}",
+                "{A}$ make",
+                "{C}building",
+                "more",
+                "more",
+            ]),
+            // No finished command at all.
+            rows(&["{A}$ make", "{C}building", "more"]),
+            rows(&["plain", "text"]),
+            rows(&[]),
+        ];
+        for history in &histories {
+            let mut forward = LastCommandOutput::default();
+            for row in history {
+                forward.push_row(row, None);
+            }
+            let expected = forward.finish();
+            for page in 1..=history.len().max(1) {
+                let mut backward = NewestCommandOutput::default();
+                let mut end = history.len();
+                let mut found = None;
+                while end > 0 && found.is_none() {
+                    let first = end.saturating_sub(page);
+                    found = backward
+                        .push_page_above(history[first..end].iter().map(|row| (row.clone(), None)));
+                    end = first;
+                }
+                assert_eq!(found, expected, "page {page} of {history:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_backward_read_stops_near_the_newest_command_and_holds_little() {
+        let mut history = vec![];
+        for _ in 0..1_000 {
+            history.extend(rows(&["{A}$ ls", "{C}a", "b"]));
+            history.extend(rows(&["{0}"]));
+        }
+        history.extend(rows(&["{A}$ make", "{C}building", "more"]));
+        let mut backward = NewestCommandOutput::default();
+        let mut end = history.len();
+        let mut read = 0;
+        let output = loop {
+            let first = end.saturating_sub(2);
+            read += end - first;
+            if let Some(output) =
+                backward.push_page_above(history[first..end].iter().map(|row| (row.clone(), None)))
+            {
+                break output;
+            }
+            end = first;
+        };
+        assert_eq!(output.rows.len(), 2);
+        assert!(read <= 8, "read {read} of {} rows", history.len());
+
+        // With no finished command, what is held stays one command's rows.
+        let mut backward = NewestCommandOutput::default();
+        for _ in 0..1_000 {
+            assert!(
+                backward
+                    .push_page_above(
+                        rows(&["{A}$ sleep", "{C}waiting"])
+                            .into_iter()
+                            .map(|row| (row, None))
+                    )
+                    .is_none()
+            );
+            assert!(backward.held_cells() <= 2 * 12);
+        }
+    }
+
     #[test]
     fn the_nearest_prompt_is_read_outward_and_never_guessed() {
         let session = session();
