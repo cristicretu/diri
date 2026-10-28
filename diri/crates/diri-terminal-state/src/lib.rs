@@ -16,6 +16,7 @@
 #[cfg(feature = "core-v2")]
 pub mod core_v2;
 mod emulator;
+mod find_history;
 mod inline_images;
 mod notifications;
 mod program_status;
@@ -23,6 +24,7 @@ mod program_status;
 /// verification only).
 #[cfg(feature = "bench-verify")]
 pub use alacritty_terminal::vte::observe as osc_observe;
+pub use find_history::HistorySearch;
 pub use inline_images::{
     DEFAULT_CELL_PIXELS, STORE_BUDGET_BYTES as INLINE_IMAGE_BUDGET_BYTES, StoredImage,
 };

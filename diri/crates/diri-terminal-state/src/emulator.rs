@@ -144,6 +144,10 @@ pub(crate) trait Emulator: Handler + Sized {
 
     /// Rows above the visible screen on the active screen.
     fn history_rows(&self) -> usize;
+    /// Rows that have left the active screen's history from its oldest end,
+    /// so `history_origin() + row` names a history row stably while output
+    /// evicts older ones.
+    fn history_origin(&self) -> u64;
     /// History rows of the primary screen, also while the alternate one shows.
     #[cfg(feature = "compact-history")]
     fn primary_history_rows(&self) -> usize;
@@ -401,6 +405,11 @@ impl Emulator for Term<Collector> {
     #[inline]
     fn history_rows(&self) -> usize {
         self.grid().history_size()
+    }
+
+    #[inline]
+    fn history_origin(&self) -> u64 {
+        self.grid().history_origin()
     }
 
     #[cfg(feature = "compact-history")]
