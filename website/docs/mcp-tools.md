@@ -59,7 +59,7 @@ Park or revive an authorized session without losing it: hibernate freezes its wh
 
 ### `release_agent`
 
-Terminate an authorized agent session. Delegated agents may release direct children; root agents may release sessions in their project. The caller and its ancestors are protected.
+Terminate an authorized agent session. Delegated agents may release direct children; root agents may release sessions in their project and their direct children anywhere. The caller and its ancestors are protected.
 
 | Argument | Type | Notes |
 | --- | --- | --- |
