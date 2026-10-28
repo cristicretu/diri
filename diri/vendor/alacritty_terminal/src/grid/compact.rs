@@ -333,6 +333,13 @@ impl<T> Lines<T> {
             + self.extra_heap
     }
 
+    /// `heap_bytes` with the line indexes at their lengths.
+    fn live_bytes(&self) -> usize {
+        self.packed.len() * std::mem::size_of::<PackedLine>()
+            + self.extras.len() * std::mem::size_of::<LineExtra<T>>()
+            + self.extra_heap
+    }
+
     /// Recompute `extra_heap` after extras were changed in place.
     fn recount_heap(&mut self) {
         self.extra_heap = self.extras.iter().map(LineExtra::heap_bytes).sum();
@@ -424,6 +431,22 @@ impl<T> Deferred<T> {
             previous = ptr;
         }
         (rows, payload, eager)
+    }
+
+    /// Give back index capacity that evicted lines left behind, which the
+    /// history budget does not count.
+    fn shrink_evicted(&mut self) {
+        debug_assert!(self.lines.heap_bytes() >= self.lines.live_bytes());
+        let slack = |len: usize| len.saturating_mul(2).saturating_add(64);
+        if self.lines.packed.capacity() > slack(self.lines.packed.len()) {
+            self.lines.packed.shrink_to_fit();
+        }
+        if self.lines.extras.capacity() > slack(self.lines.extras.len()) {
+            self.lines.extras.shrink_to_fit();
+        }
+        if self.sources.capacity() > slack(self.sources.len()) {
+            self.sources.shrink_to_fit();
+        }
     }
 
     fn recount(&mut self) {
@@ -1173,31 +1196,37 @@ impl<T> CompactRows<T> {
             }
             None => self.stored_payload_bytes(),
         };
-        let evict_cache = self.evict_cache.as_ref().map_or(0, |cache| {
-            std::mem::size_of::<EvictCache<T>>()
-                + cache.index.raw.capacity()
-                + cache.index.rows.capacity() * std::mem::size_of::<usize>()
-                + cache.index.styles.capacity() * std::mem::size_of::<T>()
-        });
+        // Live bytes, as a function of the history alone, so the rows kept
+        // never depend on when the bound runs (after every read, whatever its
+        // size): indexes count their lengths, not their capacities (bounds
+        // shrink those, see `bound_history_bytes`), and rows not yet sealed
+        // into a block count as the full block they grow into between seals.
+        // The oldest block's decode index, a cache that exists while full
+        // history recycles rows, is not counted.
         let deferred = self.deferred.as_ref().map_or(0, |deferred| {
             std::mem::size_of::<Deferred<T>>()
                 + deferred.payload
-                + deferred.sources.capacity() * std::mem::size_of::<Block<T>>()
-                + deferred.lines.heap_bytes()
+                + deferred.sources.len() * std::mem::size_of::<Block<T>>()
+                + deferred.lines.live_bytes()
                 + deferred.eager_cells * std::mem::size_of::<T>()
         });
+        let unsealed = self.recent.len().saturating_sub(self.visible);
+        let unsealed_bytes = if self.blocks.is_empty() && self.deferred.is_none() {
+            // No history to evict yet: count only what exists.
+            self.recent.iter().skip(self.visible).map(row_bytes).sum()
+        } else if unsealed < self.block_rows {
+            self.recent
+                .front()
+                .map_or(0, |row| self.block_rows * row_bytes(row))
+        } else {
+            self.recent.iter().skip(self.visible).map(row_bytes).sum()
+        };
+        let row_structs = self.recent.len().max(self.visible + self.block_rows) + self.oldest.len();
         payload
-            + evict_cache
             + deferred
-            + self.blocks.capacity() * std::mem::size_of::<Block<T>>()
-            + self.recent.capacity() * std::mem::size_of::<Row<T>>()
-            + self.oldest.capacity() * std::mem::size_of::<Row<T>>()
-            + self
-                .recent
-                .iter()
-                .skip(self.visible)
-                .map(row_bytes)
-                .sum::<usize>()
+            + self.blocks.len() * std::mem::size_of::<Block<T>>()
+            + row_structs * std::mem::size_of::<Row<T>>()
+            + unsealed_bytes
             + self.oldest.iter().map(row_bytes).sum::<usize>()
     }
 
@@ -1244,9 +1273,13 @@ impl<T> CompactRows<T> {
                 self.len -= 1;
             }
         }
-        // Do not retain a large block-index allocation after erasing history.
+        // Do not retain large index allocations after erasing history: the
+        // budget counts their lengths.
         if self.blocks.capacity() > self.blocks.len().saturating_mul(2).saturating_add(64) {
             self.blocks.shrink_to_fit();
+        }
+        if let Some(deferred) = &mut self.deferred {
+            deferred.shrink_evicted();
         }
         self.needs_maintenance = false;
         self.last_budget = budget;
@@ -3949,6 +3982,62 @@ mod tests {
 
     /// Everything a reader can observe: history length, cursors and every
     /// row, compared with dense storage.
+    /// Retained history is a function of the output alone: bounding it after
+    /// every byte or after every 64 KiB read keeps the same rows. Terminals
+    /// bound history once per read, and read sizes vary from run to run.
+    #[test]
+    fn bounded_history_does_not_depend_on_read_boundaries() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Lines of varied length and compressibility, some coloured, some
+        // wrapping, so blocks differ in size.
+        let mut text = Vec::new();
+        let mut line = 0;
+        while text.len() < 3 << 20 {
+            let len = (next() % 150) as usize;
+            if next() % 4 == 0 {
+                text.extend_from_slice(format!("\x1b[3{}m", next() % 8).as_bytes());
+            }
+            for _ in 0..len {
+                let byte = if next() % 3 == 0 {
+                    b'a' + (line % 26) as u8
+                } else {
+                    b' ' + (next() % 95) as u8
+                };
+                text.push(byte);
+            }
+            text.extend_from_slice(b"\x1b[0m\r\n");
+            line += 1;
+        }
+        let budget = 192 * 1024;
+        let config = Config {
+            scrolling_history: 150_000,
+            ..Config::default()
+        };
+        let parse = |read: usize| {
+            let mut term = Term::new(config.clone(), &Size, VoidListener);
+            term.grid_mut().enable_compact_history();
+            let mut parser: Processor = Processor::new();
+            for chunk in text.chunks(read) {
+                parser.advance(&mut term, chunk);
+                term.bound_primary_history_storage(budget);
+            }
+            term
+        };
+        let mut whole = parse(64 << 10);
+        let bytes = parse(1);
+        assert!(bytes.grid().history_size() > 1000);
+        same_as_dense(&mut whole, &bytes, "64 KiB reads vs single bytes");
+        // Nor on reads that happen to align with neither.
+        let mut odd = parse(4093);
+        same_as_dense(&mut odd, &bytes, "4093-byte reads vs single bytes");
+    }
+
     fn same_as_dense(actual: &mut Term<VoidListener>, expected: &Term<VoidListener>, step: &str) {
         let (a, e) = (actual.grid(), expected.grid());
         assert_eq!(a.history_size(), e.history_size(), "history after {step}");
