@@ -806,7 +806,10 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                     performer.print(c);
 
                     self.partial_utf8_len = 0;
-                    return valid_bytes - old_bytes;
+                    // Only the first character's bytes are consumed. The
+                    // valid bytes after it (an ASCII letter, say) are parsed
+                    // again from `bytes`; counting them here skipped them.
+                    return c.len_utf8() - old_bytes;
                 }
 
                 match err.error_len() {
@@ -1833,6 +1836,28 @@ mod tests {
         assert_eq!(dispatcher.dispatched.len(), 2);
         assert_eq!(dispatcher.dispatched[0], Sequence::Print('ĸ'));
         assert_eq!(dispatcher.dispatched[1], Sequence::Print('🎉'));
+    }
+
+    #[test]
+    fn partial_utf8_then_ascii_then_partial_utf8() {
+        // A read ending inside "\u{301}", the next read holding the rest of
+        // it, an ASCII letter and the start of another multi-byte character:
+        // the letter must be printed, not counted as part of the first.
+        const INPUT: &[u8] = b"e\xCC\x81a\xCC\x88b";
+
+        for split in 1..INPUT.len() {
+            let mut dispatcher = Dispatcher::default();
+            let mut parser = Parser::new();
+
+            parser.advance(&mut dispatcher, &INPUT[..split]);
+            parser.advance(&mut dispatcher, &INPUT[split..]);
+
+            assert_eq!(
+                dispatcher.dispatched,
+                ['e', '\u{301}', 'a', '\u{308}', 'b'].map(Sequence::Print),
+                "split at {split}"
+            );
+        }
     }
 
     #[test]

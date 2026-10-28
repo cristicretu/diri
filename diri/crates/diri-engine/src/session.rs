@@ -493,6 +493,10 @@ struct Shared {
     /// line question is only read off the screen once it has caught up
     /// with what the Holder had written when it answered.
     held_screen_offset: AtomicU64,
+    /// Output bytes a held pump has handed to `screen`, exit markers
+    /// excluded. Benches and tests compare it with what the child wrote, so
+    /// a read loop that skips anything cannot report a number.
+    held_parsed_bytes: AtomicU64,
     /// Set while the held pump is waiting out the redraw of a repaint whose
     /// erase is already in `screen`. The pump publishes when it ends; anyone
     /// else waking clients meanwhile would show them the erased screen.
@@ -2709,6 +2713,20 @@ impl Session {
         self.shared.child_pid.load(Ordering::SeqCst)
     }
 
+    /// Output bytes a held pump has fed to the emulator so far, exit markers
+    /// excluded. For benches and tests that prove every byte was parsed.
+    #[doc(hidden)]
+    pub fn parsed_output_bytes(&self) -> u64 {
+        self.shared.held_parsed_bytes.load(Ordering::SeqCst)
+    }
+
+    /// Runs `inspect` on the local emulator under its lock. For benches and
+    /// tests that compare the Engine's terminal with a reference parse.
+    #[doc(hidden)]
+    pub fn inspect_screen<R>(&self, inspect: impl FnOnce(&mut HeadlessScreen) -> R) -> R {
+        inspect(&mut self.shared.screen.lock().expect("screen"))
+    }
+
     pub fn screen_size(&self) -> (usize, usize) {
         if let Some(remote) = self
             .shared
@@ -3057,9 +3075,10 @@ impl Session {
         if bytes.is_empty() {
             return Ok(());
         }
-        // Raw: a wheel is not a keystroke, and must not look like user typing
-        // to the status reducer.
-        self.write_raw(&bytes)
+        // A wheel is not a keystroke and must not look like user typing to
+        // the status reducer, but the program's redraw in answer to it is
+        // interactive output: publish it at once like a click's.
+        self.write_mouse(&bytes)
     }
 
     pub fn read_scrollback(&self) -> diri_proto::ReadScrollbackResult {
@@ -3848,6 +3867,7 @@ fn new_shared(
         remote_grid: Mutex::new(None),
         remote_output_offset: AtomicU64::new(0),
         held_screen_offset: AtomicU64::new(0),
+        held_parsed_bytes: AtomicU64::new(0),
         awaiting_redraw: AtomicBool::new(false),
         grid_wake: GridWake::for_agent(&spec.manifest_id),
         agent: spec.manifest_id.clone(),
@@ -6983,6 +7003,9 @@ fn held_turn(state: Box<HeldPump>, mut resumed: bool, may_park: bool) -> HeldTur
                 }
                 let synchronized = screen.synchronized_updates_completed();
                 screen.feed_with_history(output, historical_bytes);
+                shared
+                    .held_parsed_bytes
+                    .fetch_add(output.len() as u64, Ordering::Relaxed);
                 let complete = screen.synchronized_updates_completed() != synchronized
                     && !screen.in_synchronized_update();
                 let lost = batch_filled.is_some_and(|before| screen.filled_cells() < before);
