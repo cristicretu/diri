@@ -14,7 +14,9 @@ use gpui::{
 
 use crate::blocks::BlockGlyph;
 use crate::buffer::{ApplySummary, ChangedRenderRow, GridBuffer};
-use crate::cursor_motion::{CursorCell, CursorDamage, CursorDriver, CursorFrame, CursorSchedule};
+use crate::cursor_motion::{
+    CursorCell, CursorDamage, CursorDriver, CursorFrame, CursorPreferences, CursorSchedule,
+};
 use crate::find::{
     FindSnapshot, FindSpan, NavigationTarget, SearchJob, SearchRequest, SearchResult,
     TerminalFindModel,
@@ -108,6 +110,7 @@ pub struct TerminalElement {
     hovered_reference: Option<ReferenceHit>,
     reduce_motion: bool,
     cursor_hidden: bool,
+    cursor_preferences: CursorPreferences,
 }
 
 /// Selection and reading state only: deliberately does not retain an input
@@ -831,6 +834,7 @@ impl TerminalElement {
             suspended: false,
             hovered_reference: None,
             reduce_motion: false,
+            cursor_preferences: CursorPreferences::default(),
             cursor_hidden: false,
         }
     }
@@ -966,6 +970,14 @@ impl TerminalElement {
     #[must_use]
     pub fn reduce_motion(mut self, reduce_motion: bool) -> Self {
         self.reduce_motion = reduce_motion;
+        self
+    }
+
+    /// The user's cursor shape, blink speed, and whether programs may
+    /// change the shape.
+    #[must_use]
+    pub fn cursor_preferences(mut self, preferences: CursorPreferences) -> Self {
+        self.cursor_preferences = preferences;
         self
     }
 
@@ -2034,6 +2046,7 @@ impl TerminalElement {
             return None;
         };
         driver.motion.set_steady(cursor.steady);
+        driver.motion.set_blink(self.cursor_preferences.blink);
         let cell = CursorCell {
             col: cursor.col,
             row: cursor.row,
@@ -2802,7 +2815,8 @@ impl Element for TerminalElement {
                 .as_ref()
                 .and_then(|row| tint_at(&row.tints, usize::from(cursor.col)));
             let (cursor_fill, cursor_text) = self.theme.cursor_colors(cell, cursor_tint);
-            let shape = cursor.style.shape;
+            let style = self.cursor_preferences.resolve(cursor.style);
+            let shape = style.shape;
             let block = shape == CursorShape::Block;
             // A bar or underline glyph is drawn by the row itself.
             let visible = block && self.theme.resolve_cell(cell).visible;
@@ -2839,7 +2853,7 @@ impl Element for TerminalElement {
                 frame: CursorFrame::REST,
                 covered: Vec::new(),
                 shape,
-                steady: cursor.style.steady,
+                steady: style.steady,
             })
         } else {
             None

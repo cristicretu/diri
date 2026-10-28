@@ -4860,13 +4860,11 @@ impl TerminalPane {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.reset_qol_session(&session.id);
-        let hide_pointer = self
-            .runtime
-            .store
-            .read()
-            .expect("store")
-            .preferences()
-            .terminal_hide_pointer;
+        let (hide_pointer, cursor_preferences) = {
+            let store = self.runtime.store.read().expect("store");
+            let prefs = store.preferences();
+            (prefs.terminal_hide_pointer, prefs.cursor_preferences())
+        };
         if self.focus.is_focused(window) {
             cx.set_cursor_hide_mode(if hide_pointer {
                 gpui::CursorHideMode::OnTyping
@@ -4916,6 +4914,7 @@ impl TerminalPane {
             .line_height_scale(typeface.line_height)
             .focus_handle(self.focus.clone())
             .reduce_motion(cx.reduce_motion())
+            .cursor_preferences(cursor_preferences)
             .hovered_reference(self.qol.hit.clone());
         let element = if self.qol.copy_mode.is_some()
             || self.qol.paste.is_some()
