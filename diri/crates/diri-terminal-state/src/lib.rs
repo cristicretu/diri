@@ -512,6 +512,10 @@ pub struct HeadlessScreen {
     /// its cursor (neovim entering insert mode) must still advance
     /// `content_seq`, or the attach pump withholds the frame.
     cursor_style: CursorStyle,
+    /// The parser's color generation at the last settle. A program that only
+    /// recolors (OSC 4/10/11) moves no cell, and must still advance
+    /// `content_seq` or the attach pump withholds the recolored frame.
+    colors_generation: u64,
 
     /// Diff baseline for [`grid_update`]: the cells last handed out, so the
     /// next call sends only changed rows.
@@ -589,6 +593,7 @@ impl HeadlessScreen {
             unsolicited: Vec::new(),
             title_changed: false,
             cursor_style: CursorStyle::default(),
+            colors_generation: 0,
             last_cells: Vec::new(),
             last_annotations: Vec::new(),
             last_grid_cols: 0,
@@ -939,6 +944,12 @@ impl HeadlessScreen {
         if cursor_style != self.cursor_style {
             self.cursor_style = cursor_style;
             content_changed = true;
+        }
+        // Only a host screen publishes program colors (`palette_overrides`).
+        let colors_generation = self.term.colors_generation();
+        if colors_generation != self.colors_generation {
+            self.colors_generation = colors_generation;
+            content_changed |= self.host_replies;
         }
         if self.row_digests.len() != rows || self.row_filled_cells.len() != rows {
             self.rebuild_content_cache();
@@ -1546,6 +1557,14 @@ impl HeadlessScreen {
                     self.term.grid_mut()[line][Column(usize::from(*x))].push_zerowidth(ch);
                 }
             }
+            // The cells came back with the plain underline bit; the spans
+            // say which underline, in which color, and the overline.
+            for span in &metadata.styles {
+                let end = usize::from(span.end).min(self.geometry.cols);
+                for x in usize::from(span.start)..end {
+                    restore_decoration(&mut self.term.grid_mut()[line][Column(x)], span);
+                }
+            }
             self.finish_history_read_batch(index + 1, index + 1 == count);
         }
         #[cfg(feature = "compact-history")]
@@ -1944,6 +1963,7 @@ impl HeadlessScreen {
         // they never crowd out a link. Past it a span is dropped and its
         // cells keep the plain underline bit.
         let mut style_used = 0;
+        let overrides = palette_overrides(self.host_replies, &self.term);
         let source = &grid[line];
         for x in 0..self.geometry.cols {
             let cell = &source[Column(x)];
@@ -1956,7 +1976,13 @@ impl HeadlessScreen {
             if cell.flags.intersects(SPAN_FLAGS)
                 || (extra && cell.flags.intersects(Flags::ALL_UNDERLINES))
             {
-                push_style_span(&mut result.styles, cell, x as u16, &mut style_used, budget);
+                push_style_span(
+                    &mut result.styles,
+                    (cell, overrides),
+                    x as u16,
+                    &mut style_used,
+                    budget,
+                );
             }
             if !extra {
                 continue;
@@ -2439,19 +2465,30 @@ fn wire_cell(cell: &alacritty_terminal::term::cell::Cell) -> GridCell {
     )
 }
 
-/// Colors 0–255 a program redefined with OSC 4, when it has, so grids show
-/// them as the RGB the program chose. `None`, the usual case, costs one scan
-/// of 256 entries per publication and nothing per cell.
+/// The last color index cells are painted with: 0–255, then the default
+/// foreground (OSC 10) and background (OSC 11).
+const PAINTED_COLORS: usize = NamedColor::Background as usize + 1;
+
+/// Colors a program redefined, when it has: 0–255 with OSC 4 and the default
+/// foreground and background with OSC 10/11, so grids show them as the RGB
+/// the program chose. `None`, the usual case, costs one scan of 258 entries
+/// per publication and nothing per cell.
 fn palette_overrides(host_replies: bool, term: &Term<Collector>) -> Option<&Colors> {
     let colors = term.colors();
-    (host_replies && (0..256).any(|index| colors[index].is_some())).then_some(colors)
+    (host_replies && (0..PAINTED_COLORS).any(|index| colors[index].is_some())).then_some(colors)
 }
 
 fn apply_palette(cell: &mut GridCell, colors: &Colors) {
+    // The wire's `Default` and `DefaultInverted` are the default foreground
+    // and background; each slot only ever holds its own one.
     let resolve = |color: &mut TermColor| {
-        if let TermColor::Ansi(index) = *color
-            && let Some(rgb) = colors[usize::from(index)]
-        {
+        let index = match *color {
+            TermColor::Ansi(index) => usize::from(index),
+            TermColor::Default => NamedColor::Foreground as usize,
+            TermColor::DefaultInverted => NamedColor::Background as usize,
+            TermColor::Rgb(..) => return,
+        };
+        if let Some(rgb) = colors[index] {
             *color = TermColor::Rgb(rgb.r, rgb.g, rgb.b);
         }
     };
@@ -2509,8 +2546,10 @@ fn wire_color(color: Color) -> TermColor {
     }
 }
 
-/// The decoration of `cell` beyond the style bits, if it needs a span.
-fn cell_decoration(cell: &Cell) -> Option<StyleSpan> {
+/// The decoration of `cell` beyond the style bits, if it needs a span. An
+/// indexed underline color a program redefined (`overrides`) is sent as the
+/// RGB it chose, like the cell's own colors.
+fn cell_decoration(cell: &Cell, overrides: Option<&Colors>) -> Option<StyleSpan> {
     let flags = cell.flags;
     let underline = if flags.contains(Flags::UNDERCURL) {
         UnderlineKind::Curly
@@ -2528,7 +2567,14 @@ fn cell_decoration(cell: &Cell) -> Option<StyleSpan> {
     // SGR 58 alone draws nothing; `Default` is the foreground anyway.
     let underline_color = cell
         .underline_color()
-        .map(|color| wire_color(color).packed())
+        .map(|color| match (wire_color(color), overrides) {
+            (TermColor::Ansi(index), Some(colors)) => colors[usize::from(index)]
+                .map_or(TermColor::Ansi(index), |rgb| {
+                    TermColor::Rgb(rgb.r, rgb.g, rgb.b)
+                }),
+            (color, _) => color,
+        })
+        .map(TermColor::packed)
         .filter(|packed| *packed != TermColor::Default.packed() && !underline.is_none());
     let overline = flags.contains(Flags::OVERLINE);
     let plain = matches!(underline, UnderlineKind::None | UnderlineKind::Single)
@@ -2546,12 +2592,12 @@ fn cell_decoration(cell: &Cell) -> Option<StyleSpan> {
 /// Extends the last span or starts one for the cell at `x`.
 fn push_style_span(
     spans: &mut Vec<StyleSpan>,
-    cell: &Cell,
+    (cell, overrides): (&Cell, Option<&Colors>),
     x: u16,
     used: &mut usize,
     budget: usize,
 ) {
-    let Some(mut span) = cell_decoration(cell) else {
+    let Some(mut span) = cell_decoration(cell, overrides) else {
         return;
     };
     if let Some(last) = spans.last_mut()
@@ -2837,6 +2883,25 @@ fn restore_semantic_flags(target: &mut Cell, source: GridCell) {
     }
 }
 
+/// Puts a row's decoration span back on one restored cell.
+fn restore_decoration(cell: &mut Cell, span: &StyleSpan) {
+    let underline = match span.underline {
+        UnderlineKind::None => Flags::empty(),
+        UnderlineKind::Single => Flags::UNDERLINE,
+        UnderlineKind::Double => Flags::DOUBLE_UNDERLINE,
+        UnderlineKind::Curly => Flags::UNDERCURL,
+        UnderlineKind::Dotted => Flags::DOTTED_UNDERLINE,
+        UnderlineKind::Dashed => Flags::DASHED_UNDERLINE,
+    };
+    cell.flags.remove(Flags::ALL_UNDERLINES);
+    cell.flags.insert(underline);
+    cell.flags.set(Flags::OVERLINE, span.overline);
+    cell.set_underline_color(
+        span.underline_color
+            .map(|packed| emulator_color(TermColor::unpack(packed))),
+    );
+}
+
 fn emulator_cell(cell: GridCell) -> Cell {
     let mut flags = Flags::empty();
     if cell.style.contains(TermStyle::BOLD) {
@@ -2844,6 +2909,9 @@ fn emulator_cell(cell: GridCell) -> Cell {
     }
     if cell.style.contains(TermStyle::UNDERLINE) {
         flags.insert(Flags::UNDERLINE);
+    }
+    if cell.style.contains(TermStyle::BLINK) {
+        flags.insert(Flags::BLINK);
     }
     if cell.style.contains(TermStyle::INVERSE) {
         flags.insert(Flags::INVERSE);
@@ -4293,6 +4361,118 @@ mod qol_tests {
         let rows = GridRowCodec::decode_rows(&history.payload, history.row_count as usize).unwrap();
         assert_eq!(weights(&rows[0]), BOLD_FAINT_BOTH_STYLES);
     }
+    /// A local Engine screen: the one that shows colors programs set.
+    fn host(cols: usize, rows: usize) -> HeadlessScreen {
+        HeadlessScreen::new(cols, rows).with_host_replies("test")
+    }
+
+    #[test]
+    fn a_recolor_alone_advances_the_sequence_and_reaches_the_diff() {
+        let mut screen = host(20, 2);
+        screen.feed(b"\x1b[31mred\x1b[0m plain \x1b[4:3;58;5;1mcurly\x1b[0m");
+        screen.grid_update(true);
+        let before = screen.content_seq();
+
+        // OSC 4 moves no cell. The Engine publishes only when the sequence
+        // moves, so the text already on screen must change color with it.
+        screen.feed(b"\x1b]4;1;rgb:12/34/56\x1b\\");
+        assert!(screen.content_seq() > before, "a recolor is a new frame");
+        let recolored = screen.grid_update(false);
+        assert_eq!(recolored.changed_rows.len(), 1);
+        assert_eq!(
+            recolored.changed_rows[0].cells[0].fg,
+            TermColor::Rgb(0x12, 0x34, 0x56)
+        );
+        // So does an underline drawn in that color.
+        assert_eq!(
+            recolored.changed_rows[0].metadata.styles[0].underline_color,
+            Some(TermColor::Rgb(0x12, 0x34, 0x56).packed())
+        );
+
+        // Setting the same color again is not a change; resetting it is.
+        let same = screen.content_seq();
+        screen.feed(b"\x1b]4;1;rgb:12/34/56\x1b\\");
+        assert_eq!(screen.content_seq(), same);
+        screen.feed(b"\x1b]104;1\x1b\\");
+        assert!(screen.content_seq() > same);
+        assert_eq!(
+            screen.grid_update(false).changed_rows[0].cells[0].fg,
+            TermColor::Ansi(1)
+        );
+
+        // A screen that does not show program colors has no new frame.
+        let mut mirror = HeadlessScreen::new(20, 2);
+        mirror.feed(b"\x1b[31mred");
+        let before = mirror.content_seq();
+        mirror.feed(b"\x1b]4;1;rgb:12/34/56\x1b\\");
+        assert_eq!(mirror.content_seq(), before);
+    }
+
+    #[test]
+    fn default_colors_set_with_osc_10_and_11_paint_default_cells() {
+        let mut screen = host(20, 2);
+        screen.feed(b"plain \x1b[7minverse\x1b[0m \x1b[31;42mred\x1b[0m");
+        screen.grid_update(true);
+        let before = screen.content_seq();
+        screen.feed(b"\x1b]10;rgb:ff/80/00\x1b\\\x1b]11;rgb:00/00/40\x07");
+        assert!(screen.content_seq() > before);
+        let fg = TermColor::Rgb(0xff, 0x80, 0x00);
+        let bg = TermColor::Rgb(0x00, 0x00, 0x40);
+        let update = screen.grid_update(false);
+        let cells = &update.changed_rows[0].cells;
+        // Plain text, the blanks after it, and inverse video (which swaps
+        // the two) all use the program's defaults; explicit colors do not.
+        assert_eq!((cells[0].fg, cells[0].bg), (fg, bg));
+        assert_eq!((cells[19].fg, cells[19].bg), (fg, bg));
+        assert_eq!((cells[6].fg, cells[6].bg), (fg, bg));
+        assert!(cells[6].style.contains(TermStyle::INVERSE));
+        assert_eq!(
+            (cells[14].fg, cells[14].bg),
+            (TermColor::Ansi(1), TermColor::Ansi(2))
+        );
+        // History shows them too.
+        screen.feed(b"\r\n\r\n");
+        let history = screen.scrollback_cells(0, 1);
+        let rows = GridRowCodec::decode_rows(&history.payload, 1).unwrap();
+        assert_eq!((rows[0][0].fg, rows[0][0].bg), (fg, bg));
+
+        // OSC 110/111 give the theme its defaults back.
+        screen.feed(b"\x1b]110\x1b\\\x1b]111\x1b\\");
+        let cells = screen.full_snapshot().changed_rows[0].cells.clone();
+        assert_eq!(
+            (cells[0].fg, cells[0].bg),
+            (TermColor::Default, TermColor::DefaultInverted)
+        );
+    }
+
+    #[test]
+    fn reset_forgets_the_colors_a_program_set() {
+        let mut screen = host(20, 2);
+        screen.feed(b"\x1b]4;1;rgb:12/34/56\x1b\\\x1b]11;rgb:00/00/40\x1b\\");
+        screen.feed(b"\x1bc\x1b[31mred");
+        let cell = screen.full_snapshot().changed_rows[0].cells[0];
+        assert_eq!(
+            (cell.fg, cell.bg),
+            (TermColor::Ansi(1), TermColor::DefaultInverted)
+        );
+    }
+
+    #[test]
+    fn restored_history_keeps_blink_and_decorations() {
+        let mut screen = HeadlessScreen::new(20, 2);
+        screen.feed(b"\x1b[5mblink\x1b[0m \x1b[4:3;58:2::1:2:3mcurly\x1b[0m \x1b[53;4:2mover\x1b[0m\r\n\r\n\r\n");
+        let history = screen.history_snapshot();
+        let metadata = screen.history_metadata();
+        let grid = screen.full_snapshot();
+        let mut restored = HeadlessScreen::new(20, 2);
+        assert!(restored.restore(&history, &grid, false, false, MouseModes::OFF));
+        restored.restore_history_metadata(&metadata);
+        assert_eq!(restored.history_snapshot(), history);
+        assert_eq!(restored.history_metadata(), metadata);
+        assert!(history[0][0].style.contains(TermStyle::BLINK));
+        assert_eq!(metadata[0].styles.len(), 2);
+    }
+
     #[test]
     fn hyperlink_only_changes_advance_sequence_and_survive_mirror_reseed() {
         let mut screen = HeadlessScreen::new(40, 4);

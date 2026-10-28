@@ -277,3 +277,13 @@ reflow runs under a larger allowance and the limit then holds the rows it
 produced. Both are O(1) unless the limit drops below the rows held. No wire,
 checkpoint or protocol change; the parser source is part of the Remote Helper
 Build ID. Test: `a_resize_at_capacity_keeps_every_retained_line`.
+
+## Program colors: a generation, and RIS resets them
+
+`Term` keeps `colors_generation`, advanced whenever `set_color` or
+`reset_color` changes a color cells are painted with (0–255 and the dynamic
+foreground and background; not the cursor). A program that recolors with
+OSC 4/10/11 changes no cell, so without it the host's change detection saw no
+change and never republished the screen. `reset_state` (RIS, `ESC c`) also
+clears every color a program set, as xterm and libghostty do; upstream kept
+them across `reset`. No wire, checkpoint or protocol change.

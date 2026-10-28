@@ -40,7 +40,7 @@ use crate::switcher::{
 };
 
 pub use prefs::{
-    AttentionRoute, AttentionRoutes, CursorBlinkPref, CursorShapePref, DictationShortcut, DockBadge, FileEditor, InspectorTab, InterfaceStyle, NewAgentStart, PaneDensity, Prefs,
+    AttentionRoute, AttentionRoutes, CursorBlinkPref, CursorShapePref, DictationShortcut, DockBadge, FileEditor, InspectorTab, InterfaceStyle, NewAgentStart, OptionAsMeta, PaneDensity, Prefs,
     SavedWindow, SidebarGrouping, SidebarOrdering, TabOrientation, TalkAnswer, UiLanguage,
     WindowMaterial, WindowMode, WindowPlacement,
 };
