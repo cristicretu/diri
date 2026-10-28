@@ -137,6 +137,34 @@ fn place_glide(viewport: &mut ScrollbackViewport, rows: f64, visible_rows: usize
     viewport.set_scroll_position(position, visible_rows);
 }
 
+/// How far past the window, in rows, to fetch ahead of a precise gesture
+/// moving at `velocity` points per second (positive toward history). One
+/// screen at rest, as before; a flick adds the rows it covers in
+/// [`FETCH_LEAD`], up to [`MAX_FETCH_LEAD_SCREENS`] screens.
+fn fetch_lead_rows(velocity: f32, line_height: f32, visible_rows: usize) -> i64 {
+    let screen = visible_rows.max(1) as f32;
+    let ahead = (velocity.abs() / line_height.max(1.0)) * FETCH_LEAD.as_secs_f32();
+    let rows = (screen + ahead)
+        .min(screen * MAX_FETCH_LEAD_SCREENS)
+        .round() as i64;
+    if velocity < 0.0 { -rows } else { rows }
+}
+
+/// Time a fetch ahead must cover. Deep history replies took up to about
+/// 65 ms under load; this leaves room for two of them back to back.
+const FETCH_LEAD: Duration = Duration::from_millis(150);
+
+/// Bound on how much a flick fetches ahead: a few screens of cells, far
+/// inside the 4 MiB client cache.
+const MAX_FETCH_LEAD_SCREENS: f32 = 4.0;
+
+/// Ends a find glide and drops trackpad travel not yet shown.
+fn cancel_scroll_motion(shared: &ElementSharedState) {
+    let mut state = mutex_lock(&shared.scroll_glide);
+    state.glide = None;
+    state.pacer.reset();
+}
+
 fn set_view_offset(
     shared: &ElementSharedState,
     buffer: &SharedGridBuffer,
@@ -145,7 +173,7 @@ fn set_view_offset(
 ) -> bool {
     // Keys, typing back to live, and the scroller all come through here:
     // whoever moves the view owns it, and a find glide lets go.
-    mutex_lock(&shared.scroll_glide).glide = None;
+    cancel_scroll_motion(shared);
     let mut viewport = mutex_lock(&shared.viewport);
     let changed = viewport.set_view_offset(offset, visible_rows);
     viewport.hold_reading_view(&read_lock(buffer));
@@ -650,10 +678,16 @@ struct ArmedContentPaint {
     shown_at: Option<Instant>,
 }
 
-/// The glide to a find match, if one is running, and the clock it reads.
+/// The glide to a find match, if one is running, the trackpad travel still
+/// being paced to the display, and the clock both read.
 #[derive(Default)]
 struct GlideState {
     glide: Option<crate::scroll_glide::ScrollGlide>,
+    /// Precise wheel travel bound for local scrollback, released one frame
+    /// at a time; see [`crate::scroll_pacer`].
+    pacer: crate::scroll_pacer::ScrollPacer,
+    /// The line height the paced travel was measured against.
+    pacer_line_height: f32,
     /// Pinned by tests and frame-by-frame renders; the wall clock otherwise.
     clock: Option<Instant>,
 }
@@ -1572,6 +1606,7 @@ impl TerminalElement {
     }
 
     pub fn scroll_to_absolute(&self, absolute_row: i64, anchor: f32, visible_rows: usize) -> bool {
+        self.cancel_scroll_glide();
         let mut viewport = mutex_lock(&self.shared.viewport);
         let changed = viewport.scroll_to_absolute(absolute_row, anchor, visible_rows);
         viewport.hold_reading_view(&read_lock(&self.buffer));
@@ -1593,6 +1628,9 @@ impl TerminalElement {
         if alt_screen_changed {
             mutex_lock(&self.shared.selection).clear();
         }
+        if entered_alt {
+            self.cancel_scroll_glide();
+        }
         entered_alt && mutex_lock(&self.shared.viewport).enter_alt_screen()
     }
 
@@ -1606,13 +1644,15 @@ impl TerminalElement {
     /// routes are returned for the app to pass to `SessionAttachment::scroll`.
     pub fn route_wheel(&self, event: WheelEvent) -> Option<WheelRoute> {
         self.note_interaction();
-        self.cancel_scroll_glide();
+        mutex_lock(&self.shared.scroll_glide).glide = None;
         let modes = *mutex_lock(&self.shared.modes);
         if let WheelDelta::PrecisePoints(points) = event.delta
             && ScrollRouter::is_local(modes)
         {
             return self.scroll_by_pixels(points, event);
         }
+        // Lines and program-bound wheels move whole rows at once.
+        mutex_lock(&self.shared.scroll_glide).pacer.reset();
         let route = mutex_lock(&self.shared.scroll_router).route(modes, event)?;
         match route {
             WheelRoute::Local { lines } => {
@@ -1630,22 +1670,87 @@ impl TerminalElement {
         Some(route)
     }
 
-    /// A trackpad moves local scrollback by the pixel. `lines` reports the
-    /// whole rows crossed, which is zero for most events of a slow gesture.
+    /// A trackpad moves local scrollback by the pixel, paced to the display:
+    /// the delta joins the gesture's travel, the part due by now is applied,
+    /// and each frame applies what is due by its own time (see
+    /// [`crate::scroll_pacer`]). `lines` reports the whole rows crossed so
+    /// far, which is zero for most events of a slow gesture.
+    ///
+    /// The fetch window is widened ahead of the view in proportion to the
+    /// gesture's velocity, so a flick finds its rows already fetched.
     fn scroll_by_pixels(&self, points: f32, event: WheelEvent) -> Option<WheelRoute> {
         mutex_lock(&self.shared.scroll_router).reset();
+        let visible_rows = usize::from(event.visible_rows);
+        // Viewport before pacer, the order prepaint takes them in.
         let mut viewport = mutex_lock(&self.shared.viewport);
+        let mut state = mutex_lock(&self.shared.scroll_glide);
+        let now = state.now();
+        state.pacer.push(now, points);
+        state.pacer_line_height = event.line_height;
         let before = viewport.view_offset();
-        if !viewport.scroll_by_pixels(points, event.line_height, usize::from(event.visible_rows)) {
+        let step = state.pacer.take(now);
+        let changed = self.apply_scroll_step(&mut viewport, step, event.line_height, visible_rows);
+        let outstanding = state.pacer.outstanding();
+        let will_move = outstanding != 0.0 && viewport.can_scroll(outstanding);
+        if outstanding != 0.0 && !will_move {
+            // Against an end, or back on the live edge: nothing left to show.
+            state.pacer.reset();
+        }
+        viewport.lead_fetch(
+            fetch_lead_rows(state.pacer.velocity(), event.line_height, visible_rows),
+            visible_rows,
+        );
+        if !changed && !will_move {
             return None;
+        }
+        Some(WheelRoute::Local {
+            lines: viewport.view_offset().saturating_sub(before),
+        })
+    }
+
+    fn apply_scroll_step(
+        &self,
+        viewport: &mut ScrollbackViewport,
+        step: f32,
+        line_height: f32,
+        visible_rows: usize,
+    ) -> bool {
+        if step == 0.0 || !viewport.scroll_by_pixels(step, line_height, visible_rows) {
+            return false;
         }
         viewport.hold_reading_view(&read_lock(&self.buffer));
         if !viewport.is_reading() {
             mutex_lock(&self.shared.selection).clear();
         }
-        Some(WheelRoute::Local {
-            lines: viewport.view_offset().saturating_sub(before),
-        })
+        true
+    }
+
+    /// Applies the trackpad travel due by this frame. Returns whether another
+    /// frame is needed: while travel is still held, and once more after the
+    /// last step so chrome drawn from the position (the scroller, the
+    /// reading pill) catches up with it.
+    fn step_scroll_pacer(&self, viewport: &mut ScrollbackViewport, visible_rows: usize) -> bool {
+        let mut state = mutex_lock(&self.shared.scroll_glide);
+        if state.pacer.is_settled() {
+            return false;
+        }
+        let now = state.now();
+        let step = state.pacer.take(now);
+        let line_height = state.pacer_line_height;
+        self.apply_scroll_step(viewport, step, line_height, visible_rows);
+        state.clock.is_none()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn step_scroll_pacer_for_test(&self, visible_rows: usize) {
+        let mut viewport = mutex_lock(&self.shared.viewport);
+        self.step_scroll_pacer(&mut viewport, visible_rows);
+    }
+
+    /// Whether trackpad travel is still waiting for frames to show it.
+    #[must_use]
+    pub fn scroll_pacing(&self) -> bool {
+        !mutex_lock(&self.shared.scroll_glide).pacer.is_settled()
     }
 
     /// Rows scrolled back from the live edge, with the sub-row part a
@@ -1682,6 +1787,13 @@ impl TerminalElement {
         px(mutex_lock(&self.shared.viewport)
             .scroll_position()
             .shift(f32::from(line_height), scale_factor))
+    }
+
+    /// History rows the current window would paint blank for want of a
+    /// fetch; see [`ScrollbackViewport::unfetched_rows`].
+    #[must_use]
+    pub fn unfetched_rows(&self, visible_rows: usize) -> usize {
+        mutex_lock(&self.shared.viewport).unfetched_rows(visible_rows)
     }
 
     /// True while a reading view is finding its place after a column change;
@@ -1801,6 +1913,17 @@ impl TerminalElement {
         };
         crate::command_marks::command_output_at(at, COMMAND_OUTPUT_SEARCH_ROWS, |row| {
             viewport.stored_row(&buffer, row)
+        })
+    }
+
+    /// The live line under the grid cursor, from its OSC 133 marks: whether
+    /// a shell prompt is waiting there with nothing typed.
+    #[must_use]
+    pub fn prompt_line(&self) -> crate::command_marks::PromptLine {
+        let buffer = read_lock(&self.buffer);
+        let cursor = buffer.cursor;
+        crate::command_marks::prompt_line(usize::from(cursor.row), usize::from(cursor.col), |row| {
+            buffer.row(row)
         })
     }
 
@@ -2101,7 +2224,7 @@ impl TerminalElement {
 
     /// Anything else that moves the view owns it from then on.
     fn cancel_scroll_glide(&self) {
-        mutex_lock(&self.shared.scroll_glide).glide = None;
+        cancel_scroll_motion(&self.shared);
     }
 
     pub fn sync_find_highlights(&self, model: &TerminalFindModel) {
@@ -2731,7 +2854,9 @@ impl Element for TerminalElement {
         // it: every party that touches these mutexes runs on the main thread,
         // and the clone copied the entire fetched-history cell cache per frame.
         let mut viewport = mutex_lock(&self.shared.viewport);
-        if self.step_scroll_glide(&mut viewport, visible_rows) {
+        if self.step_scroll_glide(&mut viewport, visible_rows)
+            | self.step_scroll_pacer(&mut viewport, visible_rows)
+        {
             window.request_animation_frame();
         }
         let viewport = viewport;
@@ -6086,11 +6211,21 @@ mod selection_repaint_tests {
         assert_eq!(element.view_offset(), 1);
         assert!((element.scroll_position() - 0.25).abs() < 1e-6);
         assert_eq!(element.scroll_shift(gpui::px(16.0), 2.0), gpui::px(12.0));
+        // Handled in the same instant, the second delta waits for the frame
+        // its time falls in instead of doubling this one's travel.
+        let start = std::time::Instant::now();
+        element.set_scroll_glide_clock(Some(start));
         assert_eq!(
             element.route_wheel(trackpad(4.0)),
             Some(WheelRoute::Local { lines: 0 })
         );
+        assert!(element.scroll_pacing());
+        element.set_scroll_glide_clock(Some(start + std::time::Duration::from_millis(20)));
+        element.step_scroll_pacer_for_test(usize::from(ROWS));
+        assert!(!element.scroll_pacing());
         assert_eq!(element.scroll_shift(gpui::px(16.0), 2.0), gpui::px(8.0));
+        // A later gesture.
+        element.set_scroll_glide_clock(Some(start + std::time::Duration::from_millis(200)));
 
         // The window is rows 7..10 slid up by half a row, so the row under
         // its bottom edge (window row ROWS) is live row "two".
@@ -6113,6 +6248,53 @@ mod selection_repaint_tests {
     }
 
     #[test]
+    fn jittered_trackpad_events_move_the_view_on_every_frame() {
+        // A steady 120 Hz gesture whose events are handled in pairs: two in
+        // one refresh, none in the next. Applied as handled, every other
+        // frame repeated its position; paced, every frame moves.
+        let element = populated_element();
+        mutex_lock(&element.shared.viewport).apply_geometry(1_000, 1_003, 1, usize::from(ROWS));
+        let start = std::time::Instant::now();
+        let at = |millis: f64| start + std::time::Duration::from_secs_f64(millis / 1000.0);
+        let period = 1000.0 / 120.0;
+        let mut shown = Vec::new();
+        for frame in 0..24 {
+            if frame % 2 == 0 {
+                for event in 0..2 {
+                    element.set_scroll_glide_clock(Some(at(
+                        period * f64::from(frame) + f64::from(event) * 0.3
+                    )));
+                    element.route_wheel(trackpad(6.0));
+                }
+            }
+            element.set_scroll_glide_clock(Some(at(period * f64::from(frame) + 4.0)));
+            element.step_scroll_pacer_for_test(usize::from(ROWS));
+            shown.push(element.scroll_position());
+        }
+        let moves: Vec<f64> = shown.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        assert!(
+            moves[2..].iter().all(|step| *step > 0.1),
+            "a frame repeated its position: {moves:?}"
+        );
+        // Nothing is lost: 24 events of 6 points over a 16-point line.
+        element.set_scroll_glide_clock(Some(at(period * 30.0)));
+        element.step_scroll_pacer_for_test(usize::from(ROWS));
+        assert!((element.scroll_position() - 24.0 * 6.0 / 16.0).abs() < 1e-3);
+        assert!(!element.scroll_pacing(), "an idle pacer asks for no frames");
+    }
+
+    #[test]
+    fn the_fetch_lead_grows_with_a_flick_and_points_its_way() {
+        // At rest one screen, as before; a 1,200 rows/s flick covers its
+        // fetch time several screens ahead, and a flick back leads the
+        // other way.
+        assert_eq!(super::fetch_lead_rows(0.0, 15.0, 36), 36);
+        assert_eq!(super::fetch_lead_rows(18_000.0, 15.0, 36), 144);
+        assert_eq!(super::fetch_lead_rows(-18_000.0, 15.0, 36), -144);
+        assert_eq!(super::fetch_lead_rows(1_500.0, 15.0, 36), 51);
+    }
+
+    #[test]
     fn a_trackpad_over_a_mouse_reporting_program_still_sends_whole_lines() {
         let element = populated_element();
         element.set_modes(
@@ -6122,7 +6304,7 @@ mod selection_repaint_tests {
                 diri_proto::terminal::MouseEncoding::Legacy,
             ),
         );
-        assert_eq!(element.route_wheel(trackpad(9.0)), None);
+        // Past half a line, a line goes out; the rest of it is owed.
         assert_eq!(
             element.route_wheel(trackpad(9.0)),
             Some(WheelRoute::Daemon {
@@ -6132,6 +6314,7 @@ mod selection_repaint_tests {
                 row: 1,
             })
         );
+        assert_eq!(element.route_wheel(trackpad(9.0)), None);
         assert_eq!(element.scroll_position(), 0.0, "scrollback never moved");
 
         element.set_modes(true, MouseModes::OFF);
