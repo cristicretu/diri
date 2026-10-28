@@ -13,9 +13,11 @@
 //! emulator does not model, so it is scanned out of the byte stream directly —
 //! see [`scan_progress`].
 
+mod find_history;
 mod inline_images;
 mod notifications;
 mod program_status;
+pub use find_history::HistorySearch;
 pub use inline_images::{
     DEFAULT_CELL_PIXELS, STORE_BUDGET_BYTES as INLINE_IMAGE_BUDGET_BYTES, StoredImage,
 };

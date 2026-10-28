@@ -945,6 +945,14 @@ impl DaemonClient {
             .await
     }
 
+    /// One page of Find over a local terminal's whole history.
+    pub async fn find_history(
+        &self,
+        params: &diri_proto::find::FindHistoryParams,
+    ) -> Result<diri_proto::find::FindHistoryResult, ClientError> {
+        self.typed(Method::SESSION_FIND_HISTORY, params).await
+    }
+
     pub async fn read_scrollback(
         &self,
         session_id: &SessionId,

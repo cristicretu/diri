@@ -104,6 +104,7 @@ const TERMINAL_ONLY_METHODS: &[&str] = &[
     Method::SESSION_RESET_TERMINAL,
     Method::SESSION_CLEAR_SCROLLBACK,
     Method::SESSION_CAPTURE_FIND,
+    Method::SESSION_FIND_HISTORY,
     Method::SESSION_READ_SCROLLBACK,
     Method::SESSION_READ_SCROLLBACK_CELLS,
     Method::SESSION_READ_TRANSCRIPT,
@@ -989,6 +990,7 @@ impl ControlServer {
                         | Method::TASK_ANSWER
                         | Method::TASK_CANCEL
                         | Method::SESSION_CAPTURE_FIND
+                        | Method::SESSION_FIND_HISTORY
                         | Method::SESSION_READ_SCROLLBACK_CELLS
                         | Method::SESSION_KILL
                         | Method::SESSION_REMOVE
@@ -1311,6 +1313,7 @@ impl ControlServer {
             Method::SESSION_RESET_TERMINAL => self.session_reset_terminal(params),
             Method::SESSION_CLEAR_SCROLLBACK => self.session_clear_scrollback(params),
             Method::SESSION_CAPTURE_FIND => self.session_capture_find(params),
+            Method::SESSION_FIND_HISTORY => self.session_find_history(params),
             Method::SESSION_READ_SCROLLBACK => self.session_read_scrollback(params),
             Method::SESSION_READ_SCROLLBACK_CELLS => self.session_read_scrollback_cells(params),
             Method::SESSION_KILL => self.session_kill(params),
@@ -3364,6 +3367,7 @@ impl ControlServer {
             .find_capture_cells()
             .map_err(|error| ControlError::new("find_capture_too_large", error))?;
         encode(&diri_proto::CaptureFindResult {
+            history_origin: Some(screen.history_origin()),
             owner,
             // Immutable: a retained terminal never changes under a capture.
             capture_revision: 0,
@@ -3373,6 +3377,26 @@ impl ControlServer {
             partial: cells.first_row > 0,
             cells,
         })
+    }
+
+    fn session_find_history(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::find::FindHistoryParams = decode(params)?;
+        let reader = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            registry
+                .get(&p.session_id.0)
+                .map(crate::session::Session::scrollback_reader)
+        };
+        if let Some(reader) = reader {
+            return encode(&reader.find_history(&p)?);
+        }
+        let (screen, _) = self
+            .completed_terminal(&p.session_id.0)?
+            .ok_or_else(|| self.no_retained_terminal(&p.session_id.0))?;
+        let screen = std::cell::RefCell::new(screen);
+        encode(&crate::find_history::find_history_page(&p, || {
+            screen.borrow_mut()
+        })?)
     }
 
     fn session_read_scrollback(

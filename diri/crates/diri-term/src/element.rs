@@ -665,6 +665,10 @@ struct FindHighlights {
         Vec<crate::find::FindMatch>,
         usize,
     )>,
+    /// Every match in the Engine's current rows, ascending, with the
+    /// selected index: painted on a reading view that is not showing the
+    /// capture (an older match, or history the reader scrolled to).
+    reading: Option<(Vec<crate::find::FindMatch>, usize)>,
     spans: Vec<FindSpan>,
     current_bounds: Option<Bounds<Pixels>>,
 }
@@ -1948,6 +1952,7 @@ impl TerminalElement {
         *mutex_lock(&self.shared.find_highlights) = FindHighlights {
             spans,
             retained: None,
+            reading: None,
             current_bounds: None,
         };
     }
@@ -2075,6 +2080,7 @@ impl TerminalElement {
     pub fn sync_find_highlights(&self, model: &TerminalFindModel) {
         if let Some((source, matches, current)) = model.retained_highlights() {
             let mut highlights = mutex_lock(&self.shared.find_highlights);
+            highlights.reading = model.reading_highlights();
             if !highlights
                 .retained
                 .as_ref()
@@ -2741,7 +2747,29 @@ impl Element for TerminalElement {
         {
             let buffer = read_lock(&self.buffer);
             let mut highlights = mutex_lock(&self.shared.find_highlights);
-            if let Some((source, matches, current)) = &highlights.retained {
+            let reading_view = highlights
+                .retained
+                .as_ref()
+                .is_some_and(|(source, ..)| !viewport.has_find_source(source))
+                && viewport.is_reading();
+            if let Some((matches, current)) = highlights.reading.as_ref().filter(|_| reading_view) {
+                let top = viewport.absolute_row(0);
+                let first = matches.partition_point(|item| item.absolute_row < top);
+                let spans = matches[first..]
+                    .iter()
+                    .enumerate()
+                    .map_while(|(offset, item)| {
+                        let row = usize::try_from(item.absolute_row - top).ok()?;
+                        (row < painted_rows).then_some(FindSpan {
+                            row,
+                            start_col: item.start_col,
+                            end_col_exclusive: item.end_col_exclusive,
+                            is_current: first + offset == *current,
+                        })
+                    })
+                    .collect();
+                highlights.spans = spans;
+            } else if let Some((source, matches, current)) = &highlights.retained {
                 let pinned = viewport.has_find_source(source);
                 let top = if pinned {
                     viewport.absolute_row(0)

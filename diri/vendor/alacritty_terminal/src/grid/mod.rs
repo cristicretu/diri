@@ -137,6 +137,13 @@ pub struct Grid<T> {
 
     /// Maximum number of lines in history.
     max_scroll_limit: usize,
+
+    /// Rows that have left history from its oldest end (evicted, trimmed or
+    /// cleared). The oldest retained row is row `history_origin` of
+    /// everything this grid has held, so `history_origin + index` names a
+    /// history row stably while output evicts older rows.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    history_origin: u64,
 }
 
 #[cfg(feature = "compact-history")]
@@ -175,6 +182,7 @@ impl Grid<crate::term::cell::Cell> {
         let before = self.history_size();
         self.raw.bound_history_bytes(budget);
         let after = self.history_size();
+        self.history_origin += before.saturating_sub(after) as u64;
         if after < before {
             self.max_scroll_limit = after.min(ceiling);
         } else if self.max_scroll_limit < ceiling
@@ -206,7 +214,14 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             cursor: Cursor::default(),
             lines,
             columns,
+            history_origin: 0,
         }
+    }
+
+    /// Rows that have left history from its oldest end; see the field.
+    #[inline]
+    pub fn history_origin(&self) -> u64 {
+        self.history_origin
     }
 
     /// Update the size of the scrollback history.
@@ -214,6 +229,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         let current_history_size = self.history_size();
         if current_history_size > history_size {
             self.raw.shrink_lines(current_history_size - history_size);
+            self.history_origin += (current_history_size - history_size) as u64;
         }
         self.display_offset = min(self.display_offset, history_size);
         self.max_scroll_limit = history_size;
@@ -330,8 +346,12 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 
         // Only rotate the entire history if the active region starts at the top.
         if region.start == 0 {
-            // Create scrollback for the new lines.
+            // Create scrollback for the new lines. Rotation recycles the
+            // oldest history rows for any it could not create.
+            let history = self.history_size();
             self.increase_scroll_limit(positions);
+            let created = self.history_size() - history;
+            self.history_origin += positions.saturating_sub(created).min(history) as u64;
 
             // Swap the lines fixed at the top to their target positions after rotation.
             //
@@ -448,6 +468,7 @@ impl<T> Grid<T> {
     #[inline]
     pub fn clear_history(&mut self) {
         // Explicitly purge all lines from history.
+        self.history_origin += self.history_size() as u64;
         self.raw.shrink_lines(self.history_size());
 
         // Reset display offset.
