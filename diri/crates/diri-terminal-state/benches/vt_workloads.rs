@@ -335,7 +335,10 @@ fn main() {
     }
     let only = std::env::var("DIRI_VT_BENCH_ONLY").ok();
     for name in WORKLOADS {
-        if only.as_deref().is_some_and(|only| !only.split(',').any(|n| n == name)) {
+        if only
+            .as_deref()
+            .is_some_and(|only| !only.split(',').any(|n| n == name))
+        {
             continue;
         }
         let (data, source) = match &dir {

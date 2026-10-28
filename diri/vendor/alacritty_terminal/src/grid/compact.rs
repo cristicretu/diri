@@ -14,9 +14,9 @@ use crate::term::cell::ResetDiscriminant;
 
 mod lz;
 mod seal;
-use seal::SealSlot;
 use crate::term::cell::{Cell, CellExtra, Flags, Hyperlink};
 use crate::vte::ansi::{Color, NamedColor, Rgb};
+use seal::SealSlot;
 
 const MAX_BLOCK_ROWS: usize = 64;
 /// The most decoded cells deferred history keeps for lines that are
@@ -743,15 +743,19 @@ struct Block<T> {
 
 impl<T> Block<T> {
     fn new(rows: &[Row<T>], codec: RowCodec<T>) -> Self {
-        Self::from_encoded((codec.encode)(rows), rows)
+        Self::from_encoded(
+            (codec.encode)(rows),
+            rows.len(),
+            rows.first().map_or(0, Row::len),
+        )
     }
 
-    fn from_encoded(encoded: Encoded, rows: &[Row<T>]) -> Self {
+    fn from_encoded(encoded: Encoded, count: usize, columns: usize) -> Self {
         Self {
             bytes: encoded.bytes,
             start: 0,
-            count: rows.len(),
-            columns: rows.first().map_or(0, Row::len),
+            count,
+            columns,
             resize_floor: encoded.resize_floor,
             decoded: OnceLock::new(),
             dirty: false,
@@ -872,23 +876,30 @@ impl Clone for ReadCacheFlag {
 }
 
 /// The most blocks one storage has on the helper thread. Sealing another
-/// waits for the oldest, so a helper that falls behind slows the parser
-/// down rather than holding more rows.
-const MAX_SEALING: usize = 8;
+/// collects the oldest first (see `seal`), so a helper that falls behind
+/// costs inline encoding rather than holding more rows.
+const MAX_SEALING: usize = 4;
 
 /// A block on the helper thread (see `seal`).
 struct Sealing<T>(Arc<SealSlot<T>>);
 
 impl<T: Clone> Clone for Sealing<T> {
     fn clone(&self) -> Self {
-        let (encoded, rows) = self.0.wait();
-        Self(SealSlot::finished(encoded.clone(), rows.to_vec()))
+        Self(SealSlot::finished(
+            self.0.encoded().clone(),
+            self.0.rows().to_vec(),
+            self.0.encoder(),
+        ))
     }
 }
 
 impl<T> std::fmt::Debug for Sealing<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.0.is_done() { "Sealing(done)" } else { "Sealing" })
+        f.write_str(if self.0.is_done() {
+            "Sealing(done)"
+        } else {
+            "Sealing"
+        })
     }
 }
 
@@ -967,8 +978,7 @@ impl<T> CompactRows<T> {
         index -= self.recent.len();
         let sealing_rows = self.sealing.len() * self.block_rows;
         if index < sealing_rows {
-            let (_, rows) = self.sealing[index / self.block_rows].0.wait();
-            return &rows[index % self.block_rows];
+            return &self.sealing[index / self.block_rows].0.rows()[index % self.block_rows];
         }
         index -= sealing_rows;
         let cold_rows = self.cold_rows();
@@ -994,7 +1004,8 @@ impl<T> CompactRows<T> {
     fn rows_before_oldest(&self) -> usize {
         self.recent.len()
             + self.sealing.len() * self.block_rows
-            + self.cold_rows() + self.deferred.as_ref().map_or(0, |d| d.rows)
+            + self.cold_rows()
+            + self.deferred.as_ref().map_or(0, |d| d.rows)
     }
 
     #[inline(always)]
@@ -1278,7 +1289,7 @@ impl<T> CompactRows<T> {
         let sealing = self
             .sealing
             .iter()
-            .map(|sealing| sealing.0.wait().0.bytes.len() + 2 * std::mem::size_of::<usize>())
+            .map(|sealing| sealing.0.encoded().bytes.len() + 2 * std::mem::size_of::<usize>())
             .sum::<usize>();
         payload
             + sealing
@@ -1948,8 +1959,9 @@ impl<T> CompactRows<T> {
                 .collect();
             let rows = match self.codec.seal {
                 Some(seal) => {
-                    // Collect what finished; wait for the oldest when the
-                    // helper is this far behind.
+                    // Collect what finished. When the helper is this far
+                    // behind, collect the oldest too, encoding it here if
+                    // the helper has not started it.
                     self.collect_sealed(false);
                     if self.sealing.len() >= MAX_SEALING {
                         self.collect_oldest_sealed();
@@ -1958,22 +1970,34 @@ impl<T> CompactRows<T> {
                         Ok(slot) => {
                             self.sealing.push_front(Sealing(slot));
                             continue;
-                        },
+                        }
                         Err(rows) => rows,
                     }
-                },
+                }
                 None => rows,
             };
             // Blocks enter `blocks` in order: older ones first.
             self.finish_sealing();
             let encoded = (self.codec.encode)(&rows);
-            self.push_sealed(encoded, rows);
+            let (count, columns) = (rows.len(), rows.first().map_or(0, Row::len));
+            self.push_sealed(encoded, count, columns, Some(rows));
         }
     }
 
-    /// Store a sealed block and keep its row allocations for recycling.
-    fn push_sealed(&mut self, encoded: Encoded, mut rows: Vec<Row<T>>) {
-        let block = Block::from_encoded(encoded, &rows);
+    /// Store a sealed block of `count` rows of `columns` cells, and keep its
+    /// row allocations for recycling when given them.
+    fn push_sealed(
+        &mut self,
+        encoded: Encoded,
+        count: usize,
+        columns: usize,
+        rows: Option<Vec<Row<T>>>,
+    ) {
+        let block = Block::from_encoded(encoded, count, columns);
+        let Some(mut rows) = rows else {
+            self.push_block_front(block);
+            return;
+        };
         // Only full history recycles rows, and it does so one block at a
         // time. A row whose reset would keep cells that are not template
         // cells is marked fully occupied, so `Row::reset` overwrites every
@@ -2015,8 +2039,9 @@ impl<T> CompactRows<T> {
 
     fn collect_oldest_sealed(&mut self) {
         let Sealing(slot) = self.sealing.pop_back().expect("sealing block");
+        let (count, columns) = (slot.rows().len(), slot.rows().first().map_or(0, Row::len));
         let (encoded, rows) = SealSlot::take(slot);
-        self.push_sealed(encoded, rows);
+        self.push_sealed(encoded, count, columns, rows);
     }
 
     /// Wait for every block on the helper thread.
