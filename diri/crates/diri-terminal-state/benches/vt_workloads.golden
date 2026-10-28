@@ -1,9 +1,11 @@
 # Golden digests for benches/vt_workloads.rs. Do not edit by hand.
 #
-# Reference: diri 3fc4feb66 (origin/main) with #921 (c23006a27, "Keep the
-# same history whatever the reads") merged and only the passive
-# `bench-verify` observers added (no parser change), built in release and
-# fed one byte per read with the OSC checksum on:
+# Reference: diri 0b54ea089 (origin/main, with #921's live-byte history
+# budget, #925's style hash and #843's query replies) and only the
+# passive `bench-verify` observers added (no parser change), built in
+# release and fed one byte per read with the OSC checksum on. The generated digests are identical to
+# the first reference (3fc4feb66 with #921's c23006a27); the kitten capture
+# digests are carried over from it:
 #
 #   cargo build --release -p diri-terminal-state --features bench-verify --bench vt_workloads
 #   DIRI_VT_BENCH_GOLDEN=$PWD/crates/diri-terminal-state/benches/vt_workloads.golden <bench binary> --bench

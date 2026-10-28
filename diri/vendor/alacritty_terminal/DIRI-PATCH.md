@@ -426,12 +426,6 @@ keeps 0.35% fewer rows of kitten ASCII, 0.9% of kitten Unicode and 0.4% of
 `git log -p` at 160 columns (outputs at the 150,000-row ceiling are
 unchanged).
 
-## Test-only `observe` feature
-
-`observe = ["vte/observe"]` only forwards the vendored VTE's test-only OSC
-totals (see its DIRI-PATCH.md) so `diri-terminal-state`'s `bench-verify`
-feature can reach them. No source change.
-
 ## Styles with extra storage by hash map
 
 `StyleTable::extra_id` found a style with extra storage (combining marks, an
@@ -470,3 +464,9 @@ O(1) amortized. Release builds compile none of it; no behavior, wire,
 checkpoint or protocol change. Test:
 `lines_after_narrowing_a_full_history_cost_what_they_did_before`
 (`diri-terminal-state`); probe: `--bench narrow_history`.
+
+## Test-only `observe` feature
+
+`observe = ["vte/observe"]` only forwards the vendored VTE's test-only OSC
+totals (see its DIRI-PATCH.md) so `diri-terminal-state`'s `bench-verify`
+feature can reach them. No source change.
