@@ -76,6 +76,8 @@ actions!(
         MovePaneToNewTab,
         MovePaneToNextTab,
         MovePaneToPreviousTab,
+        MoveTabToNewWindow,
+        MoveTabToNextWindow,
         OpenWorktrees,
         NewNote,
         ShowTodos,
@@ -203,6 +205,8 @@ pub enum CommandId {
     MovePaneToNewTab,
     MovePaneToNextTab,
     MovePaneToPreviousTab,
+    MoveTabToNewWindow,
+    MoveTabToNextWindow,
     OpenWorktrees,
     NewNote,
     ShowTodos,
@@ -793,6 +797,26 @@ pub const COMMANDS: &[CommandSpec] = &[
         "command.move_pane_to_previous_tab.palette_title",
         "rectangle.split.2x1",
         "workspace move pane previous tab join"
+    ),
+    spec!(
+        MoveTabToNewWindow,
+        "move-tab-to-new-window",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.move_tab_to_new_window.palette_title",
+        "macwindow.badge.plus",
+        "window move tab session new detach tear off"
+    ),
+    spec!(
+        MoveTabToNextWindow,
+        "move-tab-to-next-window",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.move_tab_to_next_window.palette_title",
+        "macwindow",
+        "window move tab session next other"
     ),
     spec!(
         NewNote,
@@ -1530,6 +1554,8 @@ impl CommandSpec {
             CommandId::MovePaneToNewTab => KeyBinding::new(key, MovePaneToNewTab, context),
             CommandId::MovePaneToNextTab => KeyBinding::new(key, MovePaneToNextTab, context),
             CommandId::MovePaneToPreviousTab => KeyBinding::new(key, MovePaneToPreviousTab, context),
+            CommandId::MoveTabToNewWindow => KeyBinding::new(key, MoveTabToNewWindow, context),
+            CommandId::MoveTabToNextWindow => KeyBinding::new(key, MoveTabToNextWindow, context),
 
             CommandId::OpenWorktrees => KeyBinding::new(key, OpenWorktrees, context),
             CommandId::NewNote => KeyBinding::new(key, NewNote, context),
@@ -2062,6 +2088,16 @@ impl CommandId {
                 description: t("command.move_pane_to_previous_tab.description"),
                 category: Workspace,
             },
+            Self::MoveTabToNewWindow => ShortcutMetadata {
+                title: t("command.move_tab_to_new_window.title"),
+                description: t("command.move_tab_to_new_window.description"),
+                category: Workspace,
+            },
+            Self::MoveTabToNextWindow => ShortcutMetadata {
+                title: t("command.move_tab_to_next_window.title"),
+                description: t("command.move_tab_to_next_window.description"),
+                category: Workspace,
+            },
             Self::ToggleTabPeek => ShortcutMetadata {
                 title: t("command.toggle_tab_peek.title"),
                 description: t("command.toggle_tab_peek.description"),
@@ -2395,6 +2431,8 @@ impl CommandId {
             Self::MovePaneToNewTab => Box::new(MovePaneToNewTab),
             Self::MovePaneToNextTab => Box::new(MovePaneToNextTab),
             Self::MovePaneToPreviousTab => Box::new(MovePaneToPreviousTab),
+            Self::MoveTabToNewWindow => Box::new(MoveTabToNewWindow),
+            Self::MoveTabToNextWindow => Box::new(MoveTabToNextWindow),
 
             Self::OpenWorktrees => Box::new(OpenWorktrees),
             Self::NewNote => Box::new(NewNote),

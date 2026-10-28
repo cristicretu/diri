@@ -29,6 +29,11 @@ mod whats_new_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod window_navigation_tests;
 mod workspace_launches;
+mod move_to_window;
+#[cfg(all(test, target_os = "macos"))]
+mod move_to_window_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod tear_off_frames;
 #[cfg(all(test, target_os = "macos"))]
 mod workspace_palette_tests;
 
@@ -404,6 +409,9 @@ pub struct RootView {
     settings_was_open: bool,
     preview: bool,
     preview_scenario: PreviewScenario,
+    /// The tab a sidebar row or strip drag is carrying, so a release
+    /// outside the window can tear it off into a new one.
+    carried_tab: Option<SessionId>,
     #[cfg(target_os = "macos")]
     menu_bar: Option<NativeMenuBar>,
     #[cfg(any(target_os = "macos", windows))]
@@ -1593,6 +1601,7 @@ impl RootView {
             settings_was_open: false,
             preview,
             preview_scenario,
+            carried_tab: None,
             #[cfg(target_os = "macos")]
             menu_bar,
             #[cfg(any(target_os = "macos", windows))]
@@ -2846,6 +2855,8 @@ impl RootView {
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.select_relative(-1, cx));
             }
+            CommandId::MoveTabToNewWindow => self.move_tab_to_new_window(window, cx),
+            CommandId::MoveTabToNextWindow => self.move_tab_to_next_window(window, cx),
             CommandId::MovePaneToNextTab | CommandId::MovePaneToPreviousTab => {
                 let source = self
                     .workspace_workbench
@@ -5402,6 +5413,9 @@ impl Render for RootView {
         let frame_started = crate::telemetry::frame_start();
         crate::perf_overlay::rendered("root");
         self.main_viewport = window.viewport_size();
+        if !cx.has_active_drag() {
+            self.carried_tab = None;
+        }
         if self.pending_notification_open.is_some()
             && self
                 .window_store
@@ -5659,6 +5673,30 @@ impl Render for RootView {
                     this.titlebar_drag_armed = false;
                 }),
             )
+            .on_drag_move(cx.listener(
+                |this, event: &gpui::DragMoveEvent<crate::sidebar::DraggedSidebarItem>, _, cx| {
+                    let session = match &event.drag(cx).0 {
+                        crate::sidebar::DragItem::Session {
+                            id,
+                            archived: false,
+                            ..
+                        } => Some(id.clone()),
+                        _ => None,
+                    };
+                    this.carry_tab(session);
+                },
+            ))
+            .on_drag_move(cx.listener(
+                |this, event: &gpui::DragMoveEvent<crate::sidebar::DraggedTab>, _, cx| {
+                    this.carry_tab(Some(event.drag(cx).0.clone()));
+                },
+            ))
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseUpEvent, window, cx| {
+                    this.release_outside(event.position, window, cx);
+                }),
+            )
             .capture_key_down(cx.listener(Self::on_key_down))
             .capture_key_up(cx.listener(Self::on_key_up))
             .on_action(cx.listener(Self::close_selected_session))
@@ -5849,6 +5887,16 @@ impl Render for RootView {
             .on_action(
                 cx.listener(|this, _: &crate::commands::MovePaneToPreviousTab, window, cx| {
                     this.run_command(CommandId::MovePaneToPreviousTab, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::MoveTabToNewWindow, window, cx| {
+                    this.run_command(CommandId::MoveTabToNewWindow, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::MoveTabToNextWindow, window, cx| {
+                    this.run_command(CommandId::MoveTabToNextWindow, window, cx);
                 }),
             )
             .on_action(

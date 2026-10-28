@@ -205,6 +205,8 @@ pub fn actions_for_catalogs(
         registered_action(CommandId::MovePaneToNewTab),
         registered_action(CommandId::MovePaneToNextTab),
         registered_action(CommandId::MovePaneToPreviousTab),
+        registered_action(CommandId::MoveTabToNewWindow),
+        registered_action(CommandId::MoveTabToNextWindow),
     ]);
 
     for target in projects {
@@ -546,6 +548,8 @@ pub fn actions_for_default_host(
         registered_action(CommandId::MovePaneToNewTab),
         registered_action(CommandId::MovePaneToNextTab),
         registered_action(CommandId::MovePaneToPreviousTab),
+        registered_action(CommandId::MoveTabToNewWindow),
+        registered_action(CommandId::MoveTabToNextWindow),
     ]);
 
     let default_name = display_name(&default_agent, catalog);
@@ -1350,6 +1354,8 @@ mod tests {
                 "move-pane-to-new-tab",
                 "move-pane-to-next-tab",
                 "move-pane-to-previous-tab",
+                "move-tab-to-new-window",
+                "move-tab-to-next-window",
                 "new-default-in-/work/diri",
                 "worktrees",
                 "new-note",
