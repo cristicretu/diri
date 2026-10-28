@@ -22,6 +22,8 @@
   "settings.appearance.interface_style": "Estilo de interfaz",
   "settings.appearance.last_folder": "Abrir terminales nuevos en la última carpeta",
   "settings.appearance.last_folder_detail": "Empezar donde estaba tu último terminal, en lugar de la carpeta del proyecto.",
+  "settings.appearance.ligatures": "Ligaduras",
+  "settings.appearance.ligatures_detail": "Une pares como => y != en un solo símbolo en las fuentes que las tienen.",
   "settings.appearance.line_height": "Interlineado",
   "settings.appearance.mode_dark": "Oscuro",
   "settings.appearance.mode_light": "Claro",

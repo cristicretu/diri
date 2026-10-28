@@ -6,10 +6,10 @@ use std::time::{Duration, Instant};
 use diri_proto::grid::{CommandEnd, CursorShape, GridCell, GridUpdate, StyleSpan, UnderlineKind};
 use diri_proto::terminal::MouseModes;
 use gpui::{
-    App, Bounds, ContentMask, Element, ElementId, FocusHandle, Font, FontFallbacks, FontId,
-    GlobalElementId, InputHandler, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels,
-    Point, ShapedLine, SharedString, Style, TextAlign, TextRun, UTF16Selection, Window, fill, font,
-    point, px, relative, size,
+    App, Bounds, ContentMask, Element, ElementId, FocusHandle, Font, FontId, GlobalElementId,
+    InputHandler, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels, Point, ShapedLine,
+    SharedString, Style, TextAlign, TextRun, UTF16Selection, Window, fill, point, px, relative,
+    size,
 };
 
 use crate::blocks::BlockGlyph;
@@ -2275,39 +2275,15 @@ fn note_cursor_damage(
     );
 }
 
-#[cfg(target_os = "macos")]
+/// Diri's own default; the app passes the user's family through
+/// [`TerminalElement::font`].
 fn default_terminal_font() -> Font {
-    let mut terminal_font = font(".SF NS Mono");
-    terminal_font.fallbacks = Some(FontFallbacks::from_fonts(
-        [
-            "Menlo",
-            "Apple Symbols",
-            "STIX Two Math",
-            "Apple Color Emoji",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect(),
-    ));
-    terminal_font
-}
-
-#[cfg(not(target_os = "macos"))]
-fn default_terminal_font() -> Font {
-    let mut terminal_font = font("monospace");
-    terminal_font.fallbacks = Some(FontFallbacks::from_fonts(
-        [
-            "Noto Sans Mono",
-            "DejaVu Sans Mono",
-            "Noto Sans Symbols 2",
-            "STIX Two Math",
-            "Noto Color Emoji",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect(),
-    ));
-    terminal_font
+    let family = if cfg!(target_os = "macos") {
+        ".SF NS Mono"
+    } else {
+        "monospace"
+    };
+    crate::glyphs::terminal_font(family, true)
 }
 
 impl IntoElement for TerminalElement {

@@ -6241,6 +6241,20 @@ impl UtilitySurfaces {
                         .child(row(
                             t("settings.appearance.line_height"),
                             line_height_control.into_any_element(),
+                        ))
+                        .child(setting_divider(colors))
+                        .child(toggle_row(
+                            t("settings.appearance.ligatures"),
+                            t("settings.appearance.ligatures_detail"),
+                            self.prefs.terminal_ligatures,
+                            "terminal_ligatures",
+                            colors,
+                            cx,
+                            |this, cx| {
+                                let enabled = !this.prefs.terminal_ligatures;
+                                this.update_prefs(move |prefs| prefs.terminal_ligatures = enabled);
+                                cx.notify();
+                            },
                         )),
                     colors,
                 )),

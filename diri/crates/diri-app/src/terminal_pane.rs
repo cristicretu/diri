@@ -1374,15 +1374,15 @@ impl TerminalPane {
             if self.residents.contains_key(&id) {
                 continue;
             }
-            let mono = crate::fonts::terminal_font(
-                &self
+            let mono = {
+                let store = self
                     .runtime
                     .store
                     .read()
-                    .expect("session store lock poisoned")
-                    .preferences()
-                    .terminal_font_family,
-            );
+                    .expect("session store lock poisoned");
+                let prefs = store.preferences();
+                crate::fonts::terminal_font(&prefs.terminal_font_family, prefs.terminal_ligatures)
+            };
             let generation = self.next_attachment_generation;
             self.next_attachment_generation = self.next_attachment_generation.wrapping_add(1);
             let parked = self
@@ -6432,7 +6432,10 @@ struct TerminalType {
 impl TerminalType {
     fn from_prefs(prefs: &crate::store::Prefs) -> Self {
         Self {
-            font: crate::fonts::terminal_font(&prefs.terminal_font_family),
+            font: crate::fonts::terminal_font(
+                &prefs.terminal_font_family,
+                prefs.terminal_ligatures,
+            ),
             size: prefs.terminal_font_size,
             line_height: prefs.terminal_line_height,
         }
