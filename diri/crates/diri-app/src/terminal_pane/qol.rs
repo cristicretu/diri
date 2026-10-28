@@ -2,7 +2,7 @@
 use super::autoscroll;
 use super::*;
 use diri_proto::grid::{GridCell, GridRowCodec, RowMetadata, TermStyle};
-use diri_term::command_marks::{CommandOutput, LastCommandOutput};
+use diri_term::command_marks::{CommandOutput, NewestCommandOutput};
 use diri_term::element::ReferenceHit;
 use gpui::{Pixels, Point};
 use std::io::Write;
@@ -836,16 +836,8 @@ impl TerminalPane {
         let client = Arc::clone(self.runtime.client());
         let request_id = id.clone();
         let task = self.tokio.spawn(async move {
-            let mut last = LastCommandOutput::default();
-            read_retained_rows(&client, &request_id, |_, cells, metadata| {
-                last.push_row(cells, metadata);
-                if last.held_cells() > COMMAND_OUTPUT_MAX_CELLS {
-                    return Err(t("terminal.command_output.too_large"));
-                }
-                Ok(())
-            })
-            .await?;
-            Ok::<_, &'static str>(last.finish().map(|output| command_output_text(&output)))
+            let output = find_last_command_output(&client, &request_id).await?;
+            Ok::<_, &'static str>(output.map(|output| command_output_text(&output)))
         });
         self.qol.busy = true;
         let read_owner = Arc::new(());
@@ -1642,6 +1634,42 @@ pub(super) async fn find_retained_prompt(
         }
     }
     Ok(found(None))
+}
+
+/// The newest finished command's output, read backward from the live end
+/// page by page (64, then 256, then 1,024 rows, as the prompt search does)
+/// and stopped once it is known, instead of reading every retained row.
+async fn find_last_command_output(
+    client: &diri_client::DaemonClient,
+    id: &SessionId,
+) -> Result<Option<diri_term::command_marks::OutputRows>, &'static str> {
+    let probe = read_row_page(client, id, 0, 1, None).await?;
+    let limit = page_limit(probe.cols);
+    let mut page_rows = PROMPT_SEARCH_FIRST_PAGE.min(limit);
+    let mut newest = NewestCommandOutput::default();
+    let mut end = probe.total;
+    while end > 0 {
+        let first = (end - page_rows).max(0);
+        let page = read_row_page(client, id, first, end - first, Some(&probe)).await?;
+        if page.rows.is_empty() {
+            break;
+        }
+        end = first;
+        let mut metadata = page.metadata.into_iter();
+        let rows = page
+            .rows
+            .into_iter()
+            .map(|cells| (cells, metadata.next()))
+            .collect::<Vec<_>>();
+        if let Some(output) = newest.push_page_above(rows.into_iter()) {
+            return Ok(Some(output));
+        }
+        if newest.held_cells() > COMMAND_OUTPUT_MAX_CELLS {
+            return Err(t("terminal.command_output.too_large"));
+        }
+        page_rows = (page_rows * 4).min(limit);
+    }
+    Ok(None)
 }
 
 /// The text of a command's output rows, without the blank lines a shell
