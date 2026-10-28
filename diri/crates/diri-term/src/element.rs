@@ -1542,6 +1542,52 @@ impl TerminalElement {
         })
     }
 
+    /// The shell prompt nearest the top of the window, above it or below it,
+    /// read from the rows this view already holds: the live screen and any
+    /// history fetched for reading. [`PromptSearch::Unknown`] means the
+    /// answer lies in rows not held here, as does every answer while the view
+    /// has no history geometry to number rows by.
+    ///
+    /// [`PromptSearch::Unknown`]: crate::command_marks::PromptSearch::Unknown
+    #[must_use]
+    pub fn held_prompt_target(&self, next: bool) -> crate::command_marks::PromptSearch {
+        let viewport = mutex_lock(&self.shared.viewport);
+        if !viewport.geometry_known() {
+            return crate::command_marks::PromptSearch::Unknown;
+        }
+        let buffer = read_lock(&self.buffer);
+        let end = viewport
+            .live_start_row()
+            .saturating_add(i64::from(buffer.rows));
+        crate::command_marks::nearest_prompt(viewport.absolute_row(0), next, 0, end, |row| {
+            viewport.stored_row(&buffer, row)
+        })
+    }
+
+    /// The finished command whose prompt mark is drawn on a window row, and
+    /// its output: what a click on that mark selects.
+    #[must_use]
+    pub fn command_output_marked_at(
+        &self,
+        window_row: usize,
+    ) -> Option<crate::command_marks::CommandOutput> {
+        let viewport = mutex_lock(&self.shared.viewport);
+        let buffer = read_lock(&self.buffer);
+        let row = viewport.absolute_row(window_row);
+        let cells = viewport.stored_row(&buffer, row)?;
+        let col = cells.iter().position(|cell| {
+            cell.style
+                .contains(diri_proto::grid::TermStyle::PROMPT_START)
+        })?;
+        crate::command_marks::command_output_at(
+            SelectionPoint { row, col },
+            COMMAND_OUTPUT_SEARCH_ROWS,
+            |row| viewport.stored_row(&buffer, row),
+        )
+        // Only an end with a status draws a mark to click.
+        .filter(|output| output.status != CommandEnd::Unknown)
+    }
+
     /// Selects a range of absolute cells, as a programmatic selection: no
     /// sheen, and the caller copies it if it wants to.
     pub fn select_range(&self, start: SelectionPoint, end: SelectionPoint) {
@@ -5303,6 +5349,97 @@ mod selection_repaint_tests {
         let element = TerminalElement::with_buffer(GridBuffer::new(COLS, ROWS));
         element.apply_damage(update(true, &[(0, "zero"), (1, "one"), (2, "two")]));
         element
+    }
+
+    /// A row whose first cell carries `marks`.
+    fn marked(text: &str, marks: TermStyle) -> Vec<GridCell> {
+        let mut cells = row(text);
+        cells[0].style |= marks;
+        cells
+    }
+
+    /// Eight rows of history under the three live rows, with prompts on
+    /// history rows 2 and 6: `ls` printed one row and exited 0.
+    fn history_with_prompts(skip: Option<i64>) -> TerminalElement {
+        let element = populated_element();
+        let history = |absolute: i64| match absolute {
+            2 => marked("$ ls", TermStyle::PROMPT_START),
+            3 => marked("a.txt", TermStyle::OUTPUT_START),
+            4 => marked("$", TermStyle::COMMAND_SUCCEEDED | TermStyle::PROMPT_START),
+            6 => marked("$ make", TermStyle::PROMPT_START),
+            _ => row("text"),
+        };
+        // Fetched in two pieces around a row that never arrived.
+        let gap = skip.unwrap_or(8);
+        let mut viewport = mutex_lock(&element.shared.viewport);
+        viewport.apply_rows(
+            (0..gap).map(history).collect(),
+            0,
+            8,
+            11,
+            1,
+            usize::from(ROWS),
+        );
+        if gap < 8 {
+            viewport.apply_rows(
+                (gap + 1..8).map(history).collect(),
+                gap + 1,
+                8,
+                11,
+                1,
+                usize::from(ROWS),
+            );
+        }
+        drop(viewport);
+        element
+    }
+
+    #[test]
+    fn prompt_jumps_are_answered_from_held_rows_without_a_read() {
+        use crate::command_marks::PromptSearch;
+        let element = history_with_prompts(None);
+        // The window's top is history row 5.
+        element.set_view_offset(3, usize::from(ROWS));
+        assert_eq!(element.held_prompt_target(false), PromptSearch::Found(4));
+        assert_eq!(element.held_prompt_target(true), PromptSearch::Found(6));
+        element.set_view_offset(8, usize::from(ROWS));
+        assert_eq!(element.held_prompt_target(false), PromptSearch::Absent);
+        element.set_view_offset(2, usize::from(ROWS));
+        assert_eq!(
+            element.held_prompt_target(true),
+            PromptSearch::Absent,
+            "the live screen below holds no prompt"
+        );
+
+        // A row that was never fetched is not guessed past.
+        let element = history_with_prompts(Some(5));
+        element.set_view_offset(2, usize::from(ROWS));
+        assert_eq!(element.held_prompt_target(false), PromptSearch::Unknown);
+
+        // Without history geometry rows have no numbers to search by.
+        let element = populated_element();
+        assert_eq!(element.held_prompt_target(false), PromptSearch::Unknown);
+    }
+
+    #[test]
+    fn a_command_mark_selects_the_output_of_its_command() {
+        let element = history_with_prompts(None);
+        // History row 2, the `ls` prompt, at the top of the window.
+        element.set_view_offset(6, usize::from(ROWS));
+        let output = element.command_output_marked_at(0).unwrap();
+        assert_eq!(
+            output.start,
+            crate::selection::SelectionPoint { row: 3, col: 0 }
+        );
+        assert_eq!(
+            output.end,
+            crate::selection::SelectionPoint { row: 4, col: 0 }
+        );
+        assert_eq!(output.status, diri_proto::grid::CommandEnd::Succeeded);
+        // The output row has no mark, and `make` has not finished.
+        assert_eq!(element.command_output_marked_at(1), None);
+        element.set_view_offset(2, usize::from(ROWS));
+        assert_eq!(element.command_output_marked_at(0), None);
     }
 
     #[test]

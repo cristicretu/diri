@@ -3392,6 +3392,33 @@ impl TerminalPane {
         .map(|(col, row)| (usize::from(col), usize::from(row)))
     }
 
+    /// Whether a window point lies in the strip left of the grid where shell
+    /// command marks are drawn.
+    fn in_command_gutter(&self, position: gpui::Point<gpui::Pixels>) -> bool {
+        let viewport = self.viewport.unwrap_or_default();
+        let grid_x = viewport.x + GRID_HORIZONTAL_PADDING / 2.0;
+        let x = f32::from(position.x);
+        x < grid_x && x >= viewport.x
+    }
+
+    /// Selects the output of the finished command whose mark is on a window
+    /// row, as clicking that mark does. False when no finished command with
+    /// output starts there.
+    fn select_marked_command_output(&mut self, id: &SessionId, row: usize) -> bool {
+        let Some(resident) = self.residents.get(id) else {
+            return false;
+        };
+        let Some(output) = resident.element.command_output_marked_at(row) else {
+            return false;
+        };
+        resident.element.select_range(output.start, output.end);
+        resident.element.complete_selection();
+        if let Some(resident) = self.residents.get_mut(id) {
+            resident.pointer_owner = None;
+        }
+        true
+    }
+
     fn handle_pointer_down(
         &mut self,
         event: &gpui::MouseDownEvent,
@@ -3443,6 +3470,19 @@ impl TerminalPane {
         resident.pointer_owner = Some((event.button, owner));
         resident.mouse_motion.reset();
 
+        if owner == PointerOwner::LocalSelection
+            && event.button == MouseButton::Left
+            && event.click_count == 1
+            && is_plain_click(&event.modifiers)
+            && self.in_command_gutter(event.position)
+            && self.select_marked_command_output(&id, row)
+        {
+            cx.notify();
+            return;
+        }
+        let Some(resident) = self.residents.get_mut(&id) else {
+            return;
+        };
         match owner {
             PointerOwner::LocalSelection => {
                 // A plain press on a link arms it like a Command-press; the
@@ -3627,8 +3667,22 @@ impl TerminalPane {
                 self.qol.hover = next;
                 cx.notify();
             }
+            let mark = self
+                .in_command_gutter(event.position)
+                .then(|| {
+                    self.residents
+                        .get(&id)
+                        .and_then(|resident| resident.element.command_output_marked_at(row))
+                })
+                .flatten()
+                .map(|_| row);
+            if self.qol.gutter_mark != mark {
+                self.qol.gutter_mark = mark;
+                cx.notify();
+            }
         } else {
             self.qol.hover = None;
+            self.qol.gutter_mark = None;
         }
         let selecting = self.residents.get(&id).is_some_and(|r| {
             r.pointer_owner == Some((MouseButton::Left, PointerOwner::LocalSelection))
@@ -4950,7 +5004,7 @@ impl TerminalPane {
             .pt(px(2.0))
             .pb(px(10.0))
             .px(px(12.0))
-            .cursor(if self.qol.hit.is_some() {
+            .cursor(if self.qol.hit.is_some() || self.qol.gutter_mark.is_some() {
                 gpui::CursorStyle::PointingHand
             } else {
                 gpui::CursorStyle::IBeam
@@ -4959,6 +5013,7 @@ impl TerminalPane {
                 if !hovered {
                     this.qol.hover = None;
                     this.qol.hit = None;
+                    this.qol.gutter_mark = None;
                     this.qol.hover_key_clear();
                     cx.notify();
                 }
@@ -8049,6 +8104,21 @@ mod tests {
                             let output = resident.element.command_output_at(10, 4).unwrap();
                             resident.element.select_range(output.start, output.end);
                         }
+                        "commands-gutter" => {
+                            // A click on the failed `git push`'s red mark.
+                            let row = (0..16)
+                                .find(|&row| {
+                                    pane.residents[&id]
+                                        .element
+                                        .command_output_marked_at(row)
+                                        .is_some_and(|output| {
+                                            output.status == diri_proto::grid::CommandEnd::Failed
+                                        })
+                                })
+                                .unwrap();
+                            assert!(pane.select_marked_command_output(&id, row));
+                            pane.qol.gutter_mark = Some(row);
+                        }
                         "commands-menu" => pane.open_terminal_menu(
                             gpui::point(px(220.0), px(110.0)),
                             10,
@@ -9153,6 +9223,107 @@ mod tests {
         // The channel is live: a real keystroke still arrives.
         cx.simulate_keystrokes("a");
         assert_eq!(input.try_recv().unwrap(), (id.clone(), b"a".to_vec()));
+    }
+
+    /// History rows for a shell with prompts at rows 3 and 12, where the
+    /// command at row 3 printed rows 4 and 5 and failed.
+    fn prompted_history(rows: usize) -> Vec<Vec<GridCell>> {
+        (0..rows)
+            .map(|absolute| {
+                let mut cells = vec![GridCell::BLANK; 8];
+                let text = match absolute {
+                    3 | 12 => "$ make",
+                    4 => "error",
+                    5 => "stop",
+                    6 => "$",
+                    _ => "text",
+                };
+                for (cell, ch) in cells.iter_mut().zip(text.chars()) {
+                    cell.scalar = u32::from(ch);
+                }
+                match absolute {
+                    3 | 12 => cells[0].style |= TermStyle::PROMPT_START,
+                    4 => cells[0].style |= TermStyle::OUTPUT_START,
+                    6 => cells[0].style |= TermStyle::COMMAND_FAILED | TermStyle::PROMPT_START,
+                    _ => {}
+                }
+                cells
+            })
+            .collect()
+    }
+
+    #[gpui::test]
+    fn prompt_jumps_through_held_history_need_no_engine_read(cx: &mut TestAppContext) {
+        const ROWS: usize = 4;
+        const HISTORY: i64 = 20;
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            let element = pane.residents[&id].element.clone();
+            element.apply_damage(filled_grid('o'));
+            let history = prompted_history(HISTORY as usize);
+            element.set_view_offset(4, ROWS);
+            element
+                .complete_scrollback_fetch(
+                    diri_proto::methods::ReadScrollbackCellsResult {
+                        metadata: Vec::new(),
+                        payload: diri_proto::grid::GridRowCodec::encode_rows(&history).unwrap(),
+                        first_row: 0,
+                        row_count: HISTORY,
+                        total_rows: HISTORY + ROWS as i64,
+                        live_start_row: HISTORY,
+                        cols: 8,
+                        content_seq: 1,
+                    },
+                    ROWS,
+                )
+                .unwrap();
+            element.set_view_offset(4, ROWS);
+            let top = |element: &diri_term::element::TerminalElement| {
+                HISTORY - element.view_offset()
+            };
+            assert_eq!(top(&element), 16);
+
+            // The inert runtime has no Engine: every answer below came from
+            // the rows the view holds, at once.
+            pane.read_history(Some(false), qol::PromptMiss::NeedsMarks, window, cx);
+            assert!(!pane.qol.busy, "a held prompt waited on an Engine read");
+            assert_eq!(top(&element), 12);
+            pane.read_history(Some(false), qol::PromptMiss::NeedsMarks, window, cx);
+            assert_eq!(top(&element), 6, "the failed command's end starts a prompt");
+            pane.read_history(Some(true), qol::PromptMiss::NeedsMarks, window, cx);
+            assert_eq!(top(&element), 12);
+            pane.read_history(Some(false), qol::PromptMiss::NeedsMarks, window, cx);
+            pane.read_history(Some(false), qol::PromptMiss::NeedsMarks, window, cx);
+            assert_eq!(top(&element), 3);
+            pane.read_history(Some(false), qol::PromptMiss::NeedsMarks, window, cx);
+            assert_eq!(top(&element), 3, "nothing above the first prompt");
+            assert_eq!(pane.qol.feedback.as_deref(), Some(t("terminal.prompt.none")));
+            assert!(!pane.qol.busy);
+
+            // Its mark in the gutter selects that command's output.
+            assert!(pane.select_marked_command_output(&id, 0));
+            assert_eq!(element.selected_text(), "error\nstop\n");
+            assert!(
+                !pane.select_marked_command_output(&id, 1),
+                "an output row carries no mark"
+            );
+        });
     }
 
     #[gpui::test]
