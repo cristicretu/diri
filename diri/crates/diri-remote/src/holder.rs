@@ -43,6 +43,11 @@ const DIFF_COALESCE: Duration = Duration::from_millis(8);
 /// writes issued back to back. See [`grid_due`].
 const OUTPUT_QUIET: Duration = Duration::from_millis(1);
 const INTERACTIVE_GRID_BUDGET: u8 = 2;
+/// How long a destructive repaint's redraw may take to arrive, from when the
+/// batch that erased opened. The local Engine pump's partial-repaint ceiling,
+/// and the most any output is coalesced. A keystroke's fast path does not
+/// bypass it: publishing the erase alone is the flash this hold prevents.
+const REPAINT_HOLD: Duration = Duration::from_millis(16);
 const MAX_OUTBOUND_BYTES: usize = 20 << 20;
 const MAX_PENDING_INPUT_BYTES: usize = 1 << 20;
 /// How much raw output may accumulate before it is framed for the client.
@@ -445,6 +450,13 @@ struct Holder {
     /// a repaint caught between its erase and its redraw, and keeps the
     /// whole interval for the redraw to arrive instead of the leading edge.
     published_filled: usize,
+    /// Filled cells when the pending batch opened, which is what the last
+    /// publication showed.
+    batch_filled: usize,
+    /// Set while the pending batch holds less than it opened with and is not
+    /// a closed synchronized update: a repaint between its erase and its
+    /// redraw. The diff waits until this deadline or until content returns.
+    repaint_hold: Option<Instant>,
     /// Raw output waiting to be framed, and the offset it starts at.
     pending_output: Vec<u8>,
     pending_output_offset: u64,
@@ -508,7 +520,11 @@ impl Holder {
         pty_reader.set_nonblocking(true)?;
         let pty_writer = pty.writer()?;
         let exit_watcher = ExitWatcher::new(process_pid)?;
-        let screen = holder_screen(start.request.cols, start.request.rows);
+        let screen = holder_screen(
+            start.request.cols,
+            start.request.rows,
+            start.request.keyboard_enhancements,
+        );
         let log = OutputLog::open(&paths.output)?;
         let mut state = SessionState::new(
             &start.request,
@@ -548,6 +564,8 @@ impl Holder {
             last_output: None,
             last_grid_publication: None,
             published_filled: 0,
+            batch_filled: 0,
+            repaint_hold: None,
             pending_output: Vec::with_capacity(OUTPUT_FRAME_BYTES),
             pending_output_offset: 0,
             interactive_grid_budget: 0,
@@ -694,10 +712,10 @@ impl Holder {
             {
                 self.read_pending_connection()?;
             }
-            if self
-                .grid_due()
-                .is_some_and(|due| self.interactive_grid_budget > 0 || Instant::now() >= due)
-            {
+            if self.grid_due().is_some_and(|due| {
+                (self.interactive_grid_budget > 0 && self.repaint_hold.is_none())
+                    || Instant::now() >= due
+            }) {
                 // Held output goes out with the diff it belongs to.
                 self.flush_output()?;
                 self.emit_grid_delta()?;
@@ -809,13 +827,31 @@ impl Holder {
     fn consume_output(&mut self, bytes: &[u8]) -> io::Result<()> {
         let offset = self.log.append(bytes)?;
         self.state.output_offset = self.log.tail_offset();
-        self.screen.feed(bytes);
-        self.answer_image_queries();
         let now = Instant::now();
-        self.last_output = Some(now);
-        if self.dirty_since.is_none() {
-            self.dirty_since = Some(now);
-        }
+        let since = *self.dirty_since.get_or_insert_with(|| {
+            self.batch_filled = self.screen.filled_cells();
+            now
+        });
+        let synchronized = self.screen.synchronized_updates_completed();
+        self.screen.feed(bytes);
+        self.answer_queries();
+        self.last_output = Some(Instant::now());
+        // A closed synchronized update is a whole frame however much it
+        // erased. A keystroke may remove up to one row (backspace, kill
+        // line) without being mistaken for a repaint, and a line edit on
+        // the cursor's row (a progress line rewritten shorter) has no redraw
+        // coming.
+        let complete = self.screen.synchronized_updates_completed() != synchronized
+            && !self.screen.in_synchronized_update();
+        let allowance = if self.interactive_grid_budget > 0 {
+            self.screen.size().0
+        } else {
+            0
+        };
+        self.repaint_hold = (!complete
+            && self.screen.filled_cells() + allowance < self.batch_filled
+            && !self.screen.lost_cells_only_on_cursor_row())
+        .then_some(since + REPAINT_HOLD);
         if self
             .connection
             .as_ref()
@@ -848,13 +884,13 @@ impl Holder {
         Ok(())
     }
 
-    /// Writes the emulator's answers to inline-image support probes back to
-    /// the program, which is waiting on them. The screen keeps no other
-    /// replies (see [`holder_screen`]). Answers that do not fit the bounded
-    /// input queue are dropped: the program's probe then times out, exactly
-    /// as it did before this Holder answered at all.
-    fn answer_image_queries(&mut self) {
-        let replies = self.screen.take_replies();
+    /// Writes the emulator's answers to the program's queries back to it,
+    /// at once and in stream order, after the output that asked; the program
+    /// is waiting on them. Answers that do not fit the bounded input queue
+    /// are dropped: the program's query then times out, exactly as it did
+    /// before this Holder answered at all.
+    fn answer_queries(&mut self) {
+        let replies = self.owed_replies();
         if replies.is_empty()
             || self.pending_input.len().saturating_add(replies.len()) > MAX_PENDING_INPUT_BYTES
         {
@@ -863,6 +899,26 @@ impl Holder {
         self.pending_input.push(&replies);
         // A failed write surfaces again on the next poll of the PTY.
         let _ = self.flush_input();
+    }
+
+    /// The screen's replies this Holder owes its program. A controller from
+    /// before `query-replies-v1` answers `OSC 7501` support queries itself, a
+    /// round trip later, so while one is attached those are left to it rather
+    /// than answered twice. With no controller attached nobody else would
+    /// answer, so the Holder does.
+    fn owed_replies(&mut self) -> Vec<u8> {
+        let mut replies = self.screen.take_replies();
+        let older_controller = self
+            .connection
+            .as_ref()
+            .is_some_and(|connection| connection.epoch.is_some() && !connection.query_replies);
+        if older_controller {
+            remove_all(
+                &mut replies,
+                diri_terminal_state::PROGRAM_STATUS_QUERY_REPLY,
+            );
+        }
+        replies
     }
 
     fn read_connection(&mut self) -> io::Result<()> {
@@ -1017,6 +1073,9 @@ impl Holder {
                     self.pty
                         .resize_with_pixels(cols, rows, text_area_pixels(cols, rows))?;
                     self.screen.resize(usize::from(cols), usize::from(rows));
+                    // The in-band size report a program asked for (DECSET
+                    // 2048) is owed now, not with its next output.
+                    self.answer_queries();
                     self.state.cols = cols;
                     self.state.rows = rows;
                     self.state.snapshot_sequence = self.state.snapshot_sequence.saturating_add(1);
@@ -1113,6 +1172,7 @@ impl Holder {
                 self.reset_output_offset = self.state.output_offset;
                 self.state.snapshot_sequence = sequence;
                 self.dirty_since = None;
+                self.repaint_hold = None;
                 self.queue_snapshot(connection)
             }
             RemoteMessage::AcquireControl(_) => {
@@ -1128,6 +1188,20 @@ impl Holder {
                     request_id: request.request_id,
                     result,
                 }))
+            }
+            RemoteMessage::TerminalPalette(palette) => {
+                if !connection.query_replies {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "query-replies-v1 was not negotiated",
+                    ));
+                }
+                // Color queries are answered from it from now on, attached
+                // or not; a program that asked for color-scheme reports
+                // (DECSET 2031) is told at once if light/dark changed.
+                self.screen.set_palette(Some(palette));
+                self.answer_queries();
+                Ok(())
             }
             RemoteMessage::ImageRequest(request) => {
                 if !connection.inline_images {
@@ -1266,6 +1340,8 @@ impl Holder {
         connection.terminal_styles = styles_requested;
         connection.inline_images =
             hello.protocol.minor >= diri_proto::remote_pty::INLINE_IMAGES_PROTOCOL_MINOR;
+        connection.query_replies =
+            hello.protocol.minor >= diri_proto::remote_pty::QUERY_REPLIES_PROTOCOL_MINOR;
         ensure_keyboard_controller(self.screen.input_keyboard_state(), enhanced_keyboard)?;
         connection.enhanced_keyboard = enhanced_keyboard;
         // Judged against the lease as it stands before this attach claims it:
@@ -1286,7 +1362,16 @@ impl Holder {
             protocol: diri_proto::remote_pty::ProtocolVersion::CURRENT,
             holder_build_id: BUILD_ID.to_string(),
             session_incarnation: self.state.session_incarnation.clone(),
-            capabilities: PHASE_ONE_CAPABILITIES.to_vec(),
+            capabilities: {
+                let mut capabilities = PHASE_ONE_CAPABILITIES.to_vec();
+                if enhanced_keyboard
+                    && hello.protocol.minor >= diri_proto::remote_pty::KITTY_KEYBOARD_PROTOCOL_MINOR
+                    && self.screen.keyboard_enhancements_enabled()
+                {
+                    capabilities.push(diri_proto::remote_pty::RemoteCapability::KittyKeyboard);
+                }
+                capabilities
+            },
             controller_epoch: epoch,
             process_state: self.state.process_state.clone(),
             child_identity: (hello.protocol.minor
@@ -1501,9 +1586,15 @@ impl Holder {
         Ok(())
     }
 
-    /// When the pending grid diff is due, if one is pending.
+    /// When the pending grid diff is due, if one is pending, without a
+    /// keystroke's fast path: a destructive repaint's hold, the coalescing
+    /// interval, or the leading edge.
     fn grid_due(&self) -> Option<Instant> {
         self.dirty_since.map(|since| {
+            if let Some(hold) = self.repaint_hold {
+                // A destructive repaint waits for its redraw (or the hold).
+                return hold;
+            }
             if self.screen.filled_cells() < self.published_filled
                 && !self.screen.lost_cells_only_on_cursor_row()
             {
@@ -1529,6 +1620,7 @@ impl Holder {
         self.last_grid_publication = Some(Instant::now());
         self.published_filled = self.screen.filled_cells();
         self.screen.mark_row_baseline();
+        self.repaint_hold = None;
         if self
             .connection
             .as_ref()
@@ -1774,13 +1866,50 @@ fn ensure_keyboard_controller(
 }
 
 /// The Holder's emulator. It places inline images (the shared Kitty/iTerm2
-/// interception) and answers only their support probes: every other reply a
-/// remote program gets is the Engine's, and before `inline-images-v1` this
-/// terminal answered nothing.
-fn holder_screen(cols: u16, rows: u16) -> HeadlessScreen {
-    HeadlessScreen::new(usize::from(cols), usize::from(rows))
-        .with_inline_images()
-        .answering_image_queries_only()
+/// interception) and, from `query-replies-v1`, answers every query its
+/// program makes from its own state, as the local Engine's screen does:
+/// cursor position, status, device attributes, mode and size reports,
+/// XTVERSION, XTGETTCAP, DECRQSS, image probes and `OSC 7501` support, and
+/// color queries from the palette its controller pushed. Before
+/// `inline-images-v1` this terminal answered nothing, and before
+/// `query-replies-v1` only image probes.
+///
+/// With `keyboard_enhancements` (`kitty-keyboard-v1`: the launching Engine
+/// encodes negotiated flags) the program may also negotiate kitty keyboard
+/// flags: `CSI ? u` is answered and push/pop/set change the flags the
+/// controller receives in `InputModes`. Without it the parser keeps kitty
+/// negotiation disabled, exactly as every earlier Holder.
+fn holder_screen(cols: u16, rows: u16, keyboard_enhancements: bool) -> HeadlessScreen {
+    let (cols, rows) = (usize::from(cols), usize::from(rows));
+    if keyboard_enhancements {
+        HeadlessScreen::new_with_keyboard_enhancements(cols, rows)
+    } else {
+        HeadlessScreen::new(cols, rows)
+    }
+    .with_inline_images()
+    .answering_program_status_queries()
+    .with_host_replies(terminal_version())
+}
+
+/// What XTVERSION reports: the terminal and this Helper's build.
+fn terminal_version() -> String {
+    format!("diri {}", &BUILD_ID[..BUILD_ID.len().min(12)])
+}
+
+/// Removes every occurrence of `needle` from `bytes`. Replies are a few
+/// bytes per query, so a plain scan suffices.
+fn remove_all(bytes: &mut Vec<u8>, needle: &[u8]) {
+    let mut kept = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index..].starts_with(needle) {
+            index += needle.len();
+        } else {
+            kept.push(bytes[index]);
+            index += 1;
+        }
+    }
+    *bytes = kept;
 }
 
 /// `ws_xpixel`/`ws_ypixel` at the cell size images are placed with.
@@ -1802,6 +1931,9 @@ struct Connection {
     /// The controller speaks `inline-images-v1`: it may read images, and
     /// image anchors in the grid are meaningful to it.
     inline_images: bool,
+    /// The controller speaks `query-replies-v1`: it leaves every reply to
+    /// this Holder, `OSC 7501` support queries included.
+    query_replies: bool,
     reset_state: Option<diri_proto::remote_pty::TerminalResetState>,
     protocol_minor: u16,
     keyboard: Option<diri_proto::terminal_input::KeyboardState>,
@@ -1819,6 +1951,7 @@ impl Connection {
             terminal_reset: false,
             terminal_styles: false,
             inline_images: false,
+            query_replies: false,
             reset_state: None,
             protocol_minor: 0,
             keyboard: Some(Default::default()),
@@ -1913,6 +2046,13 @@ impl Connection {
         {
             value.capabilities.retain(|capability| {
                 *capability != diri_proto::remote_pty::RemoteCapability::GridResume
+            });
+        }
+        if !self.query_replies
+            && let RemoteMessage::HelloAck(value) = &mut message
+        {
+            value.capabilities.retain(|capability| {
+                *capability != diri_proto::remote_pty::RemoteCapability::QueryReplies
             });
         }
         if !self.terminal_reset
@@ -2486,6 +2626,7 @@ mod tests {
             cols: 80,
             rows: 24,
             persistence: diri_proto::remote_pty::PersistenceCapability::NonPersistent,
+            keyboard_enhancements: false,
         };
         let paths = roots.session(&request.session_id).unwrap();
         paths.ensure().unwrap();
@@ -2543,6 +2684,8 @@ mod tests {
             last_output: None,
             last_grid_publication: None,
             published_filled: 0,
+            batch_filled: 0,
+            repaint_hold: None,
             pending_output: Vec::new(),
             pending_output_offset: 0,
             interactive_grid_budget: 0,
@@ -2580,7 +2723,133 @@ mod tests {
         holder.last_grid_publication = Some(long_ago);
         holder.consume_output(b"\x1b[H\x1b[2J").unwrap();
         let since = holder.dirty_since.unwrap();
-        assert_eq!(holder.grid_due(), Some(since + DIFF_COALESCE));
+        assert_eq!(holder.grid_due(), Some(since + REPAINT_HOLD));
+    }
+
+    /// An erase holds its diff (even after a keystroke) until the redraw
+    /// returns the content or [`REPAINT_HOLD`] passes; a keystroke that
+    /// removes at most one row, a closed synchronized update, and additive
+    /// output never hold.
+    #[test]
+    fn a_destructive_repaint_holds_its_diff_until_the_redraw() {
+        let (_temp, mut holder, _request) = waiting_holder();
+        holder.screen = holder_screen(20, 4, false);
+        let full = b"\x1b[Haaaaaaaaaaaaaaaaaaaa\r\nbbbbbbbbbbbbbbbbbbbb\r\ncccccccccccccccccccc";
+        holder.consume_output(full).unwrap();
+        holder.emit_grid_delta().unwrap();
+
+        holder.interactive_grid_budget = INTERACTIVE_GRID_BUDGET;
+        holder.consume_output(b"\x1b[H\x1b[2J").unwrap();
+        let opened = holder.dirty_since.unwrap();
+        assert_eq!(holder.repaint_hold, Some(opened + REPAINT_HOLD));
+        assert_eq!(holder.grid_due(), Some(opened + REPAINT_HOLD));
+        holder.consume_output(full).unwrap();
+        assert_eq!(
+            holder.repaint_hold, None,
+            "the redraw ends the hold at once"
+        );
+        holder.emit_grid_delta().unwrap();
+
+        // Backspace over a character, and a kill-line of one whole row.
+        holder.interactive_grid_budget = INTERACTIVE_GRID_BUDGET;
+        holder.consume_output(b"\x08\x1b[K").unwrap();
+        assert_eq!(holder.repaint_hold, None);
+        holder.consume_output(b"\r\x1b[2K").unwrap();
+        assert_eq!(holder.repaint_hold, None);
+        holder.emit_grid_delta().unwrap();
+
+        // Without a keystroke, any loss holds; a closed synchronized update
+        // is a whole frame and does not.
+        holder.interactive_grid_budget = 0;
+        holder.consume_output(b"\x1b[H\x1b[2K").unwrap();
+        assert!(holder.repaint_hold.is_some());
+        holder.emit_grid_delta().unwrap();
+        holder
+            .consume_output(b"\x1b[?2026h\x1b[2J\x1b[?2026l")
+            .unwrap();
+        assert_eq!(holder.repaint_hold, None);
+        holder.emit_grid_delta().unwrap();
+        holder.consume_output(b"more").unwrap();
+        assert_eq!(holder.repaint_hold, None);
+        // Additive output is due on the leading edge, never later than the
+        // coalescing interval.
+        assert_eq!(
+            holder.grid_due(),
+            Some(grid_due(
+                holder.dirty_since.unwrap(),
+                holder.last_output.unwrap(),
+                holder.last_grid_publication,
+            ))
+        );
+    }
+
+    /// Only a Holder launched with `keyboardEnhancements` answers `CSI ? u`
+    /// and lets its program change the flags, and it names
+    /// `kitty-keyboard-v1` only to an enhanced controller at minor 20 or
+    /// above. A launch without the field (every older Engine) keeps the
+    /// disabled parser: the query goes unanswered and a push changes nothing.
+    #[test]
+    fn kitty_keyboard_is_negotiated_only_when_the_launch_asked() {
+        let mut disabled = holder_screen(80, 24, false);
+        disabled.feed(b"\x1b[?u\x1b[>1u");
+        assert!(!disabled.take_replies().windows(3).any(|w| w == b"?0u"));
+        assert_eq!(
+            disabled
+                .keyboard_state()
+                .enhancements
+                .map(|flags| flags.bits()),
+            Some(0)
+        );
+        let mut enabled = holder_screen(80, 24, true);
+        enabled.feed(b"\x1b[?u\x1b[>1u\x1b[?u");
+        assert_eq!(enabled.take_replies(), b"\x1b[?0u\x1b[?1u");
+        assert_eq!(
+            enabled
+                .keyboard_state()
+                .enhancements
+                .map(|flags| flags.bits()),
+            Some(1)
+        );
+
+        let (_temp, mut holder, request) = waiting_holder();
+        initialize_auth(&holder.paths, &request.session_token).unwrap();
+        let incarnation = holder.state.session_incarnation.clone();
+        let hello = |minor: u16, enhanced: bool| Hello {
+            protocol: diri_proto::remote_pty::ProtocolVersion { major: 1, minor },
+            local_build_id: "fixture".into(),
+            session_id: request.session_id.clone(),
+            session_token: request.session_token.clone(),
+            expected_incarnation: Some(incarnation.clone()),
+            requested_role: diri_proto::remote_pty::RemoteRole::Controller,
+            client_nonce: "fixture-nonce".into(),
+            required_capabilities: if enhanced {
+                vec![diri_proto::remote_pty::RemoteCapability::EnhancedKeyboard]
+            } else {
+                vec![]
+            },
+            last_acknowledged_output_offset: None,
+            last_acknowledged_grid_sequence: None,
+            grid_resume: None,
+        };
+        let named = |holder: &mut Holder, minor, enhanced| {
+            let (stream, _peer) = UnixStream::pair().unwrap();
+            let mut connection = Connection::new(stream);
+            holder
+                .handshake(&mut connection, hello(minor, enhanced))
+                .unwrap();
+            let messages = RemoteCodec::new().feed(&connection.outbound).unwrap();
+            let RemoteMessage::HelloAck(ack) = &messages[0] else {
+                panic!("HelloAck first")
+            };
+            ack.capabilities
+                .contains(&diri_proto::remote_pty::RemoteCapability::KittyKeyboard)
+        };
+        holder.screen = holder_screen(80, 24, false);
+        assert!(!named(&mut holder, 20, true), "not negotiating");
+        holder.screen = holder_screen(80, 24, true);
+        assert!(named(&mut holder, 20, true));
+        assert!(!named(&mut holder, 19, true), "older controller");
+        assert!(!named(&mut holder, 20, false), "legacy keyboard controller");
     }
 
     #[test]
@@ -3066,11 +3335,185 @@ mod tests {
     }
 
     #[test]
+    fn query_replies_are_answered_in_order_and_left_to_an_older_controller() {
+        use diri_proto::remote_pty::{QUERY_REPLIES_PROTOCOL_MINOR, RemoteCapability};
+        let (_temp, mut holder, request) = waiting_holder();
+        initialize_auth(&holder.paths, &request.session_token).unwrap();
+        holder.screen = holder_screen(80, 24, false);
+        let incarnation = holder.state.session_incarnation.clone();
+        // A support probe (`OSC 7501` then DA1) around the queries programs
+        // block on: CPR, DSR, DECRQM, DA2, text-area size.
+        let probe = b"\x1b]7501;?\x1b\\\x1b[6n\x1b[5n\x1b[?2004$p\x1b[>c\x1b[18t\x1b[c";
+        let status = diri_terminal_state::PROGRAM_STATUS_QUERY_REPLY;
+        let emulator: &[u8] =
+            b"\x1b[1;1R\x1b[0n\x1b[?2004;2$y\x1b[>0;2600;1c\x1b[8;24;80t\x1b[?62;22c";
+        let every = [status, emulator].concat();
+
+        // Detached, nobody else could answer: every reply, the status query
+        // ahead of the attributes that follow it.
+        holder.screen.feed(probe);
+        assert_eq!(holder.owed_replies(), every);
+
+        let attach = |holder: &mut Holder, minor: u16| {
+            let (stream, _peer) = UnixStream::pair().unwrap();
+            let mut connection = Connection::new(stream);
+            holder
+                .handshake(&mut connection, image_hello(&request, &incarnation, minor))
+                .unwrap();
+            let published = RemoteCodec::new().feed(&connection.outbound).unwrap();
+            let RemoteMessage::HelloAck(acknowledgement) = &published[0] else {
+                panic!("HelloAck first: {published:?}");
+            };
+            let told = acknowledgement
+                .capabilities
+                .contains(&RemoteCapability::QueryReplies);
+            assert_eq!(told, connection.query_replies);
+            connection
+        };
+
+        // An older Engine is not told, and keeps answering `OSC 7501` itself:
+        // the Holder leaves exactly that reply out so the program never gets
+        // it twice, and still answers everything the Engine never did.
+        let old = attach(&mut holder, QUERY_REPLIES_PROTOCOL_MINOR - 1);
+        assert!(!old.query_replies);
+        holder.connection = Some(old);
+        holder.screen.feed(probe);
+        assert_eq!(holder.owed_replies(), emulator);
+
+        // A capable Engine is told and answers nothing; the Holder does.
+        let capable = attach(&mut holder, QUERY_REPLIES_PROTOCOL_MINOR);
+        assert!(capable.query_replies);
+        holder.connection = Some(capable);
+        holder.screen.feed(probe);
+        assert_eq!(holder.owed_replies(), every);
+
+        // A reset (RIS from the controller) keeps the scope.
+        holder.screen.reset();
+        holder.screen.feed(b"\x1b]7501;?\x07\x1b[c");
+        assert_eq!(holder.owed_replies(), [status, b"\x1b[?62;22c"].concat());
+    }
+
+    #[test]
+    fn color_queries_are_answered_from_the_palette_a_capable_controller_pushed() {
+        use diri_proto::remote_pty::QUERY_REPLIES_PROTOCOL_MINOR;
+        use diri_proto::{TerminalAppearance, TerminalPalette};
+        let (_temp, mut holder, request) = waiting_holder();
+        initialize_auth(&holder.paths, &request.session_token).unwrap();
+        holder.screen = holder_screen(80, 24, false);
+        let incarnation = holder.state.session_incarnation.clone();
+        let palette = |appearance| TerminalPalette {
+            appearance,
+            foreground: [0x11, 0x22, 0x33],
+            background: [0xfa, 0xfb, 0xfc],
+            cursor: [0x01, 0x02, 0x03],
+            ansi: [[0x40, 0x50, 0x60]; 16],
+        };
+        let colors = b"\x1b]10;?\x1b\\\x1b]11;?\x07\x1b]4;1;?\x1b\\\x1b[?996n\x1b[c";
+        // Before any palette the colors are unknown and stay unanswered.
+        holder.screen.feed(colors);
+        assert_eq!(holder.owed_replies(), b"\x1b[?62;22c");
+
+        // An older controller cannot push one.
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut old = Connection::new(stream);
+        holder
+            .handshake(
+                &mut old,
+                image_hello(&request, &incarnation, QUERY_REPLIES_PROTOCOL_MINOR - 1),
+            )
+            .unwrap();
+        assert_eq!(
+            holder
+                .handle_message(
+                    &mut old,
+                    RemoteMessage::TerminalPalette(palette(TerminalAppearance::Dark)),
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut capable = Connection::new(stream);
+        holder
+            .handshake(
+                &mut capable,
+                image_hello(&request, &incarnation, QUERY_REPLIES_PROTOCOL_MINOR),
+            )
+            .unwrap();
+        holder
+            .handle_message(
+                &mut capable,
+                RemoteMessage::TerminalPalette(palette(TerminalAppearance::Dark)),
+            )
+            .unwrap();
+        holder.screen.feed(colors);
+        assert_eq!(
+            String::from_utf8(holder.owed_replies()).unwrap(),
+            "\x1b]10;rgb:1111/2222/3333\x1b\\\x1b]11;rgb:fafa/fbfb/fcfc\x07\
+             \x1b]4;1;rgb:4040/5050/6060\x1b\\\x1b[?997;1n\x1b[?62;22c"
+        );
+
+        // A program that asked for color-scheme reports (DECSET 2031) is
+        // told when the pushed appearance flips, and only then. The report
+        // goes to the PTY at once, so the screen owes nothing afterwards.
+        holder.screen.feed(b"\x1b[?2031h");
+        assert!(holder.owed_replies().is_empty());
+        // DECRQM reports every mode the shared emulator knows, so modes it
+        // learns (2031/2048 here; 2027 with grapheme clustering) need no
+        // Holder change.
+        holder.screen.feed(b"\x1b[?2031$p\x1b[?2048$p");
+        assert_eq!(holder.owed_replies(), b"\x1b[?2031;1$y\x1b[?2048;2$y");
+        holder
+            .screen
+            .set_palette(Some(palette(TerminalAppearance::Light)));
+        assert_eq!(holder.owed_replies(), b"\x1b[?997;2n");
+        holder
+            .screen
+            .set_palette(Some(palette(TerminalAppearance::Light)));
+        assert!(holder.owed_replies().is_empty());
+
+        // XTVERSION names the terminal and this Helper's build.
+        holder.screen.feed(b"\x1b[>0q");
+        assert_eq!(
+            String::from_utf8(holder.owed_replies()).unwrap(),
+            format!("\x1bP>|{}\x1b\\", terminal_version())
+        );
+    }
+
+    #[test]
+    fn query_replies_reach_the_program_through_the_pty() {
+        // The program asks for the cursor position and prints the answer it
+        // read, hex encoded, so the reply's path through the bounded input
+        // queue into the PTY is the one under test.
+        let (_temp, mut holder, _request) = waiting_holder_running(&[
+            "/bin/sh",
+            "-c",
+            "stty raw -echo min 0 time 30; printf 'ab\\033[6n'; \
+             dd bs=1 count=6 2>/dev/null | od -An -tx1 | tr -d ' \\n'; printf '|done'; sleep 5",
+        ]);
+        holder.screen = holder_screen(80, 24, false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !holder.screen.lines().join("").contains("|done") {
+            assert!(Instant::now() < deadline, "{:?}", holder.screen.lines());
+            holder.drain_pty().unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // ESC [ 1 ; 3 R
+        assert!(
+            holder.screen.lines().join("").contains("1b5b313b3352|done"),
+            "{:?}",
+            holder.screen.lines()
+        );
+        let _ = holder.pty.terminate(Duration::ZERO);
+    }
+
+    #[test]
     fn inline_images_are_negotiated_per_controller_and_served_in_bounded_chunks() {
         use diri_proto::remote_pty::{INLINE_IMAGES_PROTOCOL_MINOR, RemoteCapability};
         let (_temp, mut holder, request) = waiting_holder();
         initialize_auth(&holder.paths, &request.session_token).unwrap();
-        holder.screen = holder_screen(80, 24);
+        holder.screen = holder_screen(80, 24, false);
         let incarnation = holder.state.session_incarnation.clone();
         // 300×300 RGBA: larger than one chunk, so it takes two reads.
         let pixels: Vec<u8> = (0..300 * 300 * 4)
@@ -3179,7 +3622,7 @@ mod tests {
         );
         let (_holder_temp, mut holder, request) =
             waiting_holder_running(&["/bin/sh", "-c", &script]);
-        holder.screen = holder_screen(80, 24);
+        holder.screen = holder_screen(80, 24, false);
         let deadline = Instant::now() + Duration::from_secs(5);
         while !holder
             .screen
@@ -3241,7 +3684,7 @@ mod tests {
         use diri_proto::remote_pty::INLINE_IMAGES_PROTOCOL_MINOR;
         let (_temp, mut holder, request) = waiting_holder();
         initialize_auth(&holder.paths, &request.session_token).unwrap();
-        holder.screen = holder_screen(80, 24);
+        holder.screen = holder_screen(80, 24, false);
         let incarnation = holder.state.session_incarnation.clone();
         let (stream, _peer) = UnixStream::pair().unwrap();
         let mut connection = Connection::new(stream);

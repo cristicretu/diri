@@ -2259,6 +2259,7 @@ impl ControlServer {
             cols: pty.cols,
             rows: pty.rows,
             persistence,
+            keyboard_enhancements: false,
         };
 
         let mut record = new_record(&id, &kind, &captured.cwd);
@@ -4383,6 +4384,7 @@ impl ControlServer {
             cols: pty.cols,
             rows: pty.rows,
             persistence,
+            keyboard_enhancements: false,
         };
         Ok(crate::session::SessionSpec {
             id: target_id.to_owned(),

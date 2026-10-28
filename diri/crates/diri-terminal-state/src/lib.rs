@@ -13,6 +13,8 @@
 //! emulator does not model, so it is scanned out of the byte stream directly —
 //! see [`scan_progress`].
 
+#[cfg(feature = "core-v2")]
+pub mod core_v2;
 mod inline_images;
 mod notifications;
 mod program_status;
@@ -680,6 +682,19 @@ impl HeadlessScreen {
         self.term.release_primary_history_spare_rows();
     }
 
+    /// Answer `OSC 7501` support queries among this terminal's replies, in
+    /// stream order with the emulator's own, and interpret no other product
+    /// OSC. For a remote Holder (`query-replies-v1`), which answers its
+    /// program's queries itself and does not interpret product alerts. A
+    /// screen [`Self::with_notifications`] already answers them.
+    #[must_use]
+    pub fn answering_program_status_queries(mut self) -> Self {
+        if self.notifications.is_none() {
+            self.notifications = Some(notifications::NotificationParser::queries_only());
+        }
+        self
+    }
+
     /// Opt in only where this screen is the terminal the program talks to
     /// and its replies reach the program: a local Engine session. The screen
     /// then reports `terminal_version` to XTVERSION, answers color queries
@@ -743,8 +758,8 @@ impl HeadlessScreen {
             self.geometry.rows,
             self.keyboard_enhancements_enabled(),
         );
-        if self.notifications.is_some() {
-            reset = reset.with_notifications();
+        if let Some(parser) = &self.notifications {
+            reset.notifications = Some(parser.reset_copy());
         }
         if let Some(images) = &self.images {
             let cell_pixels = images.cell_pixels;
@@ -1361,7 +1376,9 @@ impl HeadlessScreen {
         } else {
             MouseTrackingMode::Off
         };
-        let encoding = if mode.contains(TermMode::SGR_MOUSE) {
+        let encoding = if mode.contains(TermMode::SGR_PIXEL_MOUSE) {
+            MouseEncoding::SgrPixels
+        } else if mode.contains(TermMode::SGR_MOUSE) {
             MouseEncoding::Sgr
         } else {
             MouseEncoding::Legacy
@@ -1770,8 +1787,10 @@ impl HeadlessScreen {
         if let Some(mode) = mouse.tracking.dec_private_mode() {
             bytes.extend_from_slice(format!("\x1b[?{mode}h").as_bytes());
         }
-        if matches!(mouse.encoding, MouseEncoding::Sgr) {
-            bytes.extend_from_slice(b"\x1b[?1006h");
+        match mouse.encoding {
+            MouseEncoding::Sgr => bytes.extend_from_slice(b"\x1b[?1006h"),
+            MouseEncoding::SgrPixels => bytes.extend_from_slice(b"\x1b[?1016h"),
+            MouseEncoding::Legacy | MouseEncoding::Unknown => {}
         }
         bytes.extend_from_slice(if update.cursor_visible {
             b"\x1b[?25h"
@@ -4125,6 +4144,44 @@ mod tests {
         assert_eq!(screen.term.grid().history_size(), HISTORY_ROW_CEILING);
     }
 
+    /// Narrowing a full history defers its re-wrap; new lines then evict
+    /// deferred rows. A line must cost what it did before the resize, not
+    /// a walk of every deferred line (4–7 ms per line at 150,000 rows in the
+    /// debug builds tests and development apps run).
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn lines_after_narrowing_a_full_history_cost_what_they_did_before() {
+        fn per_line(screen: &mut HeadlessScreen, next: &mut usize) -> std::time::Duration {
+            let mut batches: Vec<_> = (0..5)
+                .map(|_| {
+                    let lines = numbered_lines(*next, 200, 70);
+                    *next += 200;
+                    let start = std::time::Instant::now();
+                    for line in lines.split_inclusive(|&byte| byte == b'\n') {
+                        screen.feed(line);
+                    }
+                    start.elapsed() / 200
+                })
+                .collect();
+            batches.sort();
+            batches[2]
+        }
+        let mut screen = HeadlessScreen::new(80, 24);
+        let mut next = HISTORY_ROW_CEILING + 24;
+        screen.feed(&numbered_lines(0, next, 70));
+        assert_eq!(screen.term.grid().history_size(), HISTORY_ROW_CEILING);
+        let before = per_line(&mut screen, &mut next);
+        screen.resize(40, 24);
+        let narrowed = screen.term.grid().history_size();
+        assert!(narrowed > HISTORY_ROW_CEILING, "{narrowed} rows");
+        let after = per_line(&mut screen, &mut next);
+        assert_eq!(screen.term.grid().history_size(), narrowed);
+        assert!(
+            after <= before * 2 + std::time::Duration::from_micros(20),
+            "{after:?} per line after narrowing, {before:?} before"
+        );
+    }
+
     /// A re-wrapped history can hold more rows than restore admits, so a
     /// checkpoint carries the newest of them and still restores.
     #[cfg(feature = "compact-history")]
@@ -4862,6 +4919,41 @@ mod tests {
             MouseModes::new(MouseTrackingMode::Off, MouseEncoding::Sgr),
             "1006 is independent of tracking"
         );
+    }
+
+    /// DECSET 1016 is one of the exclusive mouse encodings, set, reset and
+    /// reported like the others (DECRQM `1`/`2`, not the `4` it answered
+    /// when it was only recognized), and survives a checkpoint restore.
+    #[test]
+    fn sgr_pixel_mouse_is_an_exclusive_encoding_reported_and_restored() {
+        let mut screen = HeadlessScreen::new(80, 24);
+        let modes = |screen: &mut HeadlessScreen| {
+            screen.feed(b"\x1b[?1006$p\x1b[?1016$p");
+            String::from_utf8(screen.take_replies()).unwrap()
+        };
+        assert_eq!(modes(&mut screen), "\x1b[?1006;2$y\x1b[?1016;2$y");
+        screen.feed(b"\x1b[?1002h\x1b[?1006h\x1b[?1016h");
+        assert_eq!(
+            screen.mouse_modes(),
+            MouseModes::new(MouseTrackingMode::ButtonMotion, MouseEncoding::SgrPixels)
+        );
+        assert_eq!(modes(&mut screen), "\x1b[?1006;2$y\x1b[?1016;1$y");
+
+        let snapshot = screen.full_snapshot();
+        let mut restored = HeadlessScreen::new(80, 24);
+        assert!(restored.restore(&[], &snapshot, false, false, screen.mouse_modes()));
+        assert_eq!(restored.mouse_modes(), screen.mouse_modes());
+
+        screen.feed(b"\x1b[?1006h");
+        assert_eq!(
+            screen.mouse_modes().encoding,
+            MouseEncoding::Sgr,
+            "last set wins"
+        );
+        screen.feed(b"\x1b[?1016h\x1b[?1016l");
+        assert_eq!(screen.mouse_modes().encoding, MouseEncoding::Legacy);
+        screen.feed(b"\x1b[?1016h\x1bc");
+        assert_eq!(screen.mouse_modes(), MouseModes::OFF, "RIS clears it");
     }
 
     /// Wheel bytes per mode, as a reference xterm-compatible emulator sends

@@ -1,0 +1,1372 @@
+//! Pages: fixed-size blocks of rows holding both the screen and history.
+//!
+//! The screen is the newest `lines` rows of the page list. A linefeed at the
+//! bottom of a full-screen scroll region appends one row (no cell is
+//! touched) and the oldest screen row becomes history by definition, so
+//! scrolling into history costs nothing.
+//!
+//! With a history budget, a page whose rows are all older than the newest
+//! history row is packed into a compact byte stream (see [`Page::pack`]) and
+//! its cell buffer is reused for the next tail page. History is then bounded
+//! by live bytes: packed pages plus the dense pages that still hold history
+//! rows, counted at their full size. Both sealing and eviction are driven by
+//! the row count alone, so the history kept is the same whatever the read
+//! sizes. Without a budget, whole pages past the row limit are recycled as
+//! the next tail page.
+
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
+
+use alacritty_terminal::term::grapheme::Info;
+
+use super::cell::{
+    CLUSTER, CLUSTER_SHIFT, CP, Cell, GRAPHEME, LEADING, SPACER, STYLE_SHIFT, Style, WIDE,
+};
+
+/// Per-row facts. Cells at or past `occ` were never written since the row
+/// was appended or wholly erased: they read as blanks of style `fill`, and
+/// whatever bytes they hold are garbage from a previous use of the slot.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct RowMeta {
+    pub occ: u16,
+    pub fill: u16,
+    /// Cells below `lead` are blanks of `fill` (a lower bound; 0 is always
+    /// true).
+    pub lead: u16,
+    pub wrapped: bool,
+    pub dirty: bool,
+    /// Every cell below `occ` was written by the text paths in the fill
+    /// style: blanks, tabs, printable ASCII, characters with their own
+    /// width (two-column ones followed by their spacer) and leading
+    /// spacers, with no marks or clusters. Such a row packs as text.
+    pub simple: bool,
+}
+
+#[derive(Default)]
+pub struct StyleTable {
+    table: Vec<Style>,
+    index: HashMap<Style, u16>,
+}
+
+impl StyleTable {
+    #[inline]
+    pub fn intern(&mut self, style: &Style) -> u16 {
+        if *style == Style::default() {
+            return 0;
+        }
+        if self.table.is_empty() {
+            self.table.push(Style::default());
+        }
+        if let Some(&id) = self.index.get(style) {
+            return id;
+        }
+        // Callers intern only for a cell or row fill they write, so a page
+        // holds at most rows * (cols + 1) styles, far below 65,535.
+        let id = self.table.len() as u16;
+        self.table.push(*style);
+        self.index.insert(*style, id);
+        id
+    }
+
+    #[inline]
+    pub fn get(&self, id: u16) -> Style {
+        if id == 0 {
+            Style::default()
+        } else {
+            self.table[id as usize]
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.table.clear();
+        self.index.clear();
+    }
+
+    /// A packed page never interns again: keep only the table.
+    fn freeze(&mut self) {
+        self.index = HashMap::new();
+        self.table.shrink_to_fit();
+    }
+
+    fn heap_bytes(&self) -> usize {
+        self.table.capacity() * std::mem::size_of::<Style>()
+    }
+}
+
+/// The extra codepoints of each cluster in a page: a cell with GRAPHEME
+/// names its span by the index in its CLUSTER bits. Overwritten clusters
+/// leave dead spans; the arena is compacted when it fills.
+#[derive(Default)]
+pub struct Clusters {
+    spans: Vec<(u32, u32)>,
+    chars: Vec<char>,
+}
+
+impl Clusters {
+    #[inline]
+    pub fn of(&self, cell: Cell) -> &[char] {
+        if !cell.has(GRAPHEME) {
+            return &[];
+        }
+        let (start, len) = self.spans[(cell.0 >> CLUSTER_SHIFT) as usize];
+        &self.chars[start as usize..(start + len) as usize]
+    }
+
+    fn clear(&mut self) {
+        self.spans.clear();
+        self.chars.clear();
+    }
+
+    fn release(&mut self) {
+        self.spans = Vec::new();
+        self.chars = Vec::new();
+    }
+
+    /// A new cluster holding `chars`; returns its index.
+    fn add(&mut self, chars: &[char]) -> u64 {
+        let index = self.spans.len() as u64;
+        self.spans
+            .push((self.chars.len() as u32, chars.len() as u32));
+        self.chars.extend_from_slice(chars);
+        index
+    }
+
+    /// Appends `c` to cluster `index`, moving it to the end of the arena
+    /// unless it is already there.
+    fn push(&mut self, index: usize, c: char) {
+        let (start, len) = self.spans[index];
+        if (start + len) as usize != self.chars.len() {
+            let moved = self.chars.len() as u32;
+            self.chars
+                .extend_from_within(start as usize..(start + len) as usize);
+            self.spans[index].0 = moved;
+        }
+        self.chars.push(c);
+        self.spans[index].1 += 1;
+    }
+
+    fn full(&self) -> bool {
+        self.spans.len() >= 0xFFFF || self.chars.len() >= 1 << 20
+    }
+}
+
+/// Text-row tokens (see [`pack_text_row`]) of the rows the text paths are
+/// writing left to right, kept as they write so that packing a page copies
+/// them instead of reading its cells back. A row's tokens cover its cells
+/// from `lead` to `occ`; any other write invalidates them, and the row is
+/// then packed from its cells.
+pub struct TextLog {
+    pub on: bool,
+    bytes: Vec<u8>,
+    /// Per row: start and length in `bytes`; start `INVALID` when the row
+    /// has no tokens.
+    spans: Box<[(u32, u32)]>,
+}
+
+const INVALID: u32 = u32::MAX;
+
+impl TextLog {
+    fn new(rows: usize, on: bool) -> TextLog {
+        TextLog {
+            on,
+            bytes: Vec::new(),
+            spans: vec![(INVALID, 0); rows].into_boxed_slice(),
+        }
+    }
+
+    /// Row `row` starts empty (appended, or wholly erased).
+    #[inline]
+    pub fn reset(&mut self, row: usize) {
+        if !self.on {
+            return;
+        }
+        // A row rewritten in place forever (a progress line) must not grow
+        // the arena without bound: past a limit, every row reverts to
+        // packing from cells.
+        if self.bytes.len() > self.spans.len() * 1024 {
+            self.bytes.clear();
+            self.spans.fill((INVALID, 0));
+        }
+        self.spans[row] = (self.bytes.len() as u32, 0);
+    }
+
+    /// Whether `row` can take more tokens: valid and last in the arena.
+    #[inline(always)]
+    pub fn open(&self, row: usize) -> bool {
+        let (start, len) = self.spans[row];
+        self.on && start != INVALID && (start + len) as usize == self.bytes.len()
+    }
+
+    /// Whether a write at `col` on `row` (which holds `occ` cells, so
+    /// `col >= occ`) can extend its tokens. An empty row starts over at the
+    /// arena's end with its text-row header, whose lead is `col`.
+    #[inline(always)]
+    pub fn begin(&mut self, row: usize, occ: usize, col: usize) -> bool {
+        if !self.on {
+            return false;
+        }
+        if occ == 0 {
+            let start = self.bytes.len() as u32;
+            if col < 255 {
+                self.bytes.extend_from_slice(&[T_TEXT_ROW, col as u8]);
+                self.spans[row] = (start, 2);
+            } else {
+                let lead = (col as u16).to_le_bytes();
+                self.bytes
+                    .extend_from_slice(&[T_TEXT_ROW, 255, lead[0], lead[1]]);
+                self.spans[row] = (start, 4);
+            }
+            return true;
+        }
+        self.open(row)
+    }
+
+    /// Whether the rows with cells hold valid tokens that tile the arena
+    /// in row order.
+    fn contiguous(&self, meta: &[RowMeta]) -> bool {
+        let mut at = 0u32;
+        for (row, meta) in meta.iter().enumerate() {
+            if meta.occ == 0 {
+                continue;
+            }
+            let (start, len) = self.spans[row];
+            if start != at {
+                return false;
+            }
+            at += len;
+        }
+        at as usize == self.bytes.len()
+    }
+
+    /// The arena, leaving an empty one of the same capacity.
+    fn take_bytes(&mut self) -> Vec<u8> {
+        let capacity = self.bytes.capacity();
+        std::mem::replace(&mut self.bytes, Vec::with_capacity(capacity))
+    }
+
+    #[inline(always)]
+    pub fn invalidate(&mut self, row: usize) {
+        self.spans[row].0 = INVALID;
+    }
+
+    #[inline(always)]
+    pub fn push(&mut self, row: usize, byte: u8) {
+        self.bytes.push(byte);
+        self.spans[row].1 += 1;
+    }
+
+    #[inline(always)]
+    pub fn extend(&mut self, row: usize, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
+        self.spans[row].1 += bytes.len() as u32;
+    }
+
+    /// `n` blank cells.
+    #[inline]
+    pub fn blanks(&mut self, row: usize, mut n: usize) {
+        while n >= 3 {
+            let run = n.min(255);
+            self.extend(row, &[T_BLANKS, run as u8]);
+            n -= run;
+        }
+        for _ in 0..n {
+            self.push(row, 0);
+        }
+    }
+
+    /// A character's token: its two-byte CJK code, or `utf8` (its UTF-8).
+    #[inline(always)]
+    pub fn char(&mut self, row: usize, cp: u64, utf8: &[u8]) {
+        if (CJK_BASE..CJK_END).contains(&cp) {
+            let index = cp - CJK_BASE;
+            self.extend(row, &[CJK_LEADS[(index >> 8) as usize], index as u8]);
+        } else {
+            self.extend(row, utf8);
+        }
+    }
+
+    /// Tokens of `cps`, three-byte characters whose UTF-8 is `utf8`.
+    #[inline(always)]
+    pub fn chars3(&mut self, row: usize, cps: &[u32], utf8: &[u8]) {
+        debug_assert_eq!(utf8.len(), cps.len() * 3);
+        self.bytes.reserve(utf8.len());
+        let len = self.bytes.len();
+        // SAFETY: at most three bytes per character were reserved.
+        let ptr = unsafe { self.bytes.as_mut_ptr().add(len) };
+        let mut w = 0;
+        for (k, &cp) in cps.iter().enumerate() {
+            let index = (cp as u64).wrapping_sub(CJK_BASE);
+            unsafe {
+                if index < CJK_END - CJK_BASE {
+                    ptr.add(w).write(CJK_LEADS[(index >> 8) as usize]);
+                    ptr.add(w + 1).write(index as u8);
+                    w += 2;
+                } else {
+                    std::ptr::copy_nonoverlapping(utf8.as_ptr().add(3 * k), ptr.add(w), 3);
+                    w += 3;
+                }
+            }
+        }
+        // SAFETY: `w` bytes were written within the reserved capacity.
+        unsafe { self.bytes.set_len(len + w) };
+        self.spans[row].1 += w as u32;
+    }
+
+    pub fn leading(&mut self, row: usize) {
+        self.push(row, T_LEADING);
+    }
+
+    fn get(&self, row: usize) -> Option<&[u8]> {
+        let (start, len) = self.spans[row];
+        (self.on && start != INVALID).then(|| &self.bytes[start as usize..(start + len) as usize])
+    }
+
+    fn clear(&mut self) {
+        self.bytes.clear();
+        self.spans.fill((INVALID, 0));
+    }
+}
+
+pub struct Page {
+    /// Changes whenever the page is (re)initialised, so a pen can cache
+    /// its interned id per page.
+    pub serial: u64,
+    pub len: usize,
+    /// Empty once the page is packed.
+    pub cells: Box<[Cell]>,
+    pub meta: Box<[RowMeta]>,
+    pub styles: StyleTable,
+    pub clusters: Clusters,
+    pub text: TextLog,
+    packed: Option<Box<[u8]>>,
+}
+
+const T_LITERAL: u8 = 1;
+const T_STYLE: u8 = 2;
+const T_CLUSTER: u8 = 3;
+const T_BLANKS: u8 = 4;
+/// A leading spacer: a blank with LEADING, before a wide character that
+/// wrapped to the next row.
+const T_LEADING: u8 = 5;
+/// A row packed as text (see [`Page::pack_text_row`]).
+const T_TEXT_ROW: u8 = 0x7F;
+const FLAGS: u64 = 0x7FF << 21;
+const STYLE_BITS: u64 = 0xFFFF << STYLE_SHIFT;
+
+/// Two-byte codes for U+4E00.. (CJK ideographs, Yi, most Hangul
+/// syllables): a first byte that cannot start any other token (UTF-8
+/// continuation bytes, bytes past 0xF4, unused controls) gives the high
+/// byte of `cp - CJK_BASE`, the second byte the low byte.
+const CJK_BASE: u64 = 0x4E00;
+const CJK_LEADS: [u8; 100] = {
+    let mut leads = [0u8; 100];
+    let mut n = 0;
+    let mut b = 0x06u8;
+    while n < 100 {
+        let free = matches!(b, 0x06..=0x08 | 0x0A..=0x1F | 0x80..=0xBF | 0xF5..=0xFF);
+        if free {
+            leads[n] = b;
+            n += 1;
+        }
+        b = b.wrapping_add(1);
+    }
+    leads
+};
+const CJK_HIGH: [u8; 256] = {
+    let mut high = [0xFFu8; 256];
+    let mut i = 0;
+    while i < 100 {
+        high[CJK_LEADS[i] as usize] = i as u8;
+        i += 1;
+    }
+    high
+};
+const CJK_END: u64 = CJK_BASE + 100 * 256;
+
+#[inline]
+fn wide(cp: u64) -> bool {
+    char::from_u32(cp as u32).is_some_and(|c| Info::of(c).width() == 2)
+}
+
+#[inline]
+fn push_char(out: &mut Vec<u8>, cp: u64) {
+    if (CJK_BASE..CJK_END).contains(&cp) {
+        let index = cp - CJK_BASE;
+        out.push(CJK_LEADS[(index >> 8) as usize]);
+        out.push(index as u8);
+        return;
+    }
+    push_utf8(out, cp);
+}
+
+fn push_utf8(out: &mut Vec<u8>, cp: u64) {
+    let c = char::from_u32(cp as u32).expect("cells hold scalars");
+    let mut buf = [0u8; 4];
+    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+}
+
+fn read_utf8(data: &[u8], at: &mut usize) -> u64 {
+    let len = match data[*at] {
+        0..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        _ => 4,
+    };
+    let c = std::str::from_utf8(&data[*at..*at + len])
+        .expect("packed by pack()")
+        .chars()
+        .next()
+        .expect("one char");
+    *at += len;
+    c as u64
+}
+
+/// The low bytes of eight cells when all are plain cells (no flags, no
+/// cluster) below U+0080 in style `current` (blanks give 0), with a byte
+/// mask of the printable ones (tab, space..tilde) and of the blanks.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn narrow8(cells: &[Cell], current: u64) -> Option<(u64, u64, u64)> {
+    use std::arch::aarch64::*;
+    debug_assert!(cells.len() >= 8);
+    // SAFETY: NEON is baseline on aarch64; eight cells are in bounds.
+    unsafe {
+        let p = cells.as_ptr() as *const u64;
+        let mask = vdupq_n_u64(!0x7F);
+        let want = vdupq_n_u64(current);
+        let (a, b, c, d) = (
+            vld1q_u64(p),
+            vld1q_u64(p.add(2)),
+            vld1q_u64(p.add(4)),
+            vld1q_u64(p.add(6)),
+        );
+        let same = vandq_u64(
+            vandq_u64(
+                vceqq_u64(vandq_u64(a, mask), want),
+                vceqq_u64(vandq_u64(b, mask), want),
+            ),
+            vandq_u64(
+                vceqq_u64(vandq_u64(c, mask), want),
+                vceqq_u64(vandq_u64(d, mask), want),
+            ),
+        );
+        if vminvq_u32(vreinterpretq_u32_u64(same)) == 0 {
+            return None;
+        }
+        let low = vcombine_u32(vmovn_u64(a), vmovn_u64(b));
+        let high = vcombine_u32(vmovn_u64(c), vmovn_u64(d));
+        let bytes = vmovn_u16(vcombine_u16(vmovn_u32(low), vmovn_u32(high)));
+        let plain = vorr_u8(
+            vceq_u8(bytes, vdup_n_u8(9)),
+            vand_u8(
+                vcge_u8(bytes, vdup_n_u8(0x20)),
+                vclt_u8(bytes, vdup_n_u8(0x7F)),
+            ),
+        );
+        let blank = vceq_u8(bytes, vdup_n_u8(0));
+        let word = |v: uint8x8_t| vget_lane_u64::<0>(vreinterpret_u64_u8(v));
+        Some((word(bytes), word(plain), word(blank)))
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn narrow8(cells: &[Cell], current: u64) -> Option<(u64, u64, u64)> {
+    let (mut out, mut plain, mut blank) = (0u64, 0u64, 0u64);
+    for (i, c) in cells[..8].iter().enumerate() {
+        if c.0 & !0x7F != current {
+            return None;
+        }
+        let b = c.0 & 0x7F;
+        out |= b << (8 * i);
+        if b == 9 || (0x20..0x7F).contains(&b) {
+            plain |= 0xFF << (8 * i);
+        }
+        if b == 0 {
+            blank |= 0xFF << (8 * i);
+        }
+    }
+    Some((out, plain, blank))
+}
+
+/// Writes `blanks` pending blank cells of the current style.
+#[inline]
+fn flush_blanks(out: &mut Vec<u8>, blanks: &mut usize) {
+    while *blanks >= 3 {
+        let n = (*blanks).min(255);
+        out.push(T_BLANKS);
+        out.push(n as u8);
+        *blanks -= n;
+    }
+    for _ in 0..*blanks {
+        out.push(0);
+    }
+    *blanks = 0;
+}
+
+/// Packs a row the text paths wrote (`RowMeta::simple`, a hint that this
+/// checks) as `T_TEXT_ROW`, `lead` (one byte, or 255 and a u16), then from
+/// `lead` on: `T_BLANKS n` or 0 for blanks, a tab or printable ASCII byte,
+/// `T_LEADING`, or a character (two-byte CJK code or UTF-8), two columns
+/// when its width is two. Every cell must be in the fill style with no
+/// marks or clusters, and a two-column character must be followed by its
+/// spacer; otherwise this writes nothing and returns false, and the row
+/// takes the general tokens.
+#[inline]
+fn pack_text_row(cells: &[Cell], meta: &RowMeta, out: &mut Vec<u8>) -> bool {
+    let fill = (meta.fill as u64) << STYLE_SHIFT;
+    let occ = cells.len();
+    let lead = (meta.lead as usize).min(occ);
+    // At most four bytes per cell (UTF-8), plus the header and a blank run.
+    out.reserve(8 + (occ - lead) * 4);
+    let start = out.len();
+    let mut w = Writer {
+        // SAFETY: `Writer` stays within the capacity reserved above: each
+        // cell adds at most four bytes and a blank run at most two.
+        ptr: unsafe { out.as_mut_ptr().add(start) },
+        len: 0,
+        blanks: 0,
+    };
+    w.put(T_TEXT_ROW);
+    if lead < 255 {
+        w.put(lead as u8);
+    } else {
+        w.put(255);
+        w.put(lead as u8);
+        w.put((lead >> 8) as u8);
+    }
+    let spacer = 0x20 | SPACER | fill;
+    let mut x = lead;
+    while x < occ {
+        if x + 8 <= occ
+            && let Some((word, plain, blank)) = narrow8(&cells[x..x + 8], fill)
+        {
+            if plain == u64::MAX {
+                w.flush();
+                w.put8(word);
+                x += 8;
+                continue;
+            }
+            if blank == u64::MAX {
+                w.blanks += 8;
+                x += 8;
+                continue;
+            }
+            if plain | blank == u64::MAX {
+                for byte in word.to_le_bytes() {
+                    if byte == 0 {
+                        w.blanks += 1;
+                    } else {
+                        w.flush();
+                        w.put(byte);
+                    }
+                }
+                x += 8;
+                continue;
+            }
+        }
+        let c = cells[x].0;
+        let cp = c & CP;
+        if c & !CP == WIDE | fill {
+            // A run of two-column CJK characters with their spacers.
+            let glyph = WIDE | fill;
+            let mut y = x;
+            while y + 1 < occ {
+                let (c, next) = (cells[y].0, cells[y + 1].0);
+                let index = (c & CP).wrapping_sub(CJK_BASE);
+                if c & !CP != glyph || next != spacer || index >= CJK_END - CJK_BASE {
+                    break;
+                }
+                if y == x {
+                    w.flush();
+                }
+                w.put(CJK_LEADS[(index >> 8) as usize]);
+                w.put(index as u8);
+                y += 2;
+            }
+            if y > x {
+                x = y;
+                continue;
+            }
+        }
+        if c == fill {
+            w.blanks += 1;
+            x += 1;
+            continue;
+        }
+        if c & !(CP | WIDE | LEADING) != fill {
+            break;
+        }
+        w.flush();
+        if c & LEADING != 0 {
+            if c != 0x20 | LEADING | fill {
+                break;
+            }
+            w.put(T_LEADING);
+            x += 1;
+        } else if c & WIDE != 0 {
+            if cp < 0x80 || x + 1 >= occ || cells[x + 1].0 != spacer {
+                break;
+            }
+            w.put_char(cp);
+            x += 2;
+        } else if cp == 9 || (0x20..0x7F).contains(&cp) {
+            w.put(cp as u8);
+            x += 1;
+        } else if cp >= 0xA0 {
+            w.put_char(cp);
+            x += 1;
+        } else {
+            break;
+        }
+    }
+    if x < occ {
+        return false;
+    }
+    w.flush();
+    // SAFETY: `w.len` bytes were written after `start`, within capacity.
+    unsafe { out.set_len(start + w.len) };
+    true
+}
+
+/// Decodes text-row tokens at `data[*at..]` into the `occ` cells of a row
+/// whose first `lead` cells are blanks of style `fill`.
+fn decode_text_row(data: &[u8], at: &mut usize, fill: u16, lead: usize, occ: usize) -> Vec<Cell> {
+    let fill = (fill as u64) << STYLE_SHIFT;
+    let mut cells = vec![Cell(fill); occ];
+    let mut x = lead;
+    while x < occ {
+        let byte = data[*at];
+        *at += 1;
+        let cp = match CJK_HIGH[byte as usize] {
+            _ if byte == T_LEADING => {
+                cells[x] = Cell(0x20 | LEADING | fill);
+                x += 1;
+                continue;
+            }
+            _ if byte == T_BLANKS => {
+                let n = data[*at] as usize;
+                *at += 1;
+                x += n;
+                continue;
+            }
+            0xFF if byte < 0x80 => byte as u64,
+            0xFF => {
+                *at -= 1;
+                read_utf8(data, at)
+            }
+            high => {
+                let cp = CJK_BASE + ((high as u64) << 8 | data[*at] as u64);
+                *at += 1;
+                cp
+            }
+        };
+        if cp >= 0x80 && wide(cp) {
+            cells[x] = Cell(cp | WIDE | fill);
+            cells[x + 1] = Cell(0x20 | SPACER | fill);
+            x += 2;
+        } else {
+            cells[x] = Cell(cp | fill);
+            x += 1;
+        }
+    }
+    cells
+}
+
+/// Unchecked byte output into reserved capacity, with pending blanks.
+struct Writer {
+    ptr: *mut u8,
+    len: usize,
+    blanks: usize,
+}
+
+impl Writer {
+    #[inline(always)]
+    fn put(&mut self, byte: u8) {
+        // SAFETY: the caller reserved room (see `pack_text_row`).
+        unsafe { self.ptr.add(self.len).write(byte) };
+        self.len += 1;
+    }
+
+    #[inline(always)]
+    fn put8(&mut self, word: u64) {
+        // SAFETY: as `put`; the destination may be unaligned.
+        unsafe { (self.ptr.add(self.len) as *mut u64).write_unaligned(word.to_le()) };
+        self.len += 8;
+    }
+
+    #[inline(always)]
+    fn flush(&mut self) {
+        if self.blanks == 0 {
+            return;
+        }
+        while self.blanks >= 3 {
+            let n = self.blanks.min(255);
+            self.put(T_BLANKS);
+            self.put(n as u8);
+            self.blanks -= n;
+        }
+        for _ in 0..self.blanks {
+            self.put(0);
+        }
+        self.blanks = 0;
+    }
+
+    #[inline]
+    fn put_char(&mut self, cp: u64) {
+        if (CJK_BASE..CJK_END).contains(&cp) {
+            let index = cp - CJK_BASE;
+            self.put(CJK_LEADS[(index >> 8) as usize]);
+            self.put(index as u8);
+            return;
+        }
+        let c = char::from_u32(cp as u32).expect("cells hold scalars");
+        let mut buf = [0u8; 4];
+        for &byte in c.encode_utf8(&mut buf).as_bytes() {
+            self.put(byte);
+        }
+    }
+}
+
+impl Page {
+    fn new(
+        rows: usize,
+        cols: usize,
+        serial: u64,
+        dense: Option<(Box<[Cell]>, TextLog)>,
+        logging: bool,
+    ) -> Page {
+        let (cells, text) = dense.unwrap_or_else(|| {
+            (
+                vec![Cell::default(); rows * cols].into_boxed_slice(),
+                TextLog::new(rows, logging),
+            )
+        });
+        Page {
+            serial,
+            len: 0,
+            cells,
+            meta: vec![RowMeta::default(); rows].into_boxed_slice(),
+            styles: StyleTable::default(),
+            clusters: Clusters::default(),
+            text,
+            packed: None,
+        }
+    }
+
+    fn recycle(&mut self, serial: u64) {
+        // Cells and metadata are not cleared: rows are appended with
+        // occ = 0, so stale cells are never read.
+        self.serial = serial;
+        self.len = 0;
+        self.styles.clear();
+        self.clusters.clear();
+        self.text.clear();
+    }
+
+    pub fn is_packed(&self) -> bool {
+        self.packed.is_some()
+    }
+
+    /// Adds `c` to the cluster of the cell at `index` (a hot page).
+    pub fn push_zerowidth(&mut self, index: usize, c: char) {
+        if self.clusters.full() {
+            self.compact_clusters();
+        }
+        let cell = self.cells[index];
+        if cell.has(GRAPHEME) {
+            self.clusters.push((cell.0 >> CLUSTER_SHIFT) as usize, c);
+        } else {
+            let k = self.clusters.add(&[c]);
+            self.cells[index] = Cell((cell.0 & !CLUSTER) | GRAPHEME | k << CLUSTER_SHIFT);
+        }
+    }
+
+    /// Rebuilds the arena from the clusters cells still name.
+    fn compact_clusters(&mut self) {
+        let old = std::mem::take(&mut self.clusters);
+        for cell in self.cells.iter_mut() {
+            if cell.has(GRAPHEME) {
+                let k = self.clusters.add(old.of(*cell));
+                cell.0 = (cell.0 & !CLUSTER) | k << CLUSTER_SHIFT;
+            }
+        }
+    }
+
+    /// Packs the page; returns its dense cell buffer for reuse.
+    ///
+    /// Per row, the cells below `occ` as tokens, with a current style:
+    /// `0x02 id(u16)` sets the style; `0x03 n chars` makes the next cell a
+    /// cluster with those extra codepoints; `0x04 n` is n blanks; `0x01` and
+    /// eight bytes is a literal cell; `0x05` is a leading spacer; a blank,
+    /// tab or printable ASCII cell is its byte; a character is its UTF-8
+    /// sequence, or two bytes from U+4E00 on (see [`CJK_LEADS`]), and is
+    /// two columns (with its spacer) when its width is two. Everything else about a cell (marks,
+    /// spacers that do not follow their character, leading spacers) is a
+    /// literal, so packing is lossless.
+    fn pack(&mut self, cols: usize, out: &mut Vec<u8>) -> (Box<[Cell]>, TextLog) {
+        out.clear();
+        // Every written row logged, in order, with nothing between them:
+        // the log is the packed page.
+        if self.text.on && self.text.contiguous(&self.meta[..self.len]) {
+            let bytes = self.text.take_bytes();
+            self.packed = Some(bytes.into_boxed_slice());
+            self.clusters.release();
+            self.styles.freeze();
+            let text = std::mem::replace(&mut self.text, TextLog::new(0, false));
+            let cells = std::mem::take(&mut self.cells);
+            #[cfg(debug_assertions)]
+            {
+                let mut check = vec![Cell::default(); self.len * cols];
+                let mut clusters = Clusters::default();
+                self.unpack(cols, &mut check, &mut clusters);
+                for row in 0..self.len {
+                    let occ = self.meta[row].occ as usize;
+                    assert_eq!(
+                        check[row * cols..row * cols + occ],
+                        cells[row * cols..row * cols + occ],
+                        "zero-copy packed row {row}"
+                    );
+                }
+            }
+            return (cells, text);
+        }
+        let mut current = 0u64;
+        for row in 0..self.len {
+            let occ = self.meta[row].occ as usize;
+            let cells = &self.cells[row * cols..row * cols + occ];
+            if occ > 0
+                && let Some(tokens) = self.text.get(row)
+            {
+                let meta = &self.meta[row];
+                debug_assert_eq!(
+                    decode_text_row(&tokens[2..], &mut 0, meta.fill, meta.lead as usize, occ).len(),
+                    occ
+                );
+                debug_assert!(
+                    {
+                        let mut at = 0;
+                        let mut lead = tokens[1] as usize;
+                        let mut skip = 2;
+                        if lead == 255 {
+                            lead = u16::from_le_bytes([tokens[2], tokens[3]]) as usize;
+                            skip = 4;
+                        }
+                        lead == meta.lead as usize
+                            && decode_text_row(&tokens[skip..], &mut at, meta.fill, lead, occ)
+                                == cells
+                    },
+                    "text log of row {row}"
+                );
+                out.extend_from_slice(tokens);
+                continue;
+            }
+            if occ > 0 && self.meta[row].simple && pack_text_row(cells, &self.meta[row], out) {
+                continue;
+            }
+            let mut x = 0;
+            let mut blanks = 0;
+            while x < occ {
+                let raw = cells[x].0;
+                let cell = raw & !(GRAPHEME | CLUSTER);
+                let style = cell & STYLE_BITS;
+                // Plain ASCII and blanks in the current style, eight at a
+                // time: printable bytes and tabs as themselves, blanks
+                // gathered into runs.
+                if x + 8 <= occ
+                    && let Some((word, plain, blank)) = narrow8(&cells[x..x + 8], current)
+                {
+                    if plain == u64::MAX {
+                        flush_blanks(out, &mut blanks);
+                        out.extend_from_slice(&word.to_le_bytes());
+                        x += 8;
+                        continue;
+                    }
+                    if blank == u64::MAX {
+                        blanks += 8;
+                        x += 8;
+                        continue;
+                    }
+                    if plain | blank == u64::MAX {
+                        for b in word.to_le_bytes() {
+                            if b == 0 {
+                                blanks += 1;
+                            } else {
+                                flush_blanks(out, &mut blanks);
+                                out.push(b);
+                            }
+                        }
+                        x += 8;
+                        continue;
+                    }
+                }
+                flush_blanks(out, &mut blanks);
+                if raw & GRAPHEME != 0 {
+                    let extra = self.clusters.of(cells[x]);
+                    out.push(T_CLUSTER);
+                    out.push(extra.len() as u8);
+                    for &c in extra {
+                        push_utf8(out, c as u64);
+                    }
+                }
+                let cp = cell & CP;
+                let flags = cell & FLAGS;
+                let token = |out: &mut Vec<u8>, current: &mut u64| {
+                    if style != *current {
+                        out.push(T_STYLE);
+                        out.extend_from_slice(&((style >> STYLE_SHIFT) as u16).to_le_bytes());
+                        *current = style;
+                    }
+                };
+                if flags == 0 && (cp == 0 || cp == 9 || (0x20..0x7F).contains(&cp)) {
+                    token(out, &mut current);
+                    if cp == 0 && raw & GRAPHEME == 0 {
+                        let run = cells[x..]
+                            .iter()
+                            .take(255)
+                            .take_while(|c| c.0 == cell)
+                            .count();
+                        if run >= 3 {
+                            out.push(T_BLANKS);
+                            out.push(run as u8);
+                            x += run;
+                            continue;
+                        }
+                    }
+                    out.push(cp as u8);
+                    x += 1;
+                    continue;
+                }
+                if cell == 0x20 | LEADING | style {
+                    token(out, &mut current);
+                    out.push(T_LEADING);
+                    x += 1;
+                    continue;
+                }
+                if cp >= 0x80 {
+                    let wide = wide(cp);
+                    if flags == 0 && !wide {
+                        token(out, &mut current);
+                        push_char(out, cp);
+                        x += 1;
+                        continue;
+                    }
+                    if flags == WIDE
+                        && wide
+                        && x + 1 < occ
+                        && cells[x + 1].0 == 0x20 | SPACER | style
+                    {
+                        token(out, &mut current);
+                        push_char(out, cp);
+                        x += 2;
+                        continue;
+                    }
+                }
+                out.push(T_LITERAL);
+                out.extend_from_slice(&cell.to_le_bytes());
+                x += 1;
+            }
+            flush_blanks(out, &mut blanks);
+        }
+        self.packed = Some(Box::from(out.as_slice()));
+        self.clusters.release();
+        self.styles.freeze();
+        let text = std::mem::replace(&mut self.text, TextLog::new(0, false));
+        (std::mem::take(&mut self.cells), text)
+    }
+
+    /// Decodes a packed page into `cells` (rows * cols) and `clusters`.
+    fn unpack(&self, cols: usize, cells: &mut [Cell], clusters: &mut Clusters) {
+        let data = self.packed.as_deref().expect("packed");
+        clusters.clear();
+        let mut at = 0;
+        let mut current = 0u64;
+        let mut pending: Option<u64> = None;
+        let mut chars = Vec::new();
+        for row in 0..self.len {
+            let occ = self.meta[row].occ as usize;
+            let cells = &mut cells[row * cols..row * cols + occ];
+            if occ > 0 && data[at] == T_TEXT_ROW {
+                let mut lead = data[at + 1] as usize;
+                at += 2;
+                if lead == 255 {
+                    lead = u16::from_le_bytes([data[at], data[at + 1]]) as usize;
+                    at += 2;
+                }
+                let row_cells = decode_text_row(data, &mut at, self.meta[row].fill, lead, occ);
+                cells.copy_from_slice(&row_cells);
+                continue;
+            }
+            let mut x = 0;
+            while x < occ {
+                let byte = data[at];
+                at += 1;
+                let first = x;
+                match byte {
+                    T_LITERAL => {
+                        let bytes: [u8; 8] = data[at..at + 8].try_into().expect("eight bytes");
+                        cells[x] = Cell(u64::from_le_bytes(bytes));
+                        at += 8;
+                        x += 1;
+                    }
+                    T_STYLE => {
+                        current =
+                            (u16::from_le_bytes([data[at], data[at + 1]]) as u64) << STYLE_SHIFT;
+                        at += 2;
+                        continue;
+                    }
+                    T_CLUSTER => {
+                        let n = data[at] as usize;
+                        at += 1;
+                        chars.clear();
+                        for _ in 0..n {
+                            chars.push(
+                                char::from_u32(read_utf8(data, &mut at) as u32).expect("char"),
+                            );
+                        }
+                        pending = Some(clusters.add(&chars));
+                        continue;
+                    }
+                    T_BLANKS => {
+                        let n = data[at] as usize;
+                        at += 1;
+                        cells[x..x + n].fill(Cell(current));
+                        x += n;
+                    }
+                    T_LEADING => {
+                        cells[x] = Cell(0x20 | LEADING | current);
+                        x += 1;
+                    }
+                    _ => {
+                        let cp = match CJK_HIGH[byte as usize] {
+                            0xFF if byte < 0x80 => byte as u64,
+                            0xFF => {
+                                at -= 1;
+                                read_utf8(data, &mut at)
+                            }
+                            high => {
+                                let cp = CJK_BASE + ((high as u64) << 8 | data[at] as u64);
+                                at += 1;
+                                cp
+                            }
+                        };
+                        if cp >= 0x80 && wide(cp) {
+                            cells[x] = Cell(cp | WIDE | current);
+                            cells[x + 1] = Cell(0x20 | SPACER | current);
+                            x += 2;
+                        } else {
+                            cells[x] = Cell(cp | current);
+                            x += 1;
+                        }
+                    }
+                }
+                if let Some(k) = pending.take() {
+                    cells[first].0 |= GRAPHEME | k << CLUSTER_SHIFT;
+                }
+            }
+        }
+        debug_assert_eq!(at, data.len());
+    }
+
+    /// Live bytes of a packed page.
+    fn stored_bytes(&self) -> usize {
+        self.packed.as_ref().map_or(0, |p| p.len())
+            + std::mem::size_of_val(&*self.meta)
+            + self.styles.heap_bytes()
+            + std::mem::size_of::<Page>()
+    }
+}
+
+/// The most recently unpacked page, for reads of packed history.
+struct Unpacked {
+    serial: u64,
+    cells: Box<[Cell]>,
+    clusters: Clusters,
+}
+
+pub struct Pages {
+    pub cols: usize,
+    pub lines: usize,
+    shift: u32,
+    pub history_limit: usize,
+    /// Live-byte bound on history; packs cold pages when set.
+    budget: Option<usize>,
+    pages: VecDeque<Page>,
+    /// Absolute index of the first row of `pages[0]`.
+    base: u64,
+    /// Absolute index one past the newest row.
+    total: u64,
+    /// Pages at the front that are packed.
+    sealed: usize,
+    packed_bytes: usize,
+    spare: Option<Page>,
+    spare_dense: Vec<(Box<[Cell]>, TextLog)>,
+    /// Reused output buffer of `Page::pack`.
+    scratch: Vec<u8>,
+    next_serial: u64,
+    cache: RefCell<Option<Unpacked>>,
+}
+
+/// Rows per page: a power of two near 64 KiB of cells, at least 16.
+fn rows_shift(cols: usize) -> u32 {
+    let rows = (65536 / (cols.max(1) * 8)).max(16);
+    usize::BITS - 1 - rows.leading_zeros()
+}
+
+impl Pages {
+    /// `page_rows` overrides the rows per page (a power of two), for tests.
+    pub fn new(
+        lines: usize,
+        cols: usize,
+        history_limit: usize,
+        budget: Option<usize>,
+        page_rows: Option<usize>,
+    ) -> Pages {
+        let shift = page_rows.map_or_else(
+            || rows_shift(cols),
+            |rows| {
+                assert!(rows.is_power_of_two(), "rows per page");
+                rows.trailing_zeros()
+            },
+        );
+        let mut pages = Pages {
+            cols,
+            lines,
+            shift,
+            history_limit,
+            budget,
+            pages: VecDeque::new(),
+            base: 0,
+            total: 0,
+            sealed: 0,
+            packed_bytes: 0,
+            spare: None,
+            spare_dense: Vec::new(),
+            scratch: Vec::new(),
+            next_serial: 1,
+            cache: RefCell::new(None),
+        };
+        for _ in 0..lines {
+            pages.push_row(&Style::default());
+        }
+        pages
+    }
+
+    #[inline(always)]
+    pub fn rows_per_page(&self) -> usize {
+        1 << self.shift
+    }
+
+    /// Page index and row within it of absolute row `abs`.
+    #[inline(always)]
+    fn locate_abs(&self, abs: u64) -> (usize, usize) {
+        let off = (abs - self.base) as usize;
+        (off >> self.shift, off & ((1 << self.shift) - 1))
+    }
+
+    /// Page index and row of screen line `y`.
+    #[inline(always)]
+    pub fn locate(&self, y: usize) -> (usize, usize) {
+        self.locate_abs(self.total - self.lines as u64 + y as u64)
+    }
+
+    #[inline(always)]
+    pub fn page(&self, index: usize) -> &Page {
+        &self.pages[index]
+    }
+
+    /// A page that may be written: never a packed one.
+    #[inline(always)]
+    pub fn page_mut(&mut self, index: usize) -> &mut Page {
+        debug_assert!(
+            !self.pages[index].is_packed(),
+            "writes stay out of packed pages"
+        );
+        &mut self.pages[index]
+    }
+
+    pub fn history_size(&self) -> usize {
+        let behind = (self.total - self.base) as usize - self.lines;
+        behind.min(self.history_limit)
+    }
+
+    /// Page and row of line `line`, where negative lines are history
+    /// (`-1` is the newest history row), as alacritty numbers them.
+    pub fn locate_line(&self, line: i32) -> (usize, usize) {
+        let abs = (self.total as i64 - self.lines as i64 + line as i64) as u64;
+        self.locate_abs(abs)
+    }
+
+    /// Runs `f` over page `p`'s cells and clusters, unpacking it first
+    /// (into a one-page cache) when it is packed.
+    pub fn read<R>(&self, p: usize, f: impl FnOnce(&[Cell], &Clusters) -> R) -> R {
+        let page = &self.pages[p];
+        if !page.is_packed() {
+            return f(&page.cells, &page.clusters);
+        }
+        let mut cache = self.cache.borrow_mut();
+        if cache.as_ref().is_none_or(|c| c.serial != page.serial) {
+            let mut unpacked = cache.take().unwrap_or_else(|| Unpacked {
+                serial: 0,
+                cells: vec![Cell::default(); self.rows_per_page() * self.cols].into_boxed_slice(),
+                clusters: Clusters::default(),
+            });
+            page.unpack(self.cols, &mut unpacked.cells, &mut unpacked.clusters);
+            unpacked.serial = page.serial;
+            *cache = Some(unpacked);
+        }
+        let unpacked = cache.as_ref().expect("filled");
+        f(&unpacked.cells, &unpacked.clusters)
+    }
+
+    /// Drops the read cache (readers call this after a batch).
+    pub fn release_read_cache(&self) {
+        *self.cache.borrow_mut() = None;
+    }
+
+    fn new_page(&mut self) -> Page {
+        let serial = self.next_serial;
+        self.next_serial += 1;
+        if let Some(mut page) = self.spare.take() {
+            page.recycle(serial);
+            return page;
+        }
+        let logging = self.budget.is_some();
+        Page::new(
+            self.rows_per_page(),
+            self.cols,
+            serial,
+            self.spare_dense.pop(),
+            logging,
+        )
+    }
+
+    /// Appends a blank row whose erase fill is `fill`; the oldest screen
+    /// row becomes history.
+    #[inline]
+    pub fn push_row(&mut self, fill: &Style) {
+        let rows = self.rows_per_page();
+        if self.pages.back().is_none_or(|page| page.len == rows) {
+            let page = self.new_page();
+            self.pages.push_back(page);
+        }
+        let page = self.pages.back_mut().expect("a tail page");
+        let fill = page.styles.intern(fill);
+        let row = page.len;
+        page.meta[row] = RowMeta {
+            occ: 0,
+            fill,
+            lead: 0,
+            wrapped: false,
+            dirty: true,
+            simple: true,
+        };
+        page.text.reset(row);
+        page.len += 1;
+        self.total += 1;
+        // Sealing, the hot-history count and page eviction change only when
+        // the newest row, the newest history row or the oldest row the row
+        // limit keeps crosses a page boundary.
+        let mask = self.rows_per_page() as u64 - 1;
+        let keep = (self.lines + self.history_limit) as u64;
+        if self.total & mask == 0
+            || self.total.wrapping_sub(self.lines as u64) & mask == 0
+            || self.total.wrapping_sub(self.lines as u64 + 1) & mask == 0
+            || self.total.wrapping_sub(keep) & mask == 0
+        {
+            self.seal();
+            self.trim();
+        }
+    }
+
+    /// Packs every page whose rows are all older than the newest history
+    /// row (which writes at the top of the screen may still touch).
+    #[inline]
+    fn seal(&mut self) {
+        if self.budget.is_none() {
+            return;
+        }
+        let rows = self.rows_per_page() as u64;
+        let top = self.total.saturating_sub(self.lines as u64);
+        while self.sealed < self.pages.len() {
+            let first = self.base + self.sealed as u64 * rows;
+            if first + rows >= top {
+                break;
+            }
+            let cols = self.cols;
+            let page = &mut self.pages[self.sealed];
+            let (cells, mut text) = page.pack(cols, &mut self.scratch);
+            self.packed_bytes += page.stored_bytes();
+            if self.spare_dense.len() < 2 {
+                text.clear();
+                self.spare_dense.push((cells, text));
+            }
+            self.sealed += 1;
+        }
+    }
+
+    /// Live history bytes: packed pages plus the dense pages that hold any
+    /// history row, at full size.
+    pub fn history_bytes(&self) -> usize {
+        let rows = self.rows_per_page() as u64;
+        let top = self.total.saturating_sub(self.lines as u64);
+        let first_hot = self.base + self.sealed as u64 * rows;
+        let hot_history = if first_hot >= top {
+            0
+        } else {
+            (top - first_hot).div_ceil(rows) as usize
+        };
+        let dense = self.rows_per_page()
+            * (self.cols * std::mem::size_of::<Cell>() + std::mem::size_of::<RowMeta>())
+            + std::mem::size_of::<Page>();
+        self.packed_bytes + hot_history.min(self.pages.len() - self.sealed) * dense
+    }
+
+    fn pop_front_page(&mut self) {
+        let page = self.pages.pop_front().expect("a page");
+        self.base += self.rows_per_page() as u64;
+        if page.is_packed() {
+            self.sealed -= 1;
+            self.packed_bytes -= page.stored_bytes();
+        } else if self.spare.is_none() {
+            self.spare = Some(page);
+        }
+    }
+
+    /// Drops whole pages past the row limit or, oldest first, while history
+    /// exceeds the budget.
+    #[inline]
+    fn trim(&mut self) {
+        let keep = (self.lines + self.history_limit) as u64;
+        let rows = self.rows_per_page() as u64;
+        while self.pages.len() > 1 && self.total - (self.base + rows) >= keep {
+            self.pop_front_page();
+        }
+        if let Some(budget) = self.budget {
+            while self.sealed > 0 && self.history_bytes() > budget {
+                self.pop_front_page();
+            }
+        }
+    }
+
+    /// Heap bytes held by pages, for footprint.
+    pub fn heap_bytes(&self) -> usize {
+        let dense = self.rows_per_page()
+            * (self.cols * std::mem::size_of::<Cell>() + std::mem::size_of::<RowMeta>());
+        self.packed_bytes
+            + (self.pages.len() - self.sealed + usize::from(self.spare.is_some())) * dense
+            + self.spare_dense.len() * self.rows_per_page() * self.cols * 8
+    }
+
+    pub fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+}

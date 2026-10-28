@@ -6711,6 +6711,22 @@ impl UtilitySurfaces {
                                 cx,
                             )
                             .into_any_element(),
+                        ))
+                        .child(setting_divider(colors))
+                        .child(toggle_row(
+                            t("settings.appearance.reduce_motion"),
+                            t("settings.appearance.reduce_motion_detail"),
+                            self.prefs.reduce_motion,
+                            "reduce_motion",
+                            colors,
+                            cx,
+                            |this, cx| {
+                                let enabled = !this.prefs.reduce_motion;
+                                if this.update_prefs(move |prefs| prefs.reduce_motion = enabled) {
+                                    crate::motion::set_preference(enabled, cx);
+                                }
+                                cx.notify();
+                            },
                         )),
                     colors,
                 ))
@@ -13219,6 +13235,38 @@ mod tests {
                 "the Engine is sent argv"
             );
         });
+    }
+
+    #[gpui::test]
+    fn reduce_motion_turns_animations_off_and_back_on(cx: &mut TestAppContext) {
+        let (harness, cx) = cx.add_window_view(|window, cx| {
+            SettingsWorkbenchHarness::open_at(SettingsTab::Appearance, window, cx)
+        });
+        cx.simulate_resize(size(px(1200.0), px(1600.0)));
+        cx.run_until_parked();
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        cx.update(|_, cx| crate::motion::set_system(false, cx));
+        assert!(!cx.update(|_, cx| cx.reduce_motion()));
+
+        for expected in [true, false] {
+            let toggle = cx
+                .debug_bounds("reduce_motion")
+                .expect("the motion toggle renders");
+            cx.simulate_click(toggle.center(), Modifiers::default());
+            cx.run_until_parked();
+            assert_eq!(cx.update(|_, cx| cx.reduce_motion()), expected);
+            surfaces.read_with(cx, |surfaces, _| {
+                assert_eq!(surfaces.prefs.reduce_motion, expected);
+                assert_eq!(
+                    surfaces.store.read().unwrap().preferences().reduce_motion,
+                    expected
+                );
+            });
+        }
+        // With Diri's own setting off, the system setting still decides.
+        cx.update(|_, cx| crate::motion::set_system(true, cx));
+        assert!(cx.update(|_, cx| cx.reduce_motion()));
+        cx.update(|_, cx| crate::motion::set_system(false, cx));
     }
 
     #[gpui::test]

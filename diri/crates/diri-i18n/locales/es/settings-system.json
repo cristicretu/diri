@@ -48,6 +48,8 @@
   "settings.appearance.mode_system": "Sistema",
   "settings.appearance.paste_protection": "Revisar comandos pegados",
   "settings.appearance.paste_protection_detail": "Preguntar antes de pegar varias líneas en un shell o texto con caracteres de control.",
+  "settings.appearance.reduce_motion": "Reducir movimiento",
+  "settings.appearance.reduce_motion_detail": "Desactiva las animaciones de Diri. También se desactivan cuando Reducir movimiento está activado en Ajustes del Sistema › Accesibilidad.",
   "settings.appearance.regular_face": "Estilo normal",
   "settings.appearance.shell_integration": "Integración con el shell",
   "settings.appearance.shell_integration_detail": "Marcar los prompts de zsh y bash y el resultado de cada comando en los terminales nuevos. Se aplica a los terminales abiertos después del cambio.",

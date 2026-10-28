@@ -216,6 +216,7 @@ impl Fixture {
             cols,
             rows,
             persistence: PersistenceCapability::NonPersistent,
+            keyboard_enhancements: false,
         };
         let bindings =
             RemoteBindingStore::new(temporary.path().join("bindings")).expect("bindings");
@@ -527,6 +528,7 @@ impl Holder {
             cols,
             rows,
             persistence: PersistenceCapability::NonPersistent,
+            keyboard_enhancements: false,
         };
         let launch = run_launch(&state_dir, &request);
         Self {
