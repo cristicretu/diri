@@ -570,6 +570,17 @@ pub trait Handler {
         }
     }
 
+    /// DIRI PATCH: a run of characters beyond ASCII, none a C1 control, to
+    /// be displayed.
+    ///
+    /// Must be equivalent to calling [`Handler::input`] for each character in
+    /// order, which the default implementation does.
+    fn input_text(&mut self, text: &str) {
+        for c in text.chars() {
+            self.input(c);
+        }
+    }
+
     /// Set cursor to position.
     fn goto(&mut self, _line: i32, _col: usize) {}
 
@@ -1016,6 +1027,7 @@ impl PrivateMode {
             1047 => Self::Named(NamedPrivateMode::ClearingAltScreen),
             2031 => Self::Named(NamedPrivateMode::ColorSchemeUpdates),
             2048 => Self::Named(NamedPrivateMode::InBandResize),
+            2027 => Self::Named(NamedPrivateMode::GraphemeClustering),
             _ => Self::Unknown(mode),
         }
     }
@@ -1084,6 +1096,9 @@ pub enum NamedPrivateMode {
     ColorSchemeUpdates = 2031,
     /// DIRI PATCH: in-band window resize notifications (`CSI 48 ; … t`).
     InBandResize = 2048,
+    /// Grapheme cluster widths by the first codepoint and variation
+    /// selectors, instead of the default `stringWidth`-compatible rule.
+    GraphemeClustering = 2027,
 }
 
 /// Mode for clearing line.
@@ -1418,6 +1433,14 @@ where
     #[inline]
     fn print_ascii(&mut self, text: &str) {
         self.handler.input_ascii(text);
+        if let Some(c) = text.chars().next_back() {
+            self.state.preceding_char = Some(c);
+        }
+    }
+
+    #[inline]
+    fn print_text(&mut self, text: &str) {
+        self.handler.input_text(text);
         if let Some(c) = text.chars().next_back() {
             self.state.preceding_char = Some(c);
         }

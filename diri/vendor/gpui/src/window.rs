@@ -5,7 +5,8 @@ use crate::{
     AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
     Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
+    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId,
+    GlyphRasterStyle, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
     KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
     MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
@@ -1116,6 +1117,8 @@ pub struct Window {
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
+    /// DIRI PATCH (glyph raster style): how glyphs painted now rasterize.
+    pub(crate) glyph_raster: GlyphRasterStyle,
     /// DIRI PATCH: nesting stacks of cached views for the prepaint and paint
     /// passes. See [`CachedViewBase`].
     pub(crate) cached_view_prepaint_bases: Vec<CachedViewBase<PrepaintStateIndex>>,
@@ -1855,6 +1858,7 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
+            glyph_raster: GlyphRasterStyle::default(),
             cached_view_prepaint_bases: Vec::new(),
             cached_view_paint_bases: Vec::new(),
             frame_stats: Default::default(),
@@ -3751,6 +3755,27 @@ impl Window {
         result
     }
 
+    /// DIRI PATCH (glyph raster style): paints `f` with glyphs rasterized in
+    /// `style` instead of the window default. Glyph tiles are keyed by the
+    /// style, so text painted outside the scope keeps its own rasterization.
+    pub fn with_glyph_raster_style<R>(
+        &mut self,
+        style: GlyphRasterStyle,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let previous = self.replace_glyph_raster_style(style);
+        let result = f(self);
+        self.glyph_raster = previous;
+        result
+    }
+
+    /// DIRI PATCH (glyph raster style): sets the style glyphs painted from
+    /// now on rasterize in and returns the one it replaced, for an element
+    /// that restores it at the end of its paint.
+    pub fn replace_glyph_raster_style(&mut self, style: GlyphRasterStyle) -> GlyphRasterStyle {
+        std::mem::replace(&mut self.glyph_raster, style)
+    }
+
     /// Perform prepaint on child elements in a "retryable" manner, so that any side effects
     /// of prepaints can be discarded before prepainting again. This is used to support autoscroll
     /// where we need to prepaint children to detect the autoscroll bounds, then adjust the
@@ -4396,7 +4421,14 @@ impl Window {
         );
         let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
         let subpixel_rendering = self.should_use_subpixel_rendering(font_id, font_size);
-        let dilation = self.text_system().glyph_dilation_for_color(color);
+        // DIRI PATCH (glyph raster style): smoothing can be turned off and a
+        // stroke added for the scope of `with_glyph_raster_style`.
+        let raster = self.glyph_raster;
+        let dilation = if raster.smoothing {
+            self.text_system().glyph_dilation_for_color(color)
+        } else {
+            0
+        };
         let params = RenderGlyphParams {
             font_id,
             glyph_id,
@@ -4406,6 +4438,7 @@ impl Window {
             is_emoji: false,
             subpixel_rendering,
             dilation,
+            stroke: raster.stroke,
         };
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;
@@ -4496,6 +4529,7 @@ impl Window {
             is_emoji: true,
             subpixel_rendering: false,
             dilation: 0,
+            stroke: 0,
         };
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;

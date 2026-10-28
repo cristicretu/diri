@@ -199,20 +199,31 @@ impl GridBuffer {
             let ch = char::from_u32(cell.scalar)
                 .filter(|ch| !matches!(ch, '\n' | '\r' | '\t'))
                 .unwrap_or(' ');
-            // Match the shared parser's width rules, including older Helpers
-            // whose wire cells do not distinguish wide bases from other glyphs.
-            let width = ch.width().unwrap_or(1).max(1);
-            let range = [column as u16, (column + width).min(cells.len()) as u16];
-            text.push(ch);
-            columns.push(range);
             while graphemes
                 .peek()
                 .is_some_and(|(col, _)| usize::from(*col) < column)
             {
                 graphemes.next();
             }
-            if let Some((_, combining)) = graphemes.next_if(|(col, _)| usize::from(*col) == column)
-            {
+            let combining = graphemes.next_if(|(col, _)| usize::from(*col) == column);
+            // Match the shared parser's width rules, including older Helpers
+            // whose wire cells do not distinguish wide bases from other glyphs.
+            // A cluster widened by its later codepoints (`❤` + VS16, a flag)
+            // is followed by a spacer; a spacer that ends a wrapped row is a
+            // wide character's leading padding instead.
+            let spacer_follows = cells.get(column + 1).is_some_and(|next| {
+                next.style.contains(TermStyle::WIDE_SPACER)
+                    && !(column + 2 == cells.len() && next.style.contains(TermStyle::SOFT_WRAP))
+            });
+            let width = if combining.is_some() && spacer_follows {
+                2
+            } else {
+                ch.width().unwrap_or(1).max(1)
+            };
+            let range = [column as u16, (column + width).min(cells.len()) as u16];
+            text.push(ch);
+            columns.push(range);
+            if let Some((_, combining)) = combining {
                 for ch in combining.chars() {
                     text.push(ch);
                     columns.push(range);
@@ -641,6 +652,25 @@ mod tests {
 
         buffer.cells[1] = cell('x');
         assert!(!buffer.is_blank());
+    }
+
+    #[test]
+    fn row_text_spans_clusters_widened_by_their_later_codepoints() {
+        let mut buffer = GridBuffer::new(5, 1);
+        buffer.cells = vec![cell('❤'), cell(' '), cell('🇷'), cell(' '), cell('x')];
+        buffer.cells[1].style |= TermStyle::WIDE_SPACER;
+        buffer.cells[1].scalar = 0;
+        buffer.cells[3].style |= TermStyle::WIDE_SPACER;
+        buffer.cells[3].scalar = 0;
+        buffer.annotations[0].graphemes.push((0, "\u{FE0F}".into()));
+        buffer.annotations[0].graphemes.push((2, "🇴".into()));
+        assert_eq!(
+            buffer.row_text_with_cell_ranges(0),
+            Some((
+                "❤\u{FE0F}🇷🇴x".into(),
+                vec![[0, 2], [0, 2], [2, 4], [2, 4], [4, 5]]
+            ))
+        );
     }
 
     #[test]
