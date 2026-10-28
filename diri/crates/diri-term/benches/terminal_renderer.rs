@@ -1,4 +1,6 @@
-use diri_proto::grid::{ChangedRow, GridCell, GridRowCodec, GridUpdate, TermColor, TermStyle};
+use diri_proto::grid::{
+    ChangedRow, GridCell, GridRowCodec, GridUpdate, StyleSpan, TermColor, TermStyle, UnderlineKind,
+};
 use diri_proto::methods::ReadScrollbackCellsResult;
 use diri_term::scrollback::{WheelDelta, WheelEvent};
 use diri_term::{buffer::GridBuffer, element::TerminalElement, theme::TermTheme};
@@ -41,6 +43,15 @@ fn terminal_styled_tui_scroll(cx: &mut BenchAppContext) {
 #[gpui::bench(fps = 120)]
 fn terminal_framed_tui_scroll(cx: &mut BenchAppContext) {
     scroll(cx, framed_row);
+}
+
+/// A prompt and file listing rather than prose: Nerd Font icons from the
+/// Private Use Area, powerline caps and wedges, and sextant and octant graphs.
+#[gpui::bench(fps = 120)]
+fn terminal_icon_listing_scroll(cx: &mut BenchAppContext) {
+    cx.update(|cx| diri_term::glyphs::register_bundled_fonts(cx))
+        .expect("bundled fonts");
+    scroll(cx, icon_row);
 }
 
 /// A reader scrolled 30 rows into history while output keeps arriving under
@@ -242,6 +253,7 @@ fn terminal_theme_fade_redraw(cx: &mut BenchAppContext) {
         cursor_visible: true,
         is_full_snapshot: true,
         changed_rows,
+        cursor_style: Default::default(),
     });
 
     let mut window = cx.add_empty_window();
@@ -269,9 +281,60 @@ fn terminal_theme_fade_redraw(cx: &mut BenchAppContext) {
     }
 }
 
+/// An editor full of LSP diagnostics: every row carries a colored undercurl
+/// and a dotted hint, as decoration spans.
+#[gpui::bench(fps = 120)]
+fn terminal_diagnostics_scroll(cx: &mut BenchAppContext) {
+    scroll_frames(cx, |offset, full| diagnostic_frame(offset, full, true));
+}
+
+/// The same rows as `terminal_diagnostics_scroll` on the legacy wire: one
+/// plain underline bit and no spans, which is what every underline cost
+/// before decoration spans.
+#[gpui::bench(fps = 120)]
+fn terminal_diagnostics_legacy_scroll(cx: &mut BenchAppContext) {
+    scroll_frames(cx, |offset, full| diagnostic_frame(offset, full, false));
+}
+
+fn diagnostic_frame(offset: usize, is_full_snapshot: bool, spans: bool) -> GridUpdate {
+    let mut frame = build_frame(offset, is_full_snapshot, styled_row);
+    for row in &mut frame.changed_rows {
+        for cell in &mut row.cells[4..24] {
+            cell.style |= TermStyle::UNDERLINE;
+        }
+        if spans {
+            row.metadata.styles = vec![
+                StyleSpan {
+                    start: 4,
+                    end: 14,
+                    underline: UnderlineKind::Curly,
+                    underline_color: Some(TermColor::Rgb(224, 108, 117).packed()),
+                    overline: false,
+                },
+                StyleSpan {
+                    start: 14,
+                    end: 24,
+                    underline: UnderlineKind::Dotted,
+                    underline_color: Some(TermColor::Ansi(3).packed()),
+                    overline: false,
+                },
+            ];
+        }
+    }
+    frame
+}
+
 fn scroll(cx: &mut BenchAppContext, row: fn(usize) -> Vec<GridCell>) {
     let initial = build_frame(0, true, row);
     let frames = [build_frame(1, false, row), build_frame(0, false, row)];
+    scroll_updates(cx, initial, frames);
+}
+
+fn scroll_frames(cx: &mut BenchAppContext, frame: fn(usize, bool) -> GridUpdate) {
+    scroll_updates(cx, frame(0, true), [frame(1, false), frame(0, false)]);
+}
+
+fn scroll_updates(cx: &mut BenchAppContext, initial: GridUpdate, frames: [GridUpdate; 2]) {
     let terminal = TerminalElement::with_buffer(GridBuffer::new(COLS, ROWS)).focused(true);
     terminal.apply_damage(initial);
 
@@ -412,6 +475,48 @@ fn framed_row(line_id: usize) -> Vec<GridCell> {
     }
 }
 
+fn icon_row(line_id: usize) -> Vec<GridCell> {
+    const ICONS: [char; 8] = [
+        '\u{f024b}',
+        '\u{e7a8}',
+        '\u{f023}',
+        '\u{f48a}',
+        '\u{e60b}',
+        '\u{e606}',
+        '\u{f0219}',
+        '\u{ea60}',
+    ];
+    let id = format!("{line_id:05}");
+    let icon = ICONS[line_id % ICONS.len()];
+    match line_id % 3 {
+        0 => cells("\u{e0b6}", TermColor::Ansi(5))
+            .chain(cells(
+                &format!(" \u{f179} giga \u{e0b0} \u{f07c} ~/fun/{id} "),
+                TermColor::Default,
+            ))
+            .chain(cells(
+                "\u{e0b4}\u{e0bc}\u{e0be} \u{e0a0} main \u{f044}",
+                TermColor::Ansi(2),
+            ))
+            .collect(),
+        1 => cells(
+            &format!(".rw-r--r-- 2.1k giga 27 Oct 22:41 {icon} file_{id}.rs"),
+            TermColor::Default,
+        )
+        .collect(),
+        _ => {
+            let graph: String = (0..96)
+                .map(|col| {
+                    let pick = (line_id * 7 + col * 13) % 290;
+                    char::from_u32(if pick < 60 { 0x1fb00 } else { 0x1cd00 - 60 } + pick as u32)
+                        .unwrap()
+                })
+                .collect();
+            cells(&graph, TermColor::Ansi(6)).collect()
+        }
+    }
+}
+
 fn build_frame(
     offset: usize,
     is_full_snapshot: bool,
@@ -432,6 +537,7 @@ fn build_frame(
         cursor_visible: true,
         is_full_snapshot,
         changed_rows,
+        cursor_style: Default::default(),
     }
 }
 
@@ -440,6 +546,9 @@ gpui::bench_group!(
     terminal_build_log_scroll,
     terminal_styled_tui_scroll,
     terminal_framed_tui_scroll,
+    terminal_icon_listing_scroll,
+    terminal_diagnostics_scroll,
+    terminal_diagnostics_legacy_scroll,
     terminal_reading_view_redraw,
     terminal_trackpad_fling,
     terminal_theme_fade_redraw

@@ -25,7 +25,23 @@ pub(crate) fn dir_for(prefs_path: &Path) -> PathBuf {
 }
 
 pub(crate) fn default_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(dir) = TEST_DIR.with(|dir| dir.borrow().clone()) {
+        return dir;
+    }
     dir_for(&Prefs::path())
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Points [`default_dir`] at `dir` on this thread, so UI tests never write
+/// into the person's real themes folder.
+#[cfg(test)]
+pub(crate) fn set_test_dir(dir: Option<PathBuf>) {
+    TEST_DIR.with(|slot| *slot.borrow_mut() = dir);
 }
 
 /// Reads every theme in `dir`. Files that no longer parse are skipped; they
@@ -84,15 +100,11 @@ pub(crate) fn import(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<TermTh
         slug if slug.is_empty() => "theme".to_owned(),
         slug => slug,
     };
-    std::fs::create_dir_all(dir).map_err(|_| ImportError::Write)?;
+    diri_platform::private::create_dir_all(dir).map_err(|_| ImportError::Write)?;
     let target = dir.join(format!("{stem}.{DIRI_THEME_EXTENSION}"));
     let temporary = dir.join(format!(".{stem}.{}.tmp", std::process::id()));
-    std::fs::write(&temporary, theme_file::write_diri(&spec))
-        .and_then(|()| std::fs::rename(&temporary, &target))
-        .map_err(|_| {
-            let _ = std::fs::remove_file(&temporary);
-            ImportError::Write
-        })?;
+    diri_platform::private::replace_via(&temporary, &target, theme_file::write_diri(&spec))
+        .map_err(|_| ImportError::Write)?;
     let theme = build(&stem, &spec);
     themes::add_imported(theme);
     Ok(theme)

@@ -52,6 +52,7 @@ impl Bridge {
         parent: Option<&str>,
     ) -> Result<NoteSpawn, String> {
         let params = SessionSpawnParams {
+            keep_open: None,
             appearance: None,
             account_profile_id: None,
             kind: AgentKind::NOTE,
@@ -77,7 +78,11 @@ impl Bridge {
             Err(_) => return Ok(NoteSpawn::Unavailable("Diri isn't running".into())),
         };
         let deadline = Instant::now() + NOTE_SPAWN_TIMEOUT;
-        match client.request_until(Method::SESSION_SPAWN.into(), params, deadline) {
+        match client.request_until(
+            Method::SESSION_SPAWN.into(),
+            self.stamp_actor(Method::SESSION_SPAWN, params),
+            deadline,
+        ) {
             Ok(value) => {
                 let record: SessionRecord = serde_json::from_value(value)
                     .map_err(|e| format!("invalid session.spawn response: {e}"))?;

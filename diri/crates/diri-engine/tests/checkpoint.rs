@@ -60,6 +60,7 @@ fn shell_spec(
 fn record(id: &str) -> diri_proto::SessionRecord {
     use diri_proto::*;
     SessionRecord {
+        command_run: None,
         attention_state: None,
         id: SessionId(id.into()),
         kind: AgentKind::SHELL,
@@ -94,6 +95,7 @@ fn record(id: &str) -> diri_proto::SessionRecord {
         pull_requests: None,
         listening_ports: None,
         foreground_agent: None,
+        foreground_program: None,
         terminal_cwd: None,
         agent_workspace: None,
         note_id: None,
@@ -151,6 +153,7 @@ fn synthetic_grid(text: &str) -> GridUpdate {
         cursor_visible: true,
         is_full_snapshot: true,
         changed_rows: rows,
+        cursor_style: Default::default(),
     }
 }
 
@@ -326,10 +329,12 @@ fn adoption_seeds_from_the_checkpoint_not_the_raw_tail() {
         .expect("adopted")
         .screen_lines()
         .join("\n");
+    // A pre-snapshot checkpoint comes from an Engine that never negotiated
+    // kitty flags, so the adopted session knows they are zero.
     assert_eq!(
         registry.get("s_ad").unwrap().keyboard_state(),
         Some(diri_proto::terminal_input::KeyboardState {
-            enhancements: None,
+            enhancements: Some(0.try_into().unwrap()),
             application_cursor_keys: true,
             application_keypad: true
         })

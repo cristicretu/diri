@@ -356,6 +356,8 @@ impl SessionAttachment {
     ) -> Result<Self, AttachmentError> {
         let request = AttachRequest {
             enhanced_keyboard: options.enhanced_keyboard,
+            // This client decodes cursor shapes and decoration spans.
+            terminal_styles: true,
             attach: session_id.clone(),
             from_offset: None,
             token: None,
@@ -824,6 +826,7 @@ mod tests {
                     cursor_visible: true,
                     is_full_snapshot: index == 0,
                     changed_rows: Vec::new(),
+                    cursor_style: Default::default(),
                 };
                 super::write_frame(server.get_mut(), &Frame::grid(&grid).unwrap())
                     .await
@@ -1010,6 +1013,7 @@ mod tests {
                     cursor_row: 0,
                     cursor_visible: true,
                     is_full_snapshot: index == 0,
+                    cursor_style: Default::default(),
                     changed_rows: vec![ChangedRow::new(
                         0,
                         vec![GridCell {
@@ -1218,6 +1222,7 @@ mod tests {
         let scratch = tempfile::Builder::new().prefix("diri-t4-").tempdir()?;
         let mut control = TestControl::connect(&socket).await?;
         let spawn = SessionSpawnParams {
+            keep_open: None,
             appearance: None,
             kind: AgentKind::SHELL,
             cwd: scratch.path().to_string_lossy().into_owned(),

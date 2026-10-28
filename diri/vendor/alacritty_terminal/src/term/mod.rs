@@ -79,6 +79,10 @@ bitflags! {
         const REPORT_ALTERNATE_KEYS   = 1 << 20;
         const REPORT_ALL_KEYS_AS_ESC  = 1 << 21;
         const REPORT_ASSOCIATED_TEXT  = 1 << 22;
+        /// DIRI PATCH: DECSET 2031, color-scheme change reports.
+        const COLOR_SCHEME_UPDATES    = 1 << 23;
+        /// DIRI PATCH: DECSET 2048, in-band resize reports.
+        const IN_BAND_RESIZE          = 1 << 24;
         const MOUSE_MODE              = Self::MOUSE_REPORT_CLICK.bits() | Self::MOUSE_MOTION.bits() | Self::MOUSE_DRAG.bits();
         const KITTY_KEYBOARD_PROTOCOL = Self::DISAMBIGUATE_ESC_CODES.bits()
                                       | Self::REPORT_EVENT_TYPES.bits()
@@ -412,6 +416,11 @@ pub struct Term<T> {
     /// Modified terminal colors.
     colors: Colors,
 
+    /// DIRI PATCH: advances whenever a color cells are painted with (0–255
+    /// and the default foreground and background) changes, so a recolor that
+    /// moves no cell is still noticed.
+    colors_generation: u64,
+
     /// Current style of the cursor.
     cursor_style: Option<CursorStyle>,
 
@@ -460,6 +469,10 @@ pub struct Config {
 
     /// OSC52 support mode.
     pub osc52: Osc52,
+
+    /// DIRI PATCH: the name and version XTVERSION (`CSI > q`) reports. The
+    /// query is unanswered when absent.
+    pub terminal_version: Option<String>,
 }
 
 impl Default for Config {
@@ -471,6 +484,7 @@ impl Default for Config {
             vi_mode_cursor_style: Default::default(),
             kitty_keyboard: Default::default(),
             osc52: Default::default(),
+            terminal_version: None,
         }
     }
 }
@@ -498,6 +512,46 @@ pub enum Osc52 {
 }
 
 impl<T> Term<T> {
+    /// Release the primary grid's history caches once output is idle.
+    #[cfg(feature = "compact-history")]
+    pub fn release_idle_history(&mut self) {
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            self.inactive_grid
+                .as_mut()
+                .expect("primary grid")
+                .release_idle_history();
+        } else {
+            self.grid.release_idle_history();
+        }
+    }
+
+    /// DIRI PATCH: history rows of the primary screen, also while the
+    /// alternate screen is shown.
+    pub fn primary_history_size(&self) -> usize {
+        match (
+            &self.inactive_grid,
+            self.mode.contains(TermMode::ALT_SCREEN),
+        ) {
+            (Some(primary), true) => primary.history_size(),
+            _ => self.grid.history_size(),
+        }
+    }
+
+    /// DIRI PATCH: changes only the history row limit, as `set_options` does
+    /// for `scrolling_history`, without its damage and title side effects. A
+    /// lower limit drops the oldest rows; the limit survives a reset.
+    pub fn set_scrolling_history(&mut self, limit: usize) {
+        self.config.scrolling_history = limit;
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            self.inactive_grid
+                .as_mut()
+                .expect("alternate screen retains the primary grid")
+                .update_history(limit);
+        } else {
+            self.grid.update_history(limit);
+        }
+    }
+
     #[cfg(feature = "compact-history")]
     pub fn bound_primary_history_storage(&mut self, budget: usize) {
         if self.mode.contains(TermMode::ALT_SCREEN) {
@@ -561,6 +615,7 @@ impl<T> Term<T> {
             vi_mode_cursor: Default::default(),
             cursor_style: Default::default(),
             colors: color::Colors::default(),
+            colors_generation: 0,
             title_stack: Default::default(),
             is_focused: Default::default(),
             selection: Default::default(),
@@ -640,6 +695,12 @@ impl<T> Term<T> {
     }
 
     /// Set new options for the [`Term`].
+    /// DIRI PATCH: the options in effect, so a caller changing one keeps
+    /// the rest.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
     pub fn set_options(&mut self, options: Config)
     where
         T: EventListener,
@@ -887,12 +948,25 @@ impl<T> Term<T> {
 
     /// Swap primary and alternate screen buffer.
     pub fn swap_alt(&mut self) {
+        self.swap_alt_screen(AltScreen::SaveCursorAndClear);
+    }
+
+    /// DIRI PATCH: the three alternate-screen modes differ only in what
+    /// happens to the cursor and the alternate screen's contents.
+    fn swap_alt_screen(&mut self, kind: AltScreen) {
         let num_lines = self.grid.screen_lines();
         let num_cols = self.grid.columns();
+        let entering = !self.mode.contains(TermMode::ALT_SCREEN);
+        // xterm's 47 and 1047 share one cursor between the two screens.
+        let shared_cursor =
+            (kind != AltScreen::SaveCursorAndClear).then(|| self.grid.cursor.clone());
+        if !entering && kind == AltScreen::ClearOnExit {
+            self.grid.reset_region(..);
+        }
         let inactive_grid = self
             .inactive_grid
             .get_or_insert_with(|| Grid::new(num_lines, num_cols, 0));
-        if !self.mode.contains(TermMode::ALT_SCREEN) {
+        if entering && kind == AltScreen::SaveCursorAndClear {
             // Set alt screen cursor to the current primary screen cursor.
             inactive_grid.cursor = self.grid.cursor.clone();
 
@@ -922,8 +996,62 @@ impl<T> Term<T> {
                 .expect("alternate screen initialized before swap"),
         );
         self.mode ^= TermMode::ALT_SCREEN;
+        if let Some(cursor) = shared_cursor {
+            self.grid.cursor = cursor;
+        }
         self.selection = None;
         self.mark_fully_damaged();
+    }
+
+    /// DIRI PATCH: the SGR state of new text, as DECRQSS `m` reports it.
+    fn sgr_report(&self) -> String {
+        use std::fmt::Write;
+
+        fn color(out: &mut String, color: Color, base: u8, bright: u8, extended: u8) {
+            match color {
+                Color::Named(named) if (named as usize) < 8 => {
+                    let _ = write!(out, ";{}", base + named as u8);
+                }
+                Color::Named(named) if (named as usize) < 16 => {
+                    let _ = write!(out, ";{}", bright + named as u8 - 8);
+                }
+                Color::Named(_) => {}
+                Color::Indexed(index) => {
+                    let _ = write!(out, ";{extended}:5:{index}");
+                }
+                Color::Spec(rgb) => {
+                    let _ = write!(out, ";{extended}:2::{}:{}:{}", rgb.r, rgb.g, rgb.b);
+                }
+            }
+        }
+
+        let template = &self.grid.cursor.template;
+        let mut out = String::from("0");
+        for (flag, code) in [
+            (Flags::BOLD, "1"),
+            (Flags::DIM, "2"),
+            (Flags::ITALIC, "3"),
+            (Flags::UNDERLINE, "4"),
+            (Flags::DOUBLE_UNDERLINE, "4:2"),
+            (Flags::UNDERCURL, "4:3"),
+            (Flags::DOTTED_UNDERLINE, "4:4"),
+            (Flags::DASHED_UNDERLINE, "4:5"),
+            (Flags::INVERSE, "7"),
+            (Flags::HIDDEN, "8"),
+            (Flags::STRIKEOUT, "9"),
+        ] {
+            if template.flags.contains(flag) {
+                out.push(';');
+                out.push_str(code);
+            }
+        }
+        color(&mut out, template.fg, 30, 90, 38);
+        color(&mut out, template.bg, 40, 100, 48);
+        if let Some(underline) = template.underline_color() {
+            color(&mut out, underline, 58, 58, 58);
+        }
+        out.push('m');
+        out
     }
 
     /// Scroll screen down.
@@ -1165,6 +1293,12 @@ impl<T> Term<T> {
 
     pub fn colors(&self) -> &Colors {
         &self.colors
+    }
+
+    /// DIRI PATCH: see `colors_generation`. The cursor color does not count;
+    /// no cell is painted with it.
+    pub fn colors_generation(&self) -> u64 {
+        self.colors_generation
     }
 
     /// Insert a linebreak at the current cursor position.
@@ -1966,8 +2100,9 @@ impl<T: EventListener> Handler for Term<T> {
         let bg = cursor.template.bg;
         let point = cursor.point;
 
+        // DIRI PATCH: like xterm, erasing in line cancels a pending wrap, so
+        // the next character overwrites the last column instead of wrapping.
         let (left, right) = match mode {
-            ansi::LineClearMode::Right if cursor.input_needs_wrap => return,
             ansi::LineClearMode::Right => (point.column, Column(self.columns())),
             ansi::LineClearMode::Left => (Column(0), point.column + 1),
             ansi::LineClearMode::All => (Column(0), Column(self.columns())),
@@ -1981,6 +2116,7 @@ impl<T: EventListener> Handler for Term<T> {
             *cell = bg.into();
         }
 
+        self.grid.cursor.input_needs_wrap = false;
         let range = self.grid.cursor.point.line..=self.grid.cursor.point.line;
         self.selection = self.selection.take().filter(|s| !s.intersects_range(range));
     }
@@ -1993,6 +2129,7 @@ impl<T: EventListener> Handler for Term<T> {
         // Damage terminal if the color changed and it's not the cursor.
         if index != NamedColor::Cursor as usize && self.colors[index] != Some(color) {
             self.mark_fully_damaged();
+            self.colors_generation += 1;
         }
 
         self.colors[index] = Some(color);
@@ -2023,6 +2160,7 @@ impl<T: EventListener> Handler for Term<T> {
         // Damage terminal if the color changed and it's not the cursor.
         if index != NamedColor::Cursor as usize && self.colors[index].is_some() {
             self.mark_fully_damaged();
+            self.colors_generation += 1;
         }
 
         self.colors[index] = None;
@@ -2185,7 +2323,16 @@ impl<T: EventListener> Handler for Term<T> {
         self.scroll_region = Line(0)..Line(self.screen_lines() as i32);
         self.tabs = TabStops::new(self.columns());
         self.title_stack = Vec::new();
-        self.title = None;
+        // DIRI PATCH: RIS resets the title too; listeners track it by event.
+        if self.title.take().is_some() {
+            self.event_proxy.send_event(Event::ResetTitle);
+        }
+        // DIRI PATCH: and the colors a program set with OSC 4/10/11/12, as
+        // xterm and libghostty do: `reset` restores the configured palette.
+        if (0..color::COUNT).any(|index| self.colors[index].is_some()) {
+            self.colors = color::Colors::default();
+            self.colors_generation += 1;
+        }
         self.selection = None;
         self.vi_mode_cursor = Default::default();
         self.keyboard_mode_stack = Default::default();
@@ -2302,9 +2449,10 @@ impl<T: EventListener> Handler for Term<T> {
             Attr::CancelHidden => cursor.template.flags.remove(Flags::HIDDEN),
             Attr::Strike => cursor.template.flags.insert(Flags::STRIKEOUT),
             Attr::CancelStrike => cursor.template.flags.remove(Flags::STRIKEOUT),
-            _ => {
-                debug!("Term got unhandled attr: {attr:?}");
-            }
+            Attr::BlinkSlow | Attr::BlinkFast => cursor.template.flags.insert(Flags::BLINK),
+            Attr::CancelBlink => cursor.template.flags.remove(Flags::BLINK),
+            Attr::Overline => cursor.template.flags.insert(Flags::OVERLINE),
+            Attr::CancelOverline => cursor.template.flags.remove(Flags::OVERLINE),
         }
     }
 
@@ -2370,6 +2518,25 @@ impl<T: EventListener> Handler for Term<T> {
                 self.event_proxy.send_event(Event::CursorBlinkingChange);
             }
             NamedPrivateMode::SyncUpdate => (),
+            NamedPrivateMode::LegacyAltScreen => {
+                if !self.mode.contains(TermMode::ALT_SCREEN) {
+                    self.swap_alt_screen(AltScreen::Shared);
+                }
+            }
+            NamedPrivateMode::ClearingAltScreen => {
+                if !self.mode.contains(TermMode::ALT_SCREEN) {
+                    self.swap_alt_screen(AltScreen::ClearOnExit);
+                }
+            }
+            NamedPrivateMode::LeftRightMargins | NamedPrivateMode::SgrPixelMouse => (),
+            NamedPrivateMode::ColorSchemeUpdates => {
+                self.mode.insert(TermMode::COLOR_SCHEME_UPDATES)
+            }
+            NamedPrivateMode::InBandResize => {
+                self.mode.insert(TermMode::IN_BAND_RESIZE);
+                // The program learns the current size as soon as it asks.
+                self.event_proxy.send_event(Event::InBandResize);
+            }
         }
     }
 
@@ -2421,6 +2588,21 @@ impl<T: EventListener> Handler for Term<T> {
                 self.event_proxy.send_event(Event::CursorBlinkingChange);
             }
             NamedPrivateMode::SyncUpdate => (),
+            NamedPrivateMode::LegacyAltScreen => {
+                if self.mode.contains(TermMode::ALT_SCREEN) {
+                    self.swap_alt_screen(AltScreen::Shared);
+                }
+            }
+            NamedPrivateMode::ClearingAltScreen => {
+                if self.mode.contains(TermMode::ALT_SCREEN) {
+                    self.swap_alt_screen(AltScreen::ClearOnExit);
+                }
+            }
+            NamedPrivateMode::LeftRightMargins | NamedPrivateMode::SgrPixelMouse => (),
+            NamedPrivateMode::ColorSchemeUpdates => {
+                self.mode.remove(TermMode::COLOR_SCHEME_UPDATES)
+            }
+            NamedPrivateMode::InBandResize => self.mode.remove(TermMode::IN_BAND_RESIZE),
         }
     }
 
@@ -2467,6 +2649,18 @@ impl<T: EventListener> Handler for Term<T> {
                 }
                 NamedPrivateMode::SyncUpdate => ModeState::Reset,
                 NamedPrivateMode::ColumnMode => ModeState::NotSupported,
+                NamedPrivateMode::LegacyAltScreen | NamedPrivateMode::ClearingAltScreen => {
+                    self.mode.contains(TermMode::ALT_SCREEN).into()
+                }
+                NamedPrivateMode::LeftRightMargins | NamedPrivateMode::SgrPixelMouse => {
+                    ModeState::PermanentlyReset
+                }
+                NamedPrivateMode::ColorSchemeUpdates => {
+                    self.mode.contains(TermMode::COLOR_SCHEME_UPDATES).into()
+                }
+                NamedPrivateMode::InBandResize => {
+                    self.mode.contains(TermMode::IN_BAND_RESIZE).into()
+                }
             },
             PrivateMode::Unknown(_) => ModeState::NotSupported,
         };
@@ -2667,6 +2861,151 @@ impl<T: EventListener> Handler for Term<T> {
         let text = format!("\x1b[8;{};{}t", self.screen_lines(), self.columns());
         self.event_proxy.send_event(Event::PtyWrite(text));
     }
+
+    /// DIRI PATCH: XTWINOPS 19; the screen is the text area here.
+    #[inline]
+    fn screen_size_chars(&mut self) {
+        let text = format!("\x1b[9;{};{}t", self.screen_lines(), self.columns());
+        self.event_proxy.send_event(Event::PtyWrite(text));
+    }
+
+    /// DIRI PATCH: XTVERSION.
+    #[inline]
+    fn report_version(&mut self) {
+        if let Some(version) = &self.config.terminal_version {
+            let text = format!("\x1bP>|{version}\x1b\\");
+            self.event_proxy.send_event(Event::PtyWrite(text));
+        }
+    }
+
+    /// DIRI PATCH: DECSTR. Resets the modes and attributes a crashed program
+    /// may have left behind and keeps the screen, the cursor position and
+    /// bracketed paste, as xterm does.
+    fn soft_reset(&mut self) {
+        trace!("Soft reset");
+        self.mode
+            .insert(TermMode::SHOW_CURSOR | TermMode::LINE_WRAP);
+        self.mode.remove(
+            TermMode::INSERT | TermMode::ORIGIN | TermMode::APP_CURSOR | TermMode::APP_KEYPAD,
+        );
+        self.scroll_region = Line(0)..Line(self.screen_lines() as i32);
+        self.active_charset = Default::default();
+        let cursor = &mut self.grid.cursor;
+        cursor.template = Default::default();
+        cursor.charsets = Default::default();
+        let mut saved = cursor.clone();
+        saved.point = Point::default();
+        saved.input_needs_wrap = false;
+        self.grid.saved_cursor = saved;
+        if self.cursor_style.take().is_some() {
+            self.event_proxy.send_event(Event::CursorBlinkingChange);
+        }
+    }
+
+    /// DIRI PATCH: DEC-private DSR: extended cursor position and the
+    /// color-scheme query.
+    fn private_device_status(&mut self, arg: usize) {
+        match arg {
+            6 => {
+                let pos = self.grid.cursor.point;
+                let text = format!("\x1b[?{};{};1R", pos.line + 1, pos.column + 1);
+                self.event_proxy.send_event(Event::PtyWrite(text));
+            }
+            996 => self.event_proxy.send_event(Event::ColorSchemeRequest),
+            _ => debug!("unknown private device status query: {arg}"),
+        }
+    }
+
+    /// DIRI PATCH: XTGETTCAP. One reply per requested name, in order.
+    fn request_termcap(&mut self, names: &[u8]) {
+        for hex in names.split(|&byte| byte == b';') {
+            let name = decode_hex(hex);
+            let text = match name.as_deref().and_then(termcap) {
+                Some(Some(value)) => format!(
+                    "\x1bP1+r{}={}\x1b\\",
+                    hex_name(hex),
+                    encode_hex(value.as_bytes())
+                ),
+                Some(None) => format!("\x1bP1+r{}\x1b\\", hex_name(hex)),
+                None => format!("\x1bP0+r{}\x1b\\", hex_name(hex)),
+            };
+            self.event_proxy.send_event(Event::PtyWrite(text));
+        }
+    }
+
+    /// DIRI PATCH: DECRQSS for SGR, the scrolling region and the cursor style.
+    fn request_setting(&mut self, setting: &[u8]) {
+        let value = match setting {
+            b"m" => Some(self.sgr_report()),
+            b"r" => Some(format!(
+                "{};{}r",
+                self.scroll_region.start.0 + 1,
+                self.scroll_region.end.0
+            )),
+            b" q" => {
+                let style = self
+                    .cursor_style
+                    .unwrap_or(self.config.default_cursor_style);
+                let steady = match style.shape {
+                    CursorShape::Underline => 4,
+                    CursorShape::Beam => 6,
+                    CursorShape::Block | CursorShape::HollowBlock | CursorShape::Hidden => 2,
+                };
+                Some(format!("{} q", steady - u8::from(style.blinking)))
+            }
+            _ => None,
+        };
+        let text = match value {
+            Some(value) => format!("\x1bP1$r{value}\x1b\\"),
+            None => String::from("\x1bP0$r\x1b\\"),
+        };
+        self.event_proxy.send_event(Event::PtyWrite(text));
+    }
+}
+
+/// DIRI PATCH: XTGETTCAP answers. `Some(None)` is a boolean capability; the
+/// values are terminfo strings, escapes spelled the way terminfo spells them.
+fn termcap(name: &[u8]) -> Option<Option<&'static str>> {
+    Some(match name {
+        b"TN" | b"name" => Some("xterm-256color"),
+        b"Co" | b"colors" => Some("256"),
+        b"RGB" => Some("8"),
+        b"Tc" => None,
+        b"setrgbf" => Some("\\E[38;2;%p1%d;%p2%d;%p3%dm"),
+        b"setrgbb" => Some("\\E[48;2;%p1%d;%p2%d;%p3%dm"),
+        b"Smulx" => Some("\\E[4:%p1%dm"),
+        b"Ss" => Some("\\E[%p1%d q"),
+        b"Se" => Some("\\E[2 q"),
+        b"kbs" => Some("\x7f"),
+        _ => return None,
+    })
+}
+
+/// The name as sent, upper-cased the way replies spell hex.
+fn hex_name(hex: &[u8]) -> String {
+    String::from_utf8_lossy(hex).to_ascii_uppercase()
+}
+
+fn decode_hex(hex: &[u8]) -> Option<Vec<u8>> {
+    if hex.is_empty() || hex.len() % 2 != 0 {
+        return None;
+    }
+    hex.chunks(2)
+        .map(|pair| {
+            let digit = |byte: u8| (byte as char).to_digit(16);
+            Some((digit(pair[0])? * 16 + digit(pair[1])?) as u8)
+        })
+        .collect()
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
+            let _ = write!(out, "{byte:02X}");
+            out
+        })
 }
 
 /// The state of the [`Mode`] and [`PrivateMode`].
@@ -2679,6 +3018,20 @@ enum ModeState {
     Set = 1,
     /// The mode is currently not set.
     Reset = 2,
+    /// DIRI PATCH: the mode is recognized but can never be set.
+    PermanentlyReset = 4,
+}
+
+/// DIRI PATCH: how an alternate-screen mode treats the cursor and contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AltScreen {
+    /// 1049: save the cursor, clear the alternate screen on entry, restore
+    /// the cursor on exit.
+    SaveCursorAndClear,
+    /// 47: one cursor, nothing cleared.
+    Shared,
+    /// 1047: one cursor, the alternate screen cleared on exit.
+    ClearOnExit,
 }
 
 impl From<bool> for ModeState {

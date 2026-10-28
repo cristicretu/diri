@@ -151,6 +151,7 @@ impl Bridge {
             "open_api_request" => self.open_api_request(arguments),
             "quick_open_include" => self.quick_open_include(arguments),
             "whoami" => self.whoami(),
+            crate::tools::NAME_SESSION_TOOL => self.name_session(arguments),
             "get_layout" => self.get_layout(arguments),
             "manage_layout" => self.manage_layout(arguments),
             "list_children" => self.list_children(arguments),
@@ -188,7 +189,21 @@ impl Bridge {
             .checked_add(timeout)
             .ok_or_else(|| ControlFailure::Protocol("invalid request timeout".into()))?;
         let mut client = self.connect(timeout)?;
-        client.request_until(method.into(), params, deadline)
+        client.request_until(method.into(), self.stamp_actor(method, params), deadline)
+    }
+
+    /// Names this Agent's session on a request that changes what Diri's
+    /// window shows, so the app can say who did it. Reads stay unstamped.
+    pub(super) fn stamp_actor(&self, method: &str, mut params: Value) -> Value {
+        if let (Some(caller), Some(object)) = (self.caller.as_deref(), params.as_object_mut())
+            && diri_proto::agent_action::announces(method)
+        {
+            object.insert(
+                diri_proto::agent_action::ACTOR_FIELD.into(),
+                Value::String(caller.to_owned()),
+            );
+        }
+        params
     }
 
     fn request_typed<T: DeserializeOwned>(
@@ -263,6 +278,7 @@ impl Bridge {
         // Resolved before launching, so a bad split request starts nothing.
         let placement = self.spawn_placement(arguments, tracked)?;
         let params = SessionSpawnParams {
+            keep_open: None,
             appearance: None,
             kind,
             cwd: required_string(arguments, "cwd")?,
@@ -732,6 +748,10 @@ impl Bridge {
             ("hosted".into(), json!(true)),
             ("session".into(), detailed(record, Relation::Caller)),
             (
+                "name_set_by".into(),
+                json!(name_set_by(record.title_source)),
+            ),
+            (
                 "children".into(),
                 Value::Array(
                     lineage
@@ -1050,6 +1070,41 @@ impl Bridge {
         )
     }
 
+    /// The caller naming its own session. The Engine decides: it keeps a
+    /// name the user or Diri gave and names nothing while the setting is off,
+    /// unless the user asked for this name.
+    fn name_session(&self, arguments: &Value) -> Result<Value, String> {
+        let caller = self.require_caller()?;
+        let by = if optional_bool(arguments, "user_requested").unwrap_or(false) {
+            diri_proto::RenameAuthor::AgentForUser
+        } else {
+            diri_proto::RenameAuthor::Agent
+        };
+        let mut result = self.request(
+            Method::SESSION_RENAME,
+            serde_json::to_value(diri_proto::SessionRenameParams {
+                session_id: SessionId(caller.to_owned()),
+                title: required_string(arguments, "name")?,
+                by: Some(by),
+            })
+            .map_err(|error| error.to_string())?,
+            DEFAULT_TIMEOUT,
+        )?;
+        if let Some(object) = result.as_object_mut()
+            && let Some(reason) = object.get("reason").and_then(Value::as_str)
+        {
+            let note = match reason {
+                "userNamed" => "The user or Diri named this session; keep their name.",
+                "namingOff" => {
+                    "The user turned off agent session names; only names they ask for are used."
+                }
+                _ => "The session already has this name.",
+            };
+            object.insert("note".into(), json!(note));
+        }
+        Ok(result)
+    }
+
     fn require_caller(&self) -> Result<&str, String> {
         self.caller.as_deref().ok_or_else(|| {
             "this tool requires DIRIJOR_SESSION_ID and must run inside a Diri session".into()
@@ -1208,6 +1263,25 @@ fn compact(record: &SessionRecord) -> Value {
         object.insert("host".into(), json!(host));
     }
     Value::Object(object)
+}
+
+/// Who chose a session's current name, so an Agent knows whether it may
+/// replace it: `user` and `diri` names are kept, an `agent` name may be
+/// refined, an `automatic` one (prompt, terminal, provider summary, or the
+/// "Fork of …" title a fork starts with) replaced.
+fn name_set_by(source: diri_proto::TitleSource) -> &'static str {
+    use diri_proto::TitleSource;
+    match source {
+        TitleSource::UserRename => "user",
+        TitleSource::DirijorAssigned => "diri",
+        TitleSource::AgentNamed => "agent",
+        TitleSource::Placeholder
+        | TitleSource::FirstPrompt
+        | TitleSource::AgentProvided
+        | TitleSource::TerminalTitle
+        | TitleSource::Forked
+        | TitleSource::Unknown => "automatic",
+    }
 }
 
 fn detailed(record: &SessionRecord, relation: Relation) -> Value {
@@ -1439,8 +1513,26 @@ mod tests {
     use super::*;
     use diri_proto::{DateMillis, ProjectId, Resumability, TitleSource};
 
+    #[test]
+    fn window_changes_name_the_calling_agent_and_reads_do_not() {
+        let bridge = Bridge::new(PathBuf::from("/nonexistent"), Some("agent-1".into()));
+        let stamped = bridge.stamp_actor(Method::WORKSPACE_MUTATE, json!({"expectedRevision": 1}));
+        assert_eq!(stamped["actor"], "agent-1");
+        let reveal = bridge.stamp_actor(Method::SESSION_REVEAL, json!({"sessionID": "s"}));
+        assert_eq!(reveal["actor"], "agent-1");
+        let read = bridge.stamp_actor(Method::SESSION_LIST, json!({}));
+        assert_eq!(read, json!({}));
+        // Outside a Diri session there is no one to name.
+        let anonymous = Bridge::new(PathBuf::from("/nonexistent"), None);
+        assert_eq!(
+            anonymous.stamp_actor(Method::WORKSPACE_MUTATE, json!({})),
+            json!({})
+        );
+    }
+
     pub(super) fn record(id: &str, parent: Option<&str>) -> SessionRecord {
         SessionRecord {
+            command_run: None,
             attention_state: None,
             id: SessionId::new(id),
             kind: AgentKind::CODEX,
@@ -1475,6 +1567,7 @@ mod tests {
             pull_requests: None,
             listening_ports: None,
             foreground_agent: None,
+            foreground_program: None,
             terminal_cwd: None,
             agent_workspace: None,
             note_id: None,

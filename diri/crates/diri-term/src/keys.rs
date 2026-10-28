@@ -8,7 +8,8 @@ pub use diri_proto::terminal_input::*;
 /// arrows and Home/End retain the desktop's historical normal-cursor (CSI)
 /// encoding. This is a compatibility policy, not an observed terminal mode:
 /// do not persist it or use it for the strict automation key API. Keypad keys
-/// still require authoritative state, and known application modes always win.
+/// type their characters in every legacy mode, and known application modes
+/// always win.
 /// The Engine continues to enforce controller and enhanced-keyboard admission.
 pub fn encode_interactive_action(
     event: &KeyEvent,
@@ -29,6 +30,51 @@ pub fn encode_interactive_action(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The desktop key path: once a program negotiates kitty flags, keys it
+    /// asked to disambiguate arrive in that protocol, and releases are sent
+    /// only when it asked for event types.
+    #[test]
+    fn interactive_keys_follow_negotiated_kitty_flags() {
+        let keyboard = |bits: u8| {
+            Some(KeyboardState {
+                enhancements: Some(bits.try_into().unwrap()),
+                ..Default::default()
+            })
+        };
+        let enter = KeyEvent::named(NamedKey::Enter);
+        let shift = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let encode = |bits, modifiers, action| {
+            encode_interactive_action(&enter, modifiers, keyboard(bits), action).unwrap()
+        };
+        // Flags 0 keep the legacy bytes (Shift-Enter was already CSI u).
+        assert_eq!(
+            encode(0, Modifiers::default(), KeyAction::Press),
+            encode_key(&enter, Modifiers::default(), TermInputModes::default())
+        );
+        assert_eq!(encode(1, shift, KeyAction::Press), b"\x1b[13;2u");
+        assert_eq!(encode(1, Modifiers::default(), KeyAction::Press), b"\r");
+        assert_eq!(encode(1, shift, KeyAction::Release), b"");
+        // Enter, Tab and Backspace releases need all-keys mode (spec).
+        assert_eq!(encode(3, shift, KeyAction::Release), b"");
+        assert_eq!(encode(11, shift, KeyAction::Release), b"\x1b[13;2:3u");
+        let escape = KeyEvent::named(NamedKey::Escape);
+        assert_eq!(
+            encode_interactive_action(&escape, Modifiers::default(), keyboard(1), KeyAction::Press)
+                .unwrap(),
+            b"\x1b[27u"
+        );
+        // A modifier key alone is not a key the protocol reports without
+        // all-keys mode; its release sends nothing rather than an error.
+        let shift_key = KeyEvent::character("shift");
+        assert_eq!(
+            encode_interactive_action(&shift_key, shift, keyboard(3), KeyAction::Release).unwrap(),
+            b""
+        );
+    }
 
     #[test]
     fn interactive_compatibility_preserves_authoritative_modes_and_strict_errors() {
@@ -59,6 +105,8 @@ mod tests {
             encode_interactive_action(&up, Modifiers::default(), None, KeyAction::Release),
             Err(KeyEncodingError::UnsupportedRelease)
         );
+        // The keypad types its character whatever the modes, so it needs
+        // none observed.
         assert_eq!(
             encode_interactive_action(
                 &KeyEvent::keypad(KeypadKey::One),
@@ -66,7 +114,7 @@ mod tests {
                 None,
                 KeyAction::Press
             ),
-            Err(KeyEncodingError::UnknownModes)
+            Ok(b"1".to_vec())
         );
         assert!(
             encode_interactive_action(

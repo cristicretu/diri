@@ -12,6 +12,9 @@
 //!
 //! Usage: catbench <payload> [cols] [rows] [runs]
 //!
+//! `skipped-MB` is output the Engine never parsed because the session log
+//! had already rotated past it; anything but zero is a correctness bug.
+//!
 //! `DIRI_HOLDER_BIN` names a built `diri-holder`. `CATBENCH_THREADS=1` also
 //! prints per-thread CPU times of the Engine and Holder processes.
 
@@ -112,6 +115,7 @@ struct Run {
     holder_cpu: f64,
     frames: u64,
     frame_bytes: u64,
+    skipped: u64,
 }
 
 fn run_once(payload: &Path, cols: u16, rows: u16) -> Run {
@@ -244,8 +248,15 @@ fn run_once(payload: &Path, cols: u16, rows: u16) -> Run {
     while !seeded.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(5));
     }
-    std::thread::sleep(Duration::from_millis(100));
+    // `CATBENCH_SETTLE_MS` waits longer, so the Engine has subscribed to the
+    // Holder's live stream before `cat` starts.
+    let settle = std::env::var("CATBENCH_SETTLE_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .unwrap_or(100);
+    std::thread::sleep(Duration::from_millis(settle));
 
+    let skipped_before = diri_engine::session::held_output_skipped_bytes();
     let holder_before = holder_cpu();
     let cpu_before = process_cpu();
     let done = {
@@ -270,6 +281,7 @@ fn run_once(payload: &Path, cols: u16, rows: u16) -> Run {
     let (final_at, frames, frame_bytes, client_cpu) = client.join().expect("client");
     let engine_cpu = process_cpu() - cpu_before;
     let holder_after = holder_cpu();
+    let skipped = diri_engine::session::held_output_skipped_bytes() - skipped_before;
     if std::env::var_os("CATBENCH_THREADS").is_some() {
         let me = std::process::id().to_string();
         let _ = std::process::Command::new("/bin/sh")
@@ -296,6 +308,7 @@ fn run_once(payload: &Path, cols: u16, rows: u16) -> Run {
         holder_cpu: holder_after - holder_before,
         frames,
         frame_bytes,
+        skipped,
     }
 }
 
@@ -311,7 +324,7 @@ fn main() {
         let run = run_once(&payload, cols, rows);
         println!(
             "drain {:.3} s ({:.1} MB/s)  final-grid {:.3} s ({:.1} MB/s)  engine-cpu {:.3} s  \
-             client-cpu {:.3} s  holder-cpu {:.2} s  frames {}  frame-MB {:.2}",
+             client-cpu {:.3} s  holder-cpu {:.2} s  frames {}  frame-MB {:.2}  skipped-MB {:.2}",
             run.drained.as_secs_f64(),
             mb / run.drained.as_secs_f64(),
             run.final_grid.as_secs_f64(),
@@ -321,6 +334,7 @@ fn main() {
             run.holder_cpu,
             run.frames,
             run.frame_bytes as f64 / 1e6,
+            run.skipped as f64 / 1e6,
         );
     }
 }

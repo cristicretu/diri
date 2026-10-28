@@ -32,6 +32,9 @@ enum Leader {
 impl Pty {
     /// Spawn an exact structured command on a new controlling PTY.
     pub fn spawn(spec: &PtySpec) -> io::Result<Self> {
+        // Built before the fork: the child execs it without allocating, and
+        // explains a program it cannot start instead of failing the spawn.
+        let plan = crate::exec::ExecPlan::from_spec(spec)?;
         let (master, slave) = open_pair(spec)?;
         let program = &spec.argv[0];
 
@@ -47,7 +50,7 @@ impl Pty {
         let slave_fd = slave.as_raw_fd();
         // SAFETY: `pre_exec` runs after fork and before exec. The closure only
         // invokes async-signal-safe libc calls, touches stack values captured
-        // by copy, and reports errors without heap allocation in the child.
+        // by copy or the prebuilt exec plan, and never allocates in the child.
         unsafe {
             command.pre_exec(move || {
                 let mut empty: libc::sigset_t = std::mem::zeroed();
@@ -68,7 +71,11 @@ impl Pty {
                 // before exec. Ignore failure: TIOCSCTTY already set pgrp.
                 let _ = libc::tcsetpgrp(0, libc::getpid());
                 close_extra_fds();
-                Ok(())
+                // Exec here rather than returning to std: std reports a
+                // failed exec through a pipe `close_extra_fds` just closed,
+                // and the child would abort. A missing program instead
+                // prints `diri: name: command not found` and exits 127.
+                plan.exec_or_exit()
             });
         }
 

@@ -212,6 +212,74 @@ impl PaneDensity {
     }
 }
 
+/// The terminal cursor's resting shape. A name this build does not know
+/// reads as a block.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CursorShapePref {
+    Bar,
+    Underline,
+    #[default]
+    #[serde(other)]
+    Block,
+}
+
+impl CursorShapePref {
+    pub const ALL: [Self; 3] = [Self::Block, Self::Bar, Self::Underline];
+
+    pub const fn shape(self) -> diri_proto::grid::CursorShape {
+        match self {
+            Self::Block => diri_proto::grid::CursorShape::Block,
+            Self::Bar => diri_proto::grid::CursorShape::Bar,
+            Self::Underline => diri_proto::grid::CursorShape::Underline,
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        crate::i18n::t(match self {
+            Self::Block => "cursor.shape.block",
+            Self::Bar => "cursor.shape.bar",
+            Self::Underline => "cursor.shape.underline",
+        })
+    }
+}
+
+/// How fast the terminal cursor blinks once the user stops typing. A name
+/// this build does not know reads as normal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CursorBlinkPref {
+    Off,
+    Slow,
+    Fast,
+    #[default]
+    #[serde(other)]
+    Normal,
+}
+
+impl CursorBlinkPref {
+    pub const ALL: [Self; 4] = [Self::Off, Self::Slow, Self::Normal, Self::Fast];
+
+    pub const fn rate(self) -> diri_term::cursor_motion::BlinkRate {
+        use diri_term::cursor_motion::BlinkRate;
+        match self {
+            Self::Off => BlinkRate::Off,
+            Self::Slow => BlinkRate::Slow,
+            Self::Normal => BlinkRate::Normal,
+            Self::Fast => BlinkRate::Fast,
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        crate::i18n::t(match self {
+            Self::Off => "cursor.blink.off",
+            Self::Slow => "cursor.blink.slow",
+            Self::Normal => "cursor.blink.normal",
+            Self::Fast => "cursor.blink.fast",
+        })
+    }
+}
+
 /// Where a new Agent opened from a project (⌘T, New Agent) starts. Stored
 /// per project; a missing entry, or a name this build does not know, is the
 /// current checkout, which is what every project did before the choice.
@@ -240,6 +308,27 @@ pub enum FileEditor {
     DefaultApp,
     /// The first of Cursor, VS Code and Zed that is installed, otherwise the
     /// file's default app. Last because serde's catch-all must be.
+    #[default]
+    #[serde(other)]
+    Automatic,
+}
+
+/// Which Option keys a terminal treats as Meta (`ESC` + key, readline's
+/// `M-b`) rather than as the key that types the layout's characters.
+/// Stored by name; an unknown name reads as `Automatic`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OptionAsMeta {
+    /// Left Option is Meta, right Option types characters.
+    Left,
+    /// Right Option is Meta, left Option types characters.
+    Right,
+    /// Both Option keys are Meta.
+    Both,
+    /// Neither: Option types the layout's characters.
+    Off,
+    /// Meta on US layouts, characters on layouts that need Option to type
+    /// ASCII. Last because serde's catch-all must be.
     #[default]
     #[serde(other)]
     Automatic,
@@ -412,6 +501,10 @@ fn terminal_follows_last_directory_default() -> bool {
     true
 }
 
+fn terminal_ligatures_default() -> bool {
+    true
+}
+
 /// A style this build does not know, written by a newer diri, reads as
 /// unset (the material decides) rather than failing the whole file.
 fn deserialize_interface_style<'de, D: Deserializer<'de>>(
@@ -452,6 +545,10 @@ pub struct Prefs {
     /// Read the relevant part of a finished turn's reply aloud (`crate::voice`).
     #[serde(default)]
     pub talk_with_agent: bool,
+    /// Agents name their session after the task (`name_session`). The Engine
+    /// and the MCP server read it as an Agent starts, under
+    /// [`diri_proto::session_naming::PREF_KEY`], so it reaches new sessions.
+    pub agents_name_sessions: bool,
     /// After a reading, start Wispr Flow's hands-free dictation for the
     /// session in front of the user.
     #[serde(default)]
@@ -520,17 +617,34 @@ pub struct Prefs {
     /// Row height as a multiple of the font's own line height.
     #[serde(default = "terminal_line_height_default")]
     pub terminal_line_height: f32,
+    /// Let the terminal font form its ligatures (`=>`, `!=`). On is the
+    /// font's own default, so files written before the field read as on.
+    #[serde(default = "terminal_ligatures_default")]
+    pub terminal_ligatures: bool,
     pub terminal_copy_on_select: bool,
     /// Open a terminal URL on a plain click. When off, links still open with
     /// Command- or Control-click.
     pub terminal_open_links_on_click: bool,
+    /// Link schemes other than the web's that open without asking
+    /// (`ssh`, `vscode`, …), added by "Always Open" on the ask sheet.
+    #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub terminal_trusted_link_schemes: std::collections::BTreeSet<String>,
     pub terminal_hide_pointer: bool,
+    /// The cursor a terminal draws until a program asks for another.
+    pub terminal_cursor_shape: CursorShapePref,
+    pub terminal_cursor_blink: CursorBlinkPref,
+    /// Let programs change the cursor's shape and blink (vim's bar in
+    /// insert mode). Off, every terminal keeps the shape above.
+    pub terminal_cursor_follows_programs: bool,
     /// Give new zsh and bash terminals Diri's OSC 133 prompt and command
     /// marks. The Engine applies it; the store pushes it on every change.
     pub terminal_shell_integration: bool,
     /// Where a clicked `file:line` reference in terminal output opens.
     #[serde(default)]
     pub terminal_file_editor: FileEditor,
+    /// Which Option keys are Meta in a terminal.
+    #[serde(default)]
+    pub terminal_option_as_meta: OptionAsMeta,
     /// Start a new terminal in the directory the last terminal was in,
     /// instead of its project's root. Missing files pick this up as on.
     #[serde(default = "terminal_follows_last_directory_default")]
@@ -636,6 +750,17 @@ pub struct Prefs {
     pub render_counters: bool,
 }
 
+impl Prefs {
+    /// The cursor preferences every terminal pane draws with.
+    pub fn cursor_preferences(&self) -> diri_term::cursor_motion::CursorPreferences {
+        diri_term::cursor_motion::CursorPreferences {
+            shape: self.terminal_cursor_shape.shape(),
+            blink: self.terminal_cursor_blink.rate(),
+            follow_program: self.terminal_cursor_follows_programs,
+        }
+    }
+}
+
 impl Default for Prefs {
     fn default() -> Self {
         Self {
@@ -647,6 +772,7 @@ impl Default for Prefs {
             status_sounds: true,
             status_notifications: true,
             talk_with_agent: false,
+            agents_name_sessions: true,
             talk_dictation: false,
             talk_voice: String::new(),
             talk_voice_command: String::new(),
@@ -667,11 +793,17 @@ impl Default for Prefs {
             terminal_font_size: 13.0,
             terminal_font_family: String::new(),
             terminal_line_height: terminal_line_height_default(),
+            terminal_ligatures: true,
             terminal_copy_on_select: false,
             terminal_open_links_on_click: true,
+            terminal_trusted_link_schemes: Default::default(),
             terminal_hide_pointer: true,
+            terminal_cursor_shape: CursorShapePref::Block,
+            terminal_cursor_blink: CursorBlinkPref::Normal,
+            terminal_cursor_follows_programs: true,
             terminal_shell_integration: true,
             terminal_file_editor: FileEditor::Automatic,
+            terminal_option_as_meta: OptionAsMeta::Automatic,
             terminal_follows_last_directory: true,
             terminal_paste_protection: false,
             window_material: WindowMaterial::Glass,
@@ -774,12 +906,10 @@ impl Prefs {
         let parent = path.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "preference path has no parent")
         })?;
-        fs::create_dir_all(parent)?;
+        diri_platform::private::create_dir_all(parent)?;
         let bytes = serde_json::to_vec_pretty(&normalized)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let temporary = path.with_extension("json.tmp");
-        fs::write(&temporary, bytes)?;
-        fs::rename(temporary, path)
+        diri_platform::private::replace_via(&path.with_extension("json.tmp"), path, bytes)
     }
 
     pub fn zoom_terminal(&mut self, delta: f32) {
@@ -903,6 +1033,18 @@ mod tests {
     use crate::launch_recipe::{LaunchRecipe, RecipeProject};
 
     #[test]
+    fn agent_session_names_default_on_and_are_read_where_the_engine_looks() {
+        let older: Prefs = serde_json::from_str("{}").unwrap();
+        assert!(older.agents_name_sessions);
+        let mut prefs = Prefs::default();
+        let written = serde_json::to_vec(&prefs).unwrap();
+        assert!(diri_proto::session_naming::enabled(&written));
+        prefs.agents_name_sessions = false;
+        let written = serde_json::to_vec(&prefs).unwrap();
+        assert!(!diri_proto::session_naming::enabled(&written));
+    }
+
+    #[test]
     fn files_from_before_interface_styles_keep_their_material() {
         let glass: Prefs = serde_json::from_str("{}").unwrap();
         assert_eq!(glass.interface_style(), InterfaceStyle::Blended);
@@ -940,6 +1082,34 @@ mod tests {
         assert_eq!(prefs.pane_density, PaneDensity::Comfortable);
         let prefs: Prefs = serde_json::from_str(r#"{"interfaceStyle":"neon"}"#).unwrap();
         assert_eq!(prefs.interface_style(), InterfaceStyle::Blended);
+    }
+
+    #[test]
+    fn cursor_preferences_default_to_the_shipped_cursor_and_round_trip() {
+        // A file written before the settings existed changes nothing.
+        let older: Prefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            older.cursor_preferences(),
+            diri_term::cursor_motion::CursorPreferences::default()
+        );
+        let prefs: Prefs = serde_json::from_str(
+            r#"{"terminalCursorShape":"bar","terminalCursorBlink":"off","terminalCursorFollowsPrograms":false}"#,
+        )
+        .unwrap();
+        let cursor = prefs.cursor_preferences();
+        assert_eq!(cursor.shape, diri_proto::grid::CursorShape::Bar);
+        assert_eq!(cursor.blink, diri_term::cursor_motion::BlinkRate::Off);
+        assert!(!cursor.follow_program);
+        let again: Prefs =
+            serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+        assert_eq!(again.cursor_preferences(), cursor);
+        // Names from a newer build fall back instead of failing the file.
+        let newer: Prefs = serde_json::from_str(
+            r#"{"terminalCursorShape":"hollow","terminalCursorBlink":"pulse"}"#,
+        )
+        .unwrap();
+        assert_eq!(newer.terminal_cursor_shape, CursorShapePref::Block);
+        assert_eq!(newer.terminal_cursor_blink, CursorBlinkPref::Normal);
     }
 
     #[test]
@@ -1007,6 +1177,29 @@ mod tests {
     }
 
     #[test]
+    fn option_as_meta_defaults_to_automatic_and_round_trips() {
+        let legacy: Prefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.terminal_option_as_meta, OptionAsMeta::Automatic);
+        let unknown: Prefs =
+            serde_json::from_str(r#"{"terminalOptionAsMeta":"middle"}"#).unwrap();
+        assert_eq!(unknown.terminal_option_as_meta, OptionAsMeta::Automatic);
+        for choice in [
+            OptionAsMeta::Left,
+            OptionAsMeta::Right,
+            OptionAsMeta::Both,
+            OptionAsMeta::Off,
+        ] {
+            let prefs = Prefs {
+                terminal_option_as_meta: choice,
+                ..Prefs::default()
+            };
+            let restored: Prefs =
+                serde_json::from_slice(&serde_json::to_vec(&prefs).unwrap()).unwrap();
+            assert_eq!(restored.terminal_option_as_meta, choice);
+        }
+    }
+
+    #[test]
     fn ui_language_persists_as_a_tag_and_unknown_tags_follow_the_system() {
         let legacy: Prefs = serde_json::from_str("{}").unwrap();
         assert_eq!(legacy.ui_language, UiLanguage::System);
@@ -1031,10 +1224,12 @@ mod tests {
         let legacy: Prefs = serde_json::from_str(r#"{"terminalFontSize":14}"#).unwrap();
         assert_eq!(legacy.terminal_font_family, "");
         assert_eq!(legacy.terminal_line_height, 1.0);
+        assert!(legacy.terminal_ligatures, "a file without the field keeps ligatures");
 
         let mut prefs = Prefs {
             terminal_font_family: "  JetBrains Mono ".to_owned(),
             terminal_line_height: 1.2999,
+            terminal_ligatures: false,
             ..legacy
         };
         prefs.normalize();
