@@ -136,7 +136,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 State::OscString
                 | State::SosPmApcString
                 | State::DcsIgnore
-                | State::DcsPassthrough => i += self.advance_string(performer, &bytes[i..]),
+                | State::DcsPassthrough => i += self.advance_string(performer, &bytes[i..], None),
                 State::CsiEntry | State::CsiParam => i += self.advance_csi(performer, &bytes[i..]),
                 _ => {
                     // Inlining it results in worse codegen.
@@ -163,6 +163,20 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         performer: &mut P,
         bytes: &[u8],
     ) -> usize {
+        self.advance_until_terminated_indexed(performer, bytes, None)
+    }
+
+    /// Diri patch: [`Self::advance_until_terminated`] with the read's
+    /// [`scan::C0Index`], so string bodies end where the index says instead
+    /// of being scanned again. The index must describe `bytes` exactly.
+    #[inline]
+    #[must_use = "Returned value should be used to processs the remaining bytes"]
+    pub fn advance_until_terminated_indexed<P: Perform>(
+        &mut self,
+        performer: &mut P,
+        bytes: &[u8],
+        index: Option<scan::C0Index<'_>>,
+    ) -> usize {
         let mut i = 0;
 
         // Handle partial codepoints from previous calls to `advance`.
@@ -176,7 +190,10 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 State::OscString
                 | State::SosPmApcString
                 | State::DcsIgnore
-                | State::DcsPassthrough => i += self.advance_string(performer, &bytes[i..]),
+                | State::DcsPassthrough => {
+                    let index = index.map(|index| index.offset(i));
+                    i += self.advance_string(performer, &bytes[i..], index)
+                },
                 State::CsiEntry | State::CsiParam => i += self.advance_csi(performer, &bytes[i..]),
                 _ => {
                     // Inlining it results in worse codegen.
@@ -199,19 +216,43 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     /// before. The result is identical to feeding every byte to
     /// `change_state`. Always consumes at least one byte.
     #[inline]
-    fn advance_string<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
+    fn advance_string<P: Perform>(
+        &mut self,
+        performer: &mut P,
+        bytes: &[u8],
+        index: Option<scan::C0Index<'_>>,
+    ) -> usize {
         let run = match self.state {
             // Everything but CAN, SUB and ESC is ignored (`anywhere`).
-            State::SosPmApcString | State::DcsIgnore => {
-                memchr::memchr3(0x18, 0x1A, 0x1B, bytes).unwrap_or(bytes.len())
+            State::SosPmApcString | State::DcsIgnore => match index {
+                Some(index) => index.next(bytes, 0, &[0x18, 0x1A, 0x1B]),
+                None => memchr::memchr3(0x18, 0x1A, 0x1B, bytes).unwrap_or(bytes.len()),
             },
             // C0 controls are ignored and `;` splits parameters; every other
             // byte, 0x7F and 0x80..=0xFF included, is stored.
             State::OscString => {
                 // The body up to the first C0 byte (a terminator, an abort or
                 // an ignored control) is stored as one run.
-                let stops = scan::Stops { below: 0x20, above: 0xFF, bytes: [0; 4] };
-                let run = scan::run(bytes, stops);
+                let run = match index {
+                    Some(index) => index.next(bytes, 0, &[]),
+                    None => {
+                        scan::run(bytes, scan::Stops { below: 0x20, above: 0xFF, bytes: [0; 4] })
+                    },
+                };
+                // A whole OSC in this read, nothing stored before it: it is
+                // dispatched from the read itself, with no copy.
+                #[cfg(feature = "std")]
+                {
+                    let end = bytes.get(run).copied().unwrap_or(0x20);
+                    if scan::STRING_ENDS.contains(&end)
+                        && self.osc_raw.is_empty()
+                        && !self.osc_overflowed
+                        && run <= MAX_OSC_RAW_STD
+                    {
+                        self.osc_finish_in_place(performer, &bytes[..run], end);
+                        return run + 1;
+                    }
+                }
                 if run != 0 {
                     self.action_osc_put_slice(&bytes[..run]);
                 }
@@ -720,6 +761,43 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 stored += 1;
             }
             self.osc_counts = Some((stored, separators));
+        }
+    }
+
+    /// Diri patch: `osc_end` and the terminator's transition for an OSC whose
+    /// whole body is `body`, in the caller's buffer, with nothing in
+    /// `osc_raw`. Dispatches what `osc_end` would after storing `body`.
+    #[cfg(feature = "std")]
+    fn osc_finish_in_place<P: Perform>(&mut self, performer: &mut P, body: &[u8], byte: u8) {
+        self.osc_counts = None;
+        let mut params: [&[u8]; MAX_OSC_PARAMS] = [&[]; MAX_OSC_PARAMS];
+        let mut count = 0;
+        let mut start = 0;
+        for separator in memchr::memchr_iter(b';', body) {
+            if count == MAX_OSC_PARAMS {
+                break;
+            }
+            params[count] = &body[start..separator];
+            count += 1;
+            start = separator + 1;
+        }
+        if count < MAX_OSC_PARAMS {
+            params[count] = &body[start..];
+            count += 1;
+        }
+        performer.osc_dispatch(&params[..count], byte == 0x07);
+        self.osc_num_params = 0;
+        // As `advance_osc_string` continues after `osc_end`.
+        match byte {
+            0x07 => self.state = State::Ground,
+            0x18 | 0x1A => {
+                performer.execute(byte);
+                self.state = State::Ground
+            },
+            _ => {
+                self.reset_params();
+                self.state = State::Escape
+            },
         }
     }
 
@@ -1540,17 +1618,42 @@ mod tests {
         Some(kept.split(|&byte| byte == b';').take(MAX_OSC_PARAMS).map(<[u8]>::to_vec).collect())
     }
 
+    /// Every dispatch for `stream` fed in reads of `chunks` sizes, with each
+    /// read's C0 index when `indexed`.
     #[cfg(feature = "std")]
-    fn osc_dispatches(stream: &[u8], chunks: &[usize]) -> Vec<Sequence> {
+    fn dispatches(stream: &[u8], chunks: &[usize], indexed: bool) -> (Vec<Sequence>, Parser) {
         let mut dispatcher = Dispatcher::default();
         let mut parser = Parser::new();
         let mut at = 0;
         let mut sizes = chunks.iter().cycle();
+        let mut positions = Vec::new();
         while at < stream.len() {
             let take = (*sizes.next().unwrap()).min(stream.len() - at);
-            parser.advance(&mut dispatcher, &stream[at..at + take]);
+            let read = &stream[at..at + take];
+            if indexed && scan::c0_positions(read, &mut positions, usize::MAX) {
+                let index = scan::C0Index::new(&positions);
+                let mut done = 0;
+                while done < read.len() {
+                    done += parser.advance_until_terminated_indexed(
+                        &mut dispatcher,
+                        &read[done..],
+                        Some(index.offset(done)),
+                    );
+                }
+            } else {
+                parser.advance(&mut dispatcher, read);
+            }
             at += take;
         }
+        (dispatcher.dispatched, parser)
+    }
+
+    #[cfg(feature = "std")]
+    fn osc_dispatches(stream: &[u8], chunks: &[usize]) -> Vec<Sequence> {
+        let (dispatched, parser) = dispatches(stream, chunks, false);
+        let (indexed, _) = dispatches(stream, chunks, true);
+        assert_eq!(indexed, dispatched, "with the C0 index");
+        let dispatcher = Dispatcher { dispatched };
         assert!(parser.osc_raw.len() <= MAX_OSC_RAW_STD + MAX_OSC_PARAMS);
         dispatcher.dispatched.into_iter().filter(|seq| matches!(seq, Sequence::Osc(..))).collect()
     }
@@ -1593,6 +1696,57 @@ mod tests {
                 (0..8).map(|_| 1 + next(if case % 2 == 0 { 5 } else { 400 })).collect();
             assert_eq!(osc_dispatches(&stream, &chunks), expected, "case {case}");
             assert_eq!(osc_dispatches(&stream, &[stream.len()]), expected, "case {case} whole");
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn indexed_parsing_dispatches_what_scanning_does() {
+        // Escapes of every kind, string bodies, controls, C1 and UTF-8, so
+        // every string state meets every terminator at every read boundary.
+        const PIECES: [&[u8]; 22] = [
+            b"\x1b]",
+            b"\x1b]0;title",
+            b"\x1b]8;;http://a\x1b\\",
+            b"\x1b_Gq=2;AAAA",
+            b"\x1bP+q",
+            b"\x1bP1$r",
+            b"\x1b^pm",
+            b"\x1bXsos",
+            b"\x1b[31m",
+            b"\x1b[?2026h",
+            b"\x1b[?2026l",
+            b"\x07",
+            b"\x18",
+            b"\x1a",
+            b"\x1b\\",
+            b"\x1b",
+            b"text;",
+            b"\n\r\t",
+            b"\x9c",
+            b"\xc3\xa9",
+            b"\x7f",
+            b"12;:",
+        ];
+        let mut state = 0x853c_49e6_748f_ea9bu64;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        for case in 0..2_000 {
+            let stream: Vec<u8> =
+                (0..next(60)).flat_map(|_| PIECES[next(PIECES.len())].iter().copied()).collect();
+            let chunks: Vec<usize> =
+                (0..6).map(|_| 1 + next(if case % 2 == 0 { 9 } else { 300 })).collect();
+            for chunks in [&chunks[..], &[stream.len().max(1)]] {
+                assert_eq!(
+                    dispatches(&stream, chunks, true).0,
+                    dispatches(&stream, chunks, false).0,
+                    "case {case} reads {chunks:?}"
+                );
+            }
         }
     }
 

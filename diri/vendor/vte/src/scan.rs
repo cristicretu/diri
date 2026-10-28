@@ -228,6 +228,80 @@ fn pair_vectors<const N: usize>(_bytes: &[u8], _first: u8, _second: [u8; N]) -> 
     0
 }
 
+/// Where every C0 byte (below 0x20) of one read lies: the only bytes that
+/// can end or abort a string body (BEL, CAN, SUB, ESC) or that an OSC drops.
+///
+/// Built once per read by [`c0_positions`] and shared by every layer that
+/// looks for string terminators, so the bytes between them are scanned once.
+/// Positions are relative to the start of the read; `base` places a slice of
+/// that read within it.
+#[derive(Clone, Copy, Debug)]
+pub struct C0Index<'a> {
+    positions: &'a [u32],
+    base: usize,
+}
+
+impl<'a> C0Index<'a> {
+    /// An index of a read, from [`c0_positions`].
+    pub fn new(positions: &'a [u32]) -> Self {
+        Self { positions, base: 0 }
+    }
+
+    /// The same index for the slice of the read that starts `offset` bytes
+    /// into the slice this one describes.
+    #[inline]
+    #[must_use]
+    pub fn offset(self, offset: usize) -> Self {
+        Self { positions: self.positions, base: self.base + offset }
+    }
+
+    /// The first C0 byte at or after `from` in `bytes` (the slice this index
+    /// describes) whose value is in `wanted`, or `bytes.len()`.
+    #[inline]
+    pub fn next(&self, bytes: &[u8], from: usize, wanted: &[u8]) -> usize {
+        let start = (self.base + from) as u64;
+        let end = (self.base + bytes.len()) as u64;
+        let first = self.positions.partition_point(|&at| u64::from(at) < start);
+        for &at in &self.positions[first..] {
+            if u64::from(at) >= end {
+                break;
+            }
+            let at = at as usize - self.base;
+            if wanted.is_empty() || wanted.contains(&bytes[at]) {
+                return at;
+            }
+        }
+        bytes.len()
+    }
+}
+
+/// Every C0 terminator of a string body.
+pub const STRING_ENDS: [u8; 4] = [0x07, 0x18, 0x1A, 0x1B];
+
+/// Fills `out` with the offset of every byte below 0x20 in `bytes`, in
+/// order. False, with `out` unusable, when there are more than `cap` of them
+/// (output dense in controls gains nothing from an index).
+#[cfg(feature = "std")]
+pub fn c0_positions(bytes: &[u8], out: &mut std::vec::Vec<u32>, cap: usize) -> bool {
+    out.clear();
+    if bytes.len() > u32::MAX as usize {
+        return false;
+    }
+    let stops = Stops { below: 0x20, above: 0xFF, bytes: [0; 4] };
+    let mut at = 0;
+    loop {
+        at += run(&bytes[at..], stops);
+        if at == bytes.len() {
+            return true;
+        }
+        if out.len() == cap {
+            return false;
+        }
+        out.push(at as u32);
+        at += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

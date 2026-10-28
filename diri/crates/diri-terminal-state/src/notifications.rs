@@ -4,6 +4,8 @@
 //! never rewrite the user's clipboard; reads are never answered.
 use std::collections::VecDeque;
 
+use alacritty_terminal::vte::scan::{C0Index, STRING_ENDS};
+
 /// Other OSC payloads stay small; a copied selection may be long.
 const OSC_PAYLOAD_LIMIT: usize = 8192;
 /// Base64 bytes of one OSC 52 write, about 768 KiB of copied text.
@@ -125,7 +127,15 @@ impl NotificationParser {
         self.pending.clear();
     }
 
+    #[cfg(test)]
     pub fn feed(&mut self, bytes: &[u8]) {
+        self.feed_indexed(bytes, None);
+    }
+
+    /// Scans one read. With the read's C0 index `c0` (which must describe
+    /// `bytes`), escapes and string terminators are found there instead of
+    /// by scanning; the result is the same.
+    pub fn feed_indexed(&mut self, bytes: &[u8], c0: Option<C0Index<'_>>) {
         // No copy or bytewise scan for the common plain-output case.
         let mut index = 0;
         while index < bytes.len() {
@@ -135,7 +145,26 @@ impl NotificationParser {
                 // state 0 (a CSI, say): skipping both bytes at once is what
                 // states 1 and 0 would do with them.
                 let rest = &bytes[index..];
-                match alacritty_terminal::vte::scan::find_pair(rest, 0x1b, STATE_1_LEADS) {
+                let found = match c0 {
+                    Some(c0) => {
+                        let mut from = index;
+                        loop {
+                            let at = c0.next(bytes, from, &[0x1b]);
+                            if at == bytes.len() {
+                                break None;
+                            }
+                            if bytes
+                                .get(at + 1)
+                                .is_some_and(|lead| STATE_1_LEADS.contains(lead))
+                            {
+                                break Some(at - index);
+                            }
+                            from = at + 1;
+                        }
+                    }
+                    None => alacritty_terminal::vte::scan::find_pair(rest, 0x1b, STATE_1_LEADS),
+                };
+                match found {
                     Some(offset) => index += offset,
                     // An escape that ends the read waits for its next byte.
                     None if rest.last() == Some(&0x1b) => index = bytes.len() - 1,
@@ -146,7 +175,10 @@ impl NotificationParser {
             // BEL, CAN, SUB or ESC is payload (state 2), counted (6) or
             // skipped (4).
             if matches!(self.state, 2 | 4 | 6) {
-                let run = plain_run(&bytes[index..]);
+                let run = match c0 {
+                    Some(c0) => c0.next(bytes, index, &STRING_ENDS) - index,
+                    None => plain_run(&bytes[index..]),
+                };
                 if run != 0 {
                     match self.state {
                         2 => self.push_payload(&bytes[index..index + run]),
@@ -562,19 +594,33 @@ mod tests {
             let mut oracle = NotificationParser::default();
             oracle.feed_bytewise(&stream);
             let mut parser = NotificationParser::default();
+            let mut indexed = NotificationParser::default();
+            let mut positions = Vec::new();
             let mut at = 0;
             while at < stream.len() {
                 let take =
                     (1 + next(if case % 3 == 0 { 7 } else { 20_000 })).min(stream.len() - at);
-                parser.feed(&stream[at..at + take]);
+                let read = &stream[at..at + take];
+                parser.feed(read);
+                let complete =
+                    alacritty_terminal::vte::scan::c0_positions(read, &mut positions, usize::MAX);
+                assert!(complete);
+                indexed.feed_indexed(read, Some(C0Index::new(&positions)));
                 at += take;
             }
             assert_eq!(parser.observed(), oracle.observed(), "case {case}");
+            assert_eq!(indexed.observed(), oracle.observed(), "case {case} indexed");
             // Whatever state the stream ended in carries on the same.
             let tail = b"x\x1b\\\x07\x1b]9;tail\x07";
             oracle.feed_bytewise(tail);
             parser.feed(tail);
+            indexed.feed(tail);
             assert_eq!(parser.observed(), oracle.observed(), "case {case} tail");
+            assert_eq!(
+                indexed.observed(),
+                oracle.observed(),
+                "case {case} indexed tail"
+            );
         }
     }
     #[test]

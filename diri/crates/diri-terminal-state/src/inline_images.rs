@@ -33,6 +33,7 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Hyperlink};
 use alacritty_terminal::vte::ansi::Handler;
+use alacritty_terminal::vte::scan::C0Index;
 use diri_proto::inline_image::{ImageAnchor, InlineImageFormat, MAX_IMAGE_BYTES};
 
 use crate::HeadlessScreen;
@@ -256,16 +257,20 @@ impl HeadlessScreen {
         bytes: &[u8],
         historical_bytes: usize,
         csi_only: bool,
+        index: Option<C0Index<'_>>,
     ) {
         let Some(images) = self.images.as_mut() else {
-            self.parser.advance(&mut self.term, bytes);
+            self.advance_parser(bytes, index);
             return;
         };
         // Fast path: nothing pending and nothing that could start a sequence.
         if images.held.is_empty() && images.collecting.is_none() && csi_only {
-            self.parser.advance(&mut self.term, bytes);
+            self.advance_parser(bytes, index);
             return;
         }
+        // The index describes this read; bytes held from the last one shift
+        // it, so a joined input is scanned instead.
+        let index = index.filter(|_| images.held.is_empty());
         let held = std::mem::take(&mut images.held);
         let joined;
         let (input, historical) = if held.is_empty() {
@@ -283,7 +288,11 @@ impl HeadlessScreen {
         while position < input.len() {
             let images = self.images.as_mut().expect("images");
             if let Some(collecting) = images.collecting.as_mut() {
-                match collect(collecting, &input[position..]) {
+                match collect(
+                    collecting,
+                    &input[position..],
+                    index.map(|index| index.offset(position)),
+                ) {
                     Collected::Complete(consumed) => {
                         position += consumed;
                         let collecting = images.collecting.take().expect("collecting");
@@ -299,21 +308,20 @@ impl HeadlessScreen {
                 }
                 continue;
             }
-            match next_sequence(&input[position..]) {
+            let here = index.map(|index| index.offset(position));
+            match next_sequence(&input[position..], here) {
                 Next::None => {
-                    self.parser.advance(&mut self.term, &input[position..]);
+                    self.advance_parser(&input[position..], here);
                     position = input.len();
                 }
                 Next::Partial(start) => {
-                    self.parser
-                        .advance(&mut self.term, &input[position..position + start]);
+                    self.advance_parser(&input[position..position + start], here);
                     let images = self.images.as_mut().expect("images");
                     images.held.extend_from_slice(&input[position + start..]);
                     position = input.len();
                 }
                 Next::Found(start, prefix) => {
-                    self.parser
-                        .advance(&mut self.term, &input[position..position + start]);
+                    self.advance_parser(&input[position..position + start], here);
                     position += start + prefix.len();
                     let kind = if prefix == KITTY_PREFIX {
                         SequenceKind::Kitty
@@ -328,6 +336,15 @@ impl HeadlessScreen {
                     });
                 }
             }
+        }
+    }
+
+    /// Hands bytes to the emulator's parser, with their part of the read's
+    /// C0 index when there is one.
+    fn advance_parser(&mut self, bytes: &[u8], index: Option<C0Index<'_>>) {
+        match index {
+            Some(index) => self.parser.advance_indexed(&mut self.term, bytes, index),
+            None => self.parser.advance(&mut self.term, bytes),
         }
     }
 
@@ -1223,13 +1240,28 @@ enum Next {
     Partial(usize),
 }
 
-fn next_sequence(input: &[u8]) -> Next {
-    // One pass for both openers: every `ESC ]` or `ESC _` is a candidate.
+fn next_sequence(input: &[u8], index: Option<C0Index<'_>>) -> Next {
+    // One pass for both openers: every `ESC ]` or `ESC _` is a candidate. With
+    // the read's index, only its escapes are looked at.
+    let next_opener = |from: usize| match index {
+        Some(index) => {
+            let mut from = from;
+            loop {
+                let at = index.next(input, from, &[0x1b]);
+                if at == input.len() {
+                    return None;
+                }
+                if matches!(input.get(at + 1), Some(b']' | b'_')) {
+                    return Some(at);
+                }
+                from = at + 1;
+            }
+        }
+        None => alacritty_terminal::vte::scan::find_pair(&input[from..], 0x1b, [b']', b'_'])
+            .map(|at| from + at),
+    };
     let mut from = 0;
-    while let Some(at) =
-        alacritty_terminal::vte::scan::find_pair(&input[from..], 0x1b, [b']', b'_'])
-    {
-        let start = from + at;
+    while let Some(start) = next_opener(from) {
         if let Some(prefix) = PREFIXES
             .iter()
             .find(|prefix| input[start..].starts_with(prefix))
@@ -1258,7 +1290,7 @@ enum Collected {
 }
 
 /// Appends body bytes up to a terminator (BEL or ST).
-fn collect(collecting: &mut Collecting, input: &[u8]) -> Collected {
+fn collect(collecting: &mut Collecting, input: &[u8], index: Option<C0Index<'_>>) -> Collected {
     if collecting.pending_esc {
         collecting.pending_esc = false;
         if input.first() == Some(&b'\\') {
@@ -1268,7 +1300,11 @@ fn collect(collecting: &mut Collecting, input: &[u8]) -> Collected {
         // parser, but so it is in a real terminal's string state.
         return Collected::Aborted(0);
     }
-    let Some(at) = memchr::memchr2(0x07, 0x1b, input) else {
+    let at = match index {
+        Some(index) => Some(index.next(input, 0, &[0x07, 0x1b])).filter(|&at| at < input.len()),
+        None => memchr::memchr2(0x07, 0x1b, input),
+    };
+    let Some(at) = at else {
         push_body(collecting, input);
         return Collected::Partial;
     };

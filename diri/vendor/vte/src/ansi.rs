@@ -356,6 +356,32 @@ impl<T: Timeout> Processor<T> {
         }
     }
 
+    /// Diri patch: [`Self::advance`] with the read's [`crate::scan::C0Index`],
+    /// which must describe `bytes` exactly. String bodies end where the index
+    /// says; bytes held for a synchronized update are parsed without it.
+    pub fn advance_indexed<H>(
+        &mut self,
+        handler: &mut H,
+        bytes: &[u8],
+        index: crate::scan::C0Index<'_>,
+    ) where
+        H: Handler,
+    {
+        let mut processed = 0;
+        while processed != bytes.len() {
+            if self.state.sync_state.timeout.pending_timeout() {
+                processed += self.advance_sync(handler, &bytes[processed..]);
+            } else {
+                let mut performer = Performer::new(&mut self.state, handler);
+                processed += self.parser.advance_until_terminated_indexed(
+                    &mut performer,
+                    &bytes[processed..],
+                    Some(index.offset(processed)),
+                );
+            }
+        }
+    }
+
     /// End a synchronized update.
     pub fn stop_sync<H>(&mut self, handler: &mut H)
     where

@@ -170,3 +170,26 @@ the per-byte storage), `the_osc_limit_counts_body_bytes_not_separators`
 300,000 separators), and `scan`'s vector-against-byte-loop tests. Diri's
 `chunking_differential` tests compare one-shot, byte-at-a-time and every
 split offset.
+
+## One C0 index per read, and OSCs dispatched in place
+
+`scan::c0_positions` lists the offsets of every byte below 0x20 in a read,
+and `scan::C0Index` answers "the next C0 byte (of these values) from here".
+Diri builds one per read that contains string sequences (capped at 4,096
+entries, beyond which every layer scans as before). The progress, notification
+and image scanners and this parser then all find string terminators there, so
+an OSC or APC body is scanned once per read instead of once per layer.
+`Processor::advance_indexed` and `Parser::advance_until_terminated_indexed`
+take the index; string states end their runs where it says. Bytes held for a
+synchronized update are parsed without it.
+
+With `std`, an OSC that starts with nothing stored and ends in the same read
+is dispatched straight from the read: its parameters are slices of the
+caller's buffer, split at the first 16 separators exactly as `osc_end` splits
+`osc_raw`, and the terminator then does what `advance_osc_string` does after
+`osc_end`. Bodies over the 2 MiB limit, and OSCs that span reads, are stored
+as before.
+
+Tests: `indexed_parsing_dispatches_what_scanning_does` (2,000 random soups of
+every escape kind, string bodies, controls, C1 and UTF-8, in small and whole
+reads, with and without the index); the OSC oracle tests also run indexed.
