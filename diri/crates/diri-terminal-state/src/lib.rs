@@ -25,7 +25,7 @@ pub use program_status::{
     QUERY_REPLY as PROGRAM_STATUS_QUERY_REPLY,
 };
 
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::Dimensions;
@@ -426,17 +426,51 @@ impl Dimensions for Geometry {
     }
 }
 
-/// Collects the events the emulator emits. Only the title is interesting.
+/// Collects the events the emulator emits while it parses one read.
+///
+/// The title and the answers owed to the program must survive however much
+/// output one read carries: a bounded queue that drops when full lost the
+/// title a program set after a few dozen bells or mode toggles in the same
+/// read, and the replies to queries past the bound, so the final state
+/// depended on where reads happened to split. Events nothing reads (bells,
+/// mouse-cursor and blink notices) are not kept at all, the title keeps only
+/// its latest value, and replies are bounded by [`MAX_PENDING_EVENTS`] per
+/// parse, a backstop that no program answering its own queries reaches.
 #[derive(Clone)]
-struct Collector(SyncSender<Event>);
+struct Collector(Arc<Mutex<Inbox>>);
 
-const EVENT_QUEUE_CAPACITY: usize = 64;
+#[derive(Default)]
+struct Inbox {
+    /// The last title change since the previous drain.
+    title: Option<Event>,
+    /// Everything else that is answered, in order.
+    events: Vec<Event>,
+}
+
+/// Reply-producing events kept per drain; beyond it a flood of queries in
+/// one read goes unanswered rather than growing without bound.
+const MAX_PENDING_EVENTS: usize = 1 << 16;
 
 impl EventListener for Collector {
     fn send_event(&self, event: Event) {
-        // A full channel means nobody is draining it, which is not worth
-        // failing a session over.
-        let _ = self.0.try_send(event);
+        match event {
+            Event::Title(_) | Event::ResetTitle => {
+                self.0.lock().expect("terminal events").title = Some(event);
+            }
+            Event::PtyWrite(_)
+            | Event::TextAreaSizeRequest(_)
+            | Event::CellSizeRequest(_)
+            | Event::ColorRequest(..)
+            | Event::ColorSchemeRequest
+            | Event::InBandResize => {
+                let mut inbox = self.0.lock().expect("terminal events");
+                if inbox.events.len() < MAX_PENDING_EVENTS {
+                    inbox.events.push(event);
+                }
+            }
+            // Bells, mouse-cursor, blink and other notices: nothing reads them.
+            _ => {}
+        }
     }
 }
 
@@ -449,7 +483,9 @@ pub struct HeadlessScreen {
     keyboard_enhancements_known: bool,
     term: Term<Collector>,
     parser: Processor,
-    events: Receiver<Event>,
+    events: Arc<Mutex<Inbox>>,
+    /// Drained events, kept to reuse the allocation.
+    drained_events: Vec<Event>,
     geometry: Geometry,
 
     title: Option<String>,
@@ -555,14 +591,14 @@ impl HeadlessScreen {
             cols: cols.max(1),
             rows: rows.max(1),
         };
-        let (sender, events) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+        let events = Arc::new(Mutex::new(Inbox::default()));
         let config = Config {
             kitty_keyboard,
             scrolling_history: history_line_limit(geometry.cols),
             default_cursor_style: DEFAULT_CURSOR,
             ..Config::default()
         };
-        let term = Term::new(config, &geometry, Collector(sender));
+        let term = Term::new(config, &geometry, Collector(Arc::clone(&events)));
         #[cfg(feature = "compact-history")]
         let term = {
             let mut term = term;
@@ -574,6 +610,7 @@ impl HeadlessScreen {
             term,
             parser: Processor::new(),
             events,
+            drained_events: Vec::new(),
             geometry,
             title: None,
             progress_state: None,
@@ -2223,7 +2260,13 @@ impl HeadlessScreen {
     }
 
     fn drain_events(&mut self) {
-        while let Ok(event) = self.events.try_recv() {
+        let mut drained = std::mem::take(&mut self.drained_events);
+        let title = {
+            let mut inbox = self.events.lock().expect("terminal events");
+            std::mem::swap(&mut inbox.events, &mut drained);
+            inbox.title.take()
+        };
+        for event in title.into_iter().chain(drained.drain(..)) {
             match event {
                 Event::Title(title) => {
                     let title = Some(title);
@@ -2298,6 +2341,7 @@ impl HeadlessScreen {
                 _ => {}
             }
         }
+        self.drained_events = drained;
     }
 
     /// Takes the answers owed to the child. The pump writes these to the PTY
