@@ -1,4 +1,5 @@
 {
+  "agent_notice.app_action": "Run an app action",
   "agent_notice.change_workspaces": "Edit workspaces",
   "agent_notice.close_pane": "Close pane",
   "agent_notice.close_tab": "Close tab",

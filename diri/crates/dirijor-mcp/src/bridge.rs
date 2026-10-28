@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use crate::control::{ControlClient, ControlFailure, default_socket_path};
 use crate::tools::{ToolDefinition, tool_definitions_for};
 
+mod actions;
 mod api;
 #[cfg(test)]
 mod audit_tests;
@@ -150,6 +151,8 @@ impl Bridge {
             "browser" => self.browser(arguments),
             "computer" => self.computer(arguments),
             "open_api_request" => self.open_api_request(arguments),
+            "list_actions" => self.list_actions(arguments),
+            "perform_action" => self.perform_action(arguments),
             "quick_open_include" => self.quick_open_include(arguments),
             "whoami" => self.whoami(),
             crate::tools::NAME_SESSION_TOOL => self.name_session(arguments),

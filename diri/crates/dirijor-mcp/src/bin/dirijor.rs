@@ -1,5 +1,7 @@
 #[path = "dirijor/completion.rs"]
 mod completion;
+#[path = "dirijor/api.rs"]
+mod api;
 #[path = "dirijor/notes.rs"]
 mod notes;
 #[path = "dirijor/organization.rs"]
@@ -114,6 +116,9 @@ fn run(arguments: &[String]) -> Result<(), CliError> {
         "ports" => ports(arguments.get(1..).unwrap_or_default()),
         "note" | "notes" => notes::run(arguments.get(1..).unwrap_or_default()),
         "doctor" => doctor(),
+        "actions" => api::actions(arguments.get(1..).unwrap_or_default()),
+        "do" => api::perform(arguments.get(1..).unwrap_or_default()),
+        "api" => api::api(arguments.get(1..).unwrap_or_default()),
         "forward" => Err(CliError::failure(
             "companion TCP forwarding is not part of the Rust Engine",
         )),
@@ -142,8 +147,10 @@ fn print_help() {
          Resets the emulator (screen, history, modes, title) without touching the process.\n\n\
          Deferred on Linux: companion forwarding (dirijor forward).\n\n\
          {}\n\n\
+         {}\n\n\
          Notes (Markdown files; new notes appear in the sidebar when Diri is running):\n  {}",
         script::HELP,
+        api::HELP,
         notes::HELP
     );
 }
