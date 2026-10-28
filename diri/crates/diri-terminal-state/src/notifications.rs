@@ -19,6 +19,9 @@ pub struct TerminalNotification {
 pub(crate) struct NotificationParser {
     state: u8,
     payload: Vec<u8>,
+    /// State 6: the length the payload of an OSC [`finish`](Self::finish)
+    /// ignores would have, kept only to apply the same limit.
+    skipped: usize,
     pending: VecDeque<(String, TerminalNotification)>,
     pub ready: VecDeque<TerminalNotification>,
     /// Base64 payload of the newest OSC 52 clipboard write. Later writes
@@ -83,6 +86,32 @@ impl ShellPhase {
 /// it is only honoured in live output, never in replayed history.
 pub const AGENT_EXIT_OSC: &str = "6973;agent-exit;";
 
+/// Every payload prefix [`NotificationParser::finish`] acts on. Any other
+/// payload finishes to nothing.
+const PREFIXES: [&str; 8] = [
+    AGENT_EXIT_OSC,
+    "133;",
+    "7;",
+    crate::program_status::PREFIX,
+    "52;",
+    "9;",
+    "777;notify;",
+    "99;",
+];
+/// The bytes after `ESC` that state 1 does not answer with state 0.
+const STATE_1_LEADS: [u8; 7] = [b']', b'P', b'_', b'^', b'X', b'c', 0x1b];
+
+const MAX_PREFIX_BYTES: usize = AGENT_EXIT_OSC.len();
+
+/// Whether a payload so far starts with, or may yet grow into, a prefix
+/// [`NotificationParser::finish`] acts on.
+fn may_matter(payload: &[u8]) -> bool {
+    PREFIXES.iter().any(|prefix| {
+        let prefix = prefix.as_bytes();
+        prefix.starts_with(payload) || payload.starts_with(prefix)
+    })
+}
+
 impl NotificationParser {
     pub fn reset_sequence(&mut self) {
         self.state = 0;
@@ -95,11 +124,32 @@ impl NotificationParser {
         let mut index = 0;
         while index < bytes.len() {
             if self.state == 0 {
-                // Plain output between escapes cannot start an OSC.
-                let Some(offset) = memchr::memchr(0x1b, &bytes[index..]) else {
-                    return;
-                };
-                index += offset;
+                // Plain output between escapes cannot start an OSC. Nor can
+                // an escape whose next byte state 1 maps straight back to
+                // state 0 (a CSI, say): skipping both bytes at once is what
+                // states 1 and 0 would do with them.
+                let rest = &bytes[index..];
+                match alacritty_terminal::vte::scan::find_pair(rest, 0x1b, STATE_1_LEADS) {
+                    Some(offset) => index += offset,
+                    // An escape that ends the read waits for its next byte.
+                    None if rest.last() == Some(&0x1b) => index = bytes.len() - 1,
+                    None => return,
+                }
+            }
+            // String bodies go a run at a time: everything up to the next
+            // BEL, CAN, SUB or ESC is payload (state 2), counted (6) or
+            // skipped (4).
+            if matches!(self.state, 2 | 4 | 6) {
+                let run = plain_run(&bytes[index..]);
+                if run != 0 {
+                    match self.state {
+                        2 => self.push_payload(&bytes[index..index + run]),
+                        6 => self.skip_payload(run),
+                        _ => {}
+                    }
+                    index += run;
+                    continue;
+                }
             }
             let byte = bytes[index];
             index += 1;
@@ -135,11 +185,14 @@ impl NotificationParser {
                         self.payload.clear();
                         self.state = 0;
                     }
-                    _ if self.payload.len() < self.payload_limit() => self.payload.push(byte),
-                    _ => {
-                        self.payload.clear();
-                        self.state = 4;
-                    }
+                    _ => self.push_payload(&[byte]),
+                },
+                // An OSC `finish` ignores: it ends, aborts and overflows as
+                // state 2 does, and its (empty) payload finishes to nothing.
+                6 => match byte {
+                    7 | 0x18 | 0x1a => self.state = 0,
+                    0x1b => self.state = 3,
+                    _ => self.skip_payload(1),
                 },
                 3 => {
                     if byte == b'\\' {
@@ -166,6 +219,55 @@ impl NotificationParser {
                 }
                 _ => unreachable!(),
             }
+        }
+    }
+
+    /// Appends OSC body bytes exactly as pushing them one at a time would:
+    /// a byte that arrives with the payload at its limit drops the payload
+    /// and skips the rest of the sequence.
+    ///
+    /// A payload that can no longer start with a prefix [`finish`](Self::finish)
+    /// acts on is not stored: the sequence moves to state 6, which only
+    /// counts its length (a long OSC another feature owns is never copied).
+    fn push_payload(&mut self, mut run: &[u8]) {
+        // The limit depends on the first three bytes (`52;` is a clipboard
+        // write) and the prefix decides whether the payload matters, so the
+        // bytes that could decide either go one at a time.
+        while self.payload.len() < MAX_PREFIX_BYTES {
+            let Some((&byte, rest)) = run.split_first() else {
+                return;
+            };
+            if self.payload.len() >= self.payload_limit() {
+                self.payload.clear();
+                self.state = 4;
+                return;
+            }
+            self.payload.push(byte);
+            run = rest;
+            if !may_matter(&self.payload) {
+                self.skipped = self.payload.len();
+                self.payload.clear();
+                self.state = 6;
+                self.skip_payload(run.len());
+                return;
+            }
+        }
+        let room = self.payload_limit().saturating_sub(self.payload.len());
+        if run.len() > room {
+            self.payload.clear();
+            self.state = 4;
+        } else {
+            self.payload.extend_from_slice(run);
+        }
+    }
+
+    /// [`push_payload`](Self::push_payload) for a payload that is not kept:
+    /// only the limit (an ignored payload never starts `52;`) applies.
+    fn skip_payload(&mut self, run: usize) {
+        if self.skipped + run > OSC_PAYLOAD_LIMIT {
+            self.state = 4;
+        } else {
+            self.skipped += run;
         }
     }
 
@@ -287,9 +389,153 @@ fn clean(text: &str, max: usize) -> String {
         .collect()
 }
 
+/// The length of the leading run of bytes that neither end nor abort a
+/// string: anything but BEL, CAN, SUB and ESC.
+#[inline]
+fn plain_run(bytes: &[u8]) -> usize {
+    use alacritty_terminal::vte::scan::{Stops, run};
+    run(
+        bytes,
+        Stops {
+            below: 0,
+            above: 0xff,
+            bytes: [0x07, 0x18, 0x1a, 0x1b],
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl NotificationParser {
+        /// The byte-at-a-time state machine the run-based `feed` replaced,
+        /// kept as the oracle.
+        fn feed_bytewise(&mut self, bytes: &[u8]) {
+            for &byte in bytes {
+                match self.state {
+                    0 => {
+                        if byte == 0x1b {
+                            self.state = 1;
+                        }
+                    }
+                    1 => {
+                        if byte == b'c' {
+                            self.shell = ShellPhase::Unknown;
+                            self.program
+                                .end_program(crate::program_status::ProgramRemoval::Reset);
+                        }
+                        self.state = match byte {
+                            b']' => 2,
+                            b'P' | b'_' | b'^' | b'X' => 4,
+                            0x1b => 1,
+                            _ => 0,
+                        };
+                        self.payload.clear();
+                    }
+                    2 => match byte {
+                        7 => {
+                            self.finish();
+                            self.state = 0;
+                        }
+                        0x1b => self.state = 3,
+                        0x18 | 0x1a => {
+                            self.payload.clear();
+                            self.state = 0;
+                        }
+                        _ if self.payload.len() < self.payload_limit() => self.payload.push(byte),
+                        _ => {
+                            self.payload.clear();
+                            self.state = 4;
+                        }
+                    },
+                    3 => {
+                        if byte == b'\\' {
+                            self.finish();
+                            self.state = 0;
+                        } else {
+                            self.payload.clear();
+                            self.state = if byte == 0x1b { 1 } else { 0 };
+                        }
+                    }
+                    4 => match byte {
+                        7 | 0x18 | 0x1a => self.state = 0,
+                        0x1b => self.state = 5,
+                        _ => {}
+                    },
+                    5 => {
+                        self.state = if byte == b'\\' {
+                            0
+                        } else if byte == 0x1b {
+                            5
+                        } else {
+                            4
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+
+        fn observed(&self) -> String {
+            format!(
+                "{:?} {:?} {:?} {:?} {:?} {:?} {:?}",
+                self.ready,
+                self.pending,
+                self.clipboard,
+                self.agent_exit,
+                self.shell,
+                self.replies,
+                self.program,
+            )
+        }
+    }
+
+    #[test]
+    fn run_based_scanning_equals_the_bytewise_state_machine() {
+        let long_x = "x".repeat(9_000);
+        let long_b64 = "QUJD".repeat(300_000);
+        let pieces: Vec<&[u8]> = vec![
+            b"\x1b]", b"\x1b\\", b"\x07", b"\x18", b"\x1a", b"\x1b", b"\x1b_", b"\x1bP",
+            b"\x1bc", b"\x1b[", b"\x1b^", b"\x1bX", b"\x1b7", b"\x1b\x1b", b"\x1b]133;D\x07", b"9;", b"9;4;", b"777;notify;", b"99;i=1:d=0;", b"99;p=body;",
+            b"52;c;", b"6973;agent-exit;", b"133;A", b"133;C", b"7;", b"7501;", b"6;", b"5",
+            b"1337;", b"hello", b";", b"0", b"12", b"\xc3\xa9", b"\xff", b"\x9c", b"\n",
+            long_x.as_bytes(), long_b64.as_bytes(),
+        ];
+        let mut state = 0x853c_49e6_748f_ea9bu64;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        for case in 0..3_000 {
+            let mut stream = Vec::new();
+            for _ in 0..next(40) {
+                let piece = pieces[next(pieces.len())];
+                // The two long pieces are rare.
+                if piece.len() > 100 && next(8) != 0 {
+                    continue;
+                }
+                stream.extend_from_slice(piece);
+            }
+            let mut oracle = NotificationParser::default();
+            oracle.feed_bytewise(&stream);
+            let mut parser = NotificationParser::default();
+            let mut at = 0;
+            while at < stream.len() {
+                let take = (1 + next(if case % 3 == 0 { 7 } else { 20_000 })).min(stream.len() - at);
+                parser.feed(&stream[at..at + take]);
+                at += take;
+            }
+            assert_eq!(parser.observed(), oracle.observed(), "case {case}");
+            // Whatever state the stream ended in carries on the same.
+            let tail = b"x\x1b\\\x07\x1b]9;tail\x07";
+            oracle.feed_bytewise(tail);
+            parser.feed(tail);
+            assert_eq!(parser.observed(), oracle.observed(), "case {case} tail");
+        }
+    }
     #[test]
     fn a_replay_boundary_inside_a_read_delivers_only_complete_live_notifications() {
         let mut screen = crate::HeadlessScreen::new(80, 24).with_notifications();

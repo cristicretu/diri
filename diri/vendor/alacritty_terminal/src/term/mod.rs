@@ -1409,7 +1409,17 @@ impl<T: EventListener> Handler for Term<T> {
                 cell.fg = template.fg;
                 cell.bg = template.bg;
                 cell.flags = template.flags | (cell.flags & Flags::SHELL_MARKS);
-                cell.extra = template.extra.clone();
+                // Rewriting a cell that already shares the template's extra
+                // (a repeated character, a redrawn row) skips the atomic
+                // reference-count round trip.
+                let same_extra = match (&cell.extra, &template.extra) {
+                    (None, None) => true,
+                    (Some(cell), Some(template)) => Arc::ptr_eq(cell, template),
+                    _ => false,
+                };
+                if !same_extra {
+                    cell.extra = template.extra.clone();
+                }
             }
             index += count;
             if end.0 < columns {

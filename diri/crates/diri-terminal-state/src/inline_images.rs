@@ -60,12 +60,6 @@ pub const DEFAULT_CELL_PIXELS: (u16, u16) = (16, 34);
 const KITTY_PREFIX: &[u8] = b"\x1b_G";
 const ITERM_PREFIX: &[u8] = b"\x1b]1337;";
 const PREFIXES: [&[u8]; 2] = [KITTY_PREFIX, ITERM_PREFIX];
-/// Both openers are two-byte pairs no other output uses, so a SIMD pair
-/// search skips the escapes of ordinary colored and cursor-addressed output
-/// instead of stopping at each one.
-static FINDERS: std::sync::LazyLock<[memchr::memmem::Finder<'static>; 2]> =
-    std::sync::LazyLock::new(|| PREFIXES.map(memchr::memmem::Finder::new));
-
 /// One stored image. Cloning shares the bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredImage {
@@ -1169,13 +1163,18 @@ enum Next {
 }
 
 fn next_sequence(input: &[u8]) -> Next {
-    let found = PREFIXES
-        .iter()
-        .zip(FINDERS.iter())
-        .filter_map(|(prefix, finder)| finder.find(input).map(|start| (start, *prefix)))
-        .min_by_key(|(start, _)| *start);
-    if let Some((start, prefix)) = found {
-        return Next::Found(start, prefix);
+    // One pass for both openers: every `ESC ]` or `ESC _` is a candidate.
+    let mut from = 0;
+    while let Some(at) = alacritty_terminal::vte::scan::find_pair(&input[from..], 0x1b, [b']', b'_'])
+    {
+        let start = from + at;
+        if let Some(prefix) = PREFIXES
+            .iter()
+            .find(|prefix| input[start..].starts_with(prefix))
+        {
+            return Next::Found(start, prefix);
+        }
+        from = start + 1;
     }
     // The input may end inside an opener: hold the longest such tail.
     (1..ITERM_PREFIX.len())
@@ -1241,28 +1240,55 @@ fn push_body(collecting: &mut Collecting, bytes: &[u8]) {
 
 /// Forgiving standard base64: padding optional, whitespace skipped, chunks
 /// may be concatenated. False on any other byte or if `limit` is exceeded.
+///
+/// Runs of eight plain alphabet characters decode as one 48-bit group; padding,
+/// whitespace, invalid bytes and the output limit take the byte-by-byte path,
+/// which decides exactly as it always has.
 fn decode_base64_into(input: &[u8], output: &mut Vec<u8>, limit: usize) -> bool {
-    fn value(byte: u8) -> Option<u32> {
-        Some(match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'+' | b'-' => 62,
-            b'/' | b'_' => 63,
-            _ => return None,
-        } as u32)
-    }
     output.reserve((input.len() / 4 * 3).min(limit.saturating_sub(output.len())));
     let mut accumulator = 0u32;
     let mut bits = 0u32;
-    for &byte in input {
+    let mut index = 0;
+    while index < input.len() {
+        // 64 characters at a time with vectors, then eight at a time.
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        if bits == 0
+            && let Some(block) = input.get(index..index + 64)
+            && output.len() + 48 <= limit
+            && let Some(decoded) = decode_base64_block(block)
+        {
+            output.extend_from_slice(&decoded);
+            index += 64;
+            continue;
+        }
+        // Whole groups only start on a byte boundary of the output.
+        if bits == 0
+            && let Some(group) = input.get(index..index + 8)
+            && output.len() + 6 <= limit
+        {
+            let mut word = 0u64;
+            let mut invalid = 0u8;
+            for &byte in group {
+                let value = BASE64[usize::from(byte)];
+                invalid |= value;
+                word = (word << 6) | u64::from(value & 0x3f);
+            }
+            if invalid & 0x80 == 0 {
+                output.extend_from_slice(&word.to_be_bytes()[2..]);
+                index += 8;
+                continue;
+            }
+        }
+        let byte = input[index];
+        index += 1;
         if byte == b'=' || byte.is_ascii_whitespace() {
             continue;
         }
-        let Some(value) = value(byte) else {
+        let value = BASE64[usize::from(byte)];
+        if value & 0x80 != 0 {
             return false;
-        };
-        accumulator = (accumulator << 6) | value;
+        }
+        accumulator = (accumulator << 6) | u32::from(value);
         bits += 6;
         if bits >= 8 {
             bits -= 8;
@@ -1275,6 +1301,75 @@ fn decode_base64_into(input: &[u8], output: &mut Vec<u8>, limit: usize) -> bool 
     }
     true
 }
+
+/// 64 plain alphabet characters as 48 bytes; `None` when any is padding,
+/// whitespace or invalid (the scalar path then decides).
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[inline]
+fn decode_base64_block(block: &[u8]) -> Option<[u8; 48]> {
+    use std::arch::aarch64::*;
+    assert_eq!(block.len(), 64);
+    // SAFETY: NEON is enabled for this target (cfg above); the loads read
+    // the 64 bytes of `block` and both halves of the 256-byte table, and the
+    // store writes the 48 bytes of `out`.
+    unsafe {
+        let low = vld1q_u8_x4(BASE64.as_ptr());
+        let high = vld1q_u8_x4(BASE64.as_ptr().add(64));
+        // Characters in 4-lane order: lane `n` holds every fourth one.
+        let chars = vld4q_u8(block.as_ptr());
+        let offset = vdupq_n_u8(64);
+        // Bytes below 64 index `low`, 64..128 index `high`; any other index
+        // leaves 0, and bytes from 128 up are caught by their top bit.
+        let value =
+            |c: uint8x16_t| vqtbx4q_u8(vqtbl4q_u8(low, c), high, vsubq_u8(c, offset));
+        let (a, b, c, d) = (
+            value(chars.0),
+            value(chars.1),
+            value(chars.2),
+            value(chars.3),
+        );
+        let any = vorrq_u8(
+            vorrq_u8(vorrq_u8(a, b), vorrq_u8(c, d)),
+            vorrq_u8(
+                vorrq_u8(chars.0, chars.1),
+                vorrq_u8(chars.2, chars.3),
+            ),
+        );
+        if vmaxvq_u8(any) & 0x80 != 0 {
+            return None;
+        }
+        let bytes = uint8x16x3_t(
+            vorrq_u8(vshlq_n_u8(a, 2), vshrq_n_u8(b, 4)),
+            vorrq_u8(vshlq_n_u8(b, 4), vshrq_n_u8(c, 2)),
+            vorrq_u8(vshlq_n_u8(c, 6), d),
+        );
+        let mut out = [0u8; 48];
+        vst3q_u8(out.as_mut_ptr(), bytes);
+        Some(out)
+    }
+}
+
+/// Six-bit values of the standard and URL-safe alphabets; 0xFF for every
+/// other byte (padding and whitespace included).
+static BASE64: [u8; 256] = {
+    let mut table = [0xffu8; 256];
+    let mut index = 0;
+    while index < 26 {
+        table[b'A' as usize + index] = index as u8;
+        table[b'a' as usize + index] = 26 + index as u8;
+        index += 1;
+    }
+    let mut digit = 0;
+    while digit < 10 {
+        table[b'0' as usize + digit] = 52 + digit as u8;
+        digit += 1;
+    }
+    table[b'+' as usize] = 62;
+    table[b'-' as usize] = 62;
+    table[b'/' as usize] = 63;
+    table[b'_' as usize] = 63;
+    table
+};
 
 /// Format and pixel size from a file's header: PNG, GIF and JPEG.
 pub(crate) fn sniff(data: &[u8]) -> Option<(InlineImageFormat, u32, u32)> {

@@ -1458,6 +1458,18 @@ where
     }
 
     #[inline]
+    fn put_slice(&mut self, bytes: &[u8]) {
+        if let Some(request) = &mut self.state.dcs {
+            // `put` stores bytes until the limit and flags any past it.
+            let room = DCS_REQUEST_MAX.saturating_sub(request.payload.len());
+            request.payload.extend_from_slice(&bytes[..bytes.len().min(room)]);
+            if bytes.len() > room {
+                request.overflowed = true;
+            }
+        }
+    }
+
+    #[inline]
     fn unhook(&mut self) {
         let Some(request) = self.state.dcs.take() else {
             return;
@@ -1476,6 +1488,11 @@ where
         let terminator = if bell_terminated { "\x07" } else { "\x1b\\" };
 
         fn unhandled(params: &[&[u8]]) {
+            // Diri patch: formatting every byte of a long OSC nobody logs
+            // cost more than parsing it.
+            if !log::log_enabled!(log::Level::Debug) {
+                return;
+            }
             let mut buf = String::new();
             for items in params {
                 buf.push('[');
@@ -1723,8 +1740,23 @@ where
             ('B', []) | ('e', []) => handler.move_down(next_param_or(1) as usize),
             ('b', []) => {
                 if let Some(c) = self.state.preceding_char {
-                    for _ in 0..next_param_or(1) {
-                        handler.input(c);
+                    let count = usize::from(next_param_or(1));
+                    if (' '..='~').contains(&c) {
+                        // Diri patch: a repeated printable ASCII character is
+                        // a run, written a row segment at a time like any
+                        // other (`input_ascii` equals `input` per character).
+                        let run = [c as u8; 256];
+                        let mut left = count;
+                        while left != 0 {
+                            let take = left.min(run.len());
+                            let text = str::from_utf8(&run[..take]).expect("ASCII");
+                            handler.input_ascii(text);
+                            left -= take;
+                        }
+                    } else {
+                        for _ in 0..count {
+                            handler.input(c);
+                        }
                     }
                 } else {
                     debug!("tried to repeat with no preceding char");

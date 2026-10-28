@@ -1,7 +1,7 @@
 use diri_proto::grid::RowMetadata;
 use diri_proto::inline_image::{ImageAnchor, InlineImageFormat};
 
-use super::{DEFAULT_CELL_PIXELS, STORE_BUDGET_BYTES, sniff};
+use super::{DEFAULT_CELL_PIXELS, STORE_BUDGET_BYTES, decode_base64_into, sniff};
 use crate::HeadlessScreen;
 
 fn base64(bytes: &[u8]) -> String {
@@ -520,4 +520,81 @@ fn cell_size_reply() -> String {
     let mut local = screen();
     local.feed(b"\x1b]1337;ReportCellSize\x07");
     String::from_utf8(local.take_replies()).unwrap()
+}
+
+/// The byte-at-a-time decoder the grouped one replaced, kept as the oracle.
+fn decode_base64_bytewise(input: &[u8], output: &mut Vec<u8>, limit: usize) -> bool {
+    fn value(byte: u8) -> Option<u32> {
+        Some(match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        } as u32)
+    }
+    let mut accumulator = 0u32;
+    let mut bits = 0u32;
+    for &byte in input {
+        if byte == b'=' || byte.is_ascii_whitespace() {
+            continue;
+        }
+        let Some(value) = value(byte) else {
+            return false;
+        };
+        accumulator = (accumulator << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            if output.len() >= limit {
+                return false;
+            }
+            output.push((accumulator >> bits) as u8);
+            accumulator &= (1 << bits) - 1;
+        }
+    }
+    true
+}
+
+#[test]
+fn grouped_base64_decodes_exactly_as_byte_by_byte() {
+    // Mostly alphabet, with padding, whitespace, URL-safe and invalid bytes
+    // sprinkled in, at every limit around the output size.
+    const BYTES: &[u8] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/-_= \n\t!\xff";
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = |bound: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % bound as u64) as usize
+    };
+    for case in 0..20_000 {
+        let len = next(300);
+        // Clean, sparsely noisy (one block in a few is not plain), and dense.
+        let noise = [0, 0, 120, 4][case % 4];
+        let input: Vec<u8> = (0..len)
+            .map(|_| {
+                let pick = if noise != 0 && next(noise) == 0 {
+                    next(BYTES.len())
+                } else {
+                    next(64)
+                };
+                BYTES[pick]
+            })
+            .collect();
+        let prefix: Vec<u8> = (0..next(3)).map(|i| i as u8).collect();
+        let limit = prefix.len() + next(240);
+        let mut expected = prefix.clone();
+        let expected_ok = decode_base64_bytewise(&input, &mut expected, limit);
+        let mut actual = prefix;
+        let actual_ok = decode_base64_into(&input, &mut actual, limit);
+        assert_eq!(
+            (actual_ok, &actual),
+            (expected_ok, &expected),
+            "input {:?} limit {limit}",
+            String::from_utf8_lossy(&input)
+        );
+    }
 }
