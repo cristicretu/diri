@@ -804,7 +804,7 @@ impl ControlServer {
             std::fs::remove_file(&self.socket_path)?;
         }
         if let Some(parent) = self.socket_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            diri_platform::private::create_dir_all(parent)?;
         }
         let listener = UnixListener::bind(&self.socket_path)?;
         #[cfg(unix)]

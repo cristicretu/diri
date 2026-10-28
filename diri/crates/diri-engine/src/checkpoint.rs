@@ -255,11 +255,12 @@ impl ScreenCheckpoint {
             plist::Value::Integer(u64::from(self.mouse.encoding as u8).into()),
         );
 
-        let temp = path.with_extension("plist.tmp");
+        // Terminal content: owner-only from creation, never via the umask.
+        let mut bytes = Vec::new();
         plist::Value::Dictionary(dict)
-            .to_file_binary(&temp)
+            .to_writer_binary(&mut bytes)
             .map_err(std::io::Error::other)?;
-        std::fs::rename(&temp, path)
+        diri_platform::private::replace_via(&path.with_extension("plist.tmp"), path, bytes)
     }
 }
 
@@ -426,6 +427,25 @@ mod tests {
         assert!(loaded.alt_screen);
         assert!(!loaded.bracketed_paste);
         assert_eq!(loaded.mouse, sample().mouse);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoints_are_owner_only_even_over_older_world_readable_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("s_x.screen.plist");
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        sample().write_atomically(&path).expect("write");
+        assert_eq!(mode(&path), 0o600);
+
+        // A temp left 0644 by an older build must not carry its mode over.
+        let stale = path.with_extension("plist.tmp");
+        std::fs::write(&stale, b"torn").unwrap();
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
+        sample().write_atomically(&path).expect("rewrite");
+        assert_eq!(mode(&path), 0o600);
+        assert!(ScreenCheckpoint::load(&path).is_some());
     }
 
     #[test]

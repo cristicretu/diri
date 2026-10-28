@@ -4349,3 +4349,22 @@ fn read_aloud_can_pick_one_tab_or_all_but_one() {
     store.set_read_aloud(a.id.clone(), ReadAloudChoice::All);
     assert!(store.reads_aloud(&a.id) && store.reads_aloud(&b.id));
 }
+
+#[cfg(unix)]
+#[test]
+fn preferences_are_owner_only_even_over_an_older_world_readable_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let folder = directory.path().join("Application Support/diri");
+    let path = folder.join("prefs.json");
+    Prefs::default().save(&path).unwrap();
+    assert_eq!(mode(&path), 0o600);
+    assert_eq!(mode(&folder), 0o700);
+
+    let stale = path.with_extension("json.tmp");
+    std::fs::write(&stale, b"{").unwrap();
+    std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
+    Prefs::default().save(&path).unwrap();
+    assert_eq!(mode(&path), 0o600);
+}

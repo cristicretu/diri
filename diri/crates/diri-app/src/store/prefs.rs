@@ -779,12 +779,10 @@ impl Prefs {
         let parent = path.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "preference path has no parent")
         })?;
-        fs::create_dir_all(parent)?;
+        diri_platform::private::create_dir_all(parent)?;
         let bytes = serde_json::to_vec_pretty(&normalized)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let temporary = path.with_extension("json.tmp");
-        fs::write(&temporary, bytes)?;
-        fs::rename(temporary, path)
+        diri_platform::private::replace_via(&path.with_extension("json.tmp"), path, bytes)
     }
 
     pub fn zoom_terminal(&mut self, delta: f32) {
