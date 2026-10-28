@@ -47,7 +47,6 @@ actions!(
         ToggleActivity,
         ToggleOverview,
         ToggleTabPeek,
-        ReviewLaunches,
         FocusPaneLeft,
         FocusPaneRight,
         FocusPaneUp,
@@ -181,7 +180,6 @@ pub enum CommandId {
     ToggleActivity,
     ToggleOverview,
     ToggleTabPeek,
-    ReviewLaunches,
     FocusPaneLeft,
     FocusPaneRight,
     FocusPaneUp,
@@ -507,16 +505,6 @@ pub const COMMANDS: &[CommandSpec] = &[
         "command.toggle_tab_peek.palette_title",
         "rectangle.stack",
         "preview strip tabs glance"
-    ),
-    spec!(
-        ReviewLaunches,
-        "review-launches",
-        None,
-        None,
-        Some(APP_CONTEXT),
-        "command.review_launches.palette_title",
-        "tray",
-        "workspace create pending retry placement receipts"
     ),
     spec!(
         FocusPaneLeft,
@@ -1585,7 +1573,6 @@ impl CommandSpec {
             CommandId::ToggleNotifications => KeyBinding::new(key, ToggleNotifications, context),
             CommandId::ToggleActivity => KeyBinding::new(key, ToggleActivity, context),
             CommandId::ToggleOverview => KeyBinding::new(key, ToggleOverview, context),
-            CommandId::ReviewLaunches => KeyBinding::new(key, ReviewLaunches, context),
             CommandId::ToggleTabPeek => KeyBinding::new(key, ToggleTabPeek, context),
             CommandId::FocusPaneLeft => KeyBinding::new(key, FocusPaneLeft, context),
             CommandId::FocusPaneRight => KeyBinding::new(key, FocusPaneRight, context),
@@ -2121,11 +2108,6 @@ impl CommandId {
                 description: t("command.toggle_overview.description"),
                 category: Navigation,
             },
-            Self::ReviewLaunches => ShortcutMetadata {
-                title: t("command.review_launches.title"),
-                description: t("command.review_launches.description"),
-                category: Workspace,
-            },
             Self::FocusPaneLeft => ShortcutMetadata {
                 title: t("command.focus_pane_left.title"),
                 description: t("command.focus_pane_left.description"),
@@ -2605,7 +2587,6 @@ impl CommandId {
             Self::ToggleActivity => Box::new(ToggleActivity),
             Self::ToggleOverview => Box::new(ToggleOverview),
             Self::ToggleTabPeek => Box::new(ToggleTabPeek),
-            Self::ReviewLaunches => Box::new(ReviewLaunches),
             Self::FocusPaneLeft => Box::new(FocusPaneLeft),
             Self::FocusPaneRight => Box::new(FocusPaneRight),
             Self::FocusPaneUp => Box::new(FocusPaneUp),
