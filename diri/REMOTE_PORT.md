@@ -101,7 +101,9 @@ requests fail explicitly when that state is unavailable. Desktop arrows and
 Home/End retain their historical normal-cursor CSI encoding for these legacy
 sessions instead of disabling navigation after an upgrade. This compatibility
 choice does not claim or persist known modes; observed application-cursor modes
-always override it. Keypad input still requires observed modes. Controller and
+always override it. Keypad keys type their characters in every legacy mode
+(DECKPAM is observed but, as on a Num Lock keypad, changes no bytes), so they
+need no observed modes; kitty-flag programs get keypad key codes. Controller and
 enhanced-keyboard admission checks remain enforced by the Engine.
 
 Local app/client `Modes` frames retain their existing first byte and gain an

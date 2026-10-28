@@ -12,6 +12,8 @@ mod find_overlay;
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) mod find_workflow_tests;
 #[cfg(all(test, target_os = "macos"))]
+mod key_encoding_tests;
+#[cfg(all(test, target_os = "macos"))]
 mod keystroke_latency_tests;
 mod messages;
 #[cfg(all(test, target_os = "macos"))]
@@ -966,6 +968,10 @@ pub struct TerminalPane {
     drag_settle: Option<((u16, u16), Task<()>)>,
     /// A mid-drag size that has rested long enough to send.
     drag_settled: Option<(u16, u16)>,
+    /// Keys pressed while a program asked for kitty release events, as the
+    /// press encoded them. A key-up carries no native key code, so its keypad
+    /// identity and layout come from here, matched by GPUI's key name.
+    held_keys: Vec<(String, TermKeyEvent, bool)>,
     started_at: Instant,
     session_source: SessionSource,
     /// Last selection observed by the primary pane. Spawn responses select the
@@ -1252,6 +1258,7 @@ impl TerminalPane {
             last_resize_sent: None,
             drag_settle: None,
             drag_settled: None,
+            held_keys: Vec::new(),
             started_at: Instant::now(),
             session_source,
             observed_selected_id,
@@ -4130,10 +4137,19 @@ impl TerminalPane {
             return;
         }
         let option = OptionKey::for_layout(cx.keyboard_layout().id());
-        let Some((term_event, modifiers)) = terminal_key_event(event, option) else {
+        let Some(mapped) = terminal_key_event(event, option) else {
             cx.propagate();
             return;
         };
+        let (term_event, modifiers) = kitty_key_event(event, resident.keyboard, mapped);
+        if reports_key_releases(resident.keyboard) {
+            remember_held_key(
+                &mut self.held_keys,
+                &event.keystroke,
+                &term_event,
+                modifiers.shift,
+            );
+        }
         let bytes = match diri_term::keys::encode_interactive_action(
             &term_event,
             modifiers,
@@ -4209,20 +4225,20 @@ impl TerminalPane {
         let Some(resident) = self.residents.get_mut(&id) else {
             return;
         };
-        let reports_releases = resident
-            .keyboard
-            .and_then(|keyboard| keyboard.enhancements)
-            .is_some_and(|flags| {
-                flags.contains(diri_proto::terminal_input::enhanced::KeyboardEnhancements::EVENT_TYPES)
-            });
-        if !reports_releases || resident.find.is_some() {
+        let held = take_held_key(&mut self.held_keys, &event.keystroke);
+        if !reports_key_releases(resident.keyboard) || resident.find.is_some() {
             return;
         }
         let option = OptionKey::for_layout(cx.keyboard_layout().id());
-        let Some((term_event, modifiers)) = terminal_keystroke_event(&event.keystroke, option)
+        let Some((mut term_event, mut modifiers)) =
+            terminal_keystroke_event(&event.keystroke, option)
         else {
             return;
         };
+        if let Some((pressed, shift)) = held {
+            term_event = pressed;
+            modifiers.shift |= shift;
+        }
         if let Ok(bytes) = diri_term::keys::encode_interactive_action(
             &term_event,
             modifiers,
@@ -6166,6 +6182,96 @@ fn terminal_key_event(
     terminal_keystroke_event(&event.keystroke, option)
 }
 
+/// The same key with its layout characters, for a program that negotiated
+/// kitty flags. Only then is the layout looked up, so legacy typing pays
+/// nothing for it.
+fn kitty_key_event(
+    event: &KeyDownEvent,
+    keyboard: Option<diri_term::keys::KeyboardState>,
+    mapped: (TermKeyEvent, TermModifiers),
+) -> (TermKeyEvent, TermModifiers) {
+    #[cfg(target_os = "macos")]
+    {
+        let kitty = keyboard
+            .and_then(|keyboard| keyboard.enhancements)
+            .is_some_and(|flags| flags.bits() & 0b1011 != 0);
+        if kitty && let Some((unshifted, shifted)) = crate::macos::terminal_keys::layout_chars(event)
+        {
+            let (mut term_event, mut modifiers) = mapped;
+            apply_key_layout(&mut term_event, &mut modifiers, unshifted, shifted);
+            return (term_event, modifiers);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (event, keyboard);
+    mapped
+}
+
+fn reports_key_releases(keyboard: Option<diri_term::keys::KeyboardState>) -> bool {
+    keyboard
+        .and_then(|keyboard| keyboard.enhancements)
+        .is_some_and(|flags| {
+            flags.contains(diri_proto::terminal_input::enhanced::KeyboardEnhancements::EVENT_TYPES)
+        })
+}
+
+/// Held keys are few; a lost key-up (focus moved mid-press) must not grow
+/// the list, so it keeps only the most recent presses.
+const HELD_KEY_LIMIT: usize = 8;
+
+fn remember_held_key(
+    held: &mut Vec<(String, TermKeyEvent, bool)>,
+    keystroke: &gpui::Keystroke,
+    event: &TermKeyEvent,
+    shift: bool,
+) {
+    held.retain(|(key, ..)| *key != keystroke.key);
+    if held.len() == HELD_KEY_LIMIT {
+        held.remove(0);
+    }
+    held.push((keystroke.key.clone(), event.clone(), shift));
+}
+
+fn take_held_key(
+    held: &mut Vec<(String, TermKeyEvent, bool)>,
+    keystroke: &gpui::Keystroke,
+) -> Option<(TermKeyEvent, bool)> {
+    let index = held.iter().position(|(key, ..)| *key == keystroke.key)?;
+    let (_, event, shift) = held.remove(index);
+    Some((event, shift))
+}
+
+/// Records what the layout types on a character key with and without Shift.
+/// GPUI resolves Shift into the logical key for non-letters (`@`, Shift
+/// cleared), which legacy encoding wants (Ctrl-@ is NUL), but the kitty
+/// protocol names the unshifted key with a Shift modifier (Ctrl-Shift-2 is
+/// `CSI 50;6u`). A key the layout does not account for (a Command-layout
+/// fallback) is left alone.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn apply_key_layout(
+    event: &mut TermKeyEvent,
+    modifiers: &mut TermModifiers,
+    unshifted: char,
+    shifted: char,
+) {
+    let TermKey::Character(logical) = &event.key else {
+        return;
+    };
+    let mut chars = logical.chars();
+    let Some(key) = chars.next().filter(|_| chars.next().is_none()) else {
+        return;
+    };
+    if key == shifted && shifted != unshifted {
+        modifiers.shift = true;
+    } else if key != unshifted {
+        return;
+    }
+    event.layout = diri_term::keys::KeyLayout {
+        unshifted: Some(unshifted),
+        shifted: Some(shifted),
+    };
+}
+
 /// The terminal key a keystroke names, for presses and releases alike.
 fn terminal_keystroke_event(
     keystroke: &gpui::Keystroke,
@@ -6204,6 +6310,18 @@ fn terminal_keystroke_event(
         "f10" => Some(NamedKey::F10),
         "f11" => Some(NamedKey::F11),
         "f12" => Some(NamedKey::F12),
+        "f13" => Some(NamedKey::F13),
+        "f14" => Some(NamedKey::F14),
+        "f15" => Some(NamedKey::F15),
+        "f16" => Some(NamedKey::F16),
+        "f17" => Some(NamedKey::F17),
+        "f18" => Some(NamedKey::F18),
+        "f19" => Some(NamedKey::F19),
+        "f20" => Some(NamedKey::F20),
+        "f21" => Some(NamedKey::F21),
+        "f22" => Some(NamedKey::F22),
+        "f23" => Some(NamedKey::F23),
+        "f24" => Some(NamedKey::F24),
         _ => None,
     };
     if let Some(named) = named {
@@ -6240,6 +6358,7 @@ fn terminal_keystroke_event(
         TermKeyEvent {
             key: TermKey::Character(logical),
             text: Some(text),
+            layout: Default::default(),
         },
         modifiers,
     ))
@@ -11352,8 +11471,9 @@ mod tests {
                 ("alt-space", Some(" "), b"\x1b "),
                 // A layout whose Option leaves the key unchanged.
                 ("alt-b", Some("b"), b"\x1bb"),
-                // Control claims the chord before Option can compose.
-                ("ctrl-alt-a", None, b"\x01"),
+                // Control claims the chord before Option can compose, and
+                // Option is Meta: ESC ^A, as xterm sends Emacs C-M-a.
+                ("ctrl-alt-a", None, b"\x1b\x01"),
             ] {
                 assert_eq!(
                     option_bytes(&option_key(chord, key_char), option),
