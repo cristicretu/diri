@@ -103,7 +103,7 @@ pub(crate) struct ItermUpload {
 }
 
 pub(crate) struct InlineImages {
-    store: ImageStore,
+    pub(crate) store: ImageStore,
     collecting: Option<Collecting>,
     /// The end of the previous chunk, held back because it may begin an
     /// image sequence.
@@ -131,6 +131,56 @@ impl InlineImages {
 
     pub(crate) fn stored_bytes(&self) -> usize {
         self.store.bytes
+    }
+
+    /// See [`HeadlessScreen::inline_image_store_summary`].
+    pub(crate) fn summary(&self) -> Vec<String> {
+        let images = self;
+        let fnv = |data: &[u8]| {
+            data.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, &byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+            })
+        };
+        let store = &images.store;
+        let mut summary: Vec<String> = store
+            .order
+            .iter()
+            .filter_map(|id| {
+                let (image, kitty) = store.images.get(id)?;
+                Some(format!(
+                    "image {id} kitty={kitty:?} {:?} {}x{} compressed={} {} bytes fnv={:016x}",
+                    image.format,
+                    image.width,
+                    image.height,
+                    image.compressed,
+                    image.data.len(),
+                    fnv(&image.data),
+                ))
+            })
+            .collect();
+        let mut numbers: Vec<_> = store.kitty_numbers.iter().collect();
+        numbers.sort();
+        summary.push(format!(
+            "kitty numbers {numbers:?} next {}",
+            store.next_kitty_id
+        ));
+        if let Some(upload) = &images.kitty_upload {
+            summary.push(format!(
+                "kitty upload {} bytes fnv={:016x} error={:?}",
+                upload.data.len(),
+                fnv(&upload.data),
+                upload.error
+            ));
+        }
+        if let Some(upload) = &images.iterm_upload {
+            summary.push(format!(
+                "iterm upload {} bytes fnv={:016x} overflow={}",
+                upload.data.len(),
+                fnv(&upload.data),
+                upload.overflow
+            ));
+        }
+        summary
     }
 }
 
@@ -184,54 +234,9 @@ impl HeadlessScreen {
     #[doc(hidden)]
     #[must_use]
     pub fn inline_image_store_summary(&self) -> Vec<String> {
-        let Some(images) = self.images.as_ref() else {
-            return Vec::new();
-        };
-        let fnv = |data: &[u8]| {
-            data.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, &byte| {
-                (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
-            })
-        };
-        let store = &images.store;
-        let mut summary: Vec<String> = store
-            .order
-            .iter()
-            .filter_map(|id| {
-                let (image, kitty) = store.images.get(id)?;
-                Some(format!(
-                    "image {id} kitty={kitty:?} {:?} {}x{} compressed={} {} bytes fnv={:016x}",
-                    image.format,
-                    image.width,
-                    image.height,
-                    image.compressed,
-                    image.data.len(),
-                    fnv(&image.data),
-                ))
-            })
-            .collect();
-        let mut numbers: Vec<_> = store.kitty_numbers.iter().collect();
-        numbers.sort();
-        summary.push(format!(
-            "kitty numbers {numbers:?} next {}",
-            store.next_kitty_id
-        ));
-        if let Some(upload) = &images.kitty_upload {
-            summary.push(format!(
-                "kitty upload {} bytes fnv={:016x} error={:?}",
-                upload.data.len(),
-                fnv(&upload.data),
-                upload.error
-            ));
-        }
-        if let Some(upload) = &images.iterm_upload {
-            summary.push(format!(
-                "iterm upload {} bytes fnv={:016x} overflow={}",
-                upload.data.len(),
-                fnv(&upload.data),
-                upload.overflow
-            ));
-        }
-        summary
+        self.images
+            .as_ref()
+            .map_or_else(Vec::new, |images| images.summary())
     }
 
     /// Every image stored since the last call, oldest first, with its Kitty
@@ -1013,7 +1018,7 @@ fn dimensions_allowed(width: u32, height: u32) -> bool {
 
 // MARK: Store
 
-struct ImageStore {
+pub(crate) struct ImageStore {
     /// Distinguishes this terminal's keys from a previous one's (a restarted
     /// Engine replays the same session), so client caches cannot collide.
     nonce: u32,
@@ -1029,7 +1034,7 @@ struct ImageStore {
     next_kitty_id: u32,
     /// Every image stored, in order (benchmark verification only).
     #[cfg(feature = "bench-verify")]
-    log: Vec<(Option<u32>, StoredImage)>,
+    pub(crate) log: Vec<(Option<u32>, StoredImage)>,
 }
 
 impl ImageStore {

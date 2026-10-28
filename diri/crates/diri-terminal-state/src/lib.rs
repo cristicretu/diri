@@ -55,7 +55,7 @@ use diri_proto::{TerminalAppearance, TerminalPalette};
 /// blink). A program's DECSCUSR replaces it and `CSI 0 SP q` restores it. Mode
 /// 12 starts from it, so a DECRQM `?12` query reports the blink and never
 /// turns the cursor steady.
-const DEFAULT_CURSOR: alacritty_terminal::vte::ansi::CursorStyle =
+pub(crate) const DEFAULT_CURSOR: alacritty_terminal::vte::ansi::CursorStyle =
     alacritty_terminal::vte::ansi::CursorStyle {
         shape: alacritty_terminal::vte::ansi::CursorShape::Block,
         blinking: true,
@@ -444,14 +444,14 @@ impl Dimensions for Geometry {
 /// its latest value, and replies are bounded by [`MAX_PENDING_EVENTS`] per
 /// parse, a backstop that no program answering its own queries reaches.
 #[derive(Clone)]
-struct Collector(Arc<Mutex<Inbox>>);
+pub(crate) struct Collector(pub(crate) Arc<Mutex<Inbox>>);
 
 #[derive(Default)]
-struct Inbox {
+pub(crate) struct Inbox {
     /// The last title change since the previous drain.
-    title: Option<Event>,
+    pub(crate) title: Option<Event>,
     /// Everything else that is answered, in order.
-    events: Vec<Event>,
+    pub(crate) events: Vec<Event>,
 }
 
 /// Reply-producing events kept per drain; beyond it a flood of queries in

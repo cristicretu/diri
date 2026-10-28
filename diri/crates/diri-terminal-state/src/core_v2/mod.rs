@@ -9,6 +9,7 @@ pub mod check;
 mod events;
 mod ops;
 pub mod page;
+pub mod screen;
 pub mod term;
 pub mod text;
 
