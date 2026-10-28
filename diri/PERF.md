@@ -3060,3 +3060,69 @@ DIRI_HOLDER_BIN=$CARGO_TARGET_DIR/release/diri-holder \
 cargo test -p diri-engine --release --features latency-trace \
   --test keystroke_latency output_to_grid -- --ignored --nocapture
 ```
+
+
+## Output to the screen through the real app window (2026-10-27)
+
+**Question.** `output_photon_probe` draws a bare `TerminalElement` in a
+small panel. The installed app measured 38.9 ms median for the same TTY
+write, against 25.5 ms for the probe on the same build, so about 13 ms was
+attributed to "the app": the glass material, main-thread work, re-rendering
+the whole window for a terminal frame, or the build.
+
+**Harness.** `tests/app_photon_appkit.rs` (`src/app_photon_tests.rs`) runs
+the full `RootView` (workspace workbench with a split, title bar, tab strip,
+sidebar) in a 2056x1290 pt window with the app's own title-bar options and
+material, over a private in-process Engine with real Holders. The window is
+a non-activating panel at the right screen edge with a 6 pt strip visible,
+opened only after launch so AppKit never activates the process; a guard
+aborts the run if the process becomes active or owns the key window. Each
+TTY write starts a `diri_client::latency_trace` record (the pane, transport
+and GPUI frame observer stamp the rest) and is logged in `CLOCK_UPTIME_RAW`
+ns for joining against a ScreenCaptureKit film of that window.
+
+**Results** (SCK: write → first changed captured frame; two interleaved
+rounds of 60 writes per build; load average 5–23):
+
+| p50 / p90 ms | `x` | `\b \b` | all |
+| --- | --- | --- | --- |
+| bare panel, #833 | 11.8 / 17.0 | 28.9 / 33.2 | 21.7 / 31.6 |
+| full app window, #833 | 16.8 / 21.2 | 32.7 / 37.2 | 24.6 / 35.5 |
+| full app window, main | 30.2 / 35.7 | 36.6 / 43.0 | 33.6 / 42.0 |
+
+Hops in the full window, `x`, p50:
+
+| hop | main | #833 |
+| --- | ---: | ---: |
+| write → grid decoded | 9.0 ms | 1.3 ms |
+| decoded → pane notified | 0.05 ms | 0.05 ms |
+| notified → draw start | 0.02 ms | 0.02 ms |
+| draw (layout + paint, whole window) | 0.55 ms | 0.5–0.8 ms |
+| draw end → committed | 4.1–6.1 ms | 0.1 ms |
+| committed → GPU completed | 3.5 ms | 2.9–3.9 ms |
+| GPU completed → presented | 19–23 ms | 19–21 ms |
+
+- The window costs about 5 ms over the bare panel with #833 (8 ms on main,
+  where draws also wait for the display link). The 38.9 → ~33.6 ms rest of
+  the installed figure was not reproduced here: the installed 0.10.1 build,
+  on-screen composition of a fully visible window, or a busier app.
+- Glass vs opaque material: no difference (`x` 16.1 vs 18.4 ms SCK, GPU 3.0
+  vs 4.2 ms, within run-to-run noise). Sidebar on vs off: no difference.
+- No main-thread stall: a notified pane starts drawing within 0.02 ms (the
+  immediate frame is granted), and building the whole window's frame takes
+  0.5–1 ms.
+- The GPU is the measurable app cost. A frame draws 49 quads covering about
+  35 Mpx of a 10.6 Mpx drawable (window fill, workbench fill, two pane
+  surfaces, the unfocused pane's dim). Dropping the five largest (an
+  experiment, not a change) cut committed → GPU completed from ~3.0 to
+  ~1.0 ms and SCK `x` by ~2 ms (n=15). A 1100x700 window takes 1.5 ms.
+  Those layers are the design's glass composition, so they were left.
+- The test build links GPUI `test-support` (`framebufferOnly = NO`). A/B
+  with the shipped setting showed no difference beyond noise.
+
+```sh
+cargo build --release -p diri-engine --bin diri-holder
+DIRI_TEST_APP_PHOTON=1 DIRI_HOLDER_BIN=$CARGO_TARGET_DIR/release/diri-holder \
+  DIRI_PHOTON_LOG=/tmp/app-photon.csv \
+  cargo test --release -p diri-app --test app_photon_appkit
+```

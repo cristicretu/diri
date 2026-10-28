@@ -3,6 +3,8 @@ mod agent_setup;
 mod alerts;
 mod api_client;
 mod app_theme;
+#[cfg(all(test, target_os = "macos"))]
+mod app_photon_tests;
 mod application_notifications;
 mod chrome_focus;
 mod clipboard_transfer;
@@ -262,6 +264,10 @@ fn main() {
         #[cfg(all(test, target_os = "macos"))]
         if std::env::var_os("DIRI_TEST_NATIVE_FIND").is_some() {
             terminal_pane::find_workflow_tests::run_native();
+        }
+        #[cfg(all(test, target_os = "macos"))]
+        if std::env::var_os("DIRI_TEST_APP_PHOTON").is_some() {
+            app_photon_tests::run_native();
         }
         return;
     }
