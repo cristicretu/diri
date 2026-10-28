@@ -10,7 +10,7 @@
 //! The final sequence has literals only.
 
 const MIN_MATCH: usize = 4;
-const HASH_BITS: u32 = 12;
+const HASH_BITS: u32 = 11;
 /// How fast probing speeds up through bytes without matches (see
 /// [`compress_into`]).
 const SKIP_SHIFT: u32 = 3;

@@ -2348,7 +2348,7 @@ fn extend_plain_run(cells: &[Cell], style: &Cell, text: &mut Vec<u8>) -> usize {
         _ => {
             let key = plain_style_key(style);
             extend_run_with(cells, text, |cell| has_plain_style(cell, key))
-        },
+        }
     }
 }
 
@@ -2380,20 +2380,49 @@ fn extend_run_with(cells: &[Cell], text: &mut Vec<u8>, joins: impl Fn(&Cell) -> 
 /// `style`, and returns how many cells they took (twice the characters).
 #[inline]
 fn extend_wide_pairs(cells: &[Cell], style: &Cell, text: &mut Vec<u8>) -> usize {
+    let flags = style.flags;
+    let spacer_flags = wide_spacer_flags(flags);
+    match (style.fg, style.bg) {
+        (Color::Named(fg), Color::Named(bg)) => {
+            let named = |cell: &Cell, flags: Flags| {
+                cell.extra.is_none()
+                    && cell.flags == flags
+                    && matches!(cell.fg, Color::Named(color) if color == fg)
+                    && matches!(cell.bg, Color::Named(color) if color == bg)
+            };
+            extend_pairs_with(cells, text, |wide, spacer| {
+                named(wide, flags) && spacer.c == ' ' && named(spacer, spacer_flags)
+            })
+        }
+        _ => {
+            let key = plain_style_key(style);
+            let spacer_key = plain_style_key(&wide_spacer(style));
+            extend_pairs_with(cells, text, |wide, spacer| {
+                has_plain_style(wide, key) && spacer.c == ' ' && has_plain_style(spacer, spacer_key)
+            })
+        }
+    }
+}
+
+/// Appends the text of the leading pairs of `cells` that `joins`, and
+/// returns how many cells they took (twice the characters).
+#[inline(always)]
+fn extend_pairs_with(
+    cells: &[Cell],
+    text: &mut Vec<u8>,
+    joins: impl Fn(&Cell, &Cell) -> bool,
+) -> usize {
     text.reserve(2 * cells.len());
     let out = text.spare_capacity_mut().as_mut_ptr().cast::<u8>();
-    let key = plain_style_key(style);
-    let spacer_key = plain_style_key(&wide_spacer(style));
     let mut written = 0;
     let mut count = 0;
     for pair in cells.chunks_exact(2) {
-        let (wide, spacer) = (&pair[0], &pair[1]);
-        if !(has_plain_style(wide, key) && spacer.c == ' ' && has_plain_style(spacer, spacer_key)) {
+        if !joins(&pair[0], &pair[1]) {
             break;
         }
         // SAFETY: at most `cells.len() / 2` scalars of four bytes are
         // written into the capacity reserved above.
-        written += unsafe { write_scalar(out.add(written), wide.c) };
+        written += unsafe { write_scalar(out.add(written), pair[0].c) };
         count += 2;
     }
     // SAFETY: the first `written` spare bytes were just written.
@@ -2719,9 +2748,8 @@ impl BlockEncoder {
             let (count, paired) = if cell.extra.is_some() {
                 text.reserve(4);
                 // SAFETY: four bytes were just reserved.
-                let written = unsafe {
-                    write_scalar(text.spare_capacity_mut().as_mut_ptr().cast(), cell.c)
-                };
+                let written =
+                    unsafe { write_scalar(text.spare_capacity_mut().as_mut_ptr().cast(), cell.c) };
                 // SAFETY: those bytes were just written.
                 unsafe { text.set_len(text.len() + written) };
                 (1, false)
@@ -3272,6 +3300,18 @@ mod tests {
             assert_eq!(actual, expected, "row {index}");
             assert_eq!(actual.occ, expected.occ, "occupancy {index}");
             assert_eq!(actual.len(), expected.len(), "width {index}");
+        }
+        // The recycling encoder writes the same payload and leaves default
+        // rows: what `clear_row` makes of them, with nothing left to reset.
+        let encoded = encode_cells(rows);
+        let mut recycled = rows.to_vec();
+        let recycled_encoded = encode_recycled_cells(&mut recycled);
+        assert_eq!(recycled_encoded.bytes, encoded.bytes);
+        assert_eq!(recycled_encoded.resize_floor, encoded.resize_floor);
+        assert_eq!(recycled_encoded.blank_on_reset, encoded.blank_on_reset);
+        for (index, row) in recycled.iter().enumerate() {
+            assert_eq!(*row, Row::new(row.len()), "recycled row {index}");
+            assert_eq!(row.occ, 0, "recycled occupancy {index}");
         }
     }
 
