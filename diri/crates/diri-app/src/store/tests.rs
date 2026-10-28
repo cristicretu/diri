@@ -3020,8 +3020,13 @@ async fn a_rejected_close_restores_the_retained_session_and_allows_a_retry() {
 
     let listed = visible_ids(&mut store.write().unwrap());
     assert_eq!(listed.len(), 2);
-    store.write().unwrap().request_close(vec![id("one")]);
-    assert_eq!(visible_ids(&mut store.write().unwrap()), vec![id("two")]);
+    {
+        // Close and look under one lock: the fake Engine rejects at once, and
+        // its reply could otherwise restore the row before the check.
+        let mut store = store.write().unwrap();
+        store.request_close(vec![id("one")]);
+        assert_eq!(visible_ids(&mut store), vec![id("two")]);
+    }
 
     eventually("the rejection is reported", || {
         store.read().unwrap().action_failure().is_some()
