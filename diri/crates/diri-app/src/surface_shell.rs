@@ -148,6 +148,7 @@ enum SettingsMenu {
     PaneDensity,
     CursorShape,
     CursorBlink,
+    SidebarUsageIndicator,
     TalkVoice,
     TalkAnswer,
     TalkTabs,
@@ -5751,6 +5752,7 @@ impl UtilitySurfaces {
             SettingsMenu::PaneDensity => (self.pane_density_options(colors, cx), 172.0),
             SettingsMenu::CursorShape => (self.cursor_shape_options(colors, cx), 172.0),
             SettingsMenu::CursorBlink => (self.cursor_blink_options(colors, cx), 172.0),
+            SettingsMenu::SidebarUsageIndicator => (self.sidebar_usage_options(colors, cx), 210.0),
             SettingsMenu::TalkVoice => (self.talk_voice_options(colors, cx), 400.0),
             SettingsMenu::TalkAnswer => (self.talk_answer_options(colors, cx), 204.0),
             SettingsMenu::TalkTabs => (self.talk_tabs_options(colors, cx), 204.0),
@@ -6191,6 +6193,53 @@ impl UtilitySurfaces {
                     cx.notify();
                 },
             ));
+        }
+        options.into_any_element()
+    }
+
+    fn sidebar_usage_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let open = self.settings_menu == Some(SettingsMenu::SidebarUsageIndicator);
+        let mut control = div()
+            .debug_selector(|| "sidebar-usage-dropdown".into())
+            .relative()
+            .min_w(px(160.0))
+            .child(settings_select_button(
+                self.prefs.sidebar_usage_indicator.title().to_owned(),
+                "sidebar-usage-dropdown",
+                open,
+                SettingsMenu::SidebarUsageIndicator,
+                colors,
+                cx,
+            ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    fn sidebar_usage_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for (index, choice) in crate::store::SidebarUsageIndicator::ALL
+            .into_iter()
+            .enumerate()
+        {
+            options = options.child(
+                div()
+                    .debug_selector(move || format!("sidebar-usage-option-{index}"))
+                    .child(settings_choice_row(
+                        format!("sidebar-usage-option-{index}"),
+                        choice.title().to_owned(),
+                        choice == self.prefs.sidebar_usage_indicator,
+                        colors,
+                        cx,
+                        move |this, cx| {
+                            this.settings_menu = None;
+                            this.update_prefs(move |prefs| prefs.sidebar_usage_indicator = choice);
+                            cx.notify();
+                        },
+                    )),
+            );
         }
         options.into_any_element()
     }
@@ -6752,6 +6801,11 @@ impl UtilitySurfaces {
                         .child(row(
                             t("settings.appearance.density"),
                             self.pane_density_dropdown(cx).into_any_element(),
+                        ))
+                        .child(setting_divider(colors))
+                        .child(row(
+                            t("sidebar.usage.setting"),
+                            self.sidebar_usage_dropdown(cx),
                         ))
                         .child(setting_divider(colors))
                         .child(row(
@@ -12749,6 +12803,49 @@ mod tests {
         // The panel now shows what is actually stored, so a second action
         // cannot resurrect the stale copy either.
         surfaces.read_with(cx, |surfaces, _| assert_eq!(surfaces.prefs, saved));
+    }
+
+    #[gpui::test]
+    fn footer_preference_appearance_keeps_newer_shared_preferences(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        let store = surfaces.read_with(cx, |surfaces, _| surfaces.store.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.settings_tab = SettingsTab::Appearance;
+            cx.notify();
+        });
+        store
+            .write()
+            .unwrap()
+            .update_preferences(|prefs| {
+                prefs
+                    .muted_notification_sessions
+                    .insert("footer-fixture".into());
+                prefs.pane_density = crate::store::PaneDensity::Compact;
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let dropdown = cx
+            .debug_bounds("sidebar-usage-dropdown")
+            .expect("Appearance usage setting");
+        cx.simulate_click(dropdown.center(), Modifiers::default());
+        cx.run_until_parked();
+        let option = cx
+            .debug_bounds("sidebar-usage-option-2")
+            .expect("Remaining quota choice");
+        cx.simulate_click(option.center(), Modifiers::default());
+        cx.run_until_parked();
+        let saved = store.read().unwrap().preferences().clone();
+        assert_eq!(
+            saved.sidebar_usage_indicator,
+            crate::store::SidebarUsageIndicator::RemainingQuota
+        );
+        assert_eq!(saved.pane_density, crate::store::PaneDensity::Compact);
+        assert!(saved.muted_notification_sessions.contains("footer-fixture"));
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(surfaces.prefs, saved);
+            assert_eq!(surfaces.settings_menu, None);
+        });
     }
 
     /// The toggle used to save `start_at_login` and stop. It now goes through

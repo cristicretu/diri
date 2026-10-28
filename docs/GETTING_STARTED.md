@@ -48,6 +48,19 @@ last project to fan out a sibling with the same prompt. Project headers reorder
 the same way. Escape cancels a drag, and releasing where nothing accepts the
 drop does nothing.
 
+## Sidebar usage indicator
+
+Choose **Settings → Appearance → Window → Sidebar usage indicator**:
+**Estimated cost** (default) keeps today's estimated API cost, **Hidden** removes
+only the metric, and **Remaining quota** shows the lowest remaining percentage
+across all quota windows of the currently selected local Claude and Codex logins
+(not every saved account or the accounts of running sessions). Hover the percentage
+to identify its agent, account, and quota window.
+
+Quota mode shows **—** if any current login has missing data, a fetch error, a
+window whose reset has passed, or data more than six minutes old. Open the account
+menu to refresh; selecting this setting adds no credential reads at startup.
+
 ## Working from the keyboard
 
 ⌘N opens the launcher, ⌘T starts a session with the default agent, ⌘K is the
