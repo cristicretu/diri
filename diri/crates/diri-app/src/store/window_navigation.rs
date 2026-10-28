@@ -69,6 +69,10 @@ struct WindowNavigation {
     revision: u64,
     completed_launches: HashSet<u64>,
     actions: std::collections::VecDeque<WindowAction>,
+    /// The grid this window's main terminal pane last measured. A session
+    /// spawned from this window is launched at it, so its child starts at
+    /// once instead of waiting for the new tab's pane to report a size.
+    terminal_grid: Option<(u16, u16)>,
 }
 
 #[derive(Clone, Debug)]
@@ -192,6 +196,12 @@ impl WindowStore {
                 })
             })
         })
+    }
+    /// Records the grid the window's main terminal pane measured.
+    pub fn note_terminal_grid(&self, size: (u16, u16)) {
+        if let Ok(mut navigation) = self.navigation.try_borrow_mut() {
+            navigation.terminal_grid = Some(size);
+        }
     }
     pub fn enqueue(&self, action: WindowAction) -> bool {
         let mut navigation = self.navigation.borrow_mut();
@@ -480,6 +490,16 @@ impl WindowWrite<'_> {
     fn scoped_spawn_options(&self, mut options: SpawnOptions) -> SpawnOptions {
         if options.workspace_target.is_none() && options.window_target.is_none() {
             options.window_target = Some(self.spawn_target());
+        }
+        // A new tab opens in this window's terminal pane: name its grid so
+        // the Engine starts the child at once, at that size. A pane that
+        // measures differently resizes the child as usual.
+        if options.initial_cols.is_none()
+            && options.initial_rows.is_none()
+            && let Some((cols, rows)) = self.navigation.terminal_grid
+        {
+            options.initial_cols = Some(i64::from(cols));
+            options.initial_rows = Some(i64::from(rows));
         }
         options
     }
@@ -1104,6 +1124,48 @@ mod tests {
         let first = WindowStore::new(Arc::new(RwLock::new(canonical)), Some(ids[0].clone()));
         let second = first.fork();
         (first, second, ids)
+    }
+
+    #[test]
+    fn a_spawn_from_a_window_names_the_grid_its_terminal_pane_measured() {
+        let (first, second, _) = windows();
+        let unsized_spawn = first
+            .write()
+            .unwrap()
+            .scoped_spawn_options(SpawnOptions::default());
+        assert_eq!(
+            (unsized_spawn.initial_cols, unsized_spawn.initial_rows),
+            (None, None),
+            "before the pane measured, the Engine picks the size"
+        );
+
+        first.note_terminal_grid((151, 43));
+        let sized = first
+            .write()
+            .unwrap()
+            .scoped_spawn_options(SpawnOptions::default());
+        assert_eq!((sized.initial_cols, sized.initial_rows), (Some(151), Some(43)));
+
+        let other = second
+            .write()
+            .unwrap()
+            .scoped_spawn_options(SpawnOptions::default());
+        assert_eq!(
+            (other.initial_cols, other.initial_rows),
+            (None, None),
+            "a window's grid never sizes another window's tabs"
+        );
+
+        let explicit = first.write().unwrap().scoped_spawn_options(SpawnOptions {
+            initial_cols: Some(120),
+            initial_rows: Some(32),
+            ..Default::default()
+        });
+        assert_eq!(
+            (explicit.initial_cols, explicit.initial_rows),
+            (Some(120), Some(32)),
+            "a caller's own size wins"
+        );
     }
 
     #[cfg(target_os = "macos")]

@@ -30,6 +30,7 @@ fn reading_view(c: &mut Criterion) {
                 ChangedRow::new(y, vec![cell; usize::from(COLS)])
             })
             .collect(),
+        cursor_style: Default::default(),
     });
     for held in [false, true] {
         element.set_view_offset(i64::from(held), usize::from(ROWS));

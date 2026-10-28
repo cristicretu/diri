@@ -297,6 +297,7 @@ fn snapshot() -> GridUpdate {
                 row.metadata = RowMetadata {
                     links: Vec::new(),
                     graphemes: vec![(3, "\u{301}".into())],
+                    styles: Vec::new(),
                 };
             }
             row
@@ -310,6 +311,7 @@ fn snapshot() -> GridUpdate {
         cursor_visible: true,
         is_full_snapshot: true,
         changed_rows,
+        cursor_style: Default::default(),
     }
 }
 

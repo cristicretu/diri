@@ -224,8 +224,9 @@ pub fn spawn(spec: &PtySpec, launcher: &Launcher) -> Result<super::Pty, Detached
         )));
     }
     stream.write_all(&[GO]).map_err(Unavailable)?;
-    // The socket is close-on-exec: EOF means the exec happened, four bytes
-    // are the errno of one that did not.
+    // The socket is close-on-exec: EOF means the exec happened, or that the
+    // helper explained on the terminal why it could not and exited 127/126.
+    // Four bytes are an older helper's errno for an exec that did not.
     let mut errno = Vec::new();
     stream.read_to_end(&mut errno).map_err(Spawn)?;
     if let Ok(bytes) = <[u8; 4]>::try_from(errno.as_slice()) {
@@ -799,6 +800,11 @@ fn helper(socket: &Path) -> i32 {
         }
     }
     drop(slave);
+    let plan = crate::exec::ExecPlan::new(
+        launch.argv.clone(),
+        launch.env.clone(),
+        launch.path.as_deref(),
+    );
     if stream.write_all(&[READY]).is_err() {
         return 0;
     }
@@ -822,45 +828,15 @@ fn helper(socket: &Path) -> i32 {
             }
         }
     }
-    let error = exec(&launch);
-    let _ = stream.write_all(&error.raw_os_error().unwrap_or(libc::ENOEXEC).to_le_bytes());
-    127
-}
-
-/// `execve`, searching the launch's own `PATH` for a bare program name the
-/// way a direct spawn does.
-fn exec(launch: &Decoded) -> io::Error {
-    let mut argv: Vec<*const libc::c_char> = launch.argv.iter().map(|arg| arg.as_ptr()).collect();
-    argv.push(std::ptr::null());
-    let mut env: Vec<*const libc::c_char> = launch.env.iter().map(|var| var.as_ptr()).collect();
-    env.push(std::ptr::null());
-    let program = launch.argv[0].as_bytes();
-    let candidates: Vec<CString> = if program.contains(&b'/') {
-        vec![launch.argv[0].clone()]
-    } else {
-        launch
-            .path
-            .as_deref()
-            .unwrap_or(b"/usr/bin:/bin:/usr/sbin:/sbin")
-            .split(|byte| *byte == b':')
-            .filter(|directory| !directory.is_empty())
-            .filter_map(|directory| CString::new([directory, b"/", program].concat()).ok())
-            .collect()
-    };
-    // As execvp: skip entries that are missing or not directories, remember
-    // a permission failure, and stop at any other error.
-    let mut denied = false;
-    for candidate in candidates {
-        // SAFETY: NUL-terminated argv/env arrays of live CStrings.
-        unsafe { libc::execve(candidate.as_ptr(), argv.as_ptr(), env.as_ptr()) };
-        let error = io::Error::last_os_error();
-        match error.raw_os_error() {
-            Some(libc::ENOENT | libc::ENOTDIR) => {}
-            Some(libc::EACCES) => denied = true,
-            _ => return error,
-        }
+    // A program that cannot start is explained on the terminal and ends with
+    // the shell's status (127, or 126), like a direct spawn: the launch
+    // itself succeeded, so nothing goes back on the stream and its EOF reads
+    // as an exec. An older parent handles that the same way.
+    // SAFETY: plain execve and write in this single-threaded helper.
+    unsafe {
+        let errno = plan.exec();
+        plan.report(errno)
     }
-    io::Error::from_raw_os_error(if denied { libc::EACCES } else { libc::ENOENT })
 }
 
 /// The framed payload and the descriptor sent with its first byte.

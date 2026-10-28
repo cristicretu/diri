@@ -183,6 +183,11 @@ impl Frame {
         Ok(Self::new(FrameType::Grid, update.encode()?))
     }
 
+    /// The grid as a client from before `terminal-styles-v1` decodes it.
+    pub fn grid_without_styles(update: &GridUpdate) -> Result<Self, GridCodecError> {
+        Ok(Self::new(FrameType::Grid, update.encode_without_styles()?))
+    }
+
     /// `direction` is `0` for up and `1` for down.
     #[must_use]
     pub fn scroll(direction: u8, lines: u16, col: u16, row: u16) -> Self {

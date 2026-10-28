@@ -191,6 +191,13 @@ fn spawn_kill_remove(control: &mut Control) {
     control.request("session.remove", json!({ "sessionID": id }));
 }
 
+/// A tab closed for good while its program runs: the Holder has started (and
+/// written its files) before the remove ends it.
+fn spawn_running_remove(control: &mut Control) {
+    let id = spawn_painted(control, "printf ready; sleep 600");
+    control.request("session.remove", json!({ "sessionID": id }));
+}
+
 fn churn(server: &ControlServer, control: &mut Control, idle: &str, busy: &str, cycles: usize) {
     for index in 0..cycles {
         hook_connection(server, idle);
@@ -200,6 +207,9 @@ fn churn(server: &ControlServer, control: &mut Control, idle: &str, busy: &str, 
         control.request("session.wake", json!({ "sessionID": idle }));
         if index % 4 == 0 {
             spawn_kill_remove(control);
+        }
+        if index % 4 == 2 {
+            spawn_running_remove(control);
         }
     }
 }
@@ -309,6 +319,10 @@ fn threads_and_descriptors_return_to_baseline_after_churn() {
     std::thread::sleep(Duration::from_millis(600));
     let baseline = ProcessStats::current();
     let baseline_targets = descriptor_targets();
+    let holders =
+        diri_engine::holder::paths::HolderPaths::new(&temp.path().join("holders"), "probe")
+            .directory;
+    let baseline_holder_files = holder_files(&holders);
 
     churn(&server, &mut control, &idle, &busy, CYCLES);
     let after = settled(baseline);
@@ -326,4 +340,21 @@ fn threads_and_descriptors_return_to_baseline_after_churn() {
         after.open_fds,
         descriptor_targets(),
     );
+    // Every removed session's Holder files go with it: the directory holds
+    // the live sessions' endpoints, not one record per session ever started.
+    let after_holder_files = holder_files(&holders);
+    assert!(
+        after_holder_files.len() <= baseline_holder_files.len(),
+        "holder directory grew from {baseline_holder_files:?} to {after_holder_files:?} over {CYCLES} churn cycles",
+    );
+}
+
+fn holder_files(directory: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(directory)
+        .expect("holders directory")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
 }

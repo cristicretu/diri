@@ -349,6 +349,7 @@ mod tests {
                 cursor_visible: true,
                 is_full_snapshot: full,
                 changed_rows: Vec::new(),
+                cursor_style: Default::default(),
             })
             .unwrap(),
         )

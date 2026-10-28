@@ -47,10 +47,21 @@ const MAX_SIGNAL: i32 = 65;
 /// a count of frames allowed.
 const OUTPUT_QUEUE_BYTES: usize = 1 << 20;
 
-/// How long the pump waits for a full subscriber queue before giving up on
-/// that subscriber. Long enough to ride out a scheduling hiccup, short enough
-/// that a hung daemon cannot hold the PTY.
-const OUTPUT_SEND_PATIENCE: Duration = Duration::from_millis(50);
+/// How long the pump waits for a full subscriber queue while the subscriber
+/// takes nothing, before giving up on it.
+///
+/// A subscriber that is still reading — the queue, or its log backlog — is
+/// waited for: the daemon is where the session's terminal state is parsed, so
+/// output must not outrun it, exactly as a terminal emulator's own PTY reads
+/// pace a program. A subscriber dropped here lets the program run free until
+/// it resubscribes, and if the log rotates past it meanwhile, those bytes are
+/// never parsed.
+///
+/// So this has to outlast one parse pass of a busy daemon (half a megabyte:
+/// a few milliseconds in a release build, a hundred in a debug one, more on a
+/// loaded machine), while still bounding how long a hung daemon can hold a
+/// program's output: once, for this long, after which it runs free.
+const OUTPUT_SEND_PATIENCE: Duration = Duration::from_millis(500);
 
 /// Buffer for one subscriber's socket writes.
 const OUTPUT_WRITE_BUFFER: usize = 256 << 10;
@@ -92,6 +103,9 @@ struct Shared {
     /// the holder's whole life; closing happens when `run` returns.
     pty: Mutex<Pty>,
     log: Mutex<OutputLog>,
+    /// Signalled after every append, for a resumed subscriber whose backlog
+    /// reaches bytes the log writer has not appended yet.
+    log_grew: std::sync::Condvar,
     /// The log's tail after its last completed append, so a stat need not
     /// wait for the log lock. The writer holds that lock across a disk write,
     /// and a stat queued behind it held the PTY lock meanwhile, which made
@@ -179,7 +193,7 @@ impl HolderServer {
 
         let socket_path = Path::new(&spec.socket_path).to_path_buf();
         if let Some(parent) = socket_path.parent() {
-            std::fs::create_dir_all(parent)
+            diri_platform::private::create_dir_all(parent)
                 .map_err(|error| HolderError::io("create socket directory", error))?;
         }
 
@@ -265,6 +279,7 @@ impl HolderServer {
             guard: guard.clone(),
             pty: Mutex::new(pty),
             log: Mutex::new(log),
+            log_grew: std::sync::Condvar::new(),
             log_tail: AtomicU64::new(epoch_offset),
             epoch_offset,
             finished: AtomicBool::new(false),
@@ -335,11 +350,26 @@ impl HolderServer {
                         // so the offset quoted here is exactly where this
                         // subscriber's first frame will begin.
                         let mut fanout = shared.output.lock().expect("output");
-                        let start_offset = fanout.next_offset;
-                        let response = HolderResponse::output_stream(
-                            HOLDER_OUTPUT_STREAM_VERSION,
-                            start_offset,
-                        );
+                        let live_offset = fanout.next_offset;
+                        // A resumed subscriber first gets what it missed, read
+                        // from the log, then the live frames. The pump waits
+                        // for it the whole time it is reading, so output can
+                        // never run further ahead of it than the queue.
+                        let backlog_start = request.resume_from.map(|from| {
+                            let oldest = shared.log.lock().expect("log").oldest_readable_offset();
+                            from.max(oldest).min(live_offset)
+                        });
+                        let start_offset = backlog_start.unwrap_or(live_offset);
+                        let response = match backlog_start {
+                            Some(_) => HolderResponse::resumed_output_stream(
+                                HOLDER_OUTPUT_STREAM_VERSION,
+                                start_offset,
+                            ),
+                            None => HolderResponse::output_stream(
+                                HOLDER_OUTPUT_STREAM_VERSION,
+                                start_offset,
+                            ),
+                        };
                         socket::set_buffer(&client, libc::SO_SNDBUF, socket::OUTPUT_SOCKET_BUFFER);
                         if socket::write_json_line(&mut client, &response).is_ok() {
                             let frames = super::fanout::FrameQueue::new(OUTPUT_QUEUE_BYTES);
@@ -351,9 +381,12 @@ impl HolderServer {
                             // reading must not keep the PTY master open after
                             // the holder has finished.
                             let holder = Arc::downgrade(&shared);
+                            let backlog = start_offset..live_offset;
                             let _ = std::thread::Builder::new()
                                 .name(format!("holder-output-{}", shared.spec.session_id))
-                                .spawn(move || serve_output_stream(&holder, client, &frames));
+                                .spawn(move || {
+                                    serve_output_stream(&holder, client, &frames, backlog);
+                                });
                         }
                         continue;
                     }
@@ -531,6 +564,10 @@ fn append_log(shared: &Shared, bytes: &[u8]) {
     let mut log = shared.log.lock().expect("log");
     let _ = log.append(bytes);
     shared.log_tail.store(log.tail_offset(), Ordering::Release);
+    drop(log);
+    // One batch per append, and nobody waits unless a resumed subscriber is
+    // reading its backlog, so this costs nothing measurable.
+    shared.log_grew.notify_all();
 }
 
 /// Parks the pump until the PTY has something for it, or the exit path says
@@ -570,7 +607,7 @@ fn wait_for_output(pty_fd: i32, wake: &std::io::PipeReader) -> std::io::Result<b
 
 /// Hands one chunk of PTY output to every attached subscriber.
 ///
-/// A subscriber that cannot accept within [`OUTPUT_SEND_PATIENCE`] is dropped.
+/// A subscriber that takes nothing for [`OUTPUT_SEND_PATIENCE`] is dropped.
 /// That bound is the whole point: waiting a little applies the backpressure a
 /// single-process terminal gets for free, so output cannot race arbitrarily far
 /// ahead of the screen that renders it — and giving up keeps a wedged or dead
@@ -604,8 +641,8 @@ fn broadcast_output(shared: &Shared, frame: &[u8]) {
     });
 }
 
-/// Offers one frame to a subscriber, waiting only as long as
-/// [`OUTPUT_SEND_PATIENCE`] for room.
+/// Offers one frame to a subscriber, waiting for room while it keeps reading
+/// and up to [`OUTPUT_SEND_PATIENCE`] once it stops.
 ///
 /// Returns false when the subscriber should be dropped: either it is gone, or
 /// it is far enough behind that continuing to wait would stall the PTY.
@@ -619,6 +656,7 @@ fn serve_output_stream(
     shared: &Weak<Shared>,
     stream: diri_platform::ipc::UnixStream,
     frames: &Arc<super::fanout::FrameQueue>,
+    backlog: std::ops::Range<u64>,
 ) {
     // The writer parks on the queue, and a write is the only way it would
     // learn the daemon has gone — so through a silent session a dead
@@ -638,7 +676,9 @@ fn serve_output_stream(
     });
 
     let mut stream = std::io::BufWriter::with_capacity(OUTPUT_WRITE_BUFFER, stream);
-    write_output_frames(&mut stream, frames);
+    if write_log_backlog(&mut stream, shared, frames, backlog) {
+        write_output_frames(&mut stream, frames);
+    }
     frames.close();
 
     // Shutdown is what interrupts the watcher's blocking read; dropping this
@@ -671,6 +711,68 @@ fn watch_output_peer(mut peer: diri_platform::ipc::UnixStream, frames: &super::f
         }
     }
     frames.close();
+}
+
+/// Writes a resumed subscriber's backlog, `range`, from the log, as frames
+/// like any other. Returns false when it cannot, and the subscriber is then
+/// closed and falls back to the log itself.
+///
+/// The pump is waiting on this subscriber's full queue meanwhile; every frame
+/// written here tells it the subscriber is still reading, so the PTY is held
+/// at the subscriber's pace rather than lapping it.
+fn write_log_backlog(
+    stream: &mut std::io::BufWriter<diri_platform::ipc::UnixStream>,
+    shared: &Weak<Shared>,
+    frames: &super::fanout::FrameQueue,
+    range: std::ops::Range<u64>,
+) -> bool {
+    let mut from = range.start;
+    while from < range.end {
+        // Upgraded per frame, so a writer stuck on a daemon that stopped
+        // reading does not keep the Holder alive.
+        let Some(holder) = shared.upgrade() else {
+            return false;
+        };
+        let (start, bytes) = {
+            let mut log = holder.log.lock().expect("log");
+            // The log is written behind the pump, so the end of the backlog
+            // can still be on its way there. The wait is bounded only so a
+            // closed subscriber is noticed: the pump has already handed those
+            // bytes to the log writer, which is what will wake it.
+            while log.tail_offset() <= from {
+                if frames.is_closed() || holder.finished.load(Ordering::SeqCst) {
+                    return false;
+                }
+                log = holder
+                    .log_grew
+                    .wait_timeout(log, OUTPUT_SEND_PATIENCE)
+                    .expect("log")
+                    .0;
+            }
+            let wanted = usize::try_from(range.end - from)
+                .unwrap_or(usize::MAX)
+                .min(super::fanout::JOINED_FRAME_BYTES);
+            log.read(from, wanted)
+        };
+        drop(holder);
+        // Rotated past it, or a failed disk write left a hole: either way
+        // these bytes are not here, and the subscriber's own log read is what
+        // records the loss.
+        if start != from || bytes.is_empty() {
+            return false;
+        }
+        let length = bytes.len() as u32;
+        if stream.write_all(&from.to_be_bytes()).is_err()
+            || stream.write_all(&length.to_be_bytes()).is_err()
+            || stream.write_all(&bytes).is_err()
+            || stream.flush().is_err()
+        {
+            return false;
+        }
+        frames.note_progress();
+        from += bytes.len() as u64;
+    }
+    true
 }
 
 /// Writes frames to one subscriber until a write fails or the queue closes.
@@ -1114,13 +1216,8 @@ fn current_stat_without_identity(shared: &Shared) -> HolderStat {
 
 fn write_pid_file(path: &str) -> HolderResult<()> {
     let contents = format!("{}\n", std::process::id());
-    std::fs::write(path, contents).map_err(|error| HolderError::io("write pid file", error))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    diri_platform::private::write(Path::new(path), contents)
+        .map_err(|error| HolderError::io("write pid file", error))
 }
 
 /// Blocks until the watched child has exited, leaving it unreaped.
@@ -1368,6 +1465,83 @@ mod tests {
             .filter_map(Weak::upgrade)
             .find(|shared| shared.spec.session_id == session_id)
             .expect("holder is running")
+    }
+
+    #[test]
+    fn a_resumed_subscriber_gets_its_backlog_and_paces_a_flood_past_the_log() {
+        let root = tempfile::tempdir().unwrap();
+        // A log of a quarter megabyte, which keeps 32 KiB when it rotates,
+        // and a program that prints ten times that as fast as it can.
+        let spec = HolderLaunchSpec {
+            session_id: "s_resume".into(),
+            socket_path: root.path().join("h.sock").to_string_lossy().into_owned(),
+            pid_file_path: root.path().join("h.pid").to_string_lossy().into_owned(),
+            log_file_path: root
+                .path()
+                .join("s_resume.bin")
+                .to_string_lossy()
+                .into_owned(),
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "seq 1 5000; sleep 0.5; seq 5001 400000; exec sleep 30".into(),
+            ],
+            cwd: "/tmp".into(),
+            environment: vec![("PATH".into(), "/usr/bin:/bin".into())]
+                .into_iter()
+                .collect(),
+            cols: 80,
+            rows: 24,
+            disk_capacity: 256 << 10,
+        };
+        let client = HolderClient::new(&spec.socket_path);
+        let server = std::thread::spawn(move || HolderServer::run(spec));
+        wait_until("holder ready", || client.is_alive());
+        let first_part = (1..=5000)
+            .map(|n| format!("{n}\r\n").len() as u64)
+            .sum::<u64>();
+        wait_until("the first part in the log", || {
+            client
+                .stat()
+                .is_ok_and(|stat| stat.log_offset >= first_part)
+        });
+
+        // Resumed from the very start: the first part comes from the log.
+        let mut stream = client
+            .open_output_stream_from(0)
+            .expect("subscribe")
+            .expect("output stream supported");
+        assert!(stream.resumed());
+        assert_eq!(stream.start_offset(), 0);
+
+        let expected: Vec<u8> = (1..=400_000)
+            .flat_map(|n| format!("{n}\r\n").into_bytes())
+            .collect();
+        let mut received = Vec::with_capacity(expected.len());
+        let mut run = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while received.len() < expected.len() {
+            assert!(std::time::Instant::now() < deadline, "stream stalled");
+            // A reader far slower than `seq`, in small bites.
+            match stream.next_run_into(Duration::from_millis(500), 16 << 10, &mut run) {
+                Ok(Some(at)) => {
+                    assert_eq!(at, received.len() as u64, "frames are contiguous");
+                    received.extend_from_slice(&run);
+                }
+                Ok(None) => {}
+                Err(error) => panic!(
+                    "dropped after {} of {} bytes: {error}",
+                    received.len(),
+                    expected.len()
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(received == expected, "every byte, in order");
+
+        client.kill_tree().expect("kill-tree");
+        wait_until("holder finished", || server.is_finished());
+        server.join().expect("join").expect("clean holder exit");
     }
 
     #[test]

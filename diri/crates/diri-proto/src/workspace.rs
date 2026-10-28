@@ -229,6 +229,14 @@ pub enum WorkspaceMutation {
     EqualizeTab {
         tab_id: TabId,
     },
+    /// Lift one pane out of a multi-pane tab into a tab of its own, placed
+    /// right after the source tab in the same workspace and selected. The
+    /// pane keeps its id, so the session it shows keeps running untouched.
+    /// Additive: an Engine without it rejects the unknown variant.
+    BreakPane {
+        tab_id: TabId,
+        pane_id: PaneId,
+    },
 }
 
 /// Where `session.spawn` places a new session in a tab's split tree. It

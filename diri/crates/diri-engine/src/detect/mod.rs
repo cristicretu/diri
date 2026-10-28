@@ -57,6 +57,8 @@ pub struct ManifestEngine {
     /// Each manifest's `agent` object verbatim, for wire surfaces that hand
     /// the descriptor to clients (`agent.readiness` is the agent catalog).
     raw_agents: HashMap<String, serde_json::Value>,
+    /// Built from the manifests on first use and shared by every session.
+    program_reporters: std::sync::OnceLock<std::sync::Arc<crate::status::ProgramReporters>>,
 }
 
 impl ManifestEngine {
@@ -67,7 +69,29 @@ impl ManifestEngine {
                 .map(|manifest| (manifest.id.clone(), manifest))
                 .collect(),
             raw_agents: HashMap::new(),
+            program_reporters: std::sync::OnceLock::new(),
         }
+    }
+
+    /// What each Agent means by its `OSC 7501` reports, from the manifests'
+    /// `agent.programStatus`.
+    pub fn program_reporters(&self) -> std::sync::Arc<crate::status::ProgramReporters> {
+        self.program_reporters
+            .get_or_init(|| {
+                let mut reporters = crate::status::ProgramReporters::default();
+                for (id, manifest) in &self.manifests {
+                    if let Some(spec) = manifest
+                        .agent
+                        .as_ref()
+                        .and_then(|agent| agent.program_status.as_ref())
+                        .filter(|spec| spec.idle_ends_turn)
+                    {
+                        reporters.idle_ends_turn(id, spec.app.as_deref());
+                    }
+                }
+                std::sync::Arc::new(reporters)
+            })
+            .clone()
     }
 
     /// The manifest's `agent` JSON exactly as shipped.
@@ -135,6 +159,7 @@ impl ManifestEngine {
                 Some(base) => {
                     base.manifests.extend(engine.manifests);
                     base.raw_agents.extend(engine.raw_agents);
+                    base.program_reporters = std::sync::OnceLock::new();
                 }
             }
         }
@@ -411,7 +436,7 @@ mod tests {
             .into_iter()
             .map(|id| engine.manifest(id).expect("manifest").rules.len())
             .sum();
-        assert_eq!(rules, 135, "the shipped ruleset lost rules");
+        assert_eq!(rules, 136, "the shipped ruleset lost rules");
 
         for id in engine.ids() {
             let expected_empty = matches!(id, "shell" | "generic");
@@ -1637,6 +1662,64 @@ mod tests {
             "Run npm install -g @openai/codex to update.",
             "",
             "› Ask Codex to do anything",
+        ];
+        assert_eq!(
+            engine
+                .evaluate(&cursor_snapshot(&chat, None), "codex")
+                .unwrap()
+                .state,
+            ManifestState::Idle
+        );
+    }
+
+    /// Codex 0.163's startup "Hooks need review" chooser, as it drew on a
+    /// 120x40 PTY on 2026-10-27. Codex reports no `OSC 7501` until it is
+    /// answered, and its `›` row read as an idle composer.
+    #[test]
+    fn codex_hooks_review_chooser_is_a_question_with_its_choices() {
+        let engine = engine();
+        let chooser = [
+            "",
+            "  Hooks need review",
+            "  1 hook is new or changed.",
+            "  Hooks can run outside the sandbox after you trust them.",
+            "",
+            "",
+            "› 1. Review hooks",
+            "  2. Trust all and continue",
+            "  3. Continue without trusting (hooks won't run)",
+            "",
+            "  enter confirm · esc skip",
+        ];
+        let observation = engine
+            .evaluate(&cursor_snapshot(&chooser, None), "codex")
+            .expect("chooser rule");
+        assert_eq!(observation.state, ManifestState::BlockedQuestion);
+        assert_eq!(observation.matched_rule_id, "hooks-review-prompt");
+        let excerpt = observation.prompt_excerpt.as_deref().unwrap_or_default();
+        assert!(
+            excerpt.trim_start().starts_with("Hooks need review"),
+            "{excerpt:?}"
+        );
+        assert_eq!(
+            observation.options.as_deref(),
+            Some(
+                &[
+                    "Review hooks".to_owned(),
+                    "Trust all and continue".to_owned(),
+                    "Continue without trusting (hooks won't run)".to_owned(),
+                ][..]
+            )
+        );
+
+        // Answered, the chat is up and the composer is idle again.
+        let chat = [
+            "  >_ OpenAI Codex (v0.163.0)",
+            "     /private/tmp/statlab",
+            "",
+            "› Reply with only the word ok.",
+            "",
+            "  GPT-6-Astra low · /private/tmp/statlab",
         ];
         assert_eq!(
             engine

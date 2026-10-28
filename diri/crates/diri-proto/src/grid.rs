@@ -187,6 +187,105 @@ impl Default for GridCell {
     }
 }
 
+/// DECSCUSR cursor shape.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum CursorShape {
+    #[default]
+    Block,
+    Underline,
+    Bar,
+}
+
+/// The cursor a program asked for with DECSCUSR (or mode 12).
+///
+/// It rides grid flag bits 3-5, which every earlier decoder ignores, so the
+/// default (a blinking block: what Diri drew before) is all-zero bits and an
+/// older Engine or Holder reads as exactly that.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct CursorStyle {
+    pub shape: CursorShape,
+    /// The program asked for a cursor that does not blink.
+    pub steady: bool,
+}
+
+impl CursorStyle {
+    const SHAPE_SHIFT: u8 = 3;
+    const STEADY_BIT: u8 = 1 << 5;
+    const MASK: u8 = 0b11 << Self::SHAPE_SHIFT | Self::STEADY_BIT;
+
+    #[must_use]
+    pub const fn flag_bits(self) -> u8 {
+        let shape = match self.shape {
+            CursorShape::Block => 0,
+            CursorShape::Underline => 1,
+            CursorShape::Bar => 2,
+        };
+        shape << Self::SHAPE_SHIFT | if self.steady { Self::STEADY_BIT } else { 0 }
+    }
+
+    /// Reads bits 3-5 of a grid flags byte. The unused shape value 3 reads
+    /// as a block, so a future shape degrades to the old cursor.
+    #[must_use]
+    pub const fn from_flag_bits(flags: u8) -> Self {
+        Self {
+            shape: match (flags >> Self::SHAPE_SHIFT) & 0b11 {
+                1 => CursorShape::Underline,
+                2 => CursorShape::Bar,
+                _ => CursorShape::Block,
+            },
+            steady: flags & Self::STEADY_BIT != 0,
+        }
+    }
+}
+
+/// Underline kinds beyond the one `TermStyle::UNDERLINE` bit (SGR `4:n`).
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UnderlineKind {
+    #[default]
+    None,
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
+
+impl UnderlineKind {
+    #[must_use]
+    pub const fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
+/// Decoration the u16 cell style cannot hold: the underline kind, its color
+/// (SGR 58) and overline (SGR 53), for the half-open cell range
+/// `start..end`. Cells keep `TermStyle::UNDERLINE`, so a renderer that does
+/// not know spans still draws a single underline.
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StyleSpan {
+    pub start: u16,
+    pub end: u16,
+    #[serde(default, skip_serializing_if = "UnderlineKind::is_none")]
+    pub underline: UnderlineKind,
+    /// Packed [`TermColor`]; absent means the cell's own foreground.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub underline_color: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub overline: bool,
+}
+
+impl StyleSpan {
+    /// Whether two spans decorate their cells identically.
+    #[must_use]
+    pub fn same_decoration(&self, other: &Self) -> bool {
+        self.underline == other.underline
+            && self.underline_color == other.underline_color
+            && self.overline == other.overline
+    }
+}
+
 /// Bounded per-row annotations. Targets are spans, never one String per cell.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -195,7 +294,25 @@ pub struct RowMetadata {
     pub links: Vec<LinkSpan>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub graphemes: Vec<(u16, String)>,
+    /// `terminal-styles-v1`: sorted, non-overlapping decoration spans. Only a
+    /// peer that negotiated the capability receives them; older decoders
+    /// reject unknown fields here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub styles: Vec<StyleSpan>,
 }
+
+/// The pre-`terminal-styles-v1` annotation form, borrowed for encoding.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyRowMetadata<'a> {
+    #[serde(skip_serializing_if = "<[LinkSpan]>::is_empty")]
+    links: &'a [LinkSpan],
+    #[serde(skip_serializing_if = "<[(u16, String)]>::is_empty")]
+    graphemes: &'a [(u16, String)],
+}
+
+/// Most spans one row may carry: one per cell.
+pub const MAX_STYLE_SPANS_PER_ROW: usize = 512;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -210,7 +327,24 @@ pub const MAX_LINK_URI_BYTES: usize = 2048;
 
 impl RowMetadata {
     pub fn is_empty(&self) -> bool {
+        self.links.is_empty() && self.graphemes.is_empty() && self.styles.is_empty()
+    }
+
+    /// True when only `terminal-styles-v1` content is missing from the
+    /// legacy form.
+    fn is_legacy_empty(&self) -> bool {
         self.links.is_empty() && self.graphemes.is_empty()
+    }
+
+    /// The decoration span covering `col`, if any. Spans are sorted.
+    #[must_use]
+    pub fn style_at(&self, col: usize) -> Option<&StyleSpan> {
+        let index = self
+            .styles
+            .partition_point(|span| usize::from(span.end) <= col);
+        self.styles
+            .get(index)
+            .filter(|span| usize::from(span.start) <= col)
     }
 
     pub fn validate(&self, cols: usize) -> bool {
@@ -237,6 +371,21 @@ impl RowMetadata {
                 return false;
             }
             previous = Some(*col);
+        }
+        if self.styles.len() > MAX_STYLE_SPANS_PER_ROW {
+            return false;
+        }
+        let mut end = 0;
+        for span in &self.styles {
+            if span.start < end
+                || span.start >= span.end
+                || usize::from(span.end) > cols
+                || (span.underline.is_none() && !span.overline)
+                || (span.underline.is_none() && span.underline_color.is_some())
+            {
+                return false;
+            }
+            end = span.end;
         }
         true
     }
@@ -271,9 +420,36 @@ pub struct GridUpdate {
     pub cursor_visible: bool,
     pub is_full_snapshot: bool,
     pub changed_rows: Vec<ChangedRow>,
+    /// DECSCUSR shape and blink; see [`CursorStyle`].
+    pub cursor_style: CursorStyle,
 }
 
 impl GridUpdate {
+    /// Whether this update carries anything only a `terminal-styles-v1`
+    /// peer understands, so a second, legacy encoding is needed.
+    #[must_use]
+    pub fn has_style_extensions(&self) -> bool {
+        self.cursor_style != CursorStyle::default()
+            || self
+                .changed_rows
+                .iter()
+                .any(|row| !row.metadata.styles.is_empty())
+    }
+
+    /// The update as a peer without `terminal-styles-v1` sees it: no
+    /// decoration spans and the default cursor.
+    pub fn strip_styles(&mut self) {
+        self.cursor_style = CursorStyle::default();
+        for row in &mut self.changed_rows {
+            row.metadata.styles.clear();
+        }
+    }
+
+    /// The exact bytes a pre-`terminal-styles-v1` Engine produced for this
+    /// screen. Equivalent to `strip_styles` then `encode`, without a copy.
+    pub fn encode_without_styles(&self) -> Result<Vec<u8>, GridCodecError> {
+        self.encode_with(false)
+    }
     /// Folds a newer contiguous update into this one while preserving the
     /// exact final grid. The newest row wins; a new snapshot or geometry
     /// replaces everything before it. This is the safe primitive used to
@@ -286,6 +462,7 @@ impl GridUpdate {
         self.cursor_col = newer.cursor_col;
         self.cursor_row = newer.cursor_row;
         self.cursor_visible = newer.cursor_visible;
+        self.cursor_style = newer.cursor_style;
         for row in newer.changed_rows {
             // Decoding intentionally accepts duplicate row ids. Sequential
             // application makes the last one authoritative, so remove every
@@ -298,7 +475,12 @@ impl GridUpdate {
         self.changed_rows.sort_by_key(|row| row.y);
     }
 
+    /// The full form, `terminal-styles-v1` included.
     pub fn encode(&self) -> Result<Vec<u8>, GridCodecError> {
+        self.encode_with(true)
+    }
+
+    fn encode_with(&self, styles: bool) -> Result<Vec<u8>, GridCodecError> {
         let row_count = u16::try_from(self.changed_rows.len())
             .map_err(|_| GridCodecError::TooManyRows(self.changed_rows.len()))?;
         let mut encoded = Vec::new();
@@ -306,22 +488,27 @@ impl GridUpdate {
         put_u16(&mut encoded, self.rows);
         put_u16(&mut encoded, self.cursor_col);
         put_u16(&mut encoded, self.cursor_row);
-        let metadata: Vec<_> = self
-            .changed_rows
-            .iter()
-            .filter(|row| !row.metadata.is_empty())
-            .map(|row| (row.y, &row.metadata))
-            .collect();
-        let flags = u8::from(self.cursor_visible)
+        let annotated = |row: &&ChangedRow| {
+            if styles {
+                !row.metadata.is_empty()
+            } else {
+                !row.metadata.is_legacy_empty()
+            }
+        };
+        let has_metadata = self.changed_rows.iter().any(|row| annotated(&row));
+        let mut flags = u8::from(self.cursor_visible)
             | (u8::from(self.is_full_snapshot) << 1)
-            | (u8::from(!metadata.is_empty()) << 2);
+            | (u8::from(has_metadata) << 2);
+        if styles {
+            flags |= self.cursor_style.flag_bits();
+        }
         encoded.push(flags);
         put_u16(&mut encoded, row_count);
         for row in &self.changed_rows {
             put_u16(&mut encoded, row.y);
             GridRowCodec::append_row(&row.cells, &mut encoded)?;
         }
-        if !metadata.is_empty() {
+        if has_metadata {
             if self
                 .changed_rows
                 .iter()
@@ -329,8 +516,25 @@ impl GridUpdate {
             {
                 return Err(GridCodecError::InvalidMetadata);
             }
-            let data =
-                serde_json::to_vec(&metadata).map_err(|_| GridCodecError::InvalidMetadata)?;
+            let rows = self.changed_rows.iter().filter(annotated);
+            let data = if styles {
+                serde_json::to_vec(&rows.map(|row| (row.y, &row.metadata)).collect::<Vec<_>>())
+            } else {
+                serde_json::to_vec(
+                    &rows
+                        .map(|row| {
+                            (
+                                row.y,
+                                LegacyRowMetadata {
+                                    links: &row.metadata.links,
+                                    graphemes: &row.metadata.graphemes,
+                                },
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            }
+            .map_err(|_| GridCodecError::InvalidMetadata)?;
             if data.len() > MAX_GRID_METADATA_BYTES {
                 return Err(GridCodecError::InvalidMetadata);
             }
@@ -396,6 +600,7 @@ impl GridUpdate {
             cursor_visible: flags & 1 != 0,
             is_full_snapshot: flags & 2 != 0,
             changed_rows,
+            cursor_style: CursorStyle::from_flag_bits(flags & CursorStyle::MASK),
         })
     }
 
@@ -689,6 +894,7 @@ mod tests {
                     ),
                 ],
             )],
+            cursor_style: Default::default(),
         };
         let expected = vec![
             0, 3, 0, 1, 0, 2, 0, 0, 3, 0, 1, // header
@@ -715,6 +921,7 @@ mod tests {
                 ChangedRow::new(0, blank.clone()),
                 ChangedRow::new(1, blank.clone()),
             ],
+            cursor_style: Default::default(),
         };
         let mut row_zero = blank.clone();
         row_zero[0].scalar = u32::from('a');
@@ -726,6 +933,7 @@ mod tests {
             cursor_visible: true,
             is_full_snapshot: false,
             changed_rows: vec![ChangedRow::new(0, row_zero)],
+            cursor_style: Default::default(),
         };
         let mut row_one = blank;
         row_one[0].scalar = u32::from('b');
@@ -737,6 +945,7 @@ mod tests {
             cursor_visible: false,
             is_full_snapshot: false,
             changed_rows: vec![ChangedRow::new(1, row_one)],
+            cursor_style: Default::default(),
         };
 
         let mut sequential = Vec::new();
@@ -801,6 +1010,7 @@ mod tests {
                 cursor_visible: random.bool(),
                 is_full_snapshot: random.bool(),
                 changed_rows,
+                cursor_style: Default::default(),
             };
             let encoded = update.encode().unwrap();
             assert_eq!(GridUpdate::decode(&encoded).unwrap(), update, "case {case}");
@@ -828,6 +1038,7 @@ mod tests {
                 ChangedRow::new(1, vec![red, red, red, red]),
                 ChangedRow::new(2, vec![red]),
             ],
+            cursor_style: Default::default(),
         };
         let mut buffer = vec![red; 100];
         full.apply(&mut buffer);
@@ -868,6 +1079,7 @@ mod tests {
             cursor_visible: true,
             is_full_snapshot: true,
             changed_rows: vec![ChangedRow::new(0, vec![GridCell::BLANK])],
+            cursor_style: Default::default(),
         }
         .encode()
         .unwrap();
@@ -962,6 +1174,7 @@ mod annotation_tests {
             cursor_visible: true,
             is_full_snapshot: true,
             changed_rows: vec![row],
+            cursor_style: Default::default(),
         }
     }
     #[test]
@@ -996,6 +1209,137 @@ mod annotation_tests {
         bad.changed_rows[0].metadata.links[0].uri.push('\x1b');
         assert_eq!(bad.encode(), Err(GridCodecError::InvalidMetadata));
     }
+    fn styled() -> GridUpdate {
+        let mut grid = annotated();
+        grid.cursor_style = CursorStyle {
+            shape: CursorShape::Bar,
+            steady: true,
+        };
+        grid.changed_rows[0].metadata.styles = vec![
+            StyleSpan {
+                start: 1,
+                end: 3,
+                underline: UnderlineKind::Curly,
+                underline_color: Some(TermColor::Rgb(224, 108, 117).packed()),
+                overline: false,
+            },
+            StyleSpan {
+                start: 5,
+                end: 6,
+                underline: UnderlineKind::None,
+                underline_color: None,
+                overline: true,
+            },
+        ];
+        grid
+    }
+
+    #[test]
+    fn styles_and_cursor_shape_round_trip() {
+        let grid = styled();
+        let decoded = GridUpdate::decode(&grid.encode().unwrap()).unwrap();
+        assert_eq!(decoded, grid);
+        assert_eq!(
+            decoded.changed_rows[0]
+                .metadata
+                .style_at(2)
+                .unwrap()
+                .underline,
+            UnderlineKind::Curly
+        );
+        assert!(decoded.changed_rows[0].metadata.style_at(3).is_none());
+        assert!(
+            decoded.changed_rows[0]
+                .metadata
+                .style_at(5)
+                .unwrap()
+                .overline
+        );
+        for shape in [CursorShape::Block, CursorShape::Underline, CursorShape::Bar] {
+            for steady in [false, true] {
+                let style = CursorStyle { shape, steady };
+                assert_eq!(CursorStyle::from_flag_bits(style.flag_bits()), style);
+                assert_eq!(style.flag_bits() & 0b111, 0, "bits 0-2 stay theirs");
+            }
+        }
+        assert_eq!(CursorStyle::default().flag_bits(), 0);
+    }
+
+    #[test]
+    fn legacy_encoding_is_the_pre_styles_wire() {
+        let grid = styled();
+        let mut stripped = grid.clone();
+        stripped.strip_styles();
+        assert!(grid.has_style_extensions());
+        assert!(!stripped.has_style_extensions());
+        let legacy = grid.encode_without_styles().unwrap();
+        assert_eq!(legacy, stripped.encode().unwrap());
+        // No `styles` key: an older decoder's `deny_unknown_fields` accepts it.
+        assert!(!String::from_utf8_lossy(&legacy).contains("styles"));
+        assert_eq!(legacy[8] & CursorStyle::MASK, 0);
+
+        // A row whose only annotation is a style span has none in legacy form.
+        let mut only = GridUpdate {
+            cols: 8,
+            rows: 1,
+            cursor_col: 0,
+            cursor_row: 0,
+            cursor_visible: true,
+            is_full_snapshot: true,
+            changed_rows: vec![ChangedRow::new(0, vec![GridCell::BLANK; 8])],
+            cursor_style: CursorStyle::default(),
+        };
+        let plain = only.encode().unwrap();
+        only.changed_rows[0].metadata.styles = styled().changed_rows[0].metadata.styles.clone();
+        assert_eq!(only.encode_without_styles().unwrap(), plain);
+        assert_eq!(plain[8] & 4, 0);
+    }
+
+    #[test]
+    fn invalid_style_spans_fail() {
+        for bad in [
+            StyleSpan {
+                start: 2,
+                end: 2,
+                underline: UnderlineKind::Double,
+                ..StyleSpan::default()
+            },
+            StyleSpan {
+                start: 0,
+                end: 9,
+                underline: UnderlineKind::Double,
+                ..StyleSpan::default()
+            },
+            StyleSpan {
+                start: 0,
+                end: 1,
+                ..StyleSpan::default()
+            },
+            StyleSpan {
+                start: 0,
+                end: 1,
+                underline_color: Some(1),
+                ..StyleSpan::default()
+            },
+        ] {
+            let mut grid = annotated();
+            grid.changed_rows[0].metadata.styles = vec![bad];
+            assert_eq!(grid.encode(), Err(GridCodecError::InvalidMetadata));
+        }
+        let mut overlapping = styled();
+        overlapping.changed_rows[0].metadata.styles[1].start = 2;
+        assert_eq!(overlapping.encode(), Err(GridCodecError::InvalidMetadata));
+    }
+
+    #[test]
+    fn coalescing_carries_the_newest_cursor_style() {
+        let mut first = annotated();
+        let mut second = styled();
+        second.is_full_snapshot = false;
+        first.coalesce(second);
+        assert_eq!(first.cursor_style.shape, CursorShape::Bar);
+    }
+
     #[test]
     fn coalescing_replaces_annotations_even_when_text_is_unchanged() {
         let mut first = annotated();
