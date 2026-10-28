@@ -22,8 +22,24 @@ fn reference(lines: usize, cols: usize, history: usize, input: &[u8]) -> Term<Vo
     term
 }
 
-fn core(lines: usize, cols: usize, history: usize, reads: &[&[u8]], raw: bool) -> Core {
-    let mut core = Core::new(lines, cols, history);
+/// A packed layout: four-row pages and a budget of `budget` bytes.
+#[derive(Clone, Copy)]
+struct Packing {
+    budget: usize,
+}
+
+fn core(
+    lines: usize,
+    cols: usize,
+    history: usize,
+    reads: &[&[u8]],
+    raw: bool,
+    packing: Option<Packing>,
+) -> Core {
+    let mut core = match packing {
+        None => Core::new(lines, cols, history),
+        Some(p) => Core::with_layout(lines, cols, history, Some(p.budget), Some(4)),
+    };
     core.raw_text = raw;
     let mut parser = Processor::<StdSyncHandler>::new();
     for read in reads {
@@ -56,13 +72,38 @@ fn check(lines: usize, cols: usize, history: usize, input: &[u8]) {
     }
     for raw in [true, false] {
         for reads in &splits {
-            let got = core(lines, cols, history, reads, raw);
+            let got = core(lines, cols, history, reads, raw, None);
             if let Err(error) = compare(&got, &want) {
                 panic!(
                     "raw={raw} reads={:?}: {error}\ninput {:?}",
                     reads.iter().map(|r| r.len()).collect::<Vec<_>>(),
                     String::from_utf8_lossy(input)
                 );
+            }
+        }
+    }
+    // Packed history under budgets that evict: lossless, and the history
+    // kept is the same for every split of the input.
+    let dense_page = 4 * (cols * 8 + 8);
+    for budget in [dense_page / 2, 2 * dense_page, 6 * dense_page, 1 << 20] {
+        let packing = Some(Packing { budget });
+        let first = core(lines, cols, history, &splits[0], true, packing);
+        let kept = first.history_size();
+        let want = reference(lines, cols, kept, input);
+        assert!(
+            first.history_bytes() <= budget.max(2 * dense_page + 1024),
+            "within budget"
+        );
+        for raw in [true, false] {
+            for reads in &splits {
+                let got = core(lines, cols, history, reads, raw, packing);
+                if let Err(error) = compare(&got, &want) {
+                    panic!(
+                        "budget={budget} raw={raw} reads={:?}: {error}\ninput {:?}",
+                        reads.iter().map(|r| r.len()).collect::<Vec<_>>(),
+                        String::from_utf8_lossy(input)
+                    );
+                }
             }
         }
     }
@@ -125,4 +166,13 @@ fn kitten_shaped_text_without_carriage_returns() {
         }
     }
     check(8, 40, 30, &input);
+}
+
+#[test]
+fn text_rows_with_orphaned_halves_and_indents() {
+    let input = "\x1b[5G漢字かな\x1b[6G\x1b[K\r\n\x1b[10Gabc\x1b[3Gxy\r\n\
+                 \x1b[4G漢字\x1b[5G\x1b[1K\n\x1b[2G\t\tq\x1b[44m\x1b[K\x1b[m\n\
+                 漢字漢字漢字\x1b[3Dw\x1b[1Gz\n"
+        .repeat(6);
+    check(4, 12, 40, input.as_bytes());
 }

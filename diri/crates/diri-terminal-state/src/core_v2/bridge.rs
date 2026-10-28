@@ -41,7 +41,7 @@ impl HeadlessScreen {
                     extra: None,
                 };
                 out.set_underline_color(style.underline);
-                for &z in core.zerowidth(line, col) {
+                for z in core.zerowidth(line, col) {
                     out.push_zerowidth(z);
                 }
                 grid[Line(line)][Column(col)] = out;

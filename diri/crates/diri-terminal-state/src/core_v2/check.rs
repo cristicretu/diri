@@ -55,7 +55,7 @@ pub fn compare<T>(core: &Core, reference: &Term<T>) -> Result<(), String> {
                 && style.fg == want.fg
                 && style.bg == want.bg
                 && style.underline == want.underline_color()
-                && core.zerowidth(line, col) == want.zerowidth().unwrap_or(&[]);
+                && core.zerowidth(line, col).as_slice() == want.zerowidth().unwrap_or(&[]);
             if !same {
                 return Err(format!(
                     "line {line} col {col}: got {:?} {:?} {:?} {:?} zw {:?}, want {:?} {:?} {:?} {:?} zw {:?}",

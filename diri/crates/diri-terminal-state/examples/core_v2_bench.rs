@@ -5,8 +5,10 @@
 //!     --example core_v2_bench -- <dir with ascii.bin unicode.bin csi.bin>
 //! ```
 //!
-//! Environment: `CORE_V2_HISTORY` (history rows kept by both cores,
-//! default 10000; 0 turns history off), `CORE_V2_ROUNDS` (default 7),
+//! Environment: `CORE_V2_HISTORY` (history row limit, default the Engine's
+//! 150,000; 0 turns history off), `CORE_V2_BUDGET` (live history bytes,
+//! default the Engine's 4 MiB; `none` keeps history dense), `CORE_V2_RSS`
+//! (`v2` or `engine`: peak RSS of that core alone over `CORE_V2_ONLY`), `CORE_V2_ROUNDS` (default 7),
 //! `CORE_V2_ONLY` (one workload name), `CORE_V2_NO_RAW` (v2 takes text from the
 //! parser's validated runs instead of raw bytes), `CORE_V2_ONLY_V2` (time only v2,
 //! for profiling), `CORE_V2_GOLDEN` (path to `vt_workloads.golden`: every
@@ -14,9 +16,9 @@
 //! needs a history of at least the golden's checked rows).
 //!
 //! Per workload the payload is repeated to at least 64 MiB and fed in
-//! 64 KiB reads. Rounds interleave the three cores (v2, current dense,
-//! current compact), and every timed v2 run must end in exactly the state
-//! a byte-at-a-time parse by the current core reaches: every cell's
+//! 64 KiB reads. Rounds interleave v2 and the Engine's `HeadlessScreen`,
+//! and every timed v2 run must end in exactly the state a byte-at-a-time
+//! parse by the current core (keeping as many history rows) reaches: every cell's
 //! character, cluster, width flags, wrap flag, style flags and colors, over
 //! the whole screen and the whole retained history, plus the cursor. A run
 //! that does not match, or that fed fewer bytes than the payload holds,
@@ -164,25 +166,100 @@ fn summary(mut values: Vec<f64>) -> String {
     )
 }
 
+/// The Engine's terminal: `HeadlessScreen` (compact history bounded at
+/// 4 MiB, notifications, links, images, replies), fed per read as the
+/// Holder feeds it.
+fn feed_engine(screen: &mut HeadlessScreen, payload: &[u8], reps: usize) -> usize {
+    let mut fed = 0;
+    for _ in 0..reps {
+        for chunk in payload.chunks(READ) {
+            screen.feed(chunk);
+            fed += chunk.len();
+            let _ = screen.take_replies();
+            let _ = screen.take_notifications();
+            let _ = screen.take_clipboard();
+        }
+    }
+    fed
+}
+
+fn max_rss_bytes() -> u64 {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: getrusage fills the struct it is given.
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    // Bytes on macOS, KiB on Linux.
+    let rss = usage.ru_maxrss as u64;
+    if cfg!(target_os = "macos") {
+        rss
+    } else {
+        rss * 1024
+    }
+}
+
+/// Settings: `CORE_V2_HISTORY` rows (default 150,000, the Engine's row
+/// ceiling), `CORE_V2_BUDGET` live history bytes (default 4 MiB, the
+/// Engine's budget; `none` keeps every row dense).
+fn settings() -> (usize, Option<usize>) {
+    let history = std::env::var("CORE_V2_HISTORY")
+        .ok()
+        .map_or(diri_terminal_state::HISTORY_ROW_CEILING, |v| {
+            v.parse().expect("rows")
+        });
+    let budget = match std::env::var("CORE_V2_BUDGET").ok().as_deref() {
+        None => Some(4 << 20),
+        Some("none") => None,
+        Some(bytes) => Some(bytes.parse().expect("bytes")),
+    };
+    (history, budget)
+}
+
 fn main() {
     let dir = std::env::args().nth(1).expect("usage: core_v2_bench <dir>");
-    let history: usize = std::env::var("CORE_V2_HISTORY")
-        .ok()
-        .map_or(10_000, |v| v.parse().expect("rows"));
+    let (history, budget) = settings();
     let rounds: usize = std::env::var("CORE_V2_ROUNDS")
         .ok()
         .map_or(7, |v| v.parse().expect("rounds"));
     let only = std::env::var("CORE_V2_ONLY").ok();
+
+    // Peak RSS of one core alone over one workload, in a fresh process.
+    if let Ok(which) = std::env::var("CORE_V2_RSS") {
+        let name = only.expect("CORE_V2_ONLY names the workload");
+        let payload = std::fs::read(format!("{dir}/{name}.bin")).expect("payload");
+        let reps = MIN_BYTES.div_ceil(payload.len());
+        let before = max_rss_bytes();
+        let (fed, history_rows, stored) = match which.as_str() {
+            "v2" => {
+                let mut core = Core::with_budget(LINES, COLS, history, budget);
+                let fed = feed(&mut core, &payload, reps);
+                (fed, core.history_size(), core.history_bytes())
+            }
+            "engine" => {
+                let mut screen = HeadlessScreen::new(COLS, LINES);
+                let fed = feed_engine(&mut screen, &payload, reps);
+                (fed, screen.history_rows(), 0)
+            }
+            other => panic!("CORE_V2_RSS is v2 or engine, not {other}"),
+        };
+        println!(
+            "{which} {name}: fed {fed} B, peak RSS {:.1} MB (process start {:.1} MB), history {history_rows} rows, v2 live history {:.2} MiB",
+            max_rss_bytes() as f64 / 1e6,
+            before as f64 / 1e6,
+            stored as f64 / (1 << 20) as f64,
+        );
+        return;
+    }
+
     let golden = std::env::var("CORE_V2_GOLDEN")
         .ok()
         .map(|path| read_golden(&path));
     println!(
-        "{LINES}x{COLS}, history {history} rows, {READ}-byte reads, >= {} MiB per run, {rounds} rounds",
+        "{LINES}x{COLS}, history <= {history} rows, budget {}, {READ}-byte reads, >= {} MiB per run, {rounds} rounds",
+        budget.map_or("none".to_owned(), |b| format!("{} bytes", b)),
         MIN_BYTES >> 20
     );
     println!(
-        "{:<10} {:>22} {:>22} {:>22}",
-        "workload", "v2 MB/s", "current dense", "current compact"
+        "{:<10} {:>20} {:>20} {:>12} {:>14}",
+        "workload", "v2 MB/s", "Engine MB/s", "v2 rows", "v2 history MiB"
     );
     for name in ["ascii", "unicode", "csi"] {
         if only.as_deref().is_some_and(|o| o != name) {
@@ -192,8 +269,15 @@ fn main() {
         let reps = MIN_BYTES.div_ceil(payload.len());
         let bytes = payload.len() * reps;
 
-        // Reference: the current core, one byte per read.
-        let mut reference = term(history, false);
+        // How many rows v2 keeps (deterministic), then the reference: the
+        // current core keeping exactly that many, one byte per read.
+        let kept = {
+            let mut core = Core::with_budget(LINES, COLS, history, budget);
+            feed(&mut core, &payload, reps);
+            core.history_size()
+        };
+        // Compact storage keeps the reference small; reads decode it.
+        let mut reference = term(kept, true);
         let mut parser = Processor::<StdSyncHandler>::new();
         for _ in 0..reps {
             for byte in payload.chunks(1) {
@@ -217,15 +301,17 @@ fn main() {
         });
         let mut golden_checked = 0;
 
-        let (mut v2, mut dense, mut compact) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut v2, mut engine) = (Vec::new(), Vec::new());
         let mut failure = None;
+        let mut stored = 0;
         for _ in 0..rounds {
-            let mut core = Core::new(LINES, COLS, history);
+            let mut core = Core::with_budget(LINES, COLS, history, budget);
             core.raw_text = std::env::var_os("CORE_V2_NO_RAW").is_none();
             let start = Instant::now();
             let fed = feed(&mut core, &payload, reps);
             let secs = start.elapsed().as_secs_f64();
             assert_eq!(fed, bytes, "every byte is fed");
+            stored = core.history_bytes();
             if let Some(want) = &want {
                 let checked: usize = want["history_rows_checked"].parse().expect("rows");
                 for (key, value) in golden_digest(&core, fed, checked) {
@@ -248,29 +334,27 @@ fn main() {
                     break;
                 }
             }
+            core.release_read_cache();
             drop(core);
 
             if std::env::var_os("CORE_V2_ONLY_V2").is_some() {
-                dense.push(0.0);
-                compact.push(0.0);
+                engine.push(0.0);
                 continue;
             }
-            for (out, is_compact) in [(&mut dense, false), (&mut compact, true)] {
-                let mut current = term(history, is_compact);
-                let start = Instant::now();
-                let fed = feed(&mut current, &payload, reps);
-                let secs = start.elapsed().as_secs_f64();
-                assert_eq!(fed, bytes, "every byte is fed");
-                out.push(bytes as f64 / secs / 1e6);
-            }
+            let mut screen = HeadlessScreen::new(COLS, LINES);
+            let start = Instant::now();
+            let fed = feed_engine(&mut screen, &payload, reps);
+            let secs = start.elapsed().as_secs_f64();
+            assert_eq!(fed, bytes, "every byte is fed");
+            engine.push(bytes as f64 / secs / 1e6);
         }
         match failure {
             Some(error) => println!("{name:<10} v2 FAILED THE STATE CHECK: {error}"),
             None => println!(
-                "{name:<10} {:>22} {:>22} {:>22}{}",
+                "{name:<10} {:>20} {:>20} {kept:>12} {:>14.2}{}",
                 summary(v2),
-                summary(dense),
-                summary(compact),
+                summary(engine),
+                stored as f64 / (1 << 20) as f64,
                 if golden_checked > 0 {
                     format!("  golden ok x{golden_checked}")
                 } else {

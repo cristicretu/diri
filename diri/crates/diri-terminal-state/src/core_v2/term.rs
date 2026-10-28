@@ -14,8 +14,8 @@ use alacritty_terminal::vte::ansi::{
     Attr, ClearMode, Handler, LineClearMode, Mode, NamedMode, NamedPrivateMode, PrivateMode,
 };
 
-use super::cell::{Cell, GRAPHEME, LEADING, MARKS, SPACER, STYLE_SHIFT, Style, WIDE};
-use super::page::Pages;
+use super::cell::{CLUSTER, Cell, GRAPHEME, LEADING, MARKS, SPACER, STYLE_SHIFT, Style, WIDE};
+use super::page::{Pages, RowMeta};
 use super::text::{Tables, tables};
 
 pub struct Core {
@@ -42,8 +42,32 @@ pub struct Core {
 
 impl Core {
     pub fn new(lines: usize, cols: usize, history_rows: usize) -> Core {
+        Core::with_budget(lines, cols, history_rows, None)
+    }
+
+    /// A core whose history is bounded by `budget` live bytes (cold pages
+    /// packed) as well as `history_rows` rows.
+    pub fn with_budget(
+        lines: usize,
+        cols: usize,
+        history_rows: usize,
+        budget: Option<usize>,
+    ) -> Core {
+        Core::with_layout(lines, cols, history_rows, budget, None)
+    }
+
+    /// [`Core::with_budget`] with `page_rows` rows per page (a power of
+    /// two), so tests can seal and evict pages with little output.
+    #[doc(hidden)]
+    pub fn with_layout(
+        lines: usize,
+        cols: usize,
+        history_rows: usize,
+        budget: Option<usize>,
+        page_rows: Option<usize>,
+    ) -> Core {
         Core {
-            pages: Pages::new(lines, cols, history_rows),
+            pages: Pages::new(lines, cols, history_rows, budget, page_rows),
             lines,
             cols,
             line: 0,
@@ -73,6 +97,16 @@ impl Core {
         self.pages.history_size()
     }
 
+    /// Live bytes of history (packed pages plus dense pages holding history).
+    pub fn history_bytes(&self) -> usize {
+        self.pages.history_bytes()
+    }
+
+    /// Heap bytes held by pages.
+    pub fn heap_bytes(&self) -> usize {
+        self.pages.heap_bytes()
+    }
+
     /// The pen's style id in page `page`.
     #[inline(always)]
     fn pen_id(&mut self, page: usize) -> u16 {
@@ -84,15 +118,17 @@ impl Core {
     }
 
     /// The cell at `line` (negative: history) and `col`, the erase fill
-    /// past the row's occupancy.
+    /// past the row's occupancy. Packed history is unpacked to read it.
     pub fn cell(&self, line: i32, col: usize) -> Cell {
         let (p, r) = self.pages.locate_line(line);
         let page = self.pages.page(p);
         let meta = page.meta[r];
         if col >= meta.occ as usize {
             Cell::blank(meta.fill)
-        } else {
+        } else if !page.is_packed() {
             page.cells[r * self.cols + col]
+        } else {
+            self.pages.read(p, |cells, _| cells[r * self.cols + col])
         }
     }
 
@@ -106,16 +142,28 @@ impl Core {
         self.pages.page(p).meta[r].wrapped
     }
 
-    pub fn zerowidth(&self, line: i32, col: usize) -> &[char] {
-        if !self.cell(line, col).has(GRAPHEME) {
-            return &[];
-        }
+    /// The extra codepoints of the cluster at `line`, `col`.
+    pub fn zerowidth(&self, line: i32, col: usize) -> Vec<char> {
         let (p, r) = self.pages.locate_line(line);
-        self.pages
-            .page(p)
-            .graphemes
-            .get(&((r * self.cols + col) as u32))
-            .map_or(&[], Vec::as_slice)
+        if col >= self.pages.page(p).meta[r].occ as usize {
+            return Vec::new();
+        }
+        let cols = self.cols;
+        self.pages.read(p, |cells, clusters| {
+            clusters.of(cells[r * cols + col]).to_vec()
+        })
+    }
+
+    /// The cluster at screen `line`, `col` (always a writable page).
+    fn zerowidth_hot(&self, line: usize, col: usize) -> &[char] {
+        let cell = self.get(line, col);
+        let (p, _) = self.pages.locate(line);
+        self.pages.page(p).clusters.of(cell)
+    }
+
+    /// Releases the read cache of packed history.
+    pub fn release_read_cache(&self) {
+        self.pages.release_read_cache();
     }
 
     /// Makes cells below `upto` real on screen line `line`.
@@ -138,17 +186,43 @@ impl Core {
         self.set_at(p, r, col, f);
     }
 
+    /// The general cell write: the row no longer packs as text.
     fn set_at(&mut self, p: usize, r: usize, col: usize, f: impl FnOnce(Cell) -> Cell) {
         self.materialize(p, r, col + 1);
         let cols = self.cols;
         let page = self.pages.page_mut(p);
         let cell = &mut page.cells[r * cols + col];
         *cell = f(*cell);
-        page.meta[r].dirty = true;
+        let meta = &mut page.meta[r];
+        meta.dirty = true;
+        meta.simple = false;
+        meta.lead = meta.lead.min(col as u16);
+        page.text.invalidate(r);
     }
 
+    /// Records a text write starting at `col` on a row whose occupancy was
+    /// `occ`, in style `style`, for the row's text packing.
+    #[inline(always)]
+    fn note_text(meta: &mut RowMeta, occ: usize, col: usize, style: u16) {
+        if occ == 0 || (col as u16) < meta.lead {
+            meta.lead = col as u16;
+        }
+        if style != meta.fill {
+            meta.simple = false;
+        }
+    }
+
+    /// A cell of screen line `line` (always a writable page).
+    #[inline]
     fn get(&self, line: usize, col: usize) -> Cell {
-        self.cell(line as i32, col)
+        let (p, r) = self.pages.locate(line);
+        let page = self.pages.page(p);
+        let meta = page.meta[r];
+        if col >= meta.occ as usize {
+            Cell::blank(meta.fill)
+        } else {
+            page.cells[r * self.cols + col]
+        }
     }
 
     // ---- the general print path, ported from `Term::input` ----
@@ -168,7 +242,8 @@ impl Core {
     fn write_at_cursor(&mut self, c: char, extra: u64) {
         let (line, col) = (self.line, self.col);
         let (p, r) = self.pages.locate(line);
-        let style = (self.pen_id(p) as u64) << STYLE_SHIFT;
+        let id = self.pen_id(p);
+        let style = (id as u64) << STYLE_SHIFT;
         let old = self.get(line, col);
         if old.has(WIDE | SPACER) {
             if old.has(WIDE) && col + 1 < self.cols {
@@ -176,7 +251,7 @@ impl Core {
             } else if col > 0 {
                 // `clear_wide`: no longer wide, no cluster, a space.
                 self.set(line, col - 1, |cell| {
-                    Cell((cell.0 & !(WIDE | GRAPHEME | super::cell::CP)) | ' ' as u64)
+                    Cell((cell.0 & !(WIDE | GRAPHEME | CLUSTER | super::cell::CP)) | ' ' as u64)
                 });
             }
             if col <= 1 && (line as i32) > -(self.history_size() as i32) {
@@ -184,9 +259,67 @@ impl Core {
                 let last = self.cols - 1;
                 self.set_at(pp, pr, last, |cell| Cell(cell.0 & !LEADING));
             }
+            let marks = self.get(line, col).0 & MARKS;
+            self.set_at(p, r, col, |_| Cell(c as u64 | extra | style | marks));
+        } else {
+            // One cell, as the text paths write it: the row keeps packing
+            // as text when the cell is plain in the fill style.
+            let occ = self.pages.page(p).meta[r].occ as usize;
+            self.materialize(p, r, col + 1);
+            let cols = self.cols;
+            let page = self.pages.page_mut(p);
+            let meta = &mut page.meta[r];
+            Self::note_text(meta, occ, col, id);
+            let marks = old.0 & MARKS;
+            if marks != 0 {
+                meta.simple = false;
+            }
+            meta.dirty = true;
+            if page.text.on {
+                let fill = meta.fill;
+                let fresh = col >= occ && id == fill && page.text.begin(r, occ, col);
+                let logged = fresh
+                    && match extra {
+                        0 if c >= '\u{A0}' => {
+                            let mut buf = [0u8; 4];
+                            page.text.blanks(r, if occ == 0 { 0 } else { col - occ });
+                            page.text
+                                .char(r, c as u64, c.encode_utf8(&mut buf).as_bytes());
+                            true
+                        }
+                        0 if (' '..'\x7f').contains(&c) => {
+                            page.text.blanks(r, if occ == 0 { 0 } else { col - occ });
+                            page.text.push(r, c as u8);
+                            true
+                        }
+                        WIDE => {
+                            let mut buf = [0u8; 4];
+                            page.text.blanks(r, if occ == 0 { 0 } else { col - occ });
+                            page.text
+                                .char(r, c as u64, c.encode_utf8(&mut buf).as_bytes());
+                            true
+                        }
+                        // The spacer right after its character is implied.
+                        SPACER => {
+                            c == ' '
+                                && col == occ
+                                && col > 0
+                                && page.cells[r * cols + col - 1].0 & !super::cell::CP
+                                    == WIDE | style
+                        }
+                        LEADING if c == ' ' => {
+                            page.text.blanks(r, if occ == 0 { 0 } else { col - occ });
+                            page.text.leading(r);
+                            true
+                        }
+                        _ => false,
+                    };
+                if !logged {
+                    page.text.invalidate(r);
+                }
+            }
+            page.cells[r * cols + col] = Cell(c as u64 | extra | style | marks);
         }
-        let marks = self.get(line, col).0 & MARKS;
-        self.set_at(p, r, col, |_| Cell(c as u64 | extra | style | marks));
         if col + 1 == self.cols {
             self.pages.page_mut(p).meta[r].wrapped = false;
         }
@@ -194,15 +327,13 @@ impl Core {
 
     fn push_zerowidth(&mut self, line: usize, col: usize, c: char) {
         let (p, r) = self.pages.locate(line);
-        let had = self.get(line, col).has(GRAPHEME);
-        self.set_at(p, r, col, |cell| Cell(cell.0 | GRAPHEME));
-        let key = (r * self.cols + col) as u32;
+        self.materialize(p, r, col + 1);
+        let cols = self.cols;
         let page = self.pages.page_mut(p);
-        let list = page.graphemes.entry(key).or_default();
-        if !had {
-            list.clear();
-        }
-        list.push(c);
+        page.push_zerowidth(r * cols + col, c);
+        page.meta[r].dirty = true;
+        page.meta[r].simple = false;
+        page.text.invalidate(r);
     }
 
     fn input_general(&mut self, c: char) {
@@ -210,10 +341,28 @@ impl Core {
             return;
         }
         let info = Info::of(c);
-        if grapheme::may_join(c, info) && self.continue_cluster(c, info) {
+        let width = info.width();
+        // A zero-width mark after a cell that is no cluster of its own
+        // making: `continue_cluster` would decline (it joins such a mark
+        // only to a lone regional indicator, keycap or emoji modifier), so
+        // the mark goes straight onto that cell.
+        let mark_only = width == 0 && !grapheme::is_presentation_mark(c) && {
+            let mut col = self.col;
+            if !self.wrap_pending {
+                col = col.saturating_sub(1);
+            }
+            if self.get(self.line, col).has(SPACER) {
+                col = col.saturating_sub(1);
+            }
+            let cell = self.get(self.line, col);
+            cell.has(GRAPHEME) || {
+                let base = cell.ch();
+                !Cluster::new(base, Info::of(base)).presentation()
+            }
+        };
+        if !mark_only && grapheme::may_join(c, info) && self.continue_cluster(c, info) {
             return;
         }
-        let width = info.width();
         if width == 0 {
             let mut col = self.col;
             if !self.wrap_pending {
@@ -278,7 +427,7 @@ impl Core {
         }
         let mut buffer = ['\0'; MAX_CLUSTER_CHARS];
         let zerowidth = {
-            let stored = self.zerowidth(line as i32, col);
+            let stored = self.zerowidth_hot(line, col);
             if stored.len() >= MAX_CLUSTER_CHARS {
                 return false;
             }
@@ -365,7 +514,7 @@ impl Core {
             }
             let cluster = self.get(line, col);
             let cluster_style = self.style_of(line as i32, cluster);
-            let zerowidth = self.zerowidth(line as i32, col).to_vec();
+            let zerowidth = self.zerowidth_hot(line, col).to_vec();
             self.wrap_pending = false;
             self.col = col;
             self.write_at_cursor(' ', LEADING);
@@ -454,6 +603,19 @@ impl Core {
                 cell.0 = byte as u64 | style;
             }
         }
+        if written > 0 {
+            let id = (style >> STYLE_SHIFT) as u16;
+            Self::note_text(meta, occ, x, id);
+            let text = &mut page.text;
+            if text.on {
+                if x >= occ && id == meta.fill && text.begin(r, occ, x) {
+                    text.blanks(r, if occ == 0 { 0 } else { x - occ });
+                    text.extend(r, &seg[..written]);
+                } else {
+                    text.invalidate(r);
+                }
+            }
+        }
         meta.occ = occ.max(x + written) as u16;
         meta.dirty = true;
         if x + written == cols {
@@ -480,6 +642,13 @@ impl Core {
         if x0 > occ {
             row[occ..x0].fill(Cell::blank(meta.fill));
         }
+        let text = &mut page.text;
+        let id = (style >> STYLE_SHIFT) as u16;
+        // Fresh cells in the fill style extend the row's text tokens.
+        let log = x0 >= occ && id == meta.fill && text.begin(r, occ, x0);
+        if log && occ > 0 {
+            text.blanks(r, x0 - occ);
+        }
         let mut x = x0;
         let mut i = 0;
         let mut cps = [0u32; 16];
@@ -487,6 +656,20 @@ impl Core {
             if bytes.len() - i >= 48 && cols - x >= 4 {
                 let found = tables.wide_run16(&bytes[i..], &mut cps);
                 let fits = found.min((cols - x) / 2);
+                if fits > 0 && x >= occ {
+                    // Fresh cells: nothing to keep or clear.
+                    let (glyph, spacer) = (WIDE | style, ' ' as u64 | SPACER | style);
+                    for (pair, &cp) in row[x..x + 2 * fits].chunks_exact_mut(2).zip(&cps[..fits]) {
+                        pair[0].0 = cp as u64 | glyph;
+                        pair[1].0 = spacer;
+                    }
+                    if log {
+                        text.chars3(r, &cps[..fits], &bytes[i..i + 3 * fits]);
+                    }
+                    x += 2 * fits;
+                    i += 3 * fits;
+                    continue;
+                }
                 if fits > 0 {
                     for &cp in &cps[..fits] {
                         let (glyph, spacer) = if x + 1 < occ {
@@ -534,8 +717,18 @@ impl Core {
                 row[x].0 = cp as u64 | WIDE | style | (old & MARKS);
                 row[x + 1].0 = ' ' as u64 | SPACER | style | (old2 & MARKS);
             }
+            if log {
+                text.char(r, cp as u64, &bytes[i..i + len]);
+            }
             x += width;
             i += len;
+        }
+        if x > x0 || x0 > occ {
+            // Written cells, or at least the blanks of the gap before x0.
+            Self::note_text(meta, occ, x0, id);
+            if text.on && !log {
+                text.invalidate(r);
+            }
         }
         meta.occ = occ.max(x) as u16;
         if x > x0 {
@@ -719,9 +912,27 @@ impl Handler for Core {
             let (line, col) = (self.line, self.col);
             let cell = self.get(line, col);
             if cell.ch() == ' ' {
-                self.set(line, col, |cell| {
-                    Cell((cell.0 & !super::cell::CP) | '\t' as u64)
-                });
+                let (p, r) = self.pages.locate(line);
+                let occ = self.pages.page(p).meta[r].occ as usize;
+                self.materialize(p, r, col + 1);
+                let cols = self.cols;
+                let page = self.pages.page_mut(p);
+                let meta = &mut page.meta[r];
+                Self::note_text(meta, occ, col, cell.style());
+                if cell.0 & !(super::cell::CP | super::cell::STYLE) != 0 {
+                    meta.simple = false;
+                }
+                if page.text.on {
+                    if col >= occ && cell.style() == meta.fill && page.text.begin(r, occ, col) {
+                        page.text.blanks(r, if occ == 0 { 0 } else { col - occ });
+                        page.text.push(r, b'\t');
+                    } else {
+                        page.text.invalidate(r);
+                    }
+                }
+                meta.dirty = true;
+                let target = &mut page.cells[r * cols + col];
+                target.0 = (target.0 & !super::cell::CP) | '\t' as u64;
             }
             loop {
                 if self.col + 1 == self.cols {
@@ -809,9 +1020,20 @@ impl Handler for Core {
         if right == cols && (left == 0 || meta.fill == id) {
             if left == 0 {
                 meta.fill = id;
+                meta.simple = true;
+                meta.lead = 0;
+                page.text.reset(r);
+            } else if (left as u16) < meta.occ {
+                page.text.invalidate(r);
             }
             meta.occ = meta.occ.min(left as u16);
+            meta.lead = meta.lead.min(meta.occ);
         } else {
+            page.text.invalidate(r);
+            if meta.fill != id {
+                meta.simple = false;
+            }
+            meta.lead = meta.lead.min(left as u16);
             self.materialize(p, r, right);
             let page = self.pages.page_mut(p);
             page.cells[r * cols + left..r * cols + right].fill(Cell::blank(id));

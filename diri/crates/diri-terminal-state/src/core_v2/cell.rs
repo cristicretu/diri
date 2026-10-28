@@ -11,7 +11,7 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor};
 /// | 21..26 | WIDE, SPACER, LEADING_SPACER, GRAPHEME, HYPERLINK        |
 /// | 26..31 | shell marks (OSC 133 A/B/C/D-ok/D-failed)                |
 /// | 32..48 | style id in the owning page's style table (0 = default) |
-/// | 48..64 | reserved (image placement / extra id)                   |
+/// | 48..64 | cluster index in the page's arena, with GRAPHEME         |
 ///
 /// Row-level facts (soft wrap, occupancy, the erase fill) live in the row's
 /// [`RowMeta`](super::page::RowMeta), not in cells.
@@ -28,6 +28,10 @@ pub const HYPERLINK: u64 = 1 << 25;
 pub const MARKS_SHIFT: u32 = 26;
 pub const MARKS: u64 = 0x1F << MARKS_SHIFT;
 pub const STYLE_SHIFT: u32 = 32;
+pub const STYLE: u64 = 0xFFFF << STYLE_SHIFT;
+/// Index of the cell's cluster in the page's cluster arena (with GRAPHEME).
+pub const CLUSTER_SHIFT: u32 = 48;
+pub const CLUSTER: u64 = 0xFFFF << CLUSTER_SHIFT;
 
 impl Cell {
     #[inline(always)]
