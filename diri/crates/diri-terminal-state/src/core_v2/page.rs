@@ -49,11 +49,17 @@ pub struct StyleTable {
 }
 
 impl StyleTable {
-    #[inline]
+    #[inline(always)]
     pub fn intern(&mut self, style: &Style) -> u16 {
-        if *style == Style::default() {
+        debug_assert_eq!(style.is_default(), *style == Style::default());
+        if style.is_default() {
             return 0;
         }
+        self.intern_other(style)
+    }
+
+    #[inline(never)]
+    fn intern_other(&mut self, style: &Style) -> u16 {
         if self.table.is_empty() {
             self.table.push(Style::default());
         }
@@ -125,9 +131,15 @@ impl Clusters {
         self.chars.clear();
     }
 
-    fn release(&mut self) {
-        self.spans = Vec::new();
-        self.chars = Vec::new();
+    /// Empties the arena for the next page, keeping a small one's
+    /// capacity (a page of marks takes a few KiB) and freeing a large one.
+    fn reuse(&mut self) {
+        const KEEP: usize = 16 << 10;
+        if self.spans.capacity() * 8 + self.chars.capacity() * 4 > KEEP {
+            *self = Clusters::default();
+        } else {
+            self.clear();
+        }
     }
 
     /// A new cluster holding `chars`; returns its index.
@@ -153,7 +165,7 @@ impl Clusters {
         self.spans[index].1 += 1;
     }
 
-    fn full(&self) -> bool {
+    pub fn full(&self) -> bool {
         self.spans.len() >= 0xFFFF || self.chars.len() >= 1 << 20
     }
 }
@@ -283,8 +295,27 @@ impl TextLog {
             let index = cp - CJK_BASE;
             self.extend(row, &[CJK_LEADS[(index >> 8) as usize], index as u8]);
         } else {
-            self.extend(row, utf8);
+            self.small(row, utf8);
         }
+    }
+
+    /// One to four bytes, without a call to `memcpy`.
+    #[inline(always)]
+    fn small(&mut self, row: usize, bytes: &[u8]) {
+        debug_assert!((1..=4).contains(&bytes.len()));
+        self.bytes.reserve(4);
+        let len = self.bytes.len();
+        // SAFETY: four bytes are reserved past `len`; only `bytes.len()` of
+        // them become part of the vector.
+        let mut word = 0u32;
+        for (k, &b) in bytes.iter().enumerate() {
+            word |= (b as u32) << (8 * k);
+        }
+        unsafe {
+            (self.bytes.as_mut_ptr().add(len) as *mut u32).write_unaligned(word.to_le());
+            self.bytes.set_len(len + bytes.len());
+        }
+        self.spans[row].1 += bytes.len() as u32;
     }
 
     /// Tokens of `cps`, three-byte characters whose UTF-8 is `utf8`.
@@ -312,6 +343,13 @@ impl TextLog {
         // SAFETY: `w` bytes were written within the reserved capacity.
         unsafe { self.bytes.set_len(len + w) };
         self.spans[row].1 += w as u32;
+    }
+
+    /// A zero-width mark on the cell before the row's last token.
+    #[inline]
+    pub fn mark(&mut self, row: usize, utf8: &[u8]) {
+        self.push(row, T_MARK);
+        self.small(row, utf8);
     }
 
     pub fn leading(&mut self, row: usize) {
@@ -352,6 +390,10 @@ const T_BLANKS: u8 = 4;
 /// A leading spacer: a blank with LEADING, before a wide character that
 /// wrapped to the next row.
 const T_LEADING: u8 = 5;
+/// In a text row: a zero-width mark (its UTF-8 follows) joining the cluster
+/// of the cell before (its character, when that is a spacer). 0xC0 starts
+/// no other token, in text or general rows.
+const T_MARK: u8 = 0xC0;
 /// A row packed as text (see [`Page::pack_text_row`]).
 const T_TEXT_ROW: u8 = 0x7F;
 const FLAGS: u64 = 0x7FF << 21;
@@ -633,13 +675,23 @@ fn pack_text_row(cells: &[Cell], meta: &RowMeta, out: &mut Vec<u8>) -> bool {
     true
 }
 
-/// Decodes text-row tokens at `data[*at..]` into the `occ` cells of a row
-/// whose first `lead` cells are blanks of style `fill`.
-fn decode_text_row(data: &[u8], at: &mut usize, fill: u16, lead: usize, occ: usize) -> Vec<Cell> {
+/// Decodes text-row tokens at `data[*at..]` into `cells`, the occupied
+/// cells of a row whose first `lead` are blanks of style `fill`, adding
+/// marks to `clusters`.
+fn decode_text_row(
+    data: &[u8],
+    at: &mut usize,
+    fill: u16,
+    lead: usize,
+    cells: &mut [Cell],
+    clusters: &mut Clusters,
+) {
     let fill = (fill as u64) << STYLE_SHIFT;
-    let mut cells = vec![Cell(fill); occ];
+    let occ = cells.len();
+    cells.fill(Cell(fill));
     let mut x = lead;
-    while x < occ {
+    // A mark may follow the row's last cell.
+    while x < occ || data.get(*at) == Some(&T_MARK) {
         let byte = data[*at];
         *at += 1;
         let cp = match CJK_HIGH[byte as usize] {
@@ -652,6 +704,15 @@ fn decode_text_row(data: &[u8], at: &mut usize, fill: u16, lead: usize, occ: usi
                 let n = data[*at] as usize;
                 *at += 1;
                 x += n;
+                continue;
+            }
+            _ if byte == T_MARK => {
+                let c = char::from_u32(read_utf8(data, at) as u32).expect("a mark");
+                let mut base = x - 1;
+                if cells[base].has(SPACER) {
+                    base -= 1;
+                }
+                push_mark(cells, clusters, base, c);
                 continue;
             }
             0xFF if byte < 0x80 => byte as u64,
@@ -674,7 +735,19 @@ fn decode_text_row(data: &[u8], at: &mut usize, fill: u16, lead: usize, occ: usi
             x += 1;
         }
     }
-    cells
+}
+
+/// Adds `c` to the cluster of `cells[index]`, starting one when the cell
+/// has none. The caller makes sure the arena is not [`Clusters::full`].
+#[inline]
+pub fn push_mark(cells: &mut [Cell], clusters: &mut Clusters, index: usize, c: char) {
+    let cell = cells[index];
+    if cell.has(GRAPHEME) {
+        clusters.push((cell.0 >> CLUSTER_SHIFT) as usize, c);
+    } else {
+        let k = clusters.add(&[c]);
+        cells[index] = Cell((cell.0 & !CLUSTER) | GRAPHEME | k << CLUSTER_SHIFT);
+    }
 }
 
 /// Unchecked byte output into reserved capacity, with pending blanks.
@@ -787,7 +860,7 @@ fn unpack_meta(data: &[u8], metas: &mut [RowMeta]) -> usize {
 }
 
 /// Dense buffers a packed page leaves behind, reused by the next tail page.
-type DenseBuffers = (Box<[Cell]>, Box<[RowMeta]>, TextLog);
+type DenseBuffers = (Box<[Cell]>, Box<[RowMeta]>, TextLog, Clusters);
 
 impl Page {
     fn new(
@@ -797,11 +870,12 @@ impl Page {
         dense: Option<DenseBuffers>,
         logging: bool,
     ) -> Page {
-        let (cells, meta, text) = dense.unwrap_or_else(|| {
+        let (cells, meta, text, clusters) = dense.unwrap_or_else(|| {
             (
                 vec![Cell::default(); rows * cols].into_boxed_slice(),
                 vec![RowMeta::default(); rows].into_boxed_slice(),
                 TextLog::new(rows, logging),
+                Clusters::default(),
             )
         });
         Page {
@@ -810,7 +884,7 @@ impl Page {
             cells,
             meta,
             styles: StyleTable::default(),
-            clusters: Clusters::default(),
+            clusters,
             text,
             packed: None,
         }
@@ -835,13 +909,7 @@ impl Page {
         if self.clusters.full() {
             self.compact_clusters();
         }
-        let cell = self.cells[index];
-        if cell.has(GRAPHEME) {
-            self.clusters.push((cell.0 >> CLUSTER_SHIFT) as usize, c);
-        } else {
-            let k = self.clusters.add(&[c]);
-            self.cells[index] = Cell((cell.0 & !CLUSTER) | GRAPHEME | k << CLUSTER_SHIFT);
-        }
+        push_mark(&mut self.cells, &mut self.clusters, index, c);
     }
 
     /// Rebuilds the arena from the clusters cells still name.
@@ -883,26 +951,6 @@ impl Page {
             if occ > 0
                 && let Some(tokens) = self.text.get(row)
             {
-                let meta = &self.meta[row];
-                debug_assert_eq!(
-                    decode_text_row(&tokens[2..], &mut 0, meta.fill, meta.lead as usize, occ).len(),
-                    occ
-                );
-                debug_assert!(
-                    {
-                        let mut at = 0;
-                        let mut lead = tokens[1] as usize;
-                        let mut skip = 2;
-                        if lead == 255 {
-                            lead = u16::from_le_bytes([tokens[2], tokens[3]]) as usize;
-                            skip = 4;
-                        }
-                        lead == meta.lead as usize
-                            && decode_text_row(&tokens[skip..], &mut at, meta.fill, lead, occ)
-                                == cells
-                    },
-                    "text log of row {row}"
-                );
                 out.extend_from_slice(tokens);
                 continue;
             }
@@ -1041,12 +1089,13 @@ impl Page {
         }
         #[cfg(not(debug_assertions))]
         let _ = cols;
-        self.clusters.release();
         self.styles.freeze();
         let text = std::mem::replace(&mut self.text, TextLog::new(0, false));
         let cells = std::mem::take(&mut self.cells);
         let meta = std::mem::take(&mut self.meta);
-        (cells, meta, text)
+        let mut clusters = std::mem::take(&mut self.clusters);
+        clusters.reuse();
+        (cells, meta, text, clusters)
     }
 
     /// Decodes a packed page into `metas` (its rows), `cells` (rows *
@@ -1075,8 +1124,7 @@ impl Page {
                     at += 2;
                 }
                 metas[row].lead = lead as u16;
-                let row_cells = decode_text_row(data, &mut at, metas[row].fill, lead, occ);
-                cells.copy_from_slice(&row_cells);
+                decode_text_row(data, &mut at, metas[row].fill, lead, cells, clusters);
                 continue;
             }
             let mut x = 0;
@@ -1394,11 +1442,11 @@ impl Pages {
             }
             let cols = self.cols;
             let page = &mut self.pages[self.sealed];
-            let (cells, meta, mut text) = page.pack(cols, &mut self.scratch);
+            let (cells, meta, mut text, clusters) = page.pack(cols, &mut self.scratch);
             self.packed_bytes += page.stored_bytes();
             if self.spare_dense.len() < 2 {
                 text.clear();
-                self.spare_dense.push((cells, meta, text));
+                self.spare_dense.push((cells, meta, text, clusters));
             }
             self.sealed += 1;
         }

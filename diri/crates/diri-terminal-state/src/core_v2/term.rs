@@ -15,7 +15,7 @@ use alacritty_terminal::vte::ansi::{
 };
 
 use super::cell::{CLUSTER, Cell, GRAPHEME, LEADING, MARKS, SPACER, STYLE_SHIFT, Style, WIDE};
-use super::page::{Pages, RowMeta};
+use super::page::{Clusters, Pages, RowMeta, push_mark};
 use super::text::{Tables, tables};
 
 pub struct Core {
@@ -651,6 +651,7 @@ impl Core {
         }
         let mut x = x0;
         let mut i = 0;
+        let mut marked = false;
         let mut cps = [0u32; 16];
         'row: while i < bytes.len() && x < cols {
             if bytes.len() - i >= 48 && cols - x >= 4 {
@@ -695,11 +696,27 @@ impl Core {
                     continue;
                 }
             }
-            let Some((cp, len, width)) = tables.decode(&bytes[i..]) else {
+            let Some((cp, len, class)) = tables.decode(&bytes[i..]) else {
                 break;
             };
-            let width = width as usize;
-            if width == 0 || x + width > cols {
+            let width = if class != 0 {
+                class as usize
+            } else {
+                match classify_rare(cp, row, x, &page.clusters) {
+                    Rare::Width(width) => width,
+                    Rare::Mark(base, c) => {
+                        push_mark(row, &mut page.clusters, base, c);
+                        marked = true;
+                        if log {
+                            text.mark(r, &bytes[i..i + len]);
+                        }
+                        i += len;
+                        continue;
+                    }
+                    Rare::General => break,
+                }
+            };
+            if x + width > cols {
                 break;
             }
             let old = if x < occ { row[x].0 } else { 0 };
@@ -723,7 +740,7 @@ impl Core {
             x += width;
             i += len;
         }
-        if x > x0 || x0 > occ {
+        if x > x0 || x0 > occ || marked {
             // Written cells, or at least the blanks of the gap before x0.
             Self::note_text(meta, occ, x0, id);
             if text.on && !log {
@@ -731,6 +748,10 @@ impl Core {
             }
         }
         meta.occ = occ.max(x) as u16;
+        if marked {
+            meta.dirty = true;
+            meta.simple = false;
+        }
         if x > x0 {
             meta.dirty = true;
             if x == cols {
@@ -745,6 +766,11 @@ impl Core {
     fn ascii_run(&mut self, bytes: &[u8]) {
         let mut i = 0;
         while i < bytes.len() {
+            if self.wrap_pending && !self.insert && self.line_wrap {
+                // What `input_general` does first for a character that
+                // starts its own cluster, as printable ASCII always does.
+                self.wrapline();
+            }
             if self.wrap_pending || self.insert {
                 self.input_general(bytes[i] as char);
                 i += 1;
@@ -859,22 +885,43 @@ impl Handler for Core {
         }
         let mut i = 0;
         let mut last = None;
+        // The end of the last text segment when it printed last: decoded
+        // once, on the way out.
+        let mut last_text = None;
         while i < bytes.len() {
             let b = bytes[i];
             if (0x20..0x7F).contains(&b) {
                 let end = printable_ascii_end(bytes, i + 1);
                 self.ascii_run(&bytes[i..end]);
                 last = Some(bytes[end - 1] as char);
+                last_text = None;
                 i = end;
                 continue;
             }
             if b >= 0x80 {
+                // The table's classes 1 and 2 start their own cluster.
+                let own = || matches!(self.tables.decode(&bytes[i..]), Some((_, _, 1 | 2)));
+                if self.wrap_pending && !self.insert && self.line_wrap && own() {
+                    self.wrapline();
+                }
                 if !self.wrap_pending && !self.insert {
                     let (used, columns) = self.write_text_segment(&bytes[i..]);
                     if used > 0 {
-                        last = last_char(&bytes[i..i + used]);
+                        last_text = Some(i + used);
                         i += used;
                         self.advance_cursor(self.col + columns);
+                        continue;
+                    }
+                    // A two-column character in the last column: a leading
+                    // spacer and a wrap, as `input_general` does, then the
+                    // character goes through the text path on the next row.
+                    if self.line_wrap
+                        && self.col + 1 == self.cols
+                        && self.cols >= 2
+                        && matches!(self.tables.decode(&bytes[i..]), Some((_, _, 2)))
+                    {
+                        self.write_at_cursor(' ', LEADING);
+                        self.wrapline();
                         continue;
                     }
                 }
@@ -883,6 +930,7 @@ impl Handler for Core {
                         let c = char::from_u32(cp).expect("validated");
                         self.input_general(c);
                         last = Some(c);
+                        last_text = None;
                         i += len;
                         continue;
                     }
@@ -898,6 +946,9 @@ impl Handler for Core {
                 _ => break,
             }
             i += 1;
+        }
+        if let Some(end) = last_text {
+            last = last_char(&bytes[..end]);
         }
         (i, last)
     }
@@ -1190,10 +1241,89 @@ impl Handler for Core {
     }
 }
 
+/// How the text path places a character the class table sends to the
+/// general path (class 0).
+enum Rare {
+    /// It starts its own cluster: write it like any other character.
+    Width(usize),
+    /// A zero-width mark that goes straight onto the cluster of the cell
+    /// at this index, as `input_general` would put it.
+    Mark(usize, char),
+    /// Anything else: the general path.
+    General,
+}
+
+/// Places a class-0 character at `x` on a row the text path is writing
+/// (no wrap pending, no insert mode). Every cell before `x` is real.
+/// Mirrors `input_general` and `continue_cluster` for the cases it accepts:
+/// - characters past the BMP that never join (the table covers only the
+///   BMP);
+/// - emoji and Indic consonants, which `continue_cluster` joins only to a
+///   cell that already holds a cluster;
+/// - zero-width marks that are not presentation marks, onto a cell
+///   `continue_cluster` would not extend (`mark_only`), or any mark that
+///   cannot join (both go straight onto the cell).
+#[inline]
+fn classify_rare(cp: u32, row: &[Cell], x: usize, clusters: &Clusters) -> Rare {
+    if cp < 0xA0 {
+        return Rare::General;
+    }
+    // SAFETY: `Tables::decode` returns only scalar values.
+    let c = unsafe { char::from_u32_unchecked(cp) };
+    let info = Info::of(c);
+    let width = info.width();
+    let joins = grapheme::may_join(c, info);
+    // The cell `continue_cluster` looks at: the one before `x`, or the
+    // character of a spacer there.
+    let base = || -> Option<usize> {
+        let mut base = x.checked_sub(1)?;
+        if row[base].has(SPACER) {
+            base = base.checked_sub(1)?;
+        }
+        Some(base)
+    };
+    if width > 0 {
+        if !joins {
+            return Rare::Width(width);
+        }
+        if !matches!(
+            info.class(),
+            Class::ExtendedPictographic | Class::EmojiModifierBase | Class::IndicConsonant
+        ) {
+            return Rare::General;
+        }
+        // At column 0, or after a spacer at column 0, it cannot join; a
+        // spacer or leading spacer as the base declines too; otherwise it
+        // joins only a cell whose cluster has extra codepoints.
+        return match base() {
+            Some(base) if row[base].has(GRAPHEME) => Rare::General,
+            _ => Rare::Width(width),
+        };
+    }
+    if grapheme::is_presentation_mark(c) || clusters.full() {
+        return Rare::General;
+    }
+    let Some(base) = base() else {
+        return Rare::General;
+    };
+    let cell = row[base];
+    let mark_only = cell.has(GRAPHEME) || {
+        let b = cell.ch();
+        !Cluster::new(b, Info::of(b)).presentation()
+    };
+    if mark_only || !joins {
+        Rare::Mark(base, c)
+    } else {
+        Rare::General
+    }
+}
+
 /// The last character of valid UTF-8 `bytes`.
 fn last_char(bytes: &[u8]) -> Option<char> {
     let start = bytes.iter().rposition(|&b| b & 0xC0 != 0x80)?;
-    std::str::from_utf8(&bytes[start..]).ok()?.chars().next()
+    let (cp, len, _) = tables().decode(&bytes[start..])?;
+    debug_assert_eq!(start + len, bytes.len());
+    char::from_u32(cp)
 }
 
 /// The end of the printable ASCII run that continues at `from`, sixteen

@@ -176,3 +176,18 @@ fn text_rows_with_orphaned_halves_and_indents() {
         .repeat(6);
     check(4, 12, 40, input.as_bytes());
 }
+
+#[test]
+fn marks_emoji_and_astral_on_the_text_path() {
+    // Marks on narrow, wide and blank cells, at the row's end and at its
+    // start (after a wrap), stacked, and after a spacer; emoji and Indic
+    // consonants after plain cells and after clusters; astral characters
+    // that never join; all through packed history.
+    let input = "abcdefghi\u{301}\u{302}漢\u{301}x 👍😀\u{301}a\u{301}👍🏽\r\n\
+                 \u{301}q ©\u{300}® ‼ क\u{94D}क e\u{301}😀 𠀀𠀁\u{301}𝐀 \u{200B}z\u{200B}\r\n\
+                 1234567890\u{301}\u{302}\u{303}\r\n🇷\u{301}x 🏽\u{301}y \u{20E3}\u{301}w 🇷\u{FE0F}\u{301}\r\n\x1b[5C\u{301}\x1b[3C漢\u{302}\r\n"
+        .repeat(5);
+    for cols in [7, 10, 11, 16] {
+        check(4, cols, 12, input.as_bytes());
+    }
+}

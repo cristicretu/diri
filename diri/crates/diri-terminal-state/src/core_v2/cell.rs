@@ -114,6 +114,15 @@ impl std::hash::Hash for Style {
 }
 
 impl Style {
+    /// `*self == Style::default()`, without comparing whole colors.
+    #[inline(always)]
+    pub fn is_default(&self) -> bool {
+        matches!(self.fg, Color::Named(NamedColor::Foreground))
+            && matches!(self.bg, Color::Named(NamedColor::Background))
+            && self.underline.is_none()
+            && self.flags == 0
+    }
+
     /// The style of a cell erased under this pen: background only.
     pub fn erased(&self) -> Style {
         Style {
