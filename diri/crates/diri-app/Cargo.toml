@@ -26,6 +26,11 @@ path = "tests/app_photon_appkit.rs"
 harness = false
 
 [[test]]
+name = "terminal_accessibility_appkit"
+path = "tests/terminal_accessibility_appkit.rs"
+harness = false
+
+[[test]]
 name = "permission_guide_appkit"
 path = "tests/permission_guide_appkit.rs"
 harness = false
@@ -98,7 +103,7 @@ diri-pty.workspace = true
 gpui_macos.workspace = true
 
 block2 = "=0.6.2"
-objc2 = "=0.6.4"
+objc2 = "=0.6.5"
 objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
     "NSAppearance",
     "NSApplication",
@@ -211,4 +216,4 @@ embed-resource = "3.0.11"
 image = { workspace = true, features = ["png", "ico"] }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61.3", features = ["UI_Notifications", "Data_Xml_Dom", "Foundation", "Foundation_Collections", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media_Audio", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62.2", features = ["UI_Notifications", "Data_Xml_Dom", "Foundation", "Foundation_Collections", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media_Audio", "Win32_UI_WindowsAndMessaging"] }

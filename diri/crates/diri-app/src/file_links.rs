@@ -157,6 +157,33 @@ fn opens_in_default_app(path: &Path) -> bool {
         })
 }
 
+/// Whether handing `path` to the system opener would run something rather
+/// than show it: an app or other bundle, a script or installer, a link file
+/// that opens a URL, or anything marked executable.
+pub(crate) fn runs_when_opened(path: &Path) -> bool {
+    const RUNS: &[&str] = &[
+        "app", "command", "tool", "terminal", "pkg", "mpkg", "dmg", "workflow", "action",
+        "scpt", "scptd", "applescript", "jar", "sh", "zsh", "bash", "csh", "fish", "prefpane",
+        "saver", "webloc", "inetloc", "fileloc", "url", "shortcut", "mobileconfig",
+        "osax", "kext", "plugin", "bundle", "xpc", "systemextension", "appex",
+    ];
+    let named = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| RUNS.iter().any(|runs| runs.eq_ignore_ascii_case(extension)));
+    if named {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            return metadata.is_file() && metadata.permissions().mode() & 0o111 != 0;
+        }
+    }
+    false
+}
+
 /// What a click on `file` opens: the editor's own URL at the line when an
 /// editor applies, otherwise the `file://` URL for the system opener.
 pub(crate) fn open_url(file: &LocalFile, editor: Option<Editor>) -> Option<String> {
@@ -338,5 +365,24 @@ mod tests {
                 .is_some(),
             "a stale one is checked again"
         );
+    }
+
+    #[test]
+    fn runnable_files_are_told_from_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("build");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        let notes = dir.path().join("notes.md");
+        std::fs::write(&notes, "# notes").unwrap();
+        assert!(!runs_when_opened(&script));
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(runs_when_opened(&script), "executable bit");
+        assert!(!runs_when_opened(&notes));
+        for name in ["Tool.app", "x.command", "Setup.PKG", "link.webloc", "a.terminal"] {
+            assert!(runs_when_opened(Path::new(name)), "{name}");
+        }
+        // A folder opens in Finder; only bundles run.
+        assert!(!runs_when_opened(dir.path()));
     }
 }

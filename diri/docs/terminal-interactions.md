@@ -13,7 +13,18 @@
   In mouse-aware terminal applications, Option-right-click opens Diri's menu.
 - Double-click then drag selects whole words. Triple-click then drag selects
   complete lines. Option-Shift-drag selects a rectangular column. Option-drag
-  continues to select locally in mouse-aware applications.
+  and Shift-drag continue to select locally in mouse-aware applications;
+  Shift with the middle or right button still reaches the application.
+- The wheel follows the program: Diri scrolls its own history unless the
+  program reads the mouse, which then gets xterm wheel reports (sideways
+  scrolling as buttons 6/7, Shift/Option/Control as modifier bits). A program
+  on the alternate screen that does not read the mouse (`less`, `man`, an
+  editor without mouse support) gets Up/Down arrow keys per line instead,
+  unless it turns alternate scroll (DECSET 1007) off. Mouse encodings
+  supported: X10-compatible (1000/1002/1003) and SGR (1006). The obsolete
+  X10 press-only mode (9) is ignored, and UTF-8 (1005), urxvt (1015) and
+  SGR-pixel (1016) coordinates fall back to the X10-compatible or SGR cell
+  form; a DECRQM query reports 1016 as permanently reset.
 - Drag beyond the top or bottom edge to extend a selection through retained
   history. Soft-wrapped lines copy without invented line breaks; hard newlines
   remain. Successful copies show a brief confirmation.

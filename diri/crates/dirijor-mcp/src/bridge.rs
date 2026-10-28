@@ -189,7 +189,21 @@ impl Bridge {
             .checked_add(timeout)
             .ok_or_else(|| ControlFailure::Protocol("invalid request timeout".into()))?;
         let mut client = self.connect(timeout)?;
-        client.request_until(method.into(), params, deadline)
+        client.request_until(method.into(), self.stamp_actor(method, params), deadline)
+    }
+
+    /// Names this Agent's session on a request that changes what Diri's
+    /// window shows, so the app can say who did it. Reads stay unstamped.
+    pub(super) fn stamp_actor(&self, method: &str, mut params: Value) -> Value {
+        if let (Some(caller), Some(object)) = (self.caller.as_deref(), params.as_object_mut())
+            && diri_proto::agent_action::announces(method)
+        {
+            object.insert(
+                diri_proto::agent_action::ACTOR_FIELD.into(),
+                Value::String(caller.to_owned()),
+            );
+        }
+        params
     }
 
     fn request_typed<T: DeserializeOwned>(
@@ -1253,7 +1267,8 @@ fn compact(record: &SessionRecord) -> Value {
 
 /// Who chose a session's current name, so an Agent knows whether it may
 /// replace it: `user` and `diri` names are kept, an `agent` name may be
-/// refined, an `automatic` one (prompt, terminal, provider summary) replaced.
+/// refined, an `automatic` one (prompt, terminal, provider summary, or the
+/// "Fork of …" title a fork starts with) replaced.
 fn name_set_by(source: diri_proto::TitleSource) -> &'static str {
     use diri_proto::TitleSource;
     match source {
@@ -1264,6 +1279,7 @@ fn name_set_by(source: diri_proto::TitleSource) -> &'static str {
         | TitleSource::FirstPrompt
         | TitleSource::AgentProvided
         | TitleSource::TerminalTitle
+        | TitleSource::Forked
         | TitleSource::Unknown => "automatic",
     }
 }
@@ -1497,6 +1513,23 @@ mod tests {
     use super::*;
     use diri_proto::{DateMillis, ProjectId, Resumability, TitleSource};
 
+    #[test]
+    fn window_changes_name_the_calling_agent_and_reads_do_not() {
+        let bridge = Bridge::new(PathBuf::from("/nonexistent"), Some("agent-1".into()));
+        let stamped = bridge.stamp_actor(Method::WORKSPACE_MUTATE, json!({"expectedRevision": 1}));
+        assert_eq!(stamped["actor"], "agent-1");
+        let reveal = bridge.stamp_actor(Method::SESSION_REVEAL, json!({"sessionID": "s"}));
+        assert_eq!(reveal["actor"], "agent-1");
+        let read = bridge.stamp_actor(Method::SESSION_LIST, json!({}));
+        assert_eq!(read, json!({}));
+        // Outside a Diri session there is no one to name.
+        let anonymous = Bridge::new(PathBuf::from("/nonexistent"), None);
+        assert_eq!(
+            anonymous.stamp_actor(Method::WORKSPACE_MUTATE, json!({})),
+            json!({})
+        );
+    }
+
     pub(super) fn record(id: &str, parent: Option<&str>) -> SessionRecord {
         SessionRecord {
             command_run: None,
@@ -1534,6 +1567,7 @@ mod tests {
             pull_requests: None,
             listening_ports: None,
             foreground_agent: None,
+            foreground_program: None,
             terminal_cwd: None,
             agent_workspace: None,
             note_id: None,
