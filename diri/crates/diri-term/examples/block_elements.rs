@@ -89,6 +89,7 @@ fn main() {
                         cursor_visible: true,
                         is_full_snapshot: true,
                         changed_rows,
+                        cursor_style: Default::default(),
                     };
                     let grid = std::env::var_os("DIRI_BLOCK_GRID").map_or(grid, |path| {
                         GridUpdate::decode(&std::fs::read(path).expect("read captured grid"))

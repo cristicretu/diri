@@ -180,10 +180,31 @@ impl RemoteSessionClient {
         self.helper.protocol.minor >= diri_proto::remote_pty::ENHANCED_KEYBOARD_PROTOCOL_MINOR
     }
 
+    /// Whether this session's Holder build answers `Hello.grid_resume`.
+    /// Older Holders would ignore the request; asking them is merely wasted.
+    pub(crate) fn supports_grid_resume(&self) -> bool {
+        self.helper.protocol.minor >= diri_proto::remote_pty::GRID_RESUME_PROTOCOL_MINOR
+    }
+
+    /// The last controller epoch a Holder granted this client, or zero.
+    pub(crate) fn last_controller_epoch(&self) -> u64 {
+        self.accepted_controller_epoch.load(Ordering::SeqCst)
+    }
+
+    /// A fresh random key for one attach's resume digests.
+    pub(crate) fn grid_resume_key()
+    -> io::Result<[u8; diri_proto::remote_pty::GRID_RESUME_KEY_BYTES]> {
+        let mut key = [0_u8; diri_proto::remote_pty::GRID_RESUME_KEY_BYTES];
+        getrandom::fill(&mut key)
+            .map_err(|error| io::Error::other(format!("secure random source failed: {error}")))?;
+        Ok(key)
+    }
+
     pub fn connect(
         &self,
         output_offset: u64,
         grid_sequence: Option<u64>,
+        grid_resume: Option<diri_proto::remote_pty::GridResume>,
     ) -> io::Result<(u64, ChildStdout)> {
         ensure_available(&self.writer.lock().expect("remote writer"))?;
         self.inline_images.store(false, Ordering::SeqCst);
@@ -199,6 +220,13 @@ impl RemoteSessionClient {
             if self.helper.protocol.minor >= diri_proto::remote_pty::TERMINAL_RESET_PROTOCOL_MINOR {
                 required_capabilities.push(diri_proto::remote_pty::RemoteCapability::TerminalReset);
             }
+            // An older Holder rejects a capability it does not know, so it is
+            // asked for only from a Helper whose minor defines it.
+            if self.helper.protocol.minor >= diri_proto::remote_pty::TERMINAL_STYLES_PROTOCOL_MINOR
+            {
+                required_capabilities
+                    .push(diri_proto::remote_pty::RemoteCapability::TerminalStyles);
+            }
             let hello = RemoteMessage::Hello(Hello {
                 protocol: ProtocolVersion::CURRENT,
                 local_build_id: format!("engine-{}", env!("CARGO_PKG_VERSION")),
@@ -210,6 +238,7 @@ impl RemoteSessionClient {
                 required_capabilities,
                 last_acknowledged_output_offset: Some(output_offset),
                 last_acknowledged_grid_sequence: grid_sequence,
+                grid_resume: grid_resume.filter(|_| self.supports_grid_resume()),
             });
             let encoded = RemoteCodec::encode(&hello).map_err(io::Error::other)?;
             channel.input.write_all(&encoded)?;
@@ -1055,6 +1084,7 @@ mod tests {
                 output_offset: 0,
                 snapshot_sequence: 1,
                 foreground_pid: None,
+                grid_resume: None,
             };
             assert_eq!(client.validate_hello(&ack).is_ok(), minor < 14);
             if minor == 14 {
@@ -1130,6 +1160,7 @@ mod tests {
                 output_offset: 0,
                 snapshot_sequence: 1,
                 foreground_pid: None,
+                grid_resume: None,
             }
         };
         let (writer, mut output) = pipe_writer();
@@ -1205,8 +1236,55 @@ mod tests {
         // whether or not it gets that far. The fixture's `/bin/false` channel
         // usually fails the Hello write, but on Linux the write can land in
         // the pipe before the child exits, so the outcome itself is a race.
-        let _ = client.connect(0, None);
+        let _ = client.connect(0, None, None);
         assert!(!client.supports_inline_images());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grid_resume_is_offered_only_to_holders_that_answer_it() {
+        use crate::remote::{manager::ArtifactCatalog, ssh::SshTransport};
+        use diri_proto::remote_pty::GRID_RESUME_PROTOCOL_MINOR;
+        let temp = tempfile::tempdir().unwrap();
+        let host = diri_proto::HostEntry {
+            id: "fixture".into(),
+            transport: Default::default(),
+            name: None,
+            ssh: "fixture".into(),
+            default_cwd: None,
+            node: None,
+        };
+        for (minor, offered) in [
+            (GRID_RESUME_PROTOCOL_MINOR - 1, false),
+            (GRID_RESUME_PROTOCOL_MINOR, true),
+        ] {
+            let manager = Arc::new(
+                RemoteManager::new(
+                    crate::remote::executor::ProcessExecutor::new("/bin/false"),
+                    ArtifactCatalog::without_artifacts_for_test(),
+                    temp.path().join(format!("control-{minor}")),
+                )
+                .unwrap(),
+            );
+            let client = RemoteSessionClient::new(
+                manager,
+                InstalledHelper {
+                    target: RemoteTarget::MacosAarch64,
+                    build_id: "fixture".into(),
+                    protocol: ProtocolVersion { major: 1, minor },
+                    transport: SshTransport::new(&host, temp.path().join("control/socket")),
+                },
+                "fixture".into(),
+                SessionToken::new("fixture-token-long-enough").unwrap(),
+                "incarnation".into(),
+                RemoteBindingStore::new(temp.path().join(format!("binding-{minor}"))).unwrap(),
+                0,
+            )
+            .unwrap();
+            // A live Holder keeps its original build; one from before minor
+            // 17 would ignore the request, so it is never sent.
+            assert_eq!(client.supports_grid_resume(), offered);
+        }
     }
 
     #[test]

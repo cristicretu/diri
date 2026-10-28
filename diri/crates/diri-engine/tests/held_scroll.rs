@@ -148,3 +148,109 @@ fn held_mouse_redraw_reaches_the_attached_grid_without_a_quiet_tick() {
         "scroll redraws wait for the 100 ms idle tick: {median:?}"
     );
 }
+
+/// A program on the alternate screen that does not read the mouse (`less`,
+/// `man`, an editor) gets the wheel as arrow keys: alternate scroll, DECSET
+/// 1007, which starts set. The arrows follow the cursor-key mode.
+#[test]
+fn alternate_screen_wheel_without_mouse_reporting_sends_arrow_keys() {
+    let temp = tempfile::tempdir().unwrap();
+    let (engine, _) =
+        ManifestEngine::load_dir(&diri_engine::detect::bundled_manifest_dir()).unwrap();
+    let registry = Arc::new(Mutex::new(Registry::new(
+        Arc::new(engine),
+        temp.path().join("state.json"),
+    )));
+    let server = Arc::new(
+        ControlServer::new(Arc::clone(&registry), temp.path().join("daemon.sock"))
+            .with_logs_dir(temp.path().join("logs"))
+            .with_holder(HolderConfig {
+                holders_dir: temp.path().join("holders"),
+                executable: env!("CARGO_BIN_EXE_diri-holder").into(),
+            }),
+    );
+    let listener = server.bind().unwrap();
+    let serving = Arc::clone(&server);
+    std::thread::spawn(move || {
+        while let Ok((stream, _)) = listener.accept() {
+            let server = Arc::clone(&serving);
+            std::thread::spawn(move || {
+                let _ = server.serve(stream);
+            });
+        }
+    });
+    let mut control = UnixStream::connect(server.socket_path()).unwrap();
+    control
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut replies = BufReader::new(control.try_clone().unwrap());
+    let message = ControlMessage::Request {
+        id: 1,
+        method: "session.spawn".into(),
+        // Echoes every byte it reads as `<hex>`, so the screen shows the
+        // exact input. It turns on cursor-key mode after its first byte.
+        params: Some(json!({
+            "kind": { "shell": {} }, "cwd": "/tmp",
+            "argv": ["/bin/bash", "--noprofile", "--norc", "-c",
+                "stty -echo -icanon min 1 time 0; printf '\x1b[?1049hready'; first=1; while IFS= read -r -d '' -n 1 ch; do printf '\x1b[2;1H%s<%02x>\x1b[K' \"$seen\" \"'$ch\"; seen=\"$seen<$(printf %02x \"'$ch\")>\"; if [ $first = 1 ] && [ \"$ch\" = A ]; then first=0; seen=\"$seen|\"; printf '\x1b[?1h\x1b[1;1Hckm\x1b[K'; fi; done"]
+        })),
+    };
+    let mut bytes = serde_json::to_vec(&message).unwrap();
+    bytes.push(b'\n');
+    control.write_all(&bytes).unwrap();
+    let mut line = String::new();
+    replies.read_line(&mut line).unwrap();
+    let spawned = match serde_json::from_str::<ControlMessage>(&line).unwrap() {
+        ControlMessage::Response {
+            result: Ok(value), ..
+        } => value,
+        other => panic!("spawn failed: {other:?}"),
+    };
+    let id = spawned["id"].as_str().unwrap().to_owned();
+    let _cleanup = SessionCleanup {
+        registry,
+        id: id.clone(),
+    };
+    let mut data = UnixStream::connect(server.socket_path()).unwrap();
+    data.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    writeln!(data, "{}", json!({ "attach": id })).unwrap();
+    let mut codec = FrameCodec::new();
+    let mut chunk = [0; 64 << 10];
+    let mut input = data.try_clone().unwrap();
+    let mut wait_for = |needle: &str| {
+        loop {
+            let count = data
+                .read(&mut chunk)
+                .unwrap_or_else(|err| panic!("waiting for {needle}: {err}"));
+            assert!(count > 0, "attachment closed");
+            for frame in codec.feed(&chunk[..count]).unwrap() {
+                if frame.frame_type != FrameType::Grid {
+                    continue;
+                }
+                let update = frame.grid_payload().unwrap().unwrap();
+                if update.changed_rows.iter().any(|row| {
+                    let text: String = row
+                        .cells
+                        .iter()
+                        .map(|c| char::from_u32(c.scalar).unwrap_or(' '))
+                        .collect();
+                    text.contains(needle)
+                }) {
+                    return;
+                }
+            }
+        }
+    };
+    wait_for("ready");
+    // Wheel up one line: CSI A.
+    input
+        .write_all(&FrameCodec::encode(&Frame::scroll(0, 1, 5, 5)).unwrap())
+        .unwrap();
+    wait_for("ckm");
+    // Wheel down two lines once the program asked for cursor-key mode: SS3 B.
+    input
+        .write_all(&FrameCodec::encode(&Frame::scroll(1, 2, 5, 5)).unwrap())
+        .unwrap();
+    wait_for("<1b><5b><41>|<1b><4f><42><1b><4f><42>");
+}

@@ -50,6 +50,14 @@ pub enum Event {
     /// cell size can leave the query unanswered, as before.
     CellSizeRequest(Arc<dyn Fn(WindowSize) -> String + Sync + Send + 'static>),
 
+    /// Diri: the program asked for the color scheme (`CSI ? 996 n`). Only
+    /// the host knows whether its theme is light or dark.
+    ColorSchemeRequest,
+
+    /// Diri: the program enabled in-band resize reports (DECSET 2048) and is
+    /// owed the current size at once. Only the host knows the pixel size.
+    InBandResize,
+
     /// Cursor blinking state has changed.
     CursorBlinkingChange,
 
@@ -77,6 +85,8 @@ impl Debug for Event {
             Event::PtyWrite(text) => write!(f, "PtyWrite({text})"),
             Event::Title(title) => write!(f, "Title({title})"),
             Event::CursorBlinkingChange => write!(f, "CursorBlinkingChange"),
+            Event::ColorSchemeRequest => write!(f, "ColorSchemeRequest"),
+            Event::InBandResize => write!(f, "InBandResize"),
             Event::MouseCursorDirty => write!(f, "MouseCursorDirty"),
             Event::ResetTitle => write!(f, "ResetTitle"),
             Event::Wakeup => write!(f, "Wakeup"),

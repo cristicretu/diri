@@ -85,6 +85,47 @@ pub fn current_physical_key() -> Option<(u16, u64)> {
     })
 }
 
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static LAYOUT_FOR_TEST: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
+}
+
+/// What the current keyboard layout types on the matching, currently
+/// dispatched key with no modifiers and with Shift alone. GPUI resolves Shift
+/// into the logical key for non-letters (`@` for Shift-2); the kitty keyboard
+/// protocol needs the unshifted key back. Scoped like
+/// [`current_native_key_code`].
+pub fn current_key_layout_chars(event: &KeyDownEvent) -> Option<(String, String)> {
+    let code = current_native_key_code(event)?;
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(chars) = LAYOUT_FOR_TEST.with(|state| state.borrow().clone()) {
+        return Some(chars);
+    }
+    Some(crate::events::layout_chars_for_key_code(code))
+}
+
+/// Like [`with_native_key_for_test`], with the layout characters a fixed
+/// keyboard layout would report, independent of the host's layout.
+#[cfg(any(test, feature = "test-support"))]
+pub fn with_native_key_layout_for_test<R>(
+    event: KeyDownEvent,
+    code: u16,
+    layout: (&str, &str),
+    callback: impl FnOnce() -> R,
+) -> R {
+    let previous = LAYOUT_FOR_TEST.with(|state| {
+        state.replace(Some((layout.0.to_owned(), layout.1.to_owned())))
+    });
+    struct Restore(Option<(String, String)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LAYOUT_FOR_TEST.with(|state| state.replace(self.0.take()));
+        }
+    }
+    let _restore = Restore(previous);
+    with_native_key_for_test(event, code, callback)
+}
+
 /// Exercise the same scoped dispatch boundary without sending OS input.
 #[cfg(any(test, feature = "test-support"))]
 pub fn with_native_key_for_test<R>(

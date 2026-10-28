@@ -6062,14 +6062,18 @@ impl WorkbenchInspector {
 impl Render for WorkbenchInspector {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::perf_overlay::rendered("inspector");
-        self.title_opacity = crate::window_chrome::title_row_opacity(window);
         let colors = {
             let store = self
                 .runtime
                 .store
                 .read()
                 .expect("session store lock poisoned");
-            crate::right_panel::panel_colors_in(&store)
+            let colors = crate::right_panel::panel_colors_in(&store);
+            self.title_opacity = crate::window_chrome::title_row_opacity(
+                window,
+                crate::chrome_focus::look_in(&store, colors.appearance, window),
+            );
+            colors
         };
         let held_hint = crate::held_hints::opacity(window, cx);
         // A hosted shell paints the terminal fill itself. Under a glass window

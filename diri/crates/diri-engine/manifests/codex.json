@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "id": "codex",
-  "version": "2026.10.01.1",
+  "version": "2026.10.27.1",
   "statusModel": "full",
   "agent": {
     "id": "codex",
@@ -14,6 +14,11 @@
     ],
     "firstClass": true,
     "catalogOrder": 20,
+    "programStatus": {
+      "app": "codex",
+      "idleEndsTurn": true,
+      "_notice": "Codex 0.163 reports idle, never done, when a turn finishes, so idle after work is the result. A denied approval reads the same: working, then idle."
+    },
     "setup": {
       "url": "https://developers.openai.com/codex/cli/",
       "installHint": "Follow OpenAI's Codex CLI installation guide.",
@@ -196,6 +201,28 @@
       ],
       "capture": {
         "region": "bottom_non_empty_lines",
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "hooks-review-prompt",
+      "state": "blockedQuestion",
+      "priority": 990,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 12,
+      "_notice": "Codex 0.163 asks at startup whether to trust new or changed hooks, before it reports any OSC 7501 status. Its selected row starts with \u203a, which the idle prompt rule would read as a ready composer.",
+      "when": {
+        "all": [
+          { "contains": "hooks need review" },
+          { "contains": "continue without trusting" }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 8,
         "maxChars": 400
       }
     },

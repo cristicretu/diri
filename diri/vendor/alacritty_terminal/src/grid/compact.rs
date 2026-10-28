@@ -493,6 +493,34 @@ impl<T> Deferred<T> {
     /// Every row at `columns`, newest first.
     fn build_rows(&self, codec: RowCodec<T>) -> Vec<Row<T>> {
         let mut out = Vec::with_capacity(self.rows);
+        self.for_each_row_chunk(codec, usize::MAX, |rows| out.append(rows));
+        out
+    }
+
+    /// [`Self::build_rows`] handed to `sink` in chunks of exactly `chunk`
+    /// rows (the last one shorter), newest first, so a caller that encodes
+    /// each chunk never holds every reflowed row at once. `sink` takes the
+    /// rows it keeps out of the buffer.
+    fn for_each_row_chunk(
+        &self,
+        codec: RowCodec<T>,
+        chunk: usize,
+        mut sink: impl FnMut(&mut Vec<Row<T>>),
+    ) {
+        let mut out = Vec::with_capacity(self.rows.min(chunk));
+        let mut flush = |out: &mut Vec<Row<T>>, all: bool| {
+            while out.len() >= chunk || (all && !out.is_empty()) {
+                if out.len() > chunk {
+                    let rest = out.split_off(chunk);
+                    sink(out);
+                    out.clear();
+                    out.extend(rest);
+                } else {
+                    sink(out);
+                    out.clear();
+                }
+            }
+        };
         let mut sources = self.sources.iter();
         let mut decoded = Vec::new().into_iter();
         let mut chunks = Vec::new();
@@ -510,6 +538,7 @@ impl<T> Deferred<T> {
             let skip = match extra {
                 Some(LineExtra::Eager(rows)) => {
                     out.extend(rows.iter().rev().map(codec.clone_row));
+                    flush(&mut out, false);
                     continue;
                 }
                 Some(LineExtra::Greedy { skip, .. }) => *skip as usize,
@@ -518,8 +547,9 @@ impl<T> Deferred<T> {
             rows.reverse();
             (codec.line_rows)(rows, skip, cells as usize, self.columns, &mut chunks);
             out.extend(chunks.drain(..).rev());
+            flush(&mut out, false);
         }
-        out
+        flush(&mut out, true);
     }
 
     /// Remove the newest `count` source rows, newest first.
@@ -1026,6 +1056,19 @@ impl<T> CompactRows<T> {
         }
     }
 
+    /// Give back what streaming output leaves behind once it stops: decode
+    /// caches, the oldest block's eviction index and spare row allocations,
+    /// and deque capacity beyond what the rows need. Stored history is
+    /// untouched; each cache is rebuilt on its next use.
+    pub fn release_idle(&mut self) {
+        self.release_read_cache();
+        self.evict_cache = None;
+        self.spare = Vec::new();
+        self.recent.shrink_to_fit();
+        self.oldest.shrink_to_fit();
+        self.blocks.shrink_to_fit();
+    }
+
     #[cfg(test)]
     fn payload_bytes(&self) -> usize {
         self.payload_bytes
@@ -1428,6 +1471,19 @@ impl<T> CompactRows<T> {
         true
     }
 
+    /// Reflow deferred history into blocks now, one block at a time, so a
+    /// read of every history row (a checkpoint, a capture) decodes a block
+    /// at a time instead of first reflowing all of it into one copy.
+    pub fn prepare_history_read(&mut self) {
+        if self
+            .deferred
+            .as_ref()
+            .is_some_and(|d| d.read.get().is_none())
+        {
+            self.materialize_deferred();
+        }
+    }
+
     /// Reflow deferred history into blocks after every newer block.
     fn materialize_deferred(&mut self) {
         let Some(deferred) = self.deferred.take() else {
@@ -1436,18 +1492,26 @@ impl<T> CompactRows<T> {
         let codec = self.codec;
         let columns = deferred.columns;
         let mut deferred = *deferred;
-        let rows = deferred
-            .read
-            .take()
-            .unwrap_or_else(|| deferred.build_rows(codec));
         debug_assert!(
             self.blocks
                 .iter()
                 .all(|block| block.count == self.block_rows)
         );
         debug_assert_eq!(self.block_rows, block_rows::<T>(columns));
-        for chunk in rows.chunks(self.block_rows) {
-            self.blocks.push_back(Block::new(chunk, codec));
+        match deferred.read.take() {
+            Some(rows) => {
+                for chunk in rows.chunks(self.block_rows) {
+                    self.blocks.push_back(Block::new(chunk, codec));
+                }
+            }
+            // Nothing read it yet: encode one block at a time rather than
+            // reflowing every row first (tens of MB for full history).
+            None => {
+                let blocks = &mut self.blocks;
+                deferred.for_each_row_chunk(codec, self.block_rows, |rows| {
+                    blocks.push_back(Block::new(rows, codec));
+                });
+            }
         }
         self.payload_bytes = None;
         self.evict_cache = None;
@@ -3655,6 +3719,12 @@ mod tests {
                         }
                         1 => compact.bound_primary_history_storage(usize::MAX / 2),
                         2 => same_as_dense(&mut compact, &dense, &label),
+                        // A full in-order read (a checkpoint): deferred
+                        // history is stored a block at a time first.
+                        3 => {
+                            compact.grid_mut().prepare_history_read();
+                            same_as_dense(&mut compact, &dense, &label);
+                        }
                         _ => {}
                     }
                 }
