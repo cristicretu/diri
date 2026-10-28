@@ -1555,8 +1555,12 @@ impl TerminalElement {
     #[must_use]
     pub fn link_at(&self, col: usize, window_row: usize) -> Option<String> {
         match self.reference_at(col, window_row) {
-            Some(TerminalReference::Url(url)) => Some(url),
-            Some(TerminalReference::File(_)) | None => None,
+            Some(TerminalReference::Url(url))
+                if crate::link_scheme::kind(&url) == Some(crate::link_scheme::LinkKind::Web) =>
+            {
+                Some(url)
+            }
+            Some(TerminalReference::Url(_) | TerminalReference::File(_)) | None => None,
         }
     }
 
@@ -1587,7 +1591,7 @@ impl TerminalElement {
             if diri_proto::inline_image::is_anchor(&link.uri) {
                 return None;
             }
-            return reference_from_run(&link.uri).map(|reference| ReferenceHit {
+            return reference_from_link_uri(&link.uri).map(|reference| ReferenceHit {
                 reference,
                 spans: vec![(absolute_row, usize::from(link.start), usize::from(link.end))],
             });
@@ -3839,7 +3843,7 @@ fn url_from_run(run: &str) -> Option<String> {
     } else if stripped.starts_with("www.") && stripped["www.".len()..].contains('.') {
         Some(format!("https://{stripped}"))
     } else {
-        None
+        crate::link_scheme::app_link(stripped, false).map(str::to_owned)
     }
 }
 
@@ -3975,6 +3979,19 @@ fn trim_reference_run(run: &str) -> &str {
     run.trim()
         .trim_start_matches(['(', '[', '{', '<', '\'', '"'])
         .trim_end_matches(['.', ',', ';', ':', ')', ']', '}', '\'', '"', '>', '!', '?'])
+}
+
+/// A program's explicit OSC 8 target: any allowed scheme, not only the ones
+/// plain text is trusted to spell.
+fn reference_from_link_uri(uri: &str) -> Option<TerminalReference> {
+    if crate::link_scheme::scheme(uri).is_some_and(|scheme| crate::link_scheme::is_blocked(&scheme))
+    {
+        return None;
+    }
+    if let Some(link) = crate::link_scheme::app_link(uri, true) {
+        return Some(TerminalReference::Url(link.to_owned()));
+    }
+    reference_from_run(uri)
 }
 
 fn reference_from_run(run: &str) -> Option<TerminalReference> {
@@ -5014,6 +5031,14 @@ mod link_tests {
         assert_eq!(url_from_run("not-a-url"), None);
         assert_eq!(url_from_run("www."), None);
         assert_eq!(url_from_run("http:/broken"), None);
+        // App links in plain text need `scheme://` or a mail address.
+        assert_eq!(url_from_run("ssh://forge,").as_deref(), Some("ssh://forge"));
+        assert_eq!(
+            url_from_run("<mailto:me@example.com>").as_deref(),
+            Some("mailto:me@example.com")
+        );
+        assert_eq!(url_from_run("localhost:3000"), None);
+        assert_eq!(url_from_run("javascript://alert(1)"), None);
     }
 
     #[test]
@@ -5089,11 +5114,15 @@ mod link_tests {
             ("fe80::1", None),
             ("[::1]:8080", None),
             ("2001:db8::ff00:42:8329", None),
-            ("ftp://example.com/a.txt", None),
             ("Finished", None),
         ] {
             assert_eq!(reference_from_run(run), expected, "{run}");
         }
+        // Other schemes are app links, which the host asks about first.
+        assert_eq!(
+            reference_from_run("ftp://example.com/a.txt"),
+            Some(TerminalReference::Url("ftp://example.com/a.txt".to_owned()))
+        );
         // URLs keep winning over the file reading of their path.
         assert_eq!(
             reference_from_run("https://example.com/src/app.rs:42"),
@@ -5475,6 +5504,21 @@ mod selection_repaint_tests {
         assert_eq!(hit.spans, vec![(0, 0, 5)]);
         assert!(element.reference_hit_at(5, 0).is_none());
         frame.changed_rows[0].metadata.links[0].uri = "javascript:alert(1)".into();
+        element.apply_damage(frame.clone());
+        assert!(element.reference_hit_at(2, 0).is_none());
+        // An app link is a link; the host decides whether to ask.
+        frame.changed_rows[0].metadata.links[0].uri = "vscode://file/a.rs:1".into();
+        element.apply_damage(frame.clone());
+        assert_eq!(
+            element
+                .reference_hit_at(2, 0)
+                .unwrap()
+                .reference
+                .destination(),
+            "vscode://file/a.rs:1"
+        );
+        assert_eq!(element.link_at(2, 0), None, "link_at stays web-only");
+        frame.changed_rows[0].metadata.links[0].uri = "data:text/html,x".into();
         element.apply_damage(frame);
         assert!(element.reference_hit_at(2, 0).is_none());
     }

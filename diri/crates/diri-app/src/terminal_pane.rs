@@ -8814,6 +8814,98 @@ mod tests {
         );
     }
 
+    /// Links to other apps ask on the window's sheet; "Always Open" trusts
+    /// the scheme. Files the system opener would run always ask.
+    #[gpui::test]
+    fn app_links_and_runnable_files_ask_before_opening(cx: &mut TestAppContext) {
+        let launch = tempfile::tempdir().unwrap();
+        std::fs::write(launch.path().join("deploy.command"), "#!/bin/sh\n").unwrap();
+        std::fs::write(launch.path().join("notes.md"), "# notes").unwrap();
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let mut session = fixture_session();
+        session.host = None;
+        session.kind = ProtoAgentKind::SHELL;
+        session.cwd = launch.path().display().to_string();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session.clone());
+            store.select(session.id);
+            store
+                .update_preferences(|prefs| {
+                    prefs.terminal_file_editor = crate::store::FileEditor::DefaultApp;
+                })
+                .unwrap();
+        }
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        let open = |cx: &mut gpui::VisualTestContext, reference: TerminalReference| {
+            pane.update_in(cx, |pane, window, cx| pane.open_reference(reference, window, cx));
+            cx.run_until_parked();
+        };
+
+        // Web links open at once, as before.
+        open(cx, TerminalReference::Url("https://example.com".into()));
+        assert!(!cx.has_pending_prompt());
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com"));
+
+        // An app link waits for the sheet; Cancel opens nothing.
+        open(cx, TerminalReference::Url("ssh://forge".into()));
+        assert!(cx.has_pending_prompt(), "the sheet asks");
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com"));
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com"));
+
+        // Open opens once and trusts nothing.
+        open(cx, TerminalReference::Url("ssh://forge".into()));
+        cx.simulate_prompt_answer("Open");
+        cx.run_until_parked();
+        assert_eq!(cx.opened_url().as_deref(), Some("ssh://forge"));
+        open(cx, TerminalReference::Url("ssh://forge/2".into()));
+        assert!(cx.has_pending_prompt(), "still asks");
+
+        // Always Open trusts the scheme from then on.
+        cx.simulate_prompt_answer("Always Open ssh Links");
+        cx.run_until_parked();
+        assert_eq!(cx.opened_url().as_deref(), Some("ssh://forge/2"));
+        open(cx, TerminalReference::Url("ssh://other".into()));
+        assert!(!cx.has_pending_prompt());
+        assert_eq!(cx.opened_url().as_deref(), Some("ssh://other"));
+        pane.update_in(cx, |pane, _, _| {
+            let store = pane.runtime.store.read().unwrap();
+            let trusted = &store.preferences().terminal_trusted_link_schemes;
+            assert_eq!(trusted.iter().collect::<Vec<_>>(), ["ssh"]);
+        });
+        // Trust is per scheme.
+        open(cx, TerminalReference::Url("vscode://file/a.rs".into()));
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        // Refused schemes never open, and never ask.
+        open(cx, TerminalReference::Url("javascript:alert(1)".into()));
+        assert!(!cx.has_pending_prompt());
+        assert_eq!(cx.opened_url().as_deref(), Some("ssh://other"));
+
+        // A script the default app would run asks, with no Always.
+        open(cx, TerminalReference::File("deploy.command".into()));
+        assert!(cx.has_pending_prompt());
+        assert_eq!(cx.opened_url().as_deref(), Some("ssh://other"));
+        cx.simulate_prompt_answer("Open");
+        cx.run_until_parked();
+        assert!(cx.opened_url().unwrap().ends_with("/deploy.command"));
+        // A document does not.
+        open(cx, TerminalReference::File("notes.md".into()));
+        assert!(!cx.has_pending_prompt());
+        assert!(cx.opened_url().unwrap().ends_with("/notes.md"));
+    }
+
     #[gpui::test]
     fn terminal_file_links_open_the_editor_at_the_line(cx: &mut TestAppContext) {
         // Real files, so the existence check has something to find. The

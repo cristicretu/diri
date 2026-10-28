@@ -151,6 +151,10 @@
   "settings.resources.memory_limit_detail": "Freeze an idle session when its process tree reaches this size.",
   "settings.resources.session_limits": "Session limits",
   "settings.resources.title": "Resources",
+  "settings.terminal.app_links": "Links that open apps",
+  "settings.terminal.app_links_detail": "These open without asking. Click one to ask again.",
+  "settings.terminal.app_links_detail_none": "Diri asks before opening ssh, mailto, editor and other app links.",
+  "settings.terminal.app_links_remove": "{scheme} ✕",
   "settings.terminal.file_links_detail": "The editor a clicked file path opens in.",
   "settings.terminal.mouse": "Mouse and selection",
   "settings.terminal.shell": "Shell"

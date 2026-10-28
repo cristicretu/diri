@@ -528,6 +528,10 @@ pub struct Prefs {
     /// Open a terminal URL on a plain click. When off, links still open with
     /// Command- or Control-click.
     pub terminal_open_links_on_click: bool,
+    /// Link schemes other than the web's that open without asking
+    /// (`ssh`, `vscode`, …), added by "Always Open" on the ask sheet.
+    #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub terminal_trusted_link_schemes: std::collections::BTreeSet<String>,
     pub terminal_hide_pointer: bool,
     /// Give new zsh and bash terminals Diri's OSC 133 prompt and command
     /// marks. The Engine applies it; the store pushes it on every change.
@@ -674,6 +678,7 @@ impl Default for Prefs {
             terminal_line_height: terminal_line_height_default(),
             terminal_copy_on_select: false,
             terminal_open_links_on_click: true,
+            terminal_trusted_link_schemes: Default::default(),
             terminal_hide_pointer: true,
             terminal_shell_integration: true,
             terminal_file_editor: FileEditor::Automatic,

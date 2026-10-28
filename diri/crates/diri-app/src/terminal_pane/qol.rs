@@ -235,17 +235,119 @@ impl TerminalPane {
         cx: &mut Context<Self>,
     ) {
         match reference {
-            TerminalReference::Url(url) => cx.open_url(&url),
+            TerminalReference::Url(url) => match diri_term::link_scheme::kind(&url) {
+                Some(diri_term::link_scheme::LinkKind::Web) => cx.open_url(&url),
+                Some(diri_term::link_scheme::LinkKind::App) => self.open_app_link(url, window, cx),
+                None => {}
+            },
             TerminalReference::File(reference) => {
-                let opened = self
-                    .local_file(&reference)
-                    .and_then(|file| crate::file_links::open_url(&file, self.file_editor()));
-                match opened {
-                    Some(url) => cx.open_url(&url),
-                    None => self.show_terminal_feedback(t("terminal.file_not_local"), window, cx),
+                let Some(file) = self.local_file(&reference) else {
+                    self.show_terminal_feedback(t("terminal.file_not_local"), window, cx);
+                    return;
+                };
+                let Some(url) = crate::file_links::open_url(&file, self.file_editor()) else {
+                    self.show_terminal_feedback(t("terminal.file_not_local"), window, cx);
+                    return;
+                };
+                // The system opener runs an app, script or installer it is
+                // handed. Ask every time; there is no "always" for these.
+                if url.starts_with("file://") && crate::file_links::runs_when_opened(&file.path) {
+                    let name = file
+                        .path
+                        .file_name()
+                        .map_or_else(|| file.display(), |name| name.to_string_lossy().into_owned());
+                    self.ask_before_opening(
+                        url,
+                        tf("terminal.link.run_title", &[("name", &name)]),
+                        tf("terminal.link.run_detail", &[("path", &file.display())]),
+                        None,
+                        window,
+                        cx,
+                    );
+                    return;
                 }
+                cx.open_url(&url);
             }
         }
+    }
+
+    /// A link to another app (`ssh://`, `vscode://`, `mailto:`): opens at
+    /// once if its scheme is trusted, otherwise after the user says so.
+    fn open_app_link(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(scheme) = diri_term::link_scheme::scheme(&url) else {
+            return;
+        };
+        let trusted = self
+            .runtime
+            .store
+            .read()
+            .expect("store")
+            .preferences()
+            .terminal_trusted_link_schemes
+            .contains(&scheme);
+        if trusted {
+            cx.open_url(&url);
+            return;
+        }
+        let shown: String = url.chars().take(300).collect();
+        self.ask_before_opening(
+            url,
+            tf("terminal.link.ask_title", &[("scheme", &scheme)]),
+            tf("terminal.link.ask_detail", &[("url", &shown)]),
+            Some(scheme),
+            window,
+            cx,
+        );
+    }
+
+    /// The window's sheet: Open, Always Open (when `trust` names a scheme),
+    /// Cancel. Nothing opens until a button is pressed.
+    fn ask_before_opening(
+        &mut self,
+        url: String,
+        title: String,
+        detail: String,
+        trust: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut buttons = vec![gpui::PromptButton::ok(t("terminal.link.open"))];
+        if let Some(scheme) = &trust {
+            buttons.push(gpui::PromptButton::new(tf(
+                "terminal.link.always",
+                &[("scheme", scheme)],
+            )));
+        }
+        buttons.push(gpui::PromptButton::cancel(t("terminal.paste.cancel")));
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            &title,
+            Some(&detail),
+            &buttons,
+            cx,
+        );
+        let always = trust.as_ref().map(|_| 1);
+        cx.spawn_in(window, async move |this, cx| {
+            let choice = answer.await.ok();
+            let _ = crate::floating::update_in_owner(&this, cx, |this, _, cx| {
+                if choice == Some(0) || (choice.is_some() && choice == always) {
+                    if choice == always
+                        && let Some(scheme) = trust
+                    {
+                        let _ = this
+                            .runtime
+                            .store
+                            .write()
+                            .expect("store")
+                            .update_preferences(|prefs| {
+                                prefs.terminal_trusted_link_schemes.insert(scheme);
+                            });
+                    }
+                    cx.open_url(&url);
+                }
+            });
+        })
+        .detach();
     }
 
     pub(super) fn show_terminal_feedback(

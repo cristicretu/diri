@@ -6248,6 +6248,42 @@ impl UtilitySurfaces {
         )
     }
 
+    /// App links (`ssh://`, `vscode://`, `mailto:`) ask before opening
+    /// unless their scheme was trusted from the ask sheet; this lists those
+    /// schemes so trust can be taken back.
+    fn trusted_link_schemes(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let schemes: Vec<String> = self
+            .prefs
+            .terminal_trusted_link_schemes
+            .iter()
+            .cloned()
+            .collect();
+        let detail = if schemes.is_empty() {
+            t("settings.terminal.app_links_detail_none").to_owned()
+        } else {
+            t("settings.terminal.app_links_detail").to_owned()
+        };
+        let mut chips = div().flex().flex_wrap().justify_end().gap(px(6.0));
+        for scheme in schemes {
+            let id = format!("untrust-link-scheme-{scheme}");
+            let label = tf("settings.terminal.app_links_remove", &[("scheme", &scheme)]);
+            chips = chips.child(surface_button(label, id, colors, cx, move |this, cx| {
+                let scheme = scheme.clone();
+                this.update_prefs(move |prefs| {
+                    prefs.terminal_trusted_link_schemes.remove(&scheme);
+                });
+                cx.notify();
+            }));
+        }
+        setting_row(
+            t("settings.terminal.app_links"),
+            detail,
+            chips,
+            colors,
+        )
+        .into_any_element()
+    }
+
     /// Settings › Terminal: how the terminal behaves under the mouse and
     /// in the shell. Appearance owns how it looks.
     fn terminal_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -6298,6 +6334,8 @@ impl UtilitySurfaces {
                                 cx.notify();
                             },
                         ))
+                        .child(setting_divider(colors))
+                        .child(self.trusted_link_schemes(colors, cx))
                         .child(setting_divider(colors))
                         .child(setting_row(
                             t("settings.appearance.file_links"),
@@ -9547,6 +9585,15 @@ mod tests {
                     harness
                         .sidebar
                         .update(cx, |sidebar, cx| sidebar.set_width(320.0, cx));
+                    // `DIRI_VISUAL_TRUSTED_LINKS=ssh,vscode` lists trusted
+                    // app-link schemes in Settings › Terminal.
+                    if let Ok(schemes) = std::env::var("DIRI_VISUAL_TRUSTED_LINKS") {
+                        harness.surfaces.update(cx, |surfaces, cx| {
+                            surfaces.prefs.terminal_trusted_link_schemes =
+                                schemes.split(',').map(str::to_owned).collect();
+                            cx.notify();
+                        });
+                    }
                     // `DIRI_VISUAL_TALK` turns on "Talk with your agent" and
                     // opens its Voice menu over a fixed list of voices.
                     if std::env::var_os("DIRI_VISUAL_TALK").is_some() {

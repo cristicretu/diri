@@ -12,6 +12,7 @@ pub mod find;
 pub mod identity_hue;
 pub mod inline_images;
 pub mod keys;
+pub mod link_scheme;
 pub mod messages;
 pub mod metrics;
 pub mod scroll_glide;
