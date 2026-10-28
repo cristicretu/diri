@@ -56,21 +56,55 @@ pub fn terminal_family(configured: &str) -> &str {
 }
 
 /// The terminal font for a stored family preference (empty = default) and
-/// the ligature preference. Called on every terminal frame, so the last
-/// answer is reused.
+/// the ligature preference, in the Regular face.
 pub fn terminal_font(configured: &str, ligatures: bool) -> Font {
+    terminal_font_weighted(configured, ligatures, 400)
+}
+
+/// The terminal font the preferences ask for: family, ligatures and the
+/// regular face's weight.
+pub fn terminal_font_from(prefs: &crate::store::Prefs) -> Font {
+    terminal_font_weighted(
+        &prefs.terminal_font_family,
+        prefs.terminal_ligatures,
+        prefs.terminal_font_weight,
+    )
+}
+
+/// The faces bold and italic cells use.
+pub fn terminal_faces(prefs: &crate::store::Prefs) -> diri_term::glyphs::TerminalFaces {
+    diri_term::glyphs::TerminalFaces {
+        bold: prefs.terminal_bold_weight,
+        italic: prefs.terminal_italic_weight,
+    }
+}
+
+/// Font smoothing and stroke thickening for terminal glyphs.
+pub fn glyph_raster(prefs: &crate::store::Prefs) -> gpui::GlyphRasterStyle {
+    gpui::GlyphRasterStyle {
+        smoothing: prefs.terminal_font_smoothing,
+        stroke: prefs
+            .terminal_font_thicken
+            .min(gpui::GlyphRasterStyle::MAX_STROKE),
+    }
+}
+
+/// [`terminal_font`] at a regular-face `weight`. Called on every terminal
+/// frame, so the last answer is reused.
+pub fn terminal_font_weighted(configured: &str, ligatures: bool, weight: u16) -> Font {
     thread_local! {
-        static LAST: RefCell<Option<(String, bool, Font)>> = const { RefCell::new(None) };
+        static LAST: RefCell<Option<(String, bool, u16, Font)>> = const { RefCell::new(None) };
     }
     let family = terminal_family(configured);
     LAST.with_borrow_mut(|last| {
-        if let Some((key, key_ligatures, font)) = last.as_ref()
+        if let Some((key, key_ligatures, key_weight, font)) = last.as_ref()
             && key == family
             && *key_ligatures == ligatures
+            && *key_weight == weight
         {
             return font.clone();
         }
-        let mut mono = diri_term::glyphs::terminal_font(family, ligatures);
+        let mut mono = diri_term::glyphs::terminal_font_with_weight(family, ligatures, weight);
         let mut fallbacks = diri_term::glyphs::fallback_families();
         // A custom family may lack glyphs the default covers. The bundled
         // symbol font stays first: it only maps the Private Use Area.
@@ -78,9 +112,80 @@ pub fn terminal_font(configured: &str, ligatures: bool) -> Font {
             fallbacks.insert(1, mono_family().to_owned());
         }
         mono.fallbacks = Some(FontFallbacks::from_fonts(fallbacks));
-        *last = Some((family.to_owned(), ligatures, mono.clone()));
+        *last = Some((family.to_owned(), ligatures, weight, mono.clone()));
         mono
     })
+}
+
+/// One face of the terminal family, as the face pickers offer it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FontFace {
+    /// CSS weight, rounded; font selection snaps it back onto the face.
+    pub weight: u16,
+    pub italic: bool,
+}
+
+/// The faces of the family `prefs` paints with. Reads the family GPUI has
+/// already loaded to paint, so it is cheap after the first terminal frame.
+pub fn font_faces(cx: &App, prefs: &crate::store::Prefs) -> Vec<FontFace> {
+    let font = terminal_font(&prefs.terminal_font_family, prefs.terminal_ligatures);
+    faces_from(cx.text_system().font_faces(&font))
+}
+
+/// Rounds, sorts and de-duplicates a family's faces. A platform that cannot
+/// list faces gets the four every family answers to.
+fn faces_from(raw: Vec<(gpui::FontWeight, gpui::FontStyle)>) -> Vec<FontFace> {
+    let mut faces: Vec<FontFace> = raw
+        .into_iter()
+        .filter(|(weight, _)| weight.0.is_finite())
+        .map(|(weight, style)| FontFace {
+            weight: weight.0.round().clamp(1.0, 1000.0) as u16,
+            italic: style != gpui::FontStyle::Normal,
+        })
+        .collect();
+    if faces.is_empty() {
+        faces = [(400, false), (700, false), (400, true), (700, true)]
+            .into_iter()
+            .map(|(weight, italic)| FontFace { weight, italic })
+            .collect();
+    }
+    faces.sort_by_key(|face| (face.italic, face.weight));
+    faces.dedup();
+    faces
+}
+
+/// The faces a picker lists: upright ones for Regular and Bold, italic ones
+/// for Italic. A family with no upright face (or none slanted) offers all.
+pub fn faces_for_picker(faces: &[FontFace], italic: bool) -> Vec<u16> {
+    let mut weights: Vec<u16> = faces
+        .iter()
+        .filter(|face| face.italic == italic)
+        .map(|face| face.weight)
+        .collect();
+    if weights.is_empty() && !italic {
+        weights = faces.iter().map(|face| face.weight).collect();
+        weights.sort_unstable();
+        weights.dedup();
+    }
+    weights
+}
+
+/// The localized name of a weight: Thin, Light, Regular, Medium, Bold…
+/// Halfway weights take the lighter name: CoreText reports Thin faces at
+/// 150, between Thin and Extra Light.
+pub fn weight_label(weight: u16) -> &'static str {
+    use crate::i18n::t;
+    match weight.saturating_add(49) / 100 {
+        0 | 1 => t("settings.appearance.weight_100"),
+        2 => t("settings.appearance.weight_200"),
+        3 => t("settings.appearance.weight_300"),
+        4 => t("settings.appearance.weight_400"),
+        5 => t("settings.appearance.weight_500"),
+        6 => t("settings.appearance.weight_600"),
+        7 => t("settings.appearance.weight_700"),
+        8 => t("settings.appearance.weight_800"),
+        _ => t("settings.appearance.weight_900"),
+    }
 }
 
 /// Installed fixed-pitch families, sorted, without private (`.`) families.
@@ -278,8 +383,8 @@ fn select_mono(names: &HashSet<String>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_mono, default_ui, installed, mono_family, select_mono, select_ui, terminal_family,
-        terminal_font,
+        FontFace, default_mono, default_ui, faces_for_picker, faces_from, installed, mono_family,
+        select_mono, select_ui, terminal_family, terminal_font, terminal_font_weighted,
     };
     use std::collections::HashSet;
 
@@ -303,6 +408,51 @@ mod tests {
         assert!(terminal_font("", true).features.tag_value_list().is_empty());
         assert!(!terminal_font("", false).features.tag_value_list().is_empty());
         assert!(terminal_font("", true).features.tag_value_list().is_empty());
+    }
+
+    #[test]
+    fn regular_weight_is_part_of_the_reused_font() {
+        assert_eq!(terminal_font("", true).weight, gpui::FontWeight::NORMAL);
+        assert_eq!(
+            terminal_font_weighted("", true, 500).weight,
+            gpui::FontWeight(500.0)
+        );
+        assert_eq!(terminal_font("", true).weight, gpui::FontWeight::NORMAL);
+    }
+
+    #[test]
+    fn faces_are_rounded_sorted_and_split_by_slant() {
+        use gpui::{FontStyle, FontWeight};
+        let faces = faces_from(vec![
+            (FontWeight(700.0), FontStyle::Normal),
+            (FontWeight(529.97), FontStyle::Normal),
+            (FontWeight(400.0), FontStyle::Italic),
+            (FontWeight(400.0), FontStyle::Normal),
+            (FontWeight(400.0), FontStyle::Normal),
+            (FontWeight(300.0), FontStyle::Oblique),
+        ]);
+        assert_eq!(
+            faces,
+            [
+                FontFace { weight: 400, italic: false },
+                FontFace { weight: 530, italic: false },
+                FontFace { weight: 700, italic: false },
+                FontFace { weight: 300, italic: true },
+                FontFace { weight: 400, italic: true },
+            ]
+        );
+        assert_eq!(faces_for_picker(&faces, false), [400, 530, 700]);
+        assert_eq!(faces_for_picker(&faces, true), [300, 400]);
+        // An italic-only family still offers its faces as Regular.
+        let italic_only = faces_from(vec![(FontWeight(400.0), FontStyle::Italic)]);
+        assert_eq!(faces_for_picker(&italic_only, false), [400]);
+        assert!(faces_for_picker(&faces_from(vec![(FontWeight(400.0), FontStyle::Normal)]), true).is_empty());
+        // Halfway weights read as the lighter name.
+        assert_eq!(super::weight_label(150), super::weight_label(100));
+        assert_ne!(super::weight_label(150), super::weight_label(200));
+        assert_eq!(super::weight_label(530), super::weight_label(500));
+        // Nothing listed: Regular, Bold and their italics.
+        assert_eq!(faces_from(Vec::new()).len(), 4);
     }
 
     #[test]

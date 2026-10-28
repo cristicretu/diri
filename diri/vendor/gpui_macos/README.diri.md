@@ -77,3 +77,9 @@ between captures, so it adds no resident memory.
 renderer cleared to transparent, as a transparent window's is, so a capture
 keeps the alpha of glass chrome. The site clip recorder uses it; GPUI's test
 window ignores `set_background_appearance`, so there is no other way to ask.
+
+The glyph raster style patch (see `vendor/gpui/DIRI_PATCHES.md`) adds a
+second `CGTextStroke` pass when `RenderGlyphParams::stroke` is non-zero, with
+one more device pixel of raster margin, and a `font_faces` listing plus a
+sub-1.0 weight snap in `font_id`. With `stroke == 0` the rasterizer runs
+upstream's single fill unchanged.

@@ -131,6 +131,10 @@ enum SettingsMenu {
     DefaultAgent,
     TerminalTheme,
     TerminalFont,
+    RegularFace,
+    BoldFace,
+    ItalicFace,
+    FontThicken,
     HibernateAfter,
     MemoryLimit,
     FileEditor,
@@ -502,11 +506,17 @@ pub(crate) enum UtilitySurfacesEvent {
 }
 impl gpui::EventEmitter<UtilitySurfacesEvent> for UtilitySurfaces {}
 
+/// A family's faces and the (family, ligatures) they were listed for.
+type FontFacesListing = ((String, bool), std::rc::Rc<[crate::fonts::FontFace]>);
+
 pub struct UtilitySurfaces {
     /// Installed monospace families, read when the font picker opens.
     terminal_font_families: std::rc::Rc<[String]>,
     /// The listing that picker opening started, off the main thread.
     terminal_font_listing: Option<Task<()>>,
+    /// The terminal family's faces, for the face pickers, keyed by the
+    /// family and ligature setting they were read for.
+    terminal_font_faces: std::cell::RefCell<Option<FontFacesListing>>,
     /// Voices for "Talk with your agent", read from the helper when the
     /// menu opens.
     talk_voices: Vec<crate::voice::VoiceOption>,
@@ -849,6 +859,7 @@ impl UtilitySurfaces {
             show_version_picker: false,
             terminal_font_families: std::rc::Rc::from([]),
             terminal_font_listing: None,
+            terminal_font_faces: std::cell::RefCell::new(None),
             talk_voices: Vec::new(),
             activity: "Connected client · shared daemon remains untouched".to_owned(),
             diagnostics_report,
@@ -5348,6 +5359,11 @@ impl UtilitySurfaces {
             SettingsMenu::DefaultAgent => (self.default_agent_options(colors, cx), 204.0),
             SettingsMenu::TerminalTheme => (self.terminal_theme_options(colors, cx), 252.0),
             SettingsMenu::TerminalFont => (self.terminal_font_options(colors, cx), 252.0),
+            SettingsMenu::RegularFace | SettingsMenu::BoldFace | SettingsMenu::ItalicFace => {
+                let menu = self.settings_menu.unwrap_or(SettingsMenu::RegularFace);
+                (self.font_face_options(menu, colors, cx), 204.0)
+            }
+            SettingsMenu::FontThicken => (self.font_thicken_options(colors, cx), 172.0),
             SettingsMenu::HibernateAfter => (self.hibernate_options(colors, cx), 172.0),
             SettingsMenu::MemoryLimit => (self.memory_options(colors, cx), 132.0),
             SettingsMenu::FileEditor => (self.file_editor_options(colors, cx), 204.0),
@@ -6130,6 +6146,19 @@ impl UtilitySurfaces {
             cx,
             |prefs, step| prefs.terminal_line_height += step * 0.1,
         );
+        let cell_width_control = settings_stepper(
+            "cell-width",
+            format!("{}%", self.prefs.terminal_cell_width),
+            self.prefs.terminal_cell_width > Prefs::MIN_TERMINAL_CELL_WIDTH,
+            self.prefs.terminal_cell_width < Prefs::MAX_TERMINAL_CELL_WIDTH,
+            colors,
+            cx,
+            |prefs, step| {
+                let step = Prefs::TERMINAL_CELL_WIDTH_STEP as f32 * step;
+                prefs.terminal_cell_width =
+                    (f32::from(prefs.terminal_cell_width) + step).round().max(0.0) as u16;
+            },
+        );
 
         let choices = div().w_full().flex().gap(px(12.0)).children(
             [
@@ -6168,6 +6197,7 @@ impl UtilitySurfaces {
                             crate::fonts::terminal_family(&self.prefs.terminal_font_family),
                             self.prefs.terminal_font_size,
                             self.prefs.terminal_line_height,
+                            self.prefs.terminal_font_weight,
                         )),
                 )
                 .child(setting_section(
@@ -6234,6 +6264,21 @@ impl UtilitySurfaces {
                         ))
                         .child(setting_divider(colors))
                         .child(row(
+                            t("settings.appearance.regular_face"),
+                            self.font_face_dropdown(SettingsMenu::RegularFace, cx),
+                        ))
+                        .child(setting_divider(colors))
+                        .child(row(
+                            t("settings.appearance.bold_face"),
+                            self.font_face_dropdown(SettingsMenu::BoldFace, cx),
+                        ))
+                        .child(setting_divider(colors))
+                        .child(row(
+                            t("settings.appearance.italic_face"),
+                            self.font_face_dropdown(SettingsMenu::ItalicFace, cx),
+                        ))
+                        .child(setting_divider(colors))
+                        .child(row(
                             t("settings.appearance.font_size"),
                             font_control.into_any_element(),
                         ))
@@ -6242,6 +6287,39 @@ impl UtilitySurfaces {
                             t("settings.appearance.line_height"),
                             line_height_control.into_any_element(),
                         ))
+                        .child(setting_divider(colors))
+                        .child(row(
+                            t("settings.appearance.cell_width"),
+                            cell_width_control.into_any_element(),
+                        ))
+                        .when(cfg!(target_os = "macos"), |rows| {
+                            rows.child(setting_divider(colors))
+                                .child(
+                                    setting_row(
+                                        t("settings.appearance.thicken"),
+                                        t("settings.appearance.thicken_detail"),
+                                        self.font_thicken_dropdown(cx),
+                                        colors,
+                                    )
+                                    .into_any_element(),
+                                )
+                                .child(setting_divider(colors))
+                                .child(toggle_row(
+                                    t("settings.appearance.font_smoothing"),
+                                    t("settings.appearance.font_smoothing_detail"),
+                                    self.prefs.terminal_font_smoothing,
+                                    "terminal_font_smoothing",
+                                    colors,
+                                    cx,
+                                    |this, cx| {
+                                        let enabled = !this.prefs.terminal_font_smoothing;
+                                        this.update_prefs(move |prefs| {
+                                            prefs.terminal_font_smoothing = enabled
+                                        });
+                                        cx.notify();
+                                    },
+                                ))
+                        })
                         .child(setting_divider(colors))
                         .child(toggle_row(
                             t("settings.appearance.ligatures"),
@@ -7276,6 +7354,144 @@ impl UtilitySurfaces {
             control = control.child(self.settings_menu_host(cx));
         }
         control.into_any_element()
+    }
+
+    /// The terminal family's faces, read once per family.
+    fn terminal_font_faces(&self, cx: &App) -> std::rc::Rc<[crate::fonts::FontFace]> {
+        let key = (
+            self.prefs.terminal_font_family.clone(),
+            self.prefs.terminal_ligatures,
+        );
+        let mut cached = self.terminal_font_faces.borrow_mut();
+        if let Some((cached_key, faces)) = cached.as_ref()
+            && *cached_key == key
+        {
+            return std::rc::Rc::clone(faces);
+        }
+        let faces: std::rc::Rc<[_]> = crate::fonts::font_faces(cx, &self.prefs).into();
+        *cached = Some((key, std::rc::Rc::clone(&faces)));
+        faces
+    }
+
+    /// The weight a face picker shows: `None` is the italic picker's
+    /// "same as regular".
+    fn face_weight(&self, menu: SettingsMenu) -> Option<u16> {
+        match menu {
+            SettingsMenu::BoldFace => Some(self.prefs.terminal_bold_weight),
+            SettingsMenu::ItalicFace => self.prefs.terminal_italic_weight,
+            _ => Some(self.prefs.terminal_font_weight),
+        }
+    }
+
+    fn face_label(&self, weight: Option<u16>) -> String {
+        match weight {
+            Some(weight) => crate::fonts::weight_label(weight).to_owned(),
+            None => tf(
+                "settings.appearance.face_follows_regular",
+                &[(
+                    "face",
+                    &crate::fonts::weight_label(self.prefs.terminal_font_weight),
+                )],
+            ),
+        }
+    }
+
+    fn font_face_dropdown(&self, menu: SettingsMenu, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let open = self.settings_menu == Some(menu);
+        let id = match menu {
+            SettingsMenu::BoldFace => "bold-face-dropdown",
+            SettingsMenu::ItalicFace => "italic-face-dropdown",
+            _ => "regular-face-dropdown",
+        };
+        let mut control = div().relative().min_w(px(158.0)).child(settings_select_button(
+            self.face_label(self.face_weight(menu)),
+            id,
+            open,
+            menu,
+            colors,
+            cx,
+        ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    fn font_face_options(
+        &self,
+        menu: SettingsMenu,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let faces = self.terminal_font_faces(cx);
+        let italic = menu == SettingsMenu::ItalicFace;
+        let mut choices: Vec<Option<u16>> = crate::fonts::faces_for_picker(&faces, italic)
+            .into_iter()
+            .map(Some)
+            .collect();
+        if italic {
+            choices.insert(0, None);
+        }
+        let current = self.face_weight(menu);
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for (index, choice) in choices.into_iter().enumerate() {
+            options = options.child(settings_choice_row(
+                format!("font-face-option-{index}"),
+                self.face_label(choice),
+                choice == current,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.settings_menu = None;
+                    this.update_prefs(move |prefs| match menu {
+                        SettingsMenu::BoldFace => {
+                            prefs.terminal_bold_weight = choice.unwrap_or(700);
+                        }
+                        SettingsMenu::ItalicFace => prefs.terminal_italic_weight = choice,
+                        _ => prefs.terminal_font_weight = choice.unwrap_or(400),
+                    });
+                    cx.notify();
+                },
+            ));
+        }
+        options.into_any_element()
+    }
+
+    fn font_thicken_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let open = self.settings_menu == Some(SettingsMenu::FontThicken);
+        let mut control = div().relative().min_w(px(132.0)).child(settings_select_button(
+            thicken_label(self.prefs.terminal_font_thicken),
+            "font-thicken-dropdown",
+            open,
+            SettingsMenu::FontThicken,
+            colors,
+            cx,
+        ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    fn font_thicken_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for level in 0..=Prefs::MAX_TERMINAL_FONT_THICKEN {
+            options = options.child(settings_choice_row(
+                format!("font-thicken-option-{level}"),
+                thicken_label(level),
+                level == self.prefs.terminal_font_thicken,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.settings_menu = None;
+                    this.update_prefs(move |prefs| prefs.terminal_font_thicken = level);
+                    cx.notify();
+                },
+            ));
+        }
+        options.into_any_element()
     }
 
     fn terminal_theme_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -9000,7 +9216,7 @@ fn terminal_font_option(
             let family = stored.clone();
             entity.update(cx, |this, cx| {
                 this.settings_menu = None;
-                this.update_prefs(move |prefs| prefs.terminal_font_family = family);
+                this.update_prefs(move |prefs| prefs.set_terminal_font_family(family));
                 cx.notify();
             });
         })
@@ -9185,11 +9401,23 @@ fn appearance_mode_card(
         )
 }
 
+/// The stroke thickening levels, Off to Maximum.
+fn thicken_label(level: u8) -> &'static str {
+    match level {
+        0 => t("settings.appearance.thicken_off"),
+        1 => t("settings.appearance.thicken_1"),
+        2 => t("settings.appearance.thicken_2"),
+        3 => t("settings.appearance.thicken_3"),
+        _ => t("settings.appearance.thicken_4"),
+    }
+}
+
 fn appearance_diff_preview(
     theme: TermTheme,
     family: &str,
     font_size: f32,
     line_height_scale: f32,
+    weight: u16,
 ) -> impl IntoElement {
     // Roughly a monospace face's natural row, stretched like the terminal's.
     let line_height = (font_size * 1.2 * line_height_scale).ceil();
@@ -9283,7 +9511,7 @@ fn appearance_diff_preview(
         .border_color(theme.foreground.alpha(0.09))
         .bg(theme.background)
         .font_family(SharedString::from(family.to_owned()))
-        .font_weight(FontWeight::NORMAL)
+        .font_weight(FontWeight(f32::from(weight)))
         .text_size(px(font_size))
         .flex()
         .child(column(false))
@@ -9594,6 +9822,27 @@ mod tests {
                             if std::env::var("DIRI_VISUAL_TALK").as_deref() == Ok("menu") {
                                 surfaces.settings_menu = Some(SettingsMenu::TalkVoice);
                             }
+                            cx.notify();
+                        });
+                    }
+                    // `DIRI_VISUAL_FONT=<family>` sets the terminal family with a
+                    // Medium regular face, 110% cells and Medium thickening;
+                    // `DIRI_VISUAL_FONT_MENU=regular|bold|italic|thicken` opens
+                    // that picker.
+                    if let Ok(family) = std::env::var("DIRI_VISUAL_FONT") {
+                        harness.surfaces.update(cx, |surfaces, cx| {
+                            surfaces.prefs.terminal_font_family = family;
+                            surfaces.prefs.terminal_font_weight = 500;
+                            surfaces.prefs.terminal_cell_width = 110;
+                            surfaces.prefs.terminal_font_thicken = 2;
+                            surfaces.settings_menu =
+                                match std::env::var("DIRI_VISUAL_FONT_MENU").as_deref() {
+                                    Ok("regular") => Some(SettingsMenu::RegularFace),
+                                    Ok("bold") => Some(SettingsMenu::BoldFace),
+                                    Ok("italic") => Some(SettingsMenu::ItalicFace),
+                                    Ok("thicken") => Some(SettingsMenu::FontThicken),
+                                    _ => None,
+                                };
                             cx.notify();
                         });
                     }

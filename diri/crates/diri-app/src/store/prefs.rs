@@ -416,6 +416,22 @@ fn terminal_ligatures_default() -> bool {
     true
 }
 
+const fn terminal_font_weight_default() -> u16 {
+    400
+}
+
+const fn terminal_bold_weight_default() -> u16 {
+    700
+}
+
+const fn terminal_cell_width_default() -> u16 {
+    100
+}
+
+const fn terminal_font_smoothing_default() -> bool {
+    true
+}
+
 /// A style this build does not know, written by a newer diri, reads as
 /// unset (the material decides) rather than failing the whole file.
 fn deserialize_interface_style<'de, D: Deserializer<'de>>(
@@ -532,6 +548,27 @@ pub struct Prefs {
     /// font's own default, so files written before the field read as on.
     #[serde(default = "terminal_ligatures_default")]
     pub terminal_ligatures: bool,
+    /// CSS weight of the regular face (400 Regular, 500 Medium, 300 Light).
+    /// The family's nearest face is used, so a weight it lacks is harmless.
+    #[serde(default = "terminal_font_weight_default")]
+    pub terminal_font_weight: u16,
+    /// CSS weight of the face bold cells use.
+    #[serde(default = "terminal_bold_weight_default")]
+    pub terminal_bold_weight: u16,
+    /// CSS weight of the italic face; unset follows the regular weight.
+    #[serde(default)]
+    pub terminal_italic_weight: Option<u16>,
+    /// Cell width as a percentage of the font's advance.
+    #[serde(default = "terminal_cell_width_default")]
+    pub terminal_cell_width: u16,
+    /// Platform font smoothing (macOS thickens light-on-dark text by its
+    /// luminance). On is what the terminal always did.
+    #[serde(default = "terminal_font_smoothing_default")]
+    pub terminal_font_smoothing: bool,
+    /// Extra stroke around every glyph, in quarters of a device pixel, for
+    /// thin fonts on low-resolution displays. 0 is off.
+    #[serde(default)]
+    pub terminal_font_thicken: u8,
     pub terminal_copy_on_select: bool,
     /// Open a terminal URL on a plain click. When off, links still open with
     /// Command- or Control-click.
@@ -681,6 +718,12 @@ impl Default for Prefs {
             terminal_font_family: String::new(),
             terminal_line_height: terminal_line_height_default(),
             terminal_ligatures: true,
+            terminal_font_weight: terminal_font_weight_default(),
+            terminal_bold_weight: terminal_bold_weight_default(),
+            terminal_italic_weight: None,
+            terminal_cell_width: terminal_cell_width_default(),
+            terminal_font_smoothing: true,
+            terminal_font_thicken: 0,
             terminal_copy_on_select: false,
             terminal_open_links_on_click: true,
             terminal_hide_pointer: true,
@@ -751,6 +794,10 @@ impl Prefs {
     pub const MAX_TERMINAL_FONT_SIZE: f32 = 20.0;
     pub const MIN_TERMINAL_LINE_HEIGHT: f32 = 1.0;
     pub const MAX_TERMINAL_LINE_HEIGHT: f32 = 2.0;
+    pub const MIN_TERMINAL_CELL_WIDTH: u16 = 80;
+    pub const MAX_TERMINAL_CELL_WIDTH: u16 = 150;
+    pub const TERMINAL_CELL_WIDTH_STEP: u16 = 5;
+    pub const MAX_TERMINAL_FONT_THICKEN: u8 = gpui::GlyphRasterStyle::MAX_STROKE;
 
     pub fn path() -> PathBuf {
         let home = diri_platform::home_dir()
@@ -799,6 +846,17 @@ impl Prefs {
     pub fn zoom_terminal(&mut self, delta: f32) {
         self.terminal_font_size = (self.terminal_font_size + delta)
             .clamp(Self::MIN_TERMINAL_FONT_SIZE, Self::MAX_TERMINAL_FONT_SIZE);
+    }
+
+    /// Chooses the terminal family. The faces chosen for the previous family
+    /// go back to Regular and Bold: another family's Medium may not exist.
+    pub fn set_terminal_font_family(&mut self, family: String) {
+        if family != self.terminal_font_family {
+            self.terminal_font_weight = terminal_font_weight_default();
+            self.terminal_bold_weight = terminal_bold_weight_default();
+            self.terminal_italic_weight = None;
+        }
+        self.terminal_font_family = family;
     }
 
     pub fn reset_terminal_zoom(&mut self) {
@@ -874,6 +932,16 @@ impl Prefs {
         } else {
             terminal_line_height_default()
         };
+        let weight = |weight: u16| weight.clamp(100, 900);
+        self.terminal_font_weight = weight(self.terminal_font_weight);
+        self.terminal_bold_weight = weight(self.terminal_bold_weight);
+        self.terminal_italic_weight = self.terminal_italic_weight.map(weight);
+        self.terminal_cell_width = self
+            .terminal_cell_width
+            .clamp(Self::MIN_TERMINAL_CELL_WIDTH, Self::MAX_TERMINAL_CELL_WIDTH);
+        self.terminal_font_thicken = self
+            .terminal_font_thicken
+            .min(Self::MAX_TERMINAL_FONT_THICKEN);
         let family = self.terminal_font_family.trim();
         if family.len() != self.terminal_font_family.len() {
             self.terminal_font_family = family.to_owned();
@@ -1079,6 +1147,72 @@ mod tests {
             prefs.normalize();
             assert_eq!(prefs.terminal_line_height, repaired);
         }
+    }
+
+    #[test]
+    fn font_faces_cell_width_and_thickening_default_round_trip_and_repair() {
+        // A file from before these settings paints exactly as it did.
+        let legacy: Prefs = serde_json::from_str(r#"{"terminalFontSize":14}"#).unwrap();
+        assert_eq!(legacy.terminal_font_weight, 400);
+        assert_eq!(legacy.terminal_bold_weight, 700);
+        assert_eq!(legacy.terminal_italic_weight, None);
+        assert_eq!(legacy.terminal_cell_width, 100);
+        assert!(legacy.terminal_font_smoothing);
+        assert_eq!(legacy.terminal_font_thicken, 0);
+
+        let prefs = Prefs {
+            terminal_font_weight: 500,
+            terminal_bold_weight: 800,
+            terminal_italic_weight: Some(300),
+            terminal_cell_width: 110,
+            terminal_font_smoothing: false,
+            terminal_font_thicken: 2,
+            ..Prefs::default()
+        };
+        let json = serde_json::to_value(&prefs).unwrap();
+        assert_eq!(json["terminalFontWeight"], 500);
+        assert_eq!(json["terminalCellWidth"], 110);
+        assert_eq!(json["terminalFontThicken"], 2);
+        let restored: Prefs = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, prefs);
+
+        let mut wild = Prefs {
+            terminal_font_weight: 0,
+            terminal_bold_weight: 5000,
+            terminal_italic_weight: Some(50),
+            terminal_cell_width: 400,
+            terminal_font_thicken: 200,
+            ..Prefs::default()
+        };
+        wild.normalize();
+        assert_eq!(wild.terminal_font_weight, 100);
+        assert_eq!(wild.terminal_bold_weight, 900);
+        assert_eq!(wild.terminal_italic_weight, Some(100));
+        assert_eq!(wild.terminal_cell_width, Prefs::MAX_TERMINAL_CELL_WIDTH);
+        assert_eq!(wild.terminal_font_thicken, Prefs::MAX_TERMINAL_FONT_THICKEN);
+        let mut narrow = Prefs {
+            terminal_cell_width: 10,
+            ..Prefs::default()
+        };
+        narrow.normalize();
+        assert_eq!(narrow.terminal_cell_width, Prefs::MIN_TERMINAL_CELL_WIDTH);
+
+        // Faces belong to a family; choosing another one resets them, and
+        // choosing the same one again keeps them.
+        let mut chosen = prefs.clone();
+        chosen.set_terminal_font_family(String::new());
+        assert_eq!(chosen.terminal_font_weight, 500);
+        chosen.set_terminal_font_family("Menlo".to_owned());
+        assert_eq!(chosen.terminal_font_family, "Menlo");
+        assert_eq!(
+            (
+                chosen.terminal_font_weight,
+                chosen.terminal_bold_weight,
+                chosen.terminal_italic_weight
+            ),
+            (400, 700, None)
+        );
+        assert_eq!(chosen.terminal_cell_width, 110, "cell width is not a face");
     }
 
     #[test]
