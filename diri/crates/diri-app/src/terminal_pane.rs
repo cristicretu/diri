@@ -31,6 +31,7 @@ use diri_client::attachment::{SessionAttachment, TerminalChunk};
 use diri_proto::grid::GridUpdate;
 use diri_proto::terminal::{
     MouseModes, TerminalMouseButton, TerminalMouseEvent, TerminalMouseModifiers, encode_mouse_event,
+    encode_mouse_wheel,
 };
 use diri_proto::{
     AgentKind as ProtoAgentKind, ExitReason, Resumability, RiskHint, SessionId, SessionRecord,
@@ -48,7 +49,7 @@ use diri_term::keys::{
 #[cfg(test)]
 use diri_term::keys::{TermInputModes, encode_key};
 use diri_term::metrics::CellMetrics;
-use diri_term::scrollback::{WheelDelta, WheelEvent, WheelRoute};
+use diri_term::scrollback::{HorizontalWheel, WheelDelta, WheelEvent, WheelRoute};
 use diri_term::theme::TermTheme;
 use diri_ui::{
     AgentKind as UiAgentKind, Fill, FloatingSurface, Ink, Metrics, Radius, SemanticColors,
@@ -283,6 +284,14 @@ impl MouseMotionLimiter {
         self.last_sent_at = None;
         self.last_cell = None;
         self.cancel_pending();
+    }
+
+    /// A press was reported at `cell`. As in xterm, motion is reported only
+    /// once the pointer leaves the cell the program last heard about, so a
+    /// press is not followed by a zero-distance drag.
+    fn pressed_at(&mut self, cell: (u16, u16)) {
+        self.reset();
+        self.last_cell = Some(cell);
     }
 
     fn push(&mut self, now: Instant, cell: (u16, u16), bytes: Vec<u8>) -> MotionDispatch {
@@ -684,6 +693,7 @@ struct ResidentTerminal {
     last_size: (u16, u16),
     pointer_owner: Option<(MouseButton, PointerOwner)>,
     mouse_motion: MouseMotionLimiter,
+    horizontal_wheel: HorizontalWheel,
     extent_probe: HistoryExtentProbe,
     trace: PaneTrace,
 }
@@ -1465,6 +1475,7 @@ impl TerminalPane {
                     last_size,
                     pointer_owner: None,
                     mouse_motion: MouseMotionLimiter::default(),
+                    horizontal_wheel: HorizontalWheel::default(),
                     extent_probe: HistoryExtentProbe::default(),
                     trace,
                 },
@@ -3484,6 +3495,7 @@ impl TerminalPane {
                     col as u16,
                     row as u16,
                 ) {
+                    resident.mouse_motion.pressed_at((col as u16, row as u16));
                     resident.attachment.mouse(bytes);
                 }
                 cx.stop_propagation();
@@ -4342,22 +4354,49 @@ impl TerminalPane {
                 .preferences(),
         );
         let metrics = typeface.metrics(window);
-        let viewport = self.viewport.unwrap_or_default();
-        let grid_x = viewport.x + GRID_HORIZONTAL_PADDING / 2.0;
-        let grid_y = viewport.y + self.header_height() + 2.0;
-        let col = ((f32::from(event.position.x) - grid_x) / f32::from(metrics.cell_width))
-            .floor()
-            .max(0.0) as u16;
-        let row = ((f32::from(event.position.y) - grid_y) / f32::from(metrics.line_height))
-            .floor()
-            .max(0.0) as u16;
-        let delta = match event.delta {
-            ScrollDelta::Pixels(point) => WheelDelta::PrecisePoints(f32::from(point.y)),
-            ScrollDelta::Lines(point) => WheelDelta::Lines(point.y),
+        // The same cell a click there would report (bottom-anchored grids and
+        // a reading view between rows included), clamped to the grid.
+        let (col, row) = self
+            .grid_cell_at(event.position, window)
+            .map_or((0, 0), |(col, row)| (col as u16, row as u16));
+        let (sideways, delta) = match event.delta {
+            ScrollDelta::Pixels(point) => (
+                WheelDelta::PrecisePoints(f32::from(point.x)),
+                WheelDelta::PrecisePoints(f32::from(point.y)),
+            ),
+            ScrollDelta::Lines(point) => (WheelDelta::Lines(point.x), WheelDelta::Lines(point.y)),
         };
+        let vertical = match delta {
+            WheelDelta::PrecisePoints(delta) | WheelDelta::Lines(delta) => delta,
+        };
+        let modifiers = terminal_mouse_modifiers(&event.modifiers);
         let Some(resident) = self.residents.get_mut(&id) else {
             return;
         };
+        let mouse = resident.element.mouse_modes();
+        // A program that reads the mouse gets wheel reports encoded here,
+        // like its clicks, so they carry the modifiers and the sideways axis.
+        // Everything else (alternate-scroll arrows, a Holder whose mode
+        // details are unknown) is encoded by the session's own screen.
+        let reports = mouse.is_reporting() && mouse.has_known_details();
+        let mut sent = false;
+        if reports
+            && let Some(steps) =
+                resident
+                    .horizontal_wheel
+                    .steps(sideways, vertical, f32::from(metrics.cell_width))
+        {
+            let wheel = if steps > 0 {
+                TerminalMouseEvent::WheelLeft
+            } else {
+                TerminalMouseEvent::WheelRight
+            };
+            let count = steps.unsigned_abs() as usize;
+            resident
+                .attachment
+                .mouse(encode_mouse_wheel(mouse, wheel, modifiers, col, row, count));
+            sent = true;
+        }
         let visible_rows = resident.last_size.1.max(1);
         let route = resident.element.route_wheel(WheelEvent {
             delta,
@@ -4372,10 +4411,31 @@ impl TerminalPane {
                 lines,
                 col,
                 row,
+            }) if reports => {
+                let wheel = if direction == 0 {
+                    TerminalMouseEvent::WheelUp
+                } else {
+                    TerminalMouseEvent::WheelDown
+                };
+                resident.attachment.mouse(encode_mouse_wheel(
+                    mouse,
+                    wheel,
+                    modifiers,
+                    col,
+                    row,
+                    usize::from(lines),
+                ));
+            }
+            Some(WheelRoute::Daemon {
+                direction,
+                lines,
+                col,
+                row,
             }) => resident.attachment.scroll(direction, lines, col, row),
             Some(WheelRoute::Local { .. }) => {
                 self.pump_scrollback_fetch(&id, usize::from(visible_rows));
             }
+            None if sent => {}
             None => return,
         }
         cx.stop_propagation();
@@ -5867,6 +5927,12 @@ fn pointer_owner(
             PointerOwner::Ignored
         };
     }
+    // Shift-drag selects locally even while a program reads the mouse, the
+    // xterm convention. Only the left button: Shift with the others is still
+    // reported to the program with its modifier bit.
+    if modifiers.shift && button == MouseButton::Left {
+        return PointerOwner::LocalSelection;
+    }
     if mouse.is_reporting() && mouse.has_known_details() && terminal_mouse_button(button).is_some()
     {
         PointerOwner::Terminal
@@ -6937,6 +7003,24 @@ mod tests {
             PointerOwner::LocalSelection,
             "an old remote Holder must not receive a guessed click encoding"
         );
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            pointer_owner(reporting, MouseButton::Left, &shift),
+            PointerOwner::LocalSelection,
+            "Shift-drag selects locally over a mouse-reporting program"
+        );
+        assert_eq!(
+            pointer_owner(reporting, MouseButton::Right, &shift),
+            PointerOwner::Terminal,
+            "Shift with another button is still reported, with its bit"
+        );
+        assert_eq!(
+            pointer_owner(reporting, MouseButton::Middle, &shift),
+            PointerOwner::Terminal
+        );
     }
 
     #[test]
@@ -6983,6 +7067,23 @@ mod tests {
         assert_eq!(clamp_grid_cell(usize::MAX, 100, 80, 24), Some((79, 23)));
         assert_eq!(clamp_grid_cell(0, 0, 0, 24), None);
         assert_eq!(clamp_grid_cell(0, 0, 80, 0), None);
+    }
+
+    #[test]
+    fn a_press_is_not_followed_by_a_drag_inside_its_own_cell() {
+        let started = Instant::now();
+        let mut limiter = MouseMotionLimiter::default();
+        limiter.pressed_at((4, 2));
+        assert_eq!(
+            limiter.push(started, (4, 2), b"jitter".to_vec()),
+            MotionDispatch::None,
+            "xterm reports motion only when the pointer changes cell"
+        );
+        assert_eq!(
+            limiter.push(started, (5, 2), b"drag".to_vec()),
+            MotionDispatch::SendNow(b"drag".to_vec()),
+            "the first real move is not held back by the cadence"
+        );
     }
 
     #[test]
@@ -8692,6 +8793,85 @@ mod tests {
         });
         cx.run_until_parked();
         (pane, id, cx)
+    }
+
+    /// Wheel bytes a reference xterm-compatible emulator sends a program,
+    /// recorded from that program's raw input: modifiers ride on the wheel
+    /// button, and a sideways wheel is buttons 66/67.
+    #[gpui::test]
+    fn wheel_reports_carry_modifiers_and_the_sideways_axis(cx: &mut TestAppContext) {
+        let (pane, id, cx) = drop_target_pane(cx);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let lines = |x: f32, y: f32| gpui::ScrollDelta::Lines(gpui::point(x, y));
+        let event = |delta, modifiers| gpui::ScrollWheelEvent {
+            position: gpui::point(px(200.0), px(150.0)),
+            delta,
+            modifiers,
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+        let control = Modifiers {
+            control: true,
+            ..Modifiers::default()
+        };
+        let shift_option = Modifiers {
+            shift: true,
+            alt: true,
+            ..Modifiers::default()
+        };
+        pane.update_in(cx, |pane, window, cx| {
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.attachment.mouse_observer = Some(tx);
+            resident.element.set_modes(
+                true,
+                MouseModes::new(
+                    diri_proto::terminal::MouseTrackingMode::ButtonEvents,
+                    diri_proto::terminal::MouseEncoding::Sgr,
+                ),
+            );
+            for (delta, modifiers) in [
+                (lines(0.0, 1.0), Modifiers::default()),
+                (lines(0.0, -1.0), control),
+                (lines(0.0, 1.0), shift_option),
+                (lines(1.0, 0.0), Modifiers::default()),
+                (lines(-1.0, 0.0), control),
+                (lines(0.2, 1.0), Modifiers::default()),
+            ] {
+                pane.handle_scroll(&event(delta, modifiers), window, cx);
+            }
+            // The legacy encoding carries the same buttons.
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.element.set_modes(
+                true,
+                MouseModes::new(
+                    diri_proto::terminal::MouseTrackingMode::ButtonEvents,
+                    diri_proto::terminal::MouseEncoding::Legacy,
+                ),
+            );
+            pane.handle_scroll(&event(lines(-1.0, 0.0), Modifiers::default()), window, cx);
+            // A program that does not read the mouse: the alternate screen's
+            // wheel goes to the session, which turns it into arrow keys.
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.element.set_modes(true, MouseModes::OFF);
+            pane.handle_scroll(&event(lines(0.0, -1.0), control), window, cx);
+            pane.handle_scroll(&event(lines(1.0, 0.0), Modifiers::default()), window, cx);
+        });
+        let sent: Vec<Vec<u8>> = rx.try_iter().collect();
+        let expected: Vec<&[u8]> = vec![
+            b"\x1b[<64;1;1M",
+            b"\x1b[<81;1;1M",
+            b"\x1b[<76;1;1M",
+            b"\x1b[<66;1;1M",
+            b"\x1b[<83;1;1M",
+            b"\x1b[<64;1;1M",
+            b"\x1b[Mc!!",
+            b"scroll 1 1 0 0",
+        ];
+        assert_eq!(
+            sent.iter().map(|bytes| bytes.as_slice()).collect::<Vec<_>>(),
+            expected,
+            "a mostly-vertical notch sends no sideways report, and only a \
+             reporting program gets a sideways wheel"
+        );
     }
 
     #[gpui::test]

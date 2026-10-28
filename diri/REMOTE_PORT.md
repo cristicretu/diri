@@ -691,7 +691,13 @@ wire mode byte retains its historical any-mouse bit and uses previously unused
 bits for those details. A live protocol 1.3 Holder exposes only the historical
 bit, so the Engine preserves those details as unknown: it does not synthesize
 button or motion reports, while wheel intent remains encoded by that Holder's
-authoritative parser. Scrollback is bounded to 4 MiB and served on demand
+authoritative parser. A `Scroll` frame for a program on the alternate screen
+that does not read the mouse becomes Up/Down arrow keys (alternate scroll,
+DECSET 1007, cursor-key mode honoured) in Helper builds that include it; an
+older live Holder keeps ignoring that wheel. No frame or capability changes.
+A controller encodes wheel reports for a program whose mouse details it
+knows, with modifiers and the sideways axis, and sends them as mouse input
+like its clicks. Scrollback is bounded to 4 MiB and served on demand
 through `Scroll`. Raw output is bounded to 32 MiB.
 
 On-demand history reads use the Engine's bounded background-request pool. The

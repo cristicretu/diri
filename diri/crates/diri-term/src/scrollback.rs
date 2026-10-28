@@ -910,6 +910,53 @@ impl ScrollRouter {
     }
 }
 
+/// Sideways wheel travel bound for a mouse-reporting program, which xterm
+/// reports as buttons 6 and 7 (codes 66 and 67). Diri has no horizontal
+/// scrollback, so this only ever feeds a program.
+///
+/// Trackpads drift sideways during a vertical swipe, so an event counts only
+/// when its horizontal part dominates; a vertical one forgets partial travel.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HorizontalWheel {
+    accumulated_points: f32,
+}
+
+impl HorizontalWheel {
+    /// Signed whole steps for one event: positive scrolls left (content
+    /// moves right, as AppKit's positive `deltaX`), negative right.
+    pub fn steps(&mut self, x: WheelDelta, y: f32, cell_width: f32) -> Option<i32> {
+        let delta = match x {
+            WheelDelta::PrecisePoints(delta) | WheelDelta::Lines(delta) => delta,
+        };
+        if delta == 0.0 || delta.abs() <= y.abs() {
+            self.accumulated_points = 0.0;
+            return None;
+        }
+        match x {
+            WheelDelta::Lines(lines) => {
+                self.accumulated_points = 0.0;
+                let magnitude = (lines.abs().trunc() as i32).clamp(1, 10);
+                Some(if lines > 0.0 { magnitude } else { -magnitude })
+            }
+            WheelDelta::PrecisePoints(points) => {
+                if self.accumulated_points != 0.0
+                    && points.is_sign_positive() != self.accumulated_points.is_sign_positive()
+                {
+                    self.accumulated_points = 0.0;
+                }
+                self.accumulated_points += points;
+                let per_step = cell_width.max(4.0);
+                let steps = (self.accumulated_points / per_step).trunc() as i32;
+                if steps == 0 {
+                    return None;
+                }
+                self.accumulated_points -= steps as f32 * per_step;
+                Some(steps)
+            }
+        }
+    }
+}
+
 fn classic_steps(delta: f32, visible_rows: u16) -> Option<i32> {
     if delta == 0.0 {
         return None;
@@ -958,6 +1005,32 @@ mod tests {
     use diri_proto::grid::{GridRowCodec, TermColor, TermStyle};
 
     use super::*;
+
+    #[test]
+    fn horizontal_wheel_needs_a_dominant_sideways_axis() {
+        let mut wheel = HorizontalWheel::default();
+        assert_eq!(wheel.steps(WheelDelta::Lines(1.0), 0.0, 8.0), Some(1));
+        assert_eq!(wheel.steps(WheelDelta::Lines(-1.0), 0.0, 8.0), Some(-1));
+        assert_eq!(
+            wheel.steps(WheelDelta::Lines(1.0), 2.0, 8.0),
+            None,
+            "a vertical notch"
+        );
+        // A trackpad's sideways drift during a vertical swipe sends nothing.
+        for _ in 0..20 {
+            assert_eq!(wheel.steps(WheelDelta::PrecisePoints(3.0), 12.0, 8.0), None);
+        }
+        assert_eq!(wheel.steps(WheelDelta::PrecisePoints(5.0), 0.0, 8.0), None);
+        assert_eq!(
+            wheel.steps(WheelDelta::PrecisePoints(5.0), 0.0, 8.0),
+            Some(1)
+        );
+        assert_eq!(
+            wheel.steps(WheelDelta::PrecisePoints(-17.0), 1.0, 8.0),
+            Some(-2)
+        );
+        assert_eq!(wheel.steps(WheelDelta::PrecisePoints(0.0), 0.0, 8.0), None);
+    }
 
     fn cell(ch: char) -> GridCell {
         GridCell::new(
