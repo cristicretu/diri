@@ -117,6 +117,7 @@
   "toast.non_persistent": "{host} ends sessions when SSH drops",
   "toast.non_persistent_detail": "Stay connected, or the agent may exit.",
   "toast.notification_session_gone": "That session was closed or archived",
+  "toast.pane_has_nowhere_to_go": "No other tab can take this pane",
   "toast.prefs_sync_failed": "Couldn’t sync prefs to {host}",
   "toast.privacy_reports": "diri sends crash and error reports",
   "toast.privacy_reports_detail": "Terminal contents never leave your computer.",

@@ -52,8 +52,10 @@ restores upstream's corners. Linux and other renderers keep circular corners.
 The native key-dispatch patch exposes read-only hardware key codes during the
 matching synchronous callback. A nested/unwind-safe scope restores prior state
 and never alters GPUI's logical Keystroke or IME text. Diri's terminal alone uses
-this metadata for DEC numeric-keypad identity; ordinary text fields and global
-shortcuts retain their existing behavior. The app adds a direct edge to this
+this metadata for DEC numeric-keypad identity and, through
+`current_key_layout_chars`, for the unshifted key the kitty keyboard protocol
+reports when GPUI resolved Shift into a symbol (`@` for Shift-2); ordinary
+text fields and global shortcuts retain their existing behavior. The app adds a direct edge to this
 already-pinned crate, avoiding an unsafe ABI shim or another event monitor.
 
 The alert patch (`MacWindow::prompt`) also moves the initial keyboard focus
@@ -77,6 +79,18 @@ between captures, so it adds no resident memory.
 renderer cleared to transparent, as a transparent window's is, so a capture
 keeps the alpha of glass chrome. The site clip recorder uses it; GPUI's test
 window ignores `set_background_appearance`, so there is no other way to ask.
+
+The accessibility focus patch (`accessibility_focused_ui_element` on
+`GPUIView`) lets a host app name the focused content for VoiceOver. `GPUIView`
+is the window's first responder but not an accessibility element, so AppKit
+reported the whole window as focused. The patch returns a sibling view in the
+same superview that is an accessibility element and reports itself focused,
+which is how Diri's terminal text area (`diri-app/src/macos/terminal_accessibility.rs`)
+receives VoiceOver's keyboard focus. With no such sibling it calls NSView's
+implementation, so upstream behavior is unchanged. It runs only when an
+accessibility client asks. `diri-app`'s `terminal_accessibility_appkit` test
+installs this exact method on a plain view and checks the window's focused
+element.
 
 The glyph raster style patch (see `vendor/gpui/DIRI_PATCHES.md`) adds a
 second `CGTextStroke` pass when `RenderGlyphParams::stroke` is non-zero, with

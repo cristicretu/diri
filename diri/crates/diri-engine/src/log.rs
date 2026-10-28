@@ -86,7 +86,7 @@ impl OutputLog {
         read_only: bool,
     ) -> io::Result<Self> {
         if !read_only {
-            fs::create_dir_all(dir)?;
+            diri_platform::private::create_dir_all(dir)?;
         }
         let mut log = Self::view(dir, session_id, ring_capacity, disk_capacity, read_only);
         log.open_or_recover()?;
@@ -209,20 +209,24 @@ impl OutputLog {
 
     // MARK: Read
 
-    /// Reads up to `max_bytes` from `from_offset`, clamped to what remains
-    /// available. Returns the actual start offset and the bytes.
-    pub fn read(&mut self, from_offset: u64, max_bytes: usize) -> (u64, Vec<u8>) {
+    /// The oldest offset [`Self::read`] can still return.
+    pub fn oldest_readable_offset(&self) -> u64 {
         // A read-only view holds no ring, and its `ring_start_offset` is where
         // the tail stood when it opened: once a rewrite moves the file's base
         // past that, only the file says what is still readable. Taking the
         // stale value let a reader far enough behind ask the file for a
         // window that ended before its base.
-        let oldest_available = if self.read_only {
+        if self.read_only {
             self.file_base_offset
         } else {
             self.ring_start_offset.min(self.file_base_offset)
-        };
-        let start = from_offset.max(oldest_available);
+        }
+    }
+
+    /// Reads up to `max_bytes` from `from_offset`, clamped to what remains
+    /// available. Returns the actual start offset and the bytes.
+    pub fn read(&mut self, from_offset: u64, max_bytes: usize) -> (u64, Vec<u8>) {
+        let start = from_offset.max(self.oldest_readable_offset());
         if start >= self.tail_offset {
             return (self.tail_offset, Vec::new());
         }

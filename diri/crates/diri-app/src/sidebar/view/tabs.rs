@@ -663,6 +663,7 @@ impl Sidebar {
             // The shared pill layer draws the selection; a tab fills itself
             // only while that layer stands down.
             .look_pill(colors, look, active && !pill_drawn)
+            .when_some(self.pane_drop_fill(&id, cx), |tab, fill| tab.bg(fill))
             // The tab the pointer just left keeps a fading fill; the
             // declarative hover below still lights the new tab at once.
             // Neither lights a tab while the window is not key.
@@ -954,6 +955,10 @@ impl Sidebar {
         if cx.reduce_motion() {
             self.activity_frame = 0;
         }
+        if crate::pane_drag::end_if_released(cx) {
+            self.pane_drop_area = None;
+        }
+        self.animate_pane_drop(window, cx);
         let strip = self.horizontal_strip(available_width, trailing, cx);
         self.schedule_activity_tick(cx);
         self.schedule_title_tick();
@@ -994,6 +999,14 @@ impl Sidebar {
                     this.track_lift_pointer(event.event.position, cx);
                 },
             ))
+            .on_drag_move::<crate::pane_drag::DraggedPane>(cx.listener(
+                |this, event: &gpui::DragMoveEvent<crate::pane_drag::DraggedPane>, _, cx| {
+                    this.pane_drag_move(event.event.position, event.bounds, true, cx);
+                },
+            ))
+            .on_drop(cx.listener(|this, _: &crate::pane_drag::DraggedPane, _, cx| {
+                this.pane_drop(cx);
+            }))
             .role(Role::TabList)
             .aria_label(t("sidebar.tabs.project_sessions"))
             .titlebar_drag_area()
@@ -1025,6 +1038,7 @@ impl Sidebar {
             // Islands already paint this chrome; a second tint would darken it.
             .when(!self.islands(), |strip| strip.bg(colors.sidebar_surface()))
             .text_color(colors.primary)
+            .children(self.pane_new_tab_slot(true, cx))
             .child(
                 div()
                     .flex_1()
