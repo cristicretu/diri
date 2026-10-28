@@ -6,6 +6,8 @@
 
 pub mod event;
 pub mod event_loop;
+#[doc(hidden)]
+pub mod cell_proto;
 pub mod grid;
 pub mod index;
 pub mod selection;

@@ -118,3 +118,7 @@ features = [
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
 ]
+
+[[example]]
+name = "cell_proto"
+path = "examples/cell_proto.rs"

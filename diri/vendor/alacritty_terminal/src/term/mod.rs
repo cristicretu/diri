@@ -28,7 +28,7 @@ use crate::vte::ansi::{
 
 pub mod cell;
 pub mod color;
-mod grapheme;
+pub(crate) mod grapheme;
 mod grapheme_table;
 pub mod keyboard;
 pub mod search;
