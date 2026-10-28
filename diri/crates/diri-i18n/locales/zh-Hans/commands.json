@@ -277,6 +277,8 @@
   "command.zoom_out.description": "缩小终端文字",
   "command.zoom_out.title": "减小文字",
   "settings.shortcuts.conflict": "已被“{command}”使用。",
+  "settings.shortcuts.conflict_replace": "已被“{command}”使用。按 ↩ 改为分配给此操作。",
+  "settings.shortcuts.conflict_swap": "已被“{command}”使用。按 ↩ 改为分配给此操作，按 ⇥ 互换两者。",
   "settings.shortcuts.empty_detail": "试试操作名称、描述或按键。",
   "settings.shortcuts.empty_title": "未找到快捷键",
   "settings.shortcuts.global_conflict": "此快捷键已被其他应用占用，请选择其他快捷键。",
