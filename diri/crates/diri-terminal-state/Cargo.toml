@@ -59,3 +59,7 @@ required-features = ["bench-verify"]
 [[bench]]
 name = "history_depth"
 harness = false
+
+[[bench]]
+name = "narrow_history"
+harness = false
