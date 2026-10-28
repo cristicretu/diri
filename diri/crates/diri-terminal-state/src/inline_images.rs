@@ -175,6 +175,63 @@ impl HeadlessScreen {
             .map_or(0, |images| images.stored_bytes())
     }
 
+    /// Every stored image and any transmission still arriving, one line
+    /// each, oldest first: ids, format, size and a hash of the bytes. For
+    /// tests and benchmarks that require two parses to agree on the images
+    /// themselves, not only on their total size.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn inline_image_store_summary(&self) -> Vec<String> {
+        let Some(images) = self.images.as_ref() else {
+            return Vec::new();
+        };
+        let fnv = |data: &[u8]| {
+            data.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, &byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+            })
+        };
+        let store = &images.store;
+        let mut summary: Vec<String> = store
+            .order
+            .iter()
+            .filter_map(|id| {
+                let (image, kitty) = store.images.get(id)?;
+                Some(format!(
+                    "image {id} kitty={kitty:?} {:?} {}x{} compressed={} {} bytes fnv={:016x}",
+                    image.format,
+                    image.width,
+                    image.height,
+                    image.compressed,
+                    image.data.len(),
+                    fnv(&image.data),
+                ))
+            })
+            .collect();
+        let mut numbers: Vec<_> = store.kitty_numbers.iter().collect();
+        numbers.sort();
+        summary.push(format!(
+            "kitty numbers {numbers:?} next {}",
+            store.next_kitty_id
+        ));
+        if let Some(upload) = &images.kitty_upload {
+            summary.push(format!(
+                "kitty upload {} bytes fnv={:016x} error={:?}",
+                upload.data.len(),
+                fnv(&upload.data),
+                upload.error
+            ));
+        }
+        if let Some(upload) = &images.iterm_upload {
+            summary.push(format!(
+                "iterm upload {} bytes fnv={:016x} overflow={}",
+                upload.data.len(),
+                fnv(&upload.data),
+                upload.overflow
+            ));
+        }
+        summary
+    }
+
     /// The device-pixel size of one cell as the client draws it. Images given
     /// no size in cells are sized from it, and pixel-size queries report it.
     pub fn set_cell_pixels(&mut self, width: u16, height: u16) {
@@ -1165,7 +1222,8 @@ enum Next {
 fn next_sequence(input: &[u8]) -> Next {
     // One pass for both openers: every `ESC ]` or `ESC _` is a candidate.
     let mut from = 0;
-    while let Some(at) = alacritty_terminal::vte::scan::find_pair(&input[from..], 0x1b, [b']', b'_'])
+    while let Some(at) =
+        alacritty_terminal::vte::scan::find_pair(&input[from..], 0x1b, [b']', b'_'])
     {
         let start = from + at;
         if let Some(prefix) = PREFIXES
@@ -1320,8 +1378,7 @@ fn decode_base64_block(block: &[u8]) -> Option<[u8; 48]> {
         let offset = vdupq_n_u8(64);
         // Bytes below 64 index `low`, 64..128 index `high`; any other index
         // leaves 0, and bytes from 128 up are caught by their top bit.
-        let value =
-            |c: uint8x16_t| vqtbx4q_u8(vqtbl4q_u8(low, c), high, vsubq_u8(c, offset));
+        let value = |c: uint8x16_t| vqtbx4q_u8(vqtbl4q_u8(low, c), high, vsubq_u8(c, offset));
         let (a, b, c, d) = (
             value(chars.0),
             value(chars.1),
@@ -1330,10 +1387,7 @@ fn decode_base64_block(block: &[u8]) -> Option<[u8; 48]> {
         );
         let any = vorrq_u8(
             vorrq_u8(vorrq_u8(a, b), vorrq_u8(c, d)),
-            vorrq_u8(
-                vorrq_u8(chars.0, chars.1),
-                vorrq_u8(chars.2, chars.3),
-            ),
+            vorrq_u8(vorrq_u8(chars.0, chars.1), vorrq_u8(chars.2, chars.3)),
         );
         if vmaxvq_u8(any) & 0x80 != 0 {
             return None;

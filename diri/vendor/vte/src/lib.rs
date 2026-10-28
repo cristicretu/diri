@@ -1294,8 +1294,13 @@ mod tests {
     #[test]
     fn osc_bodies_in_runs_dispatch_what_per_byte_storage_did() {
         const BODY: &[u8] = b"xy1;;;;\x01\n\x7f\x9c\xc3\xff ";
-        const ENDS: [(&[u8], bool); 5] =
-            [(b"\x07", true), (b"\x1b\\", false), (b"\x18", false), (b"\x1a", false), (b"\x1b[m", false)];
+        const ENDS: [(&[u8], bool); 5] = [
+            (b"\x07", true),
+            (b"\x1b\\", false),
+            (b"\x18", false),
+            (b"\x1a", false),
+            (b"\x1b[m", false),
+        ];
         let mut state = 0x2545_f491_4f6c_dd1du64;
         let mut next = |bound: usize| {
             state ^= state << 13;
@@ -1319,7 +1324,8 @@ mod tests {
                     expected.push(Sequence::Osc(params, bell));
                 }
             }
-            let chunks: Vec<usize> = (0..8).map(|_| 1 + next(if case % 2 == 0 { 5 } else { 400 })).collect();
+            let chunks: Vec<usize> =
+                (0..8).map(|_| 1 + next(if case % 2 == 0 { 5 } else { 400 })).collect();
             assert_eq!(osc_dispatches(&stream, &chunks), expected, "case {case}");
             assert_eq!(osc_dispatches(&stream, &[stream.len()]), expected, "case {case} whole");
         }
@@ -1343,8 +1349,10 @@ mod tests {
                 let mut stream = b"\x1b]".to_vec();
                 stream.extend_from_slice(&body);
                 stream.push(0x07);
-                let expected: Vec<Sequence> =
-                    expected_osc(&body).map(|params| Sequence::Osc(params, true)).into_iter().collect();
+                let expected: Vec<Sequence> = expected_osc(&body)
+                    .map(|params| Sequence::Osc(params, true))
+                    .into_iter()
+                    .collect();
                 for chunks in [&[65_536][..], &[1_000_003], &[stream.len()]] {
                     assert_eq!(
                         osc_dispatches(&stream, chunks),

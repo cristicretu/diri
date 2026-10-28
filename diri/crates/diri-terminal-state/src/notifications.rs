@@ -496,11 +496,45 @@ mod tests {
         let long_x = "x".repeat(9_000);
         let long_b64 = "QUJD".repeat(300_000);
         let pieces: Vec<&[u8]> = vec![
-            b"\x1b]", b"\x1b\\", b"\x07", b"\x18", b"\x1a", b"\x1b", b"\x1b_", b"\x1bP",
-            b"\x1bc", b"\x1b[", b"\x1b^", b"\x1bX", b"\x1b7", b"\x1b\x1b", b"\x1b]133;D\x07", b"9;", b"9;4;", b"777;notify;", b"99;i=1:d=0;", b"99;p=body;",
-            b"52;c;", b"6973;agent-exit;", b"133;A", b"133;C", b"7;", b"7501;", b"6;", b"5",
-            b"1337;", b"hello", b";", b"0", b"12", b"\xc3\xa9", b"\xff", b"\x9c", b"\n",
-            long_x.as_bytes(), long_b64.as_bytes(),
+            b"\x1b]",
+            b"\x1b\\",
+            b"\x07",
+            b"\x18",
+            b"\x1a",
+            b"\x1b",
+            b"\x1b_",
+            b"\x1bP",
+            b"\x1bc",
+            b"\x1b[",
+            b"\x1b^",
+            b"\x1bX",
+            b"\x1b7",
+            b"\x1b\x1b",
+            b"\x1b]133;D\x07",
+            b"9;",
+            b"9;4;",
+            b"777;notify;",
+            b"99;i=1:d=0;",
+            b"99;p=body;",
+            b"52;c;",
+            b"6973;agent-exit;",
+            b"133;A",
+            b"133;C",
+            b"7;",
+            b"7501;",
+            b"6;",
+            b"5",
+            b"1337;",
+            b"hello",
+            b";",
+            b"0",
+            b"12",
+            b"\xc3\xa9",
+            b"\xff",
+            b"\x9c",
+            b"\n",
+            long_x.as_bytes(),
+            long_b64.as_bytes(),
         ];
         let mut state = 0x853c_49e6_748f_ea9bu64;
         let mut next = |bound: usize| {
@@ -524,7 +558,8 @@ mod tests {
             let mut parser = NotificationParser::default();
             let mut at = 0;
             while at < stream.len() {
-                let take = (1 + next(if case % 3 == 0 { 7 } else { 20_000 })).min(stream.len() - at);
+                let take =
+                    (1 + next(if case % 3 == 0 { 7 } else { 20_000 })).min(stream.len() - at);
                 parser.feed(&stream[at..at + take]);
                 at += take;
             }

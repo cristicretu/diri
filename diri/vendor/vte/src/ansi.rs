@@ -2262,6 +2262,41 @@ mod tests {
         reset_colors: Vec<usize>,
     }
 
+    #[derive(Default)]
+    struct Termcaps(Vec<Vec<u8>>);
+
+    impl Handler for Termcaps {
+        fn request_termcap(&mut self, names: &[u8]) {
+            self.0.push(names.to_vec());
+        }
+    }
+
+    #[test]
+    fn dcs_requests_in_runs_keep_the_per_byte_cap_and_filtering() {
+        for len in [0, 1, 1023, 1024, 1025, 5000] {
+            // DEL and bytes from 0x80 are not passed through; C0 bytes are.
+            let mut body = Vec::new();
+            for index in 0..len {
+                body.push(b'a' + (index % 26) as u8);
+                if index % 97 == 5 {
+                    body.extend_from_slice(b"\x7f\xc3\x01");
+                }
+            }
+            let kept: Vec<u8> = body.iter().copied().filter(|&byte| byte < 0x7f).collect();
+            let expected: Vec<Vec<u8>> =
+                if kept.len() <= DCS_REQUEST_MAX { vec![kept] } else { vec![] };
+            let stream = [b"\x1bP+q".as_slice(), &body, b"\x1b\\"].concat();
+            for read in [1, 7, stream.len()] {
+                let mut handler = Termcaps::default();
+                let mut parser = Processor::<StdSyncHandler>::new();
+                for chunk in stream.chunks(read) {
+                    parser.advance(&mut handler, chunk);
+                }
+                assert_eq!(handler.0, expected, "{len} bytes in reads of {read}");
+            }
+        }
+    }
+
     impl Handler for MockHandler {
         fn terminal_attribute(&mut self, attr: Attr) {
             self.attr = Some(attr);

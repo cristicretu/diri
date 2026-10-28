@@ -1,8 +1,8 @@
 # Diri VTE patch
 
 Source: crates.io `vte` 0.15.0, copied from the Cargo registry. Original
-Apache-2.0/MIT licenses and upstream tests are retained. There are six
-production changes. The first is `SyncState::default`: its byte buffer starts empty instead of reserving
+Apache-2.0/MIT licenses and upstream tests are retained. Each production change has
+a section below. The first is `SyncState::default`: its byte buffer starts empty instead of reserving
 the 2 MiB synchronization limit for every terminal, including idle shells.
 
 Original crates.io archive SHA-256:
@@ -94,3 +94,47 @@ Test: `partial_utf8_then_ascii_then_partial_utf8`.
 reset and report it (DECRQM answers `1`/`2` instead of `0`). Parsing is
 otherwise unchanged; the width rules live in `alacritty_terminal`'s
 `term/grapheme.rs`.
+
+## String bodies and CSI parameters in runs
+
+Upstream walks every byte of an OSC, DCS, SOS, PM or APC body through the
+state dispatch, one call each. A Kitty image chunk or an 8 KiB OSC cost a
+dispatch per byte. Now:
+
+- **SOS/PM/APC and ignored DCS** skip to the next CAN, SUB or ESC with
+  `memchr3`; every other byte was ignored anyway.
+- **OSC** stores the body up to the next C0 byte as one copy. With `std`,
+  `osc_raw` keeps the `;` separators and `osc_end` splits the first
+  `MAX_OSC_PARAMS` of them, instead of recording each as it arrives. What is
+  dispatched is unchanged: the same parameters, C0 controls still dropped,
+  later separators still ignored. The 2 MiB limit still counts body bytes
+  without separators (exactly, once a body nears it), and separators past the
+  sixteenth are dropped, so the buffer stays below the limit plus 16. Without
+  `std` the fixed buffer keeps the per-byte rules.
+- **DCS passthrough** hands runs of `put` bytes to a new
+  `Perform::put_slice`, whose default calls `put` per byte. The ANSI
+  performer appends the run to its request with the same 1 KiB cap.
+- **CSI** digits, `;` and `:` update the parameters in a tight loop
+  (`advance_csi`) instead of a dispatch per byte. Any other byte goes through
+  the state machine as before, and the loop returns after it, so
+  `advance_until_terminated` still stops right after a synchronized-update
+  CSI.
+- **REP** (`CSI b`) of a printable ASCII character goes to `input_ascii` in
+  runs of up to 256 instead of `input` per repetition; `input_ascii` is
+  defined as equal to `input` per character.
+- An unhandled OSC no longer formats its whole body for a debug log line
+  nobody enabled (`log_enabled!` guard).
+
+The runs are found by `scan::run` (new module, public so Diri's own string
+scanners use the same code): NEON on aarch64 and SSE2 on x86_64, both
+baseline features of those targets, checking 64 bytes per step; a byte loop
+elsewhere. `scan::find_pair` finds a two-byte opener (`ESC ]`, `ESC _`) the
+same way. No new dependency and no per-parser memory.
+
+Tests: `osc_bodies_in_runs_dispatch_what_per_byte_storage_did` (random OSCs,
+controls, C1 bytes and every terminator, in random reads, against a model of
+the per-byte storage), `the_osc_limit_counts_body_bytes_not_separators`
+(bodies of the limit minus one, the limit and plus one, with 3, 40 and
+300,000 separators), and `scan`'s vector-against-byte-loop tests. Diri's
+`chunking_differential` tests compare one-shot, byte-at-a-time and every
+split offset.

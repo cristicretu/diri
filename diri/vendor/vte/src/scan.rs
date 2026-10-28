@@ -59,7 +59,8 @@ fn vectors(bytes: &[u8], stops: Stops) -> usize {
         // Four bits per byte of a compare mask; the first set nibble is the
         // first stop.
         let first = |mask: uint8x16_t| -> Option<usize> {
-            let nibbles = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(mask), 4)), 0);
+            let nibbles =
+                vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(mask), 4)), 0);
             (nibbles != 0).then(|| nibbles.trailing_zeros() as usize / 4)
         };
         let base = bytes.as_ptr();
@@ -175,8 +176,9 @@ fn pair_vectors<const N: usize>(bytes: &[u8], first: u8, second: [u8; N]) -> usi
         while index + 17 <= bytes.len() {
             let here = vld1q_u8(base.add(index));
             let next = vld1q_u8(base.add(index + 1));
-            let follows =
-                seconds.iter().fold(vdupq_n_u8(0), |any, &byte| vorrq_u8(any, vceqq_u8(next, byte)));
+            let follows = seconds
+                .iter()
+                .fold(vdupq_n_u8(0), |any, &byte| vorrq_u8(any, vceqq_u8(next, byte)));
             let mask = vandq_u8(vceqq_u8(here, lead), follows);
             let nibbles =
                 vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(mask), 4)), 0);
@@ -204,9 +206,9 @@ fn pair_vectors<const N: usize>(bytes: &[u8], first: u8, second: [u8; N]) -> usi
         while index + 17 <= bytes.len() {
             let here = _mm_loadu_si128(base.add(index) as *const __m128i);
             let next = _mm_loadu_si128(base.add(index + 1) as *const __m128i);
-            let follows = seconds
-                .iter()
-                .fold(_mm_setzero_si128(), |any, &byte| _mm_or_si128(any, _mm_cmpeq_epi8(next, byte)));
+            let follows = seconds.iter().fold(_mm_setzero_si128(), |any, &byte| {
+                _mm_or_si128(any, _mm_cmpeq_epi8(next, byte))
+            });
             let mask = _mm_movemask_epi8(_mm_and_si128(_mm_cmpeq_epi8(here, lead), follows));
             if mask != 0 {
                 return index + mask.trailing_zeros() as usize;
@@ -284,8 +286,9 @@ mod tests {
                     [0x1b, b']', b'_', b'a', 0x1b, b'x'][(state >> 20) as usize % 6]
                 })
                 .collect();
-            let expected =
-                bytes.windows(2).position(|pair| pair[0] == 0x1b && (pair[1] == b']' || pair[1] == b'_'));
+            let expected = bytes
+                .windows(2)
+                .position(|pair| pair[0] == 0x1b && (pair[1] == b']' || pair[1] == b'_'));
             assert_eq!(find_pair(&bytes, 0x1b, [b']', b'_']), expected, "{bytes:?}");
         }
     }

@@ -2,9 +2,18 @@
 //!
 //! ASCII, Unicode, unique multi-codepoint cells, CSI with few characters,
 //! Kitty images and long OSCs, parsed into a 120x80 terminal configured as
-//! the local Engine configures it (notifications, inline images, host
-//! replies, kitty keyboard). Every byte is parsed: the probe checks that the
-//! screen ends where a one-shot parse of the same bytes ends.
+//! the local Engine configures it (compact history with its default
+//! scrollback, notifications, inline images, host replies, kitty keyboard),
+//! with replies, notifications and clipboard writes taken after every read.
+//!
+//! Every byte is parsed, and each number is checked before it is printed:
+//! every timed run must hand the parser exactly the payload's bytes and end
+//! in the same state as a reference parse of the same bytes fed one at a
+//! time: visible grid, every scrollback row's cells and metadata, cursor,
+//! modes, title, hyperlinks, replies, notifications and stored images (ids,
+//! sizes and a hash of their bytes). Kitten's image payload deletes its image
+//! at the end, so it is also compared once with the deletes removed. A run
+//! that differs panics instead of reporting.
 //!
 //! The data is the kitten's own when `DIRI_VT_BENCH_DIR` names a directory
 //! holding `ascii.bin`, `unicode.bin`, `unique_unicode.bin`, `csi.bin`,
@@ -28,12 +37,15 @@
 //!
 //! `DIRI_VT_BENCH_READ` sets the read size (default 64 KiB; a macOS PTY hands
 //! over about 1 KiB per read). Reported: MB/s (10^6 bytes) of wall time for
-//! `feed` alone, median of 7 runs of at least 64 MB each.
+//! the reads alone (the checks are untimed), median of 7 runs of at least 64
+//! MiB each.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use diri_terminal_state::HeadlessScreen;
+#[path = "../tests/support/observed.rs"]
+mod observed;
+use observed::{Feeder, assert_same};
 
 const COLS: usize = 120;
 const ROWS: usize = 80;
@@ -160,25 +172,76 @@ fn generate(name: &str) -> Vec<u8> {
     }
 }
 
-fn screen() -> HeadlessScreen {
-    HeadlessScreen::new_with_keyboard_enhancements(COLS, ROWS)
-        .with_notifications()
-        .with_inline_images()
-        .with_host_replies("bench")
-}
-
-/// One run: feed `reps` copies of `data` in `read`-sized pieces, handling
-/// replies and notifications the way the Engine pump does.
-fn run(data: &[u8], reps: usize, read: usize) -> (Duration, HeadlessScreen) {
-    let mut screen = screen();
+/// One run: feed `reps` copies of `data` in `read`-sized pieces, taking
+/// replies, notifications and clipboard writes after each read as the Engine
+/// pump does. Returns the time spent and the bytes handed to the parser.
+fn run(data: &[u8], reps: usize, read: usize) -> (Duration, usize, Feeder) {
+    let mut feeder = Feeder::new(COLS, ROWS);
+    let mut fed = 0;
     let started = Instant::now();
     for _ in 0..reps {
         for chunk in data.chunks(read) {
-            screen.feed(black_box(chunk));
-            black_box(screen.take_replies());
+            feeder.feed(black_box(chunk));
+            fed += chunk.len();
         }
     }
-    (started.elapsed(), screen)
+    (started.elapsed(), fed, feeder)
+}
+
+/// The reference: the same bytes fed one at a time, so every escape, string
+/// body and character crosses a read boundary and goes through the parsers'
+/// per-byte paths.
+fn reference(data: &[u8], reps: usize) -> Feeder {
+    let mut feeder = Feeder::new(COLS, ROWS);
+    for _ in 0..reps {
+        for byte in data.chunks(1) {
+            feeder.feed(byte);
+        }
+    }
+    feeder
+}
+
+/// Requires `actual` to end where `expected` did. Past the history storage
+/// budget, how many of the oldest rows are still held depends on where reads
+/// ended; the rows both hold are compared, and they must be nearly all.
+fn assert_same_state(expected: &mut Feeder, actual: &mut Feeder, how: &str) {
+    let (held, reference_held) = (actual.screen.history_rows(), expected.screen.history_rows());
+    let keep = held.min(reference_held);
+    assert!(
+        held.abs_diff(reference_held) <= 1 + reference_held / 100,
+        "{how}: holds {held} history rows, the reference {reference_held}"
+    );
+    assert_same(
+        &expected.observe_newest(Some(keep)),
+        &actual.observe_newest(Some(keep)),
+        how,
+    );
+}
+
+/// `data` without Kitty delete commands (`a=d`), so the images it transmits
+/// stay stored and the comparison covers their decoded bytes. `None` when
+/// there is none to remove.
+fn without_image_deletes(data: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut at = 0;
+    let mut removed = false;
+    while let Some(start) = memchr::memmem::find(&data[at..], b"\x1b_G").map(|start| at + start) {
+        let end = memchr::memmem::find(&data[start..], b"\x1b\\")
+            .map_or(data.len(), |end| start + end + 2);
+        let control_end = memchr::memchr(b';', &data[start..end]).map_or(end, |semi| start + semi);
+        out.extend_from_slice(&data[at..start]);
+        if data[start + 3..control_end]
+            .split(|&byte| byte == b',')
+            .any(|key| key == b"a=d")
+        {
+            removed = true;
+        } else {
+            out.extend_from_slice(&data[start..end]);
+        }
+        at = end;
+    }
+    out.extend_from_slice(&data[at..]);
+    removed.then_some(out)
 }
 
 fn main() {
@@ -187,9 +250,11 @@ fn main() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(64 << 10);
     let dir = std::env::var_os("DIRI_VT_BENCH_DIR");
-    println!(
-        "workload            MB/s  (median of {RUNS}; min..max)   source  read={read}  {COLS}x{ROWS}"
-    );
+    let only = std::env::var("DIRI_VT_BENCH_ONLY").ok();
+    let min_bytes = std::env::var("DIRI_VT_BENCH_MB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map_or(MIN_BYTES_PER_RUN, |mb| mb << 20);
     if let Some(out) = std::env::var_os("DIRI_VT_BENCH_WRITE") {
         let out = std::path::Path::new(&out);
         std::fs::create_dir_all(out).expect("output directory");
@@ -203,11 +268,9 @@ fn main() {
         }
         return;
     }
-    let only = std::env::var("DIRI_VT_BENCH_ONLY").ok();
-    let min_bytes = std::env::var("DIRI_VT_BENCH_MB")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .map_or(MIN_BYTES_PER_RUN, |mb| mb << 20);
+    println!(
+        "workload            MB/s  (median of {RUNS}; min..max)   source  read={read}  {COLS}x{ROWS}"
+    );
     for name in WORKLOADS {
         if only
             .as_deref()
@@ -224,19 +287,32 @@ fn main() {
             None => (generate(name), "generated"),
         };
         let reps = min_bytes.div_ceil(data.len());
-        // Every byte parsed: reads of any size end on the same screen.
-        let (_, chunked) = run(&data, 1, read);
-        let mut whole = screen();
-        whole.feed(&data);
-        assert_eq!(
-            chunked.lines(),
-            whole.lines(),
-            "{name}: chunking changed the screen"
-        );
+        // The images a payload deletes again are compared too.
+        if let Some(kept) = without_image_deletes(&data) {
+            let (_, _, mut chunked) = run(&kept, 1, read);
+            let mut expected = reference(&kept, 1);
+            assert!(
+                !expected.screen.inline_image_store_summary().is_empty(),
+                "{name}: images kept"
+            );
+            assert_same_state(
+                &mut expected,
+                &mut chunked,
+                &format!("{name} without deletes"),
+            );
+        }
+        let mut expected = reference(&data, reps);
         let _ = run(&data, 1, read); // warm-up
         let mut rates: Vec<f64> = (0..RUNS)
             .map(|_| {
-                let (elapsed, _) = run(&data, reps, read);
+                let (elapsed, fed, mut feeder) = run(&data, reps, read);
+                // A run that dropped or changed anything reports nothing.
+                assert_eq!(fed, data.len() * reps, "{name}: bytes fed");
+                assert_same_state(
+                    &mut expected,
+                    &mut feeder,
+                    &format!("{name} in {read}-byte reads"),
+                );
                 (data.len() * reps) as f64 / elapsed.as_secs_f64() / 1e6
             })
             .collect();

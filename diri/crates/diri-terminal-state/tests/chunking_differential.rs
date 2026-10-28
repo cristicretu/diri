@@ -17,7 +17,9 @@
 //! same stream with one span missing (as a terminal that overwrites a read
 //! ring would) must not compare equal.
 
-use diri_terminal_state::HeadlessScreen;
+#[path = "support/observed.rs"]
+mod observed;
+use observed::{Feeder, Observed, assert_same, screen};
 
 const COLS: usize = 48;
 const ROWS: usize = 12;
@@ -263,132 +265,8 @@ fn lasting_stream(lines: usize) -> Vec<u8> {
     out
 }
 
-fn screen() -> HeadlessScreen {
-    // The local Engine's configuration.
-    HeadlessScreen::new_with_keyboard_enhancements(COLS, ROWS)
-        .with_notifications()
-        .with_inline_images()
-        .with_host_replies("diri-test")
-}
-
-/// Everything observable that does not count reads.
-#[derive(Debug, PartialEq)]
-struct Observed {
-    replies: Vec<u8>,
-    notifications: Vec<String>,
-    clipboard: Vec<String>,
-    scrollback_lines: Vec<String>,
-    scrollback_text_cells: String,
-    visible_start_row: i64,
-    cells_payload: Vec<u8>,
-    cells_metadata: String,
-    full_snapshot: String,
-    link_text: String,
-    links: Vec<(usize, String)>,
-    title: Option<String>,
-    modes: String,
-    cursor: (u16, u16, bool),
-    keyboard: String,
-    progress: Option<(i64, i64)>,
-    /// Whether any synchronized update was closed, and whether one is open.
-    /// How many closed is not compared: the parser counts at most one per
-    /// read, which is all the Engine asks of it (did a frame complete).
-    synchronized: (bool, bool),
-    image_bytes: usize,
-    program_status: String,
-}
-
-struct Feeder {
-    screen: HeadlessScreen,
-    replies: Vec<u8>,
-    notifications: Vec<String>,
-    clipboard: Vec<String>,
-}
-
-impl Feeder {
-    fn new() -> Self {
-        Self {
-            screen: screen(),
-            replies: Vec::new(),
-            notifications: Vec::new(),
-            clipboard: Vec::new(),
-        }
-    }
-
-    /// One read, handled the way the Engine pump handles it.
-    fn feed(&mut self, bytes: &[u8]) {
-        self.screen.feed(bytes);
-        self.replies.extend(self.screen.take_replies());
-        self.notifications.extend(
-            self.screen
-                .take_notifications()
-                .into_iter()
-                .map(|n| format!("{n:?}")),
-        );
-        self.clipboard.extend(self.screen.take_clipboard());
-    }
-
-    fn observe(mut self) -> Observed {
-        let screen = &mut self.screen;
-        let scrollback = screen.scrollback();
-        let cells = screen.scrollback_cells(0, i64::MAX);
-        let links = screen.link_source(usize::MAX);
-        Observed {
-            replies: self.replies,
-            notifications: self.notifications,
-            clipboard: self.clipboard,
-            scrollback_lines: scrollback.lines,
-            scrollback_text_cells: format!("{:?}", scrollback.text_cells),
-            visible_start_row: scrollback.visible_start_row,
-            cells_payload: cells.payload,
-            cells_metadata: without_store_nonce(format!("{:?}", cells.metadata)),
-            full_snapshot: without_store_nonce(format!("{:?}", screen.full_snapshot())),
-            link_text: links.text,
-            links: links
-                .hyperlinks
-                .into_iter()
-                .map(|(at, uri)| (at, without_store_nonce(uri)))
-                .collect(),
-            title: screen.title().map(str::to_owned),
-            modes: format!(
-                "alt={} paste={} focus={} mouse={:?} cursor={:?}",
-                screen.is_alt_screen(),
-                screen.bracketed_paste(),
-                screen.focus_reporting(),
-                screen.mouse_modes(),
-                screen.cursor_style(),
-            ),
-            cursor: screen.cursor(),
-            keyboard: format!("{:?}", screen.keyboard_state()),
-            progress: screen.progress(),
-            synchronized: (
-                screen.synchronized_updates_completed() > 0,
-                screen.in_synchronized_update(),
-            ),
-            image_bytes: screen.inline_image_bytes(),
-            program_status: format!("{:?}", screen.program_status()),
-        }
-    }
-}
-
-/// Image anchors name a per-screen store; only the rest must match.
-fn without_store_nonce(text: String) -> String {
-    const ANCHOR: &str = "diri-image:";
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text.as_str();
-    while let Some(at) = rest.find(ANCHOR) {
-        out.push_str(&rest[..at + ANCHOR.len()]);
-        rest = &rest[at + ANCHOR.len()..];
-        let nonce = rest.find('.').unwrap_or(0);
-        out.push('#');
-        rest = &rest[nonce..];
-    }
-    out.push_str(rest);
-    out
-}
-
 fn observe_chunks<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> Observed {
-    let mut feeder = Feeder::new();
+    let mut feeder = Feeder::new(COLS, ROWS);
     for chunk in chunks {
         feeder.feed(chunk);
     }
@@ -413,54 +291,6 @@ fn random_chunks<'a>(bytes: &'a [u8], rng: &mut Rng, max: usize) -> Vec<&'a [u8]
 }
 
 /// Names the first field that differs, so a failure says what was lost.
-fn assert_same(expected: &Observed, actual: &Observed, how: &str) {
-    if expected == actual {
-        return;
-    }
-    let e = format!("{expected:#?}");
-    let a = format!("{actual:#?}");
-    let field = e
-        .lines()
-        .zip(a.lines())
-        .take_while(|(x, y)| x == y)
-        .filter(|(x, _)| x.starts_with("    ") && !x.starts_with("     "))
-        .last()
-        .map_or("", |(x, _)| x);
-    let line = e
-        .lines()
-        .zip(a.lines())
-        .position(|(x, y)| x != y)
-        .unwrap_or(0);
-    let (x, y) = e.lines().zip(a.lines()).nth(line).unwrap_or(("", ""));
-    let column = x
-        .char_indices()
-        .zip(y.chars())
-        .find(|((_, p), q)| p != q)
-        .map_or(0, |((i, _), _)| i);
-    let window = |s: &str| {
-        let start = s.floor_char_boundary(column.saturating_sub(120));
-        let end = s.ceil_char_boundary((column + 120).min(s.len()));
-        s[start..end].to_owned()
-    };
-    eprintln!(
-        "first difference:\n  one shot: {}\n  {how}: {}",
-        window(x),
-        window(y)
-    );
-    let context = |s: &str| {
-        s.lines()
-            .skip(line.saturating_sub(3))
-            .take(6)
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    panic!(
-        "{how}: state differs from a one-shot parse (after {field})\n--- one shot\n{}\n--- {how}\n{}",
-        context(&e),
-        context(&a)
-    );
-}
-
 #[test]
 fn the_dense_stream_parses_the_same_split_at_every_offset() {
     let stream = dense_stream(0x5eed);
@@ -635,7 +465,7 @@ fn a_cut_inside_an_escape_never_prints_its_parameters() {
 fn state_after_hundreds_of_events_in_one_read_survives() {
     // One read with more events than a small bounded queue holds: the title
     // set after them, and every query's answer, must still arrive.
-    let mut screen = screen();
+    let mut screen = screen(COLS, ROWS);
     screen.feed(
         &[
             &b"\x07".repeat(500)[..],
