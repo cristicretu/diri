@@ -1,6 +1,6 @@
 //! Notification tray. Uses the app's existing type, color and motion tokens.
 use super::*;
-use crate::i18n::{t, tf};
+use crate::i18n::t;
 use crate::notification_feed::{NotificationEntry, NotificationKind};
 use crate::palette_chrome::{PaletteTooltip, keycap, scroll_fades};
 use crate::tooltip_warmth::WarmTooltip;
@@ -888,11 +888,5 @@ fn age(ms: u64) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let seconds = now.saturating_sub(ms) / 1000;
-    match seconds {
-        0..60 => t("notify.age_now").into(),
-        60..3600 => tf("notify.age_minutes", &[("n", &(seconds / 60))]),
-        3600..86400 => tf("notify.age_hours", &[("n", &(seconds / 3600))]),
-        _ => tf("notify.age_days", &[("n", &(seconds / 86400))]),
-    }
+    crate::session_presentation::age_label(ms, now).0
 }

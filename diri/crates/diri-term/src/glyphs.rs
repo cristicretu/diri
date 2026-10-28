@@ -10,7 +10,7 @@
 //! maps no code point outside the Private Use Area, so it never replaces a
 //! glyph another font already draws.
 
-use gpui::{App, Font, FontFallbacks, FontFeatures, font};
+use gpui::{App, Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, font};
 
 /// The family name of the bundled symbol font.
 pub const SYMBOLS_FAMILY: &str = "Diri Symbols Mono";
@@ -101,6 +101,54 @@ pub fn terminal_font(family: &str, ligatures: bool) -> Font {
     let mut terminal = font(family.to_owned());
     terminal.fallbacks = Some(FontFallbacks::from_fonts(fallback_families()));
     terminal.features = ligature_features(ligatures);
+    terminal
+}
+
+/// The faces the terminal paints bold and italic cells with. The regular
+/// face is the terminal [`Font`]'s own weight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TerminalFaces {
+    /// CSS weight of the bold face (700 is the family's Bold).
+    pub bold: u16,
+    /// CSS weight of the italic face; `None` follows the regular weight.
+    pub italic: Option<u16>,
+}
+
+impl Default for TerminalFaces {
+    fn default() -> Self {
+        Self {
+            bold: 700,
+            italic: None,
+        }
+    }
+}
+
+impl TerminalFaces {
+    /// `base` styled for a cell. Bold italic is the bold weight in italics.
+    #[must_use]
+    pub fn styled(self, base: &Font, bold: bool, italic: bool) -> Font {
+        if !bold && !italic {
+            return base.clone();
+        }
+        let mut styled = base.clone();
+        if bold {
+            styled.weight = FontWeight(f32::from(self.bold));
+        } else if let Some(weight) = self.italic {
+            styled.weight = FontWeight(f32::from(weight));
+        }
+        if italic {
+            styled.style = FontStyle::Italic;
+        }
+        styled
+    }
+}
+
+/// `family` at the regular face's `weight`, with the terminal fallback chain
+/// and the ligature setting.
+#[must_use]
+pub fn terminal_font_with_weight(family: &str, ligatures: bool, weight: u16) -> Font {
+    let mut terminal = terminal_font(family, ligatures);
+    terminal.weight = FontWeight(f32::from(weight));
     terminal
 }
 
@@ -210,5 +258,44 @@ mod tests {
             );
         }
         assert_ne!(terminal_font("Menlo", true), terminal_font("Menlo", false));
+    }
+
+    #[test]
+    fn faces_pick_the_configured_weights_and_bold_italic_keeps_both() {
+        let base = terminal_font_with_weight("JetBrains Mono", true, 500);
+        assert_eq!(base.weight, FontWeight(500.0));
+        let faces = TerminalFaces {
+            bold: 800,
+            italic: Some(300),
+        };
+        assert_eq!(faces.styled(&base, false, false), base);
+        let bold = faces.styled(&base, true, false);
+        assert_eq!(
+            (bold.weight, bold.style),
+            (FontWeight(800.0), FontStyle::Normal)
+        );
+        let italic = faces.styled(&base, false, true);
+        assert_eq!(
+            (italic.weight, italic.style),
+            (FontWeight(300.0), FontStyle::Italic)
+        );
+        let both = faces.styled(&base, true, true);
+        assert_eq!(
+            (both.weight, both.style),
+            (FontWeight(800.0), FontStyle::Italic)
+        );
+        // The defaults are the family's Bold and an italic of the regular face.
+        let plain = TerminalFaces::default().styled(&base, false, true);
+        assert_eq!(
+            (plain.weight, plain.style),
+            (FontWeight(500.0), FontStyle::Italic)
+        );
+        assert_eq!(
+            TerminalFaces::default().styled(&base, true, false).weight,
+            FontWeight::BOLD
+        );
+        // Everything but the face is kept: fallbacks and ligature features.
+        assert_eq!(both.fallbacks, base.fallbacks);
+        assert_eq!(both.features, base.features);
     }
 }

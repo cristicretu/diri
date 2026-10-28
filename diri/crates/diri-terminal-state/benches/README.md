@@ -26,3 +26,9 @@ These probes do not measure input-to-visible latency or full-application memory.
 
 `terminal_fleet` uses the same allocation counter and retains its existing gates
 for heap bounds, resize churn, zero warmed cursor allocations and zero leaked heap.
+
+`history_depth` feeds 300,000 lines of agent transcript, build log, `seq`,
+blank and random-truecolor output at 80 and 200 columns, one child process per
+scenario, and reports retained rows, stored bytes per row, RSS growth and the
+cost of each history walker. `DIRI_HISTORY_LINES` sets the history depth of
+`terminal_interactions` (default 10,000).

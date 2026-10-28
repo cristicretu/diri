@@ -369,7 +369,7 @@ fn compact_title(title: &str) -> String {
     result
 }
 
-fn agent_image(agent_id: &str) -> Option<Retained<NSImage>> {
+pub(super) fn agent_image(agent_id: &str) -> Option<Retained<NSImage>> {
     let kind = match agent_id {
         AgentKind::CLAUDE_CODE_ID => Some(BrandMarkKind::Claude),
         AgentKind::CODEX_ID => Some(BrandMarkKind::OpenAi),

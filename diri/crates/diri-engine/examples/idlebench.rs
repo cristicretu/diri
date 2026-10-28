@@ -10,7 +10,8 @@
 //! the bench samples both processes, waits `window-secs` (default 60) and
 //! samples again: the deltas are the idle cost. With `wake-after-secs`, it
 //! then waits until the fleet has been idle that long and types into each
-//! session in turn, timing the keystroke echo and a command's output.
+//! session in turn, timing the keystroke echo and a command's output, then
+//! types into up to 20 sessions while they are active (keys 50 ms apart).
 //!
 //! Set `DIRI_HOLDER_BIN` to a built `diri-holder`. Everything lives in a
 //! private temporary directory; nothing touches an installed Diri.
@@ -229,12 +230,20 @@ fn main() {
         }
     }
     let idle_from = quiet_since;
+    // What an idle fleet costs is measured once the fleet has settled into
+    // idleness: idle lanes give their threads back after two seconds, and
+    // that one-time transition is shown apart from the window.
+    let transition = (sample(engine_pid), sample(manager_pid));
+    std::thread::sleep(Duration::from_secs(3));
     println!(
         "sessions {count}  scrollback {lines} lines  spawned+settled in {:.1}s  manager pid {manager_pid}",
         spawn_started.elapsed().as_secs_f64()
     );
     print_point("empty engine", baseline, Sample::default());
+    print_point("quiet 2s", transition.0, transition.1);
     let first = (sample(engine_pid), sample(manager_pid));
+    print_window("engine settling", 3.0, transition.0, first.0);
+    print_window("manager settling", 3.0, transition.1, first.1);
     print_point(
         &format!("idle {:.0}s", idle_from.elapsed().as_secs_f64()),
         first.0,
@@ -311,5 +320,54 @@ fn main() {
             percentile(&mut outputs.clone(), 0.5),
             percentile(&mut outputs, 0.95),
         );
+
+        // Active sessions: keystrokes 50 ms apart, so every lane involved is
+        // hot. This is the latency a typing user feels, as opposed to the
+        // first keystroke after a long idle above.
+        let active = count.min(20);
+        let mut keys = Vec::with_capacity(active * ACTIVE_KEYS);
+        let mut commands = Vec::with_capacity(active);
+        for (index, session) in fleet.0.iter().take(active).enumerate() {
+            for _ in 0..ACTIVE_KEYS {
+                let before = session.screen_lines();
+                let sent = Instant::now();
+                session.write_input(b"x").expect("type");
+                wait_until(Duration::from_secs(10), || session.screen_lines() != before)
+                    .expect("active keystroke echo");
+                keys.push(sent.elapsed().as_secs_f64() * 1e3);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let marker = format!("a{index}y");
+            let before = session.screen_lines();
+            session.write_input(b"\x15").expect("clear line");
+            wait_until(Duration::from_secs(10), || session.screen_lines() != before)
+                .expect("line cleared");
+            std::thread::sleep(Duration::from_millis(50));
+            let started = Instant::now();
+            session
+                .write_input(format!("echo {marker}\r").as_bytes())
+                .expect("type");
+            wait_until(Duration::from_secs(10), || {
+                session
+                    .screen_lines()
+                    .iter()
+                    .any(|line| line.trim_end() == marker)
+            })
+            .expect("active command output");
+            commands.push(started.elapsed().as_secs_f64() * 1e3);
+        }
+        println!(
+            "active ({active} sessions x {ACTIVE_KEYS} keys, 50 ms apart): keystroke echo p50 {:.2} ms p95 {:.2} ms max {:.2} ms | command output p50 {:.2} ms p95 {:.2} ms",
+            percentile(&mut keys.clone(), 0.5),
+            percentile(&mut keys.clone(), 0.95),
+            percentile(&mut keys, 1.0),
+            percentile(&mut commands.clone(), 0.5),
+            percentile(&mut commands, 0.95),
+        );
+        let after = (sample(engine_pid), sample(manager_pid));
+        print_point("after typing", after.0, after.1);
     }
 }
+
+/// Keystrokes typed into each session in the active phase.
+const ACTIVE_KEYS: usize = 25;
