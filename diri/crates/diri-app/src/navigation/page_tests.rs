@@ -596,6 +596,9 @@ impl Render for ActionHarness {
             FocusPaneDown,
             SplitPaneRight,
             SplitPaneBelow,
+            SplitPaneLeft,
+            SplitPaneAbove,
+            SplitPaneBestFit,
             TogglePaneZoom,
             RemoveFocusedPane,
             PaneGrowWidth,
@@ -667,7 +670,7 @@ fn every_static_palette_action_dispatches_once_by_mouse_and_keyboard(cx: &mut Te
     };
     assert_eq!(
         actions.len(),
-        46,
+        49,
         "new static actions need a dispatch probe"
     );
     for action in actions {

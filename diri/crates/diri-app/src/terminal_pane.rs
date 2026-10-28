@@ -6063,6 +6063,7 @@ impl TerminalPane {
             .text_color(colors.primary)
             .on_action(cx.listener(Self::open_find))
             .on_action(cx.listener(Self::open_path_picker))
+            .on_action(cx.listener(Self::open_go_to_directory))
             .on_action(cx.listener(Self::find_next))
             .on_action(cx.listener(Self::find_previous))
             .on_action(cx.listener(Self::close_find))
@@ -8653,6 +8654,28 @@ mod tests {
                         "controller-feedback" => pane.handle_pane_event(
                             PaneEvent::InputFeedback(id.clone(), "Input queue full; that keystroke was dropped".into()), window, cx),
                         "copy" => pane.enter_copy_mode(window, cx),
+                        "go-to-directory" => {
+                            pane.open_path_picker(&crate::commands::InsertPath, window, cx);
+                            pane.go_to_directory_adopt_for_test(
+                                crate::path_picker::PathIndex::from_entries(
+                                    std::path::Path::new("/work/replay-web"),
+                                    &[
+                                        ("apps", true),
+                                        ("apps/license-lookup-app", true),
+                                        ("apps/license-lookup-app/README.md", false),
+                                        ("apps/license-lookup-app/src", true),
+                                        ("design_assets", true),
+                                        ("dns", true),
+                                        ("Dockerfile", false),
+                                        ("node_modules", true),
+                                    ],
+                                ),
+                                &["fun/dirijor", "fun/dirijor/diri/crates/diri-app", "work/api-gateway"],
+                            );
+                            if let Ok(query) = std::env::var("DIRI_QOL_QUERY") {
+                                pane.path_picker_query_for_test(&query);
+                            }
+                        }
                         scene if scene.starts_with("insert-path") => {
                             pane.open_path_picker(&crate::commands::InsertPath, window, cx);
                             pane.path_picker_adopt_for_test(crate::path_picker::PathIndex::from_entries(
@@ -9857,6 +9880,107 @@ mod tests {
             );
             assert!(pane.path_picker.is_none());
             assert!(input.try_recv().is_err());
+        });
+    }
+
+    /// Go to Directory types one quoted `cd` only at an empty shell prompt,
+    /// read from the screen's OSC 133 marks, and never into a running
+    /// command or over typed text.
+    #[gpui::test]
+    fn go_to_directory_cds_only_at_an_empty_prompt(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            let (tx, mut input) = mpsc::unbounded_channel();
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.attachment.claim();
+            resident.attachment.input_observer = Some((id.clone(), tx));
+            resident.keyboard = None;
+            let show = |pane: &mut TerminalPane, bytes: &[u8]| {
+                let mut screen = diri_engine::HeadlessScreen::new(60, 6);
+                screen.feed(bytes);
+                pane.residents[&id].element.apply_damage(screen.full_snapshot());
+            };
+            let press = |pane: &mut TerminalPane, key: &str, window: &mut Window, cx: &mut Context<TerminalPane>| {
+                let mut keystroke = Keystroke::parse(key).unwrap();
+                if key.len() == 1 {
+                    keystroke.key_char = Some(key.into());
+                }
+                pane.handle_key_down(
+                    &KeyDownEvent {
+                        keystroke,
+                        is_held: false,
+                        prefer_character_input: false,
+                    },
+                    window,
+                    cx,
+                );
+            };
+            let index = || {
+                crate::path_picker::PathIndex::from_entries(
+                    std::path::Path::new("/work/it's here"),
+                    &[("apps", true), ("apps/main.rs", false), ("docs", true)],
+                )
+            };
+
+            // An empty prompt: A, prompt text, B.
+            show(pane, b"\x1b]133;A\x07~ $ \x1b]133;B\x07");
+            pane.open_go_to_directory(&crate::commands::GoToDirectory, window, cx);
+            pane.path_picker_adopt_for_test(index());
+            for key in ["d", "o", "c"] {
+                press(pane, key, window, cx);
+            }
+            assert!(input.try_recv().is_err(), "the query must not reach the PTY");
+            press(pane, "enter", window, cx);
+            assert_eq!(
+                input.try_recv().unwrap(),
+                (id.clone(), b"cd -- '/work/it'\\''s here/docs'\r".to_vec())
+            );
+            assert!(input.try_recv().is_err());
+            assert!(pane.path_picker.is_none());
+
+            // Typed text at a marked prompt is left alone.
+            show(pane, b"\x1b]133;A\x07~ $ \x1b]133;B\x07git st");
+            pane.open_go_to_directory(&crate::commands::GoToDirectory, window, cx);
+            assert!(pane.path_picker.is_none(), "refused before opening");
+            assert!(pane.qol.feedback.is_some());
+            assert!(input.try_recv().is_err());
+
+            // A running command line: refused too.
+            show(
+                pane,
+                b"\x1b]133;A\x07~ $ \x1b]133;B\x07vim\r\n\x1b]133;C\x07~",
+            );
+            pane.qol.feedback = None;
+            pane.open_go_to_directory(&crate::commands::GoToDirectory, window, cx);
+            assert!(pane.path_picker.is_none());
+            assert!(pane.qol.feedback.is_some());
+
+            // fish marks no input start: the line is cleared (into the kill
+            // ring) before the cd, so half-typed text cannot run with it.
+            show(pane, b"\x1b]133;D;0\x07\x1b]133;A\x07~> ");
+            pane.open_go_to_directory(&crate::commands::GoToDirectory, window, cx);
+            pane.path_picker_adopt_for_test(index());
+            press(pane, "enter", window, cx);
+            assert_eq!(
+                input.try_recv().unwrap(),
+                (id.clone(), b"\x05\x15cd -- '/work/it'\\''s here/apps'\r".to_vec())
+            );
         });
     }
 

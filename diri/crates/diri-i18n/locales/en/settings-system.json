@@ -192,6 +192,8 @@
   "settings.terminal.app_links_detail": "These open without asking. Click one to ask again.",
   "settings.terminal.app_links_detail_none": "Diri asks before opening ssh, mailto, editor and other app links.",
   "settings.terminal.app_links_remove": "{scheme} ✕",
+  "settings.terminal.auto_balance_panes": "Even out panes after a split or close",
+  "settings.terminal.auto_balance_panes_detail": "Give every pane in a tab the same share whenever one is added or closed. Off keeps the sizes you set.",
   "settings.terminal.file_links_detail": "The editor a clicked file path opens in.",
   "settings.terminal.keyboard": "Keyboard",
   "settings.terminal.mouse": "Mouse and selection",
@@ -202,5 +204,6 @@
   "settings.terminal.option_left": "Left Option",
   "settings.terminal.option_off": "Off",
   "settings.terminal.option_right": "Right Option",
+  "settings.terminal.panes": "Split panes",
   "settings.terminal.shell": "Shell"
 }
