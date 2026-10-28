@@ -1026,15 +1026,14 @@ impl Page {
             let mut metas = vec![RowMeta::default(); self.len];
             let mut clusters = Clusters::default();
             self.unpack(cols, &mut metas, &mut check, &mut clusters);
-            for row in 0..self.len {
-                let (got, want) = (metas[row], self.meta[row]);
+            for (row, (&got, &want)) in metas.iter().zip(&self.meta[..self.len]).enumerate() {
                 assert_eq!(
                     (got.occ, got.fill, got.wrapped),
                     (want.occ, want.fill, want.wrapped),
                     "packed metadata of row {row}"
                 );
-                for x in row * cols..row * cols + want.occ as usize {
-                    let (a, b) = (check[x], self.cells[x]);
+                let span = row * cols..row * cols + want.occ as usize;
+                for (&a, &b) in check[span.clone()].iter().zip(&self.cells[span]) {
                     assert_eq!(a.0 & !CLUSTER, b.0 & !CLUSTER, "packed row {row}");
                     assert_eq!(clusters.of(a), self.clusters.of(b), "cluster in row {row}");
                 }
