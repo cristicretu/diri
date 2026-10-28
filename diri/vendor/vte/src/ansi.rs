@@ -607,6 +607,40 @@ pub trait Handler {
         }
     }
 
+    /// DIRI PATCH: raw ground-state bytes, for a terminal that decodes
+    /// text itself. Consumes a prefix of printable text and the C0 controls
+    /// HT, BS, CR, LF, VT and FF, with exactly the effect of the `input*`,
+    /// `put_tab(1)`, `backspace`, `carriage_return` and `linefeed` calls the
+    /// parser would make, and stops before anything else (escape, other C0,
+    /// DEL, C1, invalid or incomplete UTF-8). Returns the bytes consumed
+    /// and the last character printed, if any. The default consumes
+    /// nothing, so the parser handles every byte as before.
+    #[inline]
+    fn input_bytes(&mut self, _bytes: &[u8]) -> (usize, Option<char>) {
+        (0, None)
+    }
+
+    /// DIRI PATCH: REP, `c` printed `count` times. Must be equivalent to
+    /// calling [`Handler::input`] `count` times. The default writes a
+    /// repeated printable ASCII character as a run, a row segment at a time
+    /// like any other (`input_ascii` equals `input` per character).
+    fn input_repeat(&mut self, c: char, count: usize) {
+        if (' '..='~').contains(&c) {
+            let run = [c as u8; 256];
+            let mut left = count;
+            while left != 0 {
+                let take = left.min(run.len());
+                let text = str::from_utf8(&run[..take]).expect("ASCII");
+                self.input_ascii(text);
+                left -= take;
+            }
+        } else {
+            for _ in 0..count {
+                self.input(c);
+            }
+        }
+    }
+
     /// Set cursor to position.
     fn goto(&mut self, _line: i32, _col: usize) {}
 
@@ -1111,8 +1145,8 @@ pub enum NamedPrivateMode {
     /// DIRI PATCH: left and right margins (DECLRMM). Recognized so DECRQM can
     /// report it as permanently reset; margins are not implemented.
     LeftRightMargins = 69,
-    /// DIRI PATCH: SGR mouse reports in pixels. Recognized so DECRQM can
-    /// report it as permanently reset; pixel reports are not implemented.
+    /// DIRI PATCH: SGR mouse reports with pixel coordinates (xterm
+    /// SGR-Pixels), exclusive with the other mouse encodings.
     SgrPixelMouse = 1016,
     /// DIRI PATCH: alternate screen that is cleared on exit; the cursor is
     /// shared.
@@ -1465,6 +1499,15 @@ where
     }
 
     #[inline]
+    fn ground_bytes(&mut self, bytes: &[u8]) -> usize {
+        let (taken, last) = self.handler.input_bytes(bytes);
+        if let Some(c) = last {
+            self.state.preceding_char = Some(c);
+        }
+        taken
+    }
+
+    #[inline]
     fn print_text(&mut self, text: &str) {
         self.handler.input_text(text);
         if let Some(c) = text.chars().next_back() {
@@ -1798,24 +1841,7 @@ where
             ('B', []) | ('e', []) => handler.move_down(next_param_or(1) as usize),
             ('b', []) => {
                 if let Some(c) = self.state.preceding_char {
-                    let count = usize::from(next_param_or(1));
-                    if (' '..='~').contains(&c) {
-                        // Diri patch: a repeated printable ASCII character is
-                        // a run, written a row segment at a time like any
-                        // other (`input_ascii` equals `input` per character).
-                        let run = [c as u8; 256];
-                        let mut left = count;
-                        while left != 0 {
-                            let take = left.min(run.len());
-                            let text = str::from_utf8(&run[..take]).expect("ASCII");
-                            handler.input_ascii(text);
-                            left -= take;
-                        }
-                    } else {
-                        for _ in 0..count {
-                            handler.input(c);
-                        }
-                    }
+                    handler.input_repeat(c, next_param_or(1) as usize);
                 } else {
                     debug!("tried to repeat with no preceding char");
                 }

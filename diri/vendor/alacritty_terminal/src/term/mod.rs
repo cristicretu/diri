@@ -28,7 +28,9 @@ use crate::vte::ansi::{
 
 pub mod cell;
 pub mod color;
-mod grapheme;
+/// DIRI PATCH: public for the core-v2 prototype in `diri-terminal-state`.
+#[doc(hidden)]
+pub mod grapheme;
 mod grapheme_table;
 pub mod keyboard;
 pub mod search;
@@ -92,6 +94,9 @@ bitflags! {
         const IN_BAND_RESIZE          = 1 << 24;
         /// DECSET 2027: grapheme cluster widths by the clustering rule.
         const GRAPHEME_CLUSTERING     = 1 << 25;
+        /// DIRI PATCH: DECSET 1016, SGR mouse reports in pixels. Exclusive
+        /// with the other encodings, like 1005 and 1006.
+        const SGR_PIXEL_MOUSE         = 1 << 26;
         const MOUSE_MODE              = Self::MOUSE_REPORT_CLICK.bits() | Self::MOUSE_MOTION.bits() | Self::MOUSE_DRAG.bits();
         const KITTY_KEYBOARD_PROTOCOL = Self::DISAMBIGUATE_ESC_CODES.bits()
                                       | Self::REPORT_EVENT_TYPES.bits()
@@ -2875,12 +2880,18 @@ impl<T: EventListener> Handler for Term<T> {
             NamedPrivateMode::BracketedPaste => self.mode.insert(TermMode::BRACKETED_PASTE),
             // Mouse encodings are mutually exclusive.
             NamedPrivateMode::SgrMouse => {
-                self.mode.remove(TermMode::UTF8_MOUSE);
+                self.mode
+                    .remove(TermMode::UTF8_MOUSE | TermMode::SGR_PIXEL_MOUSE);
                 self.mode.insert(TermMode::SGR_MOUSE);
             }
             NamedPrivateMode::Utf8Mouse => {
-                self.mode.remove(TermMode::SGR_MOUSE);
+                self.mode
+                    .remove(TermMode::SGR_MOUSE | TermMode::SGR_PIXEL_MOUSE);
                 self.mode.insert(TermMode::UTF8_MOUSE);
+            }
+            NamedPrivateMode::SgrPixelMouse => {
+                self.mode.remove(TermMode::SGR_MOUSE | TermMode::UTF8_MOUSE);
+                self.mode.insert(TermMode::SGR_PIXEL_MOUSE);
             }
             NamedPrivateMode::AlternateScroll => self.mode.insert(TermMode::ALTERNATE_SCROLL),
             NamedPrivateMode::LineWrap => self.mode.insert(TermMode::LINE_WRAP),
@@ -2908,7 +2919,7 @@ impl<T: EventListener> Handler for Term<T> {
                     self.swap_alt_screen(AltScreen::ClearOnExit);
                 }
             }
-            NamedPrivateMode::LeftRightMargins | NamedPrivateMode::SgrPixelMouse => (),
+            NamedPrivateMode::LeftRightMargins => (),
             NamedPrivateMode::ColorSchemeUpdates => {
                 self.mode.insert(TermMode::COLOR_SCHEME_UPDATES)
             }
@@ -2956,6 +2967,7 @@ impl<T: EventListener> Handler for Term<T> {
             NamedPrivateMode::BracketedPaste => self.mode.remove(TermMode::BRACKETED_PASTE),
             NamedPrivateMode::SgrMouse => self.mode.remove(TermMode::SGR_MOUSE),
             NamedPrivateMode::Utf8Mouse => self.mode.remove(TermMode::UTF8_MOUSE),
+            NamedPrivateMode::SgrPixelMouse => self.mode.remove(TermMode::SGR_PIXEL_MOUSE),
             NamedPrivateMode::AlternateScroll => self.mode.remove(TermMode::ALTERNATE_SCROLL),
             NamedPrivateMode::LineWrap => self.mode.remove(TermMode::LINE_WRAP),
             NamedPrivateMode::Origin => self.mode.remove(TermMode::ORIGIN),
@@ -2979,7 +2991,7 @@ impl<T: EventListener> Handler for Term<T> {
                     self.swap_alt_screen(AltScreen::ClearOnExit);
                 }
             }
-            NamedPrivateMode::LeftRightMargins | NamedPrivateMode::SgrPixelMouse => (),
+            NamedPrivateMode::LeftRightMargins => (),
             NamedPrivateMode::ColorSchemeUpdates => {
                 self.mode.remove(TermMode::COLOR_SCHEME_UPDATES)
             }
@@ -3036,8 +3048,9 @@ impl<T: EventListener> Handler for Term<T> {
                 NamedPrivateMode::LegacyAltScreen | NamedPrivateMode::ClearingAltScreen => {
                     self.mode.contains(TermMode::ALT_SCREEN).into()
                 }
-                NamedPrivateMode::LeftRightMargins | NamedPrivateMode::SgrPixelMouse => {
-                    ModeState::PermanentlyReset
+                NamedPrivateMode::LeftRightMargins => ModeState::PermanentlyReset,
+                NamedPrivateMode::SgrPixelMouse => {
+                    self.mode.contains(TermMode::SGR_PIXEL_MOUSE).into()
                 }
                 NamedPrivateMode::ColorSchemeUpdates => {
                     self.mode.contains(TermMode::COLOR_SCHEME_UPDATES).into()
