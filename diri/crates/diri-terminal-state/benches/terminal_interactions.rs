@@ -22,7 +22,14 @@ use diri_terminal_state::HeadlessScreen;
 mod allocation;
 use allocation::ALLOCS;
 
-const HISTORY_LINES: usize = 10_000;
+/// Lines fed before each scenario; `DIRI_HISTORY_LINES` overrides it to
+/// probe deeper history.
+fn history_lines() -> usize {
+    std::env::var("DIRI_HISTORY_LINES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(10_000)
+}
 
 /// User plus system CPU time of this (single-threaded) process.
 #[cfg(windows)]
@@ -117,14 +124,15 @@ fn build_log(lines: usize, wide: bool) -> Vec<u8> {
 
 fn fed(cols: usize, rows: usize, wide: bool) -> HeadlessScreen {
     let mut screen = HeadlessScreen::new(cols, rows);
-    screen.feed(&build_log(HISTORY_LINES, wide));
+    screen.feed(&build_log(history_lines(), wide));
     screen.grid_update(true);
     screen
 }
 
 fn scenario(cols: usize, rows: usize, wide: bool, gate: bool) -> bool {
     println!(
-        "\n== {cols}x{rows}, {HISTORY_LINES} lines of {} build log ==",
+        "\n== {cols}x{rows}, {} lines of {} build log ==",
+        history_lines(),
         if wide { "CJK/emoji" } else { "ASCII" }
     );
     let mut ok = true;

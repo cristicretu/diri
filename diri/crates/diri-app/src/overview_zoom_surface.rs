@@ -124,8 +124,7 @@ impl SessionSurfaces {
     /// The user's terminal font, as the panes paint it.
     pub(super) fn terminal_font(&self) -> gpui::Font {
         let store = self.store.read().expect("session store lock poisoned");
-        let prefs = store.preferences();
-        crate::fonts::terminal_font(&prefs.terminal_font_family, prefs.terminal_ligatures)
+        crate::fonts::terminal_font_from(store.preferences())
     }
 
     pub(crate) fn set_page_region(&mut self, viewport: TerminalViewport, header: f32) {

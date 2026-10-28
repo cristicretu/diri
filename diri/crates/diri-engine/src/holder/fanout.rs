@@ -42,17 +42,34 @@ struct State {
     /// Bumped each time the subscriber takes bytes that never passed through
     /// `frames`: the log backlog of a resumed subscription.
     progress: u64,
+    /// No writer thread is serving the queue: none was started yet, or the
+    /// last one went idle and ended (see [`FrameQueue::park_writer`]). The
+    /// next push starts one; a close while it is set leaves the subscriber's
+    /// teardown to whoever closed.
+    writer_parked: bool,
 }
 
-/// What became of bytes offered to a subscriber.
+/// What became of a frame offered to a subscriber.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Offer {
+pub(super) enum Pushed {
+    /// Queued for the running writer.
     Queued,
+    /// Queued, and no writer is running: the caller must start one.
+    WakeWriter,
     /// The subscriber is gone; nothing was queued.
     Closed,
     /// The queue stayed full while the subscriber took nothing for the whole
-    /// patience; nothing was queued.
+    /// patience; nothing was queued, so the same bytes can be offered again.
     Stalled,
+}
+
+/// What a writer waiting with a deadline got.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Popped {
+    Frame(Frame),
+    Closed,
+    /// Nothing arrived in time.
+    Idle,
 }
 
 pub(super) struct FrameQueue {
@@ -75,6 +92,7 @@ impl FrameQueue {
                 queued: 0,
                 closed: false,
                 progress: 0,
+                writer_parked: true,
             }),
             changed: Condvar::new(),
             capacity: capacity.max(1),
@@ -95,13 +113,18 @@ impl FrameQueue {
     /// log, which has every byte.
     #[cfg(any(windows, test))]
     pub(super) fn push(&self, offset: u64, bytes: &[u8], patience: Duration) -> bool {
-        self.offer(offset, bytes, patience) == Offer::Queued
+        matches!(
+            self.offer(offset, bytes, patience),
+            Pushed::Queued | Pushed::WakeWriter
+        )
     }
 
-    /// [`Self::push`], telling apart a subscriber that is gone from one that
-    /// has merely taken nothing for `patience`. A stalled offer queues
-    /// nothing, so the caller can offer the same bytes again.
-    pub(super) fn offer(&self, offset: u64, bytes: &[u8], patience: Duration) -> Offer {
+    /// [`Self::push`], also saying whether a writer has to be started for the
+    /// frame (the queue's writer ends when it has been idle, and the push that
+    /// finds none is the one that starts the next), and telling apart a
+    /// subscriber that is gone from one that has merely taken nothing for
+    /// `patience`.
+    pub(super) fn offer(&self, offset: u64, bytes: &[u8], patience: Duration) -> Pushed {
         let mut state = self.state.lock().expect("frame queue");
         if !state.closed && state.queued >= self.capacity {
             let mut deadline = Instant::now() + patience;
@@ -114,7 +137,7 @@ impl FrameQueue {
                     remaining = patience;
                 }
                 if remaining.is_zero() {
-                    return Offer::Stalled;
+                    return Pushed::Stalled;
                 }
                 let (guard, _) = self
                     .changed
@@ -124,7 +147,7 @@ impl FrameQueue {
             }
         }
         if state.closed {
-            return Offer::Closed;
+            return Pushed::Closed;
         }
         let was_empty = state.frames.is_empty();
         state.queued += bytes.len();
@@ -140,13 +163,18 @@ impl FrameQueue {
             }
             _ => state.frames.push_back((offset, bytes.to_vec())),
         }
+        let unserved = std::mem::take(&mut state.writer_parked);
         drop(state);
         // A reader parks only on an empty queue, so a push onto a non-empty
         // one has nobody to wake.
         if was_empty {
             self.changed.notify_all();
         }
-        Offer::Queued
+        if unserved {
+            Pushed::WakeWriter
+        } else {
+            Pushed::Queued
+        }
     }
 
     /// Takes the next frame, waiting for as long as it takes one to arrive.
@@ -172,6 +200,57 @@ impl FrameQueue {
             self.wakeups
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    /// Takes the next frame, waiting at most `idle` for one to arrive.
+    pub(super) fn pop_within(&self, idle: Duration) -> Popped {
+        let mut state = self.state.lock().expect("frame queue");
+        let deadline = Instant::now() + idle;
+        loop {
+            if let Some(frame) = Self::take_front(&mut state) {
+                return Popped::Frame(self.released(state, frame));
+            }
+            if state.closed {
+                return Popped::Closed;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Popped::Idle;
+            }
+            let (guard, timeout) = self
+                .changed
+                .wait_timeout_while(state, remaining, |state| {
+                    state.frames.is_empty() && !state.closed
+                })
+                .expect("frame queue");
+            state = guard;
+            #[cfg(test)]
+            if !timeout.timed_out() {
+                self.wakeups
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            #[cfg(not(test))]
+            let _ = timeout;
+        }
+    }
+
+    /// Ends the writer's turn if nothing is waiting: returns true, and the
+    /// next push asks for a new writer. Returns false if a frame or a close
+    /// arrived meanwhile, so the writer must carry on.
+    pub(super) fn park_writer(&self) -> bool {
+        let mut state = self.state.lock().expect("frame queue");
+        if state.frames.is_empty() && !state.closed {
+            state.writer_parked = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Records that a writer was started for this queue other than by a push,
+    /// so the next push does not ask for another.
+    pub(super) fn claim_writer(&self) {
+        self.state.lock().expect("frame queue").writer_parked = false;
     }
 
     /// Takes a frame only if one is already waiting.
@@ -200,16 +279,26 @@ impl FrameQueue {
 
     /// Records that the subscriber took bytes from outside the queue, which
     /// keeps a pump waiting for room from giving up on it.
+    #[cfg(any(unix, test))]
     pub(super) fn note_progress(&self) {
         self.state.lock().expect("frame queue").progress += 1;
     }
 
     /// Marks the subscriber gone and wakes anyone waiting on it.
-    pub(super) fn close(&self) {
-        self.state.lock().expect("frame queue").closed = true;
+    ///
+    /// Returns true when no writer was running, which makes the caller the
+    /// one to release the subscriber's socket. A running writer sees the
+    /// close and releases it itself, so exactly one party ever does.
+    pub(super) fn close(&self) -> bool {
+        let mut state = self.state.lock().expect("frame queue");
+        state.closed = true;
+        let unserved = std::mem::take(&mut state.writer_parked);
+        drop(state);
         self.changed.notify_all();
+        unserved
     }
 
+    #[cfg(any(unix, test))]
     pub(super) fn is_closed(&self) -> bool {
         self.state.lock().expect("frame queue").closed
     }
@@ -218,6 +307,7 @@ impl FrameQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     fn push(queue: &FrameQueue, offset: u64, patience: Duration) -> bool {
         queue.push(offset, b"x", patience)
@@ -256,20 +346,21 @@ mod tests {
     #[test]
     fn a_stalled_offer_queues_nothing_and_can_be_offered_again() {
         let queue = FrameQueue::new(1);
-        assert_eq!(queue.offer(0, b"a", Duration::ZERO), Offer::Queued);
+        // The first frame asks for a writer; this test plays the writer.
+        assert_eq!(queue.offer(0, b"a", Duration::ZERO), Pushed::WakeWriter);
         assert_eq!(
             queue.offer(1, b"b", Duration::from_millis(10)),
-            Offer::Stalled
+            Pushed::Stalled
         );
         assert_eq!(queue.try_pop(), Some((0, b"a".to_vec())));
         assert!(
             queue.try_pop().is_none(),
             "the stalled bytes were not queued"
         );
-        assert_eq!(queue.offer(1, b"b", Duration::ZERO), Offer::Queued);
+        assert_eq!(queue.offer(1, b"b", Duration::ZERO), Pushed::Queued);
         assert_eq!(queue.try_pop(), Some((1, b"b".to_vec())));
         queue.close();
-        assert_eq!(queue.offer(2, b"c", Duration::ZERO), Offer::Closed);
+        assert_eq!(queue.offer(2, b"c", Duration::ZERO), Pushed::Closed);
     }
 
     #[test]
@@ -469,6 +560,168 @@ mod tests {
                 "round {round} (seed {seed:#x}): accepted bytes lost or reordered"
             );
         }
+    }
+
+    #[test]
+    fn a_writer_ends_when_idle_and_the_next_push_asks_for_another() {
+        let queue = FrameQueue::new(1 << 20);
+        assert_eq!(queue.offer(0, b"a", Duration::ZERO), Pushed::WakeWriter);
+        assert_eq!(queue.offer(1, b"b", Duration::ZERO), Pushed::Queued);
+        assert_eq!(
+            queue.pop_within(Duration::from_millis(10)),
+            Popped::Frame((0, b"ab".to_vec()))
+        );
+        assert_eq!(queue.pop_within(Duration::from_millis(10)), Popped::Idle);
+        assert!(queue.park_writer(), "nothing waiting: the writer may end");
+        assert_eq!(queue.offer(2, b"c", Duration::ZERO), Pushed::WakeWriter);
+        assert!(!queue.park_writer(), "a frame is waiting");
+        assert!(!queue.close(), "a running writer releases the subscriber");
+        assert_eq!(
+            queue.pop_within(Duration::ZERO),
+            Popped::Frame((2, b"c".to_vec()))
+        );
+        assert_eq!(queue.pop_within(Duration::ZERO), Popped::Closed);
+
+        let parked = FrameQueue::new(1);
+        assert!(parked.close(), "with no writer the closer releases it");
+        assert!(!parked.close(), "and only the first closer");
+    }
+
+    /// The pump, writers that end whenever they are idle (restarted by the
+    /// push that finds none), and a random hangup. Every accepted byte must
+    /// arrive exactly once and in order, no round may hang, and exactly one
+    /// party may release the subscriber.
+    fn parking_stress(first: u64, rounds: u64) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for round in first..first + rounds {
+            let seed = 0x5EED_0F5A_124B_1D07 ^ round.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let mut rng = Rng(seed | 1);
+            let queue = FrameQueue::new((rng.next() % 96 + 1) as usize);
+            let patience = Duration::from_micros(rng.next() % 2_000);
+            let idle = Duration::from_micros(rng.next() % 400);
+            let delivered = Arc::new(Mutex::new(Vec::new()));
+            let releases = Arc::new(AtomicUsize::new(0));
+            let writers = Arc::new(Mutex::new(Vec::new()));
+            let start_writer = {
+                let queue = Arc::clone(&queue);
+                let delivered = Arc::clone(&delivered);
+                let releases = Arc::clone(&releases);
+                let writers = Arc::clone(&writers);
+                move |seed: u64| {
+                    let queue = Arc::clone(&queue);
+                    let delivered = Arc::clone(&delivered);
+                    let releases = Arc::clone(&releases);
+                    let mut rng = Rng(seed | 1);
+                    writers
+                        .lock()
+                        .expect("writers")
+                        .push(std::thread::spawn(move || {
+                            loop {
+                                match queue.pop_within(idle) {
+                                    Popped::Frame(frame) => {
+                                        delivered.lock().expect("delivered").push(frame);
+                                    }
+                                    Popped::Closed => {
+                                        releases.fetch_add(1, Ordering::SeqCst);
+                                        return;
+                                    }
+                                    Popped::Idle => {
+                                        if queue.park_writer() {
+                                            return;
+                                        }
+                                    }
+                                }
+                                rng.pause();
+                            }
+                        }));
+                }
+            };
+            let hangup = rng.next().is_multiple_of(4).then(|| {
+                let queue = Arc::clone(&queue);
+                let releases = Arc::clone(&releases);
+                let after = Duration::from_micros(rng.next() % 3_000);
+                std::thread::spawn(move || {
+                    std::thread::sleep(after);
+                    if queue.close() {
+                        releases.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+            });
+            let mut accepted = Vec::new();
+            let mut offset = 0_u64;
+            for index in 0..(rng.next() % 300 + 20) {
+                let length = (rng.next() % 48 + 1) as usize;
+                let chunk: Vec<u8> = (0..length).map(|at| (index as usize ^ at) as u8).collect();
+                match queue.offer(offset, &chunk, patience) {
+                    Pushed::Queued => {}
+                    Pushed::WakeWriter => start_writer(rng.next()),
+                    Pushed::Closed | Pushed::Stalled => break,
+                }
+                accepted.extend_from_slice(&chunk);
+                offset += length as u64;
+                if rng.next().is_multiple_of(8) {
+                    // Long enough, sometimes, for the writer to end idle.
+                    std::thread::sleep(Duration::from_micros(rng.next() % 600));
+                }
+            }
+            if queue.close() {
+                releases.fetch_add(1, Ordering::SeqCst);
+            }
+            if let Some(hangup) = hangup {
+                hangup.join().expect("hangup");
+            }
+            let (done, finished) = std::sync::mpsc::channel();
+            {
+                let writers = Arc::clone(&writers);
+                std::thread::spawn(move || {
+                    let handles = std::mem::take(&mut *writers.lock().expect("writers"));
+                    for handle in handles {
+                        handle.join().expect("writer");
+                    }
+                    let _ = done.send(());
+                });
+            }
+            finished
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("round {round} (seed {seed:#x}) hung"));
+            assert_eq!(
+                releases.load(Ordering::SeqCst),
+                1,
+                "round {round} (seed {seed:#x}): released other than once"
+            );
+            let mut next = 0_u64;
+            let mut bytes = Vec::new();
+            for (start, frame) in delivered.lock().expect("delivered").iter() {
+                assert_eq!(*start, next, "round {round} (seed {seed:#x}): a gap");
+                next += frame.len() as u64;
+                bytes.extend_from_slice(frame);
+            }
+            assert!(
+                bytes == accepted,
+                "round {round} (seed {seed:#x}): accepted bytes lost or reordered"
+            );
+        }
+    }
+
+    #[test]
+    fn idle_writers_and_hangups_never_lose_a_byte_or_release_twice() {
+        parking_stress(0, 100);
+    }
+
+    /// `DIRI_STRESS_ROUNDS` rounds (default 20,000) from `DIRI_STRESS_FIRST`.
+    #[test]
+    #[ignore = "long; run on demand"]
+    fn idle_writers_and_hangups_never_lose_a_byte_or_release_twice_at_length() {
+        let setting = |name: &str, default: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        };
+        parking_stress(
+            setting("DIRI_STRESS_FIRST", 0),
+            setting("DIRI_STRESS_ROUNDS", 20_000),
+        );
     }
 
     #[test]

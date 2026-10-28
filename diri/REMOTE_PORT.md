@@ -878,17 +878,31 @@ uses typed Cell style palettes, UTF-8 scalars and style runs followed by DEFLATE
 Row occupancy, flags, colors, links and combining marks survive exact round trips.
 There is one parser and no background compression task or terminal lock.
 
-Retain up to 10,000 physical history rows under a 4 MiB stored-history allowance:
-compressed payload, allocated block/row indexes, and editable history cells.
-Discard only oldest history when either limit is reached. Visible cells,
-cell-extra heap allocations, temporary codec/read/reflow work and caller-owned
-response buffers are separate from this allowance. A resize does not evict: when
-re-wrapping needs more physical rows (a narrower screen, or fewer screen rows),
-the row limit rises to the rows the reflow produced, up to four times the cap,
-and returns toward the cap as widening, a clear or the byte allowance leaves
-fewer rows. New output then recycles the oldest row at that limit. Checkpoints
-carry only the newest 10,000 rows, within read admission. History capacity no
-longer shrinks merely because the terminal becomes wider.
+History depth is bounded by a 4 MiB stored-history allowance, not a row count:
+compressed payload, allocated block/row indexes, the line index of history whose
+column change is deferred, and editable history cells. A ceiling of 150,000
+physical rows bounds row-proportional work for near-empty output; typical agent
+and build output reaches the byte allowance first (about 120,000-185,000 rows at
+80 columns, 70,000-115,000 at 200; incompressible truecolor output about 3,800
+at 80). Discard only oldest history when either limit is reached. Once the byte
+allowance evicts, each new line recycles the oldest row, as at the row ceiling;
+when stored history falls 1/16 below the allowance, history grows again.
+Visible cells, cell-extra heap allocations, temporary codec/read/reflow work and
+caller-owned response buffers are separate from this allowance. A resize does
+not evict by row count: when re-wrapping needs more physical rows (a narrower
+screen, or fewer screen rows), the row limit rises to the rows the reflow
+produced, up to four times the ceiling, and returns toward the ceiling as
+widening, a clear or the byte allowance leave fewer rows. New output then
+recycles the oldest row at that limit; the byte allowance still bounds what a
+reflow stores. History capacity no longer shrinks merely because the terminal
+becomes wider. The Remote Helper uses the same core, so its scrollback stays
+bounded by the same 4 MiB.
+
+Exports taken under the screen lock carry only the newest 10,000 history rows:
+the Engine checkpoint (so adoption after an Engine restart restores those rows,
+within read admission) and the whole-text `session.read_scrollback` (its
+`firstRow` marks the start). Deeper rows remain readable through paged
+scrollback reads.
 
 History reads decode bounded row blocks and release caches at exclusive borrow
 boundaries. Resizing untouched hard lines retains compressed payloads and pads
@@ -948,7 +962,8 @@ PTY unread and the kernel pauses the program, however long a parse pass takes
 on a loaded machine. The program runs free only once the Engine hangs up (its
 socket closes) or the session is dying (kill-tree, SIGKILL, or the child has
 exited) and the Engine has then taken nothing for 500 ms, so a killed leader
-can still drain and exit; the Engine resumes from its offset when it returns. Display clients are unaffected: they attach to the Engine, whose
+can still drain and exit; the Engine resumes from its offset when it returns.
+Display clients are unaffected: they attach to the Engine, whose
 bounded per-client queues still drop stale diffs and reseed with a Full
 Snapshot. An older live Holder ignores `resumeFrom` and omits `resumed`; the
 Engine keeps its previous behaviour for that Holder (follow the log, subscribe
@@ -2168,6 +2183,27 @@ so a decoration-only repaint is never withheld by the attach pump. Mode 12
 starts from the blinking default, so a DECRQM `?12` query reports the blink
 and never turns the cursor steady. Checkpoint restore replays spans and the
 cursor style. No Holder task, timer or queue is added.
+
+## Grapheme cluster widths (October 2026)
+
+The shared parser in `diri-terminal-state` measures grapheme clusters, not
+codepoints, so the Holder and the local Engine lay out `❤️` (VS16), ZWJ
+sequences, skin tones, keycaps and flag pairs as one cell of two columns. The
+default widths are those of `Bun.stringWidth` in the Bun release embedded in
+Claude Code, from Bun's own generated table
+(`vendor/alacritty_terminal/src/term/grapheme_table.rs`); a program that sets
+DECSET 2027 gets first-codepoint cluster widths instead, and DECRQM 2027
+reports the mode. A cluster's extra codepoints ride the existing grapheme
+metadata and the widened base is followed by the existing wide-spacer cell,
+so Snapshot, Diff, the grid codec and the protocol minor are unchanged.
+
+This is a Helper build change, not a protocol change. The parser source is
+part of the Build ID, so a new Engine uploads a new Helper and new Holders use
+the new widths. A live Holder keeps the binary that launched it and its old
+codepoint widths until its session restarts; the Engine renders that Holder's
+grid as sent. Mode 2027 is parser state: it is not carried in snapshots or
+checkpoints, so after a Holder or Engine restart a program sees the default
+widths until it sets the mode again.
 
 ## Read-only output log ownership
 

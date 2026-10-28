@@ -257,8 +257,6 @@ pub struct AgentLogo {
     badged: bool,
     inset: f32,
     monochrome: bool,
-    /// Drawn in place of the generic terminal glyph of a mark-less kind.
-    glyph: Option<IconName>,
     colors: SemanticColors,
 }
 
@@ -273,17 +271,8 @@ impl AgentLogo {
             badged: true,
             inset: BADGE_MARK_INSET,
             monochrome: false,
-            glyph: None,
             colors,
         }
-    }
-
-    /// A terminal running a known program shows that program's kind of
-    /// glyph (an editor, a database shell) instead of the terminal prompt.
-    /// Kinds with a brand mark keep it.
-    pub fn glyph(mut self, glyph: Option<IconName>) -> Self {
-        self.glyph = glyph;
-        self
     }
 
     /// Draw every kind in the one neutral ink instead of its brand color,
@@ -343,7 +332,7 @@ impl RenderOnce for AgentLogo {
                 if self.kind == AgentKind::Note {
                     IconName::File
                 } else {
-                    self.glyph.unwrap_or(IconName::Terminal)
+                    IconName::Terminal
                 },
                 mark_size.max(self.size * 0.54),
                 fill,

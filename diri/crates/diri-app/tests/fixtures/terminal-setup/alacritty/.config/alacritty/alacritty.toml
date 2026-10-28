@@ -1,0 +1,31 @@
+[general]
+import = ["~/.config/alacritty/themes/base.toml"]
+
+[font]
+size = 16.0
+
+[font.normal]
+family = "Menlo"
+
+[font.offset]
+y = 4
+
+[colors.primary]
+background = "0x1d1f21"
+
+[cursor]
+style = { shape = "Underline", blinking = "Always" }
+
+[window]
+padding = { x = 6, y = 6 }
+option_as_alt = "Both"
+opacity = 0.9
+
+[scrolling]
+history = 5000
+
+[selection]
+save_to_clipboard = true
+
+[env]
+GITHUB_TOKEN = "ghp_secretsecret"

@@ -325,18 +325,6 @@ fn validate_grid(grid: &GridUpdate) -> Result<(), MirrorError> {
     Ok(())
 }
 
-/// How [`HeadlessScreen::text_lines`] reads; all off reads like
-/// [`HeadlessScreen::lines`].
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct TextOptions {
-    /// Join soft-wrapped rows into the line the program wrote.
-    pub unwrap: bool,
-    /// Keep colours and attributes as SGR escape sequences.
-    pub ansi: bool,
-    /// Include retained history above the screen, oldest first.
-    pub scrollback: bool,
-}
-
 /// Screen text and hyperlink targets for the artifact scanner; see
 /// [`HeadlessScreen::link_source`].
 #[derive(Clone, Debug, Default)]
@@ -374,17 +362,30 @@ impl ScreenSnapshot {
     }
 }
 
-/// Retain up to 10,000 physical history rows within 4 MiB of stored row
-/// representation. Cold rows are losslessly compressed; visible cells and
-/// temporary caller-owned responses are separate. Dense differential builds
-/// translate this allowance into a width-dependent row count.
+/// History depth is bounded by 4 MiB of stored row representation, not by a
+/// row count. Cold rows are losslessly compressed, so typical agent and build
+/// output keeps 100,000+ rows at 80 columns while high-entropy output keeps
+/// fewer; visible cells and temporary caller-owned responses are separate.
+/// Dense differential builds translate this allowance into a width-dependent
+/// row count.
 const HISTORY_STORAGE_BUDGET_BYTES: usize = 4 << 20;
+
+/// The most physical history rows kept however well they compress, so the
+/// work that scales with rows (a column change's first history scan, reading
+/// reflowed history) stays bounded for near-empty output. Typical output
+/// reaches the byte budget first.
+pub const HISTORY_ROW_CEILING: usize = 150_000;
+
+/// Newest history rows a checkpoint or a whole-history text read carries.
+/// Both run under the screen lock; deeper history stays readable page by
+/// page through `scrollback_cells`.
+pub const HISTORY_EXPORT_ROWS: usize = 10_000;
 
 fn history_line_limit(cols: usize) -> usize {
     #[cfg(feature = "compact-history")]
     {
         let _ = cols;
-        10_000
+        HISTORY_ROW_CEILING
     }
     #[cfg(not(feature = "compact-history"))]
     {
@@ -392,11 +393,6 @@ fn history_line_limit(cols: usize) -> usize {
         HISTORY_STORAGE_BUDGET_BYTES / bytes_per_line
     }
 }
-
-/// Newest history rows a checkpoint carries. Above [`history_line_limit`]
-/// only after a resize re-wrapped full history into more rows; restore and
-/// completed-terminal retention admit no more than this.
-pub const HISTORY_EXPORT_ROWS: usize = 10_000;
 
 /// Most history rows a resize may re-wrap retained history into, as a
 /// multiple of the row limit. A column change re-wraps what is already
@@ -1147,6 +1143,17 @@ impl HeadlessScreen {
         )
     }
 
+    /// Stored bytes of the active screen's history, the quantity the history
+    /// budget bounds. Zero without compact history.
+    pub fn history_storage_bytes(&self) -> usize {
+        #[cfg(feature = "compact-history")]
+        {
+            self.term.grid().history_storage_bytes()
+        }
+        #[cfg(not(feature = "compact-history"))]
+        0
+    }
+
     pub fn content_seq(&self) -> u64 {
         self.content_seq
     }
@@ -1466,21 +1473,23 @@ impl HeadlessScreen {
     /// these alongside the visible snapshot so adoption does not collapse a
     /// long session to a single scrollback row.
     ///
-    /// At most the newest [`HISTORY_EXPORT_ROWS`]: restore admits no more.
+    /// Only the newest [`HISTORY_EXPORT_ROWS`] rows: a checkpoint is taken
+    /// under the screen lock while output streams, and restore admits no
+    /// more.
     pub fn history_snapshot(&mut self) -> Vec<Vec<GridCell>> {
         self.prepare_history_read();
-        let history = self.term.grid().history_size().min(HISTORY_EXPORT_ROWS);
+        let exported = self.term.grid().history_size().min(HISTORY_EXPORT_ROWS);
         let cols = self.geometry.cols;
-        let mut rows = Vec::with_capacity(history);
-        for index in 0..history {
-            let line = Line(index as i32 - history as i32);
+        let mut rows = Vec::with_capacity(exported);
+        for index in 0..exported {
+            let line = Line(index as i32 - exported as i32);
             let mut row = Vec::with_capacity(cols);
             let source = &self.term.grid()[line];
             for x in 0..cols {
                 row.push(wire_cell(&source[Column(x)]));
             }
             rows.push(row);
-            self.finish_history_read_batch(index + 1, index + 1 == history);
+            self.finish_history_read_batch(index + 1, index + 1 == exported);
         }
         rows
     }
@@ -1565,9 +1574,15 @@ impl HeadlessScreen {
                 }
             }
             for (x, text) in &metadata.graphemes {
+                let column = Column(usize::from(*x));
                 for ch in text.chars() {
-                    self.term.grid_mut()[line][Column(usize::from(*x))].push_zerowidth(ch);
+                    self.term.grid_mut()[line][column].push_zerowidth(ch);
                 }
+                let spacer_follows = column.0 + 1 < self.term.columns()
+                    && self.term.grid()[line][column + 1]
+                        .flags
+                        .contains(Flags::WIDE_CHAR_SPACER);
+                restore_wide_base(&mut self.term.grid_mut()[line][column], spacer_follows);
             }
             // The cells came back with the plain underline bit; the spans
             // say which underline, in which color, and the overline.
@@ -1723,6 +1738,11 @@ impl HeadlessScreen {
                         target.push_zerowidth(ch);
                     }
                 }
+                let spacer_follows = row
+                    .cells
+                    .get(x + 1)
+                    .is_some_and(|next| next.style.contains(TermStyle::WIDE_SPACER));
+                restore_wide_base(target, spacer_follows);
             }
         }
         // Semantic flags and links were written after the parser settled;
@@ -1787,16 +1807,20 @@ impl HeadlessScreen {
     /// retains. They slide once the history budget evicts, so a client caching
     /// deep scrollback across heavy output may refetch; the visible region and
     /// recent history are exact.
+    ///
+    /// Carries only the newest [`HISTORY_EXPORT_ROWS`] history rows, from
+    /// `first_row`: the whole text is built under the screen lock.
     pub fn scrollback(&mut self) -> diri_proto::ReadScrollbackResult {
         self.prepare_history_read();
         let history = self.term.grid().history_size();
+        let first = history - history.min(HISTORY_EXPORT_ROWS);
         let rows = self.geometry.rows;
         let cols = self.geometry.cols;
         let total = history + rows;
-        let mut lines = Vec::with_capacity(total);
+        let mut lines = Vec::with_capacity(total - first);
         let mut text_cells = std::collections::BTreeMap::new();
         let mut ranges = Vec::with_capacity(cols);
-        for index in 0..total {
+        for index in first..total {
             let line = Line(index as i32 - history as i32);
             let mut text = String::with_capacity(cols);
             ranges.clear();
@@ -1832,15 +1856,15 @@ impl HeadlessScreen {
                 .enumerate()
                 .any(|(i, range)| usize::from(range[0]) != i || usize::from(range[1]) != i + 1)
             {
-                text_cells.insert(index, ranges.clone());
+                text_cells.insert(index - first, ranges.clone());
             }
             lines.push(text);
-            self.finish_history_read_batch(index + 1, index + 1 == total);
+            self.finish_history_read_batch(index - first + 1, index + 1 == total);
         }
         diri_proto::ReadScrollbackResult {
             lines,
             text_cells,
-            first_row: 0,
+            first_row: first as i64,
             visible_start_row: history as i64,
             cols: cols as i64,
             rows: rows as i64,
@@ -2082,132 +2106,6 @@ impl HeadlessScreen {
             }
         }
         text.trim_end().to_string()
-    }
-
-    /// The screen, and with [`TextOptions::scrollback`] the retained history
-    /// above it, as text for a reader rather than a renderer: an agent or a
-    /// script reading another session's output. With every option off this
-    /// is exactly [`Self::lines`].
-    ///
-    /// [`TextOptions::unwrap`] rejoins rows the terminal soft-wrapped at its
-    /// width, so a URL, path, JSON value or stack frame longer than the pane
-    /// arrives as the one line the program wrote. A hard newline still ends
-    /// a line, and trailing blanks are trimmed only where a line really ends.
-    ///
-    /// [`TextOptions::ansi`] keeps colours and attributes as SGR sequences,
-    /// emitted only where the style changes and reset at each line's end so
-    /// any line can be printed on its own.
-    pub fn text_lines(&mut self, options: TextOptions) -> Vec<String> {
-        let rows = self.geometry.rows;
-        let history = if options.scrollback {
-            self.term.grid().history_size()
-        } else {
-            0
-        };
-        let total = history + rows;
-        let mut lines = Vec::with_capacity(total);
-        let mut logical = String::new();
-        for index in 0..total {
-            let line = Line(index as i32 - history as i32);
-            let continues = options.unwrap && index + 1 < total && self.row_wraps(line);
-            self.push_row_text(line, options.ansi, continues, &mut logical);
-            if !continues {
-                lines.push(std::mem::take(&mut logical));
-            }
-            if options.scrollback {
-                self.finish_history_read_batch(index + 1, index + 1 == total);
-            }
-        }
-        while lines.last().is_some_and(|line| line.trim().is_empty()) {
-            lines.pop();
-        }
-        lines
-    }
-
-    /// Whether the program's line runs on past the end of `line`.
-    fn row_wraps(&self, line: Line) -> bool {
-        let cols = self.geometry.cols;
-        cols > 0
-            && self.term.grid()[line][Column(cols - 1)]
-                .flags
-                .contains(Flags::WRAPLINE)
-    }
-
-    /// Appends one row's text to `out`; trailing blanks are kept only when
-    /// the line continues onto the next row.
-    fn push_row_text(&self, line: Line, ansi: bool, keep_trailing: bool, out: &mut String) {
-        let source = &self.term.grid()[line];
-        let cols = self.geometry.cols;
-        let spacer = Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
-        if !ansi {
-            let start = out.len();
-            for column in 0..cols {
-                let cell = &source[Column(column)];
-                if cell.flags.intersects(spacer) {
-                    continue;
-                }
-                out.push(cell.c);
-                if let Some(combining) = cell.zerowidth() {
-                    out.extend(combining.iter().copied());
-                }
-            }
-            if !keep_trailing {
-                let kept = start + out[start..].trim_end().len();
-                out.truncate(kept);
-            }
-            return;
-        }
-        let end = if keep_trailing {
-            cols
-        } else {
-            (0..cols)
-                .rev()
-                .find(|&column| {
-                    let cell = &source[Column(column)];
-                    !cell.flags.intersects(spacer)
-                        && (!(cell.c.is_whitespace() || cell.c == '\0')
-                            || cell.zerowidth().is_some())
-                })
-                .map_or(0, |column| column + 1)
-        };
-        let visual = |cell: &GridCell| {
-            (
-                cell.fg,
-                cell.bg,
-                TermStyle::from_bits_retain(cell.style.bits() & 0xff),
-            )
-        };
-        let plain = visual(&GridCell::BLANK);
-        let mut current = plain;
-        for column in 0..end {
-            let cell = &source[Column(column)];
-            if cell.flags.intersects(spacer) {
-                continue;
-            }
-            let mut wire = wire_cell(cell);
-            // The wire folds BOLD and DIM together (`DIM_BOLD` holds both
-            // bits); a reader gets the attributes the program set.
-            let mut bits = wire.style.bits() & !(TermStyle::BOLD.bits() | TermStyle::DIM.bits());
-            if cell.flags.contains(Flags::BOLD) {
-                bits |= TermStyle::BOLD.bits();
-            }
-            if cell.flags.contains(Flags::DIM) {
-                bits |= TermStyle::DIM.bits();
-            }
-            wire.style = TermStyle::from_bits_retain(bits);
-            let style = visual(&wire);
-            if style != current {
-                out.push_str(&sgr(&wire, None));
-                current = style;
-            }
-            out.push(if cell.c == '\0' { ' ' } else { cell.c });
-            if let Some(combining) = cell.zerowidth() {
-                out.extend(combining.iter().copied());
-            }
-        }
-        if current != plain {
-            out.push_str("\x1b[0m");
-        }
     }
 
     /// What a link scanner needs from the screen and the newest `history_rows`
@@ -3021,6 +2919,30 @@ fn restore_semantic_flags(target: &mut Cell, source: GridCell) {
     }
 }
 
+/// Marks a restored cluster wide when the wire put a spacer after it and the
+/// cluster is two columns. The replay already marks CJK and emoji wide, but a
+/// cluster widened by what follows its first codepoint (`❤` + VS16, a flag)
+/// was replayed by that codepoint alone. A spacer after a one-column cluster
+/// is the leading spacer of a wide character wrapped to the next row.
+fn restore_wide_base(target: &mut Cell, spacer_follows: bool) {
+    if !spacer_follows
+        || target.flags.intersects(
+            Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER,
+        )
+    {
+        return;
+    }
+    let Some(zerowidth) = target.zerowidth().filter(|chars| !chars.is_empty()) else {
+        return;
+    };
+    let cluster: String = std::iter::once(target.c)
+        .chain(zerowidth.iter().copied())
+        .collect();
+    if alacritty_terminal::term::grapheme_width(&cluster) == 2 {
+        target.flags.insert(Flags::WIDE_CHAR);
+    }
+}
+
 /// Puts a row's decoration span back on one restored cell.
 fn restore_decoration(cell: &mut Cell, span: &StyleSpan) {
     let underline = match span.underline {
@@ -3605,69 +3527,6 @@ mod tests {
     }
 
     #[test]
-    fn text_lines_with_no_options_reads_like_lines() {
-        let mut screen = HeadlessScreen::new(10, 4);
-        screen.feed(b"abcdefghijKLM  \r\n\x1b[31mred\x1b[0m \xe4\xb8\xad\r\n");
-        assert_eq!(screen.text_lines(TextOptions::default()), screen.lines());
-        assert_eq!(screen.lines(), ["abcdefghij", "KLM", "red \u{4e2d}"]);
-    }
-
-    #[test]
-    fn text_lines_unwrap_rejoins_soft_wraps_but_not_hard_newlines() {
-        let mut screen = HeadlessScreen::new(10, 6);
-        // 24 columns of path wrap twice; the space at a wrap boundary is
-        // part of the line, the blanks after a hard newline are not.
-        screen.feed(b"/a/b/c/d/e f/h/i/j/k/l/m\r\nshort   \r\n0123456789\r\nnext");
-        let unwrap = TextOptions {
-            unwrap: true,
-            ..TextOptions::default()
-        };
-        assert_eq!(
-            screen.text_lines(unwrap),
-            ["/a/b/c/d/e f/h/i/j/k/l/m", "short", "0123456789", "next"]
-        );
-    }
-
-    #[test]
-    fn text_lines_unwrap_reaches_into_history_and_across_the_screen_edge() {
-        let mut screen = HeadlessScreen::new(8, 3);
-        screen.feed(b"https://example.com/long/path\r\nx\r\ny\r\nz");
-        let visible = TextOptions {
-            unwrap: true,
-            ..TextOptions::default()
-        };
-        // Only the URL's tail is on screen.
-        assert_eq!(screen.text_lines(visible), ["x", "y", "z"]);
-        let all = TextOptions {
-            scrollback: true,
-            ..visible
-        };
-        assert_eq!(
-            screen.text_lines(all),
-            ["https://example.com/long/path", "x", "y", "z"]
-        );
-    }
-
-    #[test]
-    fn text_lines_ansi_keeps_style_changes_and_resets_each_line() {
-        let mut screen = HeadlessScreen::new(20, 3);
-        screen.feed(b"ok \x1b[1;31mFAIL\x1b[0m done\r\n\x1b[32mgreen\r\nplain");
-        let ansi = TextOptions {
-            ansi: true,
-            ..TextOptions::default()
-        };
-        assert_eq!(
-            screen.text_lines(ansi),
-            [
-                "ok \x1b[0;1;38;5;1;49mFAIL\x1b[0;39;49m done",
-                "\x1b[0;38;5;2;49mgreen\x1b[0m",
-                // SGR 32 is still in force: the program never reset it.
-                "\x1b[0;38;5;2;49mplain\x1b[0m",
-            ]
-        );
-    }
-
-    #[test]
     fn content_seq_advances_only_when_the_screen_changes() {
         let mut screen = HeadlessScreen::new(80, 24);
         screen.feed(b"hello\r\n");
@@ -3977,12 +3836,17 @@ mod tests {
     #[cfg(feature = "compact-history")]
     #[test]
     fn a_resize_at_capacity_keeps_every_retained_line() {
+        let lines = HISTORY_ROW_CEILING + 20_000;
         for (width, label) in [(70, "unwrapped"), (120, "wrapped")] {
             let mut screen = HeadlessScreen::new(80, 24);
-            screen.feed(&numbered_lines(0, 30_000, width));
+            screen.feed(&numbered_lines(0, lines, width));
             let full = retained_ids(&mut screen);
-            assert_eq!(screen.term.grid().history_size(), 10_000, "{label}");
-            let expected: Vec<usize> = (full[0]..30_000).collect();
+            assert_eq!(
+                screen.term.grid().history_size(),
+                HISTORY_ROW_CEILING,
+                "{label}"
+            );
+            let expected: Vec<usize> = (full[0]..lines).collect();
             assert_eq!(full, expected, "{label}: the starting point is contiguous");
 
             for (cols, rows) in [(40, 24), (120, 24), (80, 12), (24, 30), (80, 24)] {
@@ -3993,7 +3857,11 @@ mod tests {
                     "{label}: {cols}x{rows} lost history"
                 );
             }
-            assert_eq!(screen.term.grid().history_size(), 10_000, "{label}");
+            assert_eq!(
+                screen.term.grid().history_size(),
+                HISTORY_ROW_CEILING,
+                "{label}"
+            );
         }
     }
 
@@ -4003,30 +3871,36 @@ mod tests {
     #[cfg(feature = "compact-history")]
     #[test]
     fn a_raised_history_limit_follows_history_back_down() {
+        let burst = HISTORY_ROW_CEILING;
         let mut screen = HeadlessScreen::new(80, 24);
-        screen.feed(&numbered_lines(0, 20_000, 120));
+        screen.feed(&numbered_lines(0, burst, 120));
         screen.resize(40, 24);
         let narrowed = screen.term.grid().history_size();
-        assert!(narrowed > 10_000, "{narrowed} rows after narrowing");
+        assert!(
+            narrowed > HISTORY_ROW_CEILING,
+            "{narrowed} rows after narrowing"
+        );
 
         // At the narrow width the same rows stay retained as output arrives.
-        screen.feed(&numbered_lines(20_000, 1_000, 120));
+        screen.feed(&numbered_lines(burst, 100, 120));
         assert_eq!(screen.term.grid().history_size(), narrowed);
         let ids = retained_ids(&mut screen);
-        assert_eq!(ids, (ids[0]..21_000).collect::<Vec<_>>());
+        assert_eq!(ids, (ids[0]..burst + 100).collect::<Vec<_>>());
 
         // Clearing scrollback ends the allowance: the next burst stops at
         // the base limit, as it would have without the resize.
         screen.feed(b"\x1b[3J");
-        screen.feed(&numbered_lines(21_000, 20_000, 120));
-        assert_eq!(screen.term.grid().history_size(), 10_000);
+        screen.feed(&numbered_lines(burst + 100, burst, 120));
+        assert_eq!(screen.term.grid().history_size(), HISTORY_ROW_CEILING);
 
-        // So does widening that merges rows back.
+        // So does widening that merges rows back: output then fills history
+        // to the base limit and no further. Each line is two rows at 80.
         screen.resize(80, 24);
         screen.resize(40, 24);
         screen.resize(80, 24);
-        screen.feed(&numbered_lines(41_000, 20_000, 120));
-        assert_eq!(screen.term.grid().history_size(), 10_000);
+        let room = HISTORY_ROW_CEILING - screen.term.grid().history_size();
+        screen.feed(&numbered_lines(2 * burst + 100, room / 2 + 100, 120));
+        assert_eq!(screen.term.grid().history_size(), HISTORY_ROW_CEILING);
     }
 
     /// A re-wrapped history can hold more rows than restore admits, so a
@@ -4253,6 +4127,276 @@ mod tests {
             "restorable"
         );
         assert_eq!(restored.scrollback(), original.scrollback());
+    }
+
+    /// Text of history rows `first..first + count`, by absolute row.
+    #[cfg(feature = "compact-history")]
+    fn history_text(screen: &mut HeadlessScreen, first: i64, count: i64) -> Vec<String> {
+        let page = screen.scrollback_cells(first, count);
+        diri_proto::grid::GridRowCodec::decode_rows(&page.payload, page.row_count as usize)
+            .unwrap()
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| char::from_u32(cell.scalar).unwrap_or(' '))
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// A build-log line numbered `n`, styled like compiler output.
+    #[cfg(feature = "compact-history")]
+    fn build_line(n: usize) -> String {
+        format!(
+            "\x1b[1;32m   Compiling\x1b[0m crate-{} v0.{}.{} line {n:07}\r\n",
+            n % 97,
+            n % 13,
+            n % 7
+        )
+    }
+
+    #[cfg(feature = "compact-history")]
+    fn line_number(text: &str) -> Option<usize> {
+        text.rsplit_once("line ")?.1.get(..7)?.parse().ok()
+    }
+
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn history_depth_is_bounded_by_stored_bytes_not_rows() {
+        let mut screen = HeadlessScreen::new(80, 24);
+        let lines = 60_000;
+        let log: String = (0..lines).map(build_line).collect();
+        for chunk in log.as_bytes().chunks(64 * 1024) {
+            screen.feed(chunk);
+        }
+        // Far past the former 10,000-row cap: nothing was evicted.
+        assert_eq!(screen.history_rows(), lines + 1 - 24);
+        assert!(screen.history_storage_bytes() <= HISTORY_STORAGE_BUDGET_BYTES);
+        // The oldest line is still readable, at depth.
+        assert_eq!(
+            history_text(&mut screen, 0, 1)[0],
+            "   Compiling crate-0 v0.0.0 line 0000000"
+        );
+    }
+
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn near_empty_output_stops_at_the_row_ceiling() {
+        let mut screen = HeadlessScreen::new(80, 24);
+        let blank = b"\r\n".repeat(64 * 1024);
+        for _ in 0..(HISTORY_ROW_CEILING / blank.len() * 2 + 2) {
+            screen.feed(&blank);
+        }
+        assert_eq!(screen.history_rows(), HISTORY_ROW_CEILING);
+        assert!(screen.history_storage_bytes() <= HISTORY_STORAGE_BUDGET_BYTES);
+    }
+
+    /// One numbered row of random truecolor cells: incompressible styles.
+    #[cfg(feature = "compact-history")]
+    fn noisy_line(n: usize, cols: usize, seed: &mut u64) -> String {
+        let mut line = String::new();
+        for _ in 0..cols - 13 {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            let [r, g, b, br, bg, bb, ch, _] = seed.to_le_bytes();
+            let ch = char::from(b'!' + ch % 94);
+            line.push_str(&format!("\x1b[38;2;{r};{g};{b};48;2;{br};{bg};{bb}m{ch}"));
+        }
+        line.push_str(&format!("\x1b[0m line {n:07}\r\n"));
+        line
+    }
+
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn worst_case_output_stays_within_the_byte_budget_and_evicts_oldest_first() {
+        let cols = 80;
+        let mut screen = HeadlessScreen::new(cols, 24);
+        let mut seed = 0x9e37_79b9_7f4a_7c15;
+        let mut fed = 0;
+        let mut at_capacity = None;
+        while fed < 12_000 {
+            let chunk: String = (fed..fed + 500)
+                .map(|n| noisy_line(n, cols, &mut seed))
+                .collect();
+            screen.feed(chunk.as_bytes());
+            fed += 500;
+            // The bound holds after every feed, not only at the end.
+            assert!(screen.history_storage_bytes() <= HISTORY_STORAGE_BUDGET_BYTES);
+            if at_capacity.is_none() && screen.history_rows() < fed + 1 - 24 {
+                at_capacity = Some(screen.history_rows());
+            }
+        }
+        let capacity = at_capacity.expect("incompressible output reaches the budget");
+        assert!(
+            capacity < 10_000,
+            "{capacity} rows of incompressible output"
+        );
+        // At capacity, every retained row is present, in order, with only the
+        // oldest evicted: the newest history row is the line above the screen.
+        let rows = screen.history_rows();
+        assert!(
+            rows >= capacity * 9 / 10,
+            "{rows} rows after eviction ({capacity})"
+        );
+        let numbers: Vec<_> = history_text(&mut screen, 0, rows as i64)
+            .iter()
+            .map(|text| line_number(text).expect("numbered row"))
+            .collect();
+        assert_eq!(numbers.len(), rows);
+        assert_eq!(*numbers.last().unwrap(), fed - 24);
+        assert!(numbers.windows(2).all(|pair| pair[1] == pair[0] + 1));
+    }
+
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn history_regrows_after_incompressible_output_gives_way() {
+        let cols = 80;
+        let mut screen = HeadlessScreen::new(cols, 24);
+        let mut seed = 7;
+        let noisy: String = (0..6_000).map(|n| noisy_line(n, cols, &mut seed)).collect();
+        screen.feed(noisy.as_bytes());
+        let capacity = screen.history_rows();
+        assert!(capacity < 6_000 - 23, "the budget evicted noisy rows");
+        // Compressible output recycles noisy rows, frees bytes, and history
+        // grows past the noisy capacity again.
+        let log: String = (0..40_000).map(build_line).collect();
+        for chunk in log.as_bytes().chunks(64 * 1024) {
+            screen.feed(chunk);
+            assert!(screen.history_storage_bytes() <= HISTORY_STORAGE_BUDGET_BYTES);
+        }
+        // Every build line is retained, beneath what is left of the noise.
+        let rows = screen.history_rows();
+        assert!(
+            rows > 40_000 && rows > capacity,
+            "{rows} rows ({capacity} noisy)"
+        );
+        let first_build = (rows + 24 - 1 - 40_000) as i64;
+        assert_eq!(
+            line_number(&history_text(&mut screen, first_build, 1)[0]),
+            Some(0)
+        );
+    }
+
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn a_column_change_at_capacity_keeps_hard_line_history() {
+        let mut screen = HeadlessScreen::new(80, 24);
+        // Past the row ceiling, history recycles its oldest row per line and
+        // leaves the oldest block partial. Every line is a hard line that
+        // fits each width used below, so a column change keeps the stored
+        // rows instead of indexing every line (which would evict history).
+        let lines = HISTORY_ROW_CEILING + 1_000;
+        let log: String = (0..lines).map(build_line).collect();
+        for chunk in log.as_bytes().chunks(64 * 1024) {
+            screen.feed(chunk);
+        }
+        let rows = screen.history_rows();
+        assert_eq!(rows, HISTORY_ROW_CEILING);
+        let oldest = history_text(&mut screen, 0, 1);
+        for cols in [72, 80, 100, 80] {
+            screen.resize(cols, 24);
+            assert_eq!(screen.history_rows(), rows, "rows at {cols} columns");
+            assert_eq!(history_text(&mut screen, 0, 1), oldest);
+            assert!(screen.history_storage_bytes() <= HISTORY_STORAGE_BUDGET_BYTES);
+        }
+    }
+
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn find_and_fetch_work_at_depth() {
+        let mut screen = HeadlessScreen::new(80, 24);
+        let lines = 100_000;
+        let mut log: String = (0..lines).map(build_line).collect();
+        log.push_str("needle at the end\r\n");
+        for chunk in log.as_bytes().chunks(64 * 1024) {
+            screen.feed(chunk);
+        }
+        let history = screen.history_rows();
+        assert!(history >= lines - 24, "{history} rows retained");
+        // Fetch at depth: the oldest rows, and a page in the middle.
+        assert_eq!(line_number(&history_text(&mut screen, 0, 1)[0]), Some(0));
+        let middle = history_text(&mut screen, 50_000, 3);
+        assert_eq!(
+            middle.iter().map(|t| line_number(t)).collect::<Vec<_>>(),
+            [Some(50_000), Some(50_001), Some(50_002)]
+        );
+        // The Find capture stays bounded however deep history is, and its
+        // absolute rows agree with scrollback fetches.
+        let capture = screen.find_capture_cells().unwrap();
+        let total = (history + 24) as i64;
+        assert_eq!(capture.total_rows, total);
+        assert_eq!(capture.live_start_row, history as i64);
+        assert!(
+            capture.row_count as usize
+                <= (diri_proto::FIND_CAPTURE_MAX_CELLS / 80).min(diri_proto::FIND_CAPTURE_MAX_ROWS)
+        );
+        let rows = diri_proto::grid::GridRowCodec::decode_rows(
+            &capture.payload,
+            capture.row_count as usize,
+        )
+        .unwrap();
+        let needle = rows
+            .iter()
+            .position(|row| {
+                row.iter()
+                    .map(|cell| char::from_u32(cell.scalar).unwrap_or(' '))
+                    .collect::<String>()
+                    .starts_with("needle")
+            })
+            .expect("needle in capture") as i64
+            + capture.first_row;
+        assert_eq!(history_text(&mut screen, needle, 1), ["needle at the end"]);
+        let first = history_text(&mut screen, capture.first_row, 1);
+        assert_eq!(
+            line_number(&first[0]),
+            Some(capture.first_row as usize),
+            "capture rows are absolute history rows"
+        );
+    }
+
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn exports_under_the_screen_lock_carry_only_recent_history() {
+        let mut screen = HeadlessScreen::new(80, 24);
+        let lines = 30_000;
+        let log: String = (0..lines).map(build_line).collect();
+        screen.feed(log.as_bytes());
+        let history = screen.history_rows();
+        assert!(history > HISTORY_EXPORT_ROWS);
+
+        let snapshot = screen.history_snapshot();
+        assert_eq!(snapshot.len(), HISTORY_EXPORT_ROWS);
+        assert_eq!(screen.history_metadata().len(), HISTORY_EXPORT_ROWS);
+        let newest: String = snapshot
+            .last()
+            .unwrap()
+            .iter()
+            .map(|cell| char::from_u32(cell.scalar).unwrap_or(' '))
+            .collect();
+        assert_eq!(line_number(&newest), Some(lines - 24));
+
+        let text = screen.scrollback();
+        assert_eq!(text.first_row as usize, history - HISTORY_EXPORT_ROWS);
+        assert_eq!(text.visible_start_row as usize, history);
+        assert_eq!(text.lines.len(), HISTORY_EXPORT_ROWS + 24);
+        assert_eq!(
+            line_number(&text.lines[0]),
+            Some(history - HISTORY_EXPORT_ROWS)
+        );
+
+        // A checkpoint of deep history restores its newest rows.
+        let mut restored = HeadlessScreen::new(80, 24);
+        assert!(restored.restore(
+            &snapshot,
+            &screen.full_snapshot(),
+            false,
+            false,
+            MouseModes::OFF
+        ));
+        assert_eq!(restored.history_rows(), HISTORY_EXPORT_ROWS);
     }
 
     #[cfg(feature = "compact-history")]
@@ -4910,6 +5054,124 @@ mod qol_tests {
         let mut restored = HeadlessScreen::new(20, 3);
         assert!(restored.restore(&[], &screen.full_snapshot(), false, false, MouseModes::OFF));
         assert_eq!(restored.lines(), screen.lines());
+    }
+
+    /// Columns of each cluster as `Bun.stringWidth` in Bun 1.4.4 (the runtime
+    /// in Claude Code 2.1) measures them.
+    const BUN_CLUSTER_WIDTHS: &[(&str, u16)] = &[
+        ("❤️", 2),
+        ("✔️", 2),
+        ("⚠️", 2),
+        ("☀️", 2),
+        ("▶️", 2),
+        ("👨‍👩‍👧‍👦", 2),
+        ("🧑‍💻", 2),
+        ("🏳️‍🌈", 2),
+        ("❤️‍🔥", 2),
+        ("👍🏽", 2),
+        ("🧑🏽‍💻", 2),
+        ("🇷🇴", 2),
+        ("🇷", 1),
+        ("🇷🇴🇷", 3),
+        ("1️⃣", 2),
+        ("⌚︎", 2),
+        ("☺︎", 1),
+        ("e\u{FE0F}", 1),
+        ("x\u{200D}y", 2),
+        ("😀\u{200D}a", 3),
+        ("你", 2),
+        ("হিন্দী", 3),
+        ("রগুলো", 3),
+        ("a\u{AD}", 1),
+    ];
+
+    #[test]
+    fn grapheme_clusters_take_the_columns_claude_code_gives_them() {
+        // Claude Code moves its cursor relative to where Bun says text ends;
+        // a cluster one column off leaves fragments of earlier frames.
+        let mut screen = HeadlessScreen::new(40, 3);
+        for (text, width) in BUN_CLUSTER_WIDTHS {
+            screen.feed(format!("\x1b[H\x1b[2K{text}|").as_bytes());
+            assert_eq!(screen.cursor().0, width + 1, "{text:?}");
+            assert_eq!(screen.row_text(0), format!("{text}|"), "{text:?}");
+        }
+
+        // An Ink-style repaint: back to column 0, skip the emoji, overwrite.
+        screen.feed("\x1b[H\x1b[2K✔️ done ❤️ ok".as_bytes());
+        screen.feed(b"\r\x1b[3CDONE");
+        assert_eq!(screen.row_text(0), "✔️ DONE ❤️ ok");
+        screen.feed(b"\r\x1b[11CO");
+        assert_eq!(screen.row_text(0), "✔️ DONE ❤️ Ok");
+    }
+
+    #[test]
+    fn a_cluster_is_one_wide_cell_carrying_its_codepoints() {
+        let mut screen = HeadlessScreen::new(12, 2);
+        screen.feed("🇷🇴|❤️|👨‍👩‍👧‍👦|".as_bytes());
+        let snapshot = screen.full_snapshot();
+        let row = &snapshot.changed_rows[0];
+        let scalars: Vec<u32> = row.cells.iter().take(9).map(|cell| cell.scalar).collect();
+        assert_eq!(
+            scalars,
+            [
+                0x1F1F7, 0, '|' as u32, 0x2764, 0, '|' as u32, 0x1F468, 0, '|' as u32
+            ]
+        );
+        for spacer in [1, 4, 7] {
+            assert!(row.cells[spacer].style.contains(TermStyle::WIDE_SPACER));
+        }
+        assert_eq!(
+            row.metadata.graphemes,
+            vec![
+                (0, "🇴".to_string()),
+                (3, "\u{FE0F}".to_string()),
+                (6, "\u{200D}👩\u{200D}👧\u{200D}👦".to_string()),
+            ]
+        );
+
+        // The layout survives a checkpoint restore (Engine restart).
+        let mut restored = HeadlessScreen::new(12, 2);
+        assert!(restored.restore(&[], &snapshot, false, false, MouseModes::OFF));
+        assert_eq!(restored.full_snapshot().changed_rows, snapshot.changed_rows);
+        restored.feed(b"\r\x1b[3CX");
+        assert_eq!(restored.row_text(0), "🇷🇴|X |👨‍👩‍👧‍👦|");
+    }
+
+    #[test]
+    fn a_cluster_widened_at_the_last_column_wraps_like_a_wide_character() {
+        let mut screen = HeadlessScreen::new(5, 3);
+        screen.feed("abcd❤️|".as_bytes());
+        assert_eq!(screen.row_text(0).trim_end(), "abcd");
+        assert_eq!(screen.row_text(1), "❤️|");
+        assert_eq!(screen.cursor(), (3, 1, true));
+
+        // Without autowrap the cluster keeps its one column.
+        let mut screen = HeadlessScreen::new(5, 3);
+        screen.feed("\x1b[?7labcd❤️".as_bytes());
+        assert_eq!(screen.row_text(0), "abcd❤️");
+    }
+
+    #[test]
+    fn mode_2027_is_reported_and_switches_to_first_codepoint_widths() {
+        let mut screen = HeadlessScreen::new(20, 2);
+        screen.feed(b"\x1b[?2027$p");
+        assert_eq!(screen.take_replies(), b"\x1b[?2027;2$y");
+        screen.feed(b"\x1b[?2027h\x1b[?2027$p");
+        assert_eq!(screen.take_replies(), b"\x1b[?2027;1$y");
+
+        for (text, width) in [("❤️", 2), ("⌚︎", 1), ("👨‍👩‍👧‍👦", 2), ("हिन्दी", 2)]
+        {
+            screen.feed(format!("\x1b[H\x1b[2K{text}|").as_bytes());
+            assert_eq!(screen.cursor().0, width + 1, "{text:?}");
+            assert_eq!(screen.row_text(0), format!("{text}|"), "{text:?}");
+        }
+
+        screen.feed(b"\x1b[?2027l\x1b[?2027$p");
+        assert_eq!(screen.take_replies(), b"\x1b[?2027;2$y");
+        screen.feed("\x1b[H\x1b[2K⌚︎|".as_bytes());
+        assert_eq!(screen.cursor().0, 3);
+        screen.feed(b"\x1b[?2027h\x1bc\x1b[?2027$p");
+        assert_eq!(screen.take_replies(), b"\x1b[?2027;2$y", "RIS resets 2027");
     }
 
     #[test]

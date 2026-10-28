@@ -6,11 +6,19 @@
 //! holder appends an in-band [`HolderExitMarker`] to the log — so a daemon
 //! that wasn't running at the time still learns how the child died — then
 //! removes its control files and stops serving.
+//!
+//! A holder has no thread of its own. Each of its lanes (the PTY reader, the
+//! control socket, the input stream, each output subscriber, the exit watch)
+//! runs on a thread only while it has work, and parks its descriptor on the
+//! process's [`reactor`] once it has been idle for [`reactor::LANE_IDLE`]. A
+//! parked lane costs no thread and no wakeup; its next event starts a thread
+//! again. At any moment exactly one party owns each lane's descriptor.
 
 use std::io::{Read, Write};
 use std::net::Shutdown;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -30,6 +38,7 @@ use super::protocol::{
     HolderExitReason, HolderExitStatus, HolderLaunchSpec, HolderOperation, HolderRequest,
     HolderResponse, HolderStat,
 };
+use super::reactor;
 use super::socket;
 use super::{HolderError, HolderResult};
 
@@ -95,7 +104,8 @@ struct Shared {
     /// processes so they die with the manager too.
     guard: Option<Arc<GroupGuard>>,
     /// The PTY, kept for write/resize/stat access. The master stays open for
-    /// the holder's whole life; closing happens when `run` returns.
+    /// the holder's whole life; it closes once the last handle on this state
+    /// is gone after the exit path has finished.
     pty: Mutex<Pty>,
     log: Mutex<OutputLog>,
     /// Signalled after every append, for a resumed subscriber whose backlog
@@ -114,15 +124,26 @@ struct Shared {
     /// longer held for a stalled subscriber; see [`broadcast_output`].
     killing: AtomicBool,
     /// Self-pipe the exit path writes to once `finished` is set. It is what
-    /// lets the pump wait on the PTY without a deadline: a silent session
-    /// costs no wakeups, and the exit is still noticed at once. Both ends live
-    /// here so the write can never meet a closed pipe.
+    /// lets a running pump wait on the PTY without a deadline short of its
+    /// idle park, and still notice the exit at once. Both ends live here so
+    /// the write can never meet a closed pipe.
     pump_wake: (std::io::PipeReader, std::io::PipeWriter),
     /// Every return from the pump's wait, so a test can prove a silent
     /// session leaves it parked.
     #[cfg(test)]
     pump_wakeups: std::sync::atomic::AtomicUsize,
-    listen_fd: AtomicI32,
+    /// Who reads the PTY: a pump thread while output flows, the reactor once
+    /// it has been quiet for [`reactor::LANE_IDLE`].
+    pump: Mutex<PumpLane>,
+    /// The control socket. Shared so a request thread can keep it open
+    /// while the exit path withdraws it.
+    listener: Mutex<Option<Arc<OwnedFd>>>,
+    /// Whether the control socket's lane is parked on the reactor.
+    accept: Mutex<Lane>,
+    /// How the child's exit is watched; taken by the exit path.
+    exit_watch: Mutex<ExitWatch>,
+    /// Told once the exit path has finished, after the marker is durable.
+    on_finish: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// When the child was spawned, for its recorded runtime.
     spawned_at: std::time::Instant,
     /// Weak handles let the exit path interrupt blocking input reads without
@@ -132,6 +153,43 @@ struct Shared {
     /// The log is still written, and is still what a subscriber falls back to;
     /// this only removes the filesystem from the path a live screen waits on.
     output: Mutex<OutputFanout>,
+}
+
+/// A lane that can hand its descriptor to the reactor.
+#[derive(Default)]
+struct Lane {
+    /// Set by the exit path: the lane must not park again.
+    closed: bool,
+    /// The reactor registration while parked.
+    parked: Option<reactor::Token>,
+}
+
+/// The PTY reader's lane. Exactly one party owns the read side at any time:
+/// a pump thread (which took `reader`), or the reactor (while `parked`).
+#[derive(Default)]
+struct PumpLane {
+    reader: Option<crate::pty::PtyStream>,
+    /// The latest pump thread, for the exit path to join.
+    thread: Option<std::thread::JoinHandle<()>>,
+    parked: Option<reactor::Token>,
+    finished: bool,
+}
+
+#[derive(Default)]
+struct ExitWatch {
+    watcher: Option<diri_pty::ExitWatcher>,
+    detached: Option<Arc<DetachedLeader>>,
+}
+
+impl ExitWatch {
+    /// The descriptor that turns readable when the child exits.
+    fn descriptor(&self) -> Option<i32> {
+        #[cfg(target_os = "macos")]
+        if let Some(leader) = &self.detached {
+            return Some(leader.exit_descriptor());
+        }
+        self.watcher.as_ref().map(diri_pty::ExitWatcher::as_raw_fd)
+    }
 }
 
 /// Subscribers, and where in the stream the next byte handed to them sits.
@@ -152,8 +210,36 @@ struct OutputFanout {
 /// costs the pump a channel send, and one that falls behind pauses the PTY
 /// until it catches up (see [`broadcast_output`]). One that hangs up loses
 /// nothing, because every byte is in the log it will fall back to.
+///
+/// Its writer thread exists only while frames flow: it ends after
+/// [`reactor::LANE_IDLE`] with nothing to send, and the next frame starts
+/// another. A hangup is noticed by the reactor, not by a thread per socket.
+#[derive(Clone)]
 struct OutputSubscriber {
     frames: Arc<super::fanout::FrameQueue>,
+    link: Arc<SubscriberLink>,
+}
+
+/// A subscriber's socket. It closes once the fan-out entry, any writer and
+/// any hangup watch have all let go of it, so a registration on it can never
+/// outlive the descriptor.
+struct SubscriberLink {
+    stream: diri_platform::ipc::UnixStream,
+    /// The reactor's hangup watch while armed.
+    peer: Mutex<Option<reactor::Token>>,
+}
+
+impl SubscriberLink {
+    /// Ends the subscription: the daemon reads EOF and falls back to the log.
+    fn finish(&self) {
+        if let (Some(token), Some(reactor)) = (
+            self.peer.lock().expect("peer watch").take(),
+            reactor::shared(),
+        ) {
+            reactor.cancel(token);
+        }
+        let _ = self.stream.shutdown(Shutdown::Both);
+    }
 }
 
 impl HolderServer {
@@ -178,6 +264,32 @@ impl HolderServer {
         guard: Option<Arc<GroupGuard>>,
         launcher: Option<&AgentLauncher>,
     ) -> HolderResult<()> {
+        let (finished, done) = std::sync::mpsc::channel();
+        Self::start_hosted(
+            spec,
+            guard,
+            launcher,
+            Box::new(move || {
+                let _ = finished.send(());
+            }),
+        )?;
+        let _ = done.recv();
+        Ok(())
+    }
+
+    /// Starts the holder and returns once it is serving. It then runs on
+    /// threads of its own that exist only while it has work, and on the
+    /// process's reactor while it has none; `on_finish` runs once the child
+    /// has exited and the exit marker is durably in the log.
+    pub fn start_hosted(
+        spec: HolderLaunchSpec,
+        guard: Option<Arc<GroupGuard>>,
+        launcher: Option<&AgentLauncher>,
+        on_finish: Box<dyn FnOnce() + Send>,
+    ) -> HolderResult<()> {
+        // Started here, on a thread at the priority sessions start with, so
+        // lane threads it later starts can be given that priority too.
+        let _ = reactor::shared();
         // Never double-run: a second holder for the same session would
         // interleave two writers into one output log and stack a second child.
         // If a live holder already serves this socket, defer to it — bail
@@ -258,14 +370,10 @@ impl HolderServer {
             .map_err(|error| HolderError::io("PTY reader", error))?;
         set_nonblocking(reader.as_raw_fd());
 
-        let listener = socket::listen(&socket_path)?;
-        // The accept loop owns this fd from here; the exit watcher closes it
-        // to end the loop (see `socket::accept_raw` for why close, not just
-        // shutdown).
-        let listen_fd = {
-            use std::os::fd::IntoRawFd;
-            listener.into_raw_fd()
-        };
+        let listener: OwnedFd = socket::listen(&socket_path)?.into();
+        // Nonblocking: a request thread drains every pending connection and
+        // then waits with a deadline, so a racing connect never strands it.
+        set_nonblocking(listener.as_raw_fd());
 
         let pump_wake =
             std::io::pipe().map_err(|error| HolderError::io("create pump wake pipe", error))?;
@@ -285,7 +393,17 @@ impl HolderServer {
             pump_wake,
             #[cfg(test)]
             pump_wakeups: std::sync::atomic::AtomicUsize::new(0),
-            listen_fd: AtomicI32::new(listen_fd),
+            pump: Mutex::new(PumpLane {
+                reader: Some(reader),
+                ..PumpLane::default()
+            }),
+            listener: Mutex::new(Some(Arc::new(listener))),
+            accept: Mutex::new(Lane::default()),
+            exit_watch: Mutex::new(ExitWatch {
+                watcher: exit_watcher,
+                detached,
+            }),
+            on_finish: Mutex::new(Some(on_finish)),
             spawned_at,
             input_streams: Mutex::new(Vec::new()),
             output: Mutex::new(OutputFanout {
@@ -304,125 +422,460 @@ impl HolderServer {
 
         write_pid_file(&shared.spec.pid_file_path)?;
 
-        let pump = {
-            let shared = Arc::clone(&shared);
-            let mut reader = reader;
-            std::thread::Builder::new()
-                .name(format!("holder-pty-{}", shared.spec.session_id))
-                .spawn(move || pump_pty(&shared, &mut reader))
-                .map_err(|error| HolderError::io("spawn pump", error))?
-        };
+        {
+            let mut lane = shared.pump.lock().expect("pump");
+            spawn_pump(&shared, &mut lane).map_err(|error| HolderError::io("spawn pump", error))?;
+        }
 
-        // Registered only once the exit watcher, which alone releases it, is
+        // Registered only once the exit watch, which alone releases it, is
         // certain to run.
         if let Some(guard) = &guard {
             guard.register(child_pid);
         }
-        {
-            let shared = Arc::clone(&shared);
-            std::thread::Builder::new()
-                .name(format!("holder-exit-{}", shared.spec.session_id))
-                .spawn(move || watch_exit(&shared, pump, exit_watcher, detached))
-                .map_err(|error| {
-                    if let Some(guard) = &guard {
-                        guard.release(child_pid);
-                    }
-                    HolderError::io("spawn exit watcher", error)
-                })?;
+        if let Err(error) = watch_exit(&shared) {
+            if let Some(guard) = &guard {
+                guard.release(child_pid);
+            }
+            return Err(HolderError::io("spawn exit watcher", error));
         }
 
-        while let Some(mut client) =
-            socket::accept_raw(listen_fd, || shared.finished.load(Ordering::SeqCst))?
-        {
-            let response = match socket::read_json_line::<HolderRequest>(&mut client) {
-                Ok(request) if request.op == HolderOperation::OutputStream => {
-                    if request.stream_version != Some(HOLDER_OUTPUT_STREAM_VERSION) {
-                        HolderResponse::failure("unsupported Holder output stream version")
-                    } else if shared.finished.load(Ordering::SeqCst) {
-                        // Nothing will ever be streamed again, and the log is
-                        // complete including the exit marker. Accepting here
-                        // would leave the subscriber waiting on a stream that
-                        // is over while the marker sat unread in the file.
-                        HolderResponse::failure("holder has finished")
-                    } else {
-                        // Registered under the same lock that hands out frames,
-                        // so the offset quoted here is exactly where this
-                        // subscriber's first frame will begin.
-                        let mut fanout = shared.output.lock().expect("output");
-                        let live_offset = fanout.next_offset;
-                        // A resumed subscriber first gets what it missed, read
-                        // from the log, then the live frames. The pump waits
-                        // for it the whole time it is reading, so output can
-                        // never run further ahead of it than the queue.
-                        let backlog_start = request.resume_from.map(|from| {
-                            let oldest = shared.log.lock().expect("log").oldest_readable_offset();
-                            from.max(oldest).min(live_offset)
-                        });
-                        let start_offset = backlog_start.unwrap_or(live_offset);
-                        let response = match backlog_start {
-                            Some(_) => HolderResponse::resumed_output_stream(
-                                HOLDER_OUTPUT_STREAM_VERSION,
-                                start_offset,
-                            ),
-                            None => HolderResponse::output_stream(
-                                HOLDER_OUTPUT_STREAM_VERSION,
-                                start_offset,
-                            ),
-                        };
-                        socket::set_buffer(&client, libc::SO_SNDBUF, socket::OUTPUT_SOCKET_BUFFER);
-                        if socket::write_json_line(&mut client, &response).is_ok() {
-                            let frames = super::fanout::FrameQueue::new(OUTPUT_QUEUE_BYTES);
-                            fanout.subscribers.push(OutputSubscriber {
-                                frames: Arc::clone(&frames),
-                            });
-                            drop(fanout);
-                            // Weak: a writer wedged on a daemon that stopped
-                            // reading must not keep the PTY master open after
-                            // the holder has finished.
-                            let holder = Arc::downgrade(&shared);
-                            let backlog = start_offset..live_offset;
-                            let _ = std::thread::Builder::new()
-                                .name(format!("holder-output-{}", shared.spec.session_id))
-                                .spawn(move || {
-                                    serve_output_stream(&holder, client, &frames, backlog);
-                                });
-                        }
-                        continue;
-                    }
-                }
-                Ok(request) if request.op == HolderOperation::Stream => {
-                    let version = request.stream_version.filter(|version| {
-                        *version == HOLDER_STREAM_VERSION
-                            || *version == HOLDER_STREAM_VERSION_PIXELS
-                    });
-                    if let Some(version) = version {
-                        let response = HolderResponse::stream(version);
-                        if socket::write_json_line(&mut client, &response).is_ok() {
-                            let client = Arc::new(client);
-                            let mut streams = shared.input_streams.lock().expect("input streams");
-                            streams.retain(|stream| stream.strong_count() > 0);
-                            streams.push(Arc::downgrade(&client));
-                            drop(streams);
-                            let shared = Arc::clone(&shared);
-                            let _ = std::thread::Builder::new()
-                                .name(format!("holder-input-{}", shared.spec.session_id))
-                                .spawn(move || serve_input_stream(&shared, client));
-                        }
-                        continue;
-                    } else {
-                        HolderResponse::failure("unsupported Holder input stream version")
-                    }
-                }
-                Ok(request) => handle(&shared, &request)
-                    .unwrap_or_else(|error| HolderResponse::failure(error.to_string())),
-                Err(error) => HolderResponse::failure(error.to_string()),
-            };
-            let _ = socket::write_json_line(&mut client, &response);
-        }
+        // A new session is about to be asked for its streams and a stat.
+        spawn_control(&shared).map_err(|error| HolderError::io("spawn control", error))?;
         Ok(())
-        // `shared` unwinds here: the PTY master closes, EOFing any straggler
-        // that still holds the slave.
     }
+}
+
+/// Starts one of a session's lane threads, named for what it serves.
+fn spawn_lane(
+    kind: &str,
+    session: &str,
+    work: impl FnOnce() + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    #[cfg(test)]
+    let live = live_lanes::Live::enter(session);
+    std::thread::Builder::new()
+        .name(format!("holder-{kind}-{session}"))
+        .spawn(move || {
+            #[cfg(test)]
+            let _live = live;
+            reactor::lane_qos::adopt();
+            work();
+        })
+}
+
+/// Lane threads alive per session, so a test can prove an idle session holds
+/// none.
+#[cfg(test)]
+mod live_lanes {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    static LIVE: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+    pub(super) struct Live(String);
+
+    impl Live {
+        pub(super) fn enter(session: &str) -> Self {
+            *LIVE
+                .lock()
+                .expect("live lanes")
+                .get_or_insert_with(HashMap::new)
+                .entry(session.to_string())
+                .or_default() += 1;
+            Self(session.to_string())
+        }
+    }
+
+    impl Drop for Live {
+        fn drop(&mut self) {
+            if let Some(count) = LIVE
+                .lock()
+                .expect("live lanes")
+                .as_mut()
+                .and_then(|live| live.get_mut(&self.0))
+            {
+                *count -= 1;
+            }
+        }
+    }
+
+    pub(super) fn count(session: &str) -> usize {
+        LIVE.lock()
+            .expect("live lanes")
+            .as_ref()
+            .and_then(|live| live.get(session).copied())
+            .unwrap_or(0)
+    }
+}
+
+/// Starts a pump thread to take the PTY's read side from `lane`.
+fn spawn_pump(shared: &Arc<Shared>, lane: &mut PumpLane) -> std::io::Result<()> {
+    let pump = Arc::clone(shared);
+    let thread = spawn_lane("pty", &shared.spec.session_id, move || pump_pty(&pump))?;
+    // The previous pump has parked or is on its way out; nothing to join.
+    lane.thread = Some(thread);
+    Ok(())
+}
+
+/// Runs on the reactor when a parked PTY turns readable.
+fn wake_pump(holder: &Weak<Shared>) {
+    let Some(shared) = holder.upgrade() else {
+        return;
+    };
+    let mut lane = shared.pump.lock().expect("pump");
+    lane.parked = None;
+    if lane.finished {
+        return;
+    }
+    if spawn_pump(&shared, &mut lane).is_err() {
+        // No thread to be had right now. The PTY is still readable, so the
+        // re-armed watch fires again at once: pause so that is a retry, not
+        // a spin.
+        std::thread::sleep(Duration::from_millis(10));
+        if !park_pump(&shared, &mut lane) {
+            // Nothing can carry the PTY: leave it to the exit path rather
+            // than lose the reader.
+            diri_telemetry::warn_event!(
+                "holder.pump_unparkable",
+                session = diri_telemetry::id(&shared.spec.session_id),
+            );
+        }
+    }
+}
+
+/// Hands the PTY in `lane` to the reactor. False if it would not take it.
+fn park_pump(shared: &Arc<Shared>, lane: &mut PumpLane) -> bool {
+    let (Some(reactor), Some(reader)) = (reactor::shared(), lane.reader.as_ref()) else {
+        return false;
+    };
+    let holder = Arc::downgrade(shared);
+    match reactor.when_readable(reader.as_raw_fd(), move || wake_pump(&holder)) {
+        Ok(token) => {
+            lane.parked = Some(token);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Starts a thread to serve control requests.
+fn spawn_control(shared: &Arc<Shared>) -> std::io::Result<()> {
+    let holder = Arc::downgrade(shared);
+    spawn_lane("control", &shared.spec.session_id, move || {
+        serve_control(&holder);
+    })
+    .map(drop)
+}
+
+/// Runs on the reactor when a parked control socket has a connection.
+fn wake_control(holder: &Weak<Shared>) {
+    let Some(shared) = holder.upgrade() else {
+        return;
+    };
+    let mut lane = shared.accept.lock().expect("accept");
+    lane.parked = None;
+    if lane.closed {
+        return;
+    }
+    if spawn_control(&shared).is_err() {
+        std::thread::sleep(Duration::from_millis(10));
+        let _ = park_control(&shared, &mut lane);
+    }
+}
+
+/// Hands the control socket to the reactor. False if it would not take it.
+fn park_control(shared: &Arc<Shared>, lane: &mut Lane) -> bool {
+    let Some(reactor) = reactor::shared() else {
+        return false;
+    };
+    let Some(listener) = shared.listener.lock().expect("listener").clone() else {
+        return true; // withdrawn: nothing left to serve
+    };
+    let holder = Arc::downgrade(shared);
+    let fd = listener.as_raw_fd();
+    match reactor.when_readable(fd, move || {
+        // Held open for as long as the registration exists.
+        let _listener = listener;
+        wake_control(&holder);
+    }) {
+        Ok(token) => {
+            lane.parked = Some(token);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Answers control connections until the socket has been quiet for
+/// [`reactor::CONTROL_IDLE`], then parks it on the reactor.
+///
+/// It holds the holder only while answering, so a request thread waiting
+/// out its idle period never keeps a finished session's PTY open.
+fn serve_control(holder: &Weak<Shared>) {
+    loop {
+        let Some(shared) = holder.upgrade() else {
+            return;
+        };
+        if shared.finished.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(listener) = shared.listener.lock().expect("listener").clone() else {
+            return;
+        };
+        // SAFETY: accept(2) on a listening fd kept open by `listener`; the
+        // addr out-params are unused.
+        let client = unsafe {
+            libc::accept(
+                listener.as_raw_fd(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if client >= 0 {
+            // SAFETY: a fresh fd accept just handed us; the stream owns it.
+            let client = unsafe {
+                use std::os::fd::FromRawFd;
+                diri_platform::ipc::UnixStream::from_raw_fd(client)
+            };
+            // BSD hands the listener's O_NONBLOCK on to accepted sockets;
+            // requests are served with blocking reads.
+            let _ = client.set_nonblocking(false);
+            serve_client(&shared, client);
+            continue;
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => {}
+            _ => {
+                // Never give up on a live listener: the usual cause,
+                // descriptor exhaustion, clears once something closes.
+                let delay = crate::limits::accept_retry_delay(&error);
+                eprintln!("diri-holder: accept: {error}; retrying in {delay:?}");
+                drop(shared);
+                std::thread::sleep(delay);
+                continue;
+            }
+        }
+        drop(shared);
+        match reactor::wait_readable(listener.as_raw_fd(), None, Some(reactor::CONTROL_IDLE)) {
+            Ok(reactor::Readiness::Idle) => {}
+            _ => continue,
+        }
+        let Some(shared) = holder.upgrade() else {
+            return;
+        };
+        let mut lane = shared.accept.lock().expect("accept");
+        if lane.closed || park_control(&shared, &mut lane) {
+            return;
+        }
+        // No reactor: keep the thread, looking again each idle period so a
+        // withdrawn listener is still noticed.
+    }
+}
+
+/// Answers one control connection.
+fn serve_client(shared: &Arc<Shared>, mut client: diri_platform::ipc::UnixStream) {
+    let response = match socket::read_json_line::<HolderRequest>(&mut client) {
+        Ok(request) if request.op == HolderOperation::OutputStream => {
+            if request.stream_version != Some(HOLDER_OUTPUT_STREAM_VERSION) {
+                HolderResponse::failure("unsupported Holder output stream version")
+            } else if shared.finished.load(Ordering::SeqCst) {
+                // Nothing will ever be streamed again, and the log is
+                // complete including the exit marker. Accepting here
+                // would leave the subscriber waiting on a stream that
+                // is over while the marker sat unread in the file.
+                HolderResponse::failure("holder has finished")
+            } else {
+                subscribe_output(shared, client, request.resume_from);
+                return;
+            }
+        }
+        Ok(request) if request.op == HolderOperation::Stream => {
+            let version = request.stream_version.filter(|version| {
+                *version == HOLDER_STREAM_VERSION || *version == HOLDER_STREAM_VERSION_PIXELS
+            });
+            if let Some(version) = version {
+                let response = HolderResponse::stream(version);
+                if socket::write_json_line(&mut client, &response).is_ok() {
+                    let client = Arc::new(client);
+                    let mut streams = shared.input_streams.lock().expect("input streams");
+                    streams.retain(|stream| stream.strong_count() > 0);
+                    streams.push(Arc::downgrade(&client));
+                    drop(streams);
+                    let _ = spawn_input(shared, client);
+                }
+                return;
+            }
+            HolderResponse::failure("unsupported Holder input stream version")
+        }
+        Ok(request) => handle(shared, &request)
+            .unwrap_or_else(|error| HolderResponse::failure(error.to_string())),
+        Err(error) => HolderResponse::failure(error.to_string()),
+    };
+    let _ = socket::write_json_line(&mut client, &response);
+}
+
+/// Registers a daemon for live output, first replaying what it missed from
+/// the log when it asks to resume from an earlier offset.
+fn subscribe_output(
+    shared: &Arc<Shared>,
+    mut client: diri_platform::ipc::UnixStream,
+    resume_from: Option<u64>,
+) {
+    // Registered under the same lock that hands out frames, so the offset
+    // quoted here is exactly where this subscriber's first frame will begin.
+    let mut fanout = shared.output.lock().expect("output");
+    let live_offset = fanout.next_offset;
+    // A resumed subscriber first gets what it missed, read from the log, then
+    // the live frames. The pump waits for it the whole time it is reading, so
+    // output can never run further ahead of it than the queue.
+    let backlog_start = resume_from.map(|from| {
+        let oldest = shared.log.lock().expect("log").oldest_readable_offset();
+        from.max(oldest).min(live_offset)
+    });
+    let start_offset = backlog_start.unwrap_or(live_offset);
+    let response = match backlog_start {
+        Some(_) => {
+            HolderResponse::resumed_output_stream(HOLDER_OUTPUT_STREAM_VERSION, start_offset)
+        }
+        None => HolderResponse::output_stream(HOLDER_OUTPUT_STREAM_VERSION, start_offset),
+    };
+    socket::set_buffer(&client, libc::SO_SNDBUF, socket::OUTPUT_SOCKET_BUFFER);
+    if socket::write_json_line(&mut client, &response).is_err() {
+        return;
+    }
+    let frames = super::fanout::FrameQueue::new(OUTPUT_QUEUE_BYTES);
+    let link = Arc::new(SubscriberLink {
+        stream: client,
+        peer: Mutex::new(None),
+    });
+    let backlog = start_offset..live_offset;
+    // A backlog has to be written now, not when the next frame arrives, so
+    // its writer starts here. Claimed before the pump can see the queue, so
+    // the pump never starts a second one.
+    let replay = !backlog.is_empty();
+    if replay {
+        frames.claim_writer();
+    }
+    let subscriber = OutputSubscriber {
+        frames: Arc::clone(&frames),
+        link: Arc::clone(&link),
+    };
+    if replay && spawn_writer(shared, &subscriber, backlog).is_err() {
+        // Nobody serves it, so the release is ours; the daemon falls back to
+        // the log.
+        frames.close();
+        link.finish();
+        return;
+    }
+    fanout.subscribers.push(subscriber);
+    drop(fanout);
+    // Without a backlog there is no writer yet: the first frame starts one.
+    watch_peer(Arc::downgrade(shared), link, frames);
+}
+
+/// Closes a subscriber's queue when its daemon hangs up.
+///
+/// A subscriber sends nothing after its request, so its socket turns
+/// readable only when the daemon goes. Through a silent session a dead
+/// subscriber would otherwise keep its socket and buffer until the next
+/// frame failed to write. Without a reactor nothing watches, and that next
+/// failed write is what releases it.
+fn watch_peer(
+    holder: Weak<Shared>,
+    link: Arc<SubscriberLink>,
+    frames: Arc<super::fanout::FrameQueue>,
+) {
+    let Some(reactor) = reactor::shared() else {
+        return;
+    };
+    let mut peer = link.peer.lock().expect("peer watch");
+    let fd = link.stream.as_raw_fd();
+    let watched = Arc::clone(&link);
+    // The registration holds the link, so the socket stays open while it can
+    // fire.
+    if let Ok(token) = reactor.when_readable(fd, move || peer_readable(holder, watched, frames)) {
+        *peer = Some(token);
+    }
+}
+
+/// Runs on the reactor when a subscriber's socket turns readable.
+fn peer_readable(
+    holder: Weak<Shared>,
+    link: Arc<SubscriberLink>,
+    frames: Arc<super::fanout::FrameQueue>,
+) {
+    *link.peer.lock().expect("peer watch") = None;
+    let mut scratch = [0u8; 64];
+    loop {
+        // SAFETY: a writable scratch buffer of the length passed, on a
+        // socket the link keeps open. Never blocks.
+        let count = unsafe {
+            libc::recv(
+                link.stream.as_raw_fd(),
+                scratch.as_mut_ptr().cast(),
+                scratch.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if count > 0 {
+            continue; // not part of the protocol; discarded rather than trusted
+        }
+        if count < 0 {
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => {
+                    // Still connected: watch again.
+                    if !frames.is_closed() {
+                        watch_peer(holder, link, frames);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+        break; // EOF or a broken socket: the daemon is gone
+    }
+    if frames.close() {
+        // No writer is running to see the close; release it here. The pump
+        // prunes the closed entry itself should it hold the fan-out now.
+        link.finish();
+        let Some(shared) = holder.upgrade() else {
+            return;
+        };
+        let prune = move |fanout: &mut OutputFanout| {
+            fanout
+                .subscribers
+                .retain(|subscriber| !Arc::ptr_eq(&subscriber.frames, &frames));
+        };
+        // The fan-out lock is only ever held briefly (the pump waits on a
+        // full queue without it), but the reactor must not wait on it at all.
+        if let Ok(mut fanout) = shared.output.try_lock() {
+            prune(&mut fanout);
+        } else {
+            let holder = Arc::clone(&shared);
+            let _ = spawn_lane("output", &shared.spec.session_id, move || {
+                prune(&mut holder.output.lock().expect("output"));
+            });
+        }
+    }
+}
+
+/// Starts a writer thread for a subscriber whose queue asked for one, which
+/// first writes `backlog` from the log.
+fn spawn_writer(
+    shared: &Arc<Shared>,
+    subscriber: &OutputSubscriber,
+    backlog: std::ops::Range<u64>,
+) -> std::io::Result<()> {
+    let holder = Arc::downgrade(shared);
+    let link = Arc::clone(&subscriber.link);
+    let frames = Arc::clone(&subscriber.frames);
+    spawn_lane("output", &shared.spec.session_id, move || {
+        write_output(&holder, &link, &frames, backlog);
+    })
+    .map(drop)
 }
 
 fn open_log(spec: &HolderLaunchSpec) -> HolderResult<OutputLog> {
@@ -444,62 +897,75 @@ fn open_log(spec: &HolderLaunchSpec) -> HolderResult<OutputLog> {
         .map_err(|error| HolderError::io("open output log", error))
 }
 
-/// Drains PTY output into the log until the child is gone.
+/// Drains PTY output into the log while it flows, then parks the PTY on the
+/// reactor once it has been quiet for [`reactor::LANE_IDLE`].
 ///
 /// The loop has to notice `finished` as well as output — after the exit marker
 /// is written, nothing more may be appended, or straggling grandchild output
 /// would land beyond the marker — so it waits on the PTY and the exit path's
-/// wake pipe together, with no deadline.
-fn pump_pty(shared: &Arc<Shared>, reader: &mut crate::pty::PtyStream) {
-    // The log is also the transport: the daemon reads this session's output by
-    // tailing the spill file. Appending on this thread therefore made draining
-    // the PTY wait on the filesystem — under a burst of output the pump sat in
-    // `write` for most of its wall time while the child blocked on a full PTY
-    // buffer. Handing bytes to a writer decouples the two: the feed absorbs a
-    // filesystem stall (a truncation rewrite, most of all) without ever
-    // stalling the reader, and gathers kilobyte reads into large appends.
-    //
-    // The feed is bounded, so a writer that genuinely cannot keep up applies
-    // backpressure rather than growing without limit. Ordering is preserved
-    // because exactly one thread writes.
-    let feed = Arc::new(super::log_feed::LogFeed::new());
-    let writer = {
-        let shared = Arc::clone(shared);
-        let feed = Arc::clone(&feed);
-        std::thread::Builder::new()
-            .name(format!("holder-log-{}", shared.spec.session_id))
-            .spawn(move || {
-                let _exit = super::log_feed::WriterExit(&feed);
-                let mut batch: Vec<u8> = Vec::new();
-                while feed.take(&mut batch) {
-                    // A failed disk write must not stop the session: the child
-                    // is still running and its status still matters.
-                    append_log(&shared, &batch);
-                    batch.clear();
-                    // A burst can leave a large buffer behind; an idle session
-                    // should not keep it.
-                    batch.shrink_to(super::log_feed::LOG_BATCH_BYTES);
-                }
-            })
-            .ok()
+/// wake pipe together.
+fn pump_pty(shared: &Arc<Shared>) {
+    let Some(mut reader) = shared.pump.lock().expect("pump").reader.take() else {
+        return;
     };
-    // Without a writer thread the append happens inline, which is slower but
-    // always correct.
-    let mut queue = writer.is_some().then_some(feed);
-
-    let mut buffer = [0u8; 64 << 10];
+    let idle = reactor::lane_idle();
+    let mut log = LogLane::default();
+    let mut buffer = vec![0u8; 64 << 10];
     let mut subscribers = Vec::new();
     loop {
-        if shared.finished.load(Ordering::SeqCst) {
-            break;
+        let quiet = pump_until_quiet(
+            shared,
+            &mut reader,
+            &mut log,
+            &mut buffer,
+            &mut subscribers,
+            idle,
+        );
+        // Every queued byte must reach the log before the pump lets go: the
+        // exit path writes the marker straight after joining this thread,
+        // and a byte still in flight would land after it. Parked, the writer
+        // has nothing to do either.
+        log.finish();
+        if !quiet {
+            return; // EOF or finished: the exit path takes it from here
         }
-        let readable = wait_for_output(reader.as_raw_fd(), &shared.pump_wake.0);
+        let mut lane = shared.pump.lock().expect("pump");
+        lane.reader = Some(reader);
+        if lane.finished || park_pump(shared, &mut lane) {
+            return;
+        }
+        // The reactor would not take it: keep pumping on this thread.
+        reader = lane.reader.take().expect("reader just returned");
+    }
+}
+
+/// Pumps until the PTY has been quiet for `idle` (returns true), or it hits
+/// EOF or the holder finishes (returns false).
+fn pump_until_quiet(
+    shared: &Arc<Shared>,
+    reader: &mut crate::pty::PtyStream,
+    log: &mut LogLane,
+    buffer: &mut [u8],
+    subscribers: &mut Vec<OutputSubscriber>,
+    idle: Option<Duration>,
+) -> bool {
+    use std::os::fd::AsRawFd as _;
+    loop {
+        if shared.finished.load(Ordering::SeqCst) {
+            return false;
+        }
+        let readable = reactor::wait_readable(
+            reader.as_raw_fd(),
+            Some(shared.pump_wake.0.as_raw_fd()),
+            idle,
+        );
         #[cfg(test)]
         shared.pump_wakeups.fetch_add(1, Ordering::SeqCst);
         match readable {
-            Ok(false) => continue,
-            Ok(true) => {}
-            Err(_) => break,
+            Ok(reactor::Readiness::Ready) => {}
+            Ok(reactor::Readiness::Woken) => continue,
+            Ok(reactor::Readiness::Idle) => return true,
+            Err(_) => return false,
         }
         // A PTY hands over about a kilobyte per read, so appending per read
         // pays the log's per-chunk costs a thousand times for every megabyte.
@@ -534,28 +1000,84 @@ fn pump_pty(shared: &Arc<Shared>, reader: &mut crate::pty::PtyStream) {
             // this ordering is what decouples display latency from filesystem
             // throughput.
             let chunk = &buffer[..filled];
-            broadcast_output(shared, chunk, &mut subscribers);
+            broadcast_output(shared, chunk, subscribers);
             // Bytes read are handed on even if `finished` was just set: the
-            // exit watcher joins this thread before writing the marker, so
+            // exit path joins this thread before writing the marker, so
             // nothing can land beyond it — but a byte consumed from the kernel
             // and then dropped would be lost.
-            if !queue.as_ref().is_some_and(|queue| queue.push(chunk)) {
-                append_log(shared, chunk);
-            }
+            log.append(shared, chunk);
         }
         if eof || shared.finished.load(Ordering::SeqCst) {
-            break;
+            return false;
+        }
+    }
+}
+
+/// The log writer of one pump turn.
+///
+/// The log is also the transport: the daemon reads this session's output by
+/// tailing the spill file. Appending on the pump's thread therefore made
+/// draining the PTY wait on the filesystem — under a burst of output the pump
+/// sat in `write` for most of its wall time while the child blocked on a full
+/// PTY buffer. Handing bytes to a writer decouples the two: the feed absorbs a
+/// filesystem stall (a truncation rewrite, most of all) without ever stalling
+/// the reader, and gathers kilobyte reads into large appends.
+///
+/// The feed is bounded, so a writer that genuinely cannot keep up applies
+/// backpressure rather than growing without limit. Ordering is preserved
+/// because exactly one thread writes. The writer starts with the turn's first
+/// output, after that output has gone to subscribers, so starting it never
+/// delays the screen.
+#[derive(Default)]
+struct LogLane {
+    feed: Option<Arc<super::log_feed::LogFeed>>,
+    writer: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LogLane {
+    fn append(&mut self, shared: &Arc<Shared>, chunk: &[u8]) {
+        if self.feed.is_none() {
+            let feed = Arc::new(super::log_feed::LogFeed::new());
+            let writer = {
+                let shared = Arc::clone(shared);
+                let feed = Arc::clone(&feed);
+                let session = shared.spec.session_id.clone();
+                spawn_lane("log", &session, move || {
+                    let _exit = super::log_feed::WriterExit(&feed);
+                    let mut batch: Vec<u8> = Vec::new();
+                    while feed.take(&mut batch) {
+                        // A failed disk write must not stop the session:
+                        // the child is still running and its status still
+                        // matters.
+                        append_log(&shared, &batch);
+                        batch.clear();
+                        // A burst can leave a large buffer behind; an
+                        // idle session should not keep it.
+                        batch.shrink_to(super::log_feed::LOG_BATCH_BYTES);
+                    }
+                })
+                .ok()
+            };
+            // Without a writer thread the append happens inline, which is
+            // slower but always correct.
+            if writer.is_some() {
+                self.feed = Some(feed);
+                self.writer = writer;
+            }
+        }
+        if !self.feed.as_ref().is_some_and(|feed| feed.push(chunk)) {
+            append_log(shared, chunk);
         }
     }
 
-    // Every queued byte must reach the log before this thread is joined: the
-    // exit watcher writes the exit marker straight after the join, and a byte
-    // still in flight would land after it.
-    if let Some(queue) = queue.take() {
-        queue.close();
-    }
-    if let Some(writer) = writer {
-        let _ = writer.join();
+    /// Flushes everything queued to the log and ends the writer.
+    fn finish(&mut self) {
+        if let Some(feed) = self.feed.take() {
+            feed.close();
+        }
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
+        }
     }
 }
 
@@ -568,41 +1090,6 @@ fn append_log(shared: &Shared, bytes: &[u8]) {
     // One batch per append, and nobody waits unless a resumed subscriber is
     // reading its backlog, so this costs nothing measurable.
     shared.log_grew.notify_all();
-}
-
-/// Parks the pump until the PTY has something for it, or the exit path says
-/// the child is gone. Returns whether the PTY is what woke it.
-///
-/// The wake pipe is never drained: it is written once, when `finished` is
-/// set, and the pump stops on seeing that.
-fn wait_for_output(pty_fd: i32, wake: &std::io::PipeReader) -> std::io::Result<bool> {
-    use std::os::fd::AsRawFd;
-    let mut descriptors = [
-        libc::pollfd {
-            fd: pty_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: wake.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-    ];
-    loop {
-        // SAFETY: two initialized poll descriptors stay writable throughout
-        // the call; both fds outlive it. A negative timeout waits forever.
-        let ready = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, -1) };
-        if ready >= 0 {
-            // Any event at all, errors included: the read that follows turns
-            // a broken PTY into EOF, where ignoring it would spin here.
-            return Ok(descriptors[0].revents != 0);
-        }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::EINTR) {
-            return Err(error);
-        }
-    }
 }
 
 /// Hands one chunk of PTY output to every attached subscriber.
@@ -623,16 +1110,14 @@ fn wait_for_output(pty_fd: i32, wake: &std::io::PipeReader) -> std::io::Result<b
 /// output is not held for a stalled Engine; it is bounded by what the kernel
 /// buffered, and is in the log, which is where the Engine resumes.
 ///
-/// No lock is held while waiting: a subscriber arriving meanwhile is quoted
-/// the offset after this chunk, and reads this chunk from the log.
+/// No lock is held while waiting, so subscribing, a hangup's prune and
+/// control requests never queue behind a slow Engine: a subscriber arriving
+/// meanwhile is quoted the offset after this chunk, and reads this chunk from
+/// the log.
 ///
 /// `subscribers` is the pump's scratch list, reused so a chunk costs no
 /// allocation; it is left empty.
-fn broadcast_output(
-    shared: &Shared,
-    frame: &[u8],
-    subscribers: &mut Vec<Arc<super::fanout::FrameQueue>>,
-) {
+fn broadcast_output(shared: &Arc<Shared>, frame: &[u8], subscribers: &mut Vec<OutputSubscriber>) {
     let offset = {
         let mut fanout = shared.output.lock().expect("output");
         let offset = fanout.next_offset;
@@ -643,24 +1128,14 @@ fn broadcast_output(
         if fanout.subscribers.is_empty() {
             return;
         }
-        subscribers.extend(
-            fanout
-                .subscribers
-                .iter()
-                .map(|subscriber| Arc::clone(&subscriber.frames)),
-        );
+        subscribers.extend(fanout.subscribers.iter().cloned());
         offset
     };
     let mut dropped = false;
-    for frames in subscribers.drain(..) {
-        if offer_frame(shared, &frames, offset, frame) {
+    for subscriber in subscribers.drain(..) {
+        if offer_frame(shared, &subscriber, offset, frame) {
             continue;
         }
-        // Closing is what makes dropping visible. Letting the subscriber go
-        // only releases this end of the queue; its writer would keep waiting
-        // on the other, holding the socket open, and the daemon would wait for
-        // frames that are never coming instead of falling back to the log.
-        frames.close();
         dropped = true;
     }
     if dropped {
@@ -676,36 +1151,40 @@ fn broadcast_output(
 /// Offers one frame to a subscriber, waiting for room for as long as it stays
 /// connected; see [`broadcast_output`].
 ///
-/// Returns false when the subscriber should be dropped.
+/// Returns false when the subscriber is dropped. Its queue is then closed,
+/// and its socket released here when no writer is running to do it.
 fn offer_frame(
-    shared: &Shared,
-    frames: &super::fanout::FrameQueue,
+    shared: &Arc<Shared>,
+    subscriber: &OutputSubscriber,
     offset: u64,
     frame: &[u8],
 ) -> bool {
-    use super::fanout::Offer;
+    use super::fanout::Pushed;
     let mut paced_since: Option<std::time::Instant> = None;
     loop {
-        match frames.offer(offset, frame, OUTPUT_SEND_PATIENCE) {
-            Offer::Queued => {
-                if let Some(since) = paced_since {
-                    diri_telemetry::event!(
-                        "holder.output_paced",
-                        session = diri_telemetry::id(&shared.spec.session_id),
-                        offset = offset,
-                        ms = since.elapsed(),
-                    );
+        match subscriber.frames.offer(offset, frame, OUTPUT_SEND_PATIENCE) {
+            Pushed::Queued => {}
+            // Its writer ended while the session was quiet; start the next.
+            Pushed::WakeWriter => {
+                if spawn_writer(shared, subscriber, 0..0).is_err() {
+                    // Nobody serves it now, so the release is ours.
+                    subscriber.frames.close();
+                    subscriber.link.finish();
+                    return false;
                 }
-                return true;
             }
-            Offer::Closed => return false,
-            Offer::Stalled => {
+            Pushed::Closed => {
+                release_subscriber(subscriber);
+                return false;
+            }
+            Pushed::Stalled => {
                 if shared.finished.load(Ordering::SeqCst) || shared.killing.load(Ordering::SeqCst) {
                     diri_telemetry::warn_event!(
                         "holder.subscriber_dropped",
                         session = diri_telemetry::id(&shared.spec.session_id),
                         offset = offset,
                     );
+                    release_subscriber(subscriber);
                     return false;
                 }
                 // Still connected, so still the session's owner: keep the
@@ -715,72 +1194,31 @@ fn offer_frame(
                         .checked_sub(OUTPUT_SEND_PATIENCE)
                         .unwrap_or_else(std::time::Instant::now)
                 });
+                continue;
             }
         }
-    }
-}
-
-/// Serves one subscriber until it disappears or the channel closes, then
-/// releases everything held for it.
-fn serve_output_stream(
-    shared: &Weak<Shared>,
-    stream: diri_platform::ipc::UnixStream,
-    frames: &Arc<super::fanout::FrameQueue>,
-    backlog: std::ops::Range<u64>,
-) {
-    // The writer parks on the queue, and a write is the only way it would
-    // learn the daemon has gone — so through a silent session a dead
-    // subscriber would keep its thread, socket and buffer. Watching the
-    // socket for the hangup closes the queue instead. If the watcher cannot
-    // start, the subscriber is released by its next failed write, as before.
-    let _watcher = stream.try_clone().ok().and_then(|peer| {
-        let frames = Arc::clone(frames);
-        let name = std::thread::current().name().map_or_else(
-            || "holder-output-peer".to_string(),
-            |name| format!("{name}-peer"),
-        );
-        std::thread::Builder::new()
-            .name(name)
-            .spawn(move || watch_output_peer(peer, &frames))
-            .ok()
-    });
-
-    let mut stream = std::io::BufWriter::with_capacity(OUTPUT_WRITE_BUFFER, stream);
-    if write_log_backlog(&mut stream, shared, frames, backlog) {
-        write_output_frames(&mut stream, frames);
-    }
-    frames.close();
-
-    // Shutdown is what interrupts the watcher's blocking read; dropping this
-    // handle alone would not, because the watcher holds a clone of it.
-    let _ = stream.get_ref().shutdown(Shutdown::Both);
-    // The pump only prunes a closed subscriber when it next has output to
-    // offer, which a silent session never does.
-    if let Some(shared) = shared.upgrade() {
-        let mut fanout = shared.output.lock().expect("output");
-        fanout
-            .subscribers
-            .retain(|subscriber| !Arc::ptr_eq(&subscriber.frames, frames));
-    }
-}
-
-/// Closes a subscriber's queue when its daemon hangs up.
-///
-/// A subscriber sends nothing after its request, so this read blocks for the
-/// subscription's whole life and costs no wakeups. It returns when the peer
-/// closes or the writer shuts the socket down on its way out.
-fn watch_output_peer(mut peer: diri_platform::ipc::UnixStream, frames: &super::fanout::FrameQueue) {
-    let mut scratch = [0u8; 64];
-    loop {
-        match peer.read(&mut scratch) {
-            Ok(0) => break,
-            // Not part of the protocol; discarded rather than trusted.
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => break,
+        if let Some(since) = paced_since {
+            diri_telemetry::event!(
+                "holder.output_paced",
+                session = diri_telemetry::id(&shared.spec.session_id),
+                offset = offset,
+                ms = since.elapsed(),
+            );
         }
+        return true;
     }
-    frames.close();
+}
+
+/// Closes a dropped subscriber's queue. Closing is what makes dropping
+/// visible: letting the subscriber go only releases this end of the queue; a
+/// writer would keep the socket open, and the daemon would wait for frames
+/// that are never coming instead of falling back to the log. A running writer
+/// sees the close and releases the socket; with none running, the release is
+/// ours.
+fn release_subscriber(subscriber: &OutputSubscriber) {
+    if subscriber.frames.close() {
+        subscriber.link.finish();
+    }
 }
 
 /// Writes a resumed subscriber's backlog, `range`, from the log, as frames
@@ -791,7 +1229,7 @@ fn watch_output_peer(mut peer: diri_platform::ipc::UnixStream, frames: &super::f
 /// written here tells it the subscriber is still reading, so the PTY is held
 /// at the subscriber's pace rather than lapping it.
 fn write_log_backlog(
-    stream: &mut std::io::BufWriter<diri_platform::ipc::UnixStream>,
+    stream: &mut impl Write,
     shared: &Weak<Shared>,
     frames: &super::fanout::FrameQueue,
     range: std::ops::Range<u64>,
@@ -845,55 +1283,129 @@ fn write_log_backlog(
     true
 }
 
-/// Writes frames to one subscriber until a write fails or the queue closes.
-fn write_output_frames(
-    stream: &mut std::io::BufWriter<diri_platform::ipc::UnixStream>,
-    frames: &super::fanout::FrameQueue,
+/// Writes frames to one subscriber until it goes, the queue closes, or it has
+/// had nothing to send for [`reactor::LANE_IDLE`] (the next frame then starts
+/// a new writer). The buffer is always flushed before the writer waits, so
+/// ending idle strands nothing.
+fn write_output(
+    holder: &Weak<Shared>,
+    link: &Arc<SubscriberLink>,
+    frames: &Arc<super::fanout::FrameQueue>,
+    backlog: std::ops::Range<u64>,
 ) {
+    use super::fanout::Popped;
+    let idle = reactor::lane_idle();
+    let mut stream = std::io::BufWriter::with_capacity(OUTPUT_WRITE_BUFFER, &link.stream);
     let mut queued: Option<super::fanout::Frame> = None;
-    loop {
-        let (offset, frame) = match queued.take() {
-            Some(frame) => frame,
-            // Everything written so far was flushed before parking here, so
-            // waiting without a deadline strands nothing in the buffer.
-            None => match frames.pop() {
+    let replayed = backlog.is_empty() || write_log_backlog(&mut stream, holder, frames, backlog);
+    if replayed {
+        loop {
+            let (offset, frame) = match queued.take() {
                 Some(frame) => frame,
-                None => break,
-            },
-        };
-        let length = frame.len() as u32;
-        if stream.write_all(&offset.to_be_bytes()).is_err()
-            || stream.write_all(&length.to_be_bytes()).is_err()
-            || stream.write_all(&frame).is_err()
-        {
-            frames.close();
-            return;
-        }
-        // Flushed only once nothing else is waiting, so a burst coalesces into
-        // few writes while a lone chunk still leaves immediately. The frame
-        // taken here is carried to the next turn, never dropped.
-        match frames.try_pop() {
-            Some(next) => queued = Some(next),
-            None => {
-                if stream.flush().is_err() {
-                    frames.close();
-                    return;
+                None => match idle {
+                    Some(idle) => match frames.pop_within(idle) {
+                        Popped::Frame(frame) => frame,
+                        Popped::Closed => break,
+                        Popped::Idle => {
+                            if frames.park_writer() {
+                                return;
+                            }
+                            continue;
+                        }
+                    },
+                    None => match frames.pop() {
+                        Some(frame) => frame,
+                        None => break,
+                    },
+                },
+            };
+            let length = frame.len() as u32;
+            if stream.write_all(&offset.to_be_bytes()).is_err()
+                || stream.write_all(&length.to_be_bytes()).is_err()
+                || stream.write_all(&frame).is_err()
+            {
+                frames.close();
+                break;
+            }
+            // Flushed only once nothing else is waiting, so a burst coalesces into
+            // few writes while a lone chunk still leaves immediately. The frame
+            // taken here is carried to the next turn, never dropped.
+            match frames.try_pop() {
+                Some(next) => queued = Some(next),
+                None => {
+                    if stream.flush().is_err() {
+                        frames.close();
+                        break;
+                    }
                 }
             }
         }
     }
     let _ = stream.flush();
+    drop(stream);
+    frames.close();
+    // A running writer owns the release.
+    link.finish();
+    // The pump only prunes a closed subscriber when it next has output to
+    // offer, which a silent session never does.
+    if let Some(shared) = holder.upgrade() {
+        let mut fanout = shared.output.lock().expect("output");
+        fanout
+            .subscribers
+            .retain(|subscriber| !Arc::ptr_eq(&subscriber.frames, frames));
+    }
+}
+
+/// Arranges for the child's exit to start the exit path: on the reactor when
+/// the exit is pollable, else on a thread that waits for it.
+fn watch_exit(shared: &Arc<Shared>) -> std::io::Result<()> {
+    if let Some(reactor) = reactor::shared() {
+        let descriptor = shared.exit_watch.lock().expect("exit watch").descriptor();
+        if let Some(fd) = descriptor {
+            // The registration holds the holder: while its child lives, this
+            // is what keeps an idle session's state (and PTY) alive. The
+            // watch it fires on lives in that state, so it stays open.
+            let holder = Arc::clone(shared);
+            if reactor.when_readable(fd, move || exited(holder)).is_ok() {
+                return Ok(());
+            }
+        }
+    }
+    let holder = Arc::clone(shared);
+    spawn_lane("exit", &shared.spec.session_id, move || finish(holder)).map(drop)
+}
+
+/// Runs on the reactor when the child's exit watch fires.
+fn exited(shared: Arc<Shared>) {
+    let holder = Arc::clone(&shared);
+    if spawn_lane("exit", &shared.spec.session_id, move || finish(holder)).is_err() {
+        // The watch is still readable, so it fires again at once.
+        std::thread::sleep(Duration::from_millis(10));
+        if watch_exit(&shared).is_err() {
+            diri_telemetry::warn_event!(
+                "holder.exit_unwatchable",
+                session = diri_telemetry::id(&shared.spec.session_id),
+            );
+        }
+    }
+}
+
+/// The exit path, on its own thread, then `on_finish` once nothing here holds
+/// the holder any more.
+fn finish(shared: Arc<Shared>) {
+    let on_finish = finish_holder(&shared);
+    drop(shared);
+    if let Some(on_finish) = on_finish {
+        on_finish();
+    }
 }
 
 /// Waits for the child to exit, kills whatever of its tree outlived it, reaps
 /// it, then finishes the holder: final drain, exit marker, control-file
 /// cleanup, listener shutdown.
-fn watch_exit(
-    shared: &Shared,
-    pump: std::thread::JoinHandle<()>,
-    exit_watcher: Option<diri_pty::ExitWatcher>,
-    detached: Option<Arc<DetachedLeader>>,
-) {
+fn finish_holder(shared: &Shared) -> Option<Box<dyn FnOnce() + Send>> {
+    let ExitWatch { watcher, detached } =
+        std::mem::take(&mut *shared.exit_watch.lock().expect("exit watch"));
     // The leader stays an unreaped zombie until the sweep is done: that is
     // what keeps its pid, and so the group id the sweep and the guard both
     // name, from being handed to anyone else. A detached leader is launchd's
@@ -902,7 +1414,7 @@ fn watch_exit(
     let detached_exit = match &detached {
         Some(leader) => Some(wait_for_detached_exit(leader, shared.child_pid)),
         None => {
-            wait_for_exit_unreaped(shared.child_pid, exit_watcher);
+            wait_for_exit_unreaped(shared.child_pid, watcher);
             None
         }
     };
@@ -945,7 +1457,7 @@ fn watch_exit(
     };
 
     if shared.finished.swap(true, Ordering::SeqCst) {
-        return;
+        return None;
     }
     diri_telemetry::event!(
         "holder.exit",
@@ -954,7 +1466,7 @@ fn watch_exit(
         signal = exit.signal,
         runtime_s = shared.spawned_at.elapsed().as_secs(),
     );
-    // The pump waits with no deadline, so it has to be told.
+    // A running pump waits on the PTY, so it has to be told.
     let _ = (&shared.pump_wake.1).write_all(&[1]);
     for stream in shared
         .input_streams
@@ -966,8 +1478,19 @@ fn watch_exit(
         let _ = stream.shutdown(Shutdown::Both);
     }
     // The pump must stop before the final drain, or a straggler byte could
-    // land after the exit marker.
-    let _ = pump.join();
+    // land after the exit marker. A parked PTY is withdrawn from the reactor
+    // under the same lock a wake would take, so no new pump can start.
+    let pump = {
+        let mut lane = shared.pump.lock().expect("pump");
+        lane.finished = true;
+        if let (Some(token), Some(reactor)) = (lane.parked.take(), reactor::shared()) {
+            reactor.cancel(token);
+        }
+        lane.thread.take()
+    };
+    if let Some(pump) = pump {
+        let _ = pump.join();
+    }
 
     if let Ok(mut drain) = shared.pty.lock().expect("pty").reader() {
         let mut buffer = [0u8; 64 << 10];
@@ -994,22 +1517,148 @@ fn watch_exit(
     // closed its socket. Ending the subscription sends it back to the log,
     // where the marker is already durable.
     for subscriber in shared.output.lock().expect("output").subscribers.drain(..) {
-        subscriber.frames.close();
+        if subscriber.frames.close() {
+            subscriber.link.finish();
+        }
     }
 
     let _ = std::fs::remove_file(&shared.spec.socket_path);
     let _ = std::fs::remove_file(&shared.spec.pid_file_path);
 
-    let listen_fd = shared.listen_fd.swap(-1, Ordering::SeqCst);
-    if listen_fd >= 0 {
-        // Shutdown then close: on macOS only the close wakes a blocked
-        // accept(2) on an AF_UNIX listener. `finished` is already set, so the
-        // woken loop exits rather than reporting an error.
-        // SAFETY: this fd was surrendered to raw ownership in `run`; nothing
-        // else closes it.
-        unsafe {
-            libc::shutdown(listen_fd, libc::SHUT_RDWR);
-            libc::close(listen_fd);
+    {
+        let mut lane = shared.accept.lock().expect("accept");
+        lane.closed = true;
+        if let (Some(token), Some(reactor)) = (lane.parked.take(), reactor::shared()) {
+            reactor.cancel(token);
+        }
+    }
+    if let Some(listener) = shared.listener.lock().expect("listener").take() {
+        // A request thread still waiting holds its own handle; it sees
+        // `finished` within its idle period and lets go.
+        // SAFETY: shutdown on a descriptor `listener` keeps open.
+        unsafe { libc::shutdown(listener.as_raw_fd(), libc::SHUT_RDWR) };
+    }
+    shared.on_finish.lock().expect("on finish").take()
+}
+
+/// Starts a thread serving one input stream.
+fn spawn_input(
+    shared: &Arc<Shared>,
+    stream: Arc<diri_platform::ipc::UnixStream>,
+) -> std::io::Result<()> {
+    let holder = Arc::clone(shared);
+    spawn_lane("input", &shared.spec.session_id, move || {
+        serve_input_stream(&holder, stream);
+    })
+    .map(drop)
+}
+
+/// Hands an idle input stream to the reactor. False if it would not take it.
+///
+/// The registration holds the stream, so it stays on the exit path's list
+/// and is shut down with the others, which fires the wake and lets it go.
+fn park_input(shared: &Arc<Shared>, stream: &Arc<diri_platform::ipc::UnixStream>) -> bool {
+    let Some(reactor) = reactor::shared() else {
+        return false;
+    };
+    let holder = Arc::downgrade(shared);
+    let held = Arc::clone(stream);
+    reactor
+        .when_readable(stream.as_raw_fd(), move || wake_input(&holder, held))
+        .is_ok()
+}
+
+/// Runs on the reactor when a parked input stream has a frame (or hung up).
+fn wake_input(holder: &Weak<Shared>, stream: Arc<diri_platform::ipc::UnixStream>) {
+    let Some(shared) = holder.upgrade() else {
+        return;
+    };
+    if shared.finished.load(Ordering::SeqCst) {
+        return; // shut down by the exit path
+    }
+    if spawn_input(&shared, Arc::clone(&stream)).is_err() {
+        // Still readable, so a re-armed watch fires again at once.
+        std::thread::sleep(Duration::from_millis(10));
+        let _ = park_input(&shared, &stream);
+    }
+}
+
+/// Serves the negotiated high-frequency input lane. Each operation is
+/// acknowledged only after it has reached the PTY, preserving the delivery
+/// guarantee of the legacy request/response protocol without reconnecting or
+/// encoding base64 for every key.
+///
+/// The thread lives while keys arrive. After [`reactor::LANE_IDLE`] without a
+/// frame the stream is handed to the reactor and the thread ends; the next
+/// key starts a new one, at the same interactive priority.
+fn serve_input_stream(shared: &Arc<Shared>, stream: Arc<diri_platform::ipc::UnixStream>) {
+    prioritize_interactive_io();
+    let idle = reactor::lane_idle();
+    let mut payload = Vec::with_capacity(256);
+    loop {
+        if let Some(idle) = idle
+            && matches!(
+                reactor::wait_readable(stream.as_raw_fd(), None, Some(idle)),
+                Ok(reactor::Readiness::Idle)
+            )
+            && park_input(shared, &stream)
+        {
+            return;
+        }
+        let mut reader = &*stream;
+        let mut header = [0_u8; 5];
+        if !read_stream_exact(shared, &mut reader, &mut header) {
+            return;
+        }
+        let length = u32::from_be_bytes(header[1..].try_into().expect("four-byte length")) as usize;
+        if length > HOLDER_STREAM_MAX_PAYLOAD {
+            let _ = reader.write_all(&[1]);
+            return;
+        }
+        payload.resize(length, 0);
+        if !read_stream_exact(shared, &mut reader, &mut payload) {
+            return;
+        }
+        let result = match header[0] {
+            HOLDER_STREAM_INPUT => write_pty(shared, &payload),
+            HOLDER_STREAM_RESIZE | HOLDER_STREAM_RESIZE_PIXELS
+                if payload.len()
+                    == if header[0] == HOLDER_STREAM_RESIZE {
+                        4
+                    } else {
+                        8
+                    } =>
+            {
+                let word = |at: usize| u16::from_be_bytes([payload[at], payload[at + 1]]);
+                let (cols, rows) = (word(0), word(2));
+                let pixels = if payload.len() == 8 {
+                    (word(4), word(6))
+                } else {
+                    (0, 0)
+                };
+                if cols < 2 || rows < 2 {
+                    Err(HolderError::InvalidRequest(
+                        "resize requires cols/rows >= 2".into(),
+                    ))
+                } else {
+                    let _ = shared
+                        .pty
+                        .lock()
+                        .expect("pty")
+                        .resize_with_pixels(cols, rows, pixels);
+                    Ok(())
+                }
+            }
+            _ => Err(HolderError::InvalidRequest(
+                "unknown Holder input stream frame".into(),
+            )),
+        };
+        if result.is_err() {
+            let _ = reader.write_all(&[1]);
+            return;
+        }
+        if reader.write_all(&[HOLDER_STREAM_ACK]).is_err() {
+            return;
         }
     }
 }
@@ -1098,77 +1747,11 @@ fn handle(shared: &Shared, request: &HolderRequest) -> HolderResult<HolderRespon
     }
 }
 
-/// Serves the negotiated high-frequency input lane. Each operation is
-/// acknowledged only after it has reached the PTY, preserving the delivery
-/// guarantee of the legacy request/response protocol without reconnecting or
-/// encoding base64 for every key.
-fn serve_input_stream(shared: &Shared, stream: Arc<diri_platform::ipc::UnixStream>) {
-    prioritize_interactive_io();
-    let mut stream = &*stream;
-    let mut payload = Vec::with_capacity(256);
-    loop {
-        let mut header = [0_u8; 5];
-        if !read_stream_exact(shared, &mut stream, &mut header) {
-            return;
-        }
-        let length = u32::from_be_bytes(header[1..].try_into().expect("four-byte length")) as usize;
-        if length > HOLDER_STREAM_MAX_PAYLOAD {
-            let _ = stream.write_all(&[1]);
-            return;
-        }
-        payload.resize(length, 0);
-        if !read_stream_exact(shared, &mut stream, &mut payload) {
-            return;
-        }
-        let result = match header[0] {
-            HOLDER_STREAM_INPUT => write_pty(shared, &payload),
-            HOLDER_STREAM_RESIZE | HOLDER_STREAM_RESIZE_PIXELS
-                if payload.len()
-                    == if header[0] == HOLDER_STREAM_RESIZE {
-                        4
-                    } else {
-                        8
-                    } =>
-            {
-                let word = |at: usize| u16::from_be_bytes([payload[at], payload[at + 1]]);
-                let (cols, rows) = (word(0), word(2));
-                let pixels = if payload.len() == 8 {
-                    (word(4), word(6))
-                } else {
-                    (0, 0)
-                };
-                if cols < 2 || rows < 2 {
-                    Err(HolderError::InvalidRequest(
-                        "resize requires cols/rows >= 2".into(),
-                    ))
-                } else {
-                    let _ = shared
-                        .pty
-                        .lock()
-                        .expect("pty")
-                        .resize_with_pixels(cols, rows, pixels);
-                    Ok(())
-                }
-            }
-            _ => Err(HolderError::InvalidRequest(
-                "unknown Holder input stream frame".into(),
-            )),
-        };
-        if result.is_err() {
-            let _ = stream.write_all(&[1]);
-            return;
-        }
-        if stream.write_all(&[HOLDER_STREAM_ACK]).is_err() {
-            return;
-        }
-    }
-}
-
 /// A persistent socket moves keystrokes off the Holder's accept thread. Keep
 /// that dedicated, mostly-sleeping lane at interactive QoS on Apple platforms
 /// so waking it does not add latency ahead of the PTY and renderer pipeline.
 #[cfg(target_vendor = "apple")]
-fn prioritize_interactive_io() {
+pub(super) fn prioritize_interactive_io() {
     // SAFETY: this changes only the calling thread's QoS class. Priority zero
     // is the documented relative priority for the selected class.
     let _ = unsafe {
@@ -1177,7 +1760,7 @@ fn prioritize_interactive_io() {
 }
 
 #[cfg(not(target_vendor = "apple"))]
-fn prioritize_interactive_io() {}
+pub(super) fn prioritize_interactive_io() {}
 
 fn read_stream_exact(shared: &Shared, stream: &mut impl Read, mut bytes: &mut [u8]) -> bool {
     while !bytes.is_empty() && !shared.finished.load(Ordering::SeqCst) {
@@ -1809,6 +2392,87 @@ mod tests {
         client.kill_tree().expect("kill-tree");
         wait_until("holder finished", || server.is_finished());
         server.join().expect("join").expect("clean holder exit");
+    }
+
+    /// Reads output until `text` has arrived, or panics after `within`.
+    fn read_until(stream: &mut crate::holder::HolderOutputStream, text: &[u8], within: Duration) {
+        let deadline = std::time::Instant::now() + within;
+        let mut seen = Vec::new();
+        let mut run = Vec::new();
+        while !seen.windows(text.len()).any(|window| window == text) {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(
+                !left.is_zero(),
+                "no {:?} within {within:?}",
+                String::from_utf8_lossy(text)
+            );
+            if let Ok(Some(_)) =
+                stream.next_run_into(left.min(Duration::from_millis(100)), 1 << 16, &mut run)
+            {
+                seen.extend_from_slice(&run);
+            }
+        }
+    }
+
+    #[test]
+    fn an_idle_session_holds_no_threads_and_a_keystroke_wakes_it() {
+        let root = tempfile::tempdir().unwrap();
+        let spec = HolderLaunchSpec {
+            session_id: "s_lanes".into(),
+            socket_path: root.path().join("h.sock").to_string_lossy().into_owned(),
+            pid_file_path: root.path().join("h.pid").to_string_lossy().into_owned(),
+            log_file_path: root
+                .path()
+                .join("s_lanes.bin")
+                .to_string_lossy()
+                .into_owned(),
+            argv: vec!["/bin/cat".into()],
+            cwd: "/tmp".into(),
+            environment: Default::default(),
+            cols: 80,
+            rows: 24,
+            disk_capacity: 1 << 20,
+        };
+        let client = HolderClient::new(&spec.socket_path);
+        let server = std::thread::spawn(move || HolderServer::run(spec));
+        wait_until("holder ready", || client.is_alive());
+        let mut stream = client
+            .open_output_stream()
+            .expect("subscribe")
+            .expect("output stream supported");
+
+        // Busy: the PTY, its log, the subscriber and the keystroke each have
+        // a thread.
+        client.write(b"one\n").expect("type");
+        read_until(&mut stream, b"one", Duration::from_secs(5));
+        assert!(live_lanes::count("s_lanes") > 0);
+
+        // Idle: every lane parks on the reactor and its thread ends. The
+        // threads used to stay for the session's whole life, seven of them.
+        let deadline = std::time::Instant::now() + reactor::LANE_IDLE * 3;
+        while live_lanes::count("s_lanes") > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} lane threads still running after {:?} idle",
+                live_lanes::count("s_lanes"),
+                reactor::LANE_IDLE * 3
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // A keystroke wakes the input lane, then the PTY and the subscriber,
+        // and its echo arrives as it did before the session went idle.
+        let typed = std::time::Instant::now();
+        client.write(b"two\n").expect("type after idle");
+        read_until(&mut stream, b"two", Duration::from_secs(2));
+        assert!(typed.elapsed() < Duration::from_secs(1));
+
+        // The parked control socket still answers.
+        assert!(client.stat().is_ok());
+        client.kill_tree().expect("kill-tree");
+        wait_until("holder finished", || server.is_finished());
+        server.join().expect("join").expect("clean holder exit");
+        wait_until("lanes gone", || live_lanes::count("s_lanes") == 0);
     }
 
     /// Closing a session must not wait out the SIGKILL grace just because

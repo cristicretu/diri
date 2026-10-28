@@ -627,12 +627,11 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
             .iter()
             .position(|byte| Some(byte) == needle.first());
     };
+    // `memchr` rather than `Iterator::position`: the scan visits every byte
+    // a session prints, and a byte-at-a-time loop was a measurable share of
+    // the Engine pump while a `cat` of a large log streamed.
     let mut offset = 1;
-    while let Some(hit) = haystack
-        .get(offset..)?
-        .iter()
-        .position(|&byte| byte == anchor)
-    {
+    while let Some(hit) = memchr::memchr(anchor, haystack.get(offset..)?) {
         let start = offset + hit - 1;
         if haystack[start..].starts_with(needle) {
             return Some(start);
@@ -653,6 +652,46 @@ fn longest_suffix_of_prefix(data: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The anchored scan finds exactly what a window-by-window search finds,
+    /// including markers that start at the first byte, sit right after
+    /// colored output, overlap a near miss, or end the chunk.
+    #[test]
+    fn the_marker_scan_agrees_with_a_naive_search() {
+        let naive = |haystack: &[u8], needle: &[u8]| {
+            haystack
+                .windows(needle.len())
+                .position(|window| window == needle)
+        };
+        let prefix = HolderExitMarker::PREFIX;
+        let pieces: [&[u8]; 7] = [
+            b"\x1b[31mred\x1b[0m ",
+            b"]",
+            b"\x1b]",
+            b"\x1b]777;dirijor-exi",
+            prefix,
+            b"plain text ",
+            "\u{65e5}\u{672c}".as_bytes(),
+        ];
+        let mut seed = 0x2545_f491_u32;
+        for _ in 0..20_000 {
+            let mut haystack = Vec::new();
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            for shift in 0..(seed % 9) {
+                haystack.extend_from_slice(pieces[(seed >> (shift * 3)) as usize % pieces.len()]);
+            }
+            assert_eq!(
+                find(&haystack, prefix),
+                naive(&haystack, prefix),
+                "{haystack:?}"
+            );
+        }
+        assert_eq!(find(prefix, prefix), Some(0));
+        assert_eq!(find(b"", prefix), None);
+        assert_eq!(find(b"x\x1b", prefix), None);
+    }
 
     #[test]
     fn the_launch_spec_uses_swift_codable_key_spelling() {
