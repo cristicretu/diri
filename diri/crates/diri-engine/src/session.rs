@@ -529,6 +529,8 @@ struct Shared {
     echo_request: Mutex<Option<EchoRequest>>,
     /// Rings the held pump out of an idle park; see [`PumpWake`].
     pump_wake: PumpWake,
+    /// Set while a held pump runs or is parked; see [`HeldPumpLatch`].
+    held_pump: HeldPumpLatch,
     /// What the last foreground sample of a shell found: 0 unknown, 1 the
     /// shell itself, 2 a job. Only a job can change without moving bytes,
     /// so only then does an idle pump keep its slow sampling backstop.
@@ -868,6 +870,36 @@ impl PumpWake {
                 unsafe { libc::kevent(*kq, &event, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
             }
         }
+    }
+}
+
+/// Whether a held pump is still running, parked turns included: what a join
+/// of the session's pump waits for once the thread that started it has
+/// returned, since a parked pump continues on threads of its own.
+#[derive(Default)]
+struct HeldPumpLatch {
+    running: Mutex<bool>,
+    ended: Condvar,
+}
+
+impl HeldPumpLatch {
+    fn begin(&self) {
+        *self.running.lock().expect("held pump") = true;
+    }
+
+    fn end(&self) {
+        *self.running.lock().expect("held pump") = false;
+        self.ended.notify_all();
+    }
+
+    /// Waits for a held pump to finish. Callers set `stop` and ring the
+    /// doorbell first, which brings a parked pump back to see it.
+    fn wait_ended(&self) {
+        let running = self.running.lock().expect("held pump");
+        let _ended = self
+            .ended
+            .wait_while(running, |running| *running)
+            .expect("held pump");
     }
 }
 
@@ -2630,16 +2662,6 @@ impl Session {
         self.shared.screen.lock().expect("screen").lines()
     }
 
-    /// The screen as text for a reader (`session.read_screen`); see
-    /// [`diri_terminal_state::HeadlessScreen::text_lines`].
-    pub fn screen_text(&self, options: diri_terminal_state::TextOptions) -> Vec<String> {
-        self.shared
-            .screen
-            .lock()
-            .expect("screen")
-            .text_lines(options)
-    }
-
     /// The verified child birth and Holder epoch this Session was bound to
     /// at launch or adoption, if the Holder provided them. Local held
     /// sessions only; never refreshed from a later inspection.
@@ -3638,6 +3660,7 @@ impl Session {
             self.shared.stop.store(true, Ordering::SeqCst);
             if let Some(pump) = self.pump.take() {
                 let _ = pump.join();
+                self.shared.held_pump.wait_ended();
             }
             self.shared.exited.store(true, Ordering::SeqCst);
             return Ok(Exit::Signal(diri_platform::signals::SIGKILL));
@@ -3682,6 +3705,7 @@ impl Session {
         }
         if let Some(pump) = self.pump.take() {
             let _ = pump.join();
+            self.shared.held_pump.wait_ended();
         }
         Ok(exit)
     }
@@ -3721,6 +3745,7 @@ impl Drop for Session {
         }
         if let Some(pump) = self.pump.take() {
             let _ = pump.join();
+            self.shared.held_pump.wait_ended();
         }
     }
 }
@@ -3801,6 +3826,8 @@ fn new_shared(
         prompt_input: Mutex::new(PromptInputState::default()),
         log: Mutex::new(log),
         screen: Mutex::new({
+            // The pump feeds every Holder frame (about a kilobyte while output
+            // streams) and releases streaming memory once it settles.
             let (cols, rows) = (spec.pty.cols as usize, spec.pty.rows as usize);
             // Only a local session's own emulator feeds the client grid; a
             // remote session's grid, image anchors and pixels come from its
@@ -3814,11 +3841,14 @@ fn new_shared(
                 let mut screen = HeadlessScreen::new_with_keyboard_enhancements(cols, rows)
                     .with_notifications()
                     .with_inline_images()
-                    .with_host_replies(TERMINAL_VERSION);
+                    .with_host_replies(TERMINAL_VERSION)
+                    .keeping_spare_rows_until_idle();
                 screen.set_palette(terminal_palette());
                 screen
             } else {
-                HeadlessScreen::new(cols, rows).with_notifications()
+                HeadlessScreen::new(cols, rows)
+                    .with_notifications()
+                    .keeping_spare_rows_until_idle()
             }
         }),
         cell_pixels: spec
@@ -3859,6 +3889,7 @@ fn new_shared(
         relaunch_requested: AtomicBool::new(false),
         echo_request: Mutex::new(None),
         pump_wake: PumpWake::default(),
+        held_pump: HeldPumpLatch::default(),
         foreground_job: std::sync::atomic::AtomicU8::new(0),
         foreground: Mutex::new(ForegroundProgram::default()),
         progress: Mutex::new(ProgressTrack::default()),
@@ -6125,7 +6156,7 @@ fn pump_held(
     fresh: bool,
 ) {
     let replay_budget = replay_budget();
-    let (checkpoint_path, mut offset, mut watcher, mut marker_buffer) = {
+    let (checkpoint_path, offset, watcher, marker_buffer) = {
         let mut log = shared.log.lock().expect("log");
         log.refresh_from_disk();
         let checkpoint_path = crate::checkpoint::ScreenCheckpoint::path_for_log(log.path());
@@ -6219,54 +6250,53 @@ fn pump_held(
             }
         }
     };
-    // Declared after the watcher so it is dropped first: the doorbell is
-    // cleared before the kqueue it rings closes.
+    // The doorbell stays set across parks; the last turn clears it before
+    // the kqueue it rings closes (see `held_turn`).
     if let Some(watcher) = &watcher {
         shared.pump_wake.set(watcher.wake_descriptor());
     }
-    let _wake_registration = PumpWakeRegistration(&shared.pump_wake);
     // Set at the end of a quiet pass that left nothing pending, so the next
     // wait parks without a deadline instead of ticking.
-    let mut park_next = false;
+    let park_next = false;
     // Adoption can restore a checkpoint concurrently with a freshly attached
     // App. One event is cheap and guarantees a seed that raced the restore is
     // corrected without bringing back periodic grid polling.
     shared.grid_wake.notify();
-    let mut last_checkpoint_key: Option<CheckpointKey> = None;
+    let last_checkpoint_key: Option<CheckpointKey> = None;
     // (first unsaved output, latest output) since the last checkpoint.
-    let mut checkpoint_dirty_at: Option<(Instant, Instant)> = None;
-    let mut last_liveness = Instant::now();
+    let checkpoint_dirty_at: Option<(Instant, Instant)> = None;
+    let last_liveness = Instant::now();
     // When this session's foreground group was last sampled, and when bytes
     // last moved in either direction; see `held_foreground_sample_due`.
-    let mut last_foreground_sample: Option<Instant> = None;
-    let mut last_activity: Option<Instant> = None;
-    let mut last_interaction_seen = shared.last_interaction.load(Ordering::Relaxed);
-    let mut last_eval_seq = 0u64;
-    let mut last_eval_at: Option<Instant> = None;
+    let last_foreground_sample: Option<Instant> = None;
+    let last_activity: Option<Instant> = None;
+    let last_interaction_seen = shared.last_interaction.load(Ordering::Relaxed);
+    let last_eval_seq = 0u64;
+    let last_eval_at: Option<Instant> = None;
     // Set when a chunk was fed without detection running, so the settle below
     // knows the screen still needs judging.
-    let mut eval_dirty = false;
-    let mut last_scan_at = None;
-    let mut last_scan_seq = 0u64;
-    let mut exit_status: Option<HolderExitStatus> = None;
-    let mut interactive_qos = false;
+    let eval_dirty = false;
+    let last_scan_at = None;
+    let last_scan_seq = 0u64;
+    let exit_status: Option<HolderExitStatus> = None;
+    let interactive_qos = false;
     // Set while a repaint is being assembled across more than one log read.
-    let mut publish_pending: Option<Instant> = None;
+    let publish_pending: Option<Instant> = None;
     // When output was last published, which paces the leading edge; see
     // [`OUTPUT_QUIET`].
-    let mut last_published: Option<Instant> = None;
+    let last_published: Option<Instant> = None;
     // Filled cells when the pending batch opened, so an echo is judged
     // against the last published screen rather than the previous read.
-    let mut batch_filled: Option<usize> = None;
+    let batch_filled: Option<usize> = None;
     // Set while the pending batch is a repaint caught between its erase and
     // the end of its redraw; see [`RepaintHold`].
-    let mut repaint: Option<RepaintHold> = None;
+    let repaint: Option<RepaintHold> = None;
     // When the pending batch blanked the screen, which is when a blank
     // repaint's grace starts.
-    let mut blank_since: Option<Instant> = None;
+    let blank_since: Option<Instant> = None;
     // Until the tail is first caught up, bytes are history, not activity:
     // they must render, but not flip a quiet adopted session to Working.
-    let mut replaying = true;
+    let replaying = true;
     // Everything already in the log when this pump attached. A query below it
     // was asked before we were here and has either been answered or outlived
     // its asker; a query above it came from the running child and is owed an
@@ -6291,28 +6321,214 @@ fn pump_held(
     // log still underneath: the stream can end or be dropped at any moment,
     // and the loop just goes back to reading the file from the offset it had
     // reached.
-    let mut live: Option<crate::holder::HolderOutputStream> = None;
+    let live: Option<crate::holder::HolderOutputStream> = None;
     // An adopted Holder keeps the same executable for this session's life.
     // Remember a completed negative negotiation; otherwise every log wakeup
     // reconnects just to receive the same unsupported-operation response.
     // Transport errors remain retryable, as do interrupted supported streams.
-    let mut output_stream_supported = true;
+    let output_stream_supported = true;
     // Reused across passes: a fresh allocation per pass would charge every
     // byte of output an allocation it does not need.
-    let mut live_run: Vec<u8> = Vec::new();
+    let live_run: Vec<u8> = Vec::new();
     // Where the subscription's first frame sits. The holder is ahead of the
     // log by whatever it has read but not yet written, so the file has to be
     // followed up to this point before a frame can be consumed.
-    let mut live_from: u64 = 0;
+    let live_from: u64 = 0;
     // Set once the log has been read to its end, which is the only safe moment
     // to subscribe to a Holder that cannot resume.
-    let mut drained = false;
+    let drained = false;
     // Whether to subscribe without waiting for a drained log. A Holder that
     // resumes from our offset sends what we have not read yet itself, and
     // holds its PTY at our pace while we read it, so subscribing at once is
     // what keeps a flood from outrunning this pump. Cleared for a Holder that
     // cannot resume, and after a failed attempt, until the log next drains.
-    let mut subscribe_eagerly = true;
+    let subscribe_eagerly = true;
+
+    shared.held_pump.begin();
+    let state = HeldPump {
+        shared,
+        engine,
+        client,
+        exit_marker_floor,
+        manifest_id,
+        checkpoint_path,
+        replay_until,
+        offset,
+        watcher,
+        marker_buffer,
+        park_next,
+        last_checkpoint_key,
+        checkpoint_dirty_at,
+        last_liveness,
+        last_foreground_sample,
+        last_activity,
+        last_interaction_seen,
+        last_eval_seq,
+        last_eval_at,
+        eval_dirty,
+        last_scan_at,
+        last_scan_seq,
+        exit_status,
+        interactive_qos,
+        publish_pending,
+        last_published,
+        batch_filled,
+        repaint,
+        blank_since,
+        replaying,
+        live,
+        output_stream_supported,
+        live_run,
+        live_from,
+        drained,
+        subscribe_eagerly,
+    };
+    run_held(Box::new(state), false);
+}
+
+/// Everything a held pump carries from one turn to the next: the locals of
+/// its loop, moved out of the thread's stack when it parks.
+///
+/// A held pump with nothing pending used to sleep in `kevent` on its own
+/// thread, so every idle session kept an Engine thread. It now hands its
+/// kqueue to the shared reactor and the thread ends; the first event (a
+/// frame, the subscription's hangup, the doorbell, or the backstop) starts
+/// a thread that carries on with the same state. Exactly one thread runs a
+/// pump at a time: only a wake starts the next, and only after the last has
+/// let go of the state.
+struct HeldPump {
+    shared: Arc<Shared>,
+    engine: Arc<ManifestEngine>,
+    client: HolderClient,
+    exit_marker_floor: u64,
+    manifest_id: String,
+    checkpoint_path: PathBuf,
+    replay_until: u64,
+    offset: u64,
+    watcher: Option<log_watch::LogWatcher>,
+    marker_buffer: Vec<u8>,
+    park_next: bool,
+    last_checkpoint_key: Option<CheckpointKey>,
+    checkpoint_dirty_at: Option<(Instant, Instant)>,
+    last_liveness: Instant,
+    last_foreground_sample: Option<Instant>,
+    last_activity: Option<Instant>,
+    last_interaction_seen: u64,
+    last_eval_seq: u64,
+    last_eval_at: Option<Instant>,
+    eval_dirty: bool,
+    last_scan_at: Option<Instant>,
+    last_scan_seq: u64,
+    exit_status: Option<HolderExitStatus>,
+    interactive_qos: bool,
+    publish_pending: Option<Instant>,
+    last_published: Option<Instant>,
+    batch_filled: Option<usize>,
+    repaint: Option<RepaintHold>,
+    blank_since: Option<Instant>,
+    replaying: bool,
+    live: Option<crate::holder::HolderOutputStream>,
+    output_stream_supported: bool,
+    live_run: Vec<u8>,
+    live_from: u64,
+    drained: bool,
+    subscribe_eagerly: bool,
+}
+
+/// How a pump's turn on a thread ended.
+enum HeldTurn {
+    /// Nothing pending: the state waits for its kqueue to turn readable.
+    Parked(Box<HeldPump>),
+    /// The session exited or is no longer watched.
+    Done,
+}
+
+/// Ends the pump's latch, unless the pump parked: on any other way out of
+/// a turn, unwinding included, a join must not wait for it.
+struct HeldPumpEnd<'a>(Option<&'a HeldPumpLatch>);
+
+impl Drop for HeldPumpEnd<'_> {
+    fn drop(&mut self) {
+        if let Some(latch) = self.0 {
+            latch.end();
+        }
+    }
+}
+
+/// Runs turns of a held pump until it parks on the reactor or ends.
+fn run_held(mut state: Box<HeldPump>, mut resumed: bool) {
+    let shared = Arc::clone(&state.shared);
+    let mut ended = HeldPumpEnd(Some(&shared.held_pump));
+    let mut may_park = held_park::available();
+    loop {
+        match held_turn(state, resumed, may_park) {
+            HeldTurn::Done => return,
+            HeldTurn::Parked(parked) => match held_park::park(parked) {
+                Ok(()) => {
+                    ended.0 = None;
+                    return;
+                }
+                // The reactor would not take it: sleep on this thread, as
+                // before pumps could park.
+                Err(back) => {
+                    state = back;
+                    resumed = false;
+                    may_park = false;
+                }
+            },
+        }
+    }
+}
+
+/// One turn of a held pump on the current thread.
+fn held_turn(state: Box<HeldPump>, mut resumed: bool, may_park: bool) -> HeldTurn {
+    let HeldPump {
+        shared,
+        engine,
+        client,
+        exit_marker_floor,
+        manifest_id,
+        checkpoint_path,
+        replay_until,
+        mut offset,
+        mut watcher,
+        mut marker_buffer,
+        mut park_next,
+        mut last_checkpoint_key,
+        mut checkpoint_dirty_at,
+        mut last_liveness,
+        mut last_foreground_sample,
+        mut last_activity,
+        mut last_interaction_seen,
+        mut last_eval_seq,
+        mut last_eval_at,
+        mut eval_dirty,
+        mut last_scan_at,
+        mut last_scan_seq,
+        mut exit_status,
+        mut interactive_qos,
+        mut publish_pending,
+        mut last_published,
+        mut batch_filled,
+        mut repaint,
+        mut blank_since,
+        mut replaying,
+        mut live,
+        mut output_stream_supported,
+        mut live_run,
+        mut live_from,
+        mut drained,
+        mut subscribe_eagerly,
+    } = *state;
+    // Declared after the watcher so it is dropped first: the doorbell is
+    // cleared before the kqueue it rings closes. A park forgets it instead,
+    // leaving the doorbell set on the kqueue the parked state keeps open.
+    let wake_registration = PumpWakeRegistration(&shared.pump_wake);
+    if resumed {
+        // A new thread, at the default class until the loop raises it.
+        set_current_thread_interactive(false);
+        interactive_qos = false;
+    }
 
     while !shared.stop.load(Ordering::SeqCst) && exit_status.is_none() {
         if shared.reset_requested.swap(false, Ordering::SeqCst) {
@@ -6400,6 +6616,63 @@ fn pump_held(
         }
         // Frames only once the file has been followed up to where they begin.
         let streaming = live.is_some() && offset >= live_from;
+        // Nothing is pending: the pump would sleep until a frame, a hangup or
+        // the doorbell. Instead of sleeping on this thread, hand the state to
+        // the reactor and let the thread go.
+        let parks_here = streaming
+            && repaint.is_none()
+            && publish_pending.is_none()
+            && park_next
+            && watcher.is_some()
+            && live.as_ref().and_then(park_descriptor).is_some();
+        let woke = std::mem::take(&mut resumed) && parks_here;
+        if parks_here
+            && !woke
+            && may_park
+            && let (Some(parking), Some(descriptor)) =
+                (watcher.as_mut(), live.as_ref().and_then(park_descriptor))
+            && parking.arm_stream(descriptor)
+        {
+            std::mem::forget(wake_registration);
+            return HeldTurn::Parked(Box::new(HeldPump {
+                shared,
+                engine,
+                client,
+                exit_marker_floor,
+                manifest_id,
+                checkpoint_path,
+                replay_until,
+                offset,
+                watcher,
+                marker_buffer,
+                park_next,
+                last_checkpoint_key,
+                checkpoint_dirty_at,
+                last_liveness,
+                last_foreground_sample,
+                last_activity,
+                last_interaction_seen,
+                last_eval_seq,
+                last_eval_at,
+                eval_dirty,
+                last_scan_at,
+                last_scan_seq,
+                exit_status,
+                interactive_qos,
+                publish_pending,
+                last_published,
+                batch_filled,
+                repaint,
+                blank_since,
+                replaying,
+                live,
+                output_stream_supported,
+                live_run,
+                live_from,
+                drained,
+                subscribe_eagerly,
+            }));
+        }
         let from_log;
         let (start, chunk): (u64, &[u8]) = match live.as_mut().filter(|_| streaming) {
             Some(stream) => {
@@ -6423,7 +6696,14 @@ fn pump_held(
                         // Nothing is pending: sleep until a frame, a hangup or
                         // the doorbell, then take whatever is there at once.
                         (true, Some(watcher), Some(descriptor)) => {
-                            if watcher.park(descriptor, IDLE_PARK) {
+                            // Woken from the reactor: the events are already
+                            // waiting, so collect them without sleeping.
+                            let replaced = if woke {
+                                watcher.drain_events()
+                            } else {
+                                watcher.park(descriptor, IDLE_PARK)
+                            };
+                            if replaced {
                                 shared.log.lock().expect("log").invalidate_read_handle();
                             }
                             Duration::ZERO
@@ -6525,6 +6805,7 @@ fn pump_held(
                 replaying = false;
                 // The replay tail is drained: checkpoint immediately, as the
                 // Swift daemon does right after `replayExistingLog`.
+                shared.screen.lock().expect("screen").release_idle_memory();
                 if checkpoint_dirty_at.take().is_some() {
                     persist_checkpoint(
                         &shared,
@@ -6538,6 +6819,9 @@ fn pump_held(
                 last.elapsed() >= CHECKPOINT_SETTLE || first.elapsed() >= CHECKPOINT_MAX_STALENESS
             }) {
                 checkpoint_dirty_at = None;
+                // Output has been quiet for a second (or keeps streaming past
+                // the staleness bound, when the rows are reused at once).
+                shared.screen.lock().expect("screen").release_idle_memory();
                 persist_checkpoint(
                     &shared,
                     &checkpoint_path,
@@ -6880,7 +7164,7 @@ fn pump_held(
     }
 
     if shared.stop.load(Ordering::SeqCst) && exit_status.is_none() {
-        return; // detaching, not exiting: the held child lives on
+        return HeldTurn::Done; // detaching, not exiting: the held child lives on
     }
 
     let exit = exit_status.map(|status| match (status.code, status.signal) {
@@ -6932,6 +7216,7 @@ fn pump_held(
     apply(&shared, &outcome);
     shared.exited.store(true, Ordering::SeqCst);
     record_exit_telemetry(&shared);
+    HeldTurn::Done
 }
 
 /// Whether an exit Diri did not ask for came from outside the Agent: its
@@ -7498,6 +7783,63 @@ mod log_watch {
             self.wait_events(Some(stream), timeout)
         }
 
+        /// Registers `stream` like [`Self::park`] does, without waiting: the
+        /// kqueue itself then turns readable on any event a park would have
+        /// woken for, so the shared reactor can wait on it instead.
+        pub fn arm_stream(&mut self, stream: i32) -> bool {
+            if self.fd < 0 {
+                self.arm();
+            }
+            let readable = libc::kevent {
+                ident: stream as usize,
+                filter: libc::EVFILT_READ,
+                flags: libc::EV_ADD | libc::EV_ONESHOT,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            // SAFETY: one initialized change; no output requested.
+            unsafe {
+                libc::kevent(
+                    self.kq,
+                    &readable,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                ) == 0
+            }
+        }
+
+        /// Collects every event waiting on the kqueue without sleeping, as
+        /// a park that returned would have. Returns true when rotation
+        /// replaced the watched file.
+        pub fn drain_events(&mut self) -> bool {
+            let zero = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            let mut replaced = false;
+            loop {
+                // SAFETY: zeroed out-events and a valid zero timeout.
+                let mut out: [libc::kevent; 4] = unsafe { std::mem::zeroed() };
+                let woke = unsafe {
+                    libc::kevent(self.kq, std::ptr::null(), 0, out.as_mut_ptr(), 4, &zero)
+                };
+                if woke <= 0 {
+                    break;
+                }
+                replaced |= out[..woke as usize].iter().any(|event| {
+                    event.filter == libc::EVFILT_VNODE
+                        && event.fflags & (libc::NOTE_DELETE | libc::NOTE_RENAME) != 0
+                });
+            }
+            if replaced {
+                self.arm();
+            }
+            replaced
+        }
+
         fn wait_events(&mut self, stream: Option<i32>, timeout: Duration) -> bool {
             let spec = libc::timespec {
                 tv_sec: timeout.as_secs() as libc::time_t,
@@ -7599,6 +7941,98 @@ mod log_watch {
         pub fn park(&mut self, _stream: i32, timeout: Duration) -> bool {
             self.wait(timeout)
         }
+
+        pub fn arm_stream(&mut self, _stream: i32) -> bool {
+            false
+        }
+
+        pub fn drain_events(&mut self) -> bool {
+            false
+        }
+    }
+}
+
+/// Where a parked held pump waits: the shared reactor, on the pump's own
+/// log-watch kqueue (readable once a frame, a hangup, the doorbell or a log
+/// change is waiting), with [`IDLE_PARK`] as the backstop.
+#[cfg(target_os = "macos")]
+mod held_park {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use super::{HeldPump, IDLE_PARK, run_held};
+    use crate::holder::reactor;
+
+    type Slot = Arc<Mutex<Option<Box<HeldPump>>>>;
+
+    pub(super) fn available() -> bool {
+        reactor::shared().is_some()
+    }
+
+    /// Hands a parked pump to the reactor, or gives it back.
+    pub(super) fn park(state: Box<HeldPump>) -> Result<(), Box<HeldPump>> {
+        let (Some(reactor), Some(kq)) = (
+            reactor::shared(),
+            state
+                .watcher
+                .as_ref()
+                .map(|watcher| watcher.wake_descriptor()),
+        ) else {
+            return Err(state);
+        };
+        // The slot keeps the state, and with it the kqueue, open while the
+        // registration can fire, and hands it back if it cannot.
+        let slot: Slot = Arc::new(Mutex::new(Some(state)));
+        let waiting = Arc::clone(&slot);
+        match reactor.when_readable_within(kq, IDLE_PARK, move || resume(waiting)) {
+            Ok(_) => Ok(()),
+            Err(_) => Err(slot
+                .lock()
+                .expect("parked pump")
+                .take()
+                .expect("an unregistered park keeps its state")),
+        }
+    }
+
+    /// Runs on the reactor: carries the pump on on a thread of its own.
+    fn resume(slot: Slot) {
+        let name = match slot.lock().expect("parked pump").as_ref() {
+            Some(state) => format!("diri-session-{}", state.shared.id),
+            None => return,
+        };
+        let taken = Arc::clone(&slot);
+        let spawned = std::thread::Builder::new().name(name).spawn(move || {
+            if let Some(state) = taken.lock().expect("parked pump").take() {
+                run_held(state, true);
+            }
+        });
+        if spawned.is_ok() {
+            return;
+        }
+        // No thread to be had: the kqueue is still readable, so a re-armed
+        // park fires again at once. Pause so that is a retry, not a spin.
+        std::thread::sleep(Duration::from_millis(10));
+        let Some(state) = slot.lock().expect("parked pump").take() else {
+            return;
+        };
+        if let Err(state) = park(state) {
+            // Neither a thread nor the reactor: the pump is lost. Let joins
+            // through rather than hang them.
+            state.shared.held_pump.end();
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod held_park {
+    use super::HeldPump;
+
+    pub(super) fn available() -> bool {
+        false
+    }
+
+    pub(super) fn park(state: Box<HeldPump>) -> Result<(), Box<HeldPump>> {
+        Err(state)
     }
 }
 

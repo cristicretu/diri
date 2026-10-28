@@ -80,6 +80,17 @@ renderer cleared to transparent, as a transparent window's is, so a capture
 keeps the alpha of glass chrome. The site clip recorder uses it; GPUI's test
 window ignores `set_background_appearance`, so there is no other way to ask.
 
+The on-demand Dock menu patch (`set_dock_menu_provider`, marked `DIRI PATCH`
+in `src/platform.rs`) lets the app answer `applicationDockMenu:` itself. AppKit
+sends that message each time the person opens the Dock icon's menu; with a
+provider installed, `handle_dock_menu` calls it on the main thread and returns
+the `NSMenu` it gives back (the app keeps that menu alive), falling back to
+upstream's stored `set_dock_menu` menu when there is no provider or it returns
+null. Upstream's menu is static, so a list of sessions would have to be rebuilt
+on every status change; this way Diri builds it only when it is opened, and its
+items use their own native targets rather than GPUI's ever-growing menu action
+table.
+
 The accessibility focus patch (`accessibility_focused_ui_element` on
 `GPUIView`) lets a host app name the focused content for VoiceOver. `GPUIView`
 is the window's first responder but not an accessibility element, so AppKit
@@ -91,3 +102,9 @@ implementation, so upstream behavior is unchanged. It runs only when an
 accessibility client asks. `diri-app`'s `terminal_accessibility_appkit` test
 installs this exact method on a plain view and checks the window's focused
 element.
+
+The glyph raster style patch (see `vendor/gpui/DIRI_PATCHES.md`) adds a
+second `CGTextStroke` pass when `RenderGlyphParams::stroke` is non-zero, with
+one more device pixel of raster margin, and a `font_faces` listing plus a
+sub-1.0 weight snap in `font_id`. With `stroke == 0` the rasterizer runs
+upstream's single fill unchanged.

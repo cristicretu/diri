@@ -55,16 +55,6 @@ impl<T: Default> Row<T> {
         Row { inner, occ: 0 }
     }
 
-    /// Increase the number of columns in the row.
-    #[inline]
-    pub fn grow(&mut self, columns: usize) {
-        if self.inner.len() >= columns {
-            return;
-        }
-
-        self.inner.resize_with(columns, T::default);
-    }
-
     /// Reduce the number of columns in the row.
     ///
     /// This will return all non-empty cells that were removed.
@@ -117,8 +107,71 @@ impl<T: Default> Row<T> {
     }
 }
 
+impl<T: Default + PartialEq> Row<T> {
+    /// Increase the number of columns in the row.
+    ///
+    /// Every cell at or after `occ` equals the last cell. New cells are
+    /// default cells, so when the last cell is not one (blanks a coloured
+    /// template left behind), the cells before the new ones count as
+    /// occupied: `Row::reset` then clears them too.
+    #[inline]
+    pub fn grow(&mut self, columns: usize) {
+        if self.inner.len() >= columns {
+            return;
+        }
+
+        if self.inner.last().is_some_and(|last| *last != T::default()) {
+            self.occ = self.inner.len();
+        }
+        self.inner.resize_with(columns, T::default);
+    }
+}
+
 #[allow(clippy::len_without_is_empty)]
 impl<T> Row<T> {
+    /// The number of leading cells up to the last one that is not a default
+    /// cell: everything after it is default.
+    ///
+    /// Cells from `occ` on have not been written since the row was last reset
+    /// or created, so they all equal the last cell. When that one and the
+    /// one at `occ` are default cells, the search starts at `occ`, and a
+    /// short line in a wide row is not scanned past its end. (Checking the
+    /// cell at `occ` too keeps a row that broke the rule with blanks of
+    /// another color there, as `grow` once could make, exact.)
+    #[inline]
+    pub fn content_len(&self, is_default: impl Fn(&T) -> bool) -> usize {
+        let cells = &self.inner[..];
+        let scan = match (cells.get(self.occ), cells.last()) {
+            (Some(first), Some(last)) if is_default(first) && is_default(last) => self.occ,
+            _ => cells.len(),
+        };
+        debug_assert!(
+            cells[scan..].iter().all(&is_default),
+            "cells at or after the occupancy are default cells"
+        );
+        cells[..scan]
+            .iter()
+            .rposition(|cell| !is_default(cell))
+            .map_or(0, |i| i + 1)
+    }
+
+    /// DIRI PATCH: lets `write` fill a prefix of the cells from `start` on
+    /// (it returns how many it wrote) and raises the occupancy only over
+    /// those, as indexing each written range would.
+    #[inline]
+    pub(crate) fn write_from(
+        &mut self,
+        start: usize,
+        write: impl FnOnce(&mut [T]) -> usize,
+    ) -> usize {
+        let written = write(&mut self.inner[start..]);
+        debug_assert!(start + written <= self.inner.len());
+        if written != 0 {
+            self.occ = max(self.occ, start + written);
+        }
+        written
+    }
+
     #[inline]
     pub fn from_vec(vec: Vec<T>, occ: usize) -> Row<T> {
         Row { inner: vec, occ }

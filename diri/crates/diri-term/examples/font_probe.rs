@@ -72,6 +72,7 @@ fn main() {
                     is_emoji: false,
                     subpixel_rendering: false,
                     dilation: 0,
+                    stroke: 0,
                 };
                 match ts.glyph_raster_bounds(&params) {
                     Err(error) => println!("  raster_bounds FAILED: {error:?}"),

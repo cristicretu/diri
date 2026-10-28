@@ -178,6 +178,19 @@ impl Default for Cell {
 }
 
 impl Cell {
+    /// Whether this is `Cell::default()`. The character and flags rule out
+    /// almost every other cell before the colors are compared, and the
+    /// checks do not short-circuit, so this is a few compares without
+    /// branches.
+    #[inline]
+    pub fn is_default(&self) -> bool {
+        (self.c == ' ')
+            & self.flags.is_empty()
+            & self.extra.is_none()
+            & matches!(self.fg, Color::Named(NamedColor::Foreground))
+            & matches!(self.bg, Color::Named(NamedColor::Background))
+    }
+
     /// Zerowidth characters stored in this cell.
     #[inline]
     pub fn zerowidth(&self) -> Option<&[char]> {

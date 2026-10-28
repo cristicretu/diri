@@ -652,6 +652,85 @@ fn holder_agent_has_a_real_editable_resizable_terminal() {
 }
 
 #[test]
+fn holder_lays_out_emoji_clusters_as_claude_code_measures_them() {
+    // The Holder runs the shared parser: `❤️`, a ZWJ family and a flag each
+    // take the two columns Bun's stringWidth gives them, as one wide cell
+    // carrying the rest of the cluster, in the snapshot a reconnect gets.
+    let temporary = tempfile::tempdir().expect("temp");
+    let state_dir = temporary.path().join("state");
+    let request = LaunchRequest {
+        session_id: test_session_id("holder-grapheme-widths"),
+        session_token: token(),
+        argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf '|\\342\\235\\244\\357\\270\\217|\\360\\237\\221\\250\\342\\200\\215\\360\\237\\221\\251\\342\\200\\215\\360\\237\\221\\247|\\360\\237\\207\\267\\360\\237\\207\\264|end>'; while :; do sleep 1; done".into(),
+        ],
+        cwd: "/".into(),
+        environment: vec![diri_proto::remote_pty::EnvironmentVariable {
+            name: "PATH".into(),
+            value: "/usr/bin:/bin".into(),
+        }],
+        cols: 40,
+        rows: 4,
+        persistence: PersistenceCapability::NonPersistent,
+    };
+    let launch: LaunchResult = run_json("launch", &state_dir, Some(&request));
+    {
+        let mut first = Attach::open(&state_dir, hello(&launch, Some(0), "grapheme-first"));
+        first.receive_until(Duration::from_secs(3), |message| {
+            message_contains(message, "end>")
+        });
+    }
+    let mut second = Attach::open(&state_dir, hello(&launch, None, "grapheme-second"));
+    let received = second.receive_until(Duration::from_secs(3), |message| {
+        matches!(message, RemoteMessage::FullSnapshot(_))
+    });
+    let Some(RemoteMessage::FullSnapshot(snapshot)) = received.last() else {
+        panic!("reconnect snapshot");
+    };
+    let row = snapshot
+        .grid
+        .changed_rows
+        .iter()
+        .find(|row| row.y == 0)
+        .expect("first row");
+    let bars: Vec<usize> = row
+        .cells
+        .iter()
+        .enumerate()
+        .filter(|(_, cell)| cell.scalar == u32::from('|'))
+        .map(|(column, _)| column)
+        .collect();
+    assert_eq!(bars, [0, 3, 6, 9]);
+    for spacer in [2, 5, 8] {
+        assert!(
+            row.cells[spacer]
+                .style
+                .contains(diri_proto::grid::TermStyle::WIDE_SPACER)
+        );
+    }
+    assert_eq!(
+        row.metadata.graphemes,
+        vec![
+            (1, "\u{FE0F}".to_string()),
+            (4, "\u{200D}👩\u{200D}👧".to_string()),
+            (7, "🇴".to_string()),
+        ]
+    );
+
+    let _: SessionInspection = run_json(
+        "kill",
+        &state_dir,
+        Some(&SessionSelector {
+            session_id: launch.session_id,
+            session_token: token(),
+            expected_incarnation: Some(launch.session_incarnation),
+        }),
+    );
+}
+
+#[test]
 fn list_kill_and_gc_complete_the_session_lifecycle() {
     let temporary = tempfile::tempdir().expect("temp");
     let state_dir = temporary.path().join("state");
