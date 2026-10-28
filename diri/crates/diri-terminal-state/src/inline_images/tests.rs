@@ -514,6 +514,71 @@ fn holder_scope_answers_only_image_support_probes() {
     assert!(plain.take_replies().is_empty());
 }
 
+#[test]
+fn query_replies_holder_answers_every_query_in_stream_order() {
+    // A `query-replies-v1` Holder's screen.
+    let holder = || {
+        HeadlessScreen::new(40, 10)
+            .with_inline_images()
+            .answering_program_status_queries()
+    };
+    let mut screen = holder();
+    screen.feed(b"ab\x1b[6n\x1b[5n\x1b[?2004$p\x1b[>c\x1b[18t");
+    // The support probe programs use: the status query, then attributes.
+    screen.feed(b"\x1b]7501;?\x1b\\\x1b[c");
+    assert_eq!(
+        String::from_utf8(screen.take_replies()).unwrap(),
+        "\x1b[1;3R\x1b[0n\x1b[?2004;2$y\x1b[>0;2600;1c\x1b[8;10;40t\
+         \x1b]7501;?\x1b\\\x1b[?62;22c",
+    );
+
+    // Split across reads, the query is still answered ahead of the
+    // attributes that follow it.
+    screen.feed(b"\x1b]75");
+    screen.feed(b"01;?\x1b");
+    screen.feed(b"\\\x1b[c");
+    assert_eq!(screen.take_replies(), b"\x1b]7501;?\x1b\\\x1b[?62;22c");
+
+    // Product OSCs stay uninterpreted: no alert, clipboard, exit report or
+    // status record, and nothing accumulates.
+    screen.feed(b"\x1b]9;hello\x07\x1b]52;c;aGk=\x07\x1b]6973;agent-exit;3\x07");
+    screen.feed(b"\x1b]7501;state=working\x07\x1b]777;notify;t;b\x07");
+    assert!(!screen.has_notifications());
+    assert_eq!(screen.take_agent_exit(), None);
+    assert_eq!(screen.program_status(), None);
+    assert!(screen.take_replies().is_empty());
+    // An over-long OSC is skipped, not buffered, and ends cleanly.
+    let mut long = b"\x1b]7501;".to_vec();
+    long.extend(std::iter::repeat_n(b'x', 1 << 20));
+    long.extend_from_slice(b"\x1b\\\x1b]7501;?\x07");
+    screen.feed(&long);
+    assert_eq!(screen.take_replies(), b"\x1b]7501;?\x1b\\");
+
+    // The scope survives a terminal reset.
+    screen.reset();
+    screen.feed(b"\x1b]7501;?\x07\x1b[6n\x1b[c");
+    assert_eq!(
+        screen.take_replies(),
+        b"\x1b]7501;?\x1b\\\x1b[1;1R\x1b[?62;22c"
+    );
+    screen.feed(b"\x1b]9;after reset\x07");
+    assert!(!screen.has_notifications());
+
+    // The replies are the local Engine's, byte for byte.
+    let probe = b"\x1b[6n\x1b[5n\x1b[?1049$p\x1b[>c\x1b[18t\x1b[14t\x1b]7501;?\x07\x1b[c";
+    let mut local = screen_with_notifications();
+    let mut remote = holder();
+    local.feed(probe);
+    remote.feed(probe);
+    assert_eq!(remote.take_replies(), local.take_replies());
+}
+
+fn screen_with_notifications() -> HeadlessScreen {
+    HeadlessScreen::new(40, 10)
+        .with_notifications()
+        .with_inline_images()
+}
+
 /// What the local scope answers to `ReportCellSize`, so the Holder scope can
 /// be compared against it without restating the format.
 fn cell_size_reply() -> String {
