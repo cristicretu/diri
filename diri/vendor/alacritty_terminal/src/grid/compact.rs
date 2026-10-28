@@ -16,6 +16,29 @@ mod lz;
 use crate::term::cell::{Cell, CellExtra, Flags, Hyperlink};
 use crate::vte::ansi::{Color, NamedColor, Rgb};
 
+/// Whether a debug consistency check that walks `len` items runs now.
+///
+/// Small histories (every unit test's) are checked on every call. Deeper ones
+/// are checked once per `len` calls, so a check costs O(1) amortized and a
+/// debug build keeps per-line cost independent of history depth: walking a
+/// 150,000-row deferred history after every new line cost 4–7 ms. Release
+/// builds never call this.
+fn audit_due(len: usize) -> bool {
+    const ALWAYS: usize = 1024;
+    if len <= ALWAYS {
+        return true;
+    }
+    thread_local! {
+        static CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    CALLS.with(|calls| {
+        let next = calls.get() + 1;
+        let due = next >= len;
+        calls.set(if due { 0 } else { next });
+        due
+    })
+}
+
 const MAX_BLOCK_ROWS: usize = 64;
 /// The most decoded cells deferred history keeps for lines that are
 /// reflowed eagerly (see [`LineExtra::Eager`]).
@@ -324,9 +347,9 @@ impl<T> Lines<T> {
     }
 
     fn heap_bytes(&self) -> usize {
-        debug_assert_eq!(
-            self.extra_heap,
-            self.extras.iter().map(LineExtra::heap_bytes).sum::<usize>()
+        debug_assert!(
+            !audit_due(self.extras.len())
+                || self.extra_heap == self.extras.iter().map(LineExtra::heap_bytes).sum::<usize>()
         );
         self.packed.capacity() * std::mem::size_of::<PackedLine>()
             + self.extras.capacity() * std::mem::size_of::<LineExtra<T>>()
@@ -1168,7 +1191,9 @@ impl<T> CompactRows<T> {
         let row_bytes = |row: &Row<T>| row.len().saturating_mul(std::mem::size_of::<T>());
         let payload = match self.payload_bytes {
             Some(payload) => {
-                debug_assert_eq!(payload, self.stored_payload_bytes());
+                debug_assert!(
+                    !audit_due(self.blocks.len()) || payload == self.stored_payload_bytes()
+                );
                 payload
             }
             None => self.stored_payload_bytes(),
@@ -1624,9 +1649,10 @@ impl<T> CompactRows<T> {
         self.needs_maintenance = true;
         if let Some(deferred) = &mut self.deferred {
             deferred.read = OnceLock::new();
-            debug_assert_eq!(
-                (deferred.rows, deferred.payload, deferred.eager_cells),
-                deferred.counted()
+            debug_assert!(
+                !audit_due(deferred.lines.packed.len() + deferred.sources.len())
+                    || (deferred.rows, deferred.payload, deferred.eager_cells)
+                        == deferred.counted()
             );
             if deferred.lines.is_empty() {
                 debug_assert!(deferred.sources.is_empty());

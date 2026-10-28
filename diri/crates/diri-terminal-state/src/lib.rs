@@ -4081,6 +4081,44 @@ mod tests {
         assert_eq!(screen.term.grid().history_size(), HISTORY_ROW_CEILING);
     }
 
+    /// Narrowing a full history defers its re-wrap; new lines then evict
+    /// deferred rows. A line must cost what it did before the resize, not
+    /// a walk of every deferred line (4–7 ms per line at 150,000 rows in the
+    /// debug builds tests and development apps run).
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn lines_after_narrowing_a_full_history_cost_what_they_did_before() {
+        fn per_line(screen: &mut HeadlessScreen, next: &mut usize) -> std::time::Duration {
+            let mut batches: Vec<_> = (0..5)
+                .map(|_| {
+                    let lines = numbered_lines(*next, 200, 70);
+                    *next += 200;
+                    let start = std::time::Instant::now();
+                    for line in lines.split_inclusive(|&byte| byte == b'\n') {
+                        screen.feed(line);
+                    }
+                    start.elapsed() / 200
+                })
+                .collect();
+            batches.sort();
+            batches[2]
+        }
+        let mut screen = HeadlessScreen::new(80, 24);
+        let mut next = HISTORY_ROW_CEILING + 24;
+        screen.feed(&numbered_lines(0, next, 70));
+        assert_eq!(screen.term.grid().history_size(), HISTORY_ROW_CEILING);
+        let before = per_line(&mut screen, &mut next);
+        screen.resize(40, 24);
+        let narrowed = screen.term.grid().history_size();
+        assert!(narrowed > HISTORY_ROW_CEILING, "{narrowed} rows");
+        let after = per_line(&mut screen, &mut next);
+        assert_eq!(screen.term.grid().history_size(), narrowed);
+        assert!(
+            after <= before * 2 + std::time::Duration::from_micros(20),
+            "{after:?} per line after narrowing, {before:?} before"
+        );
+    }
+
     /// A re-wrapped history can hold more rows than restore admits, so a
     /// checkpoint carries the newest of them and still restores.
     #[cfg(feature = "compact-history")]

@@ -392,3 +392,19 @@ OSC 4/10/11 changes no cell, so without it the host's change detection saw no
 change and never republished the screen. `reset_state` (RIS, `ESC c`) also
 clears every color a program set, as xterm and libghostty do; upstream kept
 them across `reset`. No wire, checkpoint or protocol change.
+
+## Amortized history audits in debug builds
+
+Three debug assertions in `grid/compact.rs` re-derived history bookkeeping
+from scratch on every change: the deferred history's row, payload and
+eager-cell counts (a layout of every deferred line), the deferred line
+index's extra heap, and the stored payload bytes (every block). After a
+column change defers a full history, each new line evicts a deferred row, so
+a debug build (`cargo test`, development apps) walked every deferred line
+per line: 7.6–13 ms per line at 150,000 rows, against 9 µs before the
+resize. `audit_due` keeps the checks exact for collections up to 1,024 items
+(every unit test's) and otherwise runs them once per `len` calls, which is
+O(1) amortized. Release builds compile none of it; no behavior, wire,
+checkpoint or protocol change. Test:
+`lines_after_narrowing_a_full_history_cost_what_they_did_before`
+(`diri-terminal-state`); probe: `--bench narrow_history`.
