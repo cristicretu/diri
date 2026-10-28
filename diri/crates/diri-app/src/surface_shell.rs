@@ -138,6 +138,8 @@ enum SettingsMenu {
     UpdateChannel,
     InterfaceStyle,
     PaneDensity,
+    CursorShape,
+    CursorBlink,
     TalkVoice,
     TalkAnswer,
     TalkTabs,
@@ -5376,6 +5378,8 @@ impl UtilitySurfaces {
             SettingsMenu::UpdateChannel => (self.update_channel_options(colors, cx), 132.0),
             SettingsMenu::InterfaceStyle => (self.interface_style_options(colors, cx), 172.0),
             SettingsMenu::PaneDensity => (self.pane_density_options(colors, cx), 172.0),
+            SettingsMenu::CursorShape => (self.cursor_shape_options(colors, cx), 172.0),
+            SettingsMenu::CursorBlink => (self.cursor_blink_options(colors, cx), 172.0),
             SettingsMenu::TalkVoice => (self.talk_voice_options(colors, cx), 400.0),
             SettingsMenu::TalkAnswer => (self.talk_answer_options(colors, cx), 204.0),
             SettingsMenu::TalkTabs => (self.talk_tabs_options(colors, cx), 204.0),
@@ -5741,6 +5745,78 @@ impl UtilitySurfaces {
                 move |this, cx| {
                     this.settings_menu = None;
                     this.update_prefs(move |prefs| prefs.pane_density = choice);
+                    cx.notify();
+                },
+            ));
+        }
+        options.into_any_element()
+    }
+
+    fn cursor_shape_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let open = self.settings_menu == Some(SettingsMenu::CursorShape);
+        let mut control = div().relative().min_w(px(132.0)).child(settings_select_button(
+            self.prefs.terminal_cursor_shape.title().to_owned(),
+            "cursor-shape-dropdown",
+            open,
+            SettingsMenu::CursorShape,
+            colors,
+            cx,
+        ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    fn cursor_shape_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for (index, choice) in crate::store::CursorShapePref::ALL.into_iter().enumerate() {
+            options = options.child(settings_choice_row(
+                format!("cursor-shape-option-{index}"),
+                choice.title().to_owned(),
+                choice == self.prefs.terminal_cursor_shape,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.settings_menu = None;
+                    this.update_prefs(move |prefs| prefs.terminal_cursor_shape = choice);
+                    cx.notify();
+                },
+            ));
+        }
+        options.into_any_element()
+    }
+
+    fn cursor_blink_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let open = self.settings_menu == Some(SettingsMenu::CursorBlink);
+        let mut control = div().relative().min_w(px(132.0)).child(settings_select_button(
+            self.prefs.terminal_cursor_blink.title().to_owned(),
+            "cursor-blink-dropdown",
+            open,
+            SettingsMenu::CursorBlink,
+            colors,
+            cx,
+        ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    fn cursor_blink_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for (index, choice) in crate::store::CursorBlinkPref::ALL.into_iter().enumerate() {
+            options = options.child(settings_choice_row(
+                format!("cursor-blink-option-{index}"),
+                choice.title().to_owned(),
+                choice == self.prefs.terminal_cursor_blink,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.settings_menu = None;
+                    this.update_prefs(move |prefs| prefs.terminal_cursor_blink = choice);
                     cx.notify();
                 },
             ));
@@ -6302,11 +6378,93 @@ impl UtilitySurfaces {
                         .child(row(
                             t("settings.appearance.line_height"),
                             line_height_control.into_any_element(),
+                        ))
+                        .child(setting_divider(colors))
+                        .child(toggle_row(
+                            t("settings.appearance.ligatures"),
+                            t("settings.appearance.ligatures_detail"),
+                            self.prefs.terminal_ligatures,
+                            "terminal_ligatures",
+                            colors,
+                            cx,
+                            |this, cx| {
+                                let enabled = !this.prefs.terminal_ligatures;
+                                this.update_prefs(move |prefs| prefs.terminal_ligatures = enabled);
+                                cx.notify();
+                            },
+                        )),
+                    colors,
+                ))
+                .child(setting_section(
+                    t("settings.appearance.cursor"),
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(row(
+                            t("settings.appearance.cursor_shape"),
+                            self.cursor_shape_dropdown(cx),
+                        ))
+                        .child(setting_divider(colors))
+                        .child(row(
+                            t("settings.appearance.cursor_blink"),
+                            self.cursor_blink_dropdown(cx),
+                        ))
+                        .child(setting_divider(colors))
+                        .child(toggle_row(
+                            t("settings.appearance.cursor_follows_programs"),
+                            t("settings.appearance.cursor_follows_programs_detail"),
+                            self.prefs.terminal_cursor_follows_programs,
+                            "terminal_cursor_follows_programs",
+                            colors,
+                            cx,
+                            |this, cx| {
+                                let enabled = !this.prefs.terminal_cursor_follows_programs;
+                                this.update_prefs(move |prefs| {
+                                    prefs.terminal_cursor_follows_programs = enabled
+                                });
+                                cx.notify();
+                            },
                         )),
                     colors,
                 )),
             colors,
         )
+    }
+
+    /// App links (`ssh://`, `vscode://`, `mailto:`) ask before opening
+    /// unless their scheme was trusted from the ask sheet; this lists those
+    /// schemes so trust can be taken back.
+    fn trusted_link_schemes(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let schemes: Vec<String> = self
+            .prefs
+            .terminal_trusted_link_schemes
+            .iter()
+            .cloned()
+            .collect();
+        let detail = if schemes.is_empty() {
+            t("settings.terminal.app_links_detail_none").to_owned()
+        } else {
+            t("settings.terminal.app_links_detail").to_owned()
+        };
+        let mut chips = div().flex().flex_wrap().justify_end().gap(px(6.0));
+        for scheme in schemes {
+            let id = format!("untrust-link-scheme-{scheme}");
+            let label = tf("settings.terminal.app_links_remove", &[("scheme", &scheme)]);
+            chips = chips.child(surface_button(label, id, colors, cx, move |this, cx| {
+                let scheme = scheme.clone();
+                this.update_prefs(move |prefs| {
+                    prefs.terminal_trusted_link_schemes.remove(&scheme);
+                });
+                cx.notify();
+            }));
+        }
+        setting_row(
+            t("settings.terminal.app_links"),
+            detail,
+            chips,
+            colors,
+        )
+        .into_any_element()
     }
 
     /// Settings › Terminal: how the terminal behaves under the mouse and
@@ -6359,6 +6517,8 @@ impl UtilitySurfaces {
                                 cx.notify();
                             },
                         ))
+                        .child(setting_divider(colors))
+                        .child(self.trusted_link_schemes(colors, cx))
                         .child(setting_divider(colors))
                         .child(setting_row(
                             t("settings.appearance.file_links"),
@@ -9620,6 +9780,15 @@ mod tests {
                     harness
                         .sidebar
                         .update(cx, |sidebar, cx| sidebar.set_width(320.0, cx));
+                    // `DIRI_VISUAL_TRUSTED_LINKS=ssh,vscode` lists trusted
+                    // app-link schemes in Settings › Terminal.
+                    if let Ok(schemes) = std::env::var("DIRI_VISUAL_TRUSTED_LINKS") {
+                        harness.surfaces.update(cx, |surfaces, cx| {
+                            surfaces.prefs.terminal_trusted_link_schemes =
+                                schemes.split(',').map(str::to_owned).collect();
+                            cx.notify();
+                        });
+                    }
                     // `DIRI_VISUAL_TALK` turns on "Talk with your agent" and
                     // opens its Voice menu over a fixed list of voices.
                     if std::env::var_os("DIRI_VISUAL_TALK").is_some() {
@@ -10902,6 +11071,16 @@ mod tests {
                                 surfaces.theme_search.insert(query);
                                 surfaces.theme_scroll.scroll_to_item(0, ScrollStrategy::Top);
                             }
+                            cx.notify();
+                        });
+                    }
+                    if std::env::var_os("DIRI_APPEARANCE_CURSOR_MENU").is_some() {
+                        harness.surfaces.update(cx, |surfaces, cx| {
+                            surfaces.update_prefs(|prefs| {
+                                prefs.terminal_cursor_shape = crate::store::CursorShapePref::Bar;
+                                prefs.terminal_cursor_blink = crate::store::CursorBlinkPref::Slow;
+                            });
+                            surfaces.settings_menu = Some(SettingsMenu::CursorBlink);
                             cx.notify();
                         });
                     }

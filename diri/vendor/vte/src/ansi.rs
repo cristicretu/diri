@@ -402,6 +402,15 @@ impl<T: Timeout> Processor<T> {
         }
     }
 
+    /// DIRI PATCH: give back the synchronized-update buffer's capacity
+    /// while no update is open. A repaint can grow it to megabytes, and an
+    /// idle terminal would otherwise keep that allocation forever.
+    pub fn release_idle_buffers(&mut self) {
+        if self.state.sync_state.buffer.is_empty() {
+            self.state.sync_state.buffer = Vec::new();
+        }
+    }
+
     /// Number of bytes in the synchronization buffer.
     #[inline]
     pub fn sync_bytes_count(&self) -> usize {

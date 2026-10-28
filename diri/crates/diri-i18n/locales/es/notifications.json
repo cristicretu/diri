@@ -117,6 +117,7 @@
   "toast.non_persistent": "{host} cierra las sesiones si se corta SSH",
   "toast.non_persistent_detail": "Mantente conectado o el agente podría cerrarse.",
   "toast.notification_session_gone": "Esa sesión se cerró o se archivó",
+  "toast.pane_has_nowhere_to_go": "Ninguna otra pestaña puede recibir este panel",
   "toast.prefs_sync_failed": "No se pudieron sincronizar las preferencias con {host}",
   "toast.privacy_reports": "diri envía informes de fallos y errores",
   "toast.privacy_reports_detail": "El contenido del terminal nunca sale de tu equipo.",

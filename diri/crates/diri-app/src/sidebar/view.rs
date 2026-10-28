@@ -5,6 +5,7 @@ mod hover_linger;
 #[cfg(test)]
 mod hue_tests;
 mod lineage;
+mod pane_drop;
 mod project_picker;
 mod rename_input;
 mod rows;
@@ -630,6 +631,10 @@ pub struct Sidebar {
     /// Window-space row bounds from the latest prepaint. Keyboard navigation
     /// uses these to reveal only rows that actually crossed the viewport edge.
     row_bounds: Rc<RefCell<HashMap<SessionId, Bounds<Pixels>>>>,
+    /// Which surface the dragged pane is over (true: the tab strip), and
+    /// that surface's window bounds.
+    pane_drop_area: Option<bool>,
+    pane_drop_bounds: Option<Bounds<Pixels>>,
     /// The gap the insertion marker was last drawn in during a session drag.
     insertion_haptic: RefCell<haptics::Crossing>,
     insertion_line: Cell<Option<f32>>,
@@ -881,6 +886,8 @@ impl Sidebar {
             filter_focus: cx.focus_handle(),
             filter_generation: 0,
             row_bounds: Rc::new(RefCell::new(HashMap::new())),
+            pane_drop_area: None,
+            pane_drop_bounds: None,
             insertion_haptic: RefCell::new(haptics::Crossing::default()),
             insertion_line: Cell::new(None),
             fade_bounds: Rc::new(RefCell::new(HashMap::new())),
@@ -3965,6 +3972,7 @@ impl Sidebar {
             .gap(px(8.0))
             .rounded(px(SIDEBAR_ROW_RADIUS))
             .bg(fill_color)
+            .when_some(self.pane_drop_fill(&id, cx), |row, fill| row.bg(fill))
             .border_1()
             .border_color(if marked {
                 Palette::CLAY.alpha(0.78)
@@ -8543,6 +8551,9 @@ pub(crate) mod render_probe {
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::perf_overlay::rendered("sidebar");
+        if crate::pane_drag::end_if_released(cx) {
+            self.pane_drop_area = None;
+        }
         self.discard_rename_preedit(window, cx);
         #[cfg(test)]
         let render_started = std::time::Instant::now();
@@ -8815,6 +8826,14 @@ impl Sidebar {
                     this.track_lift_pointer(event.event.position, cx);
                 },
             ))
+            .on_drag_move::<crate::pane_drag::DraggedPane>(cx.listener(
+                |this, event: &gpui::DragMoveEvent<crate::pane_drag::DraggedPane>, _, cx| {
+                    this.pane_drag_move(event.event.position, event.bounds, false, cx);
+                },
+            ))
+            .on_drop(cx.listener(|this, _: &crate::pane_drag::DraggedPane, _, cx| {
+                this.pane_drop(cx);
+            }))
             .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
                 if !this.surface_in_parent {
                     this.hover_peek(*hovered, window, cx);
@@ -8956,6 +8975,8 @@ impl Sidebar {
         if self.hover_task.is_some() || self.ui.hover_card.is_some() {
             root = root.child(self.hover_card_input(cx));
         }
+        root = root.children(self.pane_new_tab_slot(false, cx));
+        self.animate_pane_drop(window, cx);
         if let Some(proposal) = self.ui.pending_sibling.clone() {
             root = root.child(self.sibling_confirmation(proposal, colors, cx));
         } else if let Some(notice) = self.ui.delegation_notice.clone() {

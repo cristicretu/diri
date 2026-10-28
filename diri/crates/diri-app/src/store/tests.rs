@@ -3020,8 +3020,13 @@ async fn a_rejected_close_restores_the_retained_session_and_allows_a_retry() {
 
     let listed = visible_ids(&mut store.write().unwrap());
     assert_eq!(listed.len(), 2);
-    store.write().unwrap().request_close(vec![id("one")]);
-    assert_eq!(visible_ids(&mut store.write().unwrap()), vec![id("two")]);
+    {
+        // Close and look under one lock: the fake Engine rejects at once, and
+        // its reply could otherwise restore the row before the check.
+        let mut store = store.write().unwrap();
+        store.request_close(vec![id("one")]);
+        assert_eq!(visible_ids(&mut store), vec![id("two")]);
+    }
 
     eventually("the rejection is reported", || {
         store.read().unwrap().action_failure().is_some()
@@ -4259,6 +4264,55 @@ mod split_panes {
         assert!(store.pane_group(&id("two")).is_none());
     }
 
+    /// A pane shell dragged into another agent's tab joins that tab's row:
+    /// focusing it keeps that row selected and the row folds it in.
+    #[test]
+    fn a_pane_shell_moved_to_another_tab_belongs_to_that_tab() {
+        let (mut store, _) = split_store();
+        store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
+            revision: 2,
+            workspaces: vec![WorkspaceRecord {
+                project_id: None,
+                id: WorkspaceId::new("w"),
+                name: "Project".into(),
+                selected_tab: Some(TabId::new("u")),
+                tabs: vec![
+                    WorkspaceTab {
+                        id: TabId::new("t"),
+                        title: None,
+                        focused_pane: PaneId::new("agent"),
+                        zoomed_pane: None,
+                        layout: leaf("agent", "one"),
+                    },
+                    WorkspaceTab {
+                        id: TabId::new("u"),
+                        title: None,
+                        focused_pane: PaneId::new("terminal"),
+                        zoomed_pane: None,
+                        layout: LayoutNode::Split {
+                            id: SplitId::new("s"),
+                            axis: LayoutAxis::Horizontal,
+                            fraction: 0.5,
+                            first: Box::new(leaf("other", "two")),
+                            second: Box::new(leaf("terminal", "shown")),
+                        },
+                    },
+                ],
+            }],
+            ..Default::default()
+        });
+        assert_eq!(store.pane_owner(&id("shown")), id("two"));
+        let (panes, shells) = store.pane_group(&id("two")).unwrap();
+        assert_eq!(panes, 2);
+        assert_eq!(
+            shells.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            vec![id("shown")]
+        );
+        assert!(store.pane_group(&id("one")).is_none());
+        // Unplaced, a shell still belongs to its parent.
+        assert_eq!(store.pane_owner(&id("hidden")), id("one"));
+    }
+
     #[test]
     fn hidden_pane_shell_is_the_newest_running_unplaced_one() {
         let (mut store, _) = split_store();
@@ -4348,4 +4402,23 @@ fn read_aloud_can_pick_one_tab_or_all_but_one() {
     assert!(store.tab_reads_aloud(&SessionId("later".into())));
     store.set_read_aloud(a.id.clone(), ReadAloudChoice::All);
     assert!(store.reads_aloud(&a.id) && store.reads_aloud(&b.id));
+}
+
+#[cfg(unix)]
+#[test]
+fn preferences_are_owner_only_even_over_an_older_world_readable_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let folder = directory.path().join("Application Support/diri");
+    let path = folder.join("prefs.json");
+    Prefs::default().save(&path).unwrap();
+    assert_eq!(mode(&path), 0o600);
+    assert_eq!(mode(&folder), 0o700);
+
+    let stale = path.with_extension("json.tmp");
+    std::fs::write(&stale, b"{").unwrap();
+    std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
+    Prefs::default().save(&path).unwrap();
+    assert_eq!(mode(&path), 0o600);
 }

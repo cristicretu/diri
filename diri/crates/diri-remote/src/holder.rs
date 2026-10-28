@@ -1504,9 +1504,15 @@ impl Holder {
     /// When the pending grid diff is due, if one is pending.
     fn grid_due(&self) -> Option<Instant> {
         self.dirty_since.map(|since| {
-            if self.screen.filled_cells() < self.published_filled {
+            if self.screen.filled_cells() < self.published_filled
+                && !self.screen.lost_cells_only_on_cursor_row()
+            {
                 // Content was removed and may be about to be redrawn: give
                 // the redraw the whole interval, as before the leading edge.
+                // A line edit on the cursor's row (backspace, a progress
+                // line rewritten shorter) has no redraw coming, so it goes
+                // out on the leading edge like output that adds, as the
+                // local Engine pump does.
                 return since + DIFF_COALESCE;
             }
             grid_due(
@@ -1522,6 +1528,7 @@ impl Holder {
         self.dirty_since = None;
         self.last_grid_publication = Some(Instant::now());
         self.published_filled = self.screen.filled_cells();
+        self.screen.mark_row_baseline();
         if self
             .connection
             .as_ref()
@@ -2547,6 +2554,33 @@ mod tests {
             foreground_probe_deadline: None,
         };
         (temp, holder, request)
+    }
+
+    /// A line edit on the cursor's row is published on the leading edge
+    /// like output that adds; an erase anywhere else still gives its redraw
+    /// the whole interval.
+    #[test]
+    fn a_line_edit_is_not_held_like_a_repaint() {
+        let (_temp, mut holder, _request) = waiting_holder();
+        let long_ago = Instant::now() - Duration::from_secs(1);
+        holder
+            .consume_output(b"row one\r\nrow two\r\n$ echo hello world")
+            .unwrap();
+        holder.emit_grid_delta().unwrap();
+        for edit in [&b"\x08 \x08"[..], b"\r\x1b[K$ true"] {
+            holder.last_grid_publication = Some(long_ago);
+            holder.consume_output(edit).unwrap();
+            let since = holder.dirty_since.unwrap();
+            assert!(
+                holder.grid_due().unwrap() < since + DIFF_COALESCE,
+                "{edit:?} is due on the leading edge"
+            );
+            holder.emit_grid_delta().unwrap();
+        }
+        holder.last_grid_publication = Some(long_ago);
+        holder.consume_output(b"\x1b[H\x1b[2J").unwrap();
+        let since = holder.dirty_since.unwrap();
+        assert_eq!(holder.grid_due(), Some(since + DIFF_COALESCE));
     }
 
     #[test]
