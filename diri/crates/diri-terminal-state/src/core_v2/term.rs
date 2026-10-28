@@ -700,7 +700,7 @@ impl Core {
     /// cursor row, from `bytes` (validated here); returns `(bytes
     /// consumed, columns)`. Stops at ASCII, invalid UTF-8, a character the
     /// general path must place, or a wide character in the way.
-    #[inline(always)]
+    #[inline(never)]
     fn write_text_segment(&mut self, bytes: &[u8]) -> (usize, usize) {
         let x0 = self.col;
         let cols = self.cols;
@@ -860,7 +860,7 @@ impl Core {
     }
 
     /// Printable ASCII bytes.
-    #[inline(always)]
+    #[inline(never)]
     fn ascii_run(&mut self, bytes: &[u8]) {
         let mut i = 0;
         while i < bytes.len() {
