@@ -312,3 +312,48 @@ OSC 4/10/11 changes no cell, so without it the host's change detection saw no
 change and never republished the screen. `reset_state` (RIS, `ESC c`) also
 clears every color a program set, as xterm and libghostty do; upstream kept
 them across `reset`. No wire, checkpoint or protocol change.
+## Cheaper history encoding
+
+History encoding was half of the session thread while output streamed. Four
+changes, measured on a 100 MB mixed log at 160 columns:
+
+- **Wide characters as pairs.** A run of wide characters alternated with their
+  spacers, so every CJK cell was its own run and its own style lookup. A run
+  whose code has the low bit set ("paired") now alternates wide characters of
+  its style with the exact spacers `Term::input` writes after them (same
+  colors, wide flag swapped for the spacer flag, a blank character, no extra
+  storage); each pair takes one character of text. Anything else (a spacer
+  with its own style or character, a lone spacer, a wide character with marks)
+  is encoded as before.
+- **Stored cells bounded by occupancy.** Finding a row's last non-default
+  cell scanned every blank column of a short line in a wide row. Every cell at
+  or after `Row::occ` equals the last cell, so `Row::content_len` starts at
+  `occ` when that cell and the one at `occ` are default cells. `Row::grow`
+  now counts the old columns as occupied when the last cell is not a default
+  cell (blanks a coloured template left), which keeps that rule true after a
+  widening; before, `Row::reset` left those coloured blanks behind on a
+  recycled line. Debug builds assert the rule wherever it is used.
+- **Style lookups in one probe.** A 32-slot direct-mapped cache sits in front
+  of the block's style table (a colored log cycles through more than the 16
+  styles the linear scan held), and styles with extra storage are found by
+  hash and comparison without cloning the cell.
+- **Fewer passes and allocations.** Runs and text are found in one walk per
+  row, the runs are written as they end (they stop where they cover the
+  stored cells, so no run count), and the style table follows the rows behind
+  a `u32` body length instead of being copied in front of them. The grapheme
+  break helpers that `Term::input` replays per joining codepoint are inlined.
+
+Payloads never leave the process, so the layout change needs no version. The
+layout is documented above `FxHasher` in `grid/compact.rs`.
+
+The spare rows a seal leaves for recycling are still released at every history
+bound by default. An owner that bounds history after every small read can keep
+them (`Grid::keep_history_spare_rows`) and release them once output goes quiet
+(`Grid::release_history_spare_rows`); otherwise most lines allocate and clear a
+fresh row. They stay uncounted, and at most one block of rows.
+
+Tests: `wide_character_pairs_round_trip_with_their_spacers`,
+`spare_rows_survive_history_bounds_until_released`,
+`a_coloured_line_widened_and_then_recycled_clears_its_old_columns` (fails
+before the `grow` change), and the existing randomized codec and storage
+tests, whose synthetic rows now keep the occupancy rule (`obey_occupancy`).

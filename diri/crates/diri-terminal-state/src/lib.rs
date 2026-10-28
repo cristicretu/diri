@@ -524,6 +524,10 @@ pub struct HeadlessScreen {
     /// recolors (OSC 4/10/11) moves no cell, and must still advance
     /// `content_seq` or the attach pump withholds the recolored frame.
     colors_generation: u64,
+    /// Keep the rows history recycles for new lines from one read to the
+    /// next, until [`HeadlessScreen::release_idle_memory`]; see
+    /// [`HeadlessScreen::keeping_spare_rows_until_idle`].
+    keep_spare_rows: bool,
 
     /// Diff baseline for [`grid_update`]: the cells last handed out, so the
     /// next call sends only changed rows.
@@ -602,6 +606,7 @@ impl HeadlessScreen {
             title_changed: false,
             cursor_style: CursorStyle::default(),
             colors_generation: 0,
+            keep_spare_rows: false,
             last_cells: Vec::new(),
             last_annotations: Vec::new(),
             last_grid_cols: 0,
@@ -664,6 +669,27 @@ impl HeadlessScreen {
         std::mem::take(&mut self.unsolicited)
     }
 
+    /// Keeps the rows that history recycles for new lines from one feed to
+    /// the next, for an owner that feeds every small read and calls
+    /// [`HeadlessScreen::release_idle_memory`] once output goes quiet.
+    ///
+    /// History seals rows into compressed blocks and reuses their cells for
+    /// the next lines. By default those spare rows are dropped after every
+    /// feed, so an idle terminal holds none; output arriving a kilobyte at a
+    /// time then allocates and clears a fresh row for most lines. Kept, they
+    /// cost at most one block of rows (128 KiB of cells) while output streams.
+    pub fn keeping_spare_rows_until_idle(mut self) -> Self {
+        self.keep_spare_rows = true;
+        self
+    }
+
+    /// Releases memory only streaming output needs (the spare rows kept by
+    /// [`HeadlessScreen::keeping_spare_rows_until_idle`]).
+    pub fn release_idle_memory(&mut self) {
+        #[cfg(feature = "compact-history")]
+        self.term.release_primary_history_spare_rows();
+    }
+
     /// Resets the emulator at its current dimensions without touching a PTY.
     ///
     /// Both screens and history, terminal modes, title/progress, queued replies,
@@ -699,6 +725,7 @@ impl HeadlessScreen {
             reset = reset.with_host_replies(version);
         }
         reset.palette = self.palette;
+        reset.keep_spare_rows = self.keep_spare_rows;
         reset.content_seq = self.content_seq.saturating_add(1);
         *self = reset;
     }
@@ -910,6 +937,8 @@ impl HeadlessScreen {
     fn settle(&mut self) {
         #[cfg(feature = "compact-history")]
         {
+            self.term
+                .keep_primary_history_spare_rows(self.keep_spare_rows);
             self.term
                 .bound_primary_history_storage(HISTORY_STORAGE_BUDGET_BYTES);
             // A limit a resize raised follows history back down (widening,
@@ -2317,8 +2346,11 @@ impl HeadlessScreen {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let grid = self.term.grid();
         let source = &grid[Line(row as i32)];
-        let cells = &source[..];
-        let cells = &cells[..self.geometry.cols.min(cells.len())];
+        let width = self.geometry.cols.min(source.len());
+        // Default cells after the content add only their count, so a short
+        // line in a wide row hashes its text, not the blank rest of the row.
+        let content = source.content_len(Cell::is_default).min(width);
+        let cells = &source[..][..content];
         let mut state = RowHashState::default();
         let mut lanes = [
             0xcbf2_9ce4_8422_2325u64,
@@ -2344,7 +2376,7 @@ impl HeadlessScreen {
         for (offset, cell) in remainder.iter().enumerate() {
             lanes[offset] = fold_mix(lanes[offset], state.word(column + offset, cell));
         }
-        let mut digest = fold_mix(state.marks, cells.len() as u64);
+        let mut digest = fold_mix(state.marks, (width as u64) << 32 | content as u64);
         for lane in lanes {
             digest = fold_mix(digest, lane);
         }
@@ -2667,10 +2699,13 @@ struct RowHashState {
     /// Links and zero-width marks are rare; they fold into their own lane.
     marks: u64,
     previous_link: Option<alacritty_terminal::term::cell::Hyperlink>,
-    /// The wire style is derived only when the raw style changes, which
-    /// consecutive cells rarely do.
+    /// The wire style is derived only for a raw style not seen in the last
+    /// two: consecutive cells rarely change it, and a run of wide characters
+    /// alternates between the character's style and its spacer's.
     raw_style: u128,
     style_hash: u64,
+    other_raw_style: u128,
+    other_style_hash: u64,
 }
 
 impl Default for RowHashState {
@@ -2681,6 +2716,8 @@ impl Default for RowHashState {
             previous_link: None,
             raw_style: u128::MAX,
             style_hash: 0,
+            other_raw_style: u128::MAX,
+            other_style_hash: 0,
         }
     }
 }
@@ -2696,8 +2733,12 @@ impl RowHashState {
         }
         let raw = raw_style_key(cell);
         if raw != self.raw_style {
-            self.raw_style = raw;
-            self.style_hash = style_word(cell.flags, cell.fg, cell.bg);
+            std::mem::swap(&mut self.raw_style, &mut self.other_raw_style);
+            std::mem::swap(&mut self.style_hash, &mut self.other_style_hash);
+            if raw != self.raw_style {
+                self.raw_style = raw;
+                self.style_hash = style_word(cell.flags, cell.fg, cell.bg);
+            }
         }
         let character = cell.c;
         self.filled += usize::from(character != ' ' && character != '\0');
@@ -3111,6 +3152,27 @@ mod tests {
         fn take_fingerprinted_rows(&self) -> usize {
             self.fingerprinted_rows
                 .swap(0, std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[test]
+    fn fingerprints_see_cells_after_the_text() {
+        // Fingerprints hash a row's text and stop at its last non-default
+        // cell; whatever changes after the text must still change them.
+        let mut screen = HeadlessScreen::new(40, 3);
+        screen.feed(b"short");
+        let mut seq = screen.content_seq();
+        for change in [
+            &b"\x1b[1;30H\x1b[41m \x1b[0m"[..],
+            b"\x1b[1;30H ",
+            b"\x1b[1;40Hz",
+            b"\x1b[1;40H\x1b[K",
+            b"\x1b[1;20H\x1b]8;;https://example.invalid\x07 \x1b]8;;\x07",
+        ] {
+            screen.feed(change);
+            assert_ne!(screen.content_seq(), seq, "{change:?}");
+            seq = screen.content_seq();
+            screen.assert_fingerprints_current(0);
         }
     }
 
