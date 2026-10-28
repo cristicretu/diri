@@ -20,7 +20,8 @@ use std::collections::{HashMap, VecDeque};
 use alacritty_terminal::term::grapheme::Info;
 
 use super::cell::{
-    CLUSTER, CLUSTER_SHIFT, CP, Cell, GRAPHEME, LEADING, SPACER, STYLE_SHIFT, Style, WIDE,
+    CLUSTER, CLUSTER_SHIFT, CP, Cell, GRAPHEME, HYPERLINK, LEADING, SPACER, STYLE_SHIFT, Style,
+    WIDE,
 };
 
 /// Per-row facts. Cells at or past `occ` were never written since the row
@@ -45,7 +46,8 @@ pub struct RowMeta {
 #[derive(Default)]
 pub struct StyleTable {
     table: Vec<Style>,
-    index: HashMap<Style, u16>,
+    /// Boxed: packed pages drop it, and a page's size counts in the budget.
+    index: Option<Box<HashMap<Style, u16>>>,
 }
 
 impl StyleTable {
@@ -57,14 +59,15 @@ impl StyleTable {
         if self.table.is_empty() {
             self.table.push(Style::default());
         }
-        if let Some(&id) = self.index.get(style) {
+        let index = self.index.get_or_insert_with(Default::default);
+        if let Some(&id) = index.get(style) {
             return id;
         }
         // Callers intern only for a cell or row fill they write, so a page
         // holds at most rows * (cols + 1) styles, far below 65,535.
         let id = self.table.len() as u16;
         self.table.push(*style);
-        self.index.insert(*style, id);
+        index.insert(*style, id);
         id
     }
 
@@ -87,12 +90,14 @@ impl StyleTable {
 
     fn clear(&mut self) {
         self.table.clear();
-        self.index.clear();
+        if let Some(index) = &mut self.index {
+            index.clear();
+        }
     }
 
     /// A packed page never interns again: keep only the table.
     fn freeze(&mut self) {
-        self.index = HashMap::new();
+        self.index = None;
         self.table.shrink_to_fit();
     }
 
@@ -131,7 +136,7 @@ impl Clusters {
     }
 
     /// A new cluster holding `chars`; returns its index.
-    fn add(&mut self, chars: &[char]) -> u64 {
+    pub fn add(&mut self, chars: &[char]) -> u64 {
         let index = self.spans.len() as u64;
         self.spans
             .push((self.chars.len() as u32, chars.len() as u32));
@@ -335,6 +340,22 @@ impl TextLog {
     }
 }
 
+/// An OSC 8 hyperlink: an explicit id, if the program gave one, and the URI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Link {
+    pub id: Option<String>,
+    pub uri: String,
+}
+
+/// The link of each cell with HYPERLINK, by `row * cols + col`, as an index
+/// into `table`. Entries of overwritten cells are stale and ignored (the
+/// bit decides).
+#[derive(Default)]
+struct Links {
+    map: HashMap<u32, u32>,
+    table: Vec<Link>,
+}
+
 pub struct Page {
     /// Changes whenever the page is (re)initialised, so a pen can cache
     /// its interned id per page.
@@ -346,6 +367,9 @@ pub struct Page {
     pub styles: StyleTable,
     pub clusters: Clusters,
     pub text: TextLog,
+    /// Hyperlinks, for pages that have any (boxed: a page's size counts in
+    /// the history budget).
+    links: Option<Box<Links>>,
     packed: Option<Box<[u8]>>,
 }
 
@@ -356,6 +380,9 @@ const T_BLANKS: u8 = 4;
 /// A leading spacer: a blank with LEADING, before a wide character that
 /// wrapped to the next row.
 const T_LEADING: u8 = 5;
+/// The next cell has a hyperlink: u16 index into the page's link table.
+/// (0xC0 never starts UTF-8.)
+const T_LINK: u8 = 0xC0;
 /// A row packed as text (see [`Page::pack_text_row`]).
 const T_TEXT_ROW: u8 = 0x7F;
 const FLAGS: u64 = 0x7FF << 21;
@@ -758,6 +785,7 @@ impl Page {
             styles: StyleTable::default(),
             clusters: Clusters::default(),
             text,
+            links: None,
             packed: None,
         }
     }
@@ -770,6 +798,36 @@ impl Page {
         self.styles.clear();
         self.clusters.clear();
         self.text.clear();
+        self.links = None;
+    }
+
+    /// The index of `link` in this page's table.
+    pub fn link_id(&mut self, link: &Link) -> u32 {
+        let links = self.links.get_or_insert_with(Default::default);
+        match links.table.iter().position(|l| l == link) {
+            Some(i) => i as u32,
+            None => {
+                links.table.push(link.clone());
+                (links.table.len() - 1) as u32
+            }
+        }
+    }
+
+    /// Cell `index` (`row * cols + col`) has link `id` of this page.
+    pub fn set_link(&mut self, index: usize, id: u32) {
+        self.links
+            .get_or_insert_with(Default::default)
+            .map
+            .insert(index as u32, id);
+    }
+
+    /// The link id recorded for cell `index` (meaningful with HYPERLINK).
+    pub fn link_of(&self, index: usize) -> Option<u32> {
+        self.links.as_ref()?.map.get(&(index as u32)).copied()
+    }
+
+    fn link(&self, id: u32) -> Option<Link> {
+        self.links.as_ref()?.table.get(id as usize).cloned()
     }
 
     pub fn is_packed(&self) -> bool {
@@ -821,13 +879,16 @@ impl Page {
             self.packed = Some(bytes.into_boxed_slice());
             self.clusters.release();
             self.styles.freeze();
+            if let Some(links) = &mut self.links {
+                links.map = HashMap::new();
+            }
             let text = std::mem::replace(&mut self.text, TextLog::new(0, false));
             let cells = std::mem::take(&mut self.cells);
             #[cfg(debug_assertions)]
             {
                 let mut check = vec![Cell::default(); self.len * cols];
                 let mut clusters = Clusters::default();
-                self.unpack(cols, &mut check, &mut clusters);
+                self.unpack(cols, &mut check, &mut clusters, &mut HashMap::new());
                 for row in 0..self.len {
                     let occ = self.meta[row].occ as usize;
                     assert_eq!(
@@ -876,7 +937,7 @@ impl Page {
             let mut blanks = 0;
             while x < occ {
                 let raw = cells[x].0;
-                let cell = raw & !(GRAPHEME | CLUSTER);
+                let cell = raw & !(GRAPHEME | CLUSTER | HYPERLINK);
                 let style = cell & STYLE_BITS;
                 // Plain ASCII and blanks in the current style, eight at a
                 // time: printable bytes and tabs as themselves, blanks
@@ -909,6 +970,12 @@ impl Page {
                     }
                 }
                 flush_blanks(out, &mut blanks);
+                if raw & HYPERLINK != 0 {
+                    let index = row * cols + x;
+                    let link = self.link_of(index).expect("linked cell");
+                    out.push(T_LINK);
+                    out.extend_from_slice(&(link as u16).to_le_bytes());
+                }
                 if raw & GRAPHEME != 0 {
                     let extra = self.clusters.of(cells[x]);
                     out.push(T_CLUSTER);
@@ -979,14 +1046,25 @@ impl Page {
         self.packed = Some(Box::from(out.as_slice()));
         self.clusters.release();
         self.styles.freeze();
+        if let Some(links) = &mut self.links {
+            links.map = HashMap::new();
+        }
         let text = std::mem::replace(&mut self.text, TextLog::new(0, false));
         (std::mem::take(&mut self.cells), text)
     }
 
     /// Decodes a packed page into `cells` (rows * cols) and `clusters`.
-    fn unpack(&self, cols: usize, cells: &mut [Cell], clusters: &mut Clusters) {
+    fn unpack(
+        &self,
+        cols: usize,
+        cells: &mut [Cell],
+        clusters: &mut Clusters,
+        links: &mut HashMap<u32, u32>,
+    ) {
         let data = self.packed.as_deref().expect("packed");
         clusters.clear();
+        links.clear();
+        let mut pending_link: Option<u32> = None;
         let mut at = 0;
         let mut current = 0u64;
         let mut pending: Option<u64> = None;
@@ -1020,6 +1098,11 @@ impl Page {
                     T_STYLE => {
                         current =
                             (u16::from_le_bytes([data[at], data[at + 1]]) as u64) << STYLE_SHIFT;
+                        at += 2;
+                        continue;
+                    }
+                    T_LINK => {
+                        pending_link = Some(u16::from_le_bytes([data[at], data[at + 1]]) as u32);
                         at += 2;
                         continue;
                     }
@@ -1071,6 +1154,10 @@ impl Page {
                 if let Some(k) = pending.take() {
                     cells[first].0 |= GRAPHEME | k << CLUSTER_SHIFT;
                 }
+                if let Some(link) = pending_link.take() {
+                    cells[first].0 |= HYPERLINK;
+                    links.insert((row * cols + first) as u32, link);
+                }
             }
         }
         debug_assert_eq!(at, data.len());
@@ -1081,6 +1168,13 @@ impl Page {
         self.packed.as_ref().map_or(0, |p| p.len())
             + std::mem::size_of_val(&*self.meta)
             + self.styles.heap_bytes()
+            + self.links.as_ref().map_or(0, |links| {
+                links
+                    .table
+                    .iter()
+                    .map(|l| l.uri.len() + l.id.as_ref().map_or(0, String::len))
+                    .sum::<usize>()
+            })
             + std::mem::size_of::<Page>()
     }
 }
@@ -1090,6 +1184,7 @@ struct Unpacked {
     serial: u64,
     cells: Box<[Cell]>,
     clusters: Clusters,
+    links: HashMap<u32, u32>,
 }
 
 pub struct Pages {
@@ -1104,6 +1199,8 @@ pub struct Pages {
     base: u64,
     /// Absolute index one past the newest row.
     total: u64,
+    /// Rows below this absolute index are not history (cleared).
+    floor: u64,
     /// Pages at the front that are packed.
     sealed: usize,
     packed_bytes: usize,
@@ -1146,6 +1243,7 @@ impl Pages {
             pages: VecDeque::new(),
             base: 0,
             total: 0,
+            floor: 0,
             sealed: 0,
             packed_bytes: 0,
             spare: None,
@@ -1194,8 +1292,18 @@ impl Pages {
     }
 
     pub fn history_size(&self) -> usize {
-        let behind = (self.total - self.base) as usize - self.lines;
+        let behind = (self.total - self.base.max(self.floor)) as usize - self.lines;
         behind.min(self.history_limit)
+    }
+
+    /// Drops every history row (ED 3, reset): rows below the screen are
+    /// hidden at once, and whole pages of them are released.
+    pub fn clear_history(&mut self) {
+        self.floor = self.total - self.lines as u64;
+        let rows = self.rows_per_page() as u64;
+        while self.pages.len() > 1 && self.base + rows <= self.floor {
+            self.pop_front_page();
+        }
     }
 
     /// Page and row of line `line`, where negative lines are history
@@ -1218,13 +1326,33 @@ impl Pages {
                 serial: 0,
                 cells: vec![Cell::default(); self.rows_per_page() * self.cols].into_boxed_slice(),
                 clusters: Clusters::default(),
+                links: HashMap::new(),
             });
-            page.unpack(self.cols, &mut unpacked.cells, &mut unpacked.clusters);
+            page.unpack(
+                self.cols,
+                &mut unpacked.cells,
+                &mut unpacked.clusters,
+                &mut unpacked.links,
+            );
             unpacked.serial = page.serial;
             *cache = Some(unpacked);
         }
         let unpacked = cache.as_ref().expect("filled");
         f(&unpacked.cells, &unpacked.clusters)
+    }
+
+    /// The link of cell `index` (`row * cols + col`) of page `p`, which has
+    /// the HYPERLINK bit.
+    pub fn read_link(&self, p: usize, index: usize) -> Option<Link> {
+        let page = &self.pages[p];
+        let id = if page.is_packed() {
+            self.read(p, |_, _| ());
+            let cache = self.cache.borrow();
+            cache.as_ref()?.links.get(&(index as u32)).copied()
+        } else {
+            page.link_of(index)
+        }?;
+        page.link(id)
     }
 
     /// Drops the read cache (readers call this after a batch).
