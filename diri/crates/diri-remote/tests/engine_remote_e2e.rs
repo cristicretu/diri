@@ -1834,3 +1834,323 @@ fn grid_update_text(update: &diri_proto::grid::GridUpdate) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// Launches `argv` as a remote session through the fake `ssh` and the real
+/// bootstrapped Helper, attached by a real Engine `Session`.
+fn spawn_remote_program(
+    temporary: &Path,
+    label: &str,
+    argv: Vec<String>,
+    one_way_delay: Option<Duration>,
+) -> Session {
+    let remote_home = temporary.join("remote-home");
+    let remote_state = temporary.join("remote-state");
+    fs::create_dir(&remote_home).expect("remote home");
+    let fake_ssh = match one_way_delay {
+        Some(delay) => write_delayed_fake_ssh(temporary, &remote_home, &remote_state, delay),
+        None => write_fake_ssh(temporary, &remote_home, &remote_state),
+    };
+    let manager = Arc::new(
+        RemoteManager::new(
+            ProcessExecutor::new(fake_ssh),
+            ArtifactCatalog::from_native_helper(Path::new(helper())).expect("catalog"),
+            temporary.join("ssh-control"),
+        )
+        .expect("manager"),
+    );
+    let host = HostEntry {
+        id: format!("fixture-{label}"),
+        transport: Default::default(),
+        name: None,
+        ssh: "fixture-host".into(),
+        default_cwd: Some("/".into()),
+        node: None,
+    };
+    let installed = manager.ensure_helper(&host).expect("bootstrap");
+    let session_id = unique_stop_session_id(label);
+    let request = LaunchRequest {
+        session_id: session_id.clone(),
+        session_token: SessionToken::new("0123abcd0123abcd0123abcd0123abcd").expect("token"),
+        argv,
+        cwd: "/".into(),
+        environment: vec![
+            EnvironmentVariable {
+                name: "TERM".into(),
+                value: "xterm-256color".into(),
+            },
+            EnvironmentVariable {
+                name: "PATH".into(),
+                value: "/usr/bin:/bin".into(),
+            },
+        ],
+        cols: 100,
+        rows: 30,
+        persistence: PersistenceCapability::NativeDetach,
+    };
+    let bindings = RemoteBindingStore::new(temporary.join("bindings")).expect("bindings");
+    Session::spawn(
+        SessionSpec {
+            id: session_id,
+            pty: PtySpec::new(request.argv.clone(), "/").size(100, 30),
+            manifest_id: "shell".into(),
+            authority: Authority::ProcessOnly,
+            logs_dir: temporary.join("logs"),
+            holder: None,
+            remote: Some(RemoteSessionSpec {
+                manager: Arc::clone(&manager),
+                helper: installed,
+                launch: request,
+                host_id: host.id.clone(),
+                binding_store: bindings,
+            }),
+            defer_launch: false,
+        },
+        Arc::new(ManifestEngine::new(Vec::new())),
+    )
+    .expect("spawn remote Session")
+}
+
+/// A remote program's queries are answered by its Holder, from the Holder's
+/// own terminal, in the order they were asked: the `OSC 7501` support query
+/// ahead of the primary device attributes that follow it. The Engine, which
+/// used to answer `OSC 7501` a round trip later, answers nothing, so no reply
+/// arrives twice.
+#[test]
+fn remote_program_queries_are_answered_once_in_stream_order() {
+    // The support probe programs use (`OSC 7501`, then DA1) around queries
+    // they block on, plus the color queries answered from the palette the
+    // Engine pushed.
+    let probe: &[u8] = b"\x1b]7501;?\x1b\\\x1b[6n\x1b[5n\x1b[?2004$p\x1b[>c\
+        \x1b]11;?\x1b\\\x1b]4;1;?\x1b\\\x1b[?996n\x1b[>0q\x1b[c";
+    let expected = [
+        diri_terminal_state::PROGRAM_STATUS_QUERY_REPLY,
+        b"\x1b[1;1R\x1b[0n\x1b[?2004;2$y\x1b[>0;2600;1c",
+        b"\x1b]11;rgb:0a0a/0b0b/0c0c\x1b\\\x1b]4;1;rgb:c0c0/2020/3030\x1b\\\x1b[?997;1n",
+        format!(
+            "\x1bP>|diri {}\x1b\\",
+            &diri_remote::BUILD_ID[..diri_remote::BUILD_ID.len().min(12)]
+        )
+        .as_bytes(),
+        b"\x1b[?62;22c",
+    ]
+    .concat();
+    let hex = |bytes: &[u8]| -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() };
+    let temporary = tempfile::tempdir().expect("temp");
+    let probe_path = temporary.path().join("probe.bin");
+    fs::write(&probe_path, probe).expect("probe");
+    // Reads exactly the expected byte count (each read waits up to 2 s, so a
+    // missing answer ends it short), then anything else that arrives within
+    // a second, and prints both hex encoded.
+    let script = format!(
+        "printf 'ready>'; IFS= read -r go; clear; stty raw -echo min 0 time 20; cat '{}'; \
+         dd bs=1 count={} 2>/dev/null | od -An -tx1 | tr -d ' \\n'; printf '|extra:'; \
+         stty min 0 time 10; dd bs=256 count=1 2>/dev/null | od -An -tx1 | tr -d ' \\n'; \
+         printf '|done'; IFS= read -r line",
+        probe_path.display(),
+        expected.len()
+    );
+    let session = spawn_remote_program(
+        temporary.path(),
+        "query-replies",
+        vec!["/bin/sh".into(), "-c".into(), script],
+        None,
+    );
+    // Asked only once the Engine is attached and the output is live, so the
+    // controller-attached path is the one under test.
+    wait_for_grid(&session, "ready>");
+    session.apply_terminal_palette(Some(diri_proto::TerminalPalette {
+        appearance: diri_proto::TerminalAppearance::Dark,
+        foreground: [0xee, 0xee, 0xee],
+        background: [0x0a, 0x0b, 0x0c],
+        cursor: [0xff, 0xff, 0xff],
+        ansi: [[0xc0, 0x20, 0x30]; 16],
+    }));
+    session.write_input(b"go\n").expect("input");
+    let mut screen = String::new();
+    wait_until("the probe", Duration::from_secs(20), || {
+        screen = session.screen_lines().concat();
+        screen.retain(|character| !character.is_whitespace());
+        screen.contains("|done")
+    });
+    assert_eq!(
+        screen,
+        format!("{}|extra:|done", hex(&expected)),
+        "answers (hex) as the remote program read them"
+    );
+    session.write_input(b"\n").expect("input");
+    let mut session = session;
+    let _ = session.terminate(Duration::from_millis(100));
+}
+
+/// Round trip of each terminal query a remote program makes, measured inside
+/// the remote PTY: the time from writing the query to reading its whole
+/// answer, or `timeout` after 1 s. Then the order in which an `OSC 7501`
+/// support query and primary device attributes are answered when sent
+/// together. A measurement, not a gate:
+/// `cargo test -p diri-remote --test engine_remote_e2e measure_remote_query_round_trips -- --ignored --nocapture`
+/// `DIRI_QUERY_RTT_DELAY_MS` adds that one-way delay to every fake `ssh`
+/// channel, standing in for a WAN link.
+#[test]
+#[ignore = "measurement; prints per-query round trips"]
+fn measure_remote_query_round_trips() {
+    let delay = std::env::var("DIRI_QUERY_RTT_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .map(Duration::from_millis);
+    let temporary = tempfile::tempdir().expect("temp");
+    let probe = temporary.path().join("probe.pl");
+    fs::write(&probe, QUERY_PROBE).expect("probe");
+    let session = spawn_remote_program(
+        temporary.path(),
+        "query-rtt",
+        vec!["/usr/bin/perl".into(), probe.display().to_string()],
+        delay,
+    );
+    println!("one-way ssh delay: {delay:?}");
+    // The probe waits for the Engine to attach and push the App's palette.
+    wait_for_grid(&session, "ready>");
+    session.apply_terminal_palette(Some(diri_proto::TerminalPalette {
+        appearance: diri_proto::TerminalAppearance::Dark,
+        foreground: [0xee, 0xee, 0xee],
+        background: [0x0a, 0x0b, 0x0c],
+        cursor: [0xff, 0xff, 0xff],
+        ansi: [[0xc0, 0x20, 0x30]; 16],
+    }));
+    session.write_input(b"go\n").expect("input");
+    wait_until("the probe", Duration::from_secs(60), || {
+        session.screen_lines().join("\n").contains("PROBE-DONE")
+    });
+    for line in session.screen_lines() {
+        let line = line.trim_end();
+        if line.starts_with("RTT") || line.starts_with("ORDER") {
+            println!("{line}");
+        }
+    }
+    session.write_input(b"\n").expect("input");
+    let mut session = session;
+    let _ = session.terminate(Duration::from_millis(100));
+}
+
+/// Writes each query, waits up to 1 s for an answer ending in its final
+/// byte, and prints `RTT <name> <ms|timeout> <median of 20>`.
+const QUERY_PROBE: &str = r#"
+use strict; use Time::HiRes qw(time sleep);
+print "ready>"; my $go = <STDIN>;
+system("stty raw -echo");
+$| = 1;
+sub collect {
+    my ($until, $deadline) = @_;
+    my $buffer = "";
+    while (1) {
+        my $left = $deadline - time;
+        last if $left <= 0;
+        my $bits = ""; vec($bits, fileno(STDIN), 1) = 1;
+        if (select($bits, undef, undef, $left) > 0) {
+            my $chunk; last unless sysread(STDIN, $chunk, 4096);
+            $buffer .= $chunk;
+            last if $until->($buffer);
+        }
+    }
+    return $buffer;
+}
+my @queries = (
+    ["CPR", "\e[6n", qr/\e\[\d+;\d+R$/],
+    ["DSR", "\e[5n", qr/\e\[0n$/],
+    ["DA1", "\e[c", qr/\e\[\?[\d;]*c$/],
+    ["DA2", "\e[>c", qr/\e\[>[\d;]*c$/],
+    ["DECRQM-2004", "\e[?2004\$p", qr/\e\[\?2004;\d\$y$/],
+    ["XTWINOPS-18t", "\e[18t", qr/\e\[8;\d+;\d+t$/],
+    ["OSC-11", "\e]11;?\e\\", qr/\e\]11;rgb:[0-9a-f\/]+\e\\$/],
+    ["OSC-4", "\e]4;1;?\e\\", qr/\e\]4;1;rgb:[0-9a-f\/]+\e\\$/],
+    ["CSI-?996n", "\e[?996n", qr/\e\[\?997;\dn$/],
+    ["XTVERSION", "\e[>0q", qr/\eP>\|[^\e]*\e\\$/],
+    ["OSC-7501", "\e]7501;?\e\\", qr/\e\]7501;\?\e\\$/],
+);
+for my $query (@queries) {
+    my ($name, $bytes, $pattern) = @$query;
+    my @samples;
+    for my $round (1 .. 20) {
+        my $start = time;
+        syswrite(STDOUT, $bytes);
+        my $answer = collect(sub { $_[0] =~ $pattern }, $start + 1.0);
+        if ($answer =~ $pattern) { push @samples, (time - $start) * 1000 }
+        else { @samples = (); last }
+        # A late answer must not land in the next measurement.
+        collect(sub { 0 }, time + 0.02);
+    }
+    if (@samples) {
+        my @sorted = sort { $a <=> $b } @samples;
+        printf "RTT %-13s median %.2f ms  p90 %.2f ms\r\n", $name,
+            $sorted[int(@sorted / 2)], $sorted[int(@sorted * 0.9)];
+    } else {
+        printf "RTT %-13s timeout (no answer within 1000 ms)\r\n", $name;
+    }
+}
+my $start = time;
+syswrite(STDOUT, "\e]7501;?\e\\\e[c");
+my $both = collect(sub { $_[0] =~ /7501/ && $_[0] =~ /\e\[\?[\d;]*c/ }, $start + 1.0);
+my $status = index($both, "7501");
+my $attributes = index($both, "\e[?");
+my $order = $status < 0 ? "no 7501 answer within 1000 ms"
+    : $status < $attributes ? "7501 answer before DA1 (support detected)"
+    : "DA1 answer before 7501 (support missed)";
+printf "ORDER %s\r\nPROBE-DONE\r\n", $order;
+my $line = <STDIN>;
+"#;
+
+/// The fake `ssh`, with every channel relayed through a process that holds
+/// each chunk for `delay` in both directions.
+fn write_delayed_fake_ssh(
+    root: &Path,
+    home: &Path,
+    state: &Path,
+    delay: Duration,
+) -> std::path::PathBuf {
+    let relay = root.join("relay.pl");
+    fs::write(&relay, DELAY_RELAY).expect("relay");
+    let path = root.join("ssh");
+    write_executable_script(
+        &path,
+        &format!(
+            "#!/bin/sh\nexport HOME='{}'\nexport DIRI_REMOTE_STATE_DIR='{}'\nfor last; do :; done\nexec /usr/bin/perl '{}' {} \"$last\"\n",
+            home.display(),
+            state.display(),
+            relay.display(),
+            delay.as_secs_f64(),
+        ),
+    );
+    path
+}
+
+/// Runs `sh -c <command>` and forwards stdin to it and its stdout back, each
+/// chunk released `delay` seconds after it was read, in order.
+const DELAY_RELAY: &str = r#"
+use strict; use IPC::Open2; use Time::HiRes qw(time sleep);
+my ($delay, $command) = @ARGV;
+my $pid = open2(my $from_child, my $to_child, "/bin/sh", "-c", $command);
+binmode $_ for (\*STDIN, \*STDOUT, $from_child, $to_child);
+my @queue; # [release time, handle, bytes]
+my %open = (in => 1, out => 1);
+while ($open{out} || @queue) {
+    my $bits = "";
+    vec($bits, fileno(STDIN), 1) = 1 if $open{in};
+    vec($bits, fileno($from_child), 1) = 1 if $open{out};
+    my $wait = @queue ? $queue[0][0] - time : undef;
+    $wait = 0 if defined $wait && $wait < 0;
+    if (select(my $ready = $bits, undef, undef, $wait) > 0) {
+        for ([\*STDIN, $to_child, "in"], [$from_child, \*STDOUT, "out"]) {
+            my ($source, $sink, $name) = @$_;
+            next unless $open{$name} && vec($ready, fileno($source), 1);
+            my $bytes;
+            if (sysread($source, $bytes, 65536)) { push @queue, [time + $delay, $sink, $bytes] }
+            else { $open{$name} = 0; push @queue, [time + $delay, $sink, undef] }
+        }
+    }
+    while (@queue && $queue[0][0] <= time) {
+        my (undef, $sink, $bytes) = @{shift @queue};
+        if (defined $bytes) { syswrite($sink, $bytes) } else { close $sink }
+    }
+}
+waitpid($pid, 0);
+exit($? >> 8);
+"#;

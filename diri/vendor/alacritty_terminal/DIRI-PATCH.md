@@ -438,6 +438,21 @@ Tests: `styles_with_extra_storage_are_told_apart_on_a_hash_collision`,
 `blocks_of_unique_combining_marks_round_trip_one_after_another`, and the
 existing randomized codec tests.
 
+## Amortized history audits in debug builds
+
+Three debug assertions in `grid/compact.rs` re-derived history bookkeeping
+from scratch on every change: the deferred history's row, payload and
+eager-cell counts (a layout of every deferred line), the deferred line
+index's extra heap, and the stored payload bytes (every block). After a
+column change defers a full history, each new line evicts a deferred row, so
+a debug build (`cargo test`, development apps) walked every deferred line
+per line: 7.6–13 ms per line at 150,000 rows, against 9 µs before the
+resize. `audit_due` keeps the checks exact for collections up to 1,024 items
+(every unit test's) and otherwise runs them once per `len` calls, which is
+O(1) amortized. Release builds compile none of it; no behavior, wire,
+checkpoint or protocol change. Test:
+`lines_after_narrowing_a_full_history_cost_what_they_did_before`
+(`diri-terminal-state`); probe: `--bench narrow_history`.
 ## SGR-Pixels mouse (DECSET 1016)
 
 `TermMode::SGR_PIXEL_MOUSE` (bit 26) records DECSET 1016. It is one of the

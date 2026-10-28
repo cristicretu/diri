@@ -18,10 +18,11 @@ use crate::grid::{GridCodecError, GridUpdate};
 use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 18;
+pub const PROTOCOL_MINOR: u16 = 19;
 pub const GRID_RESUME_PROTOCOL_MINOR: u16 = 17;
 /// Minor 17 belongs to `grid-resume-v1`; styles are negotiated by name.
 pub const TERMINAL_STYLES_PROTOCOL_MINOR: u16 = 18;
+pub const QUERY_REPLIES_PROTOCOL_MINOR: u16 = 19;
 pub const INLINE_IMAGES_PROTOCOL_MINOR: u16 = 16;
 pub const TERMINAL_RESET_PROTOCOL_MINOR: u16 = 15;
 pub const ENHANCED_KEYBOARD_PROTOCOL_MINOR: u16 = 14;
@@ -73,6 +74,9 @@ const KIND_TERMINAL_RESET: u8 = 48;
 const KIND_TERMINAL_RESET_STATE: u8 = 49;
 const KIND_IMAGE_REQUEST: u8 = 50;
 const KIND_IMAGE_RESPONSE: u8 = 51;
+/// Engine to Holder, `query-replies-v1` only: the colors the controller's
+/// terminal is painted with, which color queries are answered from.
+const KIND_TERMINAL_PALETTE: u8 = 52;
 const IMAGE_RESPONSE_HEADER_LENGTH_BYTES: usize = 4;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -125,6 +129,11 @@ pub enum RemoteCapability {
     /// underline color and overline spans in row annotations.
     #[serde(rename = "terminal-styles-v1")]
     TerminalStyles,
+    /// The Holder answers its program's terminal queries from its own
+    /// emulator, `OSC 7501` support queries included, in stream order. The
+    /// Engine then answers none of them.
+    #[serde(rename = "query-replies-v1")]
+    QueryReplies,
     IncrementalGrid,
     ProcessExit,
     Signal,
@@ -171,6 +180,7 @@ impl RemoteCapability {
             Self::InlineImages => "inline-images-v1",
             Self::GridResume => "grid-resume-v1",
             Self::TerminalStyles => "terminal-styles-v1",
+            Self::QueryReplies => "query-replies-v1",
             Self::FullSnapshot => "full-snapshot",
             Self::IncrementalGrid => "incremental-grid",
             Self::ProcessExit => "process-exit",
@@ -241,6 +251,7 @@ pub const ANNOTATED_HOLDER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::InlineImages,
     RemoteCapability::GridResume,
     RemoteCapability::TerminalStyles,
+    RemoteCapability::QueryReplies,
 ];
 pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::ProcessFacts,
@@ -1324,6 +1335,9 @@ pub enum RemoteMessage {
     InputModes(InputModes),
     ImageRequest(ImageRequest),
     ImageResponse(ImageResponse),
+    /// The App's palette, pushed by a `query-replies-v1` Engine at attach and
+    /// whenever it changes. An older Holder closes the Bridge on the kind.
+    TerminalPalette(crate::TerminalPalette),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1529,6 +1543,9 @@ impl RemoteCodec {
             RemoteMessage::ImageRequest(value) => {
                 value.validate()?;
                 append_json(KIND_IMAGE_REQUEST, value, output, start)
+            }
+            RemoteMessage::TerminalPalette(value) => {
+                append_json(KIND_TERMINAL_PALETTE, value, output, start)
             }
             RemoteMessage::ImageResponse(value) => {
                 if let Some(image) = &value.image {
@@ -1826,13 +1843,14 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
         KIND_IMAGE_RESPONSE => Ok(RemoteMessage::ImageResponse(decode_image_response(
             payload,
         )?)),
+        KIND_TERMINAL_PALETTE => Ok(RemoteMessage::TerminalPalette(decode_json(kind, payload)?)),
         _ => Err(RemoteCodecError::UnknownMessageType(kind)),
     }
 }
 
 fn validate_kind(kind: u8) -> Result<(), RemoteCodecError> {
     if (1..=FrameType::Mouse as u8).contains(&kind)
-        || (KIND_HELLO..=KIND_IMAGE_RESPONSE).contains(&kind)
+        || (KIND_HELLO..=KIND_TERMINAL_PALETTE).contains(&kind)
     {
         Ok(())
     } else {
@@ -2598,6 +2616,49 @@ mod tests {
     }
 
     #[test]
+    fn query_replies_is_a_minor_19_holder_capability() {
+        // No frame kind is added: the capability only moves which side
+        // answers a query, so an older peer never sees anything new.
+        const {
+            assert!(QUERY_REPLIES_PROTOCOL_MINOR == 19);
+            assert!(QUERY_REPLIES_PROTOCOL_MINOR == PROTOCOL_MINOR);
+            assert!(QUERY_REPLIES_PROTOCOL_MINOR > TERMINAL_STYLES_PROTOCOL_MINOR);
+            assert!(QUERY_REPLIES_PROTOCOL_MINOR > INLINE_IMAGES_PROTOCOL_MINOR);
+        }
+        assert_eq!(
+            serde_json::to_string(&RemoteCapability::QueryReplies).unwrap(),
+            "\"query-replies-v1\""
+        );
+        assert_eq!(
+            RemoteCapability::QueryReplies.wire_name(),
+            "query-replies-v1"
+        );
+        assert!(ANNOTATED_HOLDER_CAPABILITIES.contains(&RemoteCapability::QueryReplies));
+        // An older Engine reads the name as an unknown capability and ignores it.
+        assert!(!PHASE_ONE_HOLDER_CAPABILITIES.contains(&RemoteCapability::QueryReplies));
+    }
+
+    #[test]
+    fn terminal_palette_round_trips_and_is_new_to_minor_19() {
+        // Holders before minor 19 accepted kinds up to 51 and fails closed above,
+        // so the Engine sends a palette only to a `query-replies-v1` Holder.
+        const { assert!(KIND_TERMINAL_PALETTE == KIND_IMAGE_RESPONSE + 1) };
+        let message = RemoteMessage::TerminalPalette(crate::TerminalPalette {
+            appearance: crate::TerminalAppearance::Light,
+            foreground: [1, 2, 3],
+            background: [250, 251, 252],
+            cursor: [9, 8, 7],
+            ansi: [[4, 5, 6]; 16],
+        });
+        let encoded = RemoteCodec::encode(&message).expect("encode");
+        assert_eq!(encoded[0], KIND_TERMINAL_PALETTE);
+        assert_eq!(
+            RemoteCodec::new().feed(&encoded).expect("decode"),
+            vec![message]
+        );
+    }
+
+    #[test]
     fn image_chunk_slices_are_bounded() {
         let data = vec![5; MAX_IMAGE_CHUNK_BYTES + 10];
         let format = crate::inline_image::InlineImageFormat::Png;
@@ -2781,7 +2842,8 @@ mod usage_tests {
     #[test]
     fn terminal_styles_is_an_optional_minor_18_capability() {
         const {
-            assert!(TERMINAL_STYLES_PROTOCOL_MINOR == PROTOCOL_MINOR);
+            assert!(TERMINAL_STYLES_PROTOCOL_MINOR == 18);
+            assert!(TERMINAL_STYLES_PROTOCOL_MINOR < PROTOCOL_MINOR);
             assert!(TERMINAL_STYLES_PROTOCOL_MINOR > INLINE_IMAGES_PROTOCOL_MINOR);
         }
         assert_eq!(

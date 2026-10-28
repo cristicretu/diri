@@ -52,3 +52,7 @@ harness = false
 [[bench]]
 name = "history_depth"
 harness = false
+
+[[bench]]
+name = "narrow_history"
+harness = false
