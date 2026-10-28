@@ -5,11 +5,14 @@
 
 mod autoscroll;
 mod controller;
+use crate::tooltip_warmth::WarmTooltip;
 use controller::{AttachmentControl, ControllerLease};
 mod find_input;
 mod find_overlay;
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) mod find_workflow_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod key_encoding_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod keystroke_latency_tests;
 mod messages;
@@ -30,6 +33,7 @@ use diri_client::attachment::{SessionAttachment, TerminalChunk};
 use diri_proto::grid::GridUpdate;
 use diri_proto::terminal::{
     MouseModes, TerminalMouseButton, TerminalMouseEvent, TerminalMouseModifiers, encode_mouse_event,
+    encode_mouse_wheel,
 };
 use diri_proto::{
     AgentKind as ProtoAgentKind, ExitReason, Resumability, RiskHint, SessionId, SessionRecord,
@@ -47,7 +51,7 @@ use diri_term::keys::{
 #[cfg(test)]
 use diri_term::keys::{TermInputModes, encode_key};
 use diri_term::metrics::CellMetrics;
-use diri_term::scrollback::{WheelDelta, WheelEvent, WheelRoute};
+use diri_term::scrollback::{HorizontalWheel, WheelDelta, WheelEvent, WheelRoute};
 use diri_term::theme::TermTheme;
 use diri_ui::{
     AgentKind as UiAgentKind, Fill, FloatingSurface, Ink, Metrics, Radius, SemanticColors,
@@ -282,6 +286,14 @@ impl MouseMotionLimiter {
         self.last_sent_at = None;
         self.last_cell = None;
         self.cancel_pending();
+    }
+
+    /// A press was reported at `cell`. As in xterm, motion is reported only
+    /// once the pointer leaves the cell the program last heard about, so a
+    /// press is not followed by a zero-distance drag.
+    fn pressed_at(&mut self, cell: (u16, u16)) {
+        self.reset();
+        self.last_cell = Some(cell);
     }
 
     fn push(&mut self, now: Instant, cell: (u16, u16), bytes: Vec<u8>) -> MotionDispatch {
@@ -683,6 +695,7 @@ struct ResidentTerminal {
     last_size: (u16, u16),
     pointer_owner: Option<(MouseButton, PointerOwner)>,
     mouse_motion: MouseMotionLimiter,
+    horizontal_wheel: HorizontalWheel,
     extent_probe: HistoryExtentProbe,
     trace: PaneTrace,
 }
@@ -912,6 +925,8 @@ pub struct TerminalViewport {
 pub struct TerminalPane {
     #[cfg(test)]
     pub(crate) render_count: usize,
+    /// How the last key press read Option, for its release.
+    last_option_key: OptionKey,
     /// Hosts the note when this pane's session is a note Session: a note has
     /// no PTY, so the pane shows the editor and never attaches.
     note: Option<Entity<crate::notes::NotePane>>,
@@ -965,6 +980,10 @@ pub struct TerminalPane {
     drag_settle: Option<((u16, u16), Task<()>)>,
     /// A mid-drag size that has rested long enough to send.
     drag_settled: Option<(u16, u16)>,
+    /// Keys pressed while a program asked for kitty release events, as the
+    /// press encoded them. A key-up carries no native key code, so its keypad
+    /// identity and layout come from here, matched by GPUI's key name.
+    held_keys: Vec<(String, TermKeyEvent, bool)>,
     started_at: Instant,
     session_source: SessionSource,
     /// Last selection observed by the primary pane. Spawn responses select the
@@ -986,6 +1005,8 @@ pub struct TerminalPane {
     /// Space in the title bar reserved for workbench-owned controls painted
     /// above this pane, such as the auxiliary terminal's close button.
     header_trailing_inset: f32,
+    /// Set by the split workbench: the title drags this pane elsewhere.
+    pane_drag: Option<crate::pane_drag::DraggedPane>,
     /// The pane is a comfortable-density island: its fills round their outer
     /// corners, because GPUI clips children to rectangles, not to the
     /// island's rounded edge.
@@ -1224,6 +1245,7 @@ impl TerminalPane {
         let mut pane = Self {
             #[cfg(test)]
             render_count: 0,
+            last_option_key: OptionKey::Meta,
             note: None,
             pending_note_block: None,
             window_store,
@@ -1251,6 +1273,7 @@ impl TerminalPane {
             last_resize_sent: None,
             drag_settle: None,
             drag_settled: None,
+            held_keys: Vec::new(),
             started_at: Instant::now(),
             session_source,
             observed_selected_id,
@@ -1262,6 +1285,7 @@ impl TerminalPane {
             sidebar_visible: true,
             inspector_open: false,
             header_trailing_inset: 0.0,
+            pane_drag: None,
             island_corners: false,
             held_hint: 0.0,
             title_opacity: 1.0,
@@ -1373,15 +1397,15 @@ impl TerminalPane {
             if self.residents.contains_key(&id) {
                 continue;
             }
-            let mono = crate::fonts::terminal_font(
-                &self
+            let mono = {
+                let store = self
                     .runtime
                     .store
                     .read()
-                    .expect("session store lock poisoned")
-                    .preferences()
-                    .terminal_font_family,
-            );
+                    .expect("session store lock poisoned");
+                let prefs = store.preferences();
+                crate::fonts::terminal_font(&prefs.terminal_font_family, prefs.terminal_ligatures)
+            };
             let generation = self.next_attachment_generation;
             self.next_attachment_generation = self.next_attachment_generation.wrapping_add(1);
             let parked = self
@@ -1464,6 +1488,7 @@ impl TerminalPane {
                     last_size,
                     pointer_owner: None,
                     mouse_motion: MouseMotionLimiter::default(),
+                    horizontal_wheel: HorizontalWheel::default(),
                     extent_probe: HistoryExtentProbe::default(),
                     trace,
                 },
@@ -1764,6 +1789,7 @@ impl TerminalPane {
             cursor_visible: true,
             is_full_snapshot: false,
             changed_rows: vec![diri_proto::grid::ChangedRow::new(row, cells)],
+            cursor_style: Default::default(),
         };
         self.apply_grid_updates(id, [update], window, cx);
     }
@@ -1803,6 +1829,7 @@ impl TerminalPane {
                     diri_proto::grid::ChangedRow::new(row, cells)
                 })
                 .collect(),
+            cursor_style: Default::default(),
         };
         self.apply_grid_updates(id, [update], window, cx);
     }
@@ -1839,6 +1866,19 @@ impl TerminalPane {
         self.sidebar_visible = sidebar_visible;
         self.inspector_open = inspector_open;
         cx.notify();
+    }
+
+    /// Makes the title a drag handle that moves this pane (a split tab's
+    /// pane), or plain text again (None).
+    pub(crate) fn set_pane_drag(
+        &mut self,
+        source: Option<crate::pane_drag::DraggedPane>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pane_drag != source {
+            self.pane_drag = source;
+            cx.notify();
+        }
     }
 
     pub fn set_header_trailing_inset(&mut self, inset: f32, cx: &mut Context<Self>) {
@@ -2003,11 +2043,7 @@ impl TerminalPane {
                     self.schedule_find(id.clone(), self.find_rescan_delay(&id), window, cx);
                 }
                 if terminal_damage_should_repaint(self.selected_id().as_ref(), &id, changed) {
-                    let echo = self
-                        .residents
-                        .get(&id)
-                        .is_some_and(|resident| resident.attachment.take_echo());
-                    self.request_terminal_repaint(echo, window, cx);
+                    self.request_terminal_repaint(true, window, cx);
                     diri_client::latency_trace::mark(diri_client::latency_trace::Hop::PaneNotified);
                 }
             }
@@ -2454,24 +2490,29 @@ impl TerminalPane {
                 self.paste_into_session(&id, &text);
             }
             Some(TerminalDropAction::Upload(files)) => {
-                let Some((target, ssh)) = destination else {
-                    return;
-                };
-                let pane_tx = self.pane_tx.clone();
-                self.tokio.spawn(async move {
-                    let result = tokio::task::spawn_blocking(move || {
-                        files
-                            .iter()
-                            .map(|file| upload_dropped_file(file, &ssh))
-                            .collect::<Result<Vec<_>, _>>()
-                    })
-                    .await
-                    .unwrap_or_else(|error| Err(format!("upload task failed: {error}")));
-                    let _ = pane_tx.send(PaneEvent::DroppedFilesUploaded(target, result));
-                });
+                if let Some(destination) = destination {
+                    self.upload_files(destination, files);
+                }
             }
         }
         cx.notify();
+    }
+
+    /// Copies local files to a remote session's host; the remote paths are
+    /// pasted when the upload finishes (`PaneEvent::DroppedFilesUploaded`).
+    fn upload_files(&self, (target, ssh): (UploadTarget, String), files: Vec<std::path::PathBuf>) {
+        let pane_tx = self.pane_tx.clone();
+        self.tokio.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                files
+                    .iter()
+                    .map(|file| upload_dropped_file(file, &ssh))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("upload task failed: {error}")));
+            let _ = pane_tx.send(PaneEvent::DroppedFilesUploaded(target, result));
+        });
     }
 
     /// One tick as dragged files arrive over this pane, if releasing them
@@ -2680,6 +2721,14 @@ impl TerminalPane {
         if !applied {
             return;
         }
+        // A column change re-wrapped history under a reader; its view finds
+        // its place again from the daemon's rows.
+        if let Some(resident) = self.residents.get(&id)
+            && resident.element.scrollback_relocating()
+        {
+            let visible_rows = usize::from(resident.last_size.1.max(1));
+            self.pump_scrollback_fetch(&id, visible_rows);
+        }
         // Visibility/occlusion is GPUI's job (display-link stops when the
         // window is truly hidden). `is_window_active` is only OS focus, so
         // gating on it freezes a still-visible window on another monitor.
@@ -2707,7 +2756,7 @@ impl TerminalPane {
 
     fn request_terminal_repaint(
         &mut self,
-        echo: bool,
+        output: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2716,12 +2765,14 @@ impl TerminalPane {
         // display deadline (and capped ProMotion at 60 fps), so terminal
         // damage has exactly one pacing authority: the display itself.
         cx.notify();
-        // Except for the one frame a keystroke's echo buys: in an idle window
-        // it is drawn as soon as this update returns instead of at the next
-        // refresh, which the echo would otherwise wait up to a whole interval
-        // for. The platform refuses while a recent frame may still be queued,
-        // so streams and animations stay on the display link.
-        if echo {
+        // Except for the first frame of new output in an idle window, whether
+        // a keystroke's echo or a line a background program printed: it is
+        // drawn as soon as this update returns instead of at the next refresh,
+        // which it would otherwise wait up to a whole interval for. The
+        // platform refuses while a recent frame may still be on its way to
+        // the screen, so streams and animations stay on the display link and
+        // no frame is drawn that the link would not have drawn anyway.
+        if output {
             window.request_immediate_frame();
         }
     }
@@ -3340,6 +3391,16 @@ impl TerminalPane {
         position: gpui::Point<gpui::Pixels>,
         window: &mut Window,
     ) -> Option<(usize, usize)> {
+        self.grid_point_at(position, window)
+            .map(|point| (point.col, point.row))
+    }
+
+    /// The cell under `position` and the column boundary nearest it.
+    fn grid_point_at(
+        &self,
+        position: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+    ) -> Option<GridPoint> {
         self.selected_session()?;
         let store = self
             .runtime
@@ -3362,9 +3423,10 @@ impl TerminalPane {
             .grid_row_overflow(grid_rows, &typeface, window)
             .map_or(0.0, |grid_height| self.grid_inner_height() - grid_height);
         let grid_y = viewport.y + self.header_height() + 2.0 + anchor;
-        let col = ((f32::from(position.x) - grid_x) / f32::from(metrics.cell_width))
-            .floor()
-            .max(0.0) as usize;
+        let (col, edge) = pointer_columns(
+            f32::from(position.x) - grid_x,
+            f32::from(metrics.cell_width),
+        );
         let resident = self.selected_id().and_then(|id| self.residents.get(&id))?;
         // A reading view resting between rows is painted this far above its
         // whole-row positions, and shows part of one more row at the bottom.
@@ -3379,16 +3441,48 @@ impl TerminalPane {
         // The extra row is addressable for selection and links. A program
         // reading the mouse is only ever told about rows of its own screen.
         let extra_row = shift > 0.0 && !resident.element.mouse_modes().is_reporting();
+        let cols = resident.element.grid_cols();
         clamp_grid_cell(
             col,
             row,
-            resident.element.grid_cols(),
+            cols,
             resident
                 .element
                 .grid_rows()
                 .saturating_add(u16::from(extra_row)),
         )
-        .map(|(col, row)| (usize::from(col), usize::from(row)))
+        .map(|(col, row)| GridPoint {
+            col: usize::from(col),
+            row: usize::from(row),
+            edge: edge.min(usize::from(cols)),
+        })
+    }
+
+    /// Whether a window point lies in the strip left of the grid where shell
+    /// command marks are drawn.
+    fn in_command_gutter(&self, position: gpui::Point<gpui::Pixels>) -> bool {
+        let viewport = self.viewport.unwrap_or_default();
+        let grid_x = viewport.x + GRID_HORIZONTAL_PADDING / 2.0;
+        let x = f32::from(position.x);
+        x < grid_x && x >= viewport.x
+    }
+
+    /// Selects the output of the finished command whose mark is on a window
+    /// row, as clicking that mark does. False when no finished command with
+    /// output starts there.
+    fn select_marked_command_output(&mut self, id: &SessionId, row: usize) -> bool {
+        let Some(resident) = self.residents.get(id) else {
+            return false;
+        };
+        let Some(output) = resident.element.command_output_marked_at(row) else {
+            return false;
+        };
+        resident.element.select_range(output.start, output.end);
+        resident.element.complete_selection();
+        if let Some(resident) = self.residents.get_mut(id) {
+            resident.pointer_owner = None;
+        }
+        true
     }
 
     fn handle_pointer_down(
@@ -3400,7 +3494,7 @@ impl TerminalPane {
         let Some(id) = self.selected_id() else {
             return;
         };
-        let Some((col, row)) = self.grid_cell_at(event.position, window) else {
+        let Some(GridPoint { col, row, edge }) = self.grid_point_at(event.position, window) else {
             return;
         };
         self.reset_qol_session(&id);
@@ -3442,6 +3536,19 @@ impl TerminalPane {
         resident.pointer_owner = Some((event.button, owner));
         resident.mouse_motion.reset();
 
+        if owner == PointerOwner::LocalSelection
+            && event.button == MouseButton::Left
+            && event.click_count == 1
+            && is_plain_click(&event.modifiers)
+            && self.in_command_gutter(event.position)
+            && self.select_marked_command_output(&id, row)
+        {
+            cx.notify();
+            return;
+        }
+        let Some(resident) = self.residents.get_mut(&id) else {
+            return;
+        };
         match owner {
             PointerOwner::LocalSelection => {
                 // A plain press on a link arms it like a Command-press; the
@@ -3458,9 +3565,9 @@ impl TerminalPane {
                 };
                 match event.click_count {
                     1 if event.modifiers.alt && event.modifiers.shift => {
-                        resident.element.begin_rectangle_selection(col, row)
+                        resident.element.begin_rectangle_selection(edge, row)
                     }
-                    1 => resident.element.begin_selection(col, row),
+                    1 => resident.element.begin_selection(edge, row),
                     2 => resident.element.select_word(col, row),
                     _ => resident.element.select_line(row),
                 }
@@ -3483,6 +3590,7 @@ impl TerminalPane {
                     col as u16,
                     row as u16,
                 ) {
+                    resident.mouse_motion.pressed_at((col as u16, row as u16));
                     resident.attachment.mouse(bytes);
                 }
                 cx.stop_propagation();
@@ -3608,7 +3716,7 @@ impl TerminalPane {
         let Some(id) = self.selected_id() else {
             return;
         };
-        let Some((col, row)) = self.grid_cell_at(event.position, window) else {
+        let Some(GridPoint { col, row, edge }) = self.grid_point_at(event.position, window) else {
             return;
         };
         self.reset_qol_session(&id);
@@ -3626,14 +3734,28 @@ impl TerminalPane {
                 self.qol.hover = next;
                 cx.notify();
             }
+            let mark = self
+                .in_command_gutter(event.position)
+                .then(|| {
+                    self.residents
+                        .get(&id)
+                        .and_then(|resident| resident.element.command_output_marked_at(row))
+                })
+                .flatten()
+                .map(|_| row);
+            if self.qol.gutter_mark != mark {
+                self.qol.gutter_mark = mark;
+                cx.notify();
+            }
         } else {
             self.qol.hover = None;
+            self.qol.gutter_mark = None;
         }
         let selecting = self.residents.get(&id).is_some_and(|r| {
             r.pointer_owner == Some((MouseButton::Left, PointerOwner::LocalSelection))
         });
         if selecting {
-            self.update_selection_autoscroll(event.position, col, row, window, cx);
+            self.update_selection_autoscroll(event.position, col, edge, row, window, cx);
         }
         let (dispatch, attachment) = {
             let Some(resident) = self.residents.get_mut(&id) else {
@@ -3646,7 +3768,7 @@ impl TerminalPane {
                     .map(|(_, owner)| owner)
             });
             if owner == Some(PointerOwner::LocalSelection) {
-                resident.element.drag_selection(col, row);
+                resident.element.drag_selection_to_edge(col, edge, row);
                 cx.notify();
                 return;
             }
@@ -3888,7 +4010,41 @@ impl TerminalPane {
             return;
         }
 
-        let Some(text) = item.text() else {
+        // Files copied in Finder paste the way they drop: escaped paths a
+        // shell or an agent can use, uploaded first for a remote session.
+        // Finder's plain-text flavour is only the file's name. In Find the
+        // paths are just text for the query.
+        let copied_files = clipboard_paths(&item).filter(|_| {
+            self.residents
+                .get(&id)
+                .is_some_and(|resident| resident.find.is_none())
+        });
+        let text = if let Some(paths) = copied_files {
+            let destination = self.upload_destination(&id);
+            let plan = plan_terminal_drop(paths, destination.is_some());
+            if let Some(message) = plan.feedback() {
+                cx.emit(TerminalPaneEvent::ExternalDropFeedback { message });
+            }
+            match plan.action {
+                None => {
+                    record("files_refused", "files", 0, false);
+                    cx.stop_propagation();
+                    return;
+                }
+                Some(TerminalDropAction::Upload(files)) => {
+                    record("files_upload", "files", 0, false);
+                    if let Some(destination) = destination {
+                        self.upload_files(destination, files);
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                Some(TerminalDropAction::Paste(text)) => text,
+            }
+        } else if let Some(text) = item.text() {
+            text
+        } else {
             record("no_text", "other", 0, false);
             return;
         };
@@ -4128,11 +4284,33 @@ impl TerminalPane {
             cx.propagate();
             return;
         }
-        let option = OptionKey::for_layout(cx.keyboard_layout().id());
-        let Some((term_event, modifiers)) = terminal_key_event(event, option) else {
+        let option_choice = self
+            .runtime
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .terminal_option_as_meta;
+        let option = OptionKey::resolve(
+            option_choice,
+            cx.keyboard_layout().id(),
+            physical_modifier_flags(),
+        );
+        // A release reuses its press's reading: a key-up carries no flags.
+        self.last_option_key = option;
+        let Some(mapped) = terminal_key_event(event, option) else {
             cx.propagate();
             return;
         };
+        let (term_event, modifiers) = kitty_key_event(event, resident.keyboard, mapped);
+        if reports_key_releases(resident.keyboard) {
+            remember_held_key(
+                &mut self.held_keys,
+                &event.keystroke,
+                &term_event,
+                modifiers.shift,
+            );
+        }
         let bytes = match diri_term::keys::encode_interactive_action(
             &term_event,
             modifiers,
@@ -4181,6 +4359,54 @@ impl TerminalPane {
     fn handle_key_up(&mut self, event: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if matches!(event.keystroke.key.as_str(), "control" | "ctrl")
             && self.finish_switcher_modifiers(false)
+        {
+            cx.notify();
+        }
+        self.send_key_release(event, cx);
+    }
+
+    /// A program that asked for key event types (kitty flag 2) is told when
+    /// a key it saw pressed is released. Nothing is sent otherwise.
+    fn send_key_release(&mut self, event: &KeyUpEvent, cx: &mut Context<Self>) {
+        if self
+            .navigation
+            .as_ref()
+            .is_some_and(|navigation| navigation.read(cx).is_open())
+            || self
+                .utility_surfaces
+                .as_ref()
+                .is_some_and(|surfaces| surfaces.read(cx).is_open())
+            || event.keystroke.modifiers.platform
+        {
+            return;
+        }
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        let Some(resident) = self.residents.get_mut(&id) else {
+            return;
+        };
+        let held = take_held_key(&mut self.held_keys, &event.keystroke);
+        if !reports_key_releases(resident.keyboard) || resident.find.is_some() {
+            return;
+        }
+        let option = self.last_option_key;
+        let Some((mut term_event, mut modifiers)) =
+            terminal_keystroke_event(&event.keystroke, option)
+        else {
+            return;
+        };
+        if let Some((pressed, shift)) = held {
+            term_event = pressed;
+            modifiers.shift |= shift;
+        }
+        if let Ok(bytes) = diri_term::keys::encode_interactive_action(
+            &term_event,
+            modifiers,
+            resident.keyboard,
+            diri_term::keys::KeyAction::Release,
+        ) && !bytes.is_empty()
+            && resident.send_user_input(bytes)
         {
             cx.notify();
         }
@@ -4293,22 +4519,49 @@ impl TerminalPane {
                 .preferences(),
         );
         let metrics = typeface.metrics(window);
-        let viewport = self.viewport.unwrap_or_default();
-        let grid_x = viewport.x + GRID_HORIZONTAL_PADDING / 2.0;
-        let grid_y = viewport.y + self.header_height() + 2.0;
-        let col = ((f32::from(event.position.x) - grid_x) / f32::from(metrics.cell_width))
-            .floor()
-            .max(0.0) as u16;
-        let row = ((f32::from(event.position.y) - grid_y) / f32::from(metrics.line_height))
-            .floor()
-            .max(0.0) as u16;
-        let delta = match event.delta {
-            ScrollDelta::Pixels(point) => WheelDelta::PrecisePoints(f32::from(point.y)),
-            ScrollDelta::Lines(point) => WheelDelta::Lines(point.y),
+        // The same cell a click there would report (bottom-anchored grids and
+        // a reading view between rows included), clamped to the grid.
+        let (col, row) = self
+            .grid_cell_at(event.position, window)
+            .map_or((0, 0), |(col, row)| (col as u16, row as u16));
+        let (sideways, delta) = match event.delta {
+            ScrollDelta::Pixels(point) => (
+                WheelDelta::PrecisePoints(f32::from(point.x)),
+                WheelDelta::PrecisePoints(f32::from(point.y)),
+            ),
+            ScrollDelta::Lines(point) => (WheelDelta::Lines(point.x), WheelDelta::Lines(point.y)),
         };
+        let vertical = match delta {
+            WheelDelta::PrecisePoints(delta) | WheelDelta::Lines(delta) => delta,
+        };
+        let modifiers = terminal_mouse_modifiers(&event.modifiers);
         let Some(resident) = self.residents.get_mut(&id) else {
             return;
         };
+        let mouse = resident.element.mouse_modes();
+        // A program that reads the mouse gets wheel reports encoded here,
+        // like its clicks, so they carry the modifiers and the sideways axis.
+        // Everything else (alternate-scroll arrows, a Holder whose mode
+        // details are unknown) is encoded by the session's own screen.
+        let reports = mouse.is_reporting() && mouse.has_known_details();
+        let mut sent = false;
+        if reports
+            && let Some(steps) =
+                resident
+                    .horizontal_wheel
+                    .steps(sideways, vertical, f32::from(metrics.cell_width))
+        {
+            let wheel = if steps > 0 {
+                TerminalMouseEvent::WheelLeft
+            } else {
+                TerminalMouseEvent::WheelRight
+            };
+            let count = steps.unsigned_abs() as usize;
+            resident
+                .attachment
+                .mouse(encode_mouse_wheel(mouse, wheel, modifiers, col, row, count));
+            sent = true;
+        }
         let visible_rows = resident.last_size.1.max(1);
         let route = resident.element.route_wheel(WheelEvent {
             delta,
@@ -4323,10 +4576,31 @@ impl TerminalPane {
                 lines,
                 col,
                 row,
+            }) if reports => {
+                let wheel = if direction == 0 {
+                    TerminalMouseEvent::WheelUp
+                } else {
+                    TerminalMouseEvent::WheelDown
+                };
+                resident.attachment.mouse(encode_mouse_wheel(
+                    mouse,
+                    wheel,
+                    modifiers,
+                    col,
+                    row,
+                    usize::from(lines),
+                ));
+            }
+            Some(WheelRoute::Daemon {
+                direction,
+                lines,
+                col,
+                row,
             }) => resident.attachment.scroll(direction, lines, col, row),
             Some(WheelRoute::Local { .. }) => {
                 self.pump_scrollback_fetch(&id, usize::from(visible_rows));
             }
+            None if sent => {}
             None => return,
         }
         cx.stop_propagation();
@@ -4398,6 +4672,14 @@ impl TerminalPane {
             let previous = resident.last_size;
             let first_measure = previous == (0, 0);
             resident.last_size = size;
+            // Only the main pane's real viewport, never the full-window launch
+            // guess or a split's share of it, sizes the window's next tab.
+            if matches!(self.session_source, SessionSource::FollowSelection)
+                && self.viewport.is_some()
+                && let Some(window_store) = &self.window_store
+            {
+                window_store.note_terminal_grid(size);
+            }
             let now = Instant::now();
             let since_sent = self.last_resize_sent.map(|at| now.duration_since(at));
             let delay = match plan_resize(first_measure, since_sent, self.resize_flush_armed) {
@@ -4597,6 +4879,15 @@ impl TerminalPane {
                         window.dispatch_action(Box::new(ToggleSidebar), cx);
                         cx.stop_propagation();
                     }))
+                    .shortcut_tooltip(
+                        if horizontal {
+                            t("terminal.toggle_top_bar")
+                        } else {
+                            t("terminal.show_sidebar")
+                        },
+                        Some(crate::commands::CommandId::ToggleSidebar),
+                        colors,
+                    )
                     .into_any_element(),
                 "show-sidebar",
                 crate::held_hints::label(crate::commands::CommandId::ToggleSidebar),
@@ -4659,16 +4950,7 @@ impl TerminalPane {
                             .then(|| self.render_origin_note(session, colors))
                             .flatten(),
                     )
-                    .child(
-                        div()
-                            .min_w(px(0.0))
-                            .flex_1()
-                            .text_ellipsis()
-                            .text_size(px(Typo::TITLE.size))
-                            .font_weight(Typo::TITLE.weight)
-                            .text_color(colors.primary)
-                            .child(session.title.clone()),
-                    )
+                    .child(self.render_header_title(session, colors, cx))
                     .children(self.render_read_aloud_toggle(session, colors, cx))
                     .child(self.render_session_links_trigger(session, colors, cx)),
             )
@@ -4687,6 +4969,67 @@ impl TerminalPane {
                     .when(shell_controls, |trailing| {
                         trailing
                             .children(self.render_inspector_toggle(colors, self.held_hint))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// The pane's title. In a split tab the text itself is the handle that
+    /// drags the pane to another place, tab or a tab of its own; the rest
+    /// of the title bar still moves the window.
+    fn render_header_title(
+        &self,
+        session: &SessionRecord,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let text = div()
+            .min_w(px(0.0))
+            .overflow_hidden()
+            .text_ellipsis()
+            .text_size(px(Typo::TITLE.size))
+            .font_weight(Typo::TITLE.weight)
+            .text_color(colors.primary)
+            .child(session.title.clone());
+        let Some(source) = self.pane_drag.clone() else {
+            return div()
+                .min_w(px(0.0))
+                .flex_1()
+                .child(text)
+                .into_any_element();
+        };
+        let payload = crate::pane_drag::DraggedPane {
+            title: session.title.clone().into(),
+            ..source
+        };
+        let selector = format!("pane-drag-handle-{}", payload.pane.0);
+        div()
+            .min_w(px(0.0))
+            .flex_1()
+            .flex()
+            .items_center()
+            .child(
+                text.id("pane-drag-handle")
+                    .debug_selector(move || selector.clone())
+                    .flex_shrink(1.0)
+                    // The title belongs to the pane, not the window: a drag
+                    // that starts here moves the pane, never the window.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.focus(window, cx);
+                        }),
+                    )
+                    .on_drag(payload, |dragged, _, _, cx| {
+                        cx.set_global(crate::pane_drag::PaneDragState {
+                            source: Some(dragged.clone()),
+                            landing: cx
+                                .try_global::<crate::pane_drag::PaneDragState>()
+                                .and_then(|state| state.landing.clone()),
+                            ..Default::default()
+                        });
+                        cx.new(|_| dragged.clone())
                     }),
             )
             .into_any_element()
@@ -4794,13 +5137,11 @@ impl TerminalPane {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.reset_qol_session(&session.id);
-        let hide_pointer = self
-            .runtime
-            .store
-            .read()
-            .expect("store")
-            .preferences()
-            .terminal_hide_pointer;
+        let (hide_pointer, cursor_preferences) = {
+            let store = self.runtime.store.read().expect("store");
+            let prefs = store.preferences();
+            (prefs.terminal_hide_pointer, prefs.cursor_preferences())
+        };
         if self.focus.is_focused(window) {
             cx.set_cursor_hide_mode(if hide_pointer {
                 gpui::CursorHideMode::OnTyping
@@ -4835,6 +5176,13 @@ impl TerminalPane {
             }
             return centered_message(t("terminal.preparing"), "", colors).into_any_element();
         };
+        #[cfg(target_os = "macos")]
+        crate::macos::sync_terminal_accessibility(
+            window,
+            &resident.element,
+            self.focus.is_focused(window),
+            crate::switcher::display_title_str(session),
+        );
         let element = resident
             .element
             .clone()
@@ -4850,6 +5198,7 @@ impl TerminalPane {
             .line_height_scale(typeface.line_height)
             .focus_handle(self.focus.clone())
             .reduce_motion(cx.reduce_motion())
+            .cursor_preferences(cursor_preferences)
             .hovered_reference(self.qol.hit.clone());
         let element = if self.qol.copy_mode.is_some()
             || self.qol.paste.is_some()
@@ -4884,7 +5233,7 @@ impl TerminalPane {
             .pt(px(2.0))
             .pb(px(10.0))
             .px(px(12.0))
-            .cursor(if self.qol.hit.is_some() {
+            .cursor(if self.qol.hit.is_some() || self.qol.gutter_mark.is_some() {
                 gpui::CursorStyle::PointingHand
             } else {
                 gpui::CursorStyle::IBeam
@@ -4893,6 +5242,7 @@ impl TerminalPane {
                 if !hovered {
                     this.qol.hover = None;
                     this.qol.hit = None;
+                    this.qol.gutter_mark = None;
                     this.qol.hover_key_clear();
                     cx.notify();
                 }
@@ -5560,24 +5910,26 @@ impl TerminalPane {
         if crate::alerts::enabled(cx) {
             self.sync_paste_prompt(window, cx);
         }
-        let (theme, colors, sidebar_colors, typeface) = {
+        let (theme, colors, sidebar_colors, typeface, chrome_look) = {
             let store = self
                 .runtime
                 .store
                 .read()
                 .expect("session store lock poisoned");
+            let colors = crate::app_theme::colors_in(&store);
             (
                 crate::app_theme::terminal_theme_in(&store),
-                crate::app_theme::colors_in(&store),
+                colors,
                 crate::app_theme::sidebar_colors_in(&store),
                 TerminalType::from_prefs(store.preferences()),
+                crate::chrome_focus::look_in(&store, colors.appearance, window),
             )
         };
         self.sync_status_glyphs(colors, window, cx);
         self.update_selected_geometry(window, cx);
         self.main_viewport = window.viewport_size();
         self.held_hint = crate::held_hints::opacity(window, cx);
-        self.title_opacity = crate::window_chrome::title_row_opacity(window);
+        self.title_opacity = crate::window_chrome::title_row_opacity(window, chrome_look);
 
         let selected = self.selected_session();
 
@@ -5737,6 +6089,18 @@ impl TerminalPane {
                 },
             ))
             .on_action(
+                cx.listener(|this, _: &crate::commands::ClearScrollback, window, cx| {
+                    this.clear_scrollback(window, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::ResetTerminal, window, cx| {
+                    this.reset_terminal(window, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_action(
                 cx.listener(|this, _: &crate::commands::NextPrompt, window, cx| {
                     this.read_terminal_history(Some(true), window, cx);
                     cx.stop_propagation();
@@ -5749,6 +6113,27 @@ impl TerminalPane {
             .children(drop_overlay)
             .children(crate::perf_overlay::badge("terminal"))
     }
+}
+
+/// A pointer position on the grid: the cell under it, and the column
+/// boundary nearest it (`0..=cols`), where a character selection starts or
+/// ends. A cell is selected once the pointer passes its middle, as in xterm
+/// and Ghostty, and the right edge of the last column is reachable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GridPoint {
+    col: usize,
+    row: usize,
+    edge: usize,
+}
+
+/// The cell under a pointer `x` pixels into the grid, and the column
+/// boundary nearest it, both before clamping to the grid.
+fn pointer_columns(x: f32, cell_width: f32) -> (usize, usize) {
+    let columns = x / cell_width;
+    (
+        columns.floor().max(0.0) as usize,
+        columns.round().max(0.0) as usize,
+    )
 }
 
 fn clamp_grid_cell(col: usize, row: usize, cols: u16, rows: u16) -> Option<(u16, u16)> {
@@ -5798,6 +6183,12 @@ fn pointer_owner(
         } else {
             PointerOwner::Ignored
         };
+    }
+    // Shift-drag selects locally even while a program reads the mouse, the
+    // xterm convention. Only the left button: Shift with the others is still
+    // reported to the program with its modifier bit.
+    if modifiers.shift && button == MouseButton::Left {
+        return PointerOwner::LocalSelection;
     }
     if mouse.is_reporting() && mouse.has_known_details() && terminal_mouse_button(button).is_some()
     {
@@ -6044,7 +6435,41 @@ enum OptionKey {
     Compose,
 }
 
+/// macOS's device-dependent modifier bits telling which Option is held
+/// (`NX_DEVICELALTKEYMASK`, `NX_DEVICERALTKEYMASK`).
+const LEFT_OPTION_FLAG: u64 = 0x20;
+const RIGHT_OPTION_FLAG: u64 = 0x40;
+
 impl OptionKey {
+    /// The Settings choice for this keystroke. `physical` is the raw
+    /// modifier flags of the key event being dispatched, which carry the
+    /// left/right Option bits GPUI's modifiers fold together; without them
+    /// (a replayed event) a one-sided choice falls back to the layout rule.
+    fn resolve(
+        choice: crate::store::OptionAsMeta,
+        layout_id: &str,
+        physical: Option<u64>,
+    ) -> Self {
+        use crate::store::OptionAsMeta;
+        let side = match choice {
+            OptionAsMeta::Automatic => return Self::for_layout(layout_id),
+            OptionAsMeta::Both => return Self::Meta,
+            OptionAsMeta::Off => return Self::Compose,
+            OptionAsMeta::Left => LEFT_OPTION_FLAG,
+            OptionAsMeta::Right => RIGHT_OPTION_FLAG,
+        };
+        match physical {
+            Some(flags) if flags & (LEFT_OPTION_FLAG | RIGHT_OPTION_FLAG) != 0 => {
+                if flags & side != 0 {
+                    Self::Meta
+                } else {
+                    Self::Compose
+                }
+            }
+            _ => Self::for_layout(layout_id),
+        }
+    }
+
     fn for_layout(layout_id: &str) -> Self {
         // Off macOS, Alt is a real Alt key; AltGr composition arrives without
         // the alt modifier.
@@ -6078,22 +6503,140 @@ fn option_meta_text(keystroke: &gpui::Keystroke) -> String {
     key.to_owned()
 }
 
+/// Raw modifier flags of the key event dispatching right now, if any.
+fn physical_modifier_flags() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        gpui_macos::current_physical_key().map(|(_, flags)| flags)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 fn terminal_key_event(
     event: &KeyDownEvent,
     option: OptionKey,
 ) -> Option<(TermKeyEvent, TermModifiers)> {
-    let keystroke = &event.keystroke;
+    #[cfg(target_os = "macos")]
+    if let Some(keypad) = crate::macos::terminal_keys::keypad_event(event) {
+        let modifiers = &event.keystroke.modifiers;
+        return Some((
+            keypad,
+            TermModifiers {
+                shift: modifiers.shift,
+                ctrl: modifiers.control,
+                alt: modifiers.alt,
+                cmd: modifiers.platform,
+            },
+        ));
+    }
+    terminal_keystroke_event(&event.keystroke, option)
+}
+
+/// The same key with its layout characters, for a program that negotiated
+/// kitty flags. Only then is the layout looked up, so legacy typing pays
+/// nothing for it.
+fn kitty_key_event(
+    event: &KeyDownEvent,
+    keyboard: Option<diri_term::keys::KeyboardState>,
+    mapped: (TermKeyEvent, TermModifiers),
+) -> (TermKeyEvent, TermModifiers) {
+    #[cfg(target_os = "macos")]
+    {
+        let kitty = keyboard
+            .and_then(|keyboard| keyboard.enhancements)
+            .is_some_and(|flags| flags.bits() & 0b1011 != 0);
+        if kitty && let Some((unshifted, shifted)) = crate::macos::terminal_keys::layout_chars(event)
+        {
+            let (mut term_event, mut modifiers) = mapped;
+            apply_key_layout(&mut term_event, &mut modifiers, unshifted, shifted);
+            return (term_event, modifiers);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (event, keyboard);
+    mapped
+}
+
+fn reports_key_releases(keyboard: Option<diri_term::keys::KeyboardState>) -> bool {
+    keyboard
+        .and_then(|keyboard| keyboard.enhancements)
+        .is_some_and(|flags| {
+            flags.contains(diri_proto::terminal_input::enhanced::KeyboardEnhancements::EVENT_TYPES)
+        })
+}
+
+/// Held keys are few; a lost key-up (focus moved mid-press) must not grow
+/// the list, so it keeps only the most recent presses.
+const HELD_KEY_LIMIT: usize = 8;
+
+fn remember_held_key(
+    held: &mut Vec<(String, TermKeyEvent, bool)>,
+    keystroke: &gpui::Keystroke,
+    event: &TermKeyEvent,
+    shift: bool,
+) {
+    held.retain(|(key, ..)| *key != keystroke.key);
+    if held.len() == HELD_KEY_LIMIT {
+        held.remove(0);
+    }
+    held.push((keystroke.key.clone(), event.clone(), shift));
+}
+
+fn take_held_key(
+    held: &mut Vec<(String, TermKeyEvent, bool)>,
+    keystroke: &gpui::Keystroke,
+) -> Option<(TermKeyEvent, bool)> {
+    let index = held.iter().position(|(key, ..)| *key == keystroke.key)?;
+    let (_, event, shift) = held.remove(index);
+    Some((event, shift))
+}
+
+/// Records what the layout types on a character key with and without Shift.
+/// GPUI resolves Shift into the logical key for non-letters (`@`, Shift
+/// cleared), which legacy encoding wants (Ctrl-@ is NUL), but the kitty
+/// protocol names the unshifted key with a Shift modifier (Ctrl-Shift-2 is
+/// `CSI 50;6u`). A key the layout does not account for (a Command-layout
+/// fallback) is left alone.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn apply_key_layout(
+    event: &mut TermKeyEvent,
+    modifiers: &mut TermModifiers,
+    unshifted: char,
+    shifted: char,
+) {
+    let TermKey::Character(logical) = &event.key else {
+        return;
+    };
+    let mut chars = logical.chars();
+    let Some(key) = chars.next().filter(|_| chars.next().is_none()) else {
+        return;
+    };
+    if key == shifted && shifted != unshifted {
+        modifiers.shift = true;
+    } else if key != unshifted {
+        return;
+    }
+    event.layout = diri_term::keys::KeyLayout {
+        unshifted: Some(unshifted),
+        shifted: Some(shifted),
+    };
+}
+
+/// The terminal key a keystroke names, for presses and releases alike.
+fn terminal_keystroke_event(
+    keystroke: &gpui::Keystroke,
+    option: OptionKey,
+) -> Option<(TermKeyEvent, TermModifiers)> {
     let mut modifiers = TermModifiers {
         shift: keystroke.modifiers.shift,
         ctrl: keystroke.modifiers.control,
         alt: keystroke.modifiers.alt,
         cmd: keystroke.modifiers.platform,
     };
-    #[cfg(target_os = "macos")]
-    if let Some(keypad) = crate::macos::terminal_keys::keypad_event(event) {
-        return Some((keypad, modifiers));
-    }
-    let named = match event.keystroke.key.as_str() {
+    let named = match keystroke.key.as_str() {
         "up" => Some(NamedKey::ArrowUp),
         "down" => Some(NamedKey::ArrowDown),
         "right" => Some(NamedKey::ArrowRight),
@@ -6120,6 +6663,18 @@ fn terminal_key_event(
         "f10" => Some(NamedKey::F10),
         "f11" => Some(NamedKey::F11),
         "f12" => Some(NamedKey::F12),
+        "f13" => Some(NamedKey::F13),
+        "f14" => Some(NamedKey::F14),
+        "f15" => Some(NamedKey::F15),
+        "f16" => Some(NamedKey::F16),
+        "f17" => Some(NamedKey::F17),
+        "f18" => Some(NamedKey::F18),
+        "f19" => Some(NamedKey::F19),
+        "f20" => Some(NamedKey::F20),
+        "f21" => Some(NamedKey::F21),
+        "f22" => Some(NamedKey::F22),
+        "f23" => Some(NamedKey::F23),
+        "f24" => Some(NamedKey::F24),
         _ => None,
     };
     if let Some(named) = named {
@@ -6156,6 +6711,7 @@ fn terminal_key_event(
         TermKeyEvent {
             key: TermKey::Character(logical),
             text: Some(text),
+            layout: Default::default(),
         },
         modifiers,
     ))
@@ -6280,6 +6836,14 @@ fn estimated_grid_size(
     )
 }
 
+/// The files a Finder copy put on the pasteboard, if any.
+fn clipboard_paths(item: &ClipboardItem) -> Option<&[std::path::PathBuf]> {
+    item.entries().iter().find_map(|entry| match entry {
+        ClipboardEntry::ExternalPaths(paths) if !paths.paths().is_empty() => Some(paths.paths()),
+        _ => None,
+    })
+}
+
 fn clipboard_image(item: &ClipboardItem) -> Option<(&[u8], &'static str)> {
     item.entries().iter().find_map(|entry| match entry {
         ClipboardEntry::Image(image) => Some((image.bytes.as_slice(), image.format.extension())),
@@ -6297,6 +6861,20 @@ fn exit_description(session: &SessionRecord) -> String {
     let SessionStatus::Exited(info) = &session.status else {
         return t("terminal.exit.session_ended").to_owned();
     };
+    if session.command_run.is_some() {
+        // A command's own status, as a shell would show it: a kill is not
+        // an Agent being interrupted, and the signal is the reason.
+        match (info.reason, info.code, info.signal) {
+            (ExitReason::Exited, Some(0), _) => return t("terminal.exit.command_exited").to_owned(),
+            (ExitReason::Exited, Some(code), _) => {
+                return tf("terminal.exit.command_exited_code", &[("code", &code)]);
+            }
+            (ExitReason::Signaled, _, Some(signal)) => {
+                return tf("terminal.exit.command_killed", &[("signal", &signal)]);
+            }
+            _ => {}
+        }
+    }
     if info.interrupted {
         // Killed from outside (a force-quit, memory pressure), not finished:
         // the session comes back on its own, so don't blame the Agent.
@@ -6334,7 +6912,10 @@ struct TerminalType {
 impl TerminalType {
     fn from_prefs(prefs: &crate::store::Prefs) -> Self {
         Self {
-            font: crate::fonts::terminal_font(&prefs.terminal_font_family),
+            font: crate::fonts::terminal_font(
+                &prefs.terminal_font_family,
+                prefs.terminal_ligatures,
+            ),
             size: prefs.terminal_font_size,
             line_height: prefs.terminal_line_height,
         }
@@ -6484,6 +7065,7 @@ mod tests {
             cursor_visible: true,
             is_full_snapshot: true,
             changed_rows: vec![ChangedRow::new(0, first_cells)],
+            cursor_style: Default::default(),
         };
         let mut final_cells = vec![GridCell::BLANK; 2];
         final_cells[1].scalar = u32::from('b');
@@ -6495,6 +7077,7 @@ mod tests {
             cursor_visible: false,
             is_full_snapshot: false,
             changed_rows: vec![ChangedRow::new(0, final_cells.clone())],
+            cursor_style: Default::default(),
         };
 
         assert!(
@@ -6771,6 +7354,20 @@ mod tests {
     }
 
     #[test]
+    fn a_drag_selects_a_cell_past_its_middle_and_reaches_the_last_column() {
+        // 10 px cells on a 6-column grid.
+        let edge = |x: f32| pointer_columns(x, 10.0).1.min(6);
+        let cell = |x: f32| clamp_grid_cell(pointer_columns(x, 10.0).0, 0, 6, 1).unwrap().0;
+        assert_eq!((cell(14.0), edge(14.0)), (1, 1), "left half: cell 1 not yet in");
+        assert_eq!((cell(16.0), edge(16.0)), (1, 2), "right half: cell 1 joins");
+        // The right half of the last cell, and past the grid, end after it;
+        // a cell-floor end could never include column 5.
+        assert_eq!((cell(57.0), edge(57.0)), (5, 6));
+        assert_eq!((cell(90.0), edge(90.0)), (5, 6));
+        assert_eq!(edge(-4.0), 0);
+    }
+
+    #[test]
     fn pointer_ownership_preserves_local_escape_hatches_and_reporting_off() {
         let plain = Modifiers::default();
         let option = Modifiers {
@@ -6837,6 +7434,24 @@ mod tests {
             PointerOwner::LocalSelection,
             "an old remote Holder must not receive a guessed click encoding"
         );
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            pointer_owner(reporting, MouseButton::Left, &shift),
+            PointerOwner::LocalSelection,
+            "Shift-drag selects locally over a mouse-reporting program"
+        );
+        assert_eq!(
+            pointer_owner(reporting, MouseButton::Right, &shift),
+            PointerOwner::Terminal,
+            "Shift with another button is still reported, with its bit"
+        );
+        assert_eq!(
+            pointer_owner(reporting, MouseButton::Middle, &shift),
+            PointerOwner::Terminal
+        );
     }
 
     #[test]
@@ -6858,6 +7473,7 @@ mod tests {
             cursor_visible: true,
             is_full_snapshot: true,
             changed_rows: vec![diri_proto::grid::ChangedRow::new(0, cells)],
+            cursor_style: Default::default(),
         });
         let option = Modifiers {
             alt: true,
@@ -6882,6 +7498,23 @@ mod tests {
         assert_eq!(clamp_grid_cell(usize::MAX, 100, 80, 24), Some((79, 23)));
         assert_eq!(clamp_grid_cell(0, 0, 0, 24), None);
         assert_eq!(clamp_grid_cell(0, 0, 80, 0), None);
+    }
+
+    #[test]
+    fn a_press_is_not_followed_by_a_drag_inside_its_own_cell() {
+        let started = Instant::now();
+        let mut limiter = MouseMotionLimiter::default();
+        limiter.pressed_at((4, 2));
+        assert_eq!(
+            limiter.push(started, (4, 2), b"jitter".to_vec()),
+            MotionDispatch::None,
+            "xterm reports motion only when the pointer changes cell"
+        );
+        assert_eq!(
+            limiter.push(started, (5, 2), b"drag".to_vec()),
+            MotionDispatch::SendNow(b"drag".to_vec()),
+            "the first real move is not held back by the cadence"
+        );
     }
 
     #[test]
@@ -7065,6 +7698,7 @@ mod tests {
             cursor_visible: true,
             is_full_snapshot: full,
             changed_rows: Vec::new(),
+            cursor_style: Default::default(),
         }
     }
 
@@ -7083,6 +7717,7 @@ mod tests {
             changed_rows: (0..ROWS)
                 .map(|row| ChangedRow::new(row, vec![cell; usize::from(COLS)]))
                 .collect(),
+            cursor_style: Default::default(),
         }
     }
 
@@ -7808,6 +8443,20 @@ mod tests {
                         ).as_bytes());
                         grid = screen.full_snapshot();
                     }
+                    if scene == "weights" {
+                        // SGR 1 and SGR 2 apart and together, then the way
+                        // an agent mixes them, in default text and colour.
+                        let mut screen = diri_engine::HeadlessScreen::new(60, 10);
+                        screen.feed(concat!(
+                            "normal \x1b[1mbold\x1b[0m \x1b[2mfaint\x1b[0m \x1b[1;2mboth\x1b[0m\r\n",
+                            "\x1b[32mnormal \x1b[1mbold\x1b[0m\x1b[32m \x1b[2mfaint\x1b[0m\x1b[32m \x1b[1;2mboth\x1b[0m\r\n",
+                            "\r\n",
+                            "\x1b[32m●\x1b[0m \x1b[1mUpdate\x1b[0m(crates/diri-term/src/metrics.rs)\r\n",
+                            "  ⎿  \x1b[2mUpdated with 3 additions and 1 removal\x1b[0m\r\n",
+                            "\x1b[1mTotal cost:\x1b[0m $0.42  \x1b[2m(ctrl+o to expand)\x1b[0m",
+                        ).as_bytes());
+                        grid = screen.full_snapshot();
+                    }
                     if scene.starts_with("commands") {
                         // A shell with OSC 133 marks: two commands that
                         // passed, one that failed, and one still running.
@@ -7945,6 +8594,21 @@ mod tests {
                             let resident = pane.residents.get(&id).unwrap();
                             let output = resident.element.command_output_at(10, 4).unwrap();
                             resident.element.select_range(output.start, output.end);
+                        }
+                        "commands-gutter" => {
+                            // A click on the failed `git push`'s red mark.
+                            let row = (0..16)
+                                .find(|&row| {
+                                    pane.residents[&id]
+                                        .element
+                                        .command_output_marked_at(row)
+                                        .is_some_and(|output| {
+                                            output.status == diri_proto::grid::CommandEnd::Failed
+                                        })
+                                })
+                                .unwrap();
+                            assert!(pane.select_marked_command_output(&id, row));
+                            pane.qol.gutter_mark = Some(row);
                         }
                         "commands-menu" => pane.open_terminal_menu(
                             gpui::point(px(220.0), px(110.0)),
@@ -8314,11 +8978,13 @@ mod tests {
             .unwrap();
     }
 
-    /// A keystroke's echo is drawn without waiting for the display's next
-    /// refresh; ordinary output, and output after the echo, keep the display
-    /// link as their only pacer.
+    /// The first frame of new output is drawn without waiting for the
+    /// display's next refresh, whether or not anyone typed for it; the
+    /// platform decides whether a recent frame makes that unsafe, which keeps
+    /// streams on the display link. An update that changed nothing, or one for
+    /// a session that is not on screen, asks for nothing.
     #[gpui::test]
-    fn only_a_keystroke_echo_asks_for_an_immediate_frame(cx: &mut TestAppContext) {
+    fn visible_output_asks_for_an_immediate_frame(cx: &mut TestAppContext) {
         let runtime = Arc::new(StoreRuntime::inert());
         let tokio = Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -8348,36 +9014,36 @@ mod tests {
         let requests = |cx: &mut gpui::VisualTestContext| {
             cx.update(|window, _| window.immediate_frame_requests())
         };
-        let damage = |changed: bool, cx: &mut gpui::VisualTestContext| {
+        let damage = |id: &SessionId, changed: bool, cx: &mut gpui::VisualTestContext| {
             sender
                 .send(PaneEvent::ControllerDamage(id.clone(), generation, changed))
                 .expect("the pane listens for output");
             cx.run_until_parked();
         };
 
-        damage(true, cx);
-        assert_eq!(
-            requests(cx),
-            0,
-            "output nobody typed for waits for the display"
-        );
-
-        pane.read_with(cx, |pane, _| {
-            pane.residents[&id].attachment.note_echo_due_for_test()
-        });
-        damage(false, cx);
+        damage(&id, false, cx);
         assert_eq!(
             requests(cx),
             0,
             "an update that changed nothing draws nothing"
         );
-        damage(true, cx);
-        assert_eq!(requests(cx), 1, "the echo is drawn at once");
-        damage(true, cx);
+        damage(&id, true, cx);
         assert_eq!(
             requests(cx),
             1,
-            "what follows the echo is paced by the display"
+            "output nobody typed for is drawn at once, like an echo"
+        );
+        damage(&id, true, cx);
+        assert_eq!(
+            requests(cx),
+            2,
+            "every change asks; the platform paces a stream"
+        );
+        damage(&SessionId("offscreen".into()), true, cx);
+        assert_eq!(
+            requests(cx),
+            2,
+            "a session that is not on screen draws nothing"
         );
     }
 
@@ -8589,6 +9255,85 @@ mod tests {
         (pane, id, cx)
     }
 
+    /// Wheel bytes a reference xterm-compatible emulator sends a program,
+    /// recorded from that program's raw input: modifiers ride on the wheel
+    /// button, and a sideways wheel is buttons 66/67.
+    #[gpui::test]
+    fn wheel_reports_carry_modifiers_and_the_sideways_axis(cx: &mut TestAppContext) {
+        let (pane, id, cx) = drop_target_pane(cx);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let lines = |x: f32, y: f32| gpui::ScrollDelta::Lines(gpui::point(x, y));
+        let event = |delta, modifiers| gpui::ScrollWheelEvent {
+            position: gpui::point(px(200.0), px(150.0)),
+            delta,
+            modifiers,
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+        let control = Modifiers {
+            control: true,
+            ..Modifiers::default()
+        };
+        let shift_option = Modifiers {
+            shift: true,
+            alt: true,
+            ..Modifiers::default()
+        };
+        pane.update_in(cx, |pane, window, cx| {
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.attachment.mouse_observer = Some(tx);
+            resident.element.set_modes(
+                true,
+                MouseModes::new(
+                    diri_proto::terminal::MouseTrackingMode::ButtonEvents,
+                    diri_proto::terminal::MouseEncoding::Sgr,
+                ),
+            );
+            for (delta, modifiers) in [
+                (lines(0.0, 1.0), Modifiers::default()),
+                (lines(0.0, -1.0), control),
+                (lines(0.0, 1.0), shift_option),
+                (lines(1.0, 0.0), Modifiers::default()),
+                (lines(-1.0, 0.0), control),
+                (lines(0.2, 1.0), Modifiers::default()),
+            ] {
+                pane.handle_scroll(&event(delta, modifiers), window, cx);
+            }
+            // The legacy encoding carries the same buttons.
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.element.set_modes(
+                true,
+                MouseModes::new(
+                    diri_proto::terminal::MouseTrackingMode::ButtonEvents,
+                    diri_proto::terminal::MouseEncoding::Legacy,
+                ),
+            );
+            pane.handle_scroll(&event(lines(-1.0, 0.0), Modifiers::default()), window, cx);
+            // A program that does not read the mouse: the alternate screen's
+            // wheel goes to the session, which turns it into arrow keys.
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.element.set_modes(true, MouseModes::OFF);
+            pane.handle_scroll(&event(lines(0.0, -1.0), control), window, cx);
+            pane.handle_scroll(&event(lines(1.0, 0.0), Modifiers::default()), window, cx);
+        });
+        let sent: Vec<Vec<u8>> = rx.try_iter().collect();
+        let expected: Vec<&[u8]> = vec![
+            b"\x1b[<64;1;1M",
+            b"\x1b[<81;1;1M",
+            b"\x1b[<76;1;1M",
+            b"\x1b[<66;1;1M",
+            b"\x1b[<83;1;1M",
+            b"\x1b[<64;1;1M",
+            b"\x1b[Mc!!",
+            b"scroll 1 1 0 0",
+        ];
+        assert_eq!(
+            sent.iter().map(|bytes| bytes.as_slice()).collect::<Vec<_>>(),
+            expected,
+            "a mostly-vertical notch sends no sideways report, and only a \
+             reporting program gets a sideways wheel"
+        );
+    }
+
     #[gpui::test]
     fn files_dragged_over_a_pane_tick_on_arrival_and_again_when_taken(cx: &mut TestAppContext) {
         use gpui::FileDropEvent;
@@ -8707,6 +9452,98 @@ mod tests {
             events.try_recv().is_err(),
             "repeated rejection must not flood toasts"
         );
+    }
+
+    /// Links to other apps ask on the window's sheet; "Always Open" trusts
+    /// the scheme. Files the system opener would run always ask.
+    #[gpui::test]
+    fn app_links_and_runnable_files_ask_before_opening(cx: &mut TestAppContext) {
+        let launch = tempfile::tempdir().unwrap();
+        std::fs::write(launch.path().join("deploy.command"), "#!/bin/sh\n").unwrap();
+        std::fs::write(launch.path().join("notes.md"), "# notes").unwrap();
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let mut session = fixture_session();
+        session.host = None;
+        session.kind = ProtoAgentKind::SHELL;
+        session.cwd = launch.path().display().to_string();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session.clone());
+            store.select(session.id);
+            store
+                .update_preferences(|prefs| {
+                    prefs.terminal_file_editor = crate::store::FileEditor::DefaultApp;
+                })
+                .unwrap();
+        }
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        let open = |cx: &mut gpui::VisualTestContext, reference: TerminalReference| {
+            pane.update_in(cx, |pane, window, cx| pane.open_reference(reference, window, cx));
+            cx.run_until_parked();
+        };
+
+        // Web links open at once, as before.
+        open(cx, TerminalReference::Url("https://example.com".into()));
+        assert!(!cx.has_pending_prompt());
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com"));
+
+        // An app link waits for the sheet; Cancel opens nothing.
+        open(cx, TerminalReference::Url("ssh://forge".into()));
+        assert!(cx.has_pending_prompt(), "the sheet asks");
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com"));
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com"));
+
+        // Open opens once and trusts nothing.
+        open(cx, TerminalReference::Url("ssh://forge".into()));
+        cx.simulate_prompt_answer("Open");
+        cx.run_until_parked();
+        assert_eq!(cx.opened_url().as_deref(), Some("ssh://forge"));
+        open(cx, TerminalReference::Url("ssh://forge/2".into()));
+        assert!(cx.has_pending_prompt(), "still asks");
+
+        // Always Open trusts the scheme from then on.
+        cx.simulate_prompt_answer("Always Open ssh Links");
+        cx.run_until_parked();
+        assert_eq!(cx.opened_url().as_deref(), Some("ssh://forge/2"));
+        open(cx, TerminalReference::Url("ssh://other".into()));
+        assert!(!cx.has_pending_prompt());
+        assert_eq!(cx.opened_url().as_deref(), Some("ssh://other"));
+        pane.update_in(cx, |pane, _, _| {
+            let store = pane.runtime.store.read().unwrap();
+            let trusted = &store.preferences().terminal_trusted_link_schemes;
+            assert_eq!(trusted.iter().collect::<Vec<_>>(), ["ssh"]);
+        });
+        // Trust is per scheme.
+        open(cx, TerminalReference::Url("vscode://file/a.rs".into()));
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        // Refused schemes never open, and never ask.
+        open(cx, TerminalReference::Url("javascript:alert(1)".into()));
+        assert!(!cx.has_pending_prompt());
+        assert_eq!(cx.opened_url().as_deref(), Some("ssh://other"));
+
+        // A script the default app would run asks, with no Always.
+        open(cx, TerminalReference::File("deploy.command".into()));
+        assert!(cx.has_pending_prompt());
+        assert_eq!(cx.opened_url().as_deref(), Some("ssh://other"));
+        cx.simulate_prompt_answer("Open");
+        cx.run_until_parked();
+        assert!(cx.opened_url().unwrap().ends_with("/deploy.command"));
+        // A document does not.
+        open(cx, TerminalReference::File("notes.md".into()));
+        assert!(!cx.has_pending_prompt());
+        assert!(cx.opened_url().unwrap().ends_with("/notes.md"));
     }
 
     #[gpui::test]
@@ -9048,6 +9885,178 @@ mod tests {
         // The channel is live: a real keystroke still arrives.
         cx.simulate_keystrokes("a");
         assert_eq!(input.try_recv().unwrap(), (id.clone(), b"a".to_vec()));
+    }
+
+    /// History rows for a shell with prompts at rows 3 and 12, where the
+    /// command at row 3 printed rows 4 and 5 and failed.
+    fn prompted_history(rows: usize) -> Vec<Vec<GridCell>> {
+        (0..rows)
+            .map(|absolute| {
+                let mut cells = vec![GridCell::BLANK; 8];
+                let text = match absolute {
+                    3 | 12 => "$ make",
+                    4 => "error",
+                    5 => "stop",
+                    6 => "$",
+                    _ => "text",
+                };
+                for (cell, ch) in cells.iter_mut().zip(text.chars()) {
+                    cell.scalar = u32::from(ch);
+                }
+                match absolute {
+                    3 | 12 => cells[0].style |= TermStyle::PROMPT_START,
+                    4 => cells[0].style |= TermStyle::OUTPUT_START,
+                    6 => cells[0].style |= TermStyle::COMMAND_FAILED | TermStyle::PROMPT_START,
+                    _ => {}
+                }
+                cells
+            })
+            .collect()
+    }
+
+    #[gpui::test]
+    fn prompt_jumps_through_held_history_need_no_engine_read(cx: &mut TestAppContext) {
+        const ROWS: usize = 4;
+        const HISTORY: i64 = 20;
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            let element = pane.residents[&id].element.clone();
+            element.apply_damage(filled_grid('o'));
+            let history = prompted_history(HISTORY as usize);
+            element.set_view_offset(4, ROWS);
+            element
+                .complete_scrollback_fetch(
+                    diri_proto::methods::ReadScrollbackCellsResult {
+                        metadata: Vec::new(),
+                        payload: diri_proto::grid::GridRowCodec::encode_rows(&history).unwrap(),
+                        first_row: 0,
+                        row_count: HISTORY,
+                        total_rows: HISTORY + ROWS as i64,
+                        live_start_row: HISTORY,
+                        cols: 8,
+                        content_seq: 1,
+                    },
+                    ROWS,
+                )
+                .unwrap();
+            element.set_view_offset(4, ROWS);
+            let top = |element: &diri_term::element::TerminalElement| {
+                HISTORY - element.view_offset()
+            };
+            assert_eq!(top(&element), 16);
+
+            // The inert runtime has no Engine: every answer below came from
+            // the rows the view holds, at once.
+            pane.read_history(Some(false), qol::PromptMiss::NeedsMarks, window, cx);
+            assert!(!pane.qol.busy, "a held prompt waited on an Engine read");
+            assert_eq!(top(&element), 12);
+            pane.read_history(Some(false), qol::PromptMiss::NeedsMarks, window, cx);
+            assert_eq!(top(&element), 6, "the failed command's end starts a prompt");
+            pane.read_history(Some(true), qol::PromptMiss::NeedsMarks, window, cx);
+            assert_eq!(top(&element), 12);
+            pane.read_history(Some(false), qol::PromptMiss::NeedsMarks, window, cx);
+            pane.read_history(Some(false), qol::PromptMiss::NeedsMarks, window, cx);
+            assert_eq!(top(&element), 3);
+            pane.read_history(Some(false), qol::PromptMiss::NeedsMarks, window, cx);
+            assert_eq!(top(&element), 3, "nothing above the first prompt");
+            assert_eq!(pane.qol.feedback.as_deref(), Some(t("terminal.prompt.none")));
+            assert!(!pane.qol.busy);
+
+            // Its mark in the gutter selects that command's output.
+            assert!(pane.select_marked_command_output(&id, 0));
+            assert_eq!(element.selected_text(), "error\nstop\n");
+            assert!(
+                !pane.select_marked_command_output(&id, 1),
+                "an output row carries no mark"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn pasting_files_copied_in_finder_types_their_escaped_paths(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let folder = tempfile::tempdir().unwrap();
+        let shot = folder.path().join("Screen Shot (1).png");
+        let notes = folder.path().join("notes.md");
+        std::fs::write(&shot, b"png").unwrap();
+        std::fs::write(&notes, b"# notes").unwrap();
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            let (tx, mut input) = mpsc::unbounded_channel();
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.attachment.claim();
+            resident.attachment.input_observer = Some((id.clone(), tx));
+
+            // What AppKit hands over for a Finder ⌘C of two files: the file
+            // URLs, and as plain text only their names.
+            cx.write_to_clipboard(ClipboardItem {
+                entries: vec![
+                    ClipboardEntry::ExternalPaths(ExternalPaths(smallvec::smallvec![
+                        shot.clone(),
+                        notes.clone(),
+                    ])),
+                    ClipboardEntry::String(gpui::ClipboardString::new(
+                        "Screen Shot (1).png\rnotes.md".to_owned(),
+                    )),
+                ],
+            });
+            pane.paste(&Paste, window, cx);
+            let expected = terminal_drop_text([
+                shot.to_str().unwrap(),
+                notes.to_str().unwrap(),
+            ]);
+            assert!(expected.contains("Screen\\ Shot\\ \\(1\\).png "), "{expected}");
+            assert_eq!(
+                input.try_recv().unwrap(),
+                (id.clone(), expected.into_bytes()),
+                "pasted like a drop, not as the file names"
+            );
+
+            // A copied file that no longer exists pastes nothing.
+            cx.write_to_clipboard(ClipboardItem {
+                entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(
+                    smallvec::smallvec![folder.path().join("gone.png")],
+                ))],
+            });
+            pane.paste(&Paste, window, cx);
+            assert!(input.try_recv().is_err(), "a missing file was pasted");
+
+            // Ordinary text is untouched.
+            cx.write_to_clipboard(ClipboardItem::new_string("echo hi".to_owned()));
+            pane.paste(&Paste, window, cx);
+            assert_eq!(input.try_recv().unwrap(), (id.clone(), b"echo hi".to_vec()));
+        });
     }
 
     #[gpui::test]
@@ -10892,6 +11901,62 @@ mod tests {
         }
     }
 
+    fn blank_grid(cols: u16, rows: u16) -> GridUpdate {
+        GridUpdate {
+            cols,
+            rows,
+            cursor_col: 0,
+            cursor_row: 0,
+            cursor_visible: true,
+            is_full_snapshot: true,
+            changed_rows: (0..rows)
+                .map(|y| diri_proto::grid::ChangedRow::new(y, vec![GridCell::default(); cols.into()]))
+                .collect(),
+            cursor_style: Default::default(),
+        }
+    }
+
+    /// The new grid of a column change is what tells a reading view its rows
+    /// were re-wrapped; the pane has to start the fetches that find its place,
+    /// because no wheel event will.
+    #[gpui::test]
+    fn a_column_change_under_a_reader_fetches_its_place(cx: &mut TestAppContext) {
+        const ROWS: usize = 10;
+        let runtime = Arc::new(StoreRuntime::inert());
+        // Never driven: the fetch the pane starts stays in flight.
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let session = fixture_session();
+        {
+            let mut store = runtime.store.write().expect("session store lock poisoned");
+            store.upsert_session(session.clone());
+            store.select(session.id.clone());
+        }
+        let runtime_for_view = Arc::clone(&runtime);
+        let (pane, cx) = cx.add_window_view(move |window, cx| {
+            TerminalPane::new(runtime_for_view, tokio, window, cx)
+        });
+        pane.update_in(cx, |pane, window, cx| {
+            pane.apply_grid_updates(session.id.clone(), [blank_grid(8, ROWS as u16)], window, cx);
+            let resident = &pane.residents[&session.id];
+            resident.element.adopt_history_geometry(100, 110, 1, ROWS);
+            assert!(resident.element.set_view_offset(10, ROWS));
+            assert!(!resident.element.scrollback_relocating());
+
+            pane.apply_grid_updates(session.id.clone(), [blank_grid(6, ROWS as u16)], window, cx);
+            let element = &pane.residents[&session.id].element;
+            assert!(element.scrollback_relocating());
+            assert!(
+                element.begin_scrollback_fetch(ROWS).is_none(),
+                "the geometry probe is already in flight"
+            );
+        });
+    }
+
     #[gpui::test]
     fn late_scrollback_replies_cannot_mutate_a_reselected_session(cx: &mut TestAppContext) {
         const ROWS: usize = 10;
@@ -11064,6 +12129,34 @@ mod tests {
         assert_eq!(exit_description(&session), expected);
     }
 
+    /// A kept command tab says how the command ended in its own terms: its
+    /// code, or the signal that killed it, never "Agent was interrupted".
+    #[test]
+    fn a_command_exit_names_its_code_or_signal() {
+        let mut session = fixture_session();
+        session.command_run = Some(diri_proto::CommandRun::default());
+        let exit = |reason, code, signal, interrupted| {
+            SessionStatus::Exited(ExitInfo {
+                reason,
+                code,
+                signal,
+                system_restart: false,
+                interrupted,
+            })
+        };
+        session.status = exit(ExitReason::Exited, Some(127), None, false);
+        assert_eq!(exit_description(&session), "Command exited (code 127)");
+        session.status = exit(ExitReason::Signaled, None, Some(9), true);
+        assert_eq!(
+            exit_description(&session),
+            "Command was killed (signal 9)"
+        );
+        session.status = exit(ExitReason::Exited, Some(0), None, false);
+        assert_eq!(exit_description(&session), "Command exited");
+        session.command_run = None;
+        assert_eq!(exit_description(&session), "Agent exited");
+    }
+
     #[test]
     fn terminal_command_navigation_preserves_app_and_modified_shortcuts() {
         for key in [
@@ -11219,8 +12312,9 @@ mod tests {
                 ("alt-space", Some(" "), b"\x1b "),
                 // A layout whose Option leaves the key unchanged.
                 ("alt-b", Some("b"), b"\x1bb"),
-                // Control claims the chord before Option can compose.
-                ("ctrl-alt-a", None, b"\x01"),
+                // Control claims the chord before Option can compose, and
+                // Option is Meta: ESC ^A, as xterm sends Emacs C-M-a.
+                ("ctrl-alt-a", None, b"\x1b\x01"),
             ] {
                 assert_eq!(
                     option_bytes(&option_key(chord, key_char), option),
@@ -11229,6 +12323,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Settings › Terminal › Option key: one side, both, none, or the layout
+    /// rule. Left and right are told apart by the event's device flags.
+    #[test]
+    fn option_as_meta_setting_picks_meta_per_side() {
+        use crate::store::OptionAsMeta;
+        let german = "com.apple.keylayout.German";
+        let us = "com.apple.keylayout.US";
+        // Raw flags as AppKit reports ⌥ held: the device-independent Option
+        // bit plus the side's device bit.
+        let left = Some(0x8_0000 | LEFT_OPTION_FLAG);
+        let right = Some(0x8_0000 | RIGHT_OPTION_FLAG);
+        let resolve = OptionKey::resolve;
+        assert_eq!(resolve(OptionAsMeta::Both, german, left), OptionKey::Meta);
+        assert_eq!(resolve(OptionAsMeta::Off, us, left), OptionKey::Compose);
+        assert_eq!(resolve(OptionAsMeta::Left, german, left), OptionKey::Meta);
+        assert_eq!(resolve(OptionAsMeta::Left, us, right), OptionKey::Compose);
+        assert_eq!(resolve(OptionAsMeta::Right, us, left), OptionKey::Compose);
+        assert_eq!(resolve(OptionAsMeta::Right, german, right), OptionKey::Meta);
+        // Without device flags a one-sided choice falls back to the layout.
+        for side in [OptionAsMeta::Left, OptionAsMeta::Right] {
+            assert_eq!(resolve(side, us, None), OptionKey::for_layout(us));
+            assert_eq!(resolve(side, german, Some(0x8_0000)), OptionKey::for_layout(german));
+        }
+        assert_eq!(
+            resolve(OptionAsMeta::Automatic, german, left),
+            OptionKey::for_layout(german)
+        );
+
+        // End to end: left ⌥B as Meta is readline's backward-word, right ⌥L
+        // types the layout's `@`.
+        assert_eq!(
+            option_bytes(&option_key("alt-b", Some("∫")), resolve(OptionAsMeta::Left, german, left)),
+            b"\x1bb"
+        );
+        assert_eq!(
+            option_bytes(&option_key("alt-l", Some("@")), resolve(OptionAsMeta::Left, german, right)),
+            b"@"
+        );
     }
 
     /// US layouts keep Option as Meta, and Meta now means the key itself:

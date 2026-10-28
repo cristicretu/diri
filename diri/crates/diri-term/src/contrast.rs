@@ -79,11 +79,12 @@ pub(crate) fn can_recolor(cell: GridCell) -> bool {
     !cell.style.contains(TermStyle::INVISIBLE) && !is_powerline(cell.scalar)
 }
 
-/// Whether a tint above this cell bears on its glyph. Block elements are
-/// fills, not text: they cover the tint they would be judged against, and a
+/// Whether a tint above this cell bears on its glyph. Block elements,
+/// sextants and octants are fills, not text: they cover the tint they would be judged against, and a
 /// progress bar must not change color where a find match crosses it.
 pub(crate) fn tint_applies(cell: GridCell) -> bool {
-    can_recolor(cell) && !matches!(cell.scalar, 0x2580..=0x259f)
+    can_recolor(cell)
+        && !matches!(cell.scalar, 0x2580..=0x259f | 0x1fb00..=0x1fb3b | 0x1cd00..=0x1cde5)
 }
 
 /// The readable foreground for `cell`, given its resolved colors.
@@ -996,7 +997,7 @@ mod tests {
         assert_ne!(tinted.foreground, theme.resolve_cell(authored).foreground);
         assert_eq!(tinted.background, theme.resolve_cell(authored).background);
 
-        for fill in [0xe0b0, 0x2588, 0x2591] {
+        for fill in [0xe0b0, 0x2588, 0x2591, 0x1fb0b, 0x1cd8f] {
             let cell = GridCell::new(
                 fill,
                 TermColor::Rgb(230, 230, 230),

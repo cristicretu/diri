@@ -83,6 +83,7 @@ fn record(id: &str, project: &str, host: Option<&str>) -> diri_proto::SessionRec
     use diri_proto::*;
     let now = DateMillis(1.0);
     SessionRecord {
+        command_run: None,
         attention_state: None,
         id: SessionId::new(id),
         kind: AgentKind::CODEX,
@@ -117,6 +118,7 @@ fn record(id: &str, project: &str, host: Option<&str>) -> diri_proto::SessionRec
         pull_requests: None,
         listening_ports: None,
         foreground_agent: None,
+        foreground_program: None,
         terminal_cwd: None,
         agent_workspace: None,
         note_id: None,

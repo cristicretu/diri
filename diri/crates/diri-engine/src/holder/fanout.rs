@@ -39,6 +39,9 @@ struct State {
     /// Set when the subscriber is gone. Both ends check it so neither waits on
     /// the other after the socket has failed.
     closed: bool,
+    /// Bumped each time the subscriber takes bytes that never passed through
+    /// `frames`: the log backlog of a resumed subscription.
+    progress: u64,
     /// No writer thread is serving the queue: none was started yet, or the
     /// last one went idle and ended (see [`FrameQueue::park_writer`]). The
     /// next push starts one; a close while it is set leaves the subscriber's
@@ -85,6 +88,7 @@ impl FrameQueue {
                 frames: VecDeque::new(),
                 queued: 0,
                 closed: false,
+                progress: 0,
                 writer_parked: true,
             }),
             changed: Condvar::new(),
@@ -94,11 +98,15 @@ impl FrameQueue {
         })
     }
 
-    /// Queues the bytes starting at `offset`, waiting up to `patience` for
-    /// room.
+    /// Queues the bytes starting at `offset`, waiting for room for as long as
+    /// the subscriber keeps taking bytes, and up to `patience` once it stops.
     ///
-    /// Returns false if the subscriber is gone or is still full when patience
-    /// runs out — in both cases the caller drops it, and it resumes from the
+    /// A subscriber reading its log backlog takes nothing from the queue but
+    /// is still consuming the stream, so it reports that with
+    /// [`Self::note_progress`], and the wait goes on.
+    ///
+    /// Returns false if the subscriber is gone or has taken nothing for
+    /// `patience` — in both cases the caller drops it, and it resumes from the
     /// log, which has every byte.
     #[cfg(any(windows, test))]
     pub(super) fn push(&self, offset: u64, bytes: &[u8], patience: Duration) -> bool {
@@ -111,9 +119,15 @@ impl FrameQueue {
     pub(super) fn offer(&self, offset: u64, bytes: &[u8], patience: Duration) -> Pushed {
         let mut state = self.state.lock().expect("frame queue");
         if !state.closed && state.queued >= self.capacity {
-            let deadline = Instant::now() + patience;
+            let mut deadline = Instant::now() + patience;
+            let mut seen = state.progress;
             while !state.closed && state.queued >= self.capacity {
-                let remaining = deadline.saturating_duration_since(Instant::now());
+                let mut remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() && state.progress != seen {
+                    seen = state.progress;
+                    deadline = Instant::now() + patience;
+                    remaining = patience;
+                }
                 if remaining.is_zero() {
                     return Pushed::Refused;
                 }
@@ -225,6 +239,12 @@ impl FrameQueue {
         }
     }
 
+    /// Records that a writer was started for this queue other than by a push,
+    /// so the next push does not ask for another.
+    pub(super) fn claim_writer(&self) {
+        self.state.lock().expect("frame queue").writer_parked = false;
+    }
+
     /// Takes a frame only if one is already waiting.
     #[cfg(any(unix, test))]
     pub(super) fn try_pop(&self) -> Option<Frame> {
@@ -247,6 +267,12 @@ impl FrameQueue {
             self.changed.notify_all();
         }
         frame
+    }
+
+    /// Records that the subscriber took bytes from outside the queue, which
+    /// keeps a pump waiting for room from giving up on it.
+    pub(super) fn note_progress(&self) {
+        self.state.lock().expect("frame queue").progress += 1;
     }
 
     /// Marks the subscriber gone and wakes anyone waiting on it.
@@ -305,6 +331,33 @@ mod tests {
             started.elapsed() < Duration::from_millis(500),
             "push should give up at its deadline, not hang"
         );
+    }
+
+    #[test]
+    fn a_subscriber_reading_its_backlog_is_waited_for_until_it_stops() {
+        let queue = FrameQueue::new(1);
+        assert!(push(&queue, 0, Duration::from_millis(10)));
+        // Taking backlog bytes for four patiences, then going quiet. The
+        // queue itself is never drained, so only progress keeps the pump
+        // waiting.
+        let reader = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || {
+                for _ in 0..16 {
+                    std::thread::sleep(Duration::from_millis(5));
+                    queue.note_progress();
+                }
+            })
+        };
+        let started = Instant::now();
+        assert!(!push(&queue, 1, Duration::from_millis(20)));
+        let waited = started.elapsed();
+        reader.join().expect("reader");
+        assert!(
+            waited >= Duration::from_millis(80),
+            "gave up after {waited:?} while the subscriber was still reading"
+        );
+        assert!(waited < Duration::from_secs(2), "waited {waited:?}");
     }
 
     #[test]

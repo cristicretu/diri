@@ -1709,7 +1709,8 @@ fn a_blocked_program_needs_input_with_its_own_message() {
     let detail = outcome.needs_input.expect("a needs-input detail");
     assert_eq!(detail.source, NeedsInputSource::ProgramStatus);
     assert_eq!(detail.summary, "Apply 3 to add, 1 to change, 0 to destroy?");
-    assert_eq!(detail.tool_name.as_deref(), Some("terraform"));
+    // `app` names the program asking, not a tool it wants to run.
+    assert_eq!(detail.tool_name, None);
 
     // The same report again is not a second question.
     assert_eq!(reducer.reduce(report, t0()).needs_input, None);
@@ -1746,7 +1747,7 @@ fn a_shell_follows_a_reporting_job_and_returns_to_idle_when_it_stops() {
     reducer.reduce(StatusSignal::ForegroundJob { running: true }, now);
     assert_eq!(
         *reducer.status(),
-        SessionStatus::NeedsInput(NeedsInputKind::Question)
+        SessionStatus::NeedsInput(NeedsInputKind::Auth)
     );
 
     // The job ended without a result: the Engine drops its records.
@@ -1768,6 +1769,7 @@ fn a_program_error_is_a_result_that_ends_the_turn() {
     let outcome = reducer.reduce(program(ProgramState::Error), t0() + Duration::from_secs(1));
     assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
     assert!(outcome.turn_completed);
+    assert!(outcome.turn_failed);
     // Still running and no longer reporting: process-only reads as working.
     let outcome = reducer.reduce(
         StatusSignal::ProgramStatus(None),

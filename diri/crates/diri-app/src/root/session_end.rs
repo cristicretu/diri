@@ -111,10 +111,15 @@ fn runs(store: &SessionStore, id: &SessionId) -> bool {
 /// The session on screen stopped: closed (a clean `exit` closes it), removed
 /// elsewhere, or its process exited or was killed. Not an archive, a daemon
 /// restart that resumes it, or a list that has not loaded yet.
+///
+/// A command that failed or was killed as it started, or that was spawned to
+/// keep its tab, has not ended here: the window stays on it so its error and
+/// exit status can be read.
 fn ended(store: &SessionStore, id: &SessionId) -> bool {
     match store.sessions().get(id) {
         None => store.has_hydrated_sessions(),
         Some(_) if !store.is_open(id) => true,
+        Some(session) if session.command_keeps_tab() => false,
         Some(session) => matches!(
             &session.status,
             SessionStatus::Exited(info)

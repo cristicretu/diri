@@ -32,6 +32,7 @@ impl Bridge {
             self.request_typed(Method::AGENT_READINESS, json!({}), DEFAULT_TIMEOUT)?;
         let prompt = required_string(args, "prompt")?;
         let spawn = SessionSpawnParams {
+            keep_open: None,
             appearance: None,
             kind: resolve_agent_kind(&readiness, &requested),
             cwd: required_string(args, "cwd")?,

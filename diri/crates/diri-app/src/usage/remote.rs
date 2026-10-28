@@ -255,7 +255,7 @@ fn save_cache(path: &Path, values: &BTreeMap<String, SavedUsage>) -> std::io::Re
         return Err(std::io::Error::other("remote usage cache limit exceeded"));
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        diri_platform::private::create_dir_all(parent)?;
     }
     let temp = path.with_extension(format!("{}.tmp", std::process::id()));
     let mut options = std::fs::OpenOptions::new();

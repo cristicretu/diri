@@ -43,7 +43,7 @@ use diri_ui::{
 };
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Bounds, ClickEvent, Context, CursorStyle,
-    DragMoveEvent, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton,
+    DragMoveEvent, ExternalPaths, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton,
     MouseDownEvent, PathPromptOptions, Pixels, Render, Rgba, ScrollHandle, ScrollStrategy,
     SharedString, Task, TextRun, UniformListScrollHandle, Window, canvas, deferred, div,
     ease_out_quint, font, point, prelude::*, px, rgba, uniform_list,
@@ -134,9 +134,12 @@ enum SettingsMenu {
     HibernateAfter,
     MemoryLimit,
     FileEditor,
+    OptionAsMeta,
     UpdateChannel,
     InterfaceStyle,
     PaneDensity,
+    CursorShape,
+    CursorBlink,
     TalkVoice,
     TalkAnswer,
     TalkTabs,
@@ -163,6 +166,26 @@ const FILE_EDITOR_OPTIONS: [crate::store::FileEditor; 5] = [
     crate::store::FileEditor::Zed,
     crate::store::FileEditor::DefaultApp,
 ];
+
+/// Option key choices, in menu order.
+const OPTION_AS_META_OPTIONS: [crate::store::OptionAsMeta; 5] = [
+    crate::store::OptionAsMeta::Automatic,
+    crate::store::OptionAsMeta::Left,
+    crate::store::OptionAsMeta::Right,
+    crate::store::OptionAsMeta::Both,
+    crate::store::OptionAsMeta::Off,
+];
+
+fn option_as_meta_label(choice: crate::store::OptionAsMeta) -> &'static str {
+    use crate::store::OptionAsMeta;
+    crate::i18n::t(match choice {
+        OptionAsMeta::Automatic => "settings.terminal.option_automatic",
+        OptionAsMeta::Left => "settings.terminal.option_left",
+        OptionAsMeta::Right => "settings.terminal.option_right",
+        OptionAsMeta::Both => "settings.terminal.option_both",
+        OptionAsMeta::Off => "settings.terminal.option_off",
+    })
+}
 
 fn file_editor_label(choice: crate::store::FileEditor) -> String {
     use crate::store::FileEditor;
@@ -2434,6 +2457,22 @@ impl UtilitySurfaces {
             let Ok(Ok(Some(paths))) = paths.await else {
                 return;
             };
+            let _ = this.update(cx, |this, cx| this.import_theme_paths(paths, cx));
+        })
+        .detach();
+    }
+
+    /// Imports theme files picked or dropped onto the Appearance page. Each
+    /// is validated by its format (UTF-8 text for Ghostty and Diri files, a
+    /// plist for `.itermcolors`); the last good one becomes the theme and the
+    /// first failure is reported by file name.
+    fn import_theme_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        self.settings_menu = None;
+        let paths: Vec<PathBuf> = paths.into_iter().filter(|path| path.is_file()).collect();
+        if paths.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
             let dir = crate::imported_themes::default_dir();
             let results = cx
                 .background_spawn(async move {
@@ -2524,6 +2563,9 @@ impl UtilitySurfaces {
             ),
             ThemeFileStatus::Failed(message) => (message.clone(), Ink::DANGER),
         });
+        // Until something happens, say the row also takes a dropped file.
+        let status =
+            status.or_else(|| Some((t("settings.appearance.theme_drop_hint").into(), colors.tertiary)));
         div()
             .min_w(px(0.0))
             .flex()
@@ -4775,6 +4817,23 @@ impl UtilitySurfaces {
                 .flex_col()
                 .gap(px(SETTINGS_SECTION_GAP))
                 .children(self.computer_settings(cx))
+                .child(setting_section(
+                    t("settings.agents.session_names"),
+                    toggle_row(
+                        t("settings.agents.name_sessions"),
+                        t("settings.agents.name_sessions_detail"),
+                        self.prefs.agents_name_sessions,
+                        "toggle-agents-name-sessions",
+                        colors,
+                        cx,
+                        |this, cx| {
+                            let enabled = !this.prefs.agents_name_sessions;
+                            this.update_prefs(move |prefs| prefs.agents_name_sessions = enabled);
+                            cx.notify();
+                        },
+                    ),
+                    colors,
+                ))
                 // With no remote hosts the only target is this machine.
                 .when(!hosts.is_empty(), |page| {
                     page.child(setting_section(
@@ -5315,9 +5374,12 @@ impl UtilitySurfaces {
             SettingsMenu::HibernateAfter => (self.hibernate_options(colors, cx), 172.0),
             SettingsMenu::MemoryLimit => (self.memory_options(colors, cx), 132.0),
             SettingsMenu::FileEditor => (self.file_editor_options(colors, cx), 204.0),
+            SettingsMenu::OptionAsMeta => (self.option_as_meta_options(colors, cx), 204.0),
             SettingsMenu::UpdateChannel => (self.update_channel_options(colors, cx), 132.0),
             SettingsMenu::InterfaceStyle => (self.interface_style_options(colors, cx), 172.0),
             SettingsMenu::PaneDensity => (self.pane_density_options(colors, cx), 172.0),
+            SettingsMenu::CursorShape => (self.cursor_shape_options(colors, cx), 172.0),
+            SettingsMenu::CursorBlink => (self.cursor_blink_options(colors, cx), 172.0),
             SettingsMenu::TalkVoice => (self.talk_voice_options(colors, cx), 400.0),
             SettingsMenu::TalkAnswer => (self.talk_answer_options(colors, cx), 204.0),
             SettingsMenu::TalkTabs => (self.talk_tabs_options(colors, cx), 204.0),
@@ -5690,6 +5752,78 @@ impl UtilitySurfaces {
         options.into_any_element()
     }
 
+    fn cursor_shape_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let open = self.settings_menu == Some(SettingsMenu::CursorShape);
+        let mut control = div().relative().min_w(px(132.0)).child(settings_select_button(
+            self.prefs.terminal_cursor_shape.title().to_owned(),
+            "cursor-shape-dropdown",
+            open,
+            SettingsMenu::CursorShape,
+            colors,
+            cx,
+        ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    fn cursor_shape_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for (index, choice) in crate::store::CursorShapePref::ALL.into_iter().enumerate() {
+            options = options.child(settings_choice_row(
+                format!("cursor-shape-option-{index}"),
+                choice.title().to_owned(),
+                choice == self.prefs.terminal_cursor_shape,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.settings_menu = None;
+                    this.update_prefs(move |prefs| prefs.terminal_cursor_shape = choice);
+                    cx.notify();
+                },
+            ));
+        }
+        options.into_any_element()
+    }
+
+    fn cursor_blink_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let open = self.settings_menu == Some(SettingsMenu::CursorBlink);
+        let mut control = div().relative().min_w(px(132.0)).child(settings_select_button(
+            self.prefs.terminal_cursor_blink.title().to_owned(),
+            "cursor-blink-dropdown",
+            open,
+            SettingsMenu::CursorBlink,
+            colors,
+            cx,
+        ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    fn cursor_blink_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for (index, choice) in crate::store::CursorBlinkPref::ALL.into_iter().enumerate() {
+            options = options.child(settings_choice_row(
+                format!("cursor-blink-option-{index}"),
+                choice.title().to_owned(),
+                choice == self.prefs.terminal_cursor_blink,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.settings_menu = None;
+                    this.update_prefs(move |prefs| prefs.terminal_cursor_blink = choice);
+                    cx.notify();
+                },
+            ));
+        }
+        options.into_any_element()
+    }
+
     fn file_editor_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
         let mut options = div().p(px(4.0)).flex().flex_col();
         for (index, choice) in FILE_EDITOR_OPTIONS.into_iter().enumerate() {
@@ -5785,6 +5919,45 @@ impl UtilitySurfaces {
                 "update-channel-dropdown",
                 open,
                 SettingsMenu::UpdateChannel,
+                colors,
+                cx,
+            ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    fn option_as_meta_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for (index, choice) in OPTION_AS_META_OPTIONS.into_iter().enumerate() {
+            options = options.child(settings_choice_row(
+                format!("option-as-meta-option-{index}"),
+                option_as_meta_label(choice),
+                choice == self.prefs.terminal_option_as_meta,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.settings_menu = None;
+                    this.update_prefs(move |prefs| prefs.terminal_option_as_meta = choice);
+                    cx.notify();
+                },
+            ));
+        }
+        options.into_any_element()
+    }
+
+    fn option_as_meta_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let open = self.settings_menu == Some(SettingsMenu::OptionAsMeta);
+        let mut control = div()
+            .relative()
+            .min_w(px(160.0))
+            .child(settings_select_button(
+                option_as_meta_label(self.prefs.terminal_option_as_meta),
+                "option-as-meta-dropdown",
+                open,
+                SettingsMenu::OptionAsMeta,
                 colors,
                 cx,
             ));
@@ -6150,6 +6323,16 @@ impl UtilitySurfaces {
                         )),
                     colors,
                 ))
+                // A theme file dropped anywhere on the page imports, like
+                // choosing it with Import…
+                .id("appearance-theme-drop")
+                .drag_over::<ExternalPaths>(move |page, _, _, _| {
+                    page.rounded(px(Radius::CARD))
+                        .bg(colors.primary.alpha(0.04))
+                })
+                .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                    this.import_theme_paths(paths.paths().to_vec(), cx);
+                }))
                 .child(setting_section(
                     t("settings.appearance.window"),
                     div()
@@ -6195,11 +6378,93 @@ impl UtilitySurfaces {
                         .child(row(
                             t("settings.appearance.line_height"),
                             line_height_control.into_any_element(),
+                        ))
+                        .child(setting_divider(colors))
+                        .child(toggle_row(
+                            t("settings.appearance.ligatures"),
+                            t("settings.appearance.ligatures_detail"),
+                            self.prefs.terminal_ligatures,
+                            "terminal_ligatures",
+                            colors,
+                            cx,
+                            |this, cx| {
+                                let enabled = !this.prefs.terminal_ligatures;
+                                this.update_prefs(move |prefs| prefs.terminal_ligatures = enabled);
+                                cx.notify();
+                            },
+                        )),
+                    colors,
+                ))
+                .child(setting_section(
+                    t("settings.appearance.cursor"),
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(row(
+                            t("settings.appearance.cursor_shape"),
+                            self.cursor_shape_dropdown(cx),
+                        ))
+                        .child(setting_divider(colors))
+                        .child(row(
+                            t("settings.appearance.cursor_blink"),
+                            self.cursor_blink_dropdown(cx),
+                        ))
+                        .child(setting_divider(colors))
+                        .child(toggle_row(
+                            t("settings.appearance.cursor_follows_programs"),
+                            t("settings.appearance.cursor_follows_programs_detail"),
+                            self.prefs.terminal_cursor_follows_programs,
+                            "terminal_cursor_follows_programs",
+                            colors,
+                            cx,
+                            |this, cx| {
+                                let enabled = !this.prefs.terminal_cursor_follows_programs;
+                                this.update_prefs(move |prefs| {
+                                    prefs.terminal_cursor_follows_programs = enabled
+                                });
+                                cx.notify();
+                            },
                         )),
                     colors,
                 )),
             colors,
         )
+    }
+
+    /// App links (`ssh://`, `vscode://`, `mailto:`) ask before opening
+    /// unless their scheme was trusted from the ask sheet; this lists those
+    /// schemes so trust can be taken back.
+    fn trusted_link_schemes(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let schemes: Vec<String> = self
+            .prefs
+            .terminal_trusted_link_schemes
+            .iter()
+            .cloned()
+            .collect();
+        let detail = if schemes.is_empty() {
+            t("settings.terminal.app_links_detail_none").to_owned()
+        } else {
+            t("settings.terminal.app_links_detail").to_owned()
+        };
+        let mut chips = div().flex().flex_wrap().justify_end().gap(px(6.0));
+        for scheme in schemes {
+            let id = format!("untrust-link-scheme-{scheme}");
+            let label = tf("settings.terminal.app_links_remove", &[("scheme", &scheme)]);
+            chips = chips.child(surface_button(label, id, colors, cx, move |this, cx| {
+                let scheme = scheme.clone();
+                this.update_prefs(move |prefs| {
+                    prefs.terminal_trusted_link_schemes.remove(&scheme);
+                });
+                cx.notify();
+            }));
+        }
+        setting_row(
+            t("settings.terminal.app_links"),
+            detail,
+            chips,
+            colors,
+        )
+        .into_any_element()
     }
 
     /// Settings › Terminal: how the terminal behaves under the mouse and
@@ -6253,6 +6518,8 @@ impl UtilitySurfaces {
                             },
                         ))
                         .child(setting_divider(colors))
+                        .child(self.trusted_link_schemes(colors, cx))
+                        .child(setting_divider(colors))
                         .child(setting_row(
                             t("settings.appearance.file_links"),
                             t("settings.terminal.file_links_detail"),
@@ -6277,6 +6544,18 @@ impl UtilitySurfaces {
                         )),
                     colors,
                 ))
+                .when(cfg!(target_os = "macos"), |page| {
+                    page.child(setting_section(
+                        t("settings.terminal.keyboard"),
+                        div().flex().flex_col().child(setting_row(
+                            t("settings.terminal.option_key"),
+                            t("settings.terminal.option_key_detail"),
+                            self.option_as_meta_dropdown(cx),
+                            colors,
+                        )),
+                        colors,
+                    ))
+                })
                 .child(setting_section(
                     t("settings.terminal.shell"),
                     div()
@@ -9501,6 +9780,15 @@ mod tests {
                     harness
                         .sidebar
                         .update(cx, |sidebar, cx| sidebar.set_width(320.0, cx));
+                    // `DIRI_VISUAL_TRUSTED_LINKS=ssh,vscode` lists trusted
+                    // app-link schemes in Settings › Terminal.
+                    if let Ok(schemes) = std::env::var("DIRI_VISUAL_TRUSTED_LINKS") {
+                        harness.surfaces.update(cx, |surfaces, cx| {
+                            surfaces.prefs.terminal_trusted_link_schemes =
+                                schemes.split(',').map(str::to_owned).collect();
+                            cx.notify();
+                        });
+                    }
                     // `DIRI_VISUAL_TALK` turns on "Talk with your agent" and
                     // opens its Voice menu over a fixed list of voices.
                     if std::env::var_os("DIRI_VISUAL_TALK").is_some() {
@@ -10783,6 +11071,16 @@ mod tests {
                                 surfaces.theme_search.insert(query);
                                 surfaces.theme_scroll.scroll_to_item(0, ScrollStrategy::Top);
                             }
+                            cx.notify();
+                        });
+                    }
+                    if std::env::var_os("DIRI_APPEARANCE_CURSOR_MENU").is_some() {
+                        harness.surfaces.update(cx, |surfaces, cx| {
+                            surfaces.update_prefs(|prefs| {
+                                prefs.terminal_cursor_shape = crate::store::CursorShapePref::Bar;
+                                prefs.terminal_cursor_blink = crate::store::CursorBlinkPref::Slow;
+                            });
+                            surfaces.settings_menu = Some(SettingsMenu::CursorBlink);
                             cx.notify();
                         });
                     }
@@ -12212,6 +12510,65 @@ mod tests {
             });
             assert!(cx.debug_bounds("APPEARANCE_WORKSPACE_PREVIEW").is_some());
         }
+    }
+
+    #[gpui::test]
+    fn theme_files_dropped_on_the_appearance_page_import(cx: &mut TestAppContext) {
+        use gpui::FileDropEvent;
+        let themes = tempfile::tempdir().unwrap();
+        crate::imported_themes::set_test_dir(Some(themes.path().to_path_buf()));
+        let files = tempfile::tempdir().unwrap();
+        let ghostty = files.path().join("Dropped Night");
+        let mut text = String::from("background = #101418\nforeground = #d8dee9\n");
+        for index in 0..16 {
+            text.push_str(&format!("palette = {index}=#{:02x}{:02x}{:02x}\n", 40 + index * 10, 80, 120));
+        }
+        std::fs::write(&ghostty, text).unwrap();
+        let binary = files.path().join("not-a-theme.itermcolors");
+        std::fs::write(&binary, [0xff, 0xfe, 0x00, 0x01]).unwrap();
+
+        let (harness, cx) = cx.add_window_view(|window, cx| {
+            SettingsWorkbenchHarness::open_at(SettingsTab::Appearance, window, cx)
+        });
+        cx.run_until_parked();
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        let hint = cx.debug_bounds("theme-file-status").expect("drop hint");
+        let drop = |cx: &mut gpui::VisualTestContext, path: &std::path::Path| {
+            cx.simulate_event(FileDropEvent::Entered {
+                position: hint.center(),
+                paths: ExternalPaths(smallvec::smallvec![path.to_path_buf()]),
+            });
+            cx.simulate_event(FileDropEvent::Submit {
+                position: hint.center(),
+            });
+            cx.run_until_parked();
+        };
+
+        drop(cx, &ghostty);
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(surfaces.theme_file_status, Some(ThemeFileStatus::Imported(1)));
+            assert!(
+                surfaces.prefs.terminal_theme.starts_with(diri_term::themes::IMPORTED_PREFIX),
+                "{}",
+                surfaces.prefs.terminal_theme
+            );
+        });
+        assert!(themes.path().read_dir().unwrap().count() == 1);
+
+        // A file that is not text, or not a plist, is refused by name and
+        // leaves the theme alone.
+        drop(cx, &binary);
+        surfaces.read_with(cx, |surfaces, _| {
+            match &surfaces.theme_file_status {
+                Some(ThemeFileStatus::Failed(message)) => {
+                    assert!(message.contains("not-a-theme.itermcolors"), "{message}")
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(surfaces.prefs.terminal_theme.starts_with(diri_term::themes::IMPORTED_PREFIX));
+        });
+        assert!(themes.path().read_dir().unwrap().count() == 1);
+        crate::imported_themes::set_test_dir(None);
     }
 
     #[gpui::test]

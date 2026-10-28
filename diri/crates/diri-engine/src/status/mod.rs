@@ -17,6 +17,7 @@ mod risk;
 pub use risk::classify_risk;
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use diri_proto::{
@@ -25,7 +26,7 @@ use diri_proto::{
 };
 
 use crate::detect::{ManifestState, ScreenObservation, redact};
-use diri_terminal_state::{BlockedKind, ProgramRecord, ProgramState};
+use diri_terminal_state::{BlockedKind, ProgramRecord, ProgramRemoval, ProgramState};
 
 /// Which source of truth leads for an agent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,6 +143,10 @@ pub enum StatusSignal {
     /// The `OSC 7501` record that best describes the program in the
     /// terminal, sent whenever it changes; `None` once nothing reports.
     ProgramStatus(Option<ProgramRecord>),
+    /// Nothing reports any more, and why: the program cleared its records,
+    /// the terminal was reset, or the program ended. Read as
+    /// `ProgramStatus(None)`, with the reason on the evidence.
+    ProgramStatusRemoved(ProgramRemoval),
     /// Periodic tick driving the debounce timers.
     Tick,
 }
@@ -154,6 +159,41 @@ pub struct TerminalPrompt {
     pub line: Option<String>,
     /// Echo is off: a password is being typed.
     pub secret: bool,
+}
+
+/// What Agents mean by their own `OSC 7501` reports, where it goes beyond the
+/// specification, read from each manifest's `agent.programStatus`.
+///
+/// The specification has `done` end a turn and `idle` mean "waiting, with no
+/// result": a cancelled or denied turn. Some programs report `idle` at the
+/// end of every turn and never `done` (Codex 0.163), so for them `idle` after
+/// work is the turn's result.
+#[derive(Clone, Debug, Default)]
+pub struct ProgramReporters {
+    /// Values of the report's `app` key whose `idle` ends a turn.
+    idle_ends_turn_apps: HashSet<String>,
+    /// Manifests whose `idle` ends a turn, for reports that name no `app`.
+    idle_ends_turn_manifests: HashSet<String>,
+}
+
+impl ProgramReporters {
+    /// Declares that manifest `manifest_id`, whose program reports as `app`,
+    /// ends its turns with `idle`.
+    pub fn idle_ends_turn(&mut self, manifest_id: &str, app: Option<&str>) {
+        self.idle_ends_turn_manifests.insert(manifest_id.to_owned());
+        if let Some(app) = app {
+            self.idle_ends_turn_apps.insert(app.to_owned());
+        }
+    }
+
+    /// A record's own `app` decides; one without it is read with the manifest
+    /// the session's foreground program runs under.
+    fn idle_ends_turn_for(&self, record: &ProgramRecord, manifest_id: Option<&str>) -> bool {
+        match record.app.as_deref() {
+            Some(app) => self.idle_ends_turn_apps.contains(app),
+            None => manifest_id.is_some_and(|id| self.idle_ends_turn_manifests.contains(id)),
+        }
+    }
 }
 
 /// What reducing one signal produced.
@@ -169,6 +209,13 @@ pub struct ReducerOutcome {
     pub needs_input: Option<NeedsInputDetail>,
     /// Set when a turn just completed.
     pub turn_completed: bool,
+    /// The turn that just completed failed: the program reported
+    /// `OSC 7501` `error`. Only set together with `turn_completed`.
+    pub turn_failed: bool,
+    /// The turn ended without a result: the program reported `OSC 7501`
+    /// `idle` mid-turn, which is how a cancelled or denied turn reads. Its
+    /// open requests are settled, and nothing is announced as finished.
+    pub turn_abandoned: bool,
     pub attention_changed: bool,
     /// A shell job stopped waiting on its line: answered, interrupted or
     /// gone. Settles the request it raised, which no turn completion will.
@@ -297,6 +344,8 @@ pub struct StatusReducer {
     /// Set while the reducer is lent to an Agent known by name alone, whose
     /// status follows the terminal's output. See [`Self::lend_to_activity`].
     activity: Option<ActivityRead>,
+    /// Shared by every session; see [`ProgramReporters`].
+    program_reporters: Option<Arc<ProgramReporters>>,
 }
 
 /// How long output must keep coming before an Agent known only by name is
@@ -343,7 +392,14 @@ impl StatusReducer {
             program_active: false,
             program_screen_choices: None,
             activity: None,
+            program_reporters: None,
         }
+    }
+
+    /// What the catalog's Agents mean by their `OSC 7501` reports.
+    pub fn with_program_reporters(mut self, reporters: Arc<ProgramReporters>) -> Self {
+        self.program_reporters = Some(reporters);
+        self
     }
 
     /// Associates the reducer with manifest metadata safe to expose over the
@@ -614,7 +670,11 @@ impl StatusReducer {
         }
 
         if let StatusSignal::ProgramStatus(report) = signal {
-            self.apply_program_status(report, now, &mut outcome);
+            self.apply_program_status(report, None, now, &mut outcome);
+            return outcome;
+        }
+        if let StatusSignal::ProgramStatusRemoved(reason) = signal {
+            self.apply_program_status(None, Some(reason), now, &mut outcome);
             return outcome;
         }
         if self.program_active {
@@ -703,13 +763,15 @@ impl StatusReducer {
             | StatusSignal::TerminalLine(_)
             | StatusSignal::ProcessExit { .. }
             | StatusSignal::TransportUnavailable
-            | StatusSignal::ProgramStatus(_) => None,
+            | StatusSignal::ProgramStatus(_)
+            | StatusSignal::ProgramStatusRemoved(_) => None,
         };
 
         match signal {
             StatusSignal::ProcessExit { .. }
             | StatusSignal::TransportUnavailable
-            | StatusSignal::ProgramStatus(_) => {} // handled above
+            | StatusSignal::ProgramStatus(_)
+            | StatusSignal::ProgramStatusRemoved(_) => {} // handled above
             StatusSignal::ForegroundJob { .. } | StatusSignal::TerminalLine(_) => {}
             StatusSignal::PtyOutputActivity => {
                 // Bytes alone do not establish work: late terminal repaints,
@@ -1009,11 +1071,14 @@ impl StatusReducer {
         }
     }
 
-    /// Follows an `OSC 7501` report. A result (idle, done, error) ends the
-    /// turn once; `None` hands the session back to inference.
+    /// Follows an `OSC 7501` report. A result (`done`, `error`) ends the turn
+    /// once. `idle` ends it without a result, unless the program's manifest
+    /// says its `idle` is its result ([`ProgramReporters`]). `None` hands the
+    /// session back to inference; `removal` says why, when known.
     fn apply_program_status(
         &mut self,
         report: Option<ProgramRecord>,
+        removal: Option<ProgramRemoval>,
         now: SystemTime,
         outcome: &mut ReducerOutcome,
     ) {
@@ -1022,13 +1087,17 @@ impl StatusReducer {
             self.program_screen_choices = None;
         }
         self.state.last_signal_at = now;
+        let evidence_rule = match (&report, removal) {
+            (Some(record), _) => Some(program_state_name(record.state).to_owned()),
+            (None, Some(reason)) => Some(format!("removed:{}", reason.as_str())),
+            (None, None) => Some("removed".to_owned()),
+        };
         match report {
             Some(record) if record.state == ProgramState::Blocked => {
                 let kind = match record.kind {
                     Some(BlockedKind::Permission) => NeedsInputKind::Permission,
-                    Some(BlockedKind::Question | BlockedKind::Auth) | None => {
-                        NeedsInputKind::Question
-                    }
+                    Some(BlockedKind::Auth) => NeedsInputKind::Auth,
+                    Some(BlockedKind::Question) | None => NeedsInputKind::Question,
                 };
                 let hook_detail = self
                     .state
@@ -1076,7 +1145,17 @@ impl StatusReducer {
                 self.state.pending_needs_input = None;
                 self.go_working(now, false, outcome);
             }
-            Some(_) => {
+            Some(record) => {
+                // `done` and `error` are the turn's result. `idle` is the
+                // program waiting with none, after the user cancelled or
+                // denied, unless this program reports `idle` for every
+                // finished turn.
+                let result = match record.state {
+                    ProgramState::Done | ProgramState::Error => true,
+                    _ => self.program_reporters.as_ref().is_some_and(|reporters| {
+                        reporters.idle_ends_turn_for(&record, self.manifest_id.as_deref())
+                    }),
+                };
                 self.state.pending_needs_input = None;
                 self.state.screen_blocker_active = false;
                 self.state.blocker_miss_scans = 0;
@@ -1087,7 +1166,14 @@ impl StatusReducer {
                     | SessionStatus::Unknown => {
                         // A spinner frame still on screen must not undo it.
                         self.state.hold_idle_against_screen = true;
-                        self.state.pending_turn_completed = self.state.turn_in_flight;
+                        let in_flight = self.state.turn_in_flight;
+                        if result {
+                            self.state.pending_turn_completed = in_flight;
+                            outcome.turn_failed = in_flight && record.state == ProgramState::Error;
+                        } else {
+                            self.state.pending_turn_completed = false;
+                            outcome.turn_abandoned = in_flight;
+                        }
                         self.commit_idle(now, outcome);
                     }
                     SessionStatus::Starting => self.set_status(SessionStatus::Idle, outcome),
@@ -1113,7 +1199,7 @@ impl StatusReducer {
         }
         self.publish_evidence(
             StatusEvidenceSource::ProgramStatus,
-            None,
+            evidence_rule,
             None,
             now,
             outcome,
@@ -1884,6 +1970,17 @@ fn line_prompt_detail(prompt: &TerminalPrompt, now: SystemTime) -> NeedsInputDet
 /// The most a needs-input detail shows of a program's message.
 const PROGRAM_MESSAGE_MAX_CHARS: usize = 400;
 
+/// A report's state as the evidence names it, in the protocol's own words.
+fn program_state_name(state: ProgramState) -> &'static str {
+    match state {
+        ProgramState::Idle => "idle",
+        ProgramState::Done => "done",
+        ProgramState::Error => "error",
+        ProgramState::Working => "working",
+        ProgramState::Blocked => "blocked",
+    }
+}
+
 fn program_detail(
     record: &ProgramRecord,
     kind: NeedsInputKind,
@@ -1911,7 +2008,9 @@ fn program_detail(
     NeedsInputDetail {
         kind,
         source: NeedsInputSource::ProgramStatus,
-        tool_name: record.app.clone(),
+        // `app` names the program asking (`claude-code`), not the tool it
+        // wants to run; the report has no field for that.
+        tool_name: None,
         risk_hint: message
             .as_deref()
             .map_or(diri_proto::RiskHint::Neutral, classify_risk),
@@ -1953,5 +2052,7 @@ fn screen_detail(
     }
 }
 
+#[cfg(test)]
+mod program_replay_tests;
 #[cfg(test)]
 mod tests;

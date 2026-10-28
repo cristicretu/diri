@@ -300,6 +300,7 @@ fn hello(launch: &LaunchResult, acknowledged: Option<u64>, nonce: &str) -> Hello
         ],
         last_acknowledged_output_offset: acknowledged,
         last_acknowledged_grid_sequence: None,
+        grid_resume: None,
     }
 }
 
@@ -1919,4 +1920,264 @@ fn impaired_tcp_preserves_input_history_and_reconnect() {
         drop(attach);
         drop(cleanup);
     }
+}
+
+/// Starts a Holder whose child records its TTY and then stays quiet, so a
+/// test can write output to that TTY from outside the way a background
+/// program prints: no input frame is involved, so the interactive bypass
+/// never applies. Returns the attach, the TTY path and the kill selector.
+fn quiet_tty_holder(
+    state_dir: &std::path::Path,
+    label: &str,
+) -> (Attach, std::path::PathBuf, SessionSelector) {
+    let tty_file = state_dir.with_file_name(format!("{label}.tty"));
+    let request = LaunchRequest {
+        session_id: test_session_id(label),
+        session_token: token(),
+        argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!(
+                "tty > '{}'; stty -echo; printf 'ready\\r\\n'; exec cat",
+                tty_file.display()
+            ),
+        ],
+        cwd: "/".into(),
+        environment: vec![],
+        cols: 80,
+        rows: 24,
+        persistence: PersistenceCapability::NonPersistent,
+    };
+    let launch: LaunchResult = run_json("launch", state_dir, Some(&request));
+    let mut attach = Attach::open(state_dir, hello(&launch, Some(0), label));
+    attach.receive_until(Duration::from_secs(5), |message| {
+        message_contains(message, "ready") && !matches!(message, RemoteMessage::Terminal(_))
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let tty = loop {
+        if let Ok(path) = std::fs::read_to_string(&tty_file)
+            && path.trim().starts_with("/dev/")
+        {
+            break std::path::PathBuf::from(path.trim());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the child never reported its tty"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // Let the handshake's replay and reseed finish, so what follows is
+    // live output only.
+    std::thread::sleep(Duration::from_millis(100));
+    while attach.messages.try_recv().is_ok() {}
+    let selector = SessionSelector {
+        session_id: launch.session_id,
+        session_token: token(),
+        expected_incarnation: Some(launch.session_incarnation),
+    };
+    (attach, tty, selector)
+}
+
+/// Output nobody typed for (a background program's line, a spinner tick)
+/// reaches the controller as soon as the PTY goes quiet. Before, a lone write
+/// waited out the whole 8 ms coalescing interval, so its diff left the Holder
+/// 8-9 ms after the write at the median.
+#[test]
+fn unsolicited_output_is_published_on_its_leading_edge() {
+    let temporary = tempfile::tempdir_in("/tmp").expect("temp");
+    let state_dir = temporary.path().join("state");
+    let (mut attach, tty, selector) = quiet_tty_holder(&state_dir, "leading-edge");
+    let mut terminal = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&tty)
+        .expect("open tty");
+    let samples: usize = std::env::var("DIRI_LEADING_EDGE_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(30);
+    let mut latencies = Vec::with_capacity(samples);
+    let mut printed = String::new();
+    for index in 0..samples {
+        if index % 60 == 0 {
+            // Keep the line short of the terminal width.
+            terminal.write_all(b"\r\n").expect("tty write");
+            printed.clear();
+            std::thread::sleep(Duration::from_millis(40));
+            while attach.messages.try_recv().is_ok() {}
+        }
+        let byte = b'a' + (index % 26) as u8;
+        printed.push(char::from(byte));
+        let sent = Instant::now();
+        terminal.write_all(&[byte]).expect("tty write");
+        attach.receive_until(Duration::from_secs(2), |message| match message {
+            RemoteMessage::GridDelta(delta) => {
+                grid_text(&delta.grid).lines().any(|line| line == printed)
+            }
+            RemoteMessage::FullSnapshot(snapshot) => grid_text(&snapshot.grid)
+                .lines()
+                .any(|line| line == printed),
+            _ => false,
+        });
+        latencies.push(sent.elapsed());
+        // Paced, so every write starts after quiet.
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let _: SessionInspection = run_json("kill", &state_dir, Some(&selector));
+    let mut sorted = latencies.clone();
+    sorted.sort_unstable();
+    let at = |percentile: usize| sorted[(sorted.len() * percentile).div_ceil(100) - 1];
+    eprintln!(
+        "unsolicited write -> GridDelta at the controller: p50 {}us p90 {}us p99 {}us min {}us (n={})",
+        at(50).as_micros(),
+        at(90).as_micros(),
+        at(99).as_micros(),
+        sorted[0].as_micros(),
+        sorted.len()
+    );
+    assert!(
+        at(50) <= Duration::from_millis(5),
+        "a lone write took {:?} (median) to leave the Holder; it must not wait out the 8 ms coalescing interval",
+        at(50)
+    );
+}
+
+/// The leading edge must not unthrottle a stream: output that never pauses
+/// for the quiet window is still published at most once per coalescing
+/// interval (8 ms, so at most 125 publications a second).
+#[test]
+fn continuous_output_stays_capped_at_one_publication_per_interval() {
+    let temporary = tempfile::tempdir_in("/tmp").expect("temp");
+    let state_dir = temporary.path().join("state");
+    let (attach, tty, selector) = quiet_tty_holder(&state_dir, "output-cap");
+    // A writer that never pauses for long: one small write about every
+    // 200 us, far inside the quiet window, the shape of a busy build log.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let stop = Arc::clone(&stop);
+        let tty = tty.clone();
+        std::thread::spawn(move || {
+            let mut terminal = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&tty)
+                .expect("open tty");
+            let mut index = 0_u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = write!(terminal, "line {index}\r\n");
+                index += 1;
+                std::thread::sleep(Duration::from_micros(200));
+            }
+        })
+    };
+    // Let the stream settle, then count over a fixed window.
+    let settle = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < settle {
+        let _ = attach.messages.recv_timeout(Duration::from_millis(10));
+    }
+    let window = Duration::from_secs(1);
+    let started = Instant::now();
+    let mut publications = 0_u32;
+    let mut gaps = Vec::new();
+    let mut last: Option<Instant> = None;
+    while started.elapsed() < window {
+        let Ok(message) = attach.messages.recv_timeout(Duration::from_millis(50)) else {
+            continue;
+        };
+        if matches!(
+            message.expect("decode"),
+            RemoteMessage::GridDelta(_) | RemoteMessage::FullSnapshot(_)
+        ) {
+            publications += 1;
+            let now = Instant::now();
+            if let Some(last) = last {
+                gaps.push(now.duration_since(last));
+            }
+            last = Some(now);
+        }
+    }
+    let elapsed = started.elapsed();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().expect("writer");
+    let _: SessionInspection = run_json("kill", &state_dir, Some(&selector));
+    let per_second = f64::from(publications) / elapsed.as_secs_f64();
+    gaps.sort_unstable();
+    eprintln!(
+        "continuous output: {publications} publications in {elapsed:?} ({per_second:.0}/s), gap p50 {}us",
+        gaps.get(gaps.len() / 2).map_or(0, |gap| gap.as_micros())
+    );
+    assert!(
+        publications > 10,
+        "the stream was published: {publications}"
+    );
+    // Arrival times at the client jitter, so bound the count, not each gap.
+    assert!(
+        per_second <= 130.0,
+        "continuous output published {per_second:.0} times a second; the cap is one per 8 ms"
+    );
+}
+
+/// The leading edge never publishes a repaint caught between its erase and
+/// its redraw: output that removed content keeps the whole coalescing
+/// interval for the redraw to arrive, as before.
+///
+/// The redraw follows the erase by 3 ms, but a shared CI runner can stall
+/// this writer (or the Holder) past the 8 ms interval, and then publishing
+/// the erase alone is correct. So every attempt checks the invariant that
+/// holds regardless of scheduling (an erase published alone was held for the
+/// whole interval), and the repaint must be folded whole in at least one
+/// attempt, which it never is without the hold.
+#[test]
+fn an_erase_waits_for_its_redraw_instead_of_the_leading_edge() {
+    const INTERVAL: Duration = Duration::from_millis(8);
+    const ATTEMPTS: usize = 10;
+    let temporary = tempfile::tempdir_in("/tmp").expect("temp");
+    let state_dir = temporary.path().join("state");
+    let (mut attach, tty, selector) = quiet_tty_holder(&state_dir, "erase-hold");
+    let mut terminal = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&tty)
+        .expect("open tty");
+    let mut outcomes = Vec::new();
+    for attempt in 0..ATTEMPTS {
+        let before = format!("before {attempt}");
+        let redrawn = format!("redrawn {attempt}");
+        write!(terminal, "{before}\r\n").expect("tty write");
+        attach.receive_until(Duration::from_secs(2), |message| {
+            !matches!(message, RemoteMessage::Terminal(_)) && message_contains(message, &before)
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        while attach.messages.try_recv().is_ok() {}
+        // Clear, then redraw 3 ms later: past the quiet window, inside the
+        // interval. Spin rather than sleep, so timer slack cannot stretch
+        // the gap.
+        let erased_at = Instant::now();
+        terminal.write_all(b"\x1b[2J\x1b[H").expect("tty write");
+        while erased_at.elapsed() < Duration::from_millis(3) {
+            std::hint::spin_loop();
+        }
+        write!(terminal, "{redrawn}\r\n").expect("tty write");
+        let gap = erased_at.elapsed();
+        let first = attach.receive_until(Duration::from_secs(2), |message| {
+            matches!(
+                message,
+                RemoteMessage::GridDelta(_) | RemoteMessage::FullSnapshot(_)
+            )
+        });
+        let received = erased_at.elapsed();
+        let whole = message_contains(first.last().expect("a publication"), &redrawn);
+        assert!(
+            whole || received >= INTERVAL,
+            "the erased half of a repaint was published on its own {received:?} after the \
+             erase, inside the {INTERVAL:?} interval (redraw written after {gap:?})"
+        );
+        outcomes.push((gap, received, whole));
+        if whole {
+            break;
+        }
+    }
+    let _: SessionInspection = run_json("kill", &state_dir, Some(&selector));
+    assert!(
+        outcomes.iter().any(|(_, _, whole)| *whole),
+        "the erased half of a repaint was published on its own in every attempt \
+         (redraw gap, publication received): {outcomes:?}"
+    );
 }

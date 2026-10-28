@@ -38,6 +38,10 @@ mod gesture_acceptance_tests;
 mod gesture_schedule_profile;
 #[cfg(all(test, target_os = "macos"))]
 mod split_pane_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod pane_drag_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod pane_drag_frames;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -364,6 +368,9 @@ pub struct RootView {
     window_bounds_save: Option<Task<()>>,
     /// The one transient toast; connection recovery renders beside it.
     toast: ToastSlot,
+    /// "fix-auth: Zoom pane": an Agent changed the window. Its own slot, so
+    /// it never displaces feedback about the person's own action.
+    agent_notice: ToastSlot,
     toast_style: ToastStyle,
     /// Records this window's open and close for the flight recorder.
     _telemetry_window: crate::telemetry::WindowGuard,
@@ -1196,7 +1203,11 @@ impl RootView {
                         };
                         let _ = this.update(cx, |this, cx| {
                             if let Some(toast) = status.in_app_banner {
-                                this.show_toast(toast, cx);
+                                if toast.ambient {
+                                    this.show_agent_notice(toast, cx);
+                                } else {
+                                    this.show_toast(toast, cx);
+                                }
                             }
                         });
                     }
@@ -1563,6 +1574,7 @@ impl RootView {
             window_bounds_save: None,
             perf_idle_repaint: None,
             toast: ToastSlot::default(),
+            agent_notice: ToastSlot::default(),
             toast_style: ToastStyle::from_env(),
             _telemetry_window: crate::telemetry::WindowGuard::new("main", window),
             quote_target_picker: None,
@@ -1822,6 +1834,24 @@ impl RootView {
     fn show_toast(&mut self, toast: Toast, cx: &mut Context<Self>) {
         let timer = self.toast.show(toast);
         self.arm_toast_timer(timer, cx);
+        cx.notify();
+    }
+
+    /// Shows or rewrites the Agent notice. One timer per notice, and none
+    /// while nothing is shown.
+    fn show_agent_notice(&mut self, toast: Toast, cx: &mut Context<Self>) {
+        let Some(timer) = self.agent_notice.show(toast) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(timer.after).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.agent_notice.expire(timer.token) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -2353,6 +2383,16 @@ impl RootView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Escape drops a dragged pane where it came from. GPUI keeps the
+        // drag until the button comes up; every target goes quiet instead.
+        if event.keystroke.key == "escape" && crate::pane_drag::cancel(cx) {
+            if let Some(workbench) = &self.workspace_workbench {
+                workbench.update(cx, |_, cx| cx.notify());
+            }
+            self.sidebar.update(cx, |_, cx| cx.notify());
+            cx.stop_propagation();
+            return;
+        }
         if let Some(surfaces) = &self.session_surfaces
             && surfaces.read(cx).tab_peek_visible()
         {
@@ -2829,6 +2869,29 @@ impl RootView {
             CommandId::SelectPreviousSession if !self.arrow_surface_visible() => {
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.select_relative(-1, cx));
+            }
+            CommandId::MovePaneToNextTab | CommandId::MovePaneToPreviousTab => {
+                let source = self
+                    .workspace_workbench
+                    .as_ref()
+                    .filter(|_| self.active_workspace.is_some())
+                    .and_then(|workbench| workbench.read(cx).focused_drag_source());
+                let moved = source.is_some_and(|source| {
+                    self.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.move_pane_to_adjacent_tab(
+                            source,
+                            command == CommandId::MovePaneToNextTab,
+                            cx,
+                        )
+                    })
+                });
+                if !moved {
+                    self.show_feedback(
+                        "workspace",
+                        Toast::info(crate::i18n::t("toast.pane_has_nowhere_to_go")),
+                        cx,
+                    );
+                }
             }
             CommandId::SelectNextSession if !self.arrow_surface_visible() => {
                 self.sidebar
@@ -4519,7 +4582,7 @@ impl RootView {
             let strip_height = self.sidebar.read(cx).tab_strip_height();
             let strip = self.sidebar.update(cx, |sidebar, cx| {
                 sidebar.strip_held_hint = held_hint;
-                sidebar.title_opacity = crate::window_chrome::title_row_opacity(window);
+                sidebar.sync_chrome_look(sidebar_colors, window);
                 sidebar.strip_caption_inset = crate::window_chrome::caption_inset(
                     0.0,
                     f32::from(viewport_size.width) - (origin_x + card_width),
@@ -4596,6 +4659,11 @@ impl RootView {
             let available_height = (card_height - 1.0).max(0.0);
             self.terminal_available_height = available_height;
             let heights = self.workbench_layout.pane_heights(available_height);
+            // Typing goes to the terminal below only while it holds focus.
+            let below_active = self
+                .auxiliary_terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.read(cx).is_focused(window));
             if let Some(primary) = &self.terminal {
                 primary.update(cx, |terminal, cx| {
                     terminal.set_shell_chrome(visible_sidebar, self.inspector_open, cx);
@@ -4613,12 +4681,23 @@ impl RootView {
                 });
                 body = body.child(
                     div()
+                        .relative()
                         .flex_none()
                         .w_full()
                         .h(px(heights.primary))
                         .min_h(px(0.0))
                         .overflow_hidden()
-                        .child(primary.clone()),
+                        .child(primary.clone())
+                        .children(
+                            crate::pane_fade::scrim(
+                                terminal,
+                                window.is_window_active(),
+                                !below_active,
+                            )
+                            .map(|scrim| {
+                                scrim.when(card_island, |scrim| scrim.rounded_t(px(Radius::CARD)))
+                            }),
+                        ),
                 );
             }
             body = body.child(self.terminal_resize_handle(cx));
@@ -4657,6 +4736,14 @@ impl RootView {
                         .text_color(terminal.secondary)
                         .child(t("window.opening_terminal")),
                 );
+            }
+            if let Some(scrim) = crate::pane_fade::scrim(
+                terminal,
+                window.is_window_active(),
+                below_active,
+            ) {
+                auxiliary =
+                    auxiliary.child(scrim.when(card_island, |scrim| scrim.rounded_b(px(Radius::CARD))));
             }
             if let Some(id) = self.auxiliary_id.clone() {
                 let store = Arc::clone(&self.services.store);
@@ -4708,6 +4795,12 @@ impl RootView {
                 );
             });
             body = body.child(primary.clone());
+            // One pane: it recedes only while the window is not key.
+            if let Some(scrim) =
+                crate::pane_fade::scrim(terminal, window.is_window_active(), true)
+            {
+                body = body.child(scrim.when(card_island, |scrim| scrim.rounded(px(Radius::CARD))));
+            }
         }
 
         if let Some(auxiliary) = &self.auxiliary_terminal {
@@ -5192,7 +5285,8 @@ impl RootView {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let transient = self.toast.current();
-        if recovery.is_none() && transient.is_none() {
+        let agent_notice = self.agent_notice.current();
+        if recovery.is_none() && transient.is_none() && agent_notice.is_none() {
             return None;
         }
         let style = self.toast_style;
@@ -5258,6 +5352,38 @@ impl RootView {
             ));
         }
         let (left, right) = insets;
+        // The Agent notice sits bottom-centre of the work surface whatever
+        // the toast style; with the capsule style it shares that stack.
+        let mut notice_layer = None;
+        if let Some(notice) = agent_notice {
+            let element = crate::toast::toast_element(
+                notice,
+                ToastStyle::Capsule,
+                colors,
+                "agent-notice",
+                self.agent_notice.generation(),
+                reduce_motion,
+                ToastHandlers {
+                    on_action: Box::new(|_, _, _| {}),
+                    on_dismiss: Box::new(|_, _| {}),
+                    on_hover: Box::new(|_, _, _| {}),
+                },
+            );
+            if style.anchor() == crate::toast::ToastAnchor::BottomCenter {
+                items.insert(0, element);
+            } else {
+                notice_layer = Some(
+                    div()
+                        .absolute()
+                        .left(px(left + 16.0))
+                        .right(px(right + 16.0))
+                        .bottom(px(18.0))
+                        .flex()
+                        .justify_center()
+                        .child(element),
+                );
+            }
+        }
         let mut stack = div()
             .absolute()
             .left(px(left + 16.0))
@@ -5275,11 +5401,17 @@ impl RootView {
                 stack.top(px(Metrics::TITLE_BAR + 8.0)).items_end()
             }
         };
-        Some(
-            deferred(stack.children(items))
-                .with_priority(1)
+        let stack = stack.children(items);
+        let layer = match notice_layer {
+            Some(notice) => div()
+                .absolute()
+                .inset_0()
+                .child(stack)
+                .child(notice)
                 .into_any_element(),
-        )
+            None => stack.into_any_element(),
+        };
+        Some(deferred(layer).with_priority(1).into_any_element())
     }
 }
 
@@ -5750,6 +5882,21 @@ impl Render for RootView {
             .on_action(
                 cx.listener(|this, _: &crate::commands::MovePaneDown, window, cx| {
                     this.run_command(CommandId::MovePaneDown, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::MovePaneToNewTab, window, cx| {
+                    this.run_command(CommandId::MovePaneToNewTab, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::MovePaneToNextTab, window, cx| {
+                    this.run_command(CommandId::MovePaneToNextTab, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::MovePaneToPreviousTab, window, cx| {
+                    this.run_command(CommandId::MovePaneToPreviousTab, window, cx);
                 }),
             )
             .on_action(
@@ -9398,6 +9545,60 @@ mod tests {
         assert!(cx.debug_bounds("recovery-action-0").is_none());
     }
 
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn agent_notice_sits_bottom_centre_updates_in_place_and_leaves_no_timer(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use diri_proto::agent_action::AgentAction;
+        let services = test_services();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            let mut root = RootView::new(services, true, PreviewScenario::Typical, window, cx);
+            root.preview = true;
+            root
+        });
+        cx.update(|_, cx| cx.set_reduce_motion(true));
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        let actor = {
+            let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+            let mut record = fixture.list.sessions[0].clone();
+            record.title = "fix-auth".into();
+            record.title_source = diri_proto::TitleSource::UserRename;
+            record
+        };
+        root.update(cx, |root, cx| {
+            root.show_agent_notice(crate::agent_notice::notice(&actor, AgentAction::SplitPane), cx);
+        });
+        cx.run_until_parked();
+        let first = cx.debug_bounds("agent-notice").expect("notice shown");
+        let (seam, generation) =
+            root.read_with(cx, |root, _| (root.sidebar_seam, root.agent_notice.generation()));
+        assert!(first.bottom() >= px(700.0 - 30.0) && first.bottom() <= px(700.0));
+        let centre = (seam + 1000.0) / 2.0;
+        assert!((f32::from(first.center().x) - centre).abs() < 24.0);
+        // A burst rewrites the same capsule: no second notice, no re-entry.
+        cx.executor().advance_clock(Duration::from_millis(1_500));
+        root.update(cx, |root, cx| {
+            root.show_agent_notice(crate::agent_notice::notice(&actor, AgentAction::ZoomPane), cx);
+        });
+        cx.run_until_parked();
+        root.read_with(cx, |root, _| {
+            assert_eq!(root.agent_notice.generation(), generation);
+            assert_eq!(root.agent_notice.current().unwrap().message, "fix-auth: Zoom pane");
+            assert!(root.toast.current().is_none(), "the feedback slot is untouched");
+        });
+        // The first notice's timer is stale; the burst's last one closes it.
+        cx.executor().advance_clock(Duration::from_millis(1_500));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("agent-notice").is_some());
+        cx.executor().advance_clock(crate::toast::AMBIENT_HOLD);
+        cx.run_until_parked();
+        assert!(root.read_with(cx, |root, _| root.agent_notice.current().is_none()));
+        root.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("agent-notice").is_none());
+    }
+
     #[gpui::test]
     fn launch_review_keyboard_opens_exact_session_retries_only_placement_and_dismisses(
         cx: &mut gpui::TestAppContext,
@@ -11110,6 +11311,112 @@ mod tests {
         }
     }
 
+    /// An Agent changing the window, as the person sees it: nothing
+    /// (`none`, today's behaviour), the notice in each theme, a burst whose
+    /// text updates in place (`burst-1..3`), and the notice beside a
+    /// feedback toast (`with-toast`). `DIRI_AGENT_NOTICE_SCREENSHOTS=<dir>`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes Agent notice previews to DIRI_AGENT_NOTICE_SCREENSHOTS"]
+    fn render_agent_notice_screenshots() {
+        use diri_proto::agent_action::AgentAction;
+        use gpui::HeadlessAppContext;
+        let dir = std::path::PathBuf::from(
+            std::env::var("DIRI_AGENT_NOTICE_SCREENSHOTS").expect("output dir"),
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        let states: [(&str, &str, &[AgentAction]); 7] = [
+            ("none", "dark", &[]),
+            ("zoom", "dark", &[AgentAction::ZoomPane]),
+            ("zoom", "light", &[AgentAction::ZoomPane]),
+            ("burst-1", "dark", &[AgentAction::SplitPane]),
+            ("burst-2", "dark", &[AgentAction::SplitPane, AgentAction::FocusPane]),
+            (
+                "burst-3",
+                "dark",
+                &[
+                    AgentAction::SplitPane,
+                    AgentAction::FocusPane,
+                    AgentAction::EqualizePanes,
+                ],
+            ),
+            ("with-toast", "dark", &[AgentAction::NewTab]),
+        ];
+        for (state, theme, actions) in states {
+            let platform = gpui_platform::current_platform(true);
+            let mut cx = HeadlessAppContext::with_platform(
+                platform.text_system(),
+                Arc::new(diri_ui::IconAssets),
+                gpui_platform::current_headless_renderer,
+            );
+            cx.update(|cx| {
+                crate::fonts::init(cx);
+                cx.set_reduce_motion(true);
+            });
+            let services = test_services();
+            let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+            let selected = fixture.selected_session_id.clone().unwrap();
+            let session = fixture
+                .list
+                .sessions
+                .iter_mut()
+                .find(|s| s.id == selected)
+                .unwrap();
+            session.kind = diri_proto::AgentKind::CODEX;
+            session.host = None;
+            session.title = "Image drop regression".into();
+            let actor = session.clone();
+            {
+                let mut store = services.store.store.write().unwrap();
+                store.hydrate(fixture.list);
+                store.select(selected);
+                store
+                    .update_preferences(|p| {
+                        p.terminal_theme = format!("dirijor-{theme}");
+                        p.sidebar_visible = true;
+                    })
+                    .unwrap();
+            }
+            let window = cx
+                .open_window(size(px(1000.0), px(650.0)), |window, cx| {
+                    cx.new(|cx| {
+                        let mut root =
+                            RootView::new(services.clone(), false, PreviewScenario::Empty, window, cx);
+                        root.preview = true;
+                        let mut grid = diri_term::buffer::GridBuffer::new(100, 36);
+                        let sample = "  OpenAI Codex\n\n  /Users/you/work/diri\n\n  Ready to work on your project.\n\n› Ask Codex to do anything";
+                        for (y, line) in sample.lines().enumerate() {
+                            for (x, ch) in line.chars().enumerate() {
+                                grid.cells[y * 100 + x].scalar = ch as u32;
+                            }
+                        }
+                        root.terminal.as_ref().unwrap().update(cx, |terminal, cx| {
+                            terminal.seed_preview_grid_for_test(grid, cx);
+                        });
+                        if state == "with-toast" {
+                            root.show_toast(Toast::success("Copied"), cx);
+                        }
+                        for action in actions {
+                            root.show_agent_notice(
+                                crate::agent_notice::notice(&actor, *action),
+                                cx,
+                            );
+                        }
+                        root
+                    })
+                })
+                .unwrap();
+            cx.run_until_parked();
+            cx.capture_screenshot(window.into())
+                .unwrap()
+                .save(dir.join(format!("{state}-{theme}.png")))
+                .unwrap();
+            cx.update_window(window.into(), |_, window, _| window.remove_window())
+                .unwrap();
+            cx.run_until_parked();
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "writes a visual preview to DIRI_RECOVERY_SCREENSHOT"]
@@ -12597,6 +12904,9 @@ mod tests {
         });
     }
 
+    // Traffic lights exist only on macOS; elsewhere the leading lane is the
+    // platform's own (none on Linux, the window icon on Windows).
+    #[cfg(target_os = "macos")]
     #[gpui::test]
     fn the_hidden_sidebar_button_clears_the_traffic_lights_in_both_densities(
         cx: &mut gpui::TestAppContext,

@@ -48,6 +48,7 @@ fn terminal(text: &str) -> TerminalElement {
         cursor_visible: true,
         is_full_snapshot: true,
         changed_rows: vec![ChangedRow::new(0, cells)],
+        cursor_style: Default::default(),
     });
     terminal
 }

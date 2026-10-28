@@ -50,6 +50,19 @@ pub enum NamedKey {
     F10,
     F11,
     F12,
+    /// F13 through F24, as extended Mac keyboards and remapped keys send them.
+    F13,
+    F14,
+    F15,
+    F16,
+    F17,
+    F18,
+    F19,
+    F20,
+    F21,
+    F22,
+    F23,
+    F24,
 }
 
 /// Numeric keypad identity remains distinct from ordinary text and Enter.
@@ -77,45 +90,46 @@ pub enum KeypadKey {
 }
 
 impl KeypadKey {
-    /// DEC VT numeric/application keypad mapping.
-    /// https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
-    fn codes(self) -> (&'static str, u8) {
+    /// The character the key types. DECKPAM's SS3 forms are never sent: see
+    /// `encode_key`.
+    fn text(self) -> &'static str {
         match self {
-            Self::Zero => ("0", b'p'),
-            Self::One => ("1", b'q'),
-            Self::Two => ("2", b'r'),
-            Self::Three => ("3", b's'),
-            Self::Four => ("4", b't'),
-            Self::Five => ("5", b'u'),
-            Self::Six => ("6", b'v'),
-            Self::Seven => ("7", b'w'),
-            Self::Eight => ("8", b'x'),
-            Self::Nine => ("9", b'y'),
-            Self::Decimal => (".", b'n'),
-            Self::Divide => ("/", b'o'),
-            Self::Multiply => ("*", b'j'),
-            Self::Subtract => ("-", b'm'),
-            Self::Add => ("+", b'k'),
-            Self::Equal => ("=", b'X'),
-            Self::Separator => (",", b'l'),
-            Self::Enter => ("\r", b'M'),
+            Self::Zero => "0",
+            Self::One => "1",
+            Self::Two => "2",
+            Self::Three => "3",
+            Self::Four => "4",
+            Self::Five => "5",
+            Self::Six => "6",
+            Self::Seven => "7",
+            Self::Eight => "8",
+            Self::Nine => "9",
+            Self::Decimal => ".",
+            Self::Divide => "/",
+            Self::Multiply => "*",
+            Self::Subtract => "-",
+            Self::Add => "+",
+            Self::Equal => "=",
+            Self::Separator => ",",
+            Self::Enter => "\r",
         }
     }
 }
 
 impl Key {
     pub fn depends_on_modes(&self) -> bool {
+        // Keypad keys type their characters in every legacy mode (see
+        // `encode_key`), so only the cursor keys depend on observed modes.
         matches!(
             self,
-            Self::Keypad(_)
-                | Self::Named(
-                    NamedKey::ArrowUp
-                        | NamedKey::ArrowDown
-                        | NamedKey::ArrowLeft
-                        | NamedKey::ArrowRight
-                        | NamedKey::Home
-                        | NamedKey::End
-                )
+            Self::Named(
+                NamedKey::ArrowUp
+                    | NamedKey::ArrowDown
+                    | NamedKey::ArrowLeft
+                    | NamedKey::ArrowRight
+                    | NamedKey::Home
+                    | NamedKey::End
+            )
         )
     }
 }
@@ -127,6 +141,21 @@ pub struct KeyEvent {
     /// AppKit's `characters`, including Option-composed characters. Named-key
     /// constructors fill this with the key's ordinary control character.
     pub text: Option<String>,
+    /// What the layout types on this key with and without Shift, when the
+    /// platform adapter knows. Only the kitty encoder reads it.
+    pub layout: KeyLayout,
+}
+
+/// A character key's layout characters. Platform adapters often resolve Shift
+/// into the logical key (`@` for Shift-2); the kitty protocol instead names
+/// the unshifted key (`2`) with a Shift modifier and reports `@` as the
+/// shifted alternate.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct KeyLayout {
+    /// The character with no modifiers held.
+    pub unshifted: Option<char>,
+    /// The character with Shift held.
+    pub shifted: Option<char>,
 }
 
 impl KeyEvent {
@@ -136,6 +165,7 @@ impl KeyEvent {
         Self {
             key: Key::Character(text.clone()),
             text: Some(text),
+            layout: KeyLayout::default(),
         }
     }
 
@@ -145,13 +175,15 @@ impl KeyEvent {
         Self {
             key: Key::Character(logical.into()),
             text: Some(text.into()),
+            layout: KeyLayout::default(),
         }
     }
 
     pub fn keypad(key: KeypadKey) -> Self {
         Self {
             key: Key::Keypad(key),
-            text: Some(key.codes().0.to_owned()),
+            text: Some(key.text().to_owned()),
+            layout: KeyLayout::default(),
         }
     }
 
@@ -159,6 +191,7 @@ impl KeyEvent {
         Self {
             key: Key::Named(key),
             text: named_text(key).map(str::to_owned),
+            layout: KeyLayout::default(),
         }
     }
 }
@@ -179,7 +212,9 @@ pub struct TermInputModes {
     /// DEC application cursor keys (DECCKM). Only unmodified arrows use SS3;
     /// modified arrows retain xterm's CSI `1;mod` form.
     pub application_cursor_keys: bool,
-    /// DEC application numeric keypad (DECKPAM).
+    /// DEC application numeric keypad (DECKPAM). Observed and carried, but it
+    /// no longer changes keypad bytes: a Mac keypad has no Num Lock, so it
+    /// always types its characters, as xterm does with Num Lock on.
     pub application_keypad: bool,
     /// DEC bracketed-paste mode (DECSET 2004). Pass this to [`paste`].
     pub bracketed_paste: bool,
@@ -252,6 +287,7 @@ pub enum KeyEncodingError {
     UnsupportedRelease,
     UnknownModes,
     UnsupportedCommandShortcut,
+    /// No longer produced: keypad keys type their characters in every mode.
     UnsupportedKeypadModifiers,
 }
 
@@ -273,6 +309,39 @@ pub fn encode_action(
     keyboard: Option<KeyboardState>,
     action: KeyAction,
 ) -> Result<Vec<u8>, KeyEncodingError> {
+    // A program that negotiated kitty keyboard flags reads its keys in that
+    // protocol. Command chords stay the App's, as before: only
+    // Command-Backspace reaches the terminal, as the legacy kill-line.
+    // Flags that change no key's bytes (alternate keys or associated text
+    // alone) keep the legacy rules below.
+    const ACTIVE: u8 = enhanced::KeyboardEnhancements::DISAMBIGUATE
+        | enhanced::KeyboardEnhancements::EVENT_TYPES
+        | enhanced::KeyboardEnhancements::ALL_KEYS;
+    if let Some(state) = keyboard
+        && let Some(flags) = state
+            .enhancements
+            .filter(|flags| flags.bits() & ACTIVE != 0)
+        && !modifiers.cmd
+    {
+        let enhanced_event = enhanced::EnhancedKeyEvent::from(normalized_logical_key(event));
+        let enhanced_modifiers = enhanced::EnhancedModifiers {
+            ordinary: modifiers,
+            ..Default::default()
+        };
+        return match enhanced::encode(
+            &enhanced_event,
+            enhanced_modifiers,
+            state.encoding_modes(false),
+            flags,
+            action,
+        ) {
+            Ok(bytes) => Ok(bytes),
+            // A logical key the protocol has no code for (a multi-scalar
+            // layout name) still types its text.
+            Err(_) if action == KeyAction::Release => Ok(Vec::new()),
+            Err(_) => Ok(encode_key(event, modifiers, state.encoding_modes(false))),
+        };
+    }
     if action == KeyAction::Release {
         return Err(KeyEncodingError::UnsupportedRelease);
     }
@@ -285,13 +354,20 @@ pub fn encode_action(
         return Err(KeyEncodingError::UnsupportedCommandShortcut);
     }
     let modes = keyboard.unwrap_or_default().encoding_modes(false);
-    if matches!(event.key, Key::Keypad(_))
-        && modes.application_keypad
-        && (modifiers.shift || modifiers.alt || modifiers.ctrl || modifiers.cmd)
-    {
-        return Err(KeyEncodingError::UnsupportedKeypadModifiers);
-    }
     Ok(encode_key(event, modifiers, modes))
+}
+
+/// Platform adapters name a few printable keys rather than spelling them
+/// (`space`); the kitty protocol identifies a key by its Unicode scalar.
+fn normalized_logical_key(event: &KeyEvent) -> KeyEvent {
+    match &event.key {
+        Key::Character(name) if name == "space" => KeyEvent {
+            key: Key::Character(" ".to_owned()),
+            text: event.text.clone(),
+            layout: event.layout,
+        },
+        _ => event.clone(),
+    }
 }
 
 /// Encodes one key event as bytes to write to the PTY.
@@ -300,12 +376,11 @@ pub fn encode_action(
 /// named key. Command shortcuts are otherwise left for the UI adapter, except
 /// Command-Backspace, which the Swift terminal explicitly maps to Ctrl-U.
 pub fn encode_key(event: &KeyEvent, modifiers: Modifiers, modes: TermInputModes) -> Vec<u8> {
-    if let Key::Keypad(key) = event.key
-        && modes.application_keypad
-    {
-        return ss3(key.codes().1);
-    }
-
+    // Keypad keys type their characters even under DECKPAM. Mac keypads have
+    // no Num Lock and behave as xterm's keypad with Num Lock on (and as
+    // Terminal.app and other macOS terminals do), so a shell or editor that
+    // enables keypad-transmit mode (oh-my-zsh's `echoti smkx`, Vim's `t_ks`)
+    // still receives digits. Kitty-flag programs get keypad codes instead.
     // `performKeyEquivalent` handles Command-Backspace before `encode(event:)`.
     // Shift is allowed, but Option or Control makes it a different chord.
     if event.key == Key::Named(NamedKey::Backspace)
@@ -322,20 +397,22 @@ pub fn encode_key(event: &KeyEvent, modifiers: Modifiers, modes: TermInputModes)
         return bytes;
     }
 
+    // Control chords are C0 bytes, and Option (Meta) prefixes them with ESC
+    // as xterm's metaSendsEscape does: Ctrl-Option-A is `ESC ^A` (Emacs
+    // C-M-a), not a bare ^A.
     if modifiers.ctrl
         && let Key::Character(logical) = &event.key
         && let Some(bytes) = encode_control_text(logical)
     {
-        return bytes;
+        return meta_prefixed(modifiers.alt, bytes);
     }
 
+    // Control-Backspace sends the other erase byte (BS when Backspace is
+    // DEL), as xterm, kitty and Ghostty do, so readline, zsh and editors can
+    // bind it to delete a word apart from plain Backspace.
     if event.key == Key::Named(NamedKey::Backspace) {
-        let byte = backspace_byte(modes);
-        return if modifiers.alt {
-            vec![ESC, byte]
-        } else {
-            vec![byte]
-        };
+        let byte = backspace_byte(modes, modifiers.ctrl);
+        return meta_prefixed(modifiers.alt, vec![byte]);
     }
 
     let produced = event.text.as_deref().unwrap_or_default();
@@ -445,11 +522,27 @@ fn encode_csi_key(
         NamedKey::F10 => Some(tilde(21)),
         NamedKey::F11 => Some(tilde(23)),
         NamedKey::F12 => Some(tilde(24)),
+        // VT220 numbering for F13-F20, then 42-45 for F21-F24, as the
+        // reference multiplexer and rxvt-style terminals send them.
+        NamedKey::F13 => Some(tilde(25)),
+        NamedKey::F14 => Some(tilde(26)),
+        NamedKey::F15 => Some(tilde(28)),
+        NamedKey::F16 => Some(tilde(29)),
+        NamedKey::F17 => Some(tilde(31)),
+        NamedKey::F18 => Some(tilde(32)),
+        NamedKey::F19 => Some(tilde(33)),
+        NamedKey::F20 => Some(tilde(34)),
+        NamedKey::F21 => Some(tilde(42)),
+        NamedKey::F22 => Some(tilde(43)),
+        NamedKey::F23 => Some(tilde(44)),
+        NamedKey::F24 => Some(tilde(45)),
         NamedKey::Escape | NamedKey::Backspace => None,
     }
 }
 
 fn encode_control_text(logical: &str) -> Option<Vec<u8>> {
+    // Platform adapters name the space bar rather than spelling it.
+    let logical = if logical == "space" { " " } else { logical };
     let mut bytes = Vec::new();
     let mut mapped_any = false;
 
@@ -457,10 +550,16 @@ fn encode_control_text(logical: &str) -> Option<Vec<u8>> {
         match scalar {
             'a'..='z' => bytes.push(scalar as u8 - b'a' + 1),
             'A'..='Z' => bytes.push(scalar as u8 - b'A' + 1),
-            ' ' | '@' => bytes.push(0x00),
-            '[' => bytes.push(0x1b),
-            '\\' => bytes.push(0x1c),
-            ']' => bytes.push(0x1d),
+            ' ' | '@' | '2' => bytes.push(0x00),
+            '[' | '3' => bytes.push(0x1b),
+            '\\' | '4' => bytes.push(0x1c),
+            ']' | '5' => bytes.push(0x1d),
+            // xterm's VT220 digit row: Ctrl-2 through Ctrl-8 reach the C0
+            // controls a US keyboard has no other unshifted key for, and
+            // Ctrl-/ is US (readline and Emacs undo).
+            '6' => bytes.push(0x1e),
+            '7' | '/' => bytes.push(0x1f),
+            '8' => bytes.push(0x7f),
             // Swift's comment promises Ctrl-A...Ctrl-_ but its implementation
             // only spells out Space, `[`, `\\`, and `]`. T6 asks for the full
             // conventional punctuation set, so Ctrl-@/^/_ and Ctrl-? are
@@ -490,12 +589,19 @@ fn named_text(key: NamedKey) -> Option<&'static str> {
     }
 }
 
-fn backspace_byte(modes: TermInputModes) -> u8 {
-    if modes.backspace_sends_delete {
+fn backspace_byte(modes: TermInputModes, ctrl: bool) -> u8 {
+    if modes.backspace_sends_delete != ctrl {
         0x7f
     } else {
         0x08
     }
+}
+
+fn meta_prefixed(alt: bool, mut bytes: Vec<u8>) -> Vec<u8> {
+    if alt {
+        bytes.insert(0, ESC);
+    }
+    bytes
 }
 
 fn xterm_modifier(modifiers: Modifiers) -> u8 {
@@ -525,6 +631,178 @@ fn csi_tilde(number: u8, modifier: u8) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn flags(bits: u8) -> Option<KeyboardState> {
+        Some(KeyboardState {
+            enhancements: Some(bits.try_into().unwrap()),
+            ..Default::default()
+        })
+    }
+
+    fn shift() -> Modifiers {
+        Modifiers {
+            shift: true,
+            ..Default::default()
+        }
+    }
+
+    fn ctrl() -> Modifiers {
+        Modifiers {
+            ctrl: true,
+            ..Default::default()
+        }
+    }
+
+    fn alt() -> Modifiers {
+        Modifiers {
+            alt: true,
+            ..Default::default()
+        }
+    }
+
+    /// The keys the desktop sends, as its key adapter builds them.
+    fn fixtures() -> Vec<(&'static str, KeyEvent, Modifiers)> {
+        vec![
+            ("a", KeyEvent::character("a"), Modifiers::default()),
+            ("shift-a", KeyEvent::composed("a", "A"), shift()),
+            ("ctrl-c", KeyEvent::character("c"), ctrl()),
+            ("alt-b", KeyEvent::character("b"), alt()),
+            (
+                "space",
+                KeyEvent::composed("space", " "),
+                Modifiers::default(),
+            ),
+            ("ctrl-space", KeyEvent::composed("space", " "), ctrl()),
+            (
+                "enter",
+                KeyEvent::named(NamedKey::Enter),
+                Modifiers::default(),
+            ),
+            ("shift-enter", KeyEvent::named(NamedKey::Enter), shift()),
+            (
+                "escape",
+                KeyEvent::named(NamedKey::Escape),
+                Modifiers::default(),
+            ),
+            ("tab", KeyEvent::named(NamedKey::Tab), Modifiers::default()),
+            ("shift-tab", KeyEvent::named(NamedKey::Tab), shift()),
+            (
+                "backspace",
+                KeyEvent::named(NamedKey::Backspace),
+                Modifiers::default(),
+            ),
+            (
+                "up",
+                KeyEvent::named(NamedKey::ArrowUp),
+                Modifiers::default(),
+            ),
+            ("ctrl-up", KeyEvent::named(NamedKey::ArrowUp), ctrl()),
+            ("f5", KeyEvent::named(NamedKey::F5), Modifiers::default()),
+            (
+                "kp1",
+                KeyEvent::keypad(KeypadKey::One),
+                Modifiers::default(),
+            ),
+        ]
+    }
+
+    /// Every flag combination a program can negotiate, every fixture key,
+    /// pressed, repeated and released: bytes come from the kitty encoder
+    /// whenever a flag changes key bytes, and from the legacy encoder (with
+    /// its errors) otherwise. Command chords always stay legacy.
+    #[test]
+    fn negotiated_flags_select_the_kitty_encoder_for_every_combination() {
+        for bits in 0..=31u8 {
+            let keyboard = flags(bits);
+            let active = bits & 0b1011 != 0;
+            for (name, event, modifiers) in fixtures() {
+                for action in [KeyAction::Press, KeyAction::Repeat, KeyAction::Release] {
+                    let actual = encode_action(&event, modifiers, keyboard, action);
+                    let expected = if active {
+                        let mut logical = event.clone();
+                        if logical.key == Key::Character("space".into()) {
+                            logical.key = Key::Character(" ".into());
+                        }
+                        Ok(enhanced::encode(
+                            &logical.into(),
+                            enhanced::EnhancedModifiers {
+                                ordinary: modifiers,
+                                ..Default::default()
+                            },
+                            TermInputModes::default(),
+                            bits.try_into().unwrap(),
+                            action,
+                        )
+                        .unwrap())
+                    } else {
+                        encode_action(&event, modifiers, Some(KeyboardState::default()), action)
+                    };
+                    assert_eq!(actual, expected, "flags {bits} {name} {action:?}");
+                }
+            }
+            let cmd = Modifiers {
+                cmd: true,
+                ..Default::default()
+            };
+            assert_eq!(
+                encode_action(
+                    &KeyEvent::named(NamedKey::Backspace),
+                    cmd,
+                    keyboard,
+                    KeyAction::Press
+                ),
+                Ok(vec![0x15]),
+                "flags {bits}: Command-Backspace stays kill-line"
+            );
+        }
+    }
+
+    /// Concrete bytes for the flag sets agents negotiate: Claude Code and
+    /// Neovim push 1, fish pushes 1|4, Codex (crossterm) pushes 1|2|4.
+    #[test]
+    fn kitty_bytes_for_the_flag_sets_programs_negotiate() {
+        let cases: &[(u8, &str, KeyAction, &[u8])] = &[
+            (1, "a", KeyAction::Press, b"a"),
+            (1, "shift-a", KeyAction::Press, b"A"),
+            (1, "ctrl-c", KeyAction::Press, b"\x1b[99;5u"),
+            (1, "alt-b", KeyAction::Press, b"\x1b[98;3u"),
+            (1, "space", KeyAction::Press, b" "),
+            (1, "ctrl-space", KeyAction::Press, b"\x1b[32;5u"),
+            (1, "enter", KeyAction::Press, b"\r"),
+            (1, "shift-enter", KeyAction::Press, b"\x1b[13;2u"),
+            (1, "escape", KeyAction::Press, b"\x1b[27u"),
+            (1, "tab", KeyAction::Press, b"\t"),
+            (1, "shift-tab", KeyAction::Press, b"\x1b[9;2u"),
+            (1, "backspace", KeyAction::Press, b"\x7f"),
+            (1, "up", KeyAction::Press, b"\x1b[A"),
+            (1, "ctrl-up", KeyAction::Press, b"\x1b[1;5A"),
+            (1, "f5", KeyAction::Press, b"\x1b[15~"),
+            (1, "kp1", KeyAction::Press, b"\x1b[57400u"),
+            (1, "a", KeyAction::Release, b""),
+            (1, "escape", KeyAction::Release, b""),
+            (5, "shift-enter", KeyAction::Press, b"\x1b[13;2u"),
+            (7, "escape", KeyAction::Press, b"\x1b[27u"),
+            (7, "escape", KeyAction::Repeat, b"\x1b[27;1:2u"),
+            (7, "escape", KeyAction::Release, b"\x1b[27;1:3u"),
+            (7, "ctrl-c", KeyAction::Release, b"\x1b[99;5:3u"),
+            (7, "up", KeyAction::Release, b"\x1b[1;1:3A"),
+            (7, "a", KeyAction::Press, b"a"),
+            (7, "enter", KeyAction::Release, b""),
+            (8, "a", KeyAction::Press, b"\x1b[97u"),
+            (8, "enter", KeyAction::Press, b"\x1b[13u"),
+            (10, "a", KeyAction::Release, b"\x1b[97;1:3u"),
+            (24, "a", KeyAction::Press, b"\x1b[97;1;97u"),
+        ];
+        let keys = fixtures();
+        for (bits, name, action, expected) in cases {
+            let (_, event, modifiers) = keys.iter().find(|(key, ..)| key == name).unwrap();
+            assert_eq!(
+                encode_action(event, *modifiers, flags(*bits), *action).unwrap(),
+                expected.to_vec(),
+                "flags {bits} {name} {action:?}"
+            );
+        }
+    }
 
     #[test]
     fn keyboard_enhancement_json_distinguishes_unknown_zero_and_legacy_projection() {
@@ -575,15 +853,16 @@ mod tests {
                 b"\x1b[F".as_slice(),
                 b"\x1bOF".as_slice(),
             ),
+            // Keypad keys type their characters under DECKPAM too.
             (
                 KeyEvent::keypad(KeypadKey::One),
                 b"1".as_slice(),
-                b"\x1bOq".as_slice(),
+                b"1".as_slice(),
             ),
             (
                 KeyEvent::keypad(KeypadKey::Enter),
                 b"\r".as_slice(),
-                b"\x1bOM".as_slice(),
+                b"\r".as_slice(),
             ),
             (
                 KeyEvent::named(NamedKey::Enter),
@@ -892,7 +1171,12 @@ mod tests {
                     let backspace = if modifiers.cmd && !modifiers.alt && !modifiers.ctrl {
                         vec![0x15]
                     } else {
-                        let byte = if backspace_sends_delete { 0x7f } else { 0x08 };
+                        // Control sends the other erase byte.
+                        let byte = if backspace_sends_delete != modifiers.ctrl {
+                            0x7f
+                        } else {
+                            0x08
+                        };
                         if modifiers.alt {
                             vec![ESC, byte]
                         } else {
@@ -934,8 +1218,8 @@ mod tests {
                     ctrl_alt,
                     TermInputModes::default()
                 ),
-                expected,
-                "control takes precedence over Option at offset {offset}"
+                [&[ESC][..], &expected].concat(),
+                "Option prefixes the control byte with ESC at offset {offset}"
             );
         }
     }
@@ -1019,6 +1303,7 @@ mod tests {
                 &KeyEvent {
                     key: Key::Character("x".into()),
                     text: None,
+                    layout: KeyLayout::default(),
                 },
                 Modifiers::default(),
                 TermInputModes::default()

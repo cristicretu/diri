@@ -113,6 +113,7 @@ fn grid(screen: &Screen) -> GridBuffer {
         col: col as u16,
         row: row as u16,
         visible: false,
+        ..CursorState::default()
     };
     grid
 }
@@ -334,6 +335,7 @@ fn live(pane: &str, screen: &Screen) -> GridBuffer {
                     diri_proto::grid::ChangedRow::new(y, target.cells[start..start + cols].to_vec())
                 })
                 .collect(),
+            cursor_style: Default::default(),
         });
         buffer.clone()
     })
