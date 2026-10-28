@@ -3057,9 +3057,10 @@ impl Session {
         if bytes.is_empty() {
             return Ok(());
         }
-        // Raw: a wheel is not a keystroke, and must not look like user typing
-        // to the status reducer.
-        self.write_raw(&bytes)
+        // A wheel is not a keystroke and must not look like user typing to
+        // the status reducer, but the program's redraw in answer to it is
+        // interactive output: publish it at once like a click's.
+        self.write_mouse(&bytes)
     }
 
     pub fn read_scrollback(&self) -> diri_proto::ReadScrollbackResult {
