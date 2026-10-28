@@ -10,7 +10,7 @@ use block::ConcreteBlock;
 use cocoa::{
     appkit::{
         NSAppKitVersionNumber, NSAppKitVersionNumber12_0, NSApplication, NSBackingStoreBuffered,
-        NSColor, NSEvent, NSEventModifierFlags, NSFilenamesPboardType, NSPasteboard,
+        NSColor, NSEvent, NSEventModifierFlags, NSEventPhase, NSFilenamesPboardType, NSPasteboard,
         NSRequestUserAttentionType, NSScreen, NSView, NSViewHeightSizable, NSViewWidthSizable,
         NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow,
         NSWindowCollectionBehavior, NSWindowOcclusionState, NSWindowOrderingMode,
@@ -29,7 +29,7 @@ use gpui::{
     ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers,
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab,
+    PromptButton, PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab, TouchPhase,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind,
     WindowParams, point, px, size,
 };
@@ -2496,10 +2496,43 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
                 }),
                 _ => None,
             };
-            callback(event);
+            // DIRI PATCH (input timing): a wheel event's hardware time and
+            // momentum phase, for display-paced scrolling.
+            let timing = match &event {
+                PlatformInput::ScrollWheel(_) => unsafe { scroll_event_timing(native_event) },
+                _ => None,
+            };
+            gpui::with_platform_event_timing(timing, || callback(event));
             window_state.lock().event_callback = Some(callback);
         }
     }
+}
+
+/// When a wheel event happened, from `NSEvent.timestamp` (seconds of host
+/// uptime, the clock `Instant` reads), and its momentum phase.
+unsafe fn scroll_event_timing(native_event: id) -> Option<gpui::PlatformEventTiming> {
+    let seconds = unsafe { native_event.timestamp() };
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return None;
+    }
+    let now = std::time::Instant::now();
+    let now_ns = crate::display_link::host_now_ns();
+    // An event is never from the future; clamp a clock disagreement to now.
+    let at_ns = ((seconds * 1e9) as u64).min(now_ns);
+    let timestamp = crate::display_link::instant_at(now, now_ns, at_ns)?;
+    let momentum_phase = match unsafe { native_event.momentumPhase() } {
+        NSEventPhase::NSEventPhaseBegan => Some(TouchPhase::Started),
+        NSEventPhase::NSEventPhaseChanged | NSEventPhase::NSEventPhaseStationary => {
+            Some(TouchPhase::Moved)
+        }
+        NSEventPhase::NSEventPhaseEnded => Some(TouchPhase::Ended),
+        NSEventPhase::NSEventPhaseCancelled => Some(TouchPhase::Cancelled),
+        _ => None,
+    };
+    Some(gpui::PlatformEventTiming {
+        timestamp,
+        momentum_phase,
+    })
 }
 
 extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
@@ -2804,8 +2837,13 @@ extern "C" fn step(view: *mut c_void) {
     let mut lock = window_state.lock();
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
+        // DIRI PATCH (frame target time): the refresh this frame is for.
+        let target = lock
+            .frame_source
+            .as_ref()
+            .and_then(WindowFrameSource::frame_target_time);
         drop(lock);
-        callback(Default::default());
+        gpui::with_frame_target_time(target, || callback(Default::default()));
         window_state.lock().request_frame_callback = Some(callback);
     }
 }

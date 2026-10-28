@@ -23,7 +23,7 @@ use crate::inline_images::{DrawGrid, ImageDraw, InlineImageCache, append_row_dra
 use crate::metrics::CellMetrics;
 use crate::scrollback::{
     ScrollRouter, ScrollbackApplyError, ScrollbackRequest, ScrollbackViewport, ScrolledState,
-    TerminalModes, WheelDelta, WheelEvent, WheelRoute,
+    TerminalModes, WheelDelta, WheelEvent, WheelPhase, WheelRoute,
 };
 use crate::selection::{SelectionPoint, TerminalSelection};
 use crate::selection_shimmer::SelectionShimmer;
@@ -1447,10 +1447,19 @@ impl TerminalElement {
         let mut viewport = mutex_lock(&self.shared.viewport);
         let mut state = mutex_lock(&self.shared.scroll_glide);
         let now = state.now();
-        state.pacer.push(now, points);
+        if event.phase == WheelPhase::Touched {
+            // Fingers down stop what is still held, like momentum.
+            state.pacer.reset();
+        }
+        state.pacer.push(crate::scroll_pacer::PacedDelta {
+            points,
+            handled: now,
+            sent: event.sent_at,
+            momentum: event.phase == WheelPhase::Momentum,
+        });
         state.pacer_line_height = event.line_height;
         let before = viewport.view_offset();
-        let step = state.pacer.take(now);
+        let step = state.pacer.take(now, None);
         let changed = self.apply_scroll_step(&mut viewport, step, event.line_height, visible_rows);
         let outstanding = state.pacer.outstanding();
         let will_move = outstanding != 0.0 && viewport.can_scroll(outstanding);
@@ -1497,7 +1506,14 @@ impl TerminalElement {
             return false;
         }
         let now = state.now();
-        let step = state.pacer.take(now);
+        // The refresh this frame is drawn for, when the platform says; a
+        // pinned test clock stands for both.
+        let display_at = if state.clock.is_some() {
+            None
+        } else {
+            gpui::frame_target_time()
+        };
+        let step = state.pacer.take(now, display_at);
         let line_height = state.pacer_line_height;
         self.apply_scroll_step(viewport, step, line_height, visible_rows);
         state.clock.is_none()
@@ -5377,7 +5393,7 @@ mod selection_repaint_tests {
 
     use super::{TerminalElement, mutex_lock};
     use crate::buffer::GridBuffer;
-    use crate::scrollback::{WheelDelta, WheelEvent, WheelRoute};
+    use crate::scrollback::{WheelDelta, WheelEvent, WheelPhase, WheelRoute};
 
     const COLS: u16 = 8;
     const ROWS: u16 = 3;
@@ -5549,6 +5565,8 @@ mod selection_repaint_tests {
             row: 1,
             visible_rows: ROWS,
             line_height: 16.0,
+            sent_at: None,
+            phase: WheelPhase::Moved,
         }
     }
 

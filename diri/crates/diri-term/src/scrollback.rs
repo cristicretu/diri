@@ -973,6 +973,20 @@ pub enum WheelDelta {
     Lines(f32),
 }
 
+/// Where a trackpad wheel event sits in its gesture, as far as pacing it
+/// to the display cares.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WheelPhase {
+    /// Direct motion, or a source that does not say.
+    #[default]
+    Moved,
+    /// Fingers came down on the trackpad: travel still held stops where it
+    /// is shown, as momentum does.
+    Touched,
+    /// Momentum the system generates after the fingers lift.
+    Momentum,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WheelEvent {
     pub delta: WheelDelta,
@@ -980,6 +994,9 @@ pub struct WheelEvent {
     pub row: u16,
     pub visible_rows: u16,
     pub line_height: f32,
+    /// When the hardware produced the event, if the platform says.
+    pub sent_at: Option<std::time::Instant>,
+    pub phase: WheelPhase,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1196,6 +1213,8 @@ mod tests {
             row: 0,
             visible_rows: 40,
             line_height: 15.0,
+            sent_at: None,
+            phase: WheelPhase::Moved,
         };
         let lines = |route: Option<WheelRoute>| match route {
             Some(WheelRoute::Daemon { lines, .. }) => i32::from(lines),
@@ -1728,6 +1747,8 @@ mod tests {
             row: 4,
             visible_rows: 24,
             line_height: 10.0,
+            sent_at: None,
+            phase: WheelPhase::Moved,
         };
         assert_eq!(router.route(TerminalModes::default(), event(4.0)), None);
         assert_eq!(

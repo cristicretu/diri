@@ -59,7 +59,11 @@ use gpui_util::ResultExt;
 use std::{
     collections::{BTreeMap, btree_map},
     ffi::c_void,
-    sync::{Mutex, MutexGuard, PoisonError},
+    sync::{
+        Arc, Mutex, MutexGuard, OnceLock, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 static REGISTRY: Mutex<Registry> = Mutex::new(Registry::new());
@@ -82,6 +86,96 @@ struct DisplayEntry {
     link: sys::DisplayLink,
     running: bool,
     subscribers: Vec<(SubscriberId, DispatchRetained<DispatchSource>)>,
+    timing: Arc<DisplayTiming>,
+}
+
+/// DIRI PATCH (frame target time): the display's refresh grid, as its link
+/// last reported it, so a frame can learn which refresh it is drawn for.
+/// Written by the link's io thread, read on the main thread; the three
+/// values are independent atomics, and a read that mixes two callbacks is
+/// off by at most one period's drift.
+#[derive(Default)]
+pub(crate) struct DisplayTiming {
+    /// Host nanoseconds of the latest refresh the link called back for.
+    output_ns: AtomicU64,
+    /// Nanoseconds between refreshes.
+    period_ns: AtomicU64,
+    /// How far ahead of its callback the link aims: output minus current.
+    lead_ns: AtomicU64,
+}
+
+impl DisplayTiming {
+    fn record(&self, current: &sys::CVTimeStamp, output: &sys::CVTimeStamp) {
+        let valid = sys::kCVTimeStampHostTimeValid;
+        if current.flags & valid == 0 || output.flags & valid == 0 {
+            return;
+        }
+        let output_ns = host_ns(output.host_time);
+        let current_ns = host_ns(current.host_time);
+        let period_ns = if output.flags & sys::kCVTimeStampVideoRefreshPeriodValid != 0
+            && output.video_time_scale > 0
+            && output.video_refresh_period > 0
+        {
+            (output.video_refresh_period as u128 * 1_000_000_000
+                / output.video_time_scale as u128) as u64
+        } else {
+            0
+        };
+        if period_ns == 0 {
+            return;
+        }
+        self.period_ns.store(period_ns, Ordering::Relaxed);
+        self.lead_ns
+            .store(output_ns.saturating_sub(current_ns), Ordering::Relaxed);
+        self.output_ns.store(output_ns, Ordering::Relaxed);
+    }
+
+    /// The refresh a frame starting at host time `now_ns` will be shown on:
+    /// the one on the link's grid nearest to `now_ns` plus the link's lead.
+    /// A frame run by a display-link tick gets that tick's output time; one
+    /// run early (an immediate frame) or late gets the refresh it really
+    /// lands on, as the link would have aimed it.
+    fn target_ns(&self, now_ns: u64) -> Option<u64> {
+        let output_ns = self.output_ns.load(Ordering::Relaxed);
+        let period_ns = self.period_ns.load(Ordering::Relaxed);
+        if output_ns == 0 || period_ns == 0 {
+            return None;
+        }
+        let aim = now_ns.saturating_add(self.lead_ns.load(Ordering::Relaxed));
+        let offset = aim as i128 - output_ns as i128;
+        let period = period_ns as i128;
+        let refreshes = (offset + offset.signum() * period / 2) / period;
+        u64::try_from(output_ns as i128 + refreshes * period).ok()
+    }
+}
+
+/// Host time (`mach_absolute_time`, the clock of `CVTimeStamp.hostTime` and
+/// of `Instant`) in nanoseconds.
+fn host_ns(host_time: u64) -> u64 {
+    static TIMEBASE: OnceLock<(u32, u32)> = OnceLock::new();
+    let (numer, denom) = *TIMEBASE.get_or_init(|| {
+        let mut info = sys::MachTimebaseInfo { numer: 0, denom: 0 };
+        if unsafe { sys::mach_timebase_info(&mut info) } != 0 || info.denom == 0 {
+            return (1, 1);
+        }
+        (info.numer, info.denom)
+    });
+    (host_time as u128 * numer as u128 / denom as u128) as u64
+}
+
+/// Now on the host clock, in nanoseconds.
+pub(crate) fn host_now_ns() -> u64 {
+    host_ns(unsafe { sys::mach_absolute_time() })
+}
+
+/// The `Instant` of host time `at_ns`, given `now` read together with
+/// `now_ns`.
+pub(crate) fn instant_at(now: Instant, now_ns: u64, at_ns: u64) -> Option<Instant> {
+    if at_ns >= now_ns {
+        now.checked_add(Duration::from_nanos(at_ns - now_ns))
+    } else {
+        now.checked_sub(Duration::from_nanos(now_ns - at_ns))
+    }
 }
 
 // SAFETY: Both fields wrapping raw pointers are refcounted handles to
@@ -118,8 +212,8 @@ fn debug_assert_main_thread() {
 
 unsafe extern "C" fn display_link_output_callback(
     _display_link_out: *mut sys::CVDisplayLink,
-    _current_time: *const sys::CVTimeStamp,
-    _output_time: *const sys::CVTimeStamp,
+    current_time: *const sys::CVTimeStamp,
+    output_time: *const sys::CVTimeStamp,
     _flags_in: i64,
     _flags_out: *mut i64,
     display_id: *mut c_void,
@@ -127,6 +221,13 @@ unsafe extern "C" fn display_link_output_callback(
     let display_id = display_id as usize as CGDirectDisplayID;
     let registry = lock_registry();
     if let Some(entry) = registry.displays.get(&display_id) {
+        // SAFETY: CoreVideo passes valid timestamps for the duration of the
+        // callback; null is checked anyway.
+        if let (Some(current), Some(output)) =
+            unsafe { (current_time.as_ref(), output_time.as_ref()) }
+        {
+            entry.timing.record(current, output);
+        }
         for (_, frame_requests) in &entry.subscribers {
             frame_requests.merge_data(1);
         }
@@ -137,7 +238,7 @@ unsafe extern "C" fn display_link_output_callback(
 fn subscribe(
     display_id: CGDirectDisplayID,
     frame_requests: DispatchRetained<DispatchSource>,
-) -> Result<SubscriberId> {
+) -> Result<(SubscriberId, Arc<DisplayTiming>)> {
     debug_assert_main_thread();
 
     let needs_link = !lock_registry().displays.contains_key(&display_id);
@@ -154,7 +255,7 @@ fn subscribe(
         None
     };
 
-    let (subscriber_id, link_to_start) = {
+    let (subscriber_id, timing, link_to_start) = {
         let mut registry = lock_registry();
         let registry = &mut *registry;
         let subscriber_id = SubscriberId(registry.next_subscriber_id);
@@ -168,6 +269,7 @@ fn subscribe(
                 link,
                 running: false,
                 subscribers: Vec::new(),
+                timing: Arc::default(),
             }),
             (btree_map::Entry::Vacant(_), None) => {
                 // Entries are never removed, so an entry observed above cannot
@@ -176,6 +278,7 @@ fn subscribe(
             }
         };
         entry.subscribers.push((subscriber_id, frame_requests));
+        let timing = Arc::clone(&entry.timing);
         let link_to_start = if entry.running {
             None
         } else {
@@ -184,7 +287,7 @@ fn subscribe(
             // happen after the lock is released.
             Some(entry.link.clone())
         };
-        (subscriber_id, link_to_start)
+        (subscriber_id, timing, link_to_start)
     };
 
     if let Some(mut link) = link_to_start {
@@ -198,7 +301,7 @@ fn subscribe(
         }
     }
 
-    Ok(subscriber_id)
+    Ok((subscriber_id, timing))
 }
 
 fn unsubscribe(display_id: CGDirectDisplayID, subscriber_id: SubscriberId) {
@@ -231,6 +334,7 @@ fn unsubscribe(display_id: CGDirectDisplayID, subscriber_id: SubscriberId) {
 pub struct WindowFrameSource {
     frame_requests: DispatchRetained<DispatchSource>,
     registration: Option<(CGDirectDisplayID, SubscriberId)>,
+    timing: Option<Arc<DisplayTiming>>,
 }
 
 impl WindowFrameSource {
@@ -252,14 +356,25 @@ impl WindowFrameSource {
         Self {
             frame_requests,
             registration: None,
+            timing: None,
         }
     }
 
     pub fn start(&mut self, display_id: CGDirectDisplayID) -> Result<()> {
         self.stop();
-        let subscriber_id = subscribe(display_id, self.frame_requests.clone())?;
+        let (subscriber_id, timing) = subscribe(display_id, self.frame_requests.clone())?;
         self.registration = Some((display_id, subscriber_id));
+        self.timing = Some(timing);
         Ok(())
+    }
+
+    /// When a frame starting now will be on the display, from the timing the
+    /// display's link last reported; `None` before its first callback.
+    pub fn frame_target_time(&self) -> Option<Instant> {
+        let timing = self.timing.as_ref()?;
+        let now = Instant::now();
+        let now_ns = host_now_ns();
+        instant_at(now, now_ns, timing.target_ns(now_ns)?)
     }
 
     /// Queues one frame request on the main queue now, as a display-link tick
@@ -277,6 +392,7 @@ impl WindowFrameSource {
         if let Some((display_id, subscriber_id)) = self.registration.take() {
             unsubscribe(display_id, subscriber_id);
         }
+        self.timing = None;
     }
 }
 
@@ -420,6 +536,17 @@ mod sys {
         pub fn CVDisplayLinkRetain(display_link: *mut CVDisplayLink) -> *mut CVDisplayLink;
     }
 
+    #[repr(C)]
+    pub(crate) struct MachTimebaseInfo {
+        pub numer: u32,
+        pub denom: u32,
+    }
+
+    unsafe extern "C" {
+        pub fn mach_absolute_time() -> u64;
+        pub fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+    }
+
     impl DisplayLink {
         /// Apple docs: [CVDisplayLinkCreateWithCGDisplay](https://developer.apple.com/documentation/corevideo/1456981-cvdisplaylinkcreatewithcgdisplay?language=objc)
         pub unsafe fn new(
@@ -474,3 +601,55 @@ mod sys {
 #[cfg(test)]
 #[path = "display_link_pacing_tests.rs"]
 mod pacing_tests;
+
+#[cfg(test)]
+mod frame_target_tests {
+    use super::*;
+
+    fn timing(output_ns: u64, period_ns: u64, lead_ns: u64) -> DisplayTiming {
+        let timing = DisplayTiming::default();
+        timing.output_ns.store(output_ns, Ordering::Relaxed);
+        timing.period_ns.store(period_ns, Ordering::Relaxed);
+        timing.lead_ns.store(lead_ns, Ordering::Relaxed);
+        timing
+    }
+
+    #[test]
+    fn a_frame_targets_the_refresh_its_link_aims_for() {
+        // 120 Hz, the link calling back 16.7 ms (two refreshes) ahead.
+        let period = 8_333_333;
+        let timing = timing(1_000_000_000, period, 2 * period);
+        // A tick frame running just after its callback gets that output.
+        let tick = 1_000_000_000 - 2 * period + 300_000;
+        assert_eq!(timing.target_ns(tick), Some(1_000_000_000));
+        // Run late by most of a refresh, it lands one refresh later.
+        assert_eq!(
+            timing.target_ns(tick + period - 1_000_000),
+            Some(1_000_000_000 + period)
+        );
+        // Frames a few refreshes later, or earlier, stay on the same grid.
+        assert_eq!(
+            timing.target_ns(tick + 5 * period),
+            Some(1_000_000_000 + 5 * period)
+        );
+        assert_eq!(
+            timing.target_ns(tick - 3 * period),
+            Some(1_000_000_000 - 3 * period)
+        );
+        assert_eq!(DisplayTiming::default().target_ns(tick), None);
+    }
+
+    #[test]
+    fn host_time_maps_onto_instants() {
+        let now = Instant::now();
+        let now_ns = host_now_ns();
+        let later = instant_at(now, now_ns, now_ns + 5_000_000).unwrap();
+        assert_eq!(later.duration_since(now), Duration::from_millis(5));
+        let earlier = instant_at(now, now_ns, now_ns - 3_000_000).unwrap();
+        assert_eq!(now.duration_since(earlier), Duration::from_millis(3));
+        // Instant and the host clock are the same clock on macOS.
+        let skew = Instant::now().duration_since(now).as_nanos() as i128
+            - (host_now_ns() - now_ns) as i128;
+        assert!(skew.abs() < 2_000_000, "skew {skew} ns");
+    }
+}

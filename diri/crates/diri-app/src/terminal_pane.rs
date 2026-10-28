@@ -45,10 +45,11 @@ use diri_term::find::{
 use diri_term::keys::{
     Key as TermKey, KeyEvent as TermKeyEvent, Modifiers as TermModifiers, NamedKey, paste,
 };
+
 #[cfg(test)]
 use diri_term::keys::{TermInputModes, encode_key};
 use diri_term::metrics::CellMetrics;
-use diri_term::scrollback::{WheelDelta, WheelEvent, WheelRoute};
+use diri_term::scrollback::{WheelDelta, WheelEvent, WheelPhase, WheelRoute};
 use diri_term::theme::TermTheme;
 use diri_ui::{
     AgentKind as UiAgentKind, Fill, FloatingSurface, Ink, Metrics, Radius, SemanticColors,
@@ -57,7 +58,8 @@ use diri_ui::{
 use gpui::{
     AnyElement, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, ExternalPaths,
     FocusHandle, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, Render, Role,
-    ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Task, Window, div,
+    ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Task, TouchPhase,
+    Window, div,
     prelude::*, px,
 };
 use tokio::runtime::Handle;
@@ -4367,12 +4369,17 @@ impl TerminalPane {
             return;
         };
         let visible_rows = resident.last_size.1.max(1);
+        // The event's hardware time and momentum phase, when the platform
+        // attaches them (macOS): local scrollback is paced by them.
+        let timing = gpui::platform_event_timing();
         let route = resident.element.route_wheel(WheelEvent {
             delta,
             col,
             row,
             visible_rows,
             line_height: f32::from(metrics.line_height),
+            sent_at: timing.map(|timing| timing.timestamp),
+            phase: wheel_phase(event.touch_phase, timing),
         });
         match route {
             Some(WheelRoute::Daemon {
@@ -6486,6 +6493,16 @@ impl diri_ui::ScrollTarget for TerminalScrollTarget {
 /// [`TerminalPane::title_bar_height`].
 pub(crate) fn island_title_bar() -> f32 {
     Metrics::TITLE_BAR - 2.0 * crate::store::PaneDensity::Comfortable.island_gap()
+}
+
+/// Where a wheel event sits in its trackpad gesture, from GPUI's touch phase
+/// and the platform's momentum phase.
+fn wheel_phase(touch: TouchPhase, timing: Option<gpui::PlatformEventTiming>) -> WheelPhase {
+    match timing.and_then(|timing| timing.momentum_phase) {
+        Some(TouchPhase::Started | TouchPhase::Moved) => WheelPhase::Momentum,
+        _ if touch == TouchPhase::Started => WheelPhase::Touched,
+        _ => WheelPhase::Moved,
+    }
 }
 
 #[cfg(test)]
@@ -11481,3 +11498,4 @@ mod tests {
         );
     }
 }
+

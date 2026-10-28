@@ -2,7 +2,7 @@ use diri_proto::grid::{
     ChangedRow, GridCell, GridRowCodec, GridUpdate, StyleSpan, TermColor, TermStyle, UnderlineKind,
 };
 use diri_proto::methods::ReadScrollbackCellsResult;
-use diri_term::scrollback::{WheelDelta, WheelEvent};
+use diri_term::scrollback::{WheelDelta, WheelEvent, WheelPhase};
 use diri_term::{buffer::GridBuffer, element::TerminalElement, theme::TermTheme};
 use gpui::{
     AppContext as _, BenchAppContext, Context, IntoElement, ParentElement, Render, Styled, Window,
@@ -177,6 +177,8 @@ fn terminal_trackpad_fling(cx: &mut BenchAppContext) {
             row: 0,
             visible_rows: ROWS,
             line_height: LINE_HEIGHT,
+            sent_at: None,
+            phase: WheelPhase::Moved,
         });
         next = (next + 1) % fling.len();
         serve(&view.terminal);

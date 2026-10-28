@@ -28,6 +28,7 @@ pub(crate) use platform_scheduler::PlatformScheduler;
 mod geometry;
 mod gestures;
 mod global;
+mod input_timing;
 mod input;
 mod inspector;
 mod interactive;
@@ -102,6 +103,10 @@ pub use elements::*;
 pub use executor::*;
 pub use frame_observer::{FrameObserver, FrameStage, frame_observer, set_frame_observer};
 pub use frame_stats::FrameStats;
+pub use input_timing::{
+    PlatformEventTiming, frame_target_time, platform_event_timing, with_frame_target_time,
+    with_platform_event_timing,
+};
 pub use geometry::*;
 pub use gestures::*;
 pub use global::*;
