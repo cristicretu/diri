@@ -1955,7 +1955,7 @@ mod tests {
     }
 
     fn session(index: usize) -> SessionRecord {
-        SessionRecord {
+        SessionRecord { command_run: None,
             attention_state: None,
             id: SessionId::new(format!("running-{index:02}")),
             kind: ProtoAgentKind::CODEX,
@@ -1990,6 +1990,7 @@ mod tests {
             pull_requests: None,
             listening_ports: None,
             foreground_agent: None,
+            foreground_program: None,
             terminal_cwd: None,
             agent_workspace: None,
             note_id: None,
@@ -2804,7 +2805,7 @@ mod tests {
                     div().flex_1().pt(px(2.0)).pb(px(10.0)).px(px(12.0)).child(
                         self.page
                             .clone()
-                            .font(crate::fonts::terminal_font(""))
+                            .font(crate::fonts::terminal_font("", true))
                             .font_size(px(13.0))
                             .theme(theme),
                     ),

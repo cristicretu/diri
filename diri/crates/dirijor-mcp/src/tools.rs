@@ -27,6 +27,9 @@ impl ToolDefinition {
     }
 }
 
+/// The tool an Agent names its own session with.
+pub const NAME_SESSION_TOOL: &str = "name_session";
+
 pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
     let kind_enum: Vec<Value> = kinds.iter().map(|kind| json!(kind)).collect();
     let mut tools = vec![
@@ -216,7 +219,7 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
         ),
         ToolDefinition::new(
             "read_output",
-            "Read what a session produced. last_message (best for results) returns the Agent's final answer from its transcript; transcript returns the last N turns; since returns only terminal lines added after cursor (pass back the returned cursor next time); screen/tail return the rendered screen. Transcript modes fall back to the screen tail when a session has no readable transcript (remote, shells, other agents).",
+            "Read what a session produced. last_message (best for results) returns the Agent's final answer from its transcript; transcript returns the last N turns; since returns only terminal lines added after cursor (pass back the returned cursor next time); screen/tail return the rendered screen, with rows the terminal soft-wrapped rejoined into the line the program wrote so URLs, paths and JSON arrive whole (unwrap:false for one line per screen row). Transcript modes fall back to the screen tail when a session has no readable transcript (remote, shells, other agents).",
             json!({
                 "type": "object",
                 "properties": {
@@ -224,7 +227,8 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
                     "mode": {"type": "string", "enum": ["screen", "tail", "last_message", "transcript", "since"]},
                     "lines": {"type": "number", "default": 50},
                     "turns": {"type": "number", "default": 6, "minimum": 1, "maximum": 100},
-                    "cursor": {"type": "number", "minimum": 0}
+                    "cursor": {"type": "number", "minimum": 0},
+                    "unwrap": {"type": "boolean", "default": true}
                 },
                 "required": ["session_id"]
             }),
@@ -372,6 +376,11 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
             "whoami",
             "Describe this session's identity, parent, ancestors, children, worktree, and cross-session write policy. origin_note, when present, is the note you were started from: read it first with read_note {\"note\":\"origin\"}.",
             json!({"type": "object", "properties": {}}),
+        ),
+        ToolDefinition::new(
+            NAME_SESSION_TOOL,
+            "Name your own Diri session (its tab and sidebar row) after the task: 2-4 lowercase words joined by hyphens naming the task or project, e.g. fix-login-redirect or checkout-flaky-tests, never generic ones like claude or session. Call it unasked while handling the first request that identifies the work (a greeting is not enough), keep a current name that still describes the work (whoami shows it and who set it), and call it again when the task changes. A name the user or Diri gave always wins: the call leaves it and answers applied:false, reason userNamed. When the user asks for a specific name, pass it with user_requested:true; it is kept as written and later agent names never replace it. Mention a rename briefly, if at all. If it fails, carry on with the task.",
+            json!({"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":diri_proto::session_naming::MAX_USER_NAME_CHARS},"user_requested":{"type":"boolean"}},"required":["name"]}),
         ),
         ToolDefinition::new(
             "get_layout",

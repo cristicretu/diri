@@ -121,7 +121,7 @@ fn exercise(session: &mut Session) {
     let detail = session.view().needs_input.expect("detail");
     assert_eq!(detail.source, NeedsInputSource::ProgramStatus);
     assert_eq!(detail.summary, "Deploy to prod?");
-    assert_eq!(detail.tool_name.as_deref(), Some("deploy"));
+    assert_eq!(detail.tool_name, None, "`app` is the program, not a tool");
 
     session.write_input(b"\r").unwrap();
     wait_until(session, "the result", || {

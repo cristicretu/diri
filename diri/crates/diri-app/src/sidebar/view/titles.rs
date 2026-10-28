@@ -193,6 +193,30 @@ mod tests {
     }
 
     #[gpui::test]
+    fn an_agents_own_name_settles_and_lands_at_once_under_reduce_motion(cx: &mut TestAppContext) {
+        let (sidebar, cx) = panel(cx);
+        cx.run_until_parked();
+        retitle(
+            &sidebar,
+            "fix-tab-focus",
+            diri_proto::TitleSource::AgentNamed,
+            cx,
+        );
+        assert!(settling(&sidebar, cx));
+        assert_eq!(run_out(&sidebar, cx), 22);
+
+        cx.update(|_, cx| cx.set_reduce_motion(true));
+        retitle(
+            &sidebar,
+            "audit-fixtures",
+            diri_proto::TitleSource::AgentNamed,
+            cx,
+        );
+        assert!(!settling(&sidebar, cx));
+        sidebar.read_with(cx, |sidebar, _| assert!(!sidebar.title_tick));
+    }
+
+    #[gpui::test]
     fn the_strip_settles_titles_while_the_panel_is_hidden(cx: &mut TestAppContext) {
         let (sidebar, cx) = strip(cx);
         cx.run_until_parked();

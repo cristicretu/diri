@@ -148,7 +148,7 @@ pub fn write_claude_skills_plugin(inject_dir: &Path) -> io::Result<PathBuf> {
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(staging.join(".claude-plugin"))?;
+    diri_platform::private::create_dir_all(&staging.join(".claude-plugin"))?;
     write_atomic(
         &staging.join(".claude-plugin/plugin.json"),
         &serde_json::to_vec_pretty(&json!({
@@ -160,7 +160,7 @@ pub fn write_claude_skills_plugin(inject_dir: &Path) -> io::Result<PathBuf> {
     )?;
     for skill in diri_proto::skills::ALL {
         let folder = staging.join("skills").join(skill.name);
-        std::fs::create_dir_all(&folder)?;
+        diri_platform::private::create_dir_all(&folder)?;
         write_atomic(&folder.join("SKILL.md"), skill.skill_md().as_bytes())?;
     }
     let backup = inject_dir.join(format!(
@@ -343,11 +343,11 @@ pub fn write_cursor_plugin(
     hooks: bool,
 ) -> io::Result<PathBuf> {
     let plugin_root = inject_dir.join("cursor-plugin");
-    std::fs::create_dir_all(&plugin_root)?;
+    diri_platform::private::create_dir_all(&plugin_root)?;
     let plugin_dir = plugin_root.join(session_id);
     let staging = plugin_root.join(format!(".{session_id}.{}.tmp", std::process::id()));
     let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(staging.join(".cursor-plugin"))?;
+    diri_platform::private::create_dir_all(&staging.join(".cursor-plugin"))?;
     write_atomic(
         &staging.join(".cursor-plugin/plugin.json"),
         &serde_json::to_vec_pretty(&json!({
@@ -406,7 +406,7 @@ pub fn write_cursor_plugin(
     }
 
     if hooks {
-        std::fs::create_dir_all(staging.join("hooks"))?;
+        diri_platform::private::create_dir_all(&staging.join("hooks"))?;
         // Absolute CLI path: Cursor does not expand $DIRIJOR_CLI in hook cmds.
         let quoted = shell_single_quote(&cli_path.to_string_lossy());
         write_atomic(
@@ -495,16 +495,37 @@ fn is_executable(path: &Path) -> bool {
 
 fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        diri_platform::private::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, path)
+    diri_platform::private::replace_via(&path.with_extension("tmp"), path, contents)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn injected_configs_and_skills_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let inject = temp.path().join("inject");
+        write_claude_hooks_file(&inject).unwrap();
+        write_claude_mcp_http_file(&inject, "http://127.0.0.1:1/mcp").unwrap();
+        let plugin = write_claude_skills_plugin(&inject).unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&inject), 0o700);
+        assert_eq!(mode(&inject.join("claude-hooks.json")), 0o600);
+        assert_eq!(mode(&inject.join(CLAUDE_MCP_HTTP_FILE)), 0o600);
+        assert_eq!(mode(&plugin), 0o700);
+        assert_eq!(mode(&plugin.join(".claude-plugin/plugin.json")), 0o600);
+        let skill = diri_proto::skills::ALL[0].name;
+        assert_eq!(mode(&plugin.join("skills").join(skill)), 0o700);
+        assert_eq!(
+            mode(&plugin.join("skills").join(skill).join("SKILL.md")),
+            0o600
+        );
+    }
 
     #[test]
     fn the_spoken_instruction_reaches_codex_as_one_toml_string() {

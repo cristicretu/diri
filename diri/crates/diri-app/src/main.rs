@@ -1,9 +1,11 @@
 mod agent_catalog;
+mod agent_notice;
 mod agent_setup;
 mod alerts;
 mod api_client;
 mod app_theme;
 mod application_notifications;
+mod chrome_focus;
 mod clipboard_transfer;
 mod code_editor;
 mod code_intelligence;
@@ -59,6 +61,7 @@ mod overview_zoom;
 pub mod palette;
 mod palette_chrome;
 mod palette_workspace;
+mod pane_drag;
 mod pane_fade;
 mod path_picker;
 mod peek_settle;
@@ -203,6 +206,9 @@ pub(crate) fn refresh_app_menus(cx: &mut App) {
         Menu::new(t("menu.edit")).items([
             MenuItem::os_action(t("menu.copy"), CopySelection, OsAction::Copy),
             MenuItem::os_action(t("menu.paste"), Paste, OsAction::Paste),
+            MenuItem::separator(),
+            MenuItem::action(t("menu.clear_scrollback"), commands::ClearScrollback),
+            MenuItem::action(t("menu.reset_terminal"), commands::ResetTerminal),
         ]),
         Menu::new(t("menu.window")).items([
             MenuItem::action(t("menu.close_session"), CloseSession),
@@ -226,6 +232,9 @@ pub(crate) fn refresh_app_menus(cx: &mut App) {
         Menu::new(t("menu.edit")).items([
             MenuItem::os_action(t("menu.copy"), CopySelection, OsAction::Copy),
             MenuItem::os_action(t("menu.paste"), Paste, OsAction::Paste),
+            MenuItem::separator(),
+            MenuItem::action(t("menu.clear_scrollback"), commands::ClearScrollback),
+            MenuItem::action(t("menu.reset_terminal"), commands::ResetTerminal),
         ]),
         Menu::new(t("menu.window")).items([
             MenuItem::action(t("menu.close_session"), CloseSession),

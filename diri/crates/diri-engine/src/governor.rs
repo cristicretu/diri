@@ -1022,6 +1022,7 @@ mod tests {
     fn record(status: SessionStatus) -> diri_proto::SessionRecord {
         use diri_proto::{AgentKind, DateMillis, ProjectId, Resumability, SessionId, TitleSource};
         diri_proto::SessionRecord {
+            command_run: None,
             attention_state: None,
             id: SessionId::new("s_one"),
             kind: AgentKind::CLAUDE_CODE,
@@ -1056,6 +1057,7 @@ mod tests {
             pull_requests: None,
             listening_ports: None,
             foreground_agent: None,
+            foreground_program: None,
             terminal_cwd: None,
             agent_workspace: None,
             note_id: None,

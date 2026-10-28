@@ -50,6 +50,19 @@ pub enum NamedKey {
     F10,
     F11,
     F12,
+    /// F13 through F24, as extended Mac keyboards and remapped keys send them.
+    F13,
+    F14,
+    F15,
+    F16,
+    F17,
+    F18,
+    F19,
+    F20,
+    F21,
+    F22,
+    F23,
+    F24,
 }
 
 /// Numeric keypad identity remains distinct from ordinary text and Enter.
@@ -77,45 +90,46 @@ pub enum KeypadKey {
 }
 
 impl KeypadKey {
-    /// DEC VT numeric/application keypad mapping.
-    /// https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
-    fn codes(self) -> (&'static str, u8) {
+    /// The character the key types. DECKPAM's SS3 forms are never sent: see
+    /// `encode_key`.
+    fn text(self) -> &'static str {
         match self {
-            Self::Zero => ("0", b'p'),
-            Self::One => ("1", b'q'),
-            Self::Two => ("2", b'r'),
-            Self::Three => ("3", b's'),
-            Self::Four => ("4", b't'),
-            Self::Five => ("5", b'u'),
-            Self::Six => ("6", b'v'),
-            Self::Seven => ("7", b'w'),
-            Self::Eight => ("8", b'x'),
-            Self::Nine => ("9", b'y'),
-            Self::Decimal => (".", b'n'),
-            Self::Divide => ("/", b'o'),
-            Self::Multiply => ("*", b'j'),
-            Self::Subtract => ("-", b'm'),
-            Self::Add => ("+", b'k'),
-            Self::Equal => ("=", b'X'),
-            Self::Separator => (",", b'l'),
-            Self::Enter => ("\r", b'M'),
+            Self::Zero => "0",
+            Self::One => "1",
+            Self::Two => "2",
+            Self::Three => "3",
+            Self::Four => "4",
+            Self::Five => "5",
+            Self::Six => "6",
+            Self::Seven => "7",
+            Self::Eight => "8",
+            Self::Nine => "9",
+            Self::Decimal => ".",
+            Self::Divide => "/",
+            Self::Multiply => "*",
+            Self::Subtract => "-",
+            Self::Add => "+",
+            Self::Equal => "=",
+            Self::Separator => ",",
+            Self::Enter => "\r",
         }
     }
 }
 
 impl Key {
     pub fn depends_on_modes(&self) -> bool {
+        // Keypad keys type their characters in every legacy mode (see
+        // `encode_key`), so only the cursor keys depend on observed modes.
         matches!(
             self,
-            Self::Keypad(_)
-                | Self::Named(
-                    NamedKey::ArrowUp
-                        | NamedKey::ArrowDown
-                        | NamedKey::ArrowLeft
-                        | NamedKey::ArrowRight
-                        | NamedKey::Home
-                        | NamedKey::End
-                )
+            Self::Named(
+                NamedKey::ArrowUp
+                    | NamedKey::ArrowDown
+                    | NamedKey::ArrowLeft
+                    | NamedKey::ArrowRight
+                    | NamedKey::Home
+                    | NamedKey::End
+            )
         )
     }
 }
@@ -127,6 +141,21 @@ pub struct KeyEvent {
     /// AppKit's `characters`, including Option-composed characters. Named-key
     /// constructors fill this with the key's ordinary control character.
     pub text: Option<String>,
+    /// What the layout types on this key with and without Shift, when the
+    /// platform adapter knows. Only the kitty encoder reads it.
+    pub layout: KeyLayout,
+}
+
+/// A character key's layout characters. Platform adapters often resolve Shift
+/// into the logical key (`@` for Shift-2); the kitty protocol instead names
+/// the unshifted key (`2`) with a Shift modifier and reports `@` as the
+/// shifted alternate.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct KeyLayout {
+    /// The character with no modifiers held.
+    pub unshifted: Option<char>,
+    /// The character with Shift held.
+    pub shifted: Option<char>,
 }
 
 impl KeyEvent {
@@ -136,6 +165,7 @@ impl KeyEvent {
         Self {
             key: Key::Character(text.clone()),
             text: Some(text),
+            layout: KeyLayout::default(),
         }
     }
 
@@ -145,13 +175,15 @@ impl KeyEvent {
         Self {
             key: Key::Character(logical.into()),
             text: Some(text.into()),
+            layout: KeyLayout::default(),
         }
     }
 
     pub fn keypad(key: KeypadKey) -> Self {
         Self {
             key: Key::Keypad(key),
-            text: Some(key.codes().0.to_owned()),
+            text: Some(key.text().to_owned()),
+            layout: KeyLayout::default(),
         }
     }
 
@@ -159,6 +191,7 @@ impl KeyEvent {
         Self {
             key: Key::Named(key),
             text: named_text(key).map(str::to_owned),
+            layout: KeyLayout::default(),
         }
     }
 }
@@ -179,7 +212,9 @@ pub struct TermInputModes {
     /// DEC application cursor keys (DECCKM). Only unmodified arrows use SS3;
     /// modified arrows retain xterm's CSI `1;mod` form.
     pub application_cursor_keys: bool,
-    /// DEC application numeric keypad (DECKPAM).
+    /// DEC application numeric keypad (DECKPAM). Observed and carried, but it
+    /// no longer changes keypad bytes: a Mac keypad has no Num Lock, so it
+    /// always types its characters, as xterm does with Num Lock on.
     pub application_keypad: bool,
     /// DEC bracketed-paste mode (DECSET 2004). Pass this to [`paste`].
     pub bracketed_paste: bool,
@@ -252,6 +287,7 @@ pub enum KeyEncodingError {
     UnsupportedRelease,
     UnknownModes,
     UnsupportedCommandShortcut,
+    /// No longer produced: keypad keys type their characters in every mode.
     UnsupportedKeypadModifiers,
 }
 
@@ -318,12 +354,6 @@ pub fn encode_action(
         return Err(KeyEncodingError::UnsupportedCommandShortcut);
     }
     let modes = keyboard.unwrap_or_default().encoding_modes(false);
-    if matches!(event.key, Key::Keypad(_))
-        && modes.application_keypad
-        && (modifiers.shift || modifiers.alt || modifiers.ctrl || modifiers.cmd)
-    {
-        return Err(KeyEncodingError::UnsupportedKeypadModifiers);
-    }
     Ok(encode_key(event, modifiers, modes))
 }
 
@@ -334,6 +364,7 @@ fn normalized_logical_key(event: &KeyEvent) -> KeyEvent {
         Key::Character(name) if name == "space" => KeyEvent {
             key: Key::Character(" ".to_owned()),
             text: event.text.clone(),
+            layout: event.layout,
         },
         _ => event.clone(),
     }
@@ -345,12 +376,11 @@ fn normalized_logical_key(event: &KeyEvent) -> KeyEvent {
 /// named key. Command shortcuts are otherwise left for the UI adapter, except
 /// Command-Backspace, which the Swift terminal explicitly maps to Ctrl-U.
 pub fn encode_key(event: &KeyEvent, modifiers: Modifiers, modes: TermInputModes) -> Vec<u8> {
-    if let Key::Keypad(key) = event.key
-        && modes.application_keypad
-    {
-        return ss3(key.codes().1);
-    }
-
+    // Keypad keys type their characters even under DECKPAM. Mac keypads have
+    // no Num Lock and behave as xterm's keypad with Num Lock on (and as
+    // Terminal.app and other macOS terminals do), so a shell or editor that
+    // enables keypad-transmit mode (oh-my-zsh's `echoti smkx`, Vim's `t_ks`)
+    // still receives digits. Kitty-flag programs get keypad codes instead.
     // `performKeyEquivalent` handles Command-Backspace before `encode(event:)`.
     // Shift is allowed, but Option or Control makes it a different chord.
     if event.key == Key::Named(NamedKey::Backspace)
@@ -367,20 +397,22 @@ pub fn encode_key(event: &KeyEvent, modifiers: Modifiers, modes: TermInputModes)
         return bytes;
     }
 
+    // Control chords are C0 bytes, and Option (Meta) prefixes them with ESC
+    // as xterm's metaSendsEscape does: Ctrl-Option-A is `ESC ^A` (Emacs
+    // C-M-a), not a bare ^A.
     if modifiers.ctrl
         && let Key::Character(logical) = &event.key
         && let Some(bytes) = encode_control_text(logical)
     {
-        return bytes;
+        return meta_prefixed(modifiers.alt, bytes);
     }
 
+    // Control-Backspace sends the other erase byte (BS when Backspace is
+    // DEL), as xterm, kitty and Ghostty do, so readline, zsh and editors can
+    // bind it to delete a word apart from plain Backspace.
     if event.key == Key::Named(NamedKey::Backspace) {
-        let byte = backspace_byte(modes);
-        return if modifiers.alt {
-            vec![ESC, byte]
-        } else {
-            vec![byte]
-        };
+        let byte = backspace_byte(modes, modifiers.ctrl);
+        return meta_prefixed(modifiers.alt, vec![byte]);
     }
 
     let produced = event.text.as_deref().unwrap_or_default();
@@ -490,11 +522,27 @@ fn encode_csi_key(
         NamedKey::F10 => Some(tilde(21)),
         NamedKey::F11 => Some(tilde(23)),
         NamedKey::F12 => Some(tilde(24)),
+        // VT220 numbering for F13-F20, then 42-45 for F21-F24, as the
+        // reference multiplexer and rxvt-style terminals send them.
+        NamedKey::F13 => Some(tilde(25)),
+        NamedKey::F14 => Some(tilde(26)),
+        NamedKey::F15 => Some(tilde(28)),
+        NamedKey::F16 => Some(tilde(29)),
+        NamedKey::F17 => Some(tilde(31)),
+        NamedKey::F18 => Some(tilde(32)),
+        NamedKey::F19 => Some(tilde(33)),
+        NamedKey::F20 => Some(tilde(34)),
+        NamedKey::F21 => Some(tilde(42)),
+        NamedKey::F22 => Some(tilde(43)),
+        NamedKey::F23 => Some(tilde(44)),
+        NamedKey::F24 => Some(tilde(45)),
         NamedKey::Escape | NamedKey::Backspace => None,
     }
 }
 
 fn encode_control_text(logical: &str) -> Option<Vec<u8>> {
+    // Platform adapters name the space bar rather than spelling it.
+    let logical = if logical == "space" { " " } else { logical };
     let mut bytes = Vec::new();
     let mut mapped_any = false;
 
@@ -502,10 +550,16 @@ fn encode_control_text(logical: &str) -> Option<Vec<u8>> {
         match scalar {
             'a'..='z' => bytes.push(scalar as u8 - b'a' + 1),
             'A'..='Z' => bytes.push(scalar as u8 - b'A' + 1),
-            ' ' | '@' => bytes.push(0x00),
-            '[' => bytes.push(0x1b),
-            '\\' => bytes.push(0x1c),
-            ']' => bytes.push(0x1d),
+            ' ' | '@' | '2' => bytes.push(0x00),
+            '[' | '3' => bytes.push(0x1b),
+            '\\' | '4' => bytes.push(0x1c),
+            ']' | '5' => bytes.push(0x1d),
+            // xterm's VT220 digit row: Ctrl-2 through Ctrl-8 reach the C0
+            // controls a US keyboard has no other unshifted key for, and
+            // Ctrl-/ is US (readline and Emacs undo).
+            '6' => bytes.push(0x1e),
+            '7' | '/' => bytes.push(0x1f),
+            '8' => bytes.push(0x7f),
             // Swift's comment promises Ctrl-A...Ctrl-_ but its implementation
             // only spells out Space, `[`, `\\`, and `]`. T6 asks for the full
             // conventional punctuation set, so Ctrl-@/^/_ and Ctrl-? are
@@ -535,12 +589,19 @@ fn named_text(key: NamedKey) -> Option<&'static str> {
     }
 }
 
-fn backspace_byte(modes: TermInputModes) -> u8 {
-    if modes.backspace_sends_delete {
+fn backspace_byte(modes: TermInputModes, ctrl: bool) -> u8 {
+    if modes.backspace_sends_delete != ctrl {
         0x7f
     } else {
         0x08
     }
+}
+
+fn meta_prefixed(alt: bool, mut bytes: Vec<u8>) -> Vec<u8> {
+    if alt {
+        bytes.insert(0, ESC);
+    }
+    bytes
 }
 
 fn xterm_modifier(modifiers: Modifiers) -> u8 {
@@ -792,15 +853,16 @@ mod tests {
                 b"\x1b[F".as_slice(),
                 b"\x1bOF".as_slice(),
             ),
+            // Keypad keys type their characters under DECKPAM too.
             (
                 KeyEvent::keypad(KeypadKey::One),
                 b"1".as_slice(),
-                b"\x1bOq".as_slice(),
+                b"1".as_slice(),
             ),
             (
                 KeyEvent::keypad(KeypadKey::Enter),
                 b"\r".as_slice(),
-                b"\x1bOM".as_slice(),
+                b"\r".as_slice(),
             ),
             (
                 KeyEvent::named(NamedKey::Enter),
@@ -1109,7 +1171,12 @@ mod tests {
                     let backspace = if modifiers.cmd && !modifiers.alt && !modifiers.ctrl {
                         vec![0x15]
                     } else {
-                        let byte = if backspace_sends_delete { 0x7f } else { 0x08 };
+                        // Control sends the other erase byte.
+                        let byte = if backspace_sends_delete != modifiers.ctrl {
+                            0x7f
+                        } else {
+                            0x08
+                        };
                         if modifiers.alt {
                             vec![ESC, byte]
                         } else {
@@ -1151,8 +1218,8 @@ mod tests {
                     ctrl_alt,
                     TermInputModes::default()
                 ),
-                expected,
-                "control takes precedence over Option at offset {offset}"
+                [&[ESC][..], &expected].concat(),
+                "Option prefixes the control byte with ESC at offset {offset}"
             );
         }
     }
@@ -1236,6 +1303,7 @@ mod tests {
                 &KeyEvent {
                     key: Key::Character("x".into()),
                     text: None,
+                    layout: KeyLayout::default(),
                 },
                 Modifiers::default(),
                 TermInputModes::default()

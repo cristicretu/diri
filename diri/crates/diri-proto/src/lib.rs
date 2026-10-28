@@ -1,6 +1,7 @@
 //! Wire types and codecs for control messages, binary frames, grid updates, and daemon paths.
 
 pub mod accounts;
+pub mod agent_action;
 pub mod agent_names;
 pub mod api_request;
 pub mod attention;
@@ -31,6 +32,7 @@ pub mod recovery;
 pub mod remote_connection;
 pub mod remote_pty;
 pub mod schedules;
+pub mod session_naming;
 pub mod skills;
 pub use remote_connection::{RemoteConnection, RemoteConnectionState};
 pub mod process;
