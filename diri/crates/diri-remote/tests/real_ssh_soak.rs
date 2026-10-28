@@ -89,6 +89,7 @@ fn real_ssh_detach_soak_reconnects_the_same_process() {
         cols: 80,
         rows: 24,
         persistence,
+        keyboard_enhancements: false,
     };
     let bindings = RemoteBindingStore::new(temporary.path().join("bindings")).expect("bindings");
     let engine = Arc::new(ManifestEngine::new(Vec::new()));

@@ -303,6 +303,28 @@ stored rows when only the oldest block is partial, and the deferred line index
 reserves exact capacity and tracks its extras' heap incrementally (the history
 bound measures storage after every eviction).
 
+## History kept is independent of read boundaries
+
+The history budget used to measure allocation capacities, the rows not yet
+sealed into a block as they stood when the bound ran, and the oldest block's
+decode index; and `Grid::bound_history_storage` lowered the row limit to the
+rows kept after an eviction until storage fell 1/16 below the budget. All of
+these depend on when the bound runs, which is once per read, so how much
+history a terminal kept depended on how its output was split into reads (a
+64 KiB-read parse and a byte-at-a-time parse of the same 64 MB differed by
+hundreds of rows). Capacities also never shrank as narrowed deferred lines were
+evicted, so narrowing deep wide-character history evicted most of it.
+
+`CompactRows::history_storage_bytes` now counts live bytes as a function of the
+history alone: index lengths instead of capacities, the unsealed rows as the
+full block they grow into between seals (once history exists), and not the
+decode index (a cache that exists only while full history recycles rows). The
+bound shrinks the block and deferred-line indexes when their capacity exceeds
+twice their length plus 64, so uncounted slack stays bounded. The row limit
+stays at the ceiling. The kept rows are then the newest that fit, whenever the
+bound runs. Tests: `bounded_history_does_not_depend_on_read_boundaries`, and
+`narrowing_deep_wide_character_history_keeps_it` in `diri-terminal-state`.
+
 ## Cheaper history encoding
 
 History encoding was half of the session thread while output streamed. Four
@@ -392,6 +414,61 @@ OSC 4/10/11 changes no cell, so without it the host's change detection saw no
 change and never republished the screen. `reset_state` (RIS, `ESC c`) also
 clears every color a program set, as xterm and libghostty do; upstream kept
 them across `reset`. No wire, checkpoint or protocol change.
+
+## Public grapheme module
+
+`term::grapheme` (`Info`, `Class`, `Cluster`, `breaks`, `may_join`, …) is
+public (and `#[doc(hidden)]`) so the core v2 prototype in
+`diri-terminal-state` measures widths and clusters with the same tables
+instead of a copy. Visibility only; no behavior change.
+## Styles with extra storage by hash map
+
+`StyleTable::extra_id` found a style with extra storage (combining marks, an
+underline color, a hyperlink) by a linear scan of every such style already in
+the block. Output where each cell carries different marks (`kitten
+__benchmark__`'s unique Unicode: a letter and three combining marks per cell)
+gives a block of 64 rows at 120 columns about 7,700 such styles, so sealing
+it compared about 30 million entries: the unique Unicode workload fell from
+about 47 to about 10 MB/s with "Cheaper history encoding".
+
+- The first style with each hash sits in an `FxHasher` map, found or claimed
+  in one probe; a later, different style with the same hash goes to a short
+  collision list that is searched by hash and comparison as before. Ids are
+  handed out in the same order, so payloads are byte-identical.
+- The table is kept, emptied, in a thread-local between blocks next to the
+  encoding buffers (`STYLE_SCRATCH`) and released with them, so a stream of
+  such blocks does not regrow its map and list each time. It is emptied
+  before it is put back, so it holds no cell's extra storage between blocks.
+
+Tests: `styles_with_extra_storage_are_told_apart_on_a_hash_collision`,
+`blocks_of_unique_combining_marks_round_trip_one_after_another`, and the
+existing randomized codec tests.
+
+## Amortized history audits in debug builds
+
+Three debug assertions in `grid/compact.rs` re-derived history bookkeeping
+from scratch on every change: the deferred history's row, payload and
+eager-cell counts (a layout of every deferred line), the deferred line
+index's extra heap, and the stored payload bytes (every block). After a
+column change defers a full history, each new line evicts a deferred row, so
+a debug build (`cargo test`, development apps) walked every deferred line
+per line: 7.6–13 ms per line at 150,000 rows, against 9 µs before the
+resize. `audit_due` keeps the checks exact for collections up to 1,024 items
+(every unit test's) and otherwise runs them once per `len` calls, which is
+O(1) amortized. Release builds compile none of it; no behavior, wire,
+checkpoint or protocol change. Test:
+`lines_after_narrowing_a_full_history_cost_what_they_did_before`
+(`diri-terminal-state`); probe: `--bench narrow_history`.
+
+## SGR-Pixels mouse (DECSET 1016)
+
+`TermMode::SGR_PIXEL_MOUSE` (bit 26) records DECSET 1016. It is one of the
+mutually exclusive mouse encodings, as in xterm: setting 1005, 1006 or 1016
+clears the other two, and resetting 1016 leaves the legacy X10 encoding.
+DECRQM answers `1`/`2` for it (it was recognized only to answer `4`). The
+mode is state only; the host encodes the reports. RIS clears it with the rest
+of the mode bits. Mode 69 (DECLRMM) still answers `4`: left and right margins
+are not implemented.
 
 ## Stable history rows
 

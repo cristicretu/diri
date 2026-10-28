@@ -110,6 +110,7 @@ fn main() {
                     cols: 153,
                     rows: 39,
                     persistence: PersistenceCapability::NonPersistent,
+                    keyboard_enhancements: false,
                 },
                 host_id: "bench".into(),
                 binding_store: RemoteBindingStore::new(root.join("bindings"))

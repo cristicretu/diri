@@ -32,8 +32,8 @@ use std::time::{Duration, Instant};
 use diri_client::attachment::{SessionAttachment, TerminalChunk};
 use diri_proto::grid::GridUpdate;
 use diri_proto::terminal::{
-    MouseModes, TerminalMouseButton, TerminalMouseEvent, TerminalMouseModifiers, encode_mouse_event,
-    encode_mouse_wheel,
+    MouseModes, TerminalMouseButton, TerminalMouseEvent, TerminalMouseModifiers,
+    encode_mouse_event_at, encode_mouse_wheel_at, grid_position_pixels,
 };
 use diri_proto::{
     AgentKind as ProtoAgentKind, ExitReason, Resumability, RiskHint, SessionId, SessionRecord,
@@ -3390,17 +3390,6 @@ impl TerminalPane {
         }
     }
 
-    /// Grid cell under a window-space pointer position, using the same
-    /// geometry as `handle_scroll`.
-    fn grid_cell_at(
-        &self,
-        position: gpui::Point<gpui::Pixels>,
-        window: &mut Window,
-    ) -> Option<(usize, usize)> {
-        self.grid_point_at(position, window)
-            .map(|point| (point.col, point.row))
-    }
-
     /// The cell under `position` and the column boundary nearest it.
     fn grid_point_at(
         &self,
@@ -3441,13 +3430,18 @@ impl TerminalPane {
                 .element
                 .scroll_shift(metrics.line_height, window.scale_factor()),
         );
-        let row = ((f32::from(position.y) - grid_y + shift) / f32::from(metrics.line_height))
-            .floor()
-            .max(0.0) as usize;
+        let rows_down = (f32::from(position.y) - grid_y + shift) / f32::from(metrics.line_height);
+        let row = rows_down.floor().max(0.0) as usize;
         // The extra row is addressable for selection and links. A program
         // reading the mouse is only ever told about rows of its own screen.
         let extra_row = shift > 0.0 && !resident.element.mouse_modes().is_reporting();
         let cols = resident.element.grid_cols();
+        let pixel = grid_position_pixels(
+            (f32::from(position.x) - grid_x) / f32::from(metrics.cell_width),
+            rows_down,
+            cols,
+            resident.element.grid_rows(),
+        );
         clamp_grid_cell(
             col,
             row,
@@ -3461,6 +3455,7 @@ impl TerminalPane {
             col: usize::from(col),
             row: usize::from(row),
             edge: edge.min(usize::from(cols)),
+            pixel,
         })
     }
 
@@ -3500,7 +3495,13 @@ impl TerminalPane {
         let Some(id) = self.selected_id() else {
             return;
         };
-        let Some(GridPoint { col, row, edge }) = self.grid_point_at(event.position, window) else {
+        let Some(GridPoint {
+            col,
+            row,
+            edge,
+            pixel,
+        }) = self.grid_point_at(event.position, window)
+        else {
             return;
         };
         self.reset_qol_session(&id);
@@ -3589,14 +3590,18 @@ impl TerminalPane {
                     return;
                 };
                 resident.element.note_pointer_input();
-                if let Some(bytes) = encode_mouse_event(
-                    resident.element.mouse_modes(),
+                let mouse = resident.element.mouse_modes();
+                if let Some(bytes) = encode_mouse_event_at(
+                    mouse,
                     TerminalMouseEvent::Press(button),
                     terminal_mouse_modifiers(&event.modifiers),
                     col as u16,
                     row as u16,
+                    pixel,
                 ) {
-                    resident.mouse_motion.pressed_at((col as u16, row as u16));
+                    resident
+                        .mouse_motion
+                        .pressed_at(motion_key(mouse, (col, row), pixel));
                     resident.attachment.mouse(bytes);
                 }
                 cx.stop_propagation();
@@ -3620,7 +3625,8 @@ impl TerminalPane {
         // ordinary release outside the pane still reaches this path and clamps.
         self.qol.drag = None;
         self.qol.autoscroll = None;
-        let cell = self.grid_cell_at(event.position, window);
+        let point = self.grid_point_at(event.position, window);
+        let cell = point.map(|point| (point.col, point.row));
         let copy_on_select = self
             .runtime
             .store
@@ -3701,12 +3707,13 @@ impl TerminalPane {
         let Some(button) = terminal_mouse_button(event.button) else {
             return;
         };
-        if let Some(bytes) = encode_mouse_event(
+        if let Some(bytes) = encode_mouse_event_at(
             resident.element.mouse_modes(),
             TerminalMouseEvent::Release(button),
             terminal_mouse_modifiers(&event.modifiers),
             col as u16,
             row as u16,
+            point.map_or((0, 0), |point| point.pixel),
         ) {
             resident.attachment.mouse(bytes);
         }
@@ -3722,7 +3729,13 @@ impl TerminalPane {
         let Some(id) = self.selected_id() else {
             return;
         };
-        let Some(GridPoint { col, row, edge }) = self.grid_point_at(event.position, window) else {
+        let Some(GridPoint {
+            col,
+            row,
+            edge,
+            pixel,
+        }) = self.grid_point_at(event.position, window)
+        else {
             return;
         };
         self.reset_qol_session(&id);
@@ -3788,19 +3801,23 @@ impl TerminalPane {
             let Some(button) = button else {
                 return;
             };
-            let Some(bytes) = encode_mouse_event(
-                resident.element.mouse_modes(),
+            let mouse = resident.element.mouse_modes();
+            let Some(bytes) = encode_mouse_event_at(
+                mouse,
                 TerminalMouseEvent::Motion(button),
                 terminal_mouse_modifiers(&event.modifiers),
                 col as u16,
                 row as u16,
+                pixel,
             ) else {
                 return;
             };
             (
-                resident
-                    .mouse_motion
-                    .push(Instant::now(), (col as u16, row as u16), bytes),
+                resident.mouse_motion.push(
+                    Instant::now(),
+                    motion_key(mouse, (col, row), pixel),
+                    bytes,
+                ),
                 resident.attachment.clone(),
             )
         };
@@ -4429,17 +4446,22 @@ impl TerminalPane {
         }
     }
 
-    /// Starts the next queued scrollback fetch for `id`, if the viewport wants
-    /// one and none is in flight. Called from wheel events AND from fetch
+    /// Starts the queued scrollback fetches for `id` the viewport wants, up to
+    /// its in-flight limit. Called from wheel events AND from fetch
     /// completion: a fast wheel burst queues the next window while a fetch is
     /// in flight, and nothing else would ever start it — the stranded queue
     /// painted as a transient blank region in deep scrollback.
     fn pump_scrollback_fetch(&mut self, id: &SessionId, visible_rows: usize) {
+        // Up to `MAX_FETCHES_IN_FLIGHT` windows go out at once.
+        while self.start_scrollback_fetch(id, visible_rows) {}
+    }
+
+    fn start_scrollback_fetch(&mut self, id: &SessionId, visible_rows: usize) -> bool {
         let Some(resident) = self.residents.get_mut(id) else {
-            return;
+            return false;
         };
         let Some(request) = resident.element.begin_scrollback_fetch(visible_rows) else {
-            return;
+            return false;
         };
         let generation = resident.attachment_generation;
         let client = Arc::clone(self.runtime.client());
@@ -4463,6 +4485,7 @@ impl TerminalPane {
                 }
             }
         });
+        true
     }
 
     /// Learns how much history sits above a live view whose scroller knob is
@@ -4527,9 +4550,9 @@ impl TerminalPane {
         let metrics = typeface.metrics(window);
         // The same cell a click there would report (bottom-anchored grids and
         // a reading view between rows included), clamped to the grid.
-        let (col, row) = self
-            .grid_cell_at(event.position, window)
-            .map_or((0, 0), |(col, row)| (col as u16, row as u16));
+        let point = self.grid_point_at(event.position, window);
+        let (col, row) = point.map_or((0, 0), |point| (point.col as u16, point.row as u16));
+        let pixel = point.map_or((0, 0), |point| point.pixel);
         let (sideways, delta) = match event.delta {
             ScrollDelta::Pixels(point) => (
                 WheelDelta::PrecisePoints(f32::from(point.x)),
@@ -4565,7 +4588,9 @@ impl TerminalPane {
             let count = steps.unsigned_abs() as usize;
             resident
                 .attachment
-                .mouse(encode_mouse_wheel(mouse, wheel, modifiers, col, row, count));
+                .mouse(encode_mouse_wheel_at(
+                    mouse, wheel, modifiers, col, row, pixel, count,
+                ));
             sent = true;
         }
         let visible_rows = resident.last_size.1.max(1);
@@ -4588,12 +4613,15 @@ impl TerminalPane {
                 } else {
                     TerminalMouseEvent::WheelDown
                 };
-                resident.attachment.mouse(encode_mouse_wheel(
+                // The route's cell is the pointer's own (clamped the same
+                // way), so its pixel is the pointer's too.
+                resident.attachment.mouse(encode_mouse_wheel_at(
                     mouse,
                     wheel,
                     modifiers,
                     col,
                     row,
+                    pixel,
                     usize::from(lines),
                 ));
             }
@@ -5208,7 +5236,8 @@ impl TerminalPane {
             .focus_handle(self.focus.clone())
             .reduce_motion(cx.reduce_motion())
             .cursor_preferences(cursor_preferences)
-            .hovered_reference(self.qol.hit.clone());
+            .hovered_reference(self.qol.hit.clone())
+            .padding_extend(grid_surface_padding());
         let element = if self.qol.copy_mode.is_some()
             || self.qol.paste.is_some()
             || self.qol.menu.is_some()
@@ -5239,9 +5268,10 @@ impl TerminalPane {
             .relative()
             .flex_1()
             .overflow_hidden()
-            .pt(px(2.0))
-            .pb(px(10.0))
-            .px(px(12.0))
+            .pt(grid_surface_padding().top)
+            .pb(grid_surface_padding().bottom)
+            .pl(grid_surface_padding().left)
+            .pr(grid_surface_padding().right)
             .cursor(if self.qol.hit.is_some() || self.qol.gutter_mark.is_some() {
                 gpui::CursorStyle::PointingHand
             } else {
@@ -5287,7 +5317,7 @@ impl TerminalPane {
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::handle_pointer_up))
             .on_mouse_up(MouseButton::Right, cx.listener(Self::handle_pointer_up))
             // A release outside the pane still belongs to the child that saw
-            // the press. `grid_cell_at` clamps it to the nearest grid cell.
+            // the press. `grid_point_at` clamps it to the nearest grid cell.
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::handle_pointer_up))
             .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::handle_pointer_up))
             .on_mouse_up_out(MouseButton::Right, cx.listener(Self::handle_pointer_up))
@@ -5319,8 +5349,9 @@ impl TerminalPane {
                         ),
                     },
                 )
-                // Shell command marks sit in the grid's left padding.
-                .bleed_left(px(diri_term::element::COMMAND_MARK_GUTTER))
+                // Shell command marks sit in the grid's left padding, and a
+                // full-screen program's backgrounds extend into all of it.
+                .bleed(grid_surface_padding())
                 .size_full(),
             );
 
@@ -6059,6 +6090,7 @@ impl TerminalPane {
             .text_color(colors.primary)
             .on_action(cx.listener(Self::open_find))
             .on_action(cx.listener(Self::open_path_picker))
+            .on_action(cx.listener(Self::open_go_to_directory))
             .on_action(cx.listener(Self::find_next))
             .on_action(cx.listener(Self::find_previous))
             .on_action(cx.listener(Self::close_find))
@@ -6133,6 +6165,22 @@ struct GridPoint {
     col: usize,
     row: usize,
     edge: usize,
+    /// The pointer's pixel in the grid, in the nominal cells programs are
+    /// told about, for SGR-Pixels mouse reports (DECSET 1016).
+    pixel: (u32, u32),
+}
+
+/// What makes one motion report different from the last: the cell, or for
+/// SGR-Pixels reports (DECSET 1016) the pixel, which moves within a cell.
+fn motion_key(mouse: MouseModes, cell: (usize, usize), pixel: (u32, u32)) -> (u16, u16) {
+    if mouse.pixel_reports() {
+        (
+            u16::try_from(pixel.0).unwrap_or(u16::MAX),
+            u16::try_from(pixel.1).unwrap_or(u16::MAX),
+        )
+    } else {
+        (cell.0 as u16, cell.1 as u16)
+    }
 }
 
 /// The cell under a pointer `x` pixels into the grid, and the column
@@ -6355,6 +6403,18 @@ fn secondary_button(
 
 pub(crate) fn resume_all_label(count: usize) -> String {
     tf("terminal.resume_all", &[("count", &count)])
+}
+
+/// The padding around a pane's grid. The left side also holds the shell
+/// command marks, so it is at least [`diri_term::element::COMMAND_MARK_GUTTER`].
+fn grid_surface_padding() -> gpui::Edges<gpui::Pixels> {
+    const _: () = assert!(12.0 >= diri_term::element::COMMAND_MARK_GUTTER);
+    gpui::Edges {
+        top: px(2.0),
+        right: px(12.0),
+        bottom: px(10.0),
+        left: px(12.0),
+    }
 }
 
 fn centered_message(icon: &str, message: &str, colors: SemanticColors) -> gpui::Div {
@@ -7533,6 +7593,38 @@ mod tests {
         );
     }
 
+    /// A program reading SGR-Pixels reports (DECSET 1016) hears about motion
+    /// inside a cell; a cell-report program still hears only about new cells.
+    #[test]
+    fn pixel_reports_see_motion_inside_a_cell() {
+        use diri_proto::terminal::{MouseEncoding, MouseTrackingMode};
+        let pixels = MouseModes::new(MouseTrackingMode::AnyMotion, MouseEncoding::SgrPixels);
+        let cells = MouseModes::new(MouseTrackingMode::AnyMotion, MouseEncoding::Sgr);
+        let started = Instant::now();
+        for (mouse, second) in [
+            (pixels, MotionDispatch::SendNow(b"b".to_vec())),
+            (cells, MotionDispatch::None),
+        ] {
+            let mut limiter = MouseMotionLimiter::default();
+            limiter.pressed_at(motion_key(mouse, (2, 1), (32, 34)));
+            let later = started + MOUSE_MOTION_CADENCE * 2;
+            assert_eq!(
+                limiter.push(later, motion_key(mouse, (2, 1), (40, 50)), b"b".to_vec()),
+                second,
+                "{mouse:?}"
+            );
+        }
+        let point = encode_mouse_event_at(
+            pixels,
+            TerminalMouseEvent::Press(TerminalMouseButton::Left),
+            TerminalMouseModifiers::default(),
+            2,
+            1,
+            grid_position_pixels(2.5, 1.5, 80, 24),
+        );
+        assert_eq!(point, Some(b"\x1b[<0;40;51M".to_vec()));
+    }
+
     #[test]
     fn unrestricted_motion_coalesces_to_the_latest_cell_at_the_trailing_edge() {
         let started = Instant::now();
@@ -8346,6 +8438,10 @@ mod tests {
             session.cwd = root.path().display().to_string();
             root
         });
+        if scene.starts_with("insert-path-remote") {
+            session.host = Some("forge".into());
+            session.cwd = "/home/cristi/work/replay-web".into();
+        }
         let id = session.id.clone();
         {
             let mut store = runtime.store.write().unwrap();
@@ -8654,6 +8750,55 @@ mod tests {
                         "controller-feedback" => pane.handle_pane_event(
                             PaneEvent::InputFeedback(id.clone(), "Input queue full; that keystroke was dropped".into()), window, cx),
                         "copy" => pane.enter_copy_mode(window, cx),
+                        "go-to-directory" => {
+                            pane.open_path_picker(&crate::commands::InsertPath, window, cx);
+                            pane.go_to_directory_adopt_for_test(
+                                crate::path_picker::PathIndex::from_entries(
+                                    std::path::Path::new("/work/replay-web"),
+                                    &[
+                                        ("apps", true),
+                                        ("apps/license-lookup-app", true),
+                                        ("apps/license-lookup-app/README.md", false),
+                                        ("apps/license-lookup-app/src", true),
+                                        ("design_assets", true),
+                                        ("dns", true),
+                                        ("Dockerfile", false),
+                                        ("node_modules", true),
+                                    ],
+                                ),
+                                &["fun/dirijor", "fun/dirijor/diri/crates/diri-app", "work/api-gateway"],
+                            );
+                            if let Ok(query) = std::env::var("DIRI_QOL_QUERY") {
+                                pane.path_picker_query_for_test(&query);
+                            }
+                        }
+                        // The root level as a `list-dir-v1` Helper lists it.
+                        "insert-path-remote" => {
+                            use diri_proto::remote_pty::{ListDirEntry, ListDirEntryKind, ListDirResult};
+                            pane.open_path_picker(&crate::commands::InsertPath, window, cx);
+                            let entry = |name: &str, dir: bool| ListDirEntry {
+                                name: name.into(),
+                                kind: if dir { ListDirEntryKind::Directory } else { ListDirEntryKind::File },
+                                symlink: false,
+                            };
+                            pane.path_picker_adopt_for_test(crate::path_picker::PathIndex::from_remote(&ListDirResult {
+                                cwd: "/home/cristi/work/replay-web".into(),
+                                path: "/home/cristi/work/replay-web".into(),
+                                entries: vec![
+                                    entry(".git", true),
+                                    entry("Dockerfile", false),
+                                    entry("LICENSE", false),
+                                    entry("apps", true),
+                                    entry("design_assets", true),
+                                    entry("dns", true),
+                                    entry("docker-compose.yml", false),
+                                    entry("flake.nix", false),
+                                    entry("node_modules", true),
+                                ],
+                                truncated: false,
+                                failure: None,
+                            }));
+                        }
                         scene if scene.starts_with("insert-path") => {
                             pane.open_path_picker(&crate::commands::InsertPath, window, cx);
                             pane.path_picker_adopt_for_test(crate::path_picker::PathIndex::from_entries(
@@ -9858,6 +10003,107 @@ mod tests {
             );
             assert!(pane.path_picker.is_none());
             assert!(input.try_recv().is_err());
+        });
+    }
+
+    /// Go to Directory types one quoted `cd` only at an empty shell prompt,
+    /// read from the screen's OSC 133 marks, and never into a running
+    /// command or over typed text.
+    #[gpui::test]
+    fn go_to_directory_cds_only_at_an_empty_prompt(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            let (tx, mut input) = mpsc::unbounded_channel();
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.attachment.claim();
+            resident.attachment.input_observer = Some((id.clone(), tx));
+            resident.keyboard = None;
+            let show = |pane: &mut TerminalPane, bytes: &[u8]| {
+                let mut screen = diri_engine::HeadlessScreen::new(60, 6);
+                screen.feed(bytes);
+                pane.residents[&id].element.apply_damage(screen.full_snapshot());
+            };
+            let press = |pane: &mut TerminalPane, key: &str, window: &mut Window, cx: &mut Context<TerminalPane>| {
+                let mut keystroke = Keystroke::parse(key).unwrap();
+                if key.len() == 1 {
+                    keystroke.key_char = Some(key.into());
+                }
+                pane.handle_key_down(
+                    &KeyDownEvent {
+                        keystroke,
+                        is_held: false,
+                        prefer_character_input: false,
+                    },
+                    window,
+                    cx,
+                );
+            };
+            let index = || {
+                crate::path_picker::PathIndex::from_entries(
+                    std::path::Path::new("/work/it's here"),
+                    &[("apps", true), ("apps/main.rs", false), ("docs", true)],
+                )
+            };
+
+            // An empty prompt: A, prompt text, B.
+            show(pane, b"\x1b]133;A\x07~ $ \x1b]133;B\x07");
+            pane.open_go_to_directory(&crate::commands::GoToDirectory, window, cx);
+            pane.path_picker_adopt_for_test(index());
+            for key in ["d", "o", "c"] {
+                press(pane, key, window, cx);
+            }
+            assert!(input.try_recv().is_err(), "the query must not reach the PTY");
+            press(pane, "enter", window, cx);
+            assert_eq!(
+                input.try_recv().unwrap(),
+                (id.clone(), b"cd -- '/work/it'\\''s here/docs'\r".to_vec())
+            );
+            assert!(input.try_recv().is_err());
+            assert!(pane.path_picker.is_none());
+
+            // Typed text at a marked prompt is left alone.
+            show(pane, b"\x1b]133;A\x07~ $ \x1b]133;B\x07git st");
+            pane.open_go_to_directory(&crate::commands::GoToDirectory, window, cx);
+            assert!(pane.path_picker.is_none(), "refused before opening");
+            assert!(pane.qol.feedback.is_some());
+            assert!(input.try_recv().is_err());
+
+            // A running command line: refused too.
+            show(
+                pane,
+                b"\x1b]133;A\x07~ $ \x1b]133;B\x07vim\r\n\x1b]133;C\x07~",
+            );
+            pane.qol.feedback = None;
+            pane.open_go_to_directory(&crate::commands::GoToDirectory, window, cx);
+            assert!(pane.path_picker.is_none());
+            assert!(pane.qol.feedback.is_some());
+
+            // fish marks no input start: the line is cleared (into the kill
+            // ring) before the cd, so half-typed text cannot run with it.
+            show(pane, b"\x1b]133;D;0\x07\x1b]133;A\x07~> ");
+            pane.open_go_to_directory(&crate::commands::GoToDirectory, window, cx);
+            pane.path_picker_adopt_for_test(index());
+            press(pane, "enter", window, cx);
+            assert_eq!(
+                input.try_recv().unwrap(),
+                (id.clone(), b"\x05\x15cd -- '/work/it'\\''s here/apps'\r".to_vec())
+            );
         });
     }
 

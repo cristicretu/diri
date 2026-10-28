@@ -640,6 +640,14 @@ const fn window_transparency_default() -> f32 {
     1.0
 }
 
+fn terminal_theme_light_default() -> String {
+    "dirijor-light".to_owned()
+}
+
+fn terminal_theme_dark_default() -> String {
+    "dirijor-dark".to_owned()
+}
+
 const fn terminal_line_height_default() -> f32 {
     1.0
 }
@@ -662,6 +670,9 @@ pub struct Prefs {
     /// `"en"`, `"zh-Hans"` or `"es"`.
     pub ui_language: UiLanguage,
     pub confirm_before_closing_session: bool,
+    /// Turn Diri's animations off even when macOS animates. Reduce Motion
+    /// in System Settings turns them off as well; see `crate::motion`.
+    pub reduce_motion: bool,
     pub status_sounds: bool,
     pub status_notifications: bool,
     /// Which channels blocked, failed and finished sessions reach.
@@ -735,6 +746,13 @@ pub struct Prefs {
     pub terminal_theme: String,
     /// Follow native appearance changes; terminal_theme stores the resolved palette.
     pub follow_system_theme: bool,
+    /// The theme System appearance uses while macOS is light, and the one it
+    /// uses while dark. Field-level defaults, so a file from before the pair
+    /// existed follows the system exactly as it did.
+    #[serde(default = "terminal_theme_light_default")]
+    pub terminal_theme_light: String,
+    #[serde(default = "terminal_theme_dark_default")]
+    pub terminal_theme_dark: String,
     pub terminal_font_size: f32,
     /// Terminal font family by name. Empty follows diri's platform default,
     /// so a file never pins a font that only existed on another Mac.
@@ -837,6 +855,9 @@ pub struct Prefs {
     pub horizontal_tabs_visible: bool,
     /// Initial workspace for new windows; each open window keeps its own selection.
     pub active_workspace: Option<diri_proto::workspace::WorkspaceId>,
+    /// Even out a tab's panes whenever one is added to it or leaves it,
+    /// like ⌃⌘= after every split and close. Off keeps hand-sized dividers.
+    pub auto_balance_panes: bool,
     pub sidebar_ordering: SidebarOrdering,
     /// The projectless recency view has one shared archive disclosure rather
     /// than one disclosure per hidden project header.
@@ -916,6 +937,7 @@ impl Default for Prefs {
             start_at_login: false,
             ui_language: UiLanguage::System,
             confirm_before_closing_session: true,
+            reduce_motion: false,
             status_sounds: true,
             status_notifications: true,
             attention_routes: AttentionRoutes::default(),
@@ -939,6 +961,8 @@ impl Default for Prefs {
             hibernation_defaults_revision: Self::HIBERNATION_DEFAULTS_REVISION,
             terminal_theme: DEFAULT_THEME.to_owned(),
             follow_system_theme: false,
+            terminal_theme_light: terminal_theme_light_default(),
+            terminal_theme_dark: terminal_theme_dark_default(),
             terminal_font_size: 13.0,
             terminal_font_family: String::new(),
             terminal_line_height: terminal_line_height_default(),
@@ -968,6 +992,7 @@ impl Default for Prefs {
             window_placement: None,
             additional_windows: Vec::new(),
             sidebar_visible: false,
+            auto_balance_panes: false,
             sidebar_width: 248.0,
             sidebar_grouping: SidebarGrouping::Project,
             sidebar_lineage_highlights: true,
@@ -1127,15 +1152,50 @@ impl Prefs {
             return false;
         }
         let id = if dark {
-            "dirijor-dark"
+            &self.terminal_theme_dark
         } else {
-            "dirijor-light"
+            &self.terminal_theme_light
         };
-        if self.terminal_theme == id {
+        if self.terminal_theme == *id {
             return false;
         }
-        self.terminal_theme = id.to_owned();
+        self.terminal_theme = id.clone();
         true
+    }
+
+    /// The theme System appearance shows on one side of the OS appearance.
+    pub fn system_theme(&self, dark: bool) -> &str {
+        if dark {
+            &self.terminal_theme_dark
+        } else {
+            &self.terminal_theme_light
+        }
+    }
+
+    /// Chooses `id` for System appearance's light or dark side, and shows it
+    /// now when the OS is on that side. System appearance stays on.
+    pub fn set_system_theme(&mut self, dark: bool, id: &str, system_is_dark: bool) {
+        if dark {
+            self.terminal_theme_dark = id.to_owned();
+        } else {
+            self.terminal_theme_light = id.to_owned();
+        }
+        if self.follow_system_theme && dark == system_is_dark {
+            self.terminal_theme = id.to_owned();
+        }
+    }
+
+    /// Chooses one theme for every OS appearance. It also becomes the
+    /// remembered theme for its own side (`dark` is the theme's appearance),
+    /// so switching to System later keeps the family the person picked.
+    pub fn set_fixed_theme(&mut self, id: &str, dark: bool) {
+        self.follow_system_theme = false;
+        self.terminal_theme = id.to_owned();
+        if dark {
+            self.terminal_theme_dark = id.to_owned();
+        } else {
+            self.terminal_theme_light = id.to_owned();
+        }
     }
 
     pub fn normalize(&mut self) {
@@ -1202,6 +1262,12 @@ impl Prefs {
         self.workbench_primary_fraction = self.workbench_primary_fraction.clamp(0.0, 1.0);
         if self.terminal_theme.is_empty() {
             self.terminal_theme = DEFAULT_THEME.to_owned();
+        }
+        if self.terminal_theme_light.is_empty() {
+            self.terminal_theme_light = terminal_theme_light_default();
+        }
+        if self.terminal_theme_dark.is_empty() {
+            self.terminal_theme_dark = terminal_theme_dark_default();
         }
         self.launch_recipes.normalize();
     }
@@ -1376,6 +1442,40 @@ mod tests {
         restored.follow_system_theme = false;
         assert!(!restored.apply_system_theme(false));
         assert_eq!(restored.terminal_theme, "dirijor-dark");
+    }
+
+    #[test]
+    fn system_appearance_uses_the_chosen_light_and_dark_pair() {
+        // A file from before the pair follows the system as it always did.
+        let mut prefs: Prefs =
+            serde_json::from_str(r#"{"terminalTheme":"dirijor-dark","followSystemTheme":true}"#)
+                .unwrap();
+        assert_eq!(prefs.system_theme(false), "dirijor-light");
+        assert_eq!(prefs.system_theme(true), "dirijor-dark");
+
+        // Choosing the light side while the OS is dark keeps the dark theme
+        // on screen until the OS turns light.
+        prefs.set_system_theme(false, "github-light-default", true);
+        assert!(prefs.follow_system_theme);
+        assert_eq!(prefs.terminal_theme, "dirijor-dark");
+        prefs.set_system_theme(true, "vesper", true);
+        assert_eq!(prefs.terminal_theme, "vesper", "the visible side applies now");
+        assert!(prefs.apply_system_theme(false));
+        assert_eq!(prefs.terminal_theme, "github-light-default");
+        assert!(prefs.apply_system_theme(true));
+        assert_eq!(prefs.terminal_theme, "vesper");
+
+        let restored: Prefs = serde_json::from_slice(&serde_json::to_vec(&prefs).unwrap()).unwrap();
+        assert_eq!(restored.terminal_theme_light, "github-light-default");
+        assert_eq!(restored.terminal_theme_dark, "vesper");
+
+        // A fixed choice turns System off and is remembered for its side.
+        prefs.set_fixed_theme("solarized-light", false);
+        assert!(!prefs.follow_system_theme);
+        assert_eq!(prefs.terminal_theme, "solarized-light");
+        assert_eq!(prefs.system_theme(false), "solarized-light");
+        assert_eq!(prefs.system_theme(true), "vesper");
+        assert!(!prefs.apply_system_theme(true), "fixed themes ignore the OS");
     }
 
     #[test]

@@ -79,6 +79,11 @@ pub struct RemoteSessionClient {
     /// it understands one (an older Holder fails closed on the frame kind).
     inline_images: AtomicBool,
     image_requests: Mutex<HashMap<u64, mpsc::Sender<Option<ImageChunk>>>>,
+    /// The current Bridge's HelloAck confirmed `query-replies-v1`: the
+    /// Holder answers its program's `OSC 7501` support queries in stream
+    /// order, so the Engine must not answer them again. Cleared on every
+    /// connect; until a HelloAck says so the Engine answers, as it always has.
+    query_replies: AtomicBool,
 }
 
 impl RemoteSessionClient {
@@ -124,6 +129,7 @@ impl RemoteSessionClient {
             scrollback_requests: Mutex::new(HashMap::new()),
             inline_images: AtomicBool::new(false),
             image_requests: Mutex::new(HashMap::new()),
+            query_replies: AtomicBool::new(false),
         })
     }
 
@@ -208,6 +214,7 @@ impl RemoteSessionClient {
     ) -> io::Result<(u64, ChildStdout)> {
         ensure_available(&self.writer.lock().expect("remote writer"))?;
         self.inline_images.store(false, Ordering::SeqCst);
+        self.query_replies.store(false, Ordering::SeqCst);
         let mut channel = self.manager.attach(&self.helper)?;
         let setup = (|| {
             let mut required_capabilities = REQUIRED_CAPABILITIES.to_vec();
@@ -219,6 +226,9 @@ impl RemoteSessionClient {
             }
             if self.helper.protocol.minor >= diri_proto::remote_pty::TERMINAL_RESET_PROTOCOL_MINOR {
                 required_capabilities.push(diri_proto::remote_pty::RemoteCapability::TerminalReset);
+            }
+            if self.supports_terminal_clear() {
+                required_capabilities.push(diri_proto::remote_pty::RemoteCapability::TerminalClear);
             }
             // An older Holder rejects a capability it does not know, so it is
             // asked for only from a Helper whose minor defines it.
@@ -379,6 +389,18 @@ impl RemoteSessionClient {
                 "remote Holder did not confirm terminal-reset-v1",
             ));
         }
+        if self.supports_terminal_clear()
+            && (acknowledgement.protocol.minor
+                < diri_proto::remote_pty::TERMINAL_CLEAR_PROTOCOL_MINOR
+                || !acknowledgement
+                    .capabilities
+                    .contains(&diri_proto::remote_pty::RemoteCapability::TerminalClear))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote Holder did not confirm terminal-clear-v1",
+            ));
+        }
         if REQUIRED_CAPABILITIES
             .iter()
             .any(|required| !acknowledgement.capabilities.contains(required))
@@ -460,6 +482,30 @@ impl RemoteSessionClient {
         Ok(())
     }
 
+    /// Tells a `query-replies-v1` Holder the colors its terminal is painted
+    /// with, which it answers color queries from. Sent only with control
+    /// granted; any Holder that has not negotiated the capability is never
+    /// sent the frame (it would close the Bridge on the kind). A change that
+    /// meets a full Bridge is dropped: every attach sends the palette again.
+    pub(crate) fn send_palette(&self, palette: diri_proto::TerminalPalette) -> io::Result<()> {
+        if !self.holder_answers_queries() {
+            return Ok(());
+        }
+        let mut writer = self.writer.lock().expect("remote writer");
+        ensure_available(&writer)?;
+        if !writer.control_granted || writer.input.is_none() {
+            return Ok(());
+        }
+        if let Err(error) = write_message(&mut writer, &RemoteMessage::TerminalPalette(palette)) {
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Ok(());
+            }
+            terminate_current(&mut writer);
+            writer.controller_epoch = None;
+        }
+        Ok(())
+    }
+
     fn write_terminal(&self, bytes: &[u8], mouse: bool) -> io::Result<()> {
         if bytes.is_empty() {
             return Ok(());
@@ -516,6 +562,42 @@ impl RemoteSessionClient {
         write_message(
             &mut writer,
             &RemoteMessage::TerminalReset(diri_proto::remote_pty::TerminalReset {
+                controller_epoch: epoch,
+                expected_incarnation: self.incarnation.clone(),
+            }),
+        )
+    }
+
+    /// `terminal-clear-v1` rides on the reset boundary, so a Helper must
+    /// define both before the Engine asks for it.
+    pub(crate) fn supports_terminal_clear(&self) -> bool {
+        self.supports_terminal_reset()
+            && self.helper.protocol.minor >= diri_proto::remote_pty::TERMINAL_CLEAR_PROTOCOL_MINOR
+    }
+
+    /// Queues one Clear Screen and Scrollback. Like a reset it is never
+    /// coalesced, retained for reconnect or retried after an uncertain write.
+    pub(crate) fn clear_terminal(&self) -> io::Result<()> {
+        if !self.supports_terminal_clear() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "live Holder does not support terminal-clear-v1",
+            ));
+        }
+        let mut writer = self.writer.lock().expect("remote writer");
+        ensure_available(&writer)?;
+        let epoch = writer
+            .controller_epoch
+            .filter(|_| writer.control_granted)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "remote controller is reconnecting; clear was not accepted",
+                )
+            })?;
+        write_message(
+            &mut writer,
+            &RemoteMessage::TerminalClear(diri_proto::remote_pty::TerminalClear {
                 controller_epoch: epoch,
                 expected_incarnation: self.incarnation.clone(),
             }),
@@ -619,6 +701,31 @@ impl RemoteSessionClient {
         )
     }
 
+    /// One directory level relative to the remote child's live working
+    /// directory (`list-dir-v1`). A short-lived Helper process answers it, so
+    /// neither the attach channel nor the Holder's PTY loop is involved.
+    pub(crate) fn list_dir(
+        &self,
+        query: &diri_proto::ListDirQuery,
+        deadline: std::time::Instant,
+    ) -> io::Result<diri_proto::remote_pty::ListDirResult> {
+        let timeout = diri_pty::unix_socket::remaining(deadline)?;
+        let request = diri_proto::remote_pty::ListDirRequest {
+            selector: SessionSelector {
+                session_id: self.session_id.clone(),
+                session_token: self.token.clone(),
+                expected_incarnation: Some(self.incarnation.clone()),
+            },
+            path: query.path.clone(),
+            include_files: query.include_files,
+            prefix: query.prefix.clone(),
+            limit: query.limit,
+            timeout_ms: (timeout.as_millis() as u32)
+                .clamp(1, diri_proto::remote_pty::MAX_LIST_DIR_TIMEOUT_MS),
+        };
+        self.manager.list_dir(&self.helper, &request, deadline)
+    }
+
     pub fn read_scrollback_cells(
         &self,
         first_row: i64,
@@ -675,15 +782,35 @@ impl RemoteSessionClient {
         }
     }
 
-    /// Records whether this Bridge's Holder serves inline images. Only an
-    /// accepted HelloAck at protocol minor 16 naming `inline-images-v1` does.
+    /// Records whether this Bridge's Holder serves inline images and answers
+    /// its program's queries. Only an accepted HelloAck at protocol minor 16
+    /// naming `inline-images-v1`, or at minor 19 naming `query-replies-v1`,
+    /// says so.
     pub(crate) fn observe_hello_capabilities(&self, acknowledgement: &HelloAck) {
-        let capable = acknowledgement.protocol.minor
-            >= diri_proto::remote_pty::INLINE_IMAGES_PROTOCOL_MINOR
-            && acknowledgement
-                .capabilities
-                .contains(&diri_proto::remote_pty::RemoteCapability::InlineImages);
-        self.inline_images.store(capable, Ordering::SeqCst);
+        let names = |minor: u16, capability| {
+            acknowledgement.protocol.minor >= minor
+                && acknowledgement.capabilities.contains(&capability)
+        };
+        self.inline_images.store(
+            names(
+                diri_proto::remote_pty::INLINE_IMAGES_PROTOCOL_MINOR,
+                diri_proto::remote_pty::RemoteCapability::InlineImages,
+            ),
+            Ordering::SeqCst,
+        );
+        self.query_replies.store(
+            names(
+                diri_proto::remote_pty::QUERY_REPLIES_PROTOCOL_MINOR,
+                diri_proto::remote_pty::RemoteCapability::QueryReplies,
+            ),
+            Ordering::SeqCst,
+        );
+    }
+
+    /// Whether the live Holder answers its program's queries itself,
+    /// `OSC 7501` support included (`query-replies-v1`).
+    pub(crate) fn holder_answers_queries(&self) -> bool {
+        self.query_replies.load(Ordering::SeqCst)
     }
 
     pub(crate) fn supports_inline_images(&self) -> bool {
@@ -839,7 +966,9 @@ fn write_message(writer: &mut WriterState, message: &RemoteMessage) -> io::Resul
         {
             (None, frame.resize_payload(), false)
         }
-        RemoteMessage::Signal(_) | RemoteMessage::TerminalReset(_) => (None, None, true),
+        RemoteMessage::Signal(_)
+        | RemoteMessage::TerminalReset(_)
+        | RemoteMessage::TerminalClear(_) => (None, None, true),
         _ => (None, None, false),
     };
     writer.pending_bytes += bytes.len();
@@ -1027,7 +1156,7 @@ impl Drop for RemoteSessionClient {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #[cfg(unix)]
     use diri_platform::poll::AsRawIo;
     use diri_proto::frames::FrameType;
@@ -1104,19 +1233,21 @@ mod tests {
         }
     }
 
+    /// Old Helpers (forge runs several) never see the clear frame: the
+    /// Engine refuses locally, which the control layer reports as
+    /// `terminal_clear_unsupported`. A current Helper must confirm it.
     #[cfg(unix)]
     #[test]
-    fn inline_image_reads_are_sent_only_after_the_holder_negotiated_them() {
+    fn terminal_clear_is_sent_only_to_holders_that_negotiated_it() {
         use crate::remote::{
             executor::ProcessExecutor, manager::ArtifactCatalog, ssh::SshTransport,
         };
-        use diri_proto::inline_image::InlineImageFormat;
-        use diri_proto::remote_pty::{INLINE_IMAGES_PROTOCOL_MINOR, RemoteCapability};
+        use diri_proto::remote_pty::{RemoteCapability, TERMINAL_CLEAR_PROTOCOL_MINOR};
         use std::io::Read as _;
         let temp = tempfile::tempdir().unwrap();
         let host = diri_proto::HostEntry {
-            id: "fixture".into(),
             transport: Default::default(),
+            id: "fixture".into(),
             name: None,
             ssh: "fixture".into(),
             default_cwd: None,
@@ -1130,34 +1261,37 @@ mod tests {
             )
             .unwrap(),
         );
-        let client = Arc::new(
+        let client_for = |minor: u16| {
             RemoteSessionClient::new(
-                manager,
+                Arc::clone(&manager),
                 InstalledHelper {
                     target: RemoteTarget::MacosAarch64,
                     build_id: "fixture".into(),
-                    protocol: ProtocolVersion::CURRENT,
+                    protocol: ProtocolVersion { major: 1, minor },
                     transport: SshTransport::new(&host, temp.path().join("control/socket")),
                 },
                 "fixture".into(),
                 SessionToken::new("fixture-token-long-enough").unwrap(),
                 "incarnation".into(),
-                RemoteBindingStore::new(temp.path().join("binding")).unwrap(),
+                RemoteBindingStore::new(temp.path().join(format!("binding-{minor}"))).unwrap(),
                 0,
             )
-            .unwrap(),
-        );
-        let ack = |minor: u16, capable: bool| {
-            let mut capabilities = REQUIRED_CAPABILITIES.to_vec();
-            if capable {
-                capabilities.push(RemoteCapability::InlineImages);
-            }
+            .unwrap()
+        };
+        let ack = |minor: u16, capabilities: &[RemoteCapability]| {
+            let mut all = REQUIRED_CAPABILITIES.to_vec();
+            all.extend([
+                RemoteCapability::EnhancedKeyboard,
+                RemoteCapability::InputModes,
+                RemoteCapability::TerminalReset,
+            ]);
+            all.extend_from_slice(capabilities);
             HelloAck {
                 protocol: ProtocolVersion { major: 1, minor },
                 holder_build_id: "fixture".into(),
                 session_incarnation: "incarnation".into(),
-                capabilities,
-                controller_epoch: 1,
+                capabilities: all,
+                controller_epoch: 3,
                 process_state: RemoteProcessState::Running { pid: 123 },
                 child_identity: None,
                 output_offset: 0,
@@ -1166,8 +1300,75 @@ mod tests {
                 grid_resume: None,
             }
         };
+        let mut sent = [0_u8; 4096];
+
+        let old = client_for(TERMINAL_CLEAR_PROTOCOL_MINOR - 1);
+        assert!(old.supports_terminal_reset());
+        assert!(!old.supports_terminal_clear());
+        assert!(
+            old.validate_hello(&ack(TERMINAL_CLEAR_PROTOCOL_MINOR - 1, &[]))
+                .is_ok()
+        );
         let (writer, mut output) = pipe_writer();
-        *client.writer.lock().unwrap() = writer;
+        *old.writer.lock().unwrap() = writer;
+        assert_eq!(
+            old.clear_terminal().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            output.read(&mut sent).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "nothing reaches a Holder that would close the Bridge on kind 53"
+        );
+
+        let current = client_for(TERMINAL_CLEAR_PROTOCOL_MINOR);
+        assert!(current.supports_terminal_clear());
+        assert!(
+            current
+                .validate_hello(&ack(TERMINAL_CLEAR_PROTOCOL_MINOR, &[]))
+                .is_err(),
+            "a current Holder that omits terminal-clear-v1 fails closed"
+        );
+        assert!(
+            current
+                .validate_hello(&ack(
+                    TERMINAL_CLEAR_PROTOCOL_MINOR,
+                    &[RemoteCapability::TerminalClear]
+                ))
+                .is_ok()
+        );
+        let (writer, mut output) = pipe_writer();
+        *current.writer.lock().unwrap() = writer;
+        current.clear_terminal().unwrap();
+        let count = output.read(&mut sent).unwrap();
+        let messages = RemoteCodec::new().feed(&sent[..count]).unwrap();
+        assert_eq!(
+            messages,
+            vec![RemoteMessage::TerminalClear(
+                diri_proto::remote_pty::TerminalClear {
+                    controller_epoch: 3,
+                    expected_incarnation: "incarnation".into(),
+                }
+            )]
+        );
+
+        // Without a granted lease the clear is refused, never queued.
+        current.writer.lock().unwrap().control_granted = false;
+        assert_eq!(
+            current.clear_terminal().unwrap_err().kind(),
+            io::ErrorKind::NotConnected
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inline_image_reads_are_sent_only_after_the_holder_negotiated_them() {
+        use diri_proto::inline_image::InlineImageFormat;
+        use diri_proto::remote_pty::{INLINE_IMAGES_PROTOCOL_MINOR, QUERY_REPLIES_PROTOCOL_MINOR};
+        use std::io::Read as _;
+        let temp = tempfile::tempdir().unwrap();
+        let (client, mut output) = attached_fixture_client(temp.path());
+        let ack = fixture_ack;
         let mut sent = [0_u8; 4096];
 
         // Every live Holder from before inline-images-v1 (forge runs several)
@@ -1181,6 +1382,7 @@ mod tests {
         ] {
             client.observe_hello_capabilities(&ack(minor, capable));
             assert!(!client.supports_inline_images());
+            assert!(!client.holder_answers_queries());
             assert_eq!(
                 client.read_image("1a2b3c4d.3", 0).unwrap_err().kind(),
                 io::ErrorKind::Unsupported
@@ -1193,6 +1395,13 @@ mod tests {
 
         client.observe_hello_capabilities(&ack(INLINE_IMAGES_PROTOCOL_MINOR, true));
         assert!(client.supports_inline_images());
+        // A Holder from before query-replies-v1 leaves the
+        // `OSC 7501` answer to the Engine even if it names the capability.
+        assert!(!client.holder_answers_queries());
+        client.observe_hello_capabilities(&ack(QUERY_REPLIES_PROTOCOL_MINOR, false));
+        assert!(!client.holder_answers_queries());
+        client.observe_hello_capabilities(&ack(QUERY_REPLIES_PROTOCOL_MINOR, true));
+        assert!(client.holder_answers_queries());
         let reader = {
             let client = Arc::clone(&client);
             std::thread::spawn(move || client.read_image("1a2b3c4d.3", 5))
@@ -1241,6 +1450,7 @@ mod tests {
         // the pipe before the child exits, so the outcome itself is a race.
         let _ = client.connect(0, None, None);
         assert!(!client.supports_inline_images());
+        assert!(!client.holder_answers_queries());
     }
 
     #[cfg(unix)]
@@ -1378,6 +1588,113 @@ mod tests {
             },
             output,
         )
+    }
+
+    /// A client whose Bridge is a socket pair: what it sends arrives on the
+    /// returned stream. Control is granted; no Holder has said anything yet.
+    #[cfg(unix)]
+    pub(crate) fn attached_fixture_client(
+        temp: &std::path::Path,
+    ) -> (Arc<RemoteSessionClient>, UnixStream) {
+        use crate::remote::{
+            executor::ProcessExecutor, manager::ArtifactCatalog, ssh::SshTransport,
+        };
+        let host = diri_proto::HostEntry {
+            id: "fixture".into(),
+            transport: Default::default(),
+            name: None,
+            ssh: "fixture".into(),
+            default_cwd: None,
+            node: None,
+        };
+        let manager = Arc::new(
+            RemoteManager::new(
+                ProcessExecutor::new("/bin/false"),
+                ArtifactCatalog::without_artifacts_for_test(),
+                temp.join("control"),
+            )
+            .unwrap(),
+        );
+        let client = Arc::new(
+            RemoteSessionClient::new(
+                manager,
+                InstalledHelper {
+                    target: RemoteTarget::MacosAarch64,
+                    build_id: "fixture".into(),
+                    protocol: ProtocolVersion::CURRENT,
+                    transport: SshTransport::new(&host, temp.join("control/socket")),
+                },
+                "fixture".into(),
+                SessionToken::new("fixture-token-long-enough").unwrap(),
+                "incarnation".into(),
+                RemoteBindingStore::new(temp.join("binding")).unwrap(),
+                0,
+            )
+            .unwrap(),
+        );
+        let (writer, output) = pipe_writer();
+        *client.writer.lock().unwrap() = writer;
+        (client, output)
+    }
+
+    /// A Holder's HelloAck at `minor`; `capable` names `inline-images-v1`
+    /// and `query-replies-v1`.
+    pub(crate) fn fixture_ack(minor: u16, capable: bool) -> HelloAck {
+        use diri_proto::remote_pty::RemoteCapability;
+        let mut capabilities = REQUIRED_CAPABILITIES.to_vec();
+        if capable {
+            capabilities.push(RemoteCapability::InlineImages);
+            capabilities.push(RemoteCapability::QueryReplies);
+        }
+        HelloAck {
+            protocol: ProtocolVersion { major: 1, minor },
+            holder_build_id: "fixture".into(),
+            session_incarnation: "incarnation".into(),
+            capabilities,
+            controller_epoch: 1,
+            process_state: RemoteProcessState::Running { pid: 123 },
+            child_identity: None,
+            output_offset: 0,
+            snapshot_sequence: 1,
+            foreground_pid: None,
+            grid_resume: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn palettes_reach_only_a_holder_that_answers_queries() {
+        use diri_proto::remote_pty::QUERY_REPLIES_PROTOCOL_MINOR;
+        use std::io::Read as _;
+        let temp = tempfile::tempdir().unwrap();
+        let (client, mut output) = attached_fixture_client(temp.path());
+        let palette = diri_proto::TerminalPalette {
+            appearance: diri_proto::TerminalAppearance::Dark,
+            foreground: [200, 200, 200],
+            background: [10, 10, 10],
+            cursor: [255, 255, 255],
+            ansi: [[1, 2, 3]; 16],
+        };
+        let mut sent = [0_u8; 4096];
+        // An older Holder fails closed on the frame kind: nothing is sent.
+        for (minor, capable) in [
+            (QUERY_REPLIES_PROTOCOL_MINOR - 1, true),
+            (QUERY_REPLIES_PROTOCOL_MINOR, false),
+        ] {
+            client.observe_hello_capabilities(&fixture_ack(minor, capable));
+            client.send_palette(palette).unwrap();
+            assert_eq!(
+                output.read(&mut sent).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+        client.observe_hello_capabilities(&fixture_ack(QUERY_REPLIES_PROTOCOL_MINOR, true));
+        client.send_palette(palette).unwrap();
+        let count = output.read(&mut sent).unwrap();
+        assert_eq!(
+            RemoteCodec::new().feed(&sent[..count]).unwrap(),
+            vec![RemoteMessage::TerminalPalette(palette)]
+        );
     }
 
     #[cfg(unix)]

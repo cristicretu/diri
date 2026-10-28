@@ -11,6 +11,9 @@ use crate::terminal::MouseModes;
 
 /// Bit of a Modes frame's first byte that reports secret input.
 const MODES_SECRET_INPUT: u8 = 1 << 6;
+/// DECSET 1016: the mouse encoding is SGR with pixel coordinates. Bit 7 was
+/// unused, so an older client reads such a frame as plain SGR.
+const MODES_SGR_PIXELS: u8 = 1 << 7;
 
 /// A single frame larger than this indicates a corrupt stream.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -226,7 +229,12 @@ impl Frame {
         let bits = u8::from(alt_screen)
             | (u8::from(mouse.is_reporting()) << 1)
             | (mouse.detail_bits() << 2)
-            | (u8::from(bracketed_paste) << 5);
+            | (u8::from(bracketed_paste) << 5)
+            | if mouse.pixel_reports() {
+                MODES_SGR_PIXELS
+            } else {
+                0
+            };
         Self::new(FrameType::Modes, vec![bits])
     }
 
@@ -386,7 +394,8 @@ impl Frame {
             (
                 bits & 1 != 0,
                 bits & (1 << 5) != 0,
-                MouseModes::from_detail_bits(bits >> 2, bits & 2 != 0),
+                MouseModes::from_detail_bits(bits >> 2, bits & 2 != 0)
+                    .with_pixel_reports(bits & MODES_SGR_PIXELS != 0),
             )
         })
     }
@@ -717,6 +726,22 @@ mod tests {
         assert_eq!(Frame::pong().payload, Vec::<u8>::new());
         assert_eq!(Frame::input(b"input".to_vec()).payload, b"input");
         assert_eq!(Frame::mouse(b"mouse".to_vec()).payload, b"mouse");
+    }
+
+    #[test]
+    fn sgr_pixel_mouse_rides_bit_seven_and_reads_as_sgr_without_it() {
+        let pixels = MouseModes::new(
+            crate::terminal::MouseTrackingMode::ButtonEvents,
+            crate::terminal::MouseEncoding::SgrPixels,
+        );
+        let frame = Frame::modes_with_bracketed_paste(false, true, pixels).with_secret_input(true);
+        assert_eq!(frame.payload[0] & 0x80, 0x80);
+        assert_eq!(frame.terminal_modes_payload(), Some((false, true, pixels)));
+        assert_eq!(frame.secret_input_payload(), Some(true));
+        // An older client masks nothing but knows no bit 7: it reads SGR.
+        let older = MouseModes::from_detail_bits(frame.payload[0] >> 2, true);
+        assert_eq!(older.encoding, crate::terminal::MouseEncoding::Sgr);
+        assert_eq!(older.tracking, pixels.tracking);
     }
 
     #[test]

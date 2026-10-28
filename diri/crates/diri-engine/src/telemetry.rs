@@ -169,7 +169,11 @@ impl LeftModes {
             (
                 "sgr",
                 Value::from(self.mouse.is_some_and(|mouse| {
-                    mouse.encoding == diri_proto::terminal::MouseEncoding::Sgr
+                    matches!(
+                        mouse.encoding,
+                        diri_proto::terminal::MouseEncoding::Sgr
+                            | diri_proto::terminal::MouseEncoding::SgrPixels
+                    )
                 })),
             ),
             ("alt_screen", Value::from(self.alt_screen)),

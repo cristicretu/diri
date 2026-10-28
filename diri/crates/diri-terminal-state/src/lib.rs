@@ -13,6 +13,8 @@
 //! emulator does not model, so it is scanned out of the byte stream directly —
 //! see [`scan_progress`].
 
+#[cfg(feature = "core-v2")]
+pub mod core_v2;
 mod inline_images;
 mod notifications;
 mod program_status;
@@ -25,7 +27,7 @@ pub use program_status::{
     QUERY_REPLY as PROGRAM_STATUS_QUERY_REPLY,
 };
 
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::Dimensions;
@@ -431,17 +433,51 @@ impl Dimensions for Geometry {
     }
 }
 
-/// Collects the events the emulator emits. Only the title is interesting.
+/// Collects the events the emulator emits while it parses one read.
+///
+/// The title and the answers owed to the program must survive however much
+/// output one read carries: a bounded queue that drops when full lost the
+/// title a program set after a few dozen bells or mode toggles in the same
+/// read, and the replies to queries past the bound, so the final state
+/// depended on where reads happened to split. Events nothing reads (bells,
+/// mouse-cursor and blink notices) are not kept at all, the title keeps only
+/// its latest value, and replies are bounded by [`MAX_PENDING_EVENTS`] per
+/// parse, a backstop that no program answering its own queries reaches.
 #[derive(Clone)]
-struct Collector(SyncSender<Event>);
+struct Collector(Arc<Mutex<Inbox>>);
 
-const EVENT_QUEUE_CAPACITY: usize = 64;
+#[derive(Default)]
+struct Inbox {
+    /// The last title change since the previous drain.
+    title: Option<Event>,
+    /// Everything else that is answered, in order.
+    events: Vec<Event>,
+}
+
+/// Reply-producing events kept per drain; beyond it a flood of queries in
+/// one read goes unanswered rather than growing without bound.
+const MAX_PENDING_EVENTS: usize = 1 << 16;
 
 impl EventListener for Collector {
     fn send_event(&self, event: Event) {
-        // A full channel means nobody is draining it, which is not worth
-        // failing a session over.
-        let _ = self.0.try_send(event);
+        match event {
+            Event::Title(_) | Event::ResetTitle => {
+                self.0.lock().expect("terminal events").title = Some(event);
+            }
+            Event::PtyWrite(_)
+            | Event::TextAreaSizeRequest(_)
+            | Event::CellSizeRequest(_)
+            | Event::ColorRequest(..)
+            | Event::ColorSchemeRequest
+            | Event::InBandResize => {
+                let mut inbox = self.0.lock().expect("terminal events");
+                if inbox.events.len() < MAX_PENDING_EVENTS {
+                    inbox.events.push(event);
+                }
+            }
+            // Bells, mouse-cursor, blink and other notices: nothing reads them.
+            _ => {}
+        }
     }
 }
 
@@ -454,7 +490,9 @@ pub struct HeadlessScreen {
     keyboard_enhancements_known: bool,
     term: Term<Collector>,
     parser: Processor,
-    events: Receiver<Event>,
+    events: Arc<Mutex<Inbox>>,
+    /// Drained events, kept to reuse the allocation.
+    drained_events: Vec<Event>,
     geometry: Geometry,
 
     title: Option<String>,
@@ -560,14 +598,14 @@ impl HeadlessScreen {
             cols: cols.max(1),
             rows: rows.max(1),
         };
-        let (sender, events) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+        let events = Arc::new(Mutex::new(Inbox::default()));
         let config = Config {
             kitty_keyboard,
             scrolling_history: history_line_limit(geometry.cols),
             default_cursor_style: DEFAULT_CURSOR,
             ..Config::default()
         };
-        let term = Term::new(config, &geometry, Collector(sender));
+        let term = Term::new(config, &geometry, Collector(Arc::clone(&events)));
         #[cfg(feature = "compact-history")]
         let term = {
             let mut term = term;
@@ -579,6 +617,7 @@ impl HeadlessScreen {
             term,
             parser: Processor::new(),
             events,
+            drained_events: Vec::new(),
             geometry,
             title: None,
             progress_state: None,
@@ -648,6 +687,19 @@ impl HeadlessScreen {
         self.term.release_primary_history_spare_rows();
     }
 
+    /// Answer `OSC 7501` support queries among this terminal's replies, in
+    /// stream order with the emulator's own, and interpret no other product
+    /// OSC. For a remote Holder (`query-replies-v1`), which answers its
+    /// program's queries itself and does not interpret product alerts. A
+    /// screen [`Self::with_notifications`] already answers them.
+    #[must_use]
+    pub fn answering_program_status_queries(mut self) -> Self {
+        if self.notifications.is_none() {
+            self.notifications = Some(notifications::NotificationParser::queries_only());
+        }
+        self
+    }
+
     /// Opt in only where this screen is the terminal the program talks to
     /// and its replies reach the program: a local Engine session. The screen
     /// then reports `terminal_version` to XTVERSION, answers color queries
@@ -711,8 +763,8 @@ impl HeadlessScreen {
             self.geometry.rows,
             self.keyboard_enhancements_enabled(),
         );
-        if self.notifications.is_some() {
-            reset = reset.with_notifications();
+        if let Some(parser) = &self.notifications {
+            reset.notifications = Some(parser.reset_copy());
         }
         if let Some(images) = &self.images {
             let cell_pixels = images.cell_pixels;
@@ -1339,7 +1391,9 @@ impl HeadlessScreen {
         } else {
             MouseTrackingMode::Off
         };
-        let encoding = if mode.contains(TermMode::SGR_MOUSE) {
+        let encoding = if mode.contains(TermMode::SGR_PIXEL_MOUSE) {
+            MouseEncoding::SgrPixels
+        } else if mode.contains(TermMode::SGR_MOUSE) {
             MouseEncoding::Sgr
         } else {
             MouseEncoding::Legacy
@@ -1750,8 +1804,10 @@ impl HeadlessScreen {
         if let Some(mode) = mouse.tracking.dec_private_mode() {
             bytes.extend_from_slice(format!("\x1b[?{mode}h").as_bytes());
         }
-        if matches!(mouse.encoding, MouseEncoding::Sgr) {
-            bytes.extend_from_slice(b"\x1b[?1006h");
+        match mouse.encoding {
+            MouseEncoding::Sgr => bytes.extend_from_slice(b"\x1b[?1006h"),
+            MouseEncoding::SgrPixels => bytes.extend_from_slice(b"\x1b[?1016h"),
+            MouseEncoding::Legacy | MouseEncoding::Unknown => {}
         }
         bytes.extend_from_slice(if update.cursor_visible {
             b"\x1b[?25h"
@@ -2240,7 +2296,13 @@ impl HeadlessScreen {
     }
 
     fn drain_events(&mut self) {
-        while let Ok(event) = self.events.try_recv() {
+        let mut drained = std::mem::take(&mut self.drained_events);
+        let title = {
+            let mut inbox = self.events.lock().expect("terminal events");
+            std::mem::swap(&mut inbox.events, &mut drained);
+            inbox.title.take()
+        };
+        for event in title.into_iter().chain(drained.drain(..)) {
             match event {
                 Event::Title(title) => {
                     let title = Some(title);
@@ -2315,6 +2377,7 @@ impl HeadlessScreen {
                 _ => {}
             }
         }
+        self.drained_events = drained;
     }
 
     /// Takes the answers owed to the child. The pump writes these to the PTY
@@ -4098,6 +4161,44 @@ mod tests {
         assert_eq!(screen.term.grid().history_size(), HISTORY_ROW_CEILING);
     }
 
+    /// Narrowing a full history defers its re-wrap; new lines then evict
+    /// deferred rows. A line must cost what it did before the resize, not
+    /// a walk of every deferred line (4–7 ms per line at 150,000 rows in the
+    /// debug builds tests and development apps run).
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn lines_after_narrowing_a_full_history_cost_what_they_did_before() {
+        fn per_line(screen: &mut HeadlessScreen, next: &mut usize) -> std::time::Duration {
+            let mut batches: Vec<_> = (0..5)
+                .map(|_| {
+                    let lines = numbered_lines(*next, 200, 70);
+                    *next += 200;
+                    let start = std::time::Instant::now();
+                    for line in lines.split_inclusive(|&byte| byte == b'\n') {
+                        screen.feed(line);
+                    }
+                    start.elapsed() / 200
+                })
+                .collect();
+            batches.sort();
+            batches[2]
+        }
+        let mut screen = HeadlessScreen::new(80, 24);
+        let mut next = HISTORY_ROW_CEILING + 24;
+        screen.feed(&numbered_lines(0, next, 70));
+        assert_eq!(screen.term.grid().history_size(), HISTORY_ROW_CEILING);
+        let before = per_line(&mut screen, &mut next);
+        screen.resize(40, 24);
+        let narrowed = screen.term.grid().history_size();
+        assert!(narrowed > HISTORY_ROW_CEILING, "{narrowed} rows");
+        let after = per_line(&mut screen, &mut next);
+        assert_eq!(screen.term.grid().history_size(), narrowed);
+        assert!(
+            after <= before * 2 + std::time::Duration::from_micros(20),
+            "{after:?} per line after narrowing, {before:?} before"
+        );
+    }
+
     /// A re-wrapped history can hold more rows than restore admits, so a
     /// checkpoint carries the newest of them and still restores.
     #[cfg(feature = "compact-history")]
@@ -4413,6 +4514,57 @@ mod tests {
     #[cfg(feature = "compact-history")]
     fn line_number(text: &str) -> Option<usize> {
         text.rsplit_once("line ")?.1.get(..7)?.parse().ok()
+    }
+
+    /// Narrowing a deep history of wide-character lines re-wraps it rather
+    /// than evicting it. Its deferred line index used to count at capacity,
+    /// which evicting never gave back, so 150,000 rows became 73,777 here
+    /// (about 150 at 100,001 rows of 40-column CJK prose).
+    #[cfg(feature = "compact-history")]
+    #[test]
+    fn narrowing_deep_wide_character_history_keeps_it() {
+        const WIDE: &[char] = &['漢', '字', '行', '日', '本', '語', '中', '文', '書', '道'];
+        let line = |n: usize| {
+            // 36 wide characters after the number: two rows at 80 columns.
+            let text: String = (0..36)
+                .map(|i| WIDE[(n / 10 + i * 7 + n) % WIDE.len()])
+                .collect();
+            format!("line {n:07}{text}\r\n")
+        };
+        let mut screen = HeadlessScreen::new(80, 24);
+        let lines = 100_024;
+        let log: String = (0..lines).map(line).collect();
+        for chunk in log.as_bytes().chunks(64 * 1024) {
+            screen.feed(chunk);
+        }
+        let before = screen.history_rows();
+        assert!(before > 50_000, "{before} rows before narrowing");
+        screen.resize(40, 24);
+        let after = screen.history_rows();
+        assert!(
+            after >= before,
+            "{before} rows became {after} after narrowing"
+        );
+        assert!(screen.history_storage_bytes() <= HISTORY_STORAGE_BUDGET_BYTES);
+        // More output keeps it: lines evict in proportion.
+        let more: String = (lines..lines + 2_000).map(line).collect();
+        screen.feed(more.as_bytes());
+        assert!(
+            screen.history_rows() + 4_000 >= after,
+            "{} rows",
+            screen.history_rows()
+        );
+        // The newest history line is one of those just above the screen.
+        let rows = screen.history_rows() as i64;
+        let newest = history_text(&mut screen, rows - 4, 4)
+            .iter()
+            .filter_map(|text| text.strip_prefix("line ")?.get(..7)?.parse::<usize>().ok())
+            .max();
+        let newest = newest.expect("numbered history rows");
+        assert!(
+            (lines + 2_000 - 24..lines + 2_000).contains(&newest),
+            "newest history line {newest}"
+        );
     }
 
     #[cfg(feature = "compact-history")]
@@ -4842,6 +4994,41 @@ mod tests {
             MouseModes::new(MouseTrackingMode::Off, MouseEncoding::Sgr),
             "1006 is independent of tracking"
         );
+    }
+
+    /// DECSET 1016 is one of the exclusive mouse encodings, set, reset and
+    /// reported like the others (DECRQM `1`/`2`, not the `4` it answered
+    /// when it was only recognized), and survives a checkpoint restore.
+    #[test]
+    fn sgr_pixel_mouse_is_an_exclusive_encoding_reported_and_restored() {
+        let mut screen = HeadlessScreen::new(80, 24);
+        let modes = |screen: &mut HeadlessScreen| {
+            screen.feed(b"\x1b[?1006$p\x1b[?1016$p");
+            String::from_utf8(screen.take_replies()).unwrap()
+        };
+        assert_eq!(modes(&mut screen), "\x1b[?1006;2$y\x1b[?1016;2$y");
+        screen.feed(b"\x1b[?1002h\x1b[?1006h\x1b[?1016h");
+        assert_eq!(
+            screen.mouse_modes(),
+            MouseModes::new(MouseTrackingMode::ButtonMotion, MouseEncoding::SgrPixels)
+        );
+        assert_eq!(modes(&mut screen), "\x1b[?1006;2$y\x1b[?1016;1$y");
+
+        let snapshot = screen.full_snapshot();
+        let mut restored = HeadlessScreen::new(80, 24);
+        assert!(restored.restore(&[], &snapshot, false, false, screen.mouse_modes()));
+        assert_eq!(restored.mouse_modes(), screen.mouse_modes());
+
+        screen.feed(b"\x1b[?1006h");
+        assert_eq!(
+            screen.mouse_modes().encoding,
+            MouseEncoding::Sgr,
+            "last set wins"
+        );
+        screen.feed(b"\x1b[?1016h\x1b[?1016l");
+        assert_eq!(screen.mouse_modes().encoding, MouseEncoding::Legacy);
+        screen.feed(b"\x1b[?1016h\x1bc");
+        assert_eq!(screen.mouse_modes(), MouseModes::OFF, "RIS clears it");
     }
 
     /// Wheel bytes per mode, as a reference xterm-compatible emulator sends

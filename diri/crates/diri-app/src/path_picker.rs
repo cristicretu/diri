@@ -83,6 +83,10 @@ pub struct PathIndex {
     /// `node_modules`: the empty-query listing is a directory listing.
     listing: Vec<PathEntry>,
     pub truncated: bool,
+    /// A remote session's index is built one directory level at a time from
+    /// its Helper (`session.list_dir`): the directories already listed, the
+    /// root being `""`. `None` for a local index, which is scanned whole.
+    remote_listed: Option<BTreeSet<String>>,
 }
 
 impl PathIndex {
@@ -102,9 +106,62 @@ impl PathIndex {
             entries,
             listing,
             truncated: false,
+            remote_listed: None,
         };
         index.sort_listing();
         index
+    }
+
+    /// A remote session's root level, as its Helper listed it relative to the
+    /// remote child's live working directory.
+    pub fn from_remote(listing: &diri_proto::remote_pty::ListDirResult) -> Self {
+        let entries: Vec<PathEntry> = remote_entries("", &listing.entries).collect();
+        let mut index = Self {
+            root: PathBuf::from(&listing.cwd),
+            listing: entries.clone(),
+            entries,
+            truncated: listing.truncated,
+            remote_listed: Some(BTreeSet::from([String::new()])),
+        };
+        index.sort_listing();
+        index
+    }
+
+    /// Add one more remote level under `directory` (relative to the root).
+    /// Listing a level twice, or past the index cap, adds nothing.
+    pub fn merge_remote(
+        &mut self,
+        directory: &str,
+        listing: &diri_proto::remote_pty::ListDirResult,
+    ) {
+        let Some(listed) = self.remote_listed.as_mut() else {
+            return;
+        };
+        if !listed.insert(directory.to_owned()) {
+            return;
+        }
+        let room = INDEX_CAP.saturating_sub(self.entries.len());
+        let before = self.entries.len();
+        self.entries
+            .extend(remote_entries(directory, &listing.entries).take(room));
+        self.truncated |=
+            listing.truncated || self.entries.len() - before < listing.entries.len();
+    }
+
+    /// The directory a remote query is typing into (`src/ma` → `src`) when
+    /// that directory is known and not listed yet, so the picker can fetch
+    /// it. Local indexes are complete and never ask.
+    pub fn unlisted_directory(&self, query: &str) -> Option<String> {
+        let listed = self.remote_listed.as_ref()?;
+        let (directory, _) = query.rsplit_once('/')?;
+        let directory = directory.trim_end_matches('/');
+        if directory.is_empty() || listed.contains(directory) {
+            return None;
+        }
+        self.entries
+            .iter()
+            .any(|entry| entry.is_dir && entry.relative == directory)
+            .then(|| directory.to_owned())
     }
 
     fn sort_listing(&mut self) {
@@ -135,6 +192,27 @@ pub fn scan(root: &Path) -> PathIndex {
     index.truncated = truncated;
     index.sort_listing();
     index
+}
+
+fn remote_entries<'a>(
+    directory: &'a str,
+    entries: &'a [diri_proto::remote_pty::ListDirEntry],
+) -> impl Iterator<Item = PathEntry> + 'a {
+    entries
+        .iter()
+        // A name the shell would split on `/` cannot be one entry.
+        .filter(|entry| !entry.name.is_empty() && !entry.name.contains('/'))
+        .map(move |entry| {
+            let relative = if directory.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{directory}/{}", entry.name)
+            };
+            PathEntry::new(
+                relative,
+                entry.kind == diri_proto::remote_pty::ListDirEntryKind::Directory,
+            )
+        })
 }
 
 fn list_children(root: &Path) -> Vec<PathEntry> {
@@ -256,9 +334,13 @@ fn walk(root: &Path) -> (Vec<PathEntry>, bool) {
 /// One visible row: an index entry and the byte ranges the query matched.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PickerRow {
+    /// The text shown, which `highlights` index into: relative to the root
+    /// for a scanned entry, the home-collapsed absolute path for a recent.
     pub relative: String,
     pub is_dir: bool,
     pub highlights: Vec<Range<usize>>,
+    /// A recently chosen directory, by its absolute path.
+    pub recent: Option<PathBuf>,
 }
 
 impl PickerRow {
@@ -267,6 +349,54 @@ impl PickerRow {
             relative: entry.relative.clone(),
             is_dir: entry.is_dir,
             highlights: Vec::new(),
+            recent: None,
+        }
+    }
+
+    /// The absolute directory this row stands for: itself for a directory,
+    /// its parent for a file.
+    pub fn directory(&self, root: &Path) -> PathBuf {
+        let path = self
+            .recent
+            .clone()
+            .unwrap_or_else(|| root.join(&self.relative));
+        if self.is_dir {
+            path
+        } else {
+            path.parent().map_or(path.clone(), Path::to_path_buf)
+        }
+    }
+}
+
+/// What choosing a row does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PickerMode {
+    /// Type the path at the cursor (⌘E).
+    #[default]
+    InsertPath,
+    /// Directories only; choosing one `cd`s the shell there.
+    GoToDirectory,
+}
+
+/// Recents the empty query lists above the root's own children.
+pub const RECENTS_SHOWN_EMPTY: usize = 5;
+
+/// A recently chosen directory, prepared for matching by its shown text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecentDirectory {
+    pub path: PathBuf,
+    shown: String,
+    prepared: PreparedText,
+}
+
+impl RecentDirectory {
+    pub fn new(path: PathBuf, home: &Path) -> Self {
+        let shown = crate::quick_open::collapse_home(&path, home);
+        let prepared = PreparedText::new(&shown);
+        Self {
+            path,
+            shown,
+            prepared,
         }
     }
 }
@@ -274,21 +404,91 @@ impl PickerRow {
 /// Rank the index for `query`. An empty query lists the root like `ls`;
 /// otherwise the whole tree is fuzzy-matched with `/` as the word boundary,
 /// ties going to the shorter (shallower) path.
+#[cfg(test)]
 pub fn rank(index: &PathIndex, query: &str) -> Vec<PickerRow> {
+    rank_with(index, query, &[], PickerMode::InsertPath)
+}
+
+/// [`rank`] with recent directories first and, for Go to Directory, only
+/// directories. Recents are matched by their shown path; a scanned entry
+/// that is also a shown recent is listed once, as the recent.
+pub fn rank_with(
+    index: &PathIndex,
+    query: &str,
+    recents: &[RecentDirectory],
+    mode: PickerMode,
+) -> Vec<PickerRow> {
     let parsed = FuzzyQuery::new(query);
+    let mut matcher = FuzzyMatcher::paths();
+    let recents = recents
+        .iter()
+        .filter(|recent| recent.path != index.root);
+    let mut rows: Vec<PickerRow> = if parsed.is_empty() {
+        recents
+            .take(RECENTS_SHOWN_EMPTY)
+            .map(|recent| PickerRow {
+                relative: recent.shown.clone(),
+                is_dir: true,
+                highlights: Vec::new(),
+                recent: Some(recent.path.clone()),
+            })
+            .collect()
+    } else {
+        let mut scored: Vec<(u32, &RecentDirectory)> = recents
+            .filter_map(|recent| Some((parsed.score(&recent.prepared, &mut matcher)?, recent)))
+            .collect();
+        // Recency breaks ties; the list is already most recent first.
+        scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+        scored
+            .into_iter()
+            .map(|(_, recent)| PickerRow {
+                relative: recent.shown.clone(),
+                is_dir: true,
+                highlights: parsed
+                    .highlights(&recent.prepared, &recent.shown, &mut matcher)
+                    .map(|(_, ranges)| ranges)
+                    .unwrap_or_default(),
+                recent: Some(recent.path.clone()),
+            })
+            .collect()
+    };
+    rows.truncate(RESULT_LIMIT);
+    let shown_recent = |entry: &PathEntry| {
+        let path = index.root.join(&entry.relative);
+        rows.iter()
+            .any(|row| row.recent.as_deref() == Some(path.as_path()))
+    };
+    let wanted = |entry: &&PathEntry| mode == PickerMode::InsertPath || entry.is_dir;
+    let room = RESULT_LIMIT - rows.len();
+    let scanned = rank_entries(index, &parsed, &mut matcher, room, wanted, shown_recent);
+    rows.extend(scanned);
+    rows
+}
+
+fn rank_entries(
+    index: &PathIndex,
+    parsed: &FuzzyQuery,
+    matcher: &mut FuzzyMatcher,
+    room: usize,
+    wanted: impl Fn(&&PathEntry) -> bool,
+    shown_recent: impl Fn(&PathEntry) -> bool,
+) -> Vec<PickerRow> {
     if parsed.is_empty() {
         return index
             .listing
             .iter()
-            .take(RESULT_LIMIT)
+            .filter(&wanted)
+            .filter(|entry| !shown_recent(entry))
+            .take(room)
             .map(PickerRow::plain)
             .collect();
     }
-    let mut matcher = FuzzyMatcher::paths();
     let mut scored: Vec<(u32, &PathEntry)> = index
         .entries
         .iter()
-        .filter_map(|entry| Some((parsed.score(&entry.prepared, &mut matcher)?, entry)))
+        .filter(&wanted)
+        .filter_map(|entry| Some((parsed.score(&entry.prepared, matcher)?, entry)))
+        .filter(|(_, entry)| !shown_recent(entry))
         .collect();
     scored.sort_by(|(a_score, a), (b_score, b)| {
         b_score
@@ -296,18 +496,19 @@ pub fn rank(index: &PathIndex, query: &str) -> Vec<PickerRow> {
             .then_with(|| a.relative.len().cmp(&b.relative.len()))
             .then_with(|| a.relative.cmp(&b.relative))
     });
-    scored.truncate(RESULT_LIMIT);
+    scored.truncate(room);
     scored
         .into_iter()
         .map(|(_, entry)| {
             let highlights = parsed
-                .highlights(&entry.prepared, &entry.relative, &mut matcher)
+                .highlights(&entry.prepared, &entry.relative, matcher)
                 .map(|(_, ranges)| ranges)
                 .unwrap_or_default();
             PickerRow {
                 relative: entry.relative.clone(),
                 is_dir: entry.is_dir,
                 highlights,
+                recent: None,
             }
         })
         .collect()
@@ -317,9 +518,27 @@ pub fn rank(index: &PathIndex, query: &str) -> Vec<PickerRow> {
 /// Finder drop, so the next word does not fuse with the path; directories end
 /// in `/` so the user can keep typing into them.
 pub fn insertion_text(row: &PickerRow) -> String {
-    let mut text = escape_path_for_terminal(&row.relative);
+    let mut text = match &row.recent {
+        // Absolute: a recent is usually somewhere else, and `~` would not
+        // expand once escaped.
+        Some(path) => escape_path_for_terminal(&path.to_string_lossy()),
+        None => escape_path_for_terminal(&row.relative),
+    };
     text.push(if row.is_dir { '/' } else { ' ' });
     text
+}
+
+/// The command line Go to Directory types: `cd -- '<path>'` and Return.
+/// Single quotes read the same in fish, zsh and bash, with `'` written as
+/// `'\''`. `None` for a path no quoting carries safely into all three: one
+/// that is not UTF-8, holds a control character, or a backslash (fish reads
+/// `\\` inside single quotes as one backslash).
+pub fn cd_command(path: &Path) -> Option<String> {
+    let path = path.to_str()?;
+    if !path.starts_with('/') || path.chars().any(|c| c.is_control() || c == '\\') {
+        return None;
+    }
+    Some(format!("cd -- '{}'\r", path.replace('\'', "'\\''")))
 }
 
 /// Shorten `text` to at most `max_chars` characters by eliding its middle,
@@ -363,6 +582,16 @@ pub fn elide_middle(
     (out, ranges)
 }
 
+fn empty_listing() -> diri_proto::remote_pty::ListDirResult {
+    diri_proto::remote_pty::ListDirResult {
+        cwd: String::new(),
+        path: String::new(),
+        entries: Vec::new(),
+        truncated: false,
+        failure: None,
+    }
+}
+
 /// The picker's lifecycle. The index is scanned off the UI thread after the
 /// session's live working directory is known, so an open picker starts in
 /// `Loading` and renders its query field immediately.
@@ -379,26 +608,84 @@ pub struct PathPicker {
     /// Distinguishes this opening from a later one, so a slow scan for a
     /// picker the user already closed never populates its replacement.
     pub generation: u64,
+    pub mode: PickerMode,
+    pub recents: Vec<RecentDirectory>,
     pub query: QueryEditor,
     pub index: PickerIndex,
     pub rows: Vec<PickerRow>,
     pub selected: usize,
+    /// The remote level being fetched, so one keystroke asks only once.
+    pending_directory: Option<String>,
 }
 
 impl PathPicker {
-    pub fn new(generation: u64) -> Self {
+    pub fn new(generation: u64, mode: PickerMode) -> Self {
         Self {
             generation,
+            mode,
+            recents: Vec::new(),
             query: QueryEditor::default(),
             index: PickerIndex::Loading,
             rows: Vec::new(),
             selected: 0,
+            pending_directory: None,
         }
+    }
+
+    /// The remote directory the current query needs and nobody has asked
+    /// for yet. Marks it pending; the caller lists it and hands the answer
+    /// to [`Self::adopt_directory`].
+    pub fn take_wanted_directory(&mut self) -> Option<String> {
+        let PickerIndex::Ready(index) = &self.index else {
+            return None;
+        };
+        let wanted = index.unlisted_directory(self.query.text())?;
+        if self.pending_directory.as_deref() == Some(wanted.as_str()) {
+            return None;
+        }
+        self.pending_directory = Some(wanted.clone());
+        Some(wanted)
+    }
+
+    /// Merge one fetched remote level and re-rank, keeping the query. A
+    /// refused level is simply not merged; the query still ranks what is known.
+    pub fn adopt_directory(
+        &mut self,
+        directory: &str,
+        listing: Option<&diri_proto::remote_pty::ListDirResult>,
+    ) {
+        if self.pending_directory.as_deref() == Some(directory) {
+            self.pending_directory = None;
+        }
+        let PickerIndex::Ready(index) = &mut self.index else {
+            return;
+        };
+        match listing {
+            Some(listing) if listing.failure.is_none() => index.merge_remote(directory, listing),
+            // Remember the refusal so the same keystrokes do not ask again.
+            _ => index.merge_remote(directory, &empty_listing()),
+        }
+        self.refresh();
     }
 
     pub fn adopt_index(&mut self, index: PathIndex) {
         self.index = PickerIndex::Ready(index);
         self.refresh();
+    }
+
+    pub fn adopt(&mut self, index: PathIndex, recents: Vec<RecentDirectory>) {
+        self.recents = recents;
+        self.adopt_index(index);
+    }
+
+    /// Drops a recent from this picker's list (⌘⌫). Returns its path.
+    pub fn forget_selected_recent(&mut self) -> Option<PathBuf> {
+        let path = self.selected_row()?.recent.clone()?;
+        self.recents.retain(|recent| recent.path != path);
+        let selected = self.selected;
+        self.refresh();
+        self.selected = selected.min(self.rows.len().saturating_sub(1));
+        Some(path)
     }
 
     pub fn fail(&mut self, message: String) {
@@ -410,7 +697,7 @@ impl PathPicker {
     /// Re-rank after the query changed. Selection returns to the best match.
     pub fn refresh(&mut self) {
         if let PickerIndex::Ready(index) = &self.index {
-            self.rows = rank(index, self.query.text());
+            self.rows = rank_with(index, self.query.text(), &self.recents, self.mode);
         }
         self.selected = 0;
     }
@@ -430,7 +717,10 @@ impl PathPicker {
     /// Tab on a directory narrows the query to its contents instead of
     /// inserting it. Returns whether the query changed.
     pub fn descend(&mut self) -> bool {
-        let Some(row) = self.selected_row().filter(|row| row.is_dir) else {
+        let Some(row) = self
+            .selected_row()
+            .filter(|row| row.is_dir && row.recent.is_none())
+        else {
             return false;
         };
         let narrowed = format!("{}/", row.relative);
@@ -517,19 +807,21 @@ mod tests {
             relative: "notes/Screen Shot (1).png".into(),
             is_dir: false,
             highlights: Vec::new(),
+            recent: None,
         };
         assert_eq!(insertion_text(&file), "notes/Screen\\ Shot\\ \\(1\\).png ");
         let directory = PickerRow {
             relative: "apps/src".into(),
             is_dir: true,
             highlights: Vec::new(),
+            recent: None,
         };
         assert_eq!(insertion_text(&directory), "apps/src/");
     }
 
     #[test]
     fn tab_on_a_directory_narrows_the_query_to_its_contents() {
-        let mut picker = PathPicker::new(1);
+        let mut picker = PathPicker::new(1, PickerMode::InsertPath);
         picker.adopt_index(index());
         assert_eq!(picker.selected_row().unwrap().relative, "apps");
         assert!(picker.descend());
@@ -551,7 +843,7 @@ mod tests {
 
     #[test]
     fn selection_wraps_in_both_directions() {
-        let mut picker = PathPicker::new(1);
+        let mut picker = PathPicker::new(1, PickerMode::InsertPath);
         picker.adopt_index(index());
         let last = picker.rows.len() - 1;
         picker.move_selection(-1);
@@ -648,5 +940,162 @@ mod tests {
         assert!(!paths.iter().any(|path| path.starts_with("node_modules/")));
         assert!(paths.contains(&"loop"));
         assert!(!paths.iter().any(|path| path.starts_with("loop/")));
+    }
+
+    fn recents(paths: &[&str]) -> Vec<RecentDirectory> {
+        paths
+            .iter()
+            .map(|path| RecentDirectory::new(PathBuf::from(path), Path::new("/Users/me")))
+            .collect()
+    }
+
+    #[test]
+    fn recents_come_first_most_recent_first_and_skip_the_root() {
+        let recents = recents(&[
+            "/Users/me/fun/dirijor",
+            "/work/replay-web",
+            "/work/replay-web/apps",
+            "/tmp/scratch",
+        ]);
+        let rows = rank_with(&index(), "", &recents, PickerMode::InsertPath);
+        // The root is where the picker already is; the scanned `apps` is
+        // listed once, as the recent.
+        assert_eq!(
+            relatives(&rows[..3]),
+            ["~/fun/dirijor", "/work/replay-web/apps", "/tmp/scratch"]
+        );
+        assert!(rows[..3].iter().all(|row| row.recent.is_some()));
+        assert_eq!(rows.iter().filter(|row| row.relative == "apps").count(), 0);
+        assert_eq!(rows[3].relative, "design_assets");
+        // A query ranks matching recents above the tree.
+        let rows = rank_with(&index(), "dirijor", &recents, PickerMode::InsertPath);
+        assert_eq!(rows[0].relative, "~/fun/dirijor");
+        assert!(!rows[0].highlights.is_empty());
+    }
+
+    #[test]
+    fn a_recent_inserts_its_absolute_path() {
+        let recents = recents(&["/Users/me/My Repos/web"]);
+        let rows = rank_with(&index(), "", &recents, PickerMode::InsertPath);
+        assert_eq!(rows[0].relative, "~/My Repos/web");
+        assert_eq!(insertion_text(&rows[0]), "/Users/me/My\\ Repos/web/");
+        assert_eq!(
+            rows[0].directory(Path::new("/work/replay-web")),
+            Path::new("/Users/me/My Repos/web")
+        );
+    }
+
+    #[test]
+    fn go_to_directory_lists_only_directories() {
+        let rows = rank_with(&index(), "", &[], PickerMode::GoToDirectory);
+        assert_eq!(relatives(&rows), ["apps", "design_assets"]);
+        let rows = rank_with(&index(), "lic", &[], PickerMode::GoToDirectory);
+        assert!(rows.iter().all(|row| row.is_dir));
+        assert_eq!(rows[0].relative, "apps/license-lookup-app");
+        // A file's directory is its parent.
+        let file = rank(&index(), "License.ts")[0].clone();
+        assert_eq!(
+            file.directory(Path::new("/w")),
+            Path::new("/w/apps/license-lookup-app/src/types")
+        );
+    }
+
+    #[test]
+    fn forgetting_a_recent_keeps_the_selection_in_place() {
+        let mut picker = PathPicker::new(1, PickerMode::GoToDirectory);
+        picker.adopt(index(), recents(&["/a", "/b", "/c"]));
+        picker.move_selection(1);
+        assert_eq!(picker.forget_selected_recent(), Some(PathBuf::from("/b")));
+        assert_eq!(picker.selected_row().unwrap().relative, "/c");
+        // A scanned row is not a recent: nothing to forget.
+        picker.move_selection(1);
+        assert_eq!(picker.forget_selected_recent(), None);
+    }
+
+    #[test]
+    fn cd_commands_quote_for_every_shell_and_refuse_what_they_cannot() {
+        assert_eq!(
+            cd_command(Path::new("/Users/me/it's here")).as_deref(),
+            Some("cd -- '/Users/me/it'\\''s here'\r")
+        );
+        assert_eq!(
+            cd_command(Path::new("/w/-rf $(x) `y`")).as_deref(),
+            Some("cd -- '/w/-rf $(x) `y`'\r")
+        );
+        assert_eq!(cd_command(Path::new("/w/a\nb")), None);
+        assert_eq!(cd_command(Path::new("/w/a\\b")), None);
+        assert_eq!(cd_command(Path::new("relative")), None);
+    }
+
+    fn remote_level(names: &[(&str, bool)]) -> diri_proto::remote_pty::ListDirResult {
+        use diri_proto::remote_pty::{ListDirEntry, ListDirEntryKind};
+        diri_proto::remote_pty::ListDirResult {
+            cwd: "/srv/app".into(),
+            path: "/srv/app".into(),
+            entries: names
+                .iter()
+                .map(|(name, is_dir)| ListDirEntry {
+                    name: (*name).into(),
+                    kind: if *is_dir {
+                        ListDirEntryKind::Directory
+                    } else {
+                        ListDirEntryKind::File
+                    },
+                    symlink: false,
+                })
+                .collect(),
+            truncated: false,
+            failure: None,
+        }
+    }
+
+    #[test]
+    fn a_remote_index_lists_its_root_then_fetches_levels_as_the_query_enters_them() {
+        let mut picker = PathPicker::new(1, PickerMode::InsertPath);
+        picker.adopt_index(PathIndex::from_remote(&remote_level(&[
+            ("src", true),
+            (".git", true),
+            ("README.md", false),
+        ])));
+        assert_eq!(picker.root(), Some(Path::new("/srv/app")));
+        assert_eq!(relatives(&picker.rows), ["README.md", "src"]);
+        assert_eq!(picker.take_wanted_directory(), None, "the root is listed");
+
+        // Tab into `src`: the query names an unlisted level, asked for once.
+        picker.selected = 1;
+        assert!(picker.descend());
+        assert_eq!(picker.take_wanted_directory().as_deref(), Some("src"));
+        assert_eq!(picker.take_wanted_directory(), None, "already pending");
+        picker.adopt_directory("src", Some(&remote_level(&[("main.rs", false), ("ui", true)])));
+        assert_eq!(relatives(&picker.rows)[..2], ["src/ui", "src/main.rs"]);
+        assert_eq!(picker.take_wanted_directory(), None, "src is listed now");
+
+        picker.query.insert("ui/");
+        picker.refresh();
+        assert_eq!(picker.take_wanted_directory().as_deref(), Some("src/ui"));
+        // A refused level is remembered and never retried by the same query.
+        picker.adopt_directory("src/ui", None);
+        assert_eq!(picker.take_wanted_directory(), None);
+
+        // A name that is not a known directory is never asked for.
+        picker.query.clear();
+        picker.query.insert("README.md/x");
+        picker.refresh();
+        assert_eq!(picker.take_wanted_directory(), None);
+        assert_eq!(insertion_text(&PickerRow {
+            relative: "src/main.rs".into(),
+            is_dir: false,
+            highlights: Vec::new(),
+            recent: None,
+        }), "src/main.rs ");
+    }
+
+    #[test]
+    fn local_indexes_never_ask_for_remote_levels() {
+        let mut picker = PathPicker::new(1, PickerMode::InsertPath);
+        picker.adopt_index(index());
+        picker.query.insert("apps/");
+        picker.refresh();
+        assert_eq!(picker.take_wanted_directory(), None);
     }
 }

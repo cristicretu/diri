@@ -996,6 +996,7 @@ impl ControlServer {
                         | Method::SESSION_ARCHIVE
                         | Method::SESSION_RESUME
                         | Method::SESSION_PROCESS_INFO
+                        | Method::SESSION_LIST_DIR
                         | Method::SESSION_RECONNECT
                         | Method::SESSION_FORK
                         | Method::SESSION_MIGRATE
@@ -1362,6 +1363,7 @@ impl ControlServer {
             Method::VOICE_PHONE_READER => self.voice_phone_reader(params),
             Method::SESSION_RESUME => self.session_resume(params),
             Method::SESSION_PROCESS_INFO => self.session_process_info(params),
+            Method::SESSION_LIST_DIR => self.session_list_dir(params),
             Method::SESSION_RECONNECT => self.session_reconnect(params),
             Method::SESSION_FORK => self.session_fork(params),
             Method::SESSION_RESUME_FROM_HISTORY => self.session_resume_from_history(params),
@@ -2240,6 +2242,7 @@ impl ControlServer {
             cols: pty.cols,
             rows: pty.rows,
             persistence,
+            keyboard_enhancements: false,
         };
 
         let mut record = new_record(&id, &kind, &captured.cwd);
@@ -3888,6 +3891,58 @@ impl ControlServer {
         })
     }
 
+    /// One directory level relative to a remote session child's live working
+    /// directory, through its own Helper build (`list-dir-v1`).
+    fn session_list_dir(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::SessionListDirParams = decode(params)?;
+        // A slow WAN round trip plus the Helper's own listing deadline.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let (reader, host) = {
+            let registry = self.registry.try_lock().map_err(|error| match error {
+                std::sync::TryLockError::WouldBlock => {
+                    ControlError::new("list_dir_busy", "Session registry is busy")
+                }
+                std::sync::TryLockError::Poisoned(error) => poisoned(error),
+            })?;
+            let record = registry
+                .record(&p.session_id.0)
+                .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+            let session = registry.get(&p.session_id.0).ok_or_else(|| {
+                ControlError::new("process_unavailable", "Session has no live owner")
+            })?;
+            (session.process_facts_reader(), record.host)
+        };
+        let listing = reader.list_dir(&p.query, deadline).map_err(|error| {
+            let code = match error.kind() {
+                std::io::ErrorKind::Unsupported => "list_dir_unsupported",
+                std::io::ErrorKind::TimedOut => "list_dir_timeout",
+                std::io::ErrorKind::WouldBlock => "list_dir_busy",
+                std::io::ErrorKind::InvalidInput => "invalid_params",
+                _ => "list_dir_unavailable",
+            };
+            ControlError::new(code, error.to_string())
+        })?;
+        let unchanged = self.registry.try_lock().is_ok_and(|registry| {
+            registry
+                .get(&p.session_id.0)
+                .is_some_and(|session| reader.matches(session))
+                && registry
+                    .record(&p.session_id.0)
+                    .is_some_and(|record| record.host == host)
+        });
+        if !unchanged {
+            return Err(ControlError::new(
+                "stale_session",
+                "Session changed during the directory listing",
+            ));
+        }
+        encode(&diri_proto::SessionListDirResult {
+            session_id: p.session_id,
+            host,
+            listing,
+        })
+    }
+
     /// Revives an exited session's conversation under the SAME record id.
     fn session_reconnect(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::SessionReconnectParams = decode(params)?;
@@ -4364,6 +4419,7 @@ impl ControlServer {
             cols: pty.cols,
             rows: pty.rows,
             persistence,
+            keyboard_enhancements: false,
         };
         Ok(crate::session::SessionSpec {
             id: target_id.to_owned(),

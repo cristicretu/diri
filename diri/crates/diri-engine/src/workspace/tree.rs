@@ -154,30 +154,13 @@ pub(super) fn repair(snapshot: &mut WorkspaceSnapshot) {
 /// How many panes sit side by side along `axis` inside `node`: a split on
 /// the same axis adds its halves, a split across it is as wide as its wider
 /// half. Equal weights give every visible column (or row) the same share.
-fn span(node: &LayoutNode, axis: LayoutAxis) -> u32 {
-    match node {
-        LayoutNode::Pane { .. } => 1,
-        LayoutNode::Split {
-            axis: split_axis,
-            first,
-            second,
-            ..
-        } => {
-            let (first, second) = (span(first, axis), span(second, axis));
-            if *split_axis == axis {
-                first + second
-            } else {
-                first.max(second)
-            }
-        }
-    }
-}
-
 /// Rebalance every divider so panes in a row or column share it equally.
 /// Returns whether any fraction moved.
 pub(super) fn equalize(node: &mut LayoutNode) -> bool {
+    let Some(balanced) = node.balanced_fraction() else {
+        return false;
+    };
     let LayoutNode::Split {
-        axis,
         fraction,
         first,
         second,
@@ -186,8 +169,6 @@ pub(super) fn equalize(node: &mut LayoutNode) -> bool {
     else {
         return false;
     };
-    let (left, right) = (span(first, *axis), span(second, *axis));
-    let balanced = (left as f32 / (left + right) as f32).clamp(0.1, 0.9);
     let moved = (*fraction - balanced).abs() > f32::EPSILON;
     *fraction = balanced;
     let first_moved = equalize(first);

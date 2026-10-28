@@ -280,6 +280,7 @@ diri-remote list
 diri-remote kill
 diri-remote environment
 diri-remote directories
+diri-remote list-dir
 diri-remote usage
 diri-remote persistence
 diri-remote gc
@@ -699,7 +700,12 @@ DECSET 1007, cursor-key mode honoured) in Helper builds that include it; an
 older live Holder keeps ignoring that wheel. No frame or capability changes.
 A controller encodes wheel reports for a program whose mouse details it
 knows, with modifiers and the sideways axis, and sends them as mouse input
-like its clicks. Scrollback is bounded to 4 MiB and served on demand
+like its clicks. SGR-Pixels reports (DECSET 1016) ride mode-byte bit 6 beside
+the SGR bit, in `FullSnapshot` and `GridDelta` alike: a peer that predates
+the bit reads plain SGR and keeps sending cell reports, which is what every
+build did before 1016 was recognized, so no capability or minor is needed.
+Pixel coordinates are zero-based in 16×34 nominal cells, the same cell the
+Helper already reports in `ws_xpixel`/`ws_ypixel`. Scrollback is bounded to 4 MiB and served on demand
 through `Scroll`. Raw output is bounded to 32 MiB.
 
 On-demand history reads use the Engine's bounded background-request pool. The
@@ -731,8 +737,23 @@ predicate (`HeadlessScreen::lost_cells_only_on_cursor_row`, shared through
 or capability; Holders launched by older Helper builds keep the 8 ms trailing
 wait until their session is relaunched with a new Helper. If a destructive repaint
 temporarily removes screen content, the Holder instead gives its redraw bytes up
-to 16 ms to arrive, returning immediately when they do. That longer ceiling is
-isolated from typed echo and additive scrolling. When no client is attached, it
+to 16 ms to arrive, returning immediately when they do. Concretely: when a
+batch's PTY output leaves fewer filled cells than the batch opened with (what
+the last publication showed), and it did not end on a closed synchronized
+update, its diff is due 16 ms after the batch opened, and the keystroke fast
+path does not bypass that; as soon as the content is back the ordinary rules
+apply again. A keystroke may remove up to one row's worth of cells (backspace,
+kill line) without counting as a repaint, and additive output never does. This
+mirrors the local Engine pump's partial-repaint ceiling; the local pump's
+longer grace for an entirely blank screen is not copied, so remote output is
+never coalesced for more than 16 ms. The hold is Holder-only timing with no
+protocol change or capability: Holders launched by Helper builds before
+protocol minor 20 do not hold (they published a keystroke-triggered erase at
+once and a background one after 8 ms) until their session is relaunched.
+Measured through a fake `ssh` with 25 ms each way, a repaint whose redraw
+followed its erase by 2 to 10 ms reached the Engine attach as an erased frame
+in 28-30 of 30 keystroke-triggered trials before the hold and in 0-1 of 30
+after it (see `measure_remote_destructive_repaint`). When no client is attached, it
 continues parsing terminal state but does not construct or serialize diffs. If
 an attached client falls behind, stale updates are discarded and the connection
 is reseeded from a complete snapshot after reconnect.
@@ -956,10 +977,14 @@ the session's terminal state; it is not a display client. So while it keeps
 taking bytes, backlog or queue, the Holder waits for queue room before reading
 more from the PTY: a program that prints faster than the Engine parses is paced
 to the Engine, as a terminal emulator's own reads pace it, and can no longer
-lap the 32 MiB session log and have output silently skipped. The Holder gives
-up on a subscriber only after 500 ms in which it took nothing (a hung Engine);
-the program then runs free and the Engine resumes from its offset when it
-returns. Display clients are unaffected: they attach to the Engine, whose
+lap the 32 MiB session log and have output silently skipped. A slow Engine
+is never given up on: while its stream stays connected the Holder leaves the
+PTY unread and the kernel pauses the program, however long a parse pass takes
+on a loaded machine. The program runs free only once the Engine hangs up (its
+socket closes) or the session is dying (kill-tree, SIGKILL, or the child has
+exited) and the Engine has then taken nothing for 500 ms, so a killed leader
+can still drain and exit; the Engine resumes from its offset when it returns.
+Display clients are unaffected: they attach to the Engine, whose
 bounded per-client queues still drop stale diffs and reseed with a Full
 Snapshot. An older live Holder ignores `resumeFrom` and omits `resumed`; the
 Engine keeps its previous behaviour for that Holder (follow the log, subscribe
@@ -1906,10 +1931,11 @@ not enable parser negotiation: shipping `HeadlessScreen::new` remains disabled.
 Only an explicitly configured capable input owner may use the opt-in parser
 constructor. The local Engine is such an owner for local sessions: it builds
 their screens with `new_with_keyboard_enhancements`, and the desktop App
-attaches with `enhancedKeyboard` and encodes the negotiated flags. The remote
-Holder and the Engine's mirror of a remote session keep the disabled parser,
-so remote sessions still never answer `CSI ? u`; enabling it there is a
-separate Holder change. Five validated flag bits come from the shared parser; there is no
+attaches with `enhancedKeyboard` and encodes the negotiated flags. A remote
+Holder uses the opt-in parser only when its launching Engine asks for it
+(`kitty-keyboard-v1`, protocol minor 20, below); the Engine's own mirror of a
+remote session keeps the disabled parser, because the Holder is the remote
+program's emulator. Five validated flag bits come from the shared parser; there is no
 second escape parser. Direct set, query, push/pop and screen swaps share the
 same bounded stack state.
 
@@ -2015,15 +2041,15 @@ attributes (`?62;22c`, which kitten's probe waits on), and it sets the PTY's
 `ws_xpixel`/`ws_ypixel` from its cell size. The Engine still answers `OSC 7501`
 queries. Every other reply stays unanswered, as before, and the Holder keeps
 no queue of unanswered replies. A Holder from before minor 16 neither intercepts
-nor answers, so its programs see no support and keep working unchanged.
+nor answers, so its programs see no support and keep working unchanged. Minor
+19 (`query-replies-v1`, below) revises this: such a Holder answers every query.
 
 Local sessions answer more than this: XTVERSION, XTGETTCAP, DECRQSS, the kitty
 keyboard query, OSC 4/10/11/12 color queries from the App's palette
 (`terminal.configure`), `CSI ? 996 n` and DECSET 2031/2048 reports. That is
-opt-in on the shared screen (`with_host_replies`) and the Holder does not opt
-in, so a remote program still gets none of these replies and no OSC 4 color
-rewrite on the wire. Answering them remotely needs its own revision of this
-section. The shared emulator's state fixes (DECSTR, erase-in-line at a pending
+opt-in on the shared screen (`with_host_replies`). A minor 16 Holder does not
+opt in, so its programs get none of these replies and no OSC 4 color rewrite on
+the wire; a `query-replies-v1` Holder does (below). The shared emulator's state fixes (DECSTR, erase-in-line at a pending
 wrap, RIS clearing the title, modes 47 and 1047) reach Holders as ordinary
 emulator behavior with no protocol change.
 
@@ -2200,6 +2226,207 @@ codepoint widths until its session restarts; the Engine renders that Holder's
 grid as sent. Mode 2027 is parser state: it is not carried in snapshots or
 checkpoints, so after a Holder or Engine restart a program sees the default
 widths until it sets the mode again.
+
+## Query replies (protocol minor 19)
+
+Protocol minor 19 adds optional `query-replies-v1`. Minors 17 and 18 are
+`grid-resume-v1` and `terminal-styles-v1`; every one of these is gated by its
+own capability name, not by a minor range.
+
+Before it, a remote program's terminal queries were answered by nobody but
+the minor 16 image probes and the Engine's `OSC 7501` reply, so cursor
+position (`CSI 6 n`), status (`CSI 5 n`), DA2, DECRQM, `CSI 18 t`, color and
+color-scheme queries timed out, and shells, editors and agent CLIs waited on
+each timeout. The Engine's `OSC 7501` answer also arrived one WAN round trip
+after the Holder's immediate DA1, so the "status query, then DA1" support probe
+always read DA1 first and concluded the terminal had no support.
+
+A `query-replies-v1` Holder answers every query from its own emulator, the one
+shared `diri-terminal-state` parser, exactly as a local Engine session does:
+
+- **State-dependent replies** (CPR, DSR, DA1/DA2, DECRQM for every mode the
+  shared parser knows, XTWINOPS size reports, XTVERSION, XTGETTCAP, DECRQSS,
+  image probes, the in-band resize report of DECSET 2048) come from the Holder's
+  own grid, cursor and modes, so they are correct for the PTY that asked and
+  never cross the WAN. Modes the shared parser learns later (for example
+  grapheme clustering, 2027) are reported with no Holder protocol change.
+- **`OSC 7501` support queries** are answered by the Holder too, in stream
+  order with the emulator's replies, through a queries-only mode of the shared
+  OSC scanner that interprets no other product OSC (no alerts, clipboard, exit
+  reports or status records: the Engine still owns those). A support probe now
+  reads the status answer before DA1.
+- **Appearance-dependent replies** (OSC 4/10/11/12 colors, `CSI ? 996 n`, the
+  DECSET 2031 color-scheme report) come from a palette the Engine pushes in a
+  new `TerminalPalette` frame (kind 52, JSON `TerminalPalette`): after every
+  `ControlGranted`, and whenever the App's palette changes. The Holder keeps
+  the last one in memory for its lifetime, so a detached program is still
+  answered; before the first push colors stay unanswered, as before. A change of
+  light/dark is reported at once to a program that enabled DECSET 2031. A
+  palette push that meets a full Bridge is dropped; the next attach resends it.
+
+Replies go into the Holder's existing bounded input queue right after the
+output that asked, in one event loop with the PTY read and parse: a reply that
+does not fit is dropped and the program's query times out, as before; PTY
+reads never wait on it. The per-Holder cost is the stored palette (58 bytes)
+and the existing OSC scanner's empty state, with no heap allocation until a
+program sends an OSC; the queries-only scanner skips OSC payloads longer than
+16 bytes without buffering them.
+
+Negotiation is per controller attach, like `inline-images-v1`. The Engine
+never requires the capability. The Holder names it in `HelloAck` only to a
+controller at minor 19 or above; the Engine records it from each accepted
+`HelloAck`, clears it on every reconnect, and sends `TerminalPalette` only
+while it is recorded, because an older Holder closes the Bridge on the unknown
+frame kind. A Holder refuses `TerminalPalette` from a controller that did not
+negotiate it.
+
+Compatibility, both directions:
+
+- An older Holder (live Holders from earlier Helper builds keep running after
+  an upgrade) is never sent the frame, does not name the capability, and keeps
+  its minor 16 behavior: image probes only, with the Engine answering
+  `OSC 7501` a round trip later. Its sessions are not refused or restarted;
+  only Holders launched by the new Helper build answer queries.
+- A new Holder with an older Engine attached answers every query except
+  `OSC 7501`, which it leaves to that Engine so the program never receives
+  two answers. With no controller attached, nobody else could answer, so the
+  Holder answers `OSC 7501` too; an Engine that attaches later reads that
+  output as replay and answers nothing.
+
+The kitty keyboard query (`CSI ? u`) is answered only by a Holder that
+negotiates kitty keyboard flags; see the next section.
+
+## Kitty keyboard negotiation (protocol minor 20)
+
+Protocol minor 20 adds `kitty-keyboard-v1`. Before it, a remote program's
+`CSI ? u` probe went unanswered (the Holder kept the disabled keyboard
+parser), so Claude Code, Neovim, fish and Codex fell back to legacy keys and
+Shift+Enter or Ctrl-key disambiguation never turned on remotely, while the
+same programs negotiated flags in a local session.
+
+The input contract was already in place at minor 14 (`enhanced-keyboard-v1`):
+the Holder publishes the five flag bits in `InputModes` with the matching
+grid, the Engine commits them after validating that grid, the desktop App and
+`session.send_key` encode keys with them, and controllers that cannot encode
+them are refused while flags are active. Minor 20 only lets the Holder's
+emulator negotiate:
+
+- **Launch opt-in.** `LaunchRequest.keyboardEnhancements` (optional, omitted
+  when false, so a launch without it is the exact prior JSON) asks the Helper
+  to build the Holder's `HeadlessScreen` with
+  `new_with_keyboard_enhancements`. The Engine sets it only for Helpers at
+  minor 20 or newer; it is the input owner that encodes the flags. The parser
+  choice is fixed for the Holder's life, so a program's first probe, which
+  usually arrives before any attach, is answered from the start. Terminal
+  reset and resize keep it.
+- **Answers come from the Holder.** `CSI ? u`, `CSI > flags u`, `CSI < u` and
+  `CSI = flags ; mode u` are handled by the one shared parser, so remote
+  replies are byte-for-byte the local Engine's (`?<flags>u`, in stream order,
+  ahead of DA1) and cross no network.
+- **Named in `HelloAck`.** A negotiating Holder names `kitty-keyboard-v1` to a
+  controller that negotiated `enhanced-keyboard-v1` at minor 20 or above. The
+  Engine does not require it: the flags it encodes always come from
+  `InputModes`, whichever Holder sent them.
+
+Compatibility, both directions:
+
+- Holders launched by older Helper builds keep the disabled parser: the probe
+  times out and programs use legacy keys, as before. Nothing restarts them.
+- An older Engine never sends the field and gets today's Holder. A new Holder
+  that an older controller attaches to follows the minor 14 rules: an
+  `enhanced-keyboard-v1` controller receives the flags; a controller without
+  it is refused while flags are active, with the Holder and Agent preserved.
+
+There is no extra memory, thread or wakeup: the kitty parser state is the
+two bounded flag stacks the shared parser already carries.
+
+## Session directory listing (protocol minor 21)
+
+Protocol minor 21 adds the optional Helper capability `list-dir-v1` and the
+one-shot `diri-remote list-dir` command, which Insert Path (⌘E) uses for
+remote sessions. Minors 19 and 20 belong to `query-replies-v1` and
+`kitty-keyboard-v1`; this minor lands after them.
+
+- **Where it runs.** Like process facts, a short-lived Helper process started
+  over the existing SSH ControlMaster answers it; the Holder, its PTY loop
+  and the attach channel are not involved, and no frame kind is added. An idle
+  session pays nothing: no thread, timer, socket or cache.
+- **Identity.** The request carries the authenticated `SessionSelector` with a
+  pinned incarnation. The Helper checks the token, incarnation and owner lock,
+  then reads the session child's working directory (`/proc/<pid>/cwd`,
+  `proc_pidinfo`) between two native birth observations, and rechecks the
+  binding afterwards, so a recycled PID is never listed. Sessions without a
+  captured child identity answer `process_facts_unsupported`.
+- **Resolution.** `path` is read like a shell argument: empty is the child's
+  live cwd, `~` and `~/…` the account `HOME`, absolute paths stand alone, and
+  anything else is joined to the cwd. `.` is dropped; `..` is left for the
+  kernel, as it would be for the program. Paths are NUL-free and at most
+  4096 bytes.
+- **Bounds.** One level, never recursive. At most 2,000 entries (`limit`,
+  1..=2000), the lexicographically earliest kept in O(limit) memory; at most
+  65,536 directory entries read; at most 1 MiB of JSON; a `timeoutMs`
+  (1..=2000) deadline checked every 256 entries. Any bound sets `truncated`.
+  An optional case-insensitive name `prefix` filters before the limit.
+  Directories only unless `includeFiles`.
+- **Symlinks.** Entry kinds come from the directory entry (no follow). A
+  symlink costs one `stat` to report its target's kind (`directory`, `file`,
+  `other` for missing targets) and is flagged `symlink`; it is never entered.
+- **Errors.** Filesystem refusals are answers, not RPC failures: the result
+  keeps `cwd` and the resolved `path` and sets `failure` to
+  `permission_denied`, `not_found`, `not_a_directory` or `unreadable`.
+  Diagnostics never include names, paths or the token.
+- **Compatibility.** The Engine sends `list-dir` only through the session's
+  own Helper build at minor 21 or above; older builds are refused before any
+  SSH channel opens and `session.list_dir` answers `list_dir_unsupported`,
+  which the app shows as the existing "Insert Path works in local sessions
+  only". This is an optional operation, so the minor gate never touches
+  close, restore or terminate. Unknown entry kinds and failure codes from a
+  newer Helper decode as `other` / `unreadable`.
+- **Engine and app.** `session.list_dir` follows `session.process_info`:
+  the session handle is captured under the Registry, released before remote
+  I/O, shares the four-request admission, and the same handle and host are
+  rechecked before answering (`stale_session`). The deadline is 3 s. The
+  picker lists the root level when it opens and fetches one more level when
+  the query enters a known directory (Tab, or typing `dir/`), once per
+  directory; fuzzy ranking runs over the levels fetched so far. Local
+  sessions keep the app's whole-tree scan.
+
+## Terminal clear (protocol minor 22)
+
+Protocol minor 22 adds optional `terminal-clear-v1`, so Clear Screen and
+Scrollback works in remote sessions as it does locally. Minors 19-21 belong to
+`query-replies-v1`, `kitty-keyboard-v1` and `list-dir-v1`; this capability
+must merge after them so a minor-22 Helper always defines all three.
+
+A clear is an emulator mutation owned by the Holder, like a reset: it drops
+history and every row above the cursor's logical line (a wrapped prompt keeps
+its first row), leaves that line at the top and sends nothing to the child.
+The PTY, process tree, incarnation, controller lease and raw output log are
+untouched. On the alternate screen it is a no-op, because a full-screen
+program owns that screen.
+
+`TerminalClear` (frame kind 53, JSON) carries the controller epoch and the
+expected incarnation and is admitted exactly like `TerminalReset`: a stale
+epoch, a wrong incarnation or a controller that did not negotiate the
+capability is refused with no state change. The capability requires
+`terminal-reset-v1` in the same Hello, because a clear is announced through
+the reset boundary: the Holder publishes parsed output first, applies the
+clear, advances the reset generation and snapshot sequence and queues
+`TerminalResetState` plus an authoritative `FullSnapshot`. The Engine
+therefore drops in-flight scrollback reads and publishes a full grid to the
+attached client, with no new Engine state. Acceptance means queued, not
+applied; a clear is never coalesced, retained for reconnect or retried after
+an uncertain write.
+
+The Engine lists `terminal-clear-v1` in `Hello.requiredCapabilities` only for
+a Helper at minor 22 or above and fails closed if the acknowledgement omits
+it. A Holder rejects the request below minor 22 or without
+`terminal-reset-v1`, and strips the capability from `HelloAck` for a
+controller that did not ask. Older Holders never receive kind 53; the Engine
+refuses locally and the control layer reports `terminal_clear_unsupported`,
+which the desktop shows as an out-of-date Helper. The Engine answers
+`cleared: false` without contacting the Holder when its mirror shows the
+alternate screen. Footprint: one boolean per Holder connection.
 
 ## Grid history positions (protocol minor 23)
 

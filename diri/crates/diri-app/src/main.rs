@@ -4,6 +4,8 @@ mod agent_setup;
 mod alerts;
 mod api_client;
 mod app_theme;
+#[cfg(all(test, target_os = "macos"))]
+mod app_photon_tests;
 mod application_notifications;
 mod chrome_focus;
 mod clipboard_transfer;
@@ -49,6 +51,7 @@ pub mod markdown;
 mod markdown_view;
 #[cfg(any(target_os = "macos", test))]
 mod menu_inbox;
+mod motion;
 #[cfg(any(target_os = "macos", windows))]
 mod native_notifications;
 pub mod navigation;
@@ -66,6 +69,7 @@ mod palette_workspace;
 mod pane_drag;
 mod pane_fade;
 mod path_picker;
+mod path_recents;
 mod peek_settle;
 mod perf_overlay;
 mod phone_access;
@@ -274,6 +278,10 @@ fn main() {
         #[cfg(all(test, target_os = "macos"))]
         if std::env::var_os("DIRI_TEST_NATIVE_FIND").is_some() {
             terminal_pane::find_workflow_tests::run_native();
+        }
+        #[cfg(all(test, target_os = "macos"))]
+        if std::env::var_os("DIRI_TEST_APP_PHOTON").is_some() {
+            app_photon_tests::run_native();
         }
         return;
     }
@@ -519,6 +527,16 @@ fn main() {
         diri_ui::set_mark_rasterizer(macos::brand_raster::raster_mark);
         #[cfg(target_os = "macos")]
         macos::observe_scroller_style(cx);
+        motion::set_preference(
+            services
+                .store
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .preferences()
+                .reduce_motion,
+            cx,
+        );
         #[cfg(target_os = "macos")]
         macos::observe_reduce_motion(cx);
         let shortcut_overrides = services

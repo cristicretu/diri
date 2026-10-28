@@ -19,11 +19,22 @@ use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
 pub const PROTOCOL_MINOR: u16 = 23;
+/// `list-dir-v1`: the Helper lists one directory level resolved against the
+/// session child's live working directory. Minors 19 and 20 belong to
+/// `query-replies-v1` and `kitty-keyboard-v1`.
+pub const LIST_DIR_PROTOCOL_MINOR: u16 = 21;
+/// Minors 19-21 belong to `query-replies-v1`, `kitty-keyboard-v1` and
+/// `list-dir-v1`; clearing is negotiated by name like every capability.
+pub const TERMINAL_CLEAR_PROTOCOL_MINOR: u16 = 22;
 /// `grid-history-v1`: grids carry the primary screen's history position.
 pub const GRID_HISTORY_PROTOCOL_MINOR: u16 = 23;
 pub const GRID_RESUME_PROTOCOL_MINOR: u16 = 17;
 /// Minor 17 belongs to `grid-resume-v1`; styles are negotiated by name.
 pub const TERMINAL_STYLES_PROTOCOL_MINOR: u16 = 18;
+/// The launching Engine may ask a Holder to negotiate kitty keyboard flags
+/// with its program (`LaunchRequest.keyboardEnhancements`).
+pub const KITTY_KEYBOARD_PROTOCOL_MINOR: u16 = 20;
+pub const QUERY_REPLIES_PROTOCOL_MINOR: u16 = 19;
 pub const INLINE_IMAGES_PROTOCOL_MINOR: u16 = 16;
 pub const TERMINAL_RESET_PROTOCOL_MINOR: u16 = 15;
 pub const ENHANCED_KEYBOARD_PROTOCOL_MINOR: u16 = 14;
@@ -46,6 +57,16 @@ pub const MAX_DIRECTORY_ENTRIES: usize = 512;
 pub const MAX_DIRECTORY_SCANNED_ENTRIES: usize = 16_384;
 pub const MAX_DIRECTORY_RESPONSE_BYTES: usize = 512 * 1024;
 pub const MAX_EXECUTABLE_QUERIES: usize = 128;
+/// Entries one `list-dir-v1` answer may carry.
+pub const MAX_LIST_DIR_ENTRIES: usize = 2_000;
+/// Directory entries one listing reads before it stops and says `truncated`,
+/// so a huge directory costs bounded time on the remote host.
+pub const MAX_LIST_DIR_SCANNED_ENTRIES: usize = 65_536;
+/// Encoded answer bound, well inside the Engine's 2 MiB RPC ceiling.
+pub const MAX_LIST_DIR_RESPONSE_BYTES: usize = 1024 * 1024;
+pub const MAX_LIST_DIR_PATH_BYTES: usize = 4_096;
+pub const MAX_LIST_DIR_PREFIX_BYTES: usize = 255;
+pub const MAX_LIST_DIR_TIMEOUT_MS: u32 = 2_000;
 /// Image bytes per `ImageResponse`. Small enough that one read never holds
 /// interactive output behind it for long on a slow link; the Engine asks for
 /// the next chunk only after this one arrived.
@@ -75,6 +96,11 @@ const KIND_TERMINAL_RESET: u8 = 48;
 const KIND_TERMINAL_RESET_STATE: u8 = 49;
 const KIND_IMAGE_REQUEST: u8 = 50;
 const KIND_IMAGE_RESPONSE: u8 = 51;
+/// Engine to Holder, `query-replies-v1` only: the colors the controller's
+/// terminal is painted with, which color queries are answered from.
+const KIND_TERMINAL_PALETTE: u8 = 52;
+/// Engine to Holder, `terminal-clear-v1` only.
+const KIND_TERMINAL_CLEAR: u8 = 53;
 const IMAGE_RESPONSE_HEADER_LENGTH_BYTES: usize = 4;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -115,6 +141,10 @@ pub enum RemoteCapability {
     StopSession,
     #[serde(rename = "terminal-reset-v1")]
     TerminalReset,
+    /// Clear Screen and Scrollback in the Holder. Requires
+    /// `terminal-reset-v1`, whose boundary frames announce the cleared grid.
+    #[serde(rename = "terminal-clear-v1")]
+    TerminalClear,
     /// The Holder intercepts Kitty graphics and iTerm2 inline images, answers
     /// their support probes and serves stored pixels by `ImageRequest`.
     #[serde(rename = "inline-images-v1")]
@@ -127,6 +157,18 @@ pub enum RemoteCapability {
     /// underline color and overline spans in row annotations.
     #[serde(rename = "terminal-styles-v1")]
     TerminalStyles,
+    /// The Holder answers its program's terminal queries from its own
+    /// emulator, `OSC 7501` support queries included, in stream order. The
+    /// Engine then answers none of them.
+    #[serde(rename = "query-replies-v1")]
+    QueryReplies,
+    /// The Holder's emulator negotiates kitty keyboard flags with its
+    /// program (answers `CSI ? u`, honors push/pop/set) because its launching
+    /// Engine asked for it. Named only to an `enhanced-keyboard-v1`
+    /// controller at minor 20 or above; the flags themselves travel in
+    /// `InputModes` as before.
+    #[serde(rename = "kitty-keyboard-v1")]
+    KittyKeyboard,
     /// Every primary-screen grid carries the history position
     /// ([`crate::grid::GridHistory`]), so a client can keep a selection on
     /// text that scrolls into history. Only with `terminal-styles-v1`.
@@ -143,6 +185,10 @@ pub enum RemoteCapability {
     EnvironmentCapture,
     /// Helper CLI can return one bounded directory level.
     DirectoryList,
+    /// Helper CLI can list one bounded directory level resolved against an
+    /// authenticated session child's live working directory.
+    #[serde(rename = "list-dir-v1")]
+    ListDir,
     /// Helper can resolve a bounded batch of executable names against the
     /// account login PATH and validate user-selected executable paths.
     ExecutableDiscovery,
@@ -175,9 +221,12 @@ impl RemoteCapability {
             Self::ProcessFacts => "process-facts-v1",
             Self::StopSession => "stop-session-v1",
             Self::TerminalReset => "terminal-reset-v1",
+            Self::TerminalClear => "terminal-clear-v1",
             Self::InlineImages => "inline-images-v1",
             Self::GridResume => "grid-resume-v1",
             Self::TerminalStyles => "terminal-styles-v1",
+            Self::QueryReplies => "query-replies-v1",
+            Self::KittyKeyboard => "kitty-keyboard-v1",
             Self::GridHistory => "grid-history-v1",
             Self::FullSnapshot => "full-snapshot",
             Self::IncrementalGrid => "incremental-grid",
@@ -188,6 +237,7 @@ impl RemoteCapability {
             Self::SessionManagement => "session-management",
             Self::EnvironmentCapture => "environment-capture",
             Self::DirectoryList => "directory-list",
+            Self::ListDir => "list-dir-v1",
             Self::ExecutableDiscovery => "executable-discovery",
             Self::TranscriptUsage => "transcript-usage",
             Self::PersistenceProbe => "persistence-probe",
@@ -246,9 +296,11 @@ pub const ANNOTATED_HOLDER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::ProcessIdentity,
     RemoteCapability::StopSession,
     RemoteCapability::TerminalReset,
+    RemoteCapability::TerminalClear,
     RemoteCapability::InlineImages,
     RemoteCapability::GridResume,
     RemoteCapability::TerminalStyles,
+    RemoteCapability::QueryReplies,
     RemoteCapability::GridHistory,
 ];
 pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
@@ -272,9 +324,11 @@ pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::ProcessIdentity,
     RemoteCapability::StopSession,
     RemoteCapability::TerminalReset,
+    RemoteCapability::TerminalClear,
     RemoteCapability::InlineImages,
     RemoteCapability::GridResume,
     RemoteCapability::TerminalStyles,
+    RemoteCapability::ListDir,
     RemoteCapability::GridHistory,
 ];
 
@@ -874,6 +928,12 @@ pub struct LaunchRequest {
     pub cols: u16,
     pub rows: u16,
     pub persistence: PersistenceCapability,
+    /// The launching Engine encodes keys with negotiated kitty keyboard
+    /// flags, so the Holder's emulator may negotiate them with the program.
+    /// Sent only to Helpers at [`KITTY_KEYBOARD_PROTOCOL_MINOR`] or above;
+    /// omitted when false, so a launch without it is the exact prior JSON.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keyboard_enhancements: bool,
 }
 
 impl LaunchRequest {
@@ -1017,6 +1077,109 @@ fn default_process_inspection_timeout() -> u32 {
     1000
 }
 
+/// `list-dir-v1`: one directory level as a program in the session would see
+/// it. `path` is resolved like a shell argument: empty means the session
+/// child's live working directory, `~` and `~/…` the account home, an
+/// absolute path itself, anything else relative to that working directory.
+/// The listing never descends, reports entry kinds without following
+/// symlinks, and is bounded in entries, bytes and time.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListDirRequest {
+    #[serde(flatten)]
+    pub selector: SessionSelector,
+    #[serde(default)]
+    pub path: String,
+    /// Directories only unless set.
+    #[serde(default)]
+    pub include_files: bool,
+    /// Case-insensitive name prefix; empty lists every entry.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prefix: String,
+    #[serde(default = "default_list_dir_limit")]
+    pub limit: u32,
+    #[serde(default = "default_list_dir_timeout")]
+    pub timeout_ms: u32,
+}
+
+fn default_list_dir_limit() -> u32 {
+    MAX_LIST_DIR_ENTRIES as u32
+}
+
+fn default_list_dir_timeout() -> u32 {
+    1000
+}
+
+impl ListDirRequest {
+    pub fn validate(&self) -> Result<(), RemoteCodecError> {
+        self.selector.validate()?;
+        let invalid = |message: &str| Err(RemoteCodecError::InvalidLaunch(message.into()));
+        if self.path.len() > MAX_LIST_DIR_PATH_BYTES || self.path.as_bytes().contains(&0) {
+            return invalid("list-dir path must be NUL-free and at most 4096 bytes");
+        }
+        if self.prefix.len() > MAX_LIST_DIR_PREFIX_BYTES
+            || self.prefix.bytes().any(|byte| byte == 0 || byte == b'/')
+        {
+            return invalid("list-dir prefix must be one NUL-free name of at most 255 bytes");
+        }
+        if self.limit == 0 || self.limit as usize > MAX_LIST_DIR_ENTRIES {
+            return invalid("list-dir limit must be 1..=2000");
+        }
+        if !(1..=MAX_LIST_DIR_TIMEOUT_MS).contains(&self.timeout_ms) {
+            return invalid("list-dir timeout must be 1..=2000 ms");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ListDirEntryKind {
+    Directory,
+    File,
+    /// Sockets, FIFOs, devices, and symlinks whose target is missing.
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListDirEntry {
+    pub name: String,
+    /// What the entry resolves to. A symlink is reported by its target's
+    /// kind (one `stat`, never a walk) and flagged.
+    pub kind: ListDirEntryKind,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub symlink: bool,
+}
+
+/// Why a resolved directory could not be listed. The session itself was
+/// authenticated and live; these are ordinary filesystem answers, reported
+/// with the resolved path instead of failing the RPC.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListDirFailure {
+    PermissionDenied,
+    NotFound,
+    NotADirectory,
+    #[serde(other)]
+    Unreadable,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListDirResult {
+    /// The session child's live working directory on the remote host.
+    pub cwd: String,
+    /// The directory listed, lexically resolved against `cwd`.
+    pub path: String,
+    /// Sorted by name; at most the request's limit.
+    pub entries: Vec<ListDirEntry>,
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<ListDirFailure>,
+}
+
 impl SessionSelector {
     pub fn validate(&self) -> Result<(), RemoteCodecError> {
         validate_identifier("session id", &self.session_id)?;
@@ -1060,6 +1223,16 @@ pub struct StopSession {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TerminalReset {
+    pub controller_epoch: u64,
+    pub expected_incarnation: String,
+}
+
+/// Clear Screen and Scrollback, admitted like [`TerminalReset`]: history and
+/// the rows above the cursor's logical line go, that line stays at the top,
+/// and the child is not told. A no-op on the alternate screen.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TerminalClear {
     pub controller_epoch: u64,
     pub expected_incarnation: String,
 }
@@ -1323,6 +1496,7 @@ pub enum RemoteMessage {
     StopSession(StopSession),
     TerminalReset(TerminalReset),
     TerminalResetState(TerminalResetState),
+    TerminalClear(TerminalClear),
     AcquireControl(AcquireControl),
     ControlGranted(ControlGranted),
     ControlRevoked(ControlRevoked),
@@ -1334,6 +1508,9 @@ pub enum RemoteMessage {
     InputModes(InputModes),
     ImageRequest(ImageRequest),
     ImageResponse(ImageResponse),
+    /// The App's palette, pushed by a `query-replies-v1` Engine at attach and
+    /// whenever it changes. An older Holder closes the Bridge on the kind.
+    TerminalPalette(crate::TerminalPalette),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1459,7 +1636,8 @@ impl RemoteCodec {
                     // older peer remains compatible with this additive mode
                     // byte extension.
                     | (u8::from(value.mouse.is_reporting()) << 2)
-                    | (value.mouse.detail_bits() << 3);
+                    | (value.mouse.detail_bits() << 3)
+                    | (u8::from(value.mouse.pixel_reports()) << 6);
                 output.push(modes);
                 if !value.grid.is_full_snapshot {
                     return rollback(
@@ -1480,7 +1658,8 @@ impl RemoteCodec {
                 let modes = u8::from(value.alt_screen)
                     | (u8::from(value.bracketed_paste) << 1)
                     | (u8::from(value.mouse.is_reporting()) << 2)
-                    | (value.mouse.detail_bits() << 3);
+                    | (value.mouse.detail_bits() << 3)
+                    | (u8::from(value.mouse.pixel_reports()) << 6);
                 output.push(modes);
                 if value.grid.is_full_snapshot {
                     return rollback(
@@ -1508,6 +1687,10 @@ impl RemoteCodec {
             RemoteMessage::TerminalResetState(value) => {
                 value.validate()?;
                 append_json(KIND_TERMINAL_RESET_STATE, value, output, start)
+            }
+            RemoteMessage::TerminalClear(value) => {
+                validate_identifier("clear incarnation", &value.expected_incarnation)?;
+                append_json(KIND_TERMINAL_CLEAR, value, output, start)
             }
             RemoteMessage::AcquireControl(value) => {
                 validate_identifier("client nonce", &value.client_nonce)?;
@@ -1537,6 +1720,9 @@ impl RemoteCodec {
             RemoteMessage::ImageRequest(value) => {
                 value.validate()?;
                 append_json(KIND_IMAGE_REQUEST, value, output, start)
+            }
+            RemoteMessage::TerminalPalette(value) => {
+                append_json(KIND_TERMINAL_PALETTE, value, output, start)
             }
             RemoteMessage::ImageResponse(value) => {
                 if let Some(image) = &value.image {
@@ -1762,7 +1948,8 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
                 sequence,
                 alt_screen: modes & 1 != 0,
                 bracketed_paste: modes & 2 != 0,
-                mouse: MouseModes::from_detail_bits(modes >> 3, modes & 4 != 0),
+                mouse: MouseModes::from_detail_bits(modes >> 3, modes & 4 != 0)
+                    .with_pixel_reports(modes & (1 << 6) != 0),
                 grid,
             }))
         }
@@ -1786,7 +1973,8 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
                 sequence,
                 alt_screen: modes & 1 != 0,
                 bracketed_paste: modes & 2 != 0,
-                mouse: MouseModes::from_detail_bits(modes >> 3, modes & 4 != 0),
+                mouse: MouseModes::from_detail_bits(modes >> 3, modes & 4 != 0)
+                    .with_pixel_reports(modes & (1 << 6) != 0),
                 grid,
             }))
         }
@@ -1802,6 +1990,11 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
             let state: TerminalResetState = decode_json(kind, payload)?;
             state.validate()?;
             Ok(RemoteMessage::TerminalResetState(state))
+        }
+        KIND_TERMINAL_CLEAR => {
+            let request: TerminalClear = decode_json(kind, payload)?;
+            validate_identifier("clear incarnation", &request.expected_incarnation)?;
+            Ok(RemoteMessage::TerminalClear(request))
         }
         KIND_ACQUIRE_CONTROL => {
             let value: AcquireControl = decode_json(kind, payload)?;
@@ -1832,13 +2025,14 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
         KIND_IMAGE_RESPONSE => Ok(RemoteMessage::ImageResponse(decode_image_response(
             payload,
         )?)),
+        KIND_TERMINAL_PALETTE => Ok(RemoteMessage::TerminalPalette(decode_json(kind, payload)?)),
         _ => Err(RemoteCodecError::UnknownMessageType(kind)),
     }
 }
 
 fn validate_kind(kind: u8) -> Result<(), RemoteCodecError> {
     if (1..=FrameType::Mouse as u8).contains(&kind)
-        || (KIND_HELLO..=KIND_IMAGE_RESPONSE).contains(&kind)
+        || (KIND_HELLO..=KIND_TERMINAL_CLEAR).contains(&kind)
     {
         Ok(())
     } else {
@@ -2205,6 +2399,50 @@ mod tests {
     }
 
     #[test]
+    fn terminal_clear_is_an_optional_minor_22_capability() {
+        const {
+            assert!(TERMINAL_CLEAR_PROTOCOL_MINOR == 22);
+            assert!(TERMINAL_CLEAR_PROTOCOL_MINOR <= PROTOCOL_MINOR);
+            assert!(TERMINAL_CLEAR_PROTOCOL_MINOR > TERMINAL_RESET_PROTOCOL_MINOR);
+            assert!(KIND_TERMINAL_CLEAR > KIND_IMAGE_RESPONSE);
+        }
+        let message = RemoteMessage::TerminalClear(TerminalClear {
+            controller_epoch: 7,
+            expected_incarnation: "incarnation-1".into(),
+        });
+        let encoded = RemoteCodec::encode(&message).unwrap();
+        assert_eq!(encoded[0], KIND_TERMINAL_CLEAR);
+        for split in 0..=encoded.len() {
+            let mut codec = RemoteCodec::new();
+            let mut decoded = codec.feed(&encoded[..split]).unwrap();
+            decoded.extend(codec.feed(&encoded[split..]).unwrap());
+            assert_eq!(decoded, vec![message.clone()]);
+        }
+        assert!(
+            RemoteCodec::encode(&RemoteMessage::TerminalClear(TerminalClear {
+                controller_epoch: 1,
+                expected_incarnation: "../escape".into(),
+            }))
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::to_string(&RemoteCapability::TerminalClear).unwrap(),
+            "\"terminal-clear-v1\""
+        );
+        assert_eq!(
+            RemoteCapability::TerminalClear.wire_name(),
+            "terminal-clear-v1"
+        );
+        // An older peer decodes the name as Unknown and ignores it.
+        assert_eq!(
+            serde_json::from_str::<RemoteCapability>("\"terminal-clear-v2\"").unwrap(),
+            RemoteCapability::Unknown
+        );
+        assert!(ANNOTATED_HOLDER_CAPABILITIES.contains(&RemoteCapability::TerminalClear));
+        assert!(ANNOTATED_HELPER_CAPABILITIES.contains(&RemoteCapability::TerminalClear));
+    }
+
+    #[test]
     fn full_snapshot_round_trips_binary_grid_and_modes() {
         let message = RemoteMessage::FullSnapshot(snapshot());
         let encoded = RemoteCodec::encode(&message).expect("encode");
@@ -2214,6 +2452,44 @@ mod tests {
             RemoteCodec::new().feed(&encoded).expect("decode"),
             vec![message]
         );
+    }
+
+    #[test]
+    fn sgr_pixel_mouse_rides_bit_six_and_reads_as_sgr_without_it() {
+        let mut snapshot = snapshot();
+        snapshot.mouse = MouseModes::new(
+            crate::terminal::MouseTrackingMode::AnyMotion,
+            crate::terminal::MouseEncoding::SgrPixels,
+        );
+        for message in [
+            RemoteMessage::FullSnapshot(snapshot.clone()),
+            RemoteMessage::GridDelta(GridDelta {
+                sequence: 43,
+                alt_screen: snapshot.alt_screen,
+                bracketed_paste: snapshot.bracketed_paste,
+                mouse: snapshot.mouse,
+                grid: GridUpdate {
+                    is_full_snapshot: false,
+                    ..snapshot.grid.clone()
+                },
+            }),
+        ] {
+            let mut encoded = RemoteCodec::encode(&message).expect("encode");
+            assert_eq!(encoded[13] & 0b0100_0000, 0b0100_0000);
+            assert_eq!(
+                RemoteCodec::new().feed(&encoded).expect("decode"),
+                vec![message.clone()]
+            );
+            // A peer that predates the bit sees what it always did: SGR.
+            encoded[13] &= !0b0100_0000;
+            let decoded = RemoteCodec::new().feed(&encoded).expect("decode");
+            let mouse = match &decoded[0] {
+                RemoteMessage::FullSnapshot(value) => value.mouse,
+                RemoteMessage::GridDelta(value) => value.mouse,
+                other => panic!("unexpected {other:?}"),
+            };
+            assert_eq!(mouse.encoding, crate::terminal::MouseEncoding::Sgr);
+        }
     }
 
     #[test]
@@ -2341,6 +2617,7 @@ mod tests {
             cols: 80,
             rows: 24,
             persistence: PersistenceCapability::NonPersistent,
+            keyboard_enhancements: false,
         };
         request.validate().expect("structured values are valid");
         request.cwd = "relative".into();
@@ -2348,6 +2625,44 @@ mod tests {
             request.validate(),
             Err(RemoteCodecError::InvalidLaunch(_))
         ));
+    }
+
+    /// A launch without kitty keyboard negotiation is the exact prior JSON,
+    /// so an older Helper reads it unchanged; an older launch parses as
+    /// `false`; and an older Engine reads the new capability as unknown.
+    #[test]
+    fn kitty_keyboard_launch_field_and_capability_are_additive() {
+        let mut request = LaunchRequest {
+            session_id: "session-1".into(),
+            session_token: SessionToken::new("0123456789abcdef").expect("token"),
+            argv: vec!["/bin/sh".into()],
+            cwd: "/".into(),
+            environment: vec![],
+            cols: 80,
+            rows: 24,
+            persistence: PersistenceCapability::NonPersistent,
+            keyboard_enhancements: false,
+        };
+        let legacy = serde_json::to_value(&request).unwrap();
+        assert!(legacy.get("keyboardEnhancements").is_none());
+        let parsed: LaunchRequest = serde_json::from_value(legacy).unwrap();
+        assert!(!parsed.keyboard_enhancements);
+        request.keyboard_enhancements = true;
+        let asked = serde_json::to_value(&request).unwrap();
+        assert_eq!(asked["keyboardEnhancements"], true);
+        assert_eq!(
+            serde_json::from_value::<LaunchRequest>(asked).unwrap(),
+            request
+        );
+        assert_eq!(
+            serde_json::to_value(RemoteCapability::KittyKeyboard).unwrap(),
+            "kitty-keyboard-v1"
+        );
+        assert_eq!(
+            RemoteCapability::KittyKeyboard.wire_name(),
+            "kitty-keyboard-v1"
+        );
+        assert!(!ANNOTATED_HOLDER_CAPABILITIES.contains(&RemoteCapability::KittyKeyboard));
     }
 
     #[test]
@@ -2567,6 +2882,49 @@ mod tests {
     }
 
     #[test]
+    fn query_replies_is_a_minor_19_holder_capability() {
+        // No frame kind is added: the capability only moves which side
+        // answers a query, so an older peer never sees anything new.
+        const {
+            assert!(QUERY_REPLIES_PROTOCOL_MINOR == 19);
+            assert!(QUERY_REPLIES_PROTOCOL_MINOR < PROTOCOL_MINOR);
+            assert!(QUERY_REPLIES_PROTOCOL_MINOR > TERMINAL_STYLES_PROTOCOL_MINOR);
+            assert!(QUERY_REPLIES_PROTOCOL_MINOR > INLINE_IMAGES_PROTOCOL_MINOR);
+        }
+        assert_eq!(
+            serde_json::to_string(&RemoteCapability::QueryReplies).unwrap(),
+            "\"query-replies-v1\""
+        );
+        assert_eq!(
+            RemoteCapability::QueryReplies.wire_name(),
+            "query-replies-v1"
+        );
+        assert!(ANNOTATED_HOLDER_CAPABILITIES.contains(&RemoteCapability::QueryReplies));
+        // An older Engine reads the name as an unknown capability and ignores it.
+        assert!(!PHASE_ONE_HOLDER_CAPABILITIES.contains(&RemoteCapability::QueryReplies));
+    }
+
+    #[test]
+    fn terminal_palette_round_trips_and_is_new_to_minor_19() {
+        // Holders before minor 19 accepted kinds up to 51 and fails closed above,
+        // so the Engine sends a palette only to a `query-replies-v1` Holder.
+        const { assert!(KIND_TERMINAL_PALETTE == KIND_IMAGE_RESPONSE + 1) };
+        let message = RemoteMessage::TerminalPalette(crate::TerminalPalette {
+            appearance: crate::TerminalAppearance::Light,
+            foreground: [1, 2, 3],
+            background: [250, 251, 252],
+            cursor: [9, 8, 7],
+            ansi: [[4, 5, 6]; 16],
+        });
+        let encoded = RemoteCodec::encode(&message).expect("encode");
+        assert_eq!(encoded[0], KIND_TERMINAL_PALETTE);
+        assert_eq!(
+            RemoteCodec::new().feed(&encoded).expect("decode"),
+            vec![message]
+        );
+    }
+
+    #[test]
     fn image_chunk_slices_are_bounded() {
         let data = vec![5; MAX_IMAGE_CHUNK_BYTES + 10];
         let format = crate::inline_image::InlineImageFormat::Png;
@@ -2770,6 +3128,7 @@ mod usage_tests {
     #[test]
     fn terminal_styles_is_an_optional_minor_18_capability() {
         const {
+            assert!(TERMINAL_STYLES_PROTOCOL_MINOR == 18);
             assert!(TERMINAL_STYLES_PROTOCOL_MINOR < PROTOCOL_MINOR);
             assert!(TERMINAL_STYLES_PROTOCOL_MINOR > INLINE_IMAGES_PROTOCOL_MINOR);
         }
@@ -2783,5 +3142,87 @@ mod usage_tests {
         );
         assert!(!PHASE_ONE_HOLDER_CAPABILITIES.contains(&RemoteCapability::TerminalStyles));
         assert!(ANNOTATED_HOLDER_CAPABILITIES.contains(&RemoteCapability::TerminalStyles));
+    }
+
+    #[test]
+    fn list_dir_is_an_optional_minor_21_helper_capability() {
+        const {
+            assert!(LIST_DIR_PROTOCOL_MINOR == 21);
+            assert!(LIST_DIR_PROTOCOL_MINOR <= PROTOCOL_MINOR);
+            assert!(LIST_DIR_PROTOCOL_MINOR > TERMINAL_STYLES_PROTOCOL_MINOR);
+        }
+        assert_eq!(
+            serde_json::to_string(&RemoteCapability::ListDir).unwrap(),
+            "\"list-dir-v1\""
+        );
+        assert_eq!(RemoteCapability::ListDir.wire_name(), "list-dir-v1");
+        // A Helper CLI command, never part of a Holder attach.
+        assert!(!ANNOTATED_HOLDER_CAPABILITIES.contains(&RemoteCapability::ListDir));
+        assert!(!PHASE_ONE_HELPER_CAPABILITIES.contains(&RemoteCapability::ListDir));
+        assert!(ANNOTATED_HELPER_CAPABILITIES.contains(&RemoteCapability::ListDir));
+    }
+
+    #[test]
+    fn list_dir_requests_are_bounded() {
+        let request = ListDirRequest {
+            selector: SessionSelector {
+                session_id: "session-1".into(),
+                session_token: SessionToken::new("0123456789abcdef0123").unwrap(),
+                expected_incarnation: Some("incarnation-1".into()),
+            },
+            path: "src/../docs".into(),
+            include_files: true,
+            prefix: "Re".into(),
+            limit: MAX_LIST_DIR_ENTRIES as u32,
+            timeout_ms: 1000,
+        };
+        assert!(request.validate().is_ok());
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(wire["sessionId"], "session-1");
+        assert_eq!(wire["includeFiles"], true);
+        let decoded: ListDirRequest = serde_json::from_value(serde_json::json!({
+            "sessionId": "session-1",
+            "sessionToken": "0123456789abcdef0123",
+            "expectedIncarnation": null,
+        }))
+        .unwrap();
+        assert_eq!(decoded.path, "");
+        assert_eq!(decoded.limit as usize, MAX_LIST_DIR_ENTRIES);
+        for bad in [
+            ListDirRequest {
+                limit: MAX_LIST_DIR_ENTRIES as u32 + 1,
+                ..request.clone()
+            },
+            ListDirRequest {
+                limit: 0,
+                ..request.clone()
+            },
+            ListDirRequest {
+                prefix: "a/b".into(),
+                ..request.clone()
+            },
+            ListDirRequest {
+                path: "a\0b".into(),
+                ..request.clone()
+            },
+            ListDirRequest {
+                path: "x".repeat(MAX_LIST_DIR_PATH_BYTES + 1),
+                ..request.clone()
+            },
+            ListDirRequest {
+                timeout_ms: MAX_LIST_DIR_TIMEOUT_MS + 1,
+                ..request.clone()
+            },
+        ] {
+            assert!(bad.validate().is_err());
+        }
+        let result: ListDirResult = serde_json::from_value(serde_json::json!({
+            "cwd": "/w", "path": "/w", "truncated": false,
+            "entries": [{"name": "s", "kind": "socket-from-a-newer-helper"}],
+            "failure": "something_newer",
+        }))
+        .unwrap();
+        assert_eq!(result.entries[0].kind, ListDirEntryKind::Other);
+        assert_eq!(result.failure, Some(ListDirFailure::Unreadable));
     }
 }

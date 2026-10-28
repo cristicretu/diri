@@ -6,10 +6,10 @@ use std::time::{Duration, Instant};
 use diri_proto::grid::{CommandEnd, CursorShape, GridCell, GridUpdate, StyleSpan, UnderlineKind};
 use diri_proto::terminal::MouseModes;
 use gpui::{
-    App, Bounds, ContentMask, Element, ElementId, FocusHandle, Font, FontId, GlobalElementId,
-    InputHandler, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels, Point, ShapedLine,
-    SharedString, Style, TextAlign, TextRun, UTF16Selection, Window, fill, point, px, relative,
-    size,
+    App, Bounds, ContentMask, Edges, Element, ElementId, FocusHandle, Font, FontId,
+    GlobalElementId, InputHandler, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels,
+    Point, ShapedLine, SharedString, Style, TextAlign, TextRun, UTF16Selection, Window, fill,
+    point, px, relative, size,
 };
 
 use crate::blocks::BlockGlyph;
@@ -116,6 +116,9 @@ pub struct TerminalElement {
     hovered_reference: Option<ReferenceHit>,
     reduce_motion: bool,
     cursor_hidden: bool,
+    /// Host padding around the grid that a full-screen program's own
+    /// background may extend into. Zero paints nothing outside the bounds.
+    padding_extend: Edges<Pixels>,
     cursor_preferences: CursorPreferences,
 }
 
@@ -137,6 +140,34 @@ fn place_glide(viewport: &mut ScrollbackViewport, rows: f64, visible_rows: usize
     viewport.set_scroll_position(position, visible_rows);
 }
 
+/// How far past the window, in rows, to fetch ahead of a precise gesture
+/// moving at `velocity` points per second (positive toward history). One
+/// screen at rest, as before; a flick adds the rows it covers in
+/// [`FETCH_LEAD`], up to [`MAX_FETCH_LEAD_SCREENS`] screens.
+fn fetch_lead_rows(velocity: f32, line_height: f32, visible_rows: usize) -> i64 {
+    let screen = visible_rows.max(1) as f32;
+    let ahead = (velocity.abs() / line_height.max(1.0)) * FETCH_LEAD.as_secs_f32();
+    let rows = (screen + ahead)
+        .min(screen * MAX_FETCH_LEAD_SCREENS)
+        .round() as i64;
+    if velocity < 0.0 { -rows } else { rows }
+}
+
+/// Time a fetch ahead must cover. Deep history replies took up to about
+/// 65 ms under load; this leaves room for two of them back to back.
+const FETCH_LEAD: Duration = Duration::from_millis(150);
+
+/// Bound on how much a flick fetches ahead: a few screens of cells, far
+/// inside the 4 MiB client cache.
+const MAX_FETCH_LEAD_SCREENS: f32 = 4.0;
+
+/// Ends a find glide and drops trackpad travel not yet shown.
+fn cancel_scroll_motion(shared: &ElementSharedState) {
+    let mut state = mutex_lock(&shared.scroll_glide);
+    state.glide = None;
+    state.pacer.reset();
+}
+
 fn set_view_offset(
     shared: &ElementSharedState,
     buffer: &SharedGridBuffer,
@@ -145,7 +176,7 @@ fn set_view_offset(
 ) -> bool {
     // Keys, typing back to live, and the scroller all come through here:
     // whoever moves the view owns it, and a find glide lets go.
-    mutex_lock(&shared.scroll_glide).glide = None;
+    cancel_scroll_motion(shared);
     let mut viewport = mutex_lock(&shared.viewport);
     let changed = viewport.set_view_offset(offset, visible_rows);
     viewport.hold_reading_view(&read_lock(buffer));
@@ -728,10 +759,16 @@ struct ArmedContentPaint {
     shown_at: Option<Instant>,
 }
 
-/// The glide to a find match, if one is running, and the clock it reads.
+/// The glide to a find match, if one is running, the trackpad travel still
+/// being paced to the display, and the clock both read.
 #[derive(Default)]
 struct GlideState {
     glide: Option<crate::scroll_glide::ScrollGlide>,
+    /// Precise wheel travel bound for local scrollback, released one frame
+    /// at a time; see [`crate::scroll_pacer`].
+    pacer: crate::scroll_pacer::ScrollPacer,
+    /// The line height the paced travel was measured against.
+    pacer_line_height: f32,
     /// Pinned by tests and frame-by-frame renders; the wall clock otherwise.
     clock: Option<Instant>,
 }
@@ -984,6 +1021,8 @@ pub struct TerminalPrepaintState {
     overlay_quads: Vec<PaintQuad>,
     /// Shell command marks, drawn in the padding left of the grid.
     gutter_quads: Vec<PaintQuad>,
+    /// A full-screen program's edge backgrounds, carried into the padding.
+    padding_quads: Vec<PaintQuad>,
     selection: SelectionPaint,
     /// Reading path: window row and the absolute row whose shape paint reads
     /// from the history cache, as the live path reads the row cache.
@@ -1104,6 +1143,7 @@ impl TerminalElement {
             reduce_motion: false,
             cursor_preferences: CursorPreferences::default(),
             cursor_hidden: false,
+            padding_extend: Edges::default(),
         }
     }
 
@@ -1267,6 +1307,17 @@ impl TerminalElement {
     #[must_use]
     pub fn without_cursor(mut self) -> Self {
         self.cursor_hidden = true;
+        self
+    }
+
+    /// The padding the host keeps around the grid. On the alternate screen,
+    /// an edge row a program painted end to end with its own background
+    /// (an editor colourscheme, `htop`, `k9s`) carries that colour out into
+    /// this padding, so the program no longer sits inside a theme-coloured
+    /// frame. The host must let the element paint that far outside its bounds.
+    #[must_use]
+    pub fn padding_extend(mut self, padding: Edges<Pixels>) -> Self {
+        self.padding_extend = padding;
         self
     }
 
@@ -1650,6 +1701,7 @@ impl TerminalElement {
     }
 
     pub fn scroll_to_absolute(&self, absolute_row: i64, anchor: f32, visible_rows: usize) -> bool {
+        self.cancel_scroll_glide();
         let mut viewport = mutex_lock(&self.shared.viewport);
         let changed = viewport.scroll_to_absolute(absolute_row, anchor, visible_rows);
         viewport.hold_reading_view(&read_lock(&self.buffer));
@@ -1671,6 +1723,9 @@ impl TerminalElement {
         if alt_screen_changed {
             mutex_lock(&self.shared.selection).clear();
         }
+        if entered_alt {
+            self.cancel_scroll_glide();
+        }
         entered_alt && mutex_lock(&self.shared.viewport).enter_alt_screen()
     }
 
@@ -1684,13 +1739,15 @@ impl TerminalElement {
     /// routes are returned for the app to pass to `SessionAttachment::scroll`.
     pub fn route_wheel(&self, event: WheelEvent) -> Option<WheelRoute> {
         self.note_interaction();
-        self.cancel_scroll_glide();
+        mutex_lock(&self.shared.scroll_glide).glide = None;
         let modes = *mutex_lock(&self.shared.modes);
         if let WheelDelta::PrecisePoints(points) = event.delta
             && ScrollRouter::is_local(modes)
         {
             return self.scroll_by_pixels(points, event);
         }
+        // Lines and program-bound wheels move whole rows at once.
+        mutex_lock(&self.shared.scroll_glide).pacer.reset();
         let route = mutex_lock(&self.shared.scroll_router).route(modes, event)?;
         match route {
             WheelRoute::Local { lines } => {
@@ -1708,22 +1765,87 @@ impl TerminalElement {
         Some(route)
     }
 
-    /// A trackpad moves local scrollback by the pixel. `lines` reports the
-    /// whole rows crossed, which is zero for most events of a slow gesture.
+    /// A trackpad moves local scrollback by the pixel, paced to the display:
+    /// the delta joins the gesture's travel, the part due by now is applied,
+    /// and each frame applies what is due by its own time (see
+    /// [`crate::scroll_pacer`]). `lines` reports the whole rows crossed so
+    /// far, which is zero for most events of a slow gesture.
+    ///
+    /// The fetch window is widened ahead of the view in proportion to the
+    /// gesture's velocity, so a flick finds its rows already fetched.
     fn scroll_by_pixels(&self, points: f32, event: WheelEvent) -> Option<WheelRoute> {
         mutex_lock(&self.shared.scroll_router).reset();
+        let visible_rows = usize::from(event.visible_rows);
+        // Viewport before pacer, the order prepaint takes them in.
         let mut viewport = mutex_lock(&self.shared.viewport);
+        let mut state = mutex_lock(&self.shared.scroll_glide);
+        let now = state.now();
+        state.pacer.push(now, points);
+        state.pacer_line_height = event.line_height;
         let before = viewport.view_offset();
-        if !viewport.scroll_by_pixels(points, event.line_height, usize::from(event.visible_rows)) {
+        let step = state.pacer.take(now);
+        let changed = self.apply_scroll_step(&mut viewport, step, event.line_height, visible_rows);
+        let outstanding = state.pacer.outstanding();
+        let will_move = outstanding != 0.0 && viewport.can_scroll(outstanding);
+        if outstanding != 0.0 && !will_move {
+            // Against an end, or back on the live edge: nothing left to show.
+            state.pacer.reset();
+        }
+        viewport.lead_fetch(
+            fetch_lead_rows(state.pacer.velocity(), event.line_height, visible_rows),
+            visible_rows,
+        );
+        if !changed && !will_move {
             return None;
+        }
+        Some(WheelRoute::Local {
+            lines: viewport.view_offset().saturating_sub(before),
+        })
+    }
+
+    fn apply_scroll_step(
+        &self,
+        viewport: &mut ScrollbackViewport,
+        step: f32,
+        line_height: f32,
+        visible_rows: usize,
+    ) -> bool {
+        if step == 0.0 || !viewport.scroll_by_pixels(step, line_height, visible_rows) {
+            return false;
         }
         viewport.hold_reading_view(&read_lock(&self.buffer));
         if !viewport.is_reading() {
             mutex_lock(&self.shared.selection).clear();
         }
-        Some(WheelRoute::Local {
-            lines: viewport.view_offset().saturating_sub(before),
-        })
+        true
+    }
+
+    /// Applies the trackpad travel due by this frame. Returns whether another
+    /// frame is needed: while travel is still held, and once more after the
+    /// last step so chrome drawn from the position (the scroller, the
+    /// reading pill) catches up with it.
+    fn step_scroll_pacer(&self, viewport: &mut ScrollbackViewport, visible_rows: usize) -> bool {
+        let mut state = mutex_lock(&self.shared.scroll_glide);
+        if state.pacer.is_settled() {
+            return false;
+        }
+        let now = state.now();
+        let step = state.pacer.take(now);
+        let line_height = state.pacer_line_height;
+        self.apply_scroll_step(viewport, step, line_height, visible_rows);
+        state.clock.is_none()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn step_scroll_pacer_for_test(&self, visible_rows: usize) {
+        let mut viewport = mutex_lock(&self.shared.viewport);
+        self.step_scroll_pacer(&mut viewport, visible_rows);
+    }
+
+    /// Whether trackpad travel is still waiting for frames to show it.
+    #[must_use]
+    pub fn scroll_pacing(&self) -> bool {
+        !mutex_lock(&self.shared.scroll_glide).pacer.is_settled()
     }
 
     /// Rows scrolled back from the live edge, with the sub-row part a
@@ -1760,6 +1882,13 @@ impl TerminalElement {
         px(mutex_lock(&self.shared.viewport)
             .scroll_position()
             .shift(f32::from(line_height), scale_factor))
+    }
+
+    /// History rows the current window would paint blank for want of a
+    /// fetch; see [`ScrollbackViewport::unfetched_rows`].
+    #[must_use]
+    pub fn unfetched_rows(&self, visible_rows: usize) -> usize {
+        mutex_lock(&self.shared.viewport).unfetched_rows(visible_rows)
     }
 
     /// True while a reading view is finding its place after a column change;
@@ -1879,6 +2008,17 @@ impl TerminalElement {
         };
         crate::command_marks::command_output_at(at, COMMAND_OUTPUT_SEARCH_ROWS, |row| {
             viewport.stored_row(&buffer, row)
+        })
+    }
+
+    /// The live line under the grid cursor, from its OSC 133 marks: whether
+    /// a shell prompt is waiting there with nothing typed.
+    #[must_use]
+    pub fn prompt_line(&self) -> crate::command_marks::PromptLine {
+        let buffer = read_lock(&self.buffer);
+        let cursor = buffer.cursor;
+        crate::command_marks::prompt_line(usize::from(cursor.row), usize::from(cursor.col), |row| {
+            buffer.row(row)
         })
     }
 
@@ -2179,7 +2319,7 @@ impl TerminalElement {
 
     /// Anything else that moves the view owns it from then on.
     fn cancel_scroll_glide(&self) {
-        mutex_lock(&self.shared.scroll_glide).glide = None;
+        cancel_scroll_motion(&self.shared);
     }
 
     pub fn sync_find_highlights(&self, model: &TerminalFindModel) {
@@ -2737,6 +2877,7 @@ impl Element for TerminalElement {
                 sprite_shapes: Vec::new(),
                 overlay_quads: Vec::new(),
                 gutter_quads: Vec::new(),
+                padding_quads: Vec::new(),
                 selection: SelectionPaint::default(),
                 lines: Vec::new(),
                 metrics: None,
@@ -2767,6 +2908,7 @@ impl Element for TerminalElement {
                 sprite_shapes: Vec::new(),
                 overlay_quads: Vec::new(),
                 gutter_quads: Vec::new(),
+                padding_quads: Vec::new(),
                 selection: SelectionPaint::default(),
                 lines: Vec::new(),
                 metrics: None,
@@ -2809,7 +2951,9 @@ impl Element for TerminalElement {
         // it: every party that touches these mutexes runs on the main thread,
         // and the clone copied the entire fetched-history cell cache per frame.
         let mut viewport = mutex_lock(&self.shared.viewport);
-        if self.step_scroll_glide(&mut viewport, visible_rows) {
+        if self.step_scroll_glide(&mut viewport, visible_rows)
+            | self.step_scroll_pacer(&mut viewport, visible_rows)
+        {
             window.request_animation_frame();
         }
         let viewport = viewport;
@@ -2827,6 +2971,12 @@ impl Element for TerminalElement {
         let mut sprite_shapes = Vec::new();
         let mut overlay_quads = Vec::new();
         let mut gutter_quads = Vec::new();
+        let mut padding_quads = Vec::new();
+        // Only a full-screen program owns the whole grid; a shell's history
+        // scrolls, so its colours stay inside the grid.
+        let extend_padding = self.padding_extend != Edges::default()
+            && scroll_shift == px(0.0)
+            && mutex_lock(&self.shared.modes).alt_screen;
         let mut lines = Vec::with_capacity(visible_rows);
         let grid = SpriteGrid::new(bounds.origin, metrics, window.scale_factor());
         let cursor;
@@ -3042,6 +3192,23 @@ impl Element for TerminalElement {
                 let annotations = (prepared.graphemes.clone(), prepared.styles.clone());
                 cache[row] =
                     Some(self.prepare_row(cells, annotations, tints, row as u16, grid, window));
+            }
+            if extend_padding {
+                let rows: Vec<&[GridCell]> = cache
+                    .iter()
+                    .map(|row| {
+                        row.as_ref().map_or(&[][..], |row| {
+                            &row.cells[..row.cells.len().min(visible_cols)]
+                        })
+                    })
+                    .collect();
+                padding_quads = padding_extension_quads(
+                    &rows,
+                    bounds,
+                    metrics,
+                    self.padding_extend,
+                    self.theme,
+                );
             }
             cache_misses = misses;
             cache_hits = visible_rows as u64 - misses;
@@ -3286,6 +3453,7 @@ impl Element for TerminalElement {
             sprite_shapes,
             overlay_quads,
             gutter_quads,
+            padding_quads,
             selection,
             lines,
             metrics: Some(metrics),
@@ -3579,6 +3747,27 @@ impl Element for TerminalElement {
                 }
             }
         });
+        // Last, so the theme fill under the grid does not cover the sliver
+        // between the final whole cell and the bounds. Nothing else paints there.
+        if !prepaint.padding_quads.is_empty() {
+            let padded = Bounds::from_corners(
+                point(
+                    bounds.left() - self.padding_extend.left,
+                    bounds.top() - self.padding_extend.top,
+                ),
+                point(
+                    bounds.right() + self.padding_extend.right,
+                    bounds.bottom() + self.padding_extend.bottom,
+                ),
+            );
+            window.with_content_mask(Some(ContentMask { bounds: padded }), |window| {
+                window.paint_layer(padded, |window| {
+                    for quad in prepaint.padding_quads.drain(..) {
+                        window.paint_quad(quad);
+                    }
+                });
+            });
+        }
         window.replace_glyph_raster_style(previous_raster);
 
         self.report_first_content_paint();
@@ -3717,6 +3906,143 @@ fn cursor_bounds(
 /// program hid (DECTCEM) stays hidden in both, and a thumbnail has none.
 const fn cursor_should_render(host_shows_cursor: bool, protocol_visible: bool) -> bool {
     host_shows_cursor && protocol_visible
+}
+
+/// Powerline separators are drawn to fit their cell exactly; a row that
+/// uses them is a styled prompt or status bar whose colour stops there.
+const fn is_powerline(scalar: u32) -> bool {
+    matches!(scalar, 0xE0B0..=0xE0C8 | 0xE0CA | 0xE0CC..=0xE0D2 | 0xE0D4)
+}
+
+/// The background a row may carry into the padding: its edge cell's colour,
+/// when the program painted every cell of the row with a background of its
+/// own. A row with any default-background cell, a powerline glyph, or an
+/// edge in the theme's own colour keeps the theme padding.
+fn row_extension(row: &[GridCell], edge: GridCell, theme: TermTheme) -> Option<gpui::Rgba> {
+    let painted = |cell: &GridCell| {
+        (cell.style.contains(diri_proto::grid::TermStyle::INVERSE)
+            || !is_default_background(cell.bg))
+            && !is_powerline(cell.scalar)
+    };
+    if row.is_empty() || !row.iter().all(painted) {
+        return None;
+    }
+    let color = theme.resolve_cell(edge).background;
+    let byte = |channel: f32| (channel * 255.0).round() as u8;
+    let same =
+        |a: gpui::Rgba, b: gpui::Rgba| [a.r, a.g, a.b].map(byte) == [b.r, b.g, b.b].map(byte);
+    (!same(color, theme.background)).then_some(color)
+}
+
+/// Quads that carry a full-screen program's edge backgrounds out into the
+/// host padding around `bounds`: left and right per row, top and bottom per
+/// column of the first and last row (corners included), plus the sliver
+/// between the last whole cell and the bounds. Rows that do not qualify
+/// leave the padding to the theme.
+fn padding_extension_quads(
+    rows: &[&[GridCell]],
+    bounds: Bounds<Pixels>,
+    metrics: CellMetrics,
+    padding: Edges<Pixels>,
+    theme: TermTheme,
+) -> Vec<PaintQuad> {
+    let mut quads = Vec::new();
+    let Some(cols) = rows
+        .iter()
+        .map(|row| row.len())
+        .max()
+        .filter(|&cols| cols > 0)
+    else {
+        return quads;
+    };
+    let left = bounds.left() - padding.left;
+    let grid_right = bounds.left() + metrics.cell_width * cols as f32;
+    let right = bounds.right().max(grid_right) + padding.right;
+    let grid_bottom = bounds.top() + metrics.y_for_row(rows.len() as u16);
+    let bottom = bounds.bottom().max(grid_bottom) + padding.bottom;
+    let mut push = |x0: Pixels, y0: Pixels, x1: Pixels, y1: Pixels, color| {
+        if x1 > x0 && y1 > y0 {
+            quads.push(fill(
+                Bounds::from_corners(point(x0, y0), point(x1, y1)),
+                color,
+            ));
+        }
+    };
+
+    // Left and right, merging consecutive rows of one colour into one quad.
+    let mut sides: Vec<(Option<gpui::Rgba>, Option<gpui::Rgba>)> = Vec::with_capacity(rows.len());
+    for row in rows {
+        sides.push(match (row.first(), row.last()) {
+            (Some(&first), Some(&last)) if row.len() == cols => (
+                row_extension(row, first, theme),
+                row_extension(row, last, theme),
+            ),
+            _ => (None, None),
+        });
+    }
+    for side in [0, 1] {
+        let mut start = 0;
+        while start < sides.len() {
+            let color = if side == 0 {
+                sides[start].0
+            } else {
+                sides[start].1
+            };
+            let mut end = start + 1;
+            while end < sides.len()
+                && (if side == 0 {
+                    sides[end].0
+                } else {
+                    sides[end].1
+                }) == color
+            {
+                end += 1;
+            }
+            if let Some(color) = color {
+                let y0 = bounds.top() + metrics.y_for_row(start as u16);
+                let y1 = bounds.top() + metrics.y_for_row(end as u16);
+                if side == 0 {
+                    push(left, y0, bounds.left(), y1, color);
+                } else {
+                    push(grid_right, y0, right, y1, color);
+                }
+            }
+            start = end;
+        }
+    }
+
+    // Top and bottom follow the first and last row cell by cell, reaching
+    // into the corners with the edge cells' colours.
+    for (index, y0, y1) in [
+        (0, bounds.top() - padding.top, bounds.top()),
+        (rows.len() - 1, grid_bottom, bottom),
+    ] {
+        let row = rows[index];
+        if row.len() != cols || row_extension(row, row[0], theme).is_none() {
+            continue;
+        }
+        let mut col = 0;
+        while col < cols {
+            let color = theme.resolve_cell(row[col]).background;
+            let mut end = col + 1;
+            while end < cols && theme.resolve_cell(row[end]).background == color {
+                end += 1;
+            }
+            let x0 = if col == 0 {
+                left
+            } else {
+                bounds.left() + metrics.cell_width * col as f32
+            };
+            let x1 = if end == cols {
+                right
+            } else {
+                bounds.left() + metrics.cell_width * end as f32
+            };
+            push(x0, y0, x1, y1, color);
+            col = end;
+        }
+    }
+    quads
 }
 
 fn append_background_quads(
@@ -6166,11 +6492,21 @@ mod selection_repaint_tests {
         assert_eq!(element.view_offset(), 1);
         assert!((element.scroll_position() - 0.25).abs() < 1e-6);
         assert_eq!(element.scroll_shift(gpui::px(16.0), 2.0), gpui::px(12.0));
+        // Handled in the same instant, the second delta waits for the frame
+        // its time falls in instead of doubling this one's travel.
+        let start = std::time::Instant::now();
+        element.set_scroll_glide_clock(Some(start));
         assert_eq!(
             element.route_wheel(trackpad(4.0)),
             Some(WheelRoute::Local { lines: 0 })
         );
+        assert!(element.scroll_pacing());
+        element.set_scroll_glide_clock(Some(start + std::time::Duration::from_millis(20)));
+        element.step_scroll_pacer_for_test(usize::from(ROWS));
+        assert!(!element.scroll_pacing());
         assert_eq!(element.scroll_shift(gpui::px(16.0), 2.0), gpui::px(8.0));
+        // A later gesture.
+        element.set_scroll_glide_clock(Some(start + std::time::Duration::from_millis(200)));
 
         // The window is rows 7..10 slid up by half a row, so the row under
         // its bottom edge (window row ROWS) is live row "two".
@@ -6193,6 +6529,53 @@ mod selection_repaint_tests {
     }
 
     #[test]
+    fn jittered_trackpad_events_move_the_view_on_every_frame() {
+        // A steady 120 Hz gesture whose events are handled in pairs: two in
+        // one refresh, none in the next. Applied as handled, every other
+        // frame repeated its position; paced, every frame moves.
+        let element = populated_element();
+        mutex_lock(&element.shared.viewport).apply_geometry(1_000, 1_003, 1, usize::from(ROWS));
+        let start = std::time::Instant::now();
+        let at = |millis: f64| start + std::time::Duration::from_secs_f64(millis / 1000.0);
+        let period = 1000.0 / 120.0;
+        let mut shown = Vec::new();
+        for frame in 0..24 {
+            if frame % 2 == 0 {
+                for event in 0..2 {
+                    element.set_scroll_glide_clock(Some(at(
+                        period * f64::from(frame) + f64::from(event) * 0.3
+                    )));
+                    element.route_wheel(trackpad(6.0));
+                }
+            }
+            element.set_scroll_glide_clock(Some(at(period * f64::from(frame) + 4.0)));
+            element.step_scroll_pacer_for_test(usize::from(ROWS));
+            shown.push(element.scroll_position());
+        }
+        let moves: Vec<f64> = shown.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        assert!(
+            moves[2..].iter().all(|step| *step > 0.1),
+            "a frame repeated its position: {moves:?}"
+        );
+        // Nothing is lost: 24 events of 6 points over a 16-point line.
+        element.set_scroll_glide_clock(Some(at(period * 30.0)));
+        element.step_scroll_pacer_for_test(usize::from(ROWS));
+        assert!((element.scroll_position() - 24.0 * 6.0 / 16.0).abs() < 1e-3);
+        assert!(!element.scroll_pacing(), "an idle pacer asks for no frames");
+    }
+
+    #[test]
+    fn the_fetch_lead_grows_with_a_flick_and_points_its_way() {
+        // At rest one screen, as before; a 1,200 rows/s flick covers its
+        // fetch time several screens ahead, and a flick back leads the
+        // other way.
+        assert_eq!(super::fetch_lead_rows(0.0, 15.0, 36), 36);
+        assert_eq!(super::fetch_lead_rows(18_000.0, 15.0, 36), 144);
+        assert_eq!(super::fetch_lead_rows(-18_000.0, 15.0, 36), -144);
+        assert_eq!(super::fetch_lead_rows(1_500.0, 15.0, 36), 51);
+    }
+
+    #[test]
     fn a_trackpad_over_a_mouse_reporting_program_still_sends_whole_lines() {
         let element = populated_element();
         element.set_modes(
@@ -6202,7 +6585,7 @@ mod selection_repaint_tests {
                 diri_proto::terminal::MouseEncoding::Legacy,
             ),
         );
-        assert_eq!(element.route_wheel(trackpad(9.0)), None);
+        // Past half a line, a line goes out; the rest of it is owed.
         assert_eq!(
             element.route_wheel(trackpad(9.0)),
             Some(WheelRoute::Daemon {
@@ -6212,6 +6595,7 @@ mod selection_repaint_tests {
                 row: 1,
             })
         );
+        assert_eq!(element.route_wheel(trackpad(9.0)), None);
         assert_eq!(element.scroll_position(), 0.0, "scrollback never moved");
 
         element.set_modes(true, MouseModes::OFF);
@@ -6534,5 +6918,123 @@ mod grapheme_paint_tests {
                 .0
                 .starts_with("e\u{301}")
         );
+    }
+}
+
+#[cfg(test)]
+mod padding_extend_tests {
+    use super::*;
+    use diri_proto::grid::{TermColor, TermStyle};
+
+    const BLUE: TermColor = TermColor::Rgb(0x20, 0x30, 0xa0);
+    const RED: TermColor = TermColor::Rgb(0xa0, 0x20, 0x20);
+
+    fn metrics() -> CellMetrics {
+        // 8 px cells, 16 px rows.
+        CellMetrics::from_measurements(px(8.0), px(12.0), px(4.0), px(0.0), FontId(0))
+    }
+
+    fn row(bgs: &[TermColor]) -> Vec<GridCell> {
+        bgs.iter()
+            .map(|&bg| GridCell::new(u32::from(' '), TermColor::Default, bg, TermStyle::empty()))
+            .collect()
+    }
+
+    fn quads(rows: &[Vec<GridCell>]) -> Vec<(Bounds<Pixels>, gpui::Hsla)> {
+        let rows: Vec<&[GridCell]> = rows.iter().map(Vec::as_slice).collect();
+        let theme = TermTheme::default();
+        // Four columns of 8 px in a 36 px wide box: a 4 px sliver remains.
+        let bounds = Bounds::new(point(px(100.0), px(50.0)), size(px(36.0), px(48.0)));
+        let padding = Edges {
+            top: px(2.0),
+            right: px(12.0),
+            bottom: px(10.0),
+            left: px(12.0),
+        };
+        padding_extension_quads(&rows, bounds, metrics(), padding, theme)
+            .into_iter()
+            .map(|quad| (quad.bounds, quad.background.as_solid().unwrap()))
+            .collect()
+    }
+
+    fn rgba(color: TermColor) -> gpui::Hsla {
+        TermTheme::default()
+            .resolve_cell(GridCell::new(
+                32,
+                TermColor::Default,
+                color,
+                TermStyle::empty(),
+            ))
+            .background
+            .into()
+    }
+
+    fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> Bounds<Pixels> {
+        Bounds::from_corners(point(px(x0), px(y0)), point(px(x1), px(y1)))
+    }
+
+    #[test]
+    fn a_fully_painted_screen_fills_every_side_of_the_padding() {
+        let screen = vec![row(&[BLUE; 4]); 3];
+        let quads = quads(&screen);
+        let blue = rgba(BLUE);
+        // Left and right merge the three rows; right includes the sliver.
+        assert!(quads.contains(&(rect(88.0, 50.0, 100.0, 98.0), blue)));
+        assert!(quads.contains(&(rect(132.0, 50.0, 148.0, 98.0), blue)));
+        // Top and bottom reach into the corners.
+        assert!(quads.contains(&(rect(88.0, 48.0, 148.0, 50.0), blue)));
+        assert!(quads.contains(&(rect(88.0, 98.0, 148.0, 108.0), blue)));
+        assert_eq!(quads.len(), 4);
+    }
+
+    #[test]
+    fn edges_follow_each_row_and_column() {
+        // A status line of its own colour, and a top row split in two.
+        let screen = vec![
+            row(&[RED, RED, BLUE, BLUE]),
+            row(&[BLUE; 4]),
+            row(&[RED; 4]),
+        ];
+        let quads = quads(&screen);
+        let (red, blue) = (rgba(RED), rgba(BLUE));
+        assert!(quads.contains(&(rect(88.0, 50.0, 100.0, 66.0), red)));
+        assert!(quads.contains(&(rect(88.0, 66.0, 100.0, 82.0), blue)));
+        assert!(quads.contains(&(rect(132.0, 50.0, 148.0, 82.0), blue)));
+        assert!(quads.contains(&(rect(88.0, 82.0, 100.0, 98.0), red)));
+        assert!(quads.contains(&(rect(88.0, 48.0, 116.0, 50.0), red)));
+        assert!(quads.contains(&(rect(116.0, 48.0, 148.0, 50.0), blue)));
+        assert!(quads.contains(&(rect(88.0, 98.0, 148.0, 108.0), red)));
+    }
+
+    #[test]
+    fn rows_with_default_cells_or_powerline_glyphs_keep_the_theme_padding() {
+        let mut prompt = row(&[BLUE; 4]);
+        prompt[1].scalar = 0xE0B0;
+        let screen = vec![
+            row(&[BLUE, BLUE, TermColor::Default, BLUE]),
+            prompt,
+            row(&[TermColor::Default; 4]),
+        ];
+        assert!(quads(&screen).is_empty());
+    }
+
+    #[test]
+    fn a_background_in_the_theme_colour_paints_nothing() {
+        let theme = TermTheme::default().background;
+        let own = TermColor::Rgb(
+            (theme.r * 255.0).round() as u8,
+            (theme.g * 255.0).round() as u8,
+            (theme.b * 255.0).round() as u8,
+        );
+        assert!(quads(&vec![row(&[own; 4]); 2]).is_empty());
+    }
+
+    #[test]
+    fn inverse_cells_count_as_painted() {
+        let mut screen = vec![row(&[TermColor::Default; 4])];
+        for cell in &mut screen[0] {
+            cell.style = TermStyle::INVERSE;
+        }
+        assert_eq!(quads(&screen).len(), 4);
     }
 }
