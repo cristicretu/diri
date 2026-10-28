@@ -332,6 +332,7 @@ fn record(id: &str) -> diri_proto::SessionRecord {
         pull_requests: None,
         listening_ports: None,
         foreground_agent: None,
+        foreground_program: None,
         terminal_cwd: None,
         agent_workspace: None,
         note_id: None,
@@ -732,6 +733,81 @@ fn local_reset_survives_engine_replacement() {
         || screen(&restored).contains("after:x"),
     );
     assert!(!screen(&restored).contains("before reset"));
+    restored.terminate(id, Duration::from_millis(500)).unwrap();
+}
+
+/// Clear Screen and Scrollback keeps the prompt line, drops the rest, and
+/// survives Engine replacement the way a reset does.
+#[test]
+fn local_clear_keeps_the_prompt_and_survives_engine_replacement() {
+    let root = holders_dir("clear");
+    let logs = root.join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let state = root.join("state.json");
+    let holder = holder_config(&root);
+    let id = "clear-run";
+
+    let mut registry = Registry::new(engine(), &state);
+    registry
+        .spawn(
+            shell_spec(
+                id,
+                "printf 'old one\\nold two\\n$ '; IFS= read -r value; printf 'after:%s\\n' \"$value\"; IFS= read -r done",
+                &logs,
+                Some(holder.clone()),
+            ),
+            record(id),
+        )
+        .expect("spawn held");
+    let mut published = HashMap::new();
+    let screen = |registry: &Registry| registry.get(id).unwrap().screen_lines().join("\n");
+    wait_until("output before the clear", Duration::from_secs(10), || {
+        registry.changed_since(&mut published);
+        screen(&registry).contains("old two")
+    });
+    assert!(
+        registry
+            .get(id)
+            .unwrap()
+            .clear_scrollback()
+            .expect("queued")
+    );
+    wait_until("the clear to apply", Duration::from_secs(5), || {
+        !screen(&registry).contains("old")
+    });
+    assert_eq!(screen(&registry).trim(), "$");
+    assert_eq!(
+        registry
+            .get(id)
+            .unwrap()
+            .read_scrollback()
+            .visible_start_row,
+        0,
+        "history is cleared too"
+    );
+    let pid = registry.get(id).unwrap().child_pid();
+
+    registry.persist_for_shutdown().unwrap();
+    drop(registry);
+    let mut restored = Registry::new(engine(), &state);
+    restored.load().unwrap();
+    assert_eq!(restored.restore(&holder, &logs), vec![id.to_string()]);
+    assert_eq!(restored.get(id).unwrap().child_pid(), pid);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !screen(&restored).contains("old"),
+        "cleared output came back through replay: {:?}",
+        screen(&restored)
+    );
+    restored.get(id).unwrap().write_input(b"x\n").unwrap();
+    wait_until("output after adoption", Duration::from_secs(10), || {
+        screen(&restored).contains("after:x")
+    });
+    assert!(
+        screen(&restored).starts_with("$ x"),
+        "{:?}",
+        screen(&restored)
+    );
     restored.terminate(id, Duration::from_millis(500)).unwrap();
 }
 

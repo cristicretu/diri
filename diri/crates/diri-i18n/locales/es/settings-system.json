@@ -172,7 +172,15 @@
   "settings.terminal.auto_balance_panes": "Igualar los paneles al dividir o cerrar",
   "settings.terminal.auto_balance_panes_detail": "Da a cada panel de una pestaña el mismo espacio cuando se añade o se cierra uno. Desactivado, conserva los tamaños que elegiste.",
   "settings.terminal.file_links_detail": "El editor donde se abre una ruta de archivo al hacer clic.",
+  "settings.terminal.keyboard": "Teclado",
   "settings.terminal.mouse": "Ratón y selección",
+  "settings.terminal.option_automatic": "Automático",
+  "settings.terminal.option_both": "Ambas",
+  "settings.terminal.option_key": "Opción como Meta",
+  "settings.terminal.option_key_detail": "Esc + tecla, así ⌥B retrocede una palabra. Automático solo lo hace en distribuciones de EE. UU.",
+  "settings.terminal.option_left": "Opción izquierda",
+  "settings.terminal.option_off": "Desactivado",
+  "settings.terminal.option_right": "Opción derecha",
   "settings.terminal.panes": "Paneles divididos",
   "settings.terminal.shell": "Shell"
 }
