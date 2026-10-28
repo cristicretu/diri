@@ -63,6 +63,72 @@ pub enum LayoutNode {
     },
 }
 
+impl LayoutNode {
+    /// How many panes this subtree shows.
+    pub fn pane_count(&self) -> usize {
+        match self {
+            Self::Pane { .. } => 1,
+            Self::Split { first, second, .. } => first.pane_count() + second.pane_count(),
+        }
+    }
+
+    /// How many panes sit side by side along `axis`: the most a line drawn
+    /// across this subtree in that direction crosses.
+    pub fn span(&self, axis: LayoutAxis) -> u32 {
+        match self {
+            Self::Pane { .. } => 1,
+            Self::Split {
+                axis: split_axis,
+                first,
+                second,
+                ..
+            } => {
+                let (first, second) = (first.span(axis), second.span(axis));
+                if *split_axis == axis {
+                    first + second
+                } else {
+                    first.max(second)
+                }
+            }
+        }
+    }
+
+    /// The fraction that gives every pane in this split's row or column the
+    /// same share. `None` for a pane. Clamped like a divider drag.
+    pub fn balanced_fraction(&self) -> Option<f32> {
+        let Self::Split {
+            axis,
+            first,
+            second,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let (left, right) = (first.span(*axis), second.span(*axis));
+        Some((left as f32 / (left + right) as f32).clamp(0.1, 0.9))
+    }
+
+    /// Whether every divider already sits at its balanced fraction, so an
+    /// equalize would change nothing.
+    pub fn is_balanced(&self) -> bool {
+        match self {
+            Self::Pane { .. } => true,
+            Self::Split {
+                fraction,
+                first,
+                second,
+                ..
+            } => {
+                self.balanced_fraction()
+                    .is_some_and(|balanced| (*fraction - balanced).abs() <= f32::EPSILON)
+                    && first.is_balanced()
+                    && second.is_balanced()
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "id", rename_all = "camelCase")]
 pub enum LayoutNodeId {
