@@ -8,7 +8,9 @@
 //! Environment: `CORE_V2_HISTORY` (history row limit, default the Engine's
 //! 150,000; 0 turns history off), `CORE_V2_BUDGET` (live history bytes,
 //! default the Engine's 4 MiB; `none` keeps history dense), `CORE_V2_RSS`
-//! (`v2` or `engine`: peak RSS of that core alone over `CORE_V2_ONLY`), `CORE_V2_ROUNDS` (default 7),
+//! (`v2` or `engine`: peak RSS of that core alone over `CORE_V2_ONLY`),
+//! `CORE_V2_ENGINE_GOLDEN` (with `CORE_V2_GOLDEN`: check the Engine's own
+//! screen against the golden digests on all six workloads), `CORE_V2_ROUNDS` (default 7),
 //! `CORE_V2_ONLY` (one workload name), `CORE_V2_NO_RAW` (v2 takes text from the
 //! parser's validated runs instead of raw bytes), `CORE_V2_ONLY_V2` (time only v2,
 //! for profiling), `CORE_V2_GOLDEN` (path to `vt_workloads.golden`: every
@@ -103,8 +105,17 @@ fn read_golden(path: &str) -> BTreeMap<String, BTreeMap<String, String>> {
 /// way `vt_workloads` computes them, over the v2 state seen through
 /// `HeadlessScreen`. History is compared over the newest `checked` rows.
 fn golden_digest(core: &Core, bytes_fed: usize, checked: usize) -> BTreeMap<String, String> {
+    screen_digest(&mut HeadlessScreen::from_core_v2(core), bytes_fed, checked)
+}
+
+/// The golden keys of any screen: the v2 core through the bridge, or the
+/// Engine's own screen.
+fn screen_digest(
+    screen: &mut HeadlessScreen,
+    bytes_fed: usize,
+    checked: usize,
+) -> BTreeMap<String, String> {
     let mut d = BTreeMap::new();
-    let mut screen = HeadlessScreen::from_core_v2(core);
     d.insert("bytes_fed".into(), bytes_fed.to_string());
     d.insert(
         "grid_sha256".into(),
@@ -252,6 +263,45 @@ fn main() {
     let golden = std::env::var("CORE_V2_GOLDEN")
         .ok()
         .map(|path| read_golden(&path));
+
+    // The Engine's own screen (switch off) against the golden digests, on
+    // all six workloads: the parser hooks must leave its output identical.
+    if std::env::var_os("CORE_V2_ENGINE_GOLDEN").is_some() {
+        let golden = golden.expect("CORE_V2_GOLDEN");
+        for name in [
+            "ascii",
+            "unicode",
+            "unique_unicode",
+            "csi",
+            "images",
+            "long_escape_codes",
+        ] {
+            let payload = std::fs::read(format!("{dir}/{name}.bin")).expect("payload");
+            let reps = MIN_BYTES.div_ceil(payload.len());
+            let key = format!("{name} {}", sha256(&payload));
+            let want = golden
+                .get(&key)
+                .unwrap_or_else(|| panic!("no golden section [{key}]"));
+            let checked: usize = want["history_rows_checked"].parse().expect("rows");
+            let mut screen = HeadlessScreen::new(COLS, LINES);
+            let fed = feed_engine(&mut screen, &payload, reps);
+            let mut bad = Vec::new();
+            for (k, value) in screen_digest(&mut screen, fed, checked) {
+                if want[&k] != value {
+                    bad.push(k);
+                }
+            }
+            println!(
+                "engine {name:<18} {}",
+                if bad.is_empty() {
+                    "golden ok".to_owned()
+                } else {
+                    format!("GOLDEN MISMATCH {bad:?}")
+                }
+            );
+        }
+        return;
+    }
     println!(
         "{LINES}x{COLS}, history <= {history} rows, budget {}, {READ}-byte reads, >= {} MiB per run, {rounds} rounds",
         budget.map_or("none".to_owned(), |b| format!("{} bytes", b)),
