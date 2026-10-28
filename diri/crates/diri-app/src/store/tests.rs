@@ -4826,3 +4826,54 @@ fn preferences_are_owner_only_even_over_an_older_world_readable_file() {
     Prefs::default().save(&path).unwrap();
     assert_eq!(mode(&path), 0o600);
 }
+
+/// The recorded keymap layer is written with every edit and read back at
+/// launch: a rebind, an unbind (a `null` entry) and a reset all survive.
+#[test]
+fn recorded_shortcuts_persist_across_a_restart() {
+    use crate::commands::{
+        CommandId, ShortcutResolution, assign_shortcut, command, reset_shortcut, test_chords,
+        unassign_shortcut,
+    };
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("prefs.json");
+    let (mut store, _) = SessionStore::load(&path).unwrap();
+    let swapped = assign_shortcut(
+        &store.preferences().shortcut_overrides,
+        CommandId::ToggleSidebar,
+        &test_chords("cmd-n"),
+        Some(ShortcutResolution::Swap),
+    )
+    .unwrap();
+    let edited = unassign_shortcut(&swapped, CommandId::ToggleInspector);
+    store
+        .update_preferences(|prefs| prefs.shortcut_overrides = edited.clone())
+        .unwrap();
+    drop(store);
+
+    let (mut store, _) = SessionStore::load(&path).unwrap();
+    let saved = &store.preferences().shortcut_overrides.clone();
+    assert_eq!(saved, &edited);
+    assert_eq!(
+        command(CommandId::OpenLauncher).effective_keystrokes(saved),
+        vec![test_chords("cmd-b")]
+    );
+    assert!(
+        command(CommandId::ToggleInspector)
+            .effective_keystrokes(saved)
+            .is_empty()
+    );
+
+    let reset = reset_shortcut(saved, CommandId::ToggleInspector);
+    store
+        .update_preferences(|prefs| prefs.shortcut_overrides = reset.clone())
+        .unwrap();
+    drop(store);
+    let (store, _) = SessionStore::load(&path).unwrap();
+    assert!(
+        !store
+            .preferences()
+            .shortcut_overrides
+            .contains_key(command(CommandId::ToggleInspector).stable_id)
+    );
+}

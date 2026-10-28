@@ -1338,3 +1338,160 @@ fn search_finds_notes_written_since_it_last_looked(cx: &mut TestAppContext) {
         assert_eq!(overlay.notes.hits.len(), 1, "and found by its title");
     });
 }
+
+fn palette_on<'a>(
+    cx: &'a mut TestAppContext,
+    query: &str,
+) -> (Entity<Harness>, &'a mut gpui::VisualTestContext) {
+    let query = query.to_owned();
+    let (view, cx) = cx.add_window_view(move |window, cx| {
+        crate::commands::bind_keys(cx, &crate::commands::ShortcutOverrides::new());
+        let previous_focus = cx.focus_handle();
+        let overlay = cx.new(|cx| {
+            let mut overlay =
+                NavigationOverlay::opened_for_test(Arc::new(StoreRuntime::inert()), cx);
+            overlay.query.insert(&query);
+            overlay.refresh_command_items();
+            overlay.focus_handle.focus(window, cx);
+            overlay
+        });
+        Harness {
+            overlay,
+            previous_focus,
+        }
+    });
+    cx.simulate_resize(size(px(800.0), px(700.0)));
+    cx.run_until_parked();
+    (view, cx)
+}
+
+fn highlight_command(overlay: &mut NavigationOverlay, id: CommandId) {
+    overlay.highlight = overlay.ranked_sessions.len()
+        + overlay
+            .ranked_actions
+            .iter()
+            .position(|row| row.item.command == PaletteCommand::Action(id))
+            .expect("command row");
+}
+
+fn saved(overlay: &NavigationOverlay) -> crate::commands::ShortcutOverrides {
+    overlay.saved_shortcuts()
+}
+
+#[gpui::test]
+fn command_return_records_a_shortcut_for_the_highlighted_command(cx: &mut TestAppContext) {
+    let (view, cx) = palette_on(cx, "sidebar");
+    let overlay = view.read_with(cx, |view, _| view.overlay.clone());
+    overlay.update(cx, |overlay, _| {
+        highlight_command(overlay, CommandId::ToggleSidebar)
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("palette-hint-change").is_some());
+
+    cx.simulate_keystrokes(&crate::commands::test_chords("cmd-enter"));
+    overlay.read_with(cx, |overlay, _| {
+        assert_eq!(
+            overlay.rebind.as_ref().map(|rebind| rebind.command),
+            Some(CommandId::ToggleSidebar)
+        );
+        assert!(overlay.is_open(), "recording keeps the palette open");
+    });
+    assert!(cx.debug_bounds("palette-recording").is_some());
+    assert!(cx.debug_bounds("palette-hint-cancel").is_some());
+
+    // A bare key is not a shortcut; the query is not edited either.
+    cx.simulate_keystrokes("k");
+    overlay.read_with(cx, |overlay, _| {
+        assert_eq!(overlay.query.text(), "sidebar");
+        assert!(overlay.rebind.as_ref().unwrap().error.is_some());
+    });
+
+    let chord = crate::commands::test_chords("cmd-alt-shift-y");
+    cx.simulate_keystrokes(&chord);
+    overlay.read_with(cx, |overlay, _| {
+        assert!(overlay.rebind.is_none());
+        assert_eq!(
+            saved(overlay)
+                .get("toggle-sidebar")
+                .cloned()
+                .flatten()
+                .map(|key| crate::commands::keystroke_label(&key)),
+            Some(crate::commands::keystroke_label(&chord))
+        );
+    });
+    assert!(cx.debug_bounds("palette-recording").is_none());
+
+    // ⌘↩ then ⇥ restores the default.
+    cx.simulate_keystrokes(&crate::commands::test_chords("cmd-enter"));
+    assert!(cx.debug_bounds("palette-hint-reset").is_some());
+    cx.simulate_keystrokes("tab");
+    overlay.read_with(cx, |overlay, _| {
+        assert!(overlay.rebind.is_none());
+        assert!(saved(overlay).is_empty());
+    });
+    cx.update(|_, cx| crate::commands::rebind_keys(cx, &Default::default()));
+}
+
+#[gpui::test]
+fn a_recorded_clash_names_its_holder_and_swaps_or_replaces_on_request(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = palette_on(cx, "sidebar");
+    let overlay = view.read_with(cx, |view, _| view.overlay.clone());
+    overlay.update(cx, |overlay, _| {
+        highlight_command(overlay, CommandId::ToggleSidebar)
+    });
+    cx.simulate_keystrokes(&crate::commands::test_chords("cmd-enter"));
+    // ⌘N is New Session's; recording it must not run New Session.
+    cx.simulate_keystrokes(&crate::commands::test_chords("cmd-n"));
+    overlay.read_with(cx, |overlay, _| {
+        let clash = overlay.rebind.as_ref().unwrap().clash.clone().unwrap();
+        assert_eq!(clash.holder, CommandId::OpenLauncher);
+        assert!(saved(overlay).is_empty(), "nothing is saved until resolved");
+    });
+    assert!(cx.debug_bounds("palette-hint-replace").is_some());
+    assert!(cx.debug_bounds("palette-hint-swap").is_some());
+
+    cx.simulate_keystrokes("tab");
+    overlay.read_with(cx, |overlay, _| {
+        let saved = saved(overlay);
+        assert_eq!(
+            crate::commands::command(CommandId::ToggleSidebar).effective_keystrokes(&saved),
+            vec![crate::commands::test_chords("cmd-n")]
+        );
+        assert_eq!(
+            crate::commands::command(CommandId::OpenLauncher).effective_keystrokes(&saved),
+            vec![crate::commands::test_chords("cmd-b")]
+        );
+    });
+
+    // Take ⌥⌘B from the inspector by clicking Replace.
+    cx.simulate_keystrokes(&crate::commands::test_chords("cmd-enter"));
+    cx.simulate_keystrokes(&crate::commands::test_chords("cmd-alt-b"));
+    let replace = cx.debug_bounds("palette-hint-replace").unwrap();
+    cx.simulate_click(replace.center(), gpui::Modifiers::default());
+    overlay.read_with(cx, |overlay, _| {
+        assert!(overlay.rebind.is_none());
+        let saved = saved(overlay);
+        assert_eq!(
+            crate::commands::command(CommandId::ToggleSidebar).shortcut_label_for(&saved),
+            Some(crate::commands::keystroke_label(
+                &crate::commands::test_chords("cmd-alt-b")
+            ))
+        );
+        assert!(
+            crate::commands::command(CommandId::ToggleInspector)
+                .effective_keystrokes(&saved)
+                .is_empty()
+        );
+    });
+
+    // Escape ends a recording without closing the palette.
+    cx.simulate_keystrokes(&crate::commands::test_chords("cmd-enter"));
+    cx.simulate_keystrokes("escape");
+    overlay.read_with(cx, |overlay, _| {
+        assert!(overlay.rebind.is_none());
+        assert!(overlay.is_open());
+    });
+    cx.update(|_, cx| crate::commands::rebind_keys(cx, &Default::default()));
+}
