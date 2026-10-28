@@ -30,7 +30,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Hyperlink};
 use alacritty_terminal::vte::ansi::Handler;
@@ -74,13 +73,13 @@ pub struct StoredImage {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SequenceKind {
+pub(crate) enum SequenceKind {
     Kitty,
     Iterm,
 }
 
 /// An image sequence whose body is still arriving.
-struct Collecting {
+pub(crate) struct Collecting {
     kind: SequenceKind,
     body: Vec<u8>,
     /// The body outgrew [`MAX_SEQUENCE_BYTES`]; the rest is skipped.
@@ -90,14 +89,14 @@ struct Collecting {
 }
 
 /// A chunked Kitty transmission (`m=1`) still receiving data.
-struct KittyUpload {
+pub(crate) struct KittyUpload {
     command: KittyCommand,
     data: Vec<u8>,
     error: Option<&'static str>,
 }
 
 /// An iTerm2 `MultipartFile` still receiving `FilePart`s.
-struct ItermUpload {
+pub(crate) struct ItermUpload {
     args: ItermArgs,
     data: Vec<u8>,
     overflow: bool,
@@ -260,19 +259,62 @@ impl HeadlessScreen {
     pub(crate) fn cell_pixels(&self) -> Option<(u16, u16)> {
         self.images.as_ref().map(|images| images.cell_pixels)
     }
+}
+
+/// What the image layer needs from the terminal it feeds: the parser for
+/// the bytes around image sequences, replies, the cursor, and the cells
+/// anchors live in. [`HeadlessScreen`] implements it over the current core
+/// and `core_v2::Screen` over core v2 (feature `core-v2`), so both cut out,
+/// store and place images with this same code.
+pub(crate) trait ImageHost {
+    fn images_ref(&self) -> Option<&InlineImages>;
+    fn images_mut(&mut self) -> Option<&mut InlineImages>;
+    /// Hands bytes to the emulator's parser, with their part of the read's
+    /// C0 index when there is one.
+    fn advance_parser(&mut self, bytes: &[u8], index: Option<C0Index<'_>>);
+    /// Queues a reply after the emulator's own replies so far; dropped when
+    /// `historical`.
+    fn reply(&mut self, historical: bool, reply: &[u8]);
+    /// Applies bytes a synchronized update holds back (they were written
+    /// before the image sequence being dispatched).
+    fn release_held_update(&mut self);
+    /// Columns and screen lines.
+    fn screen_size(&self) -> (usize, usize);
+    /// The cursor's line and column.
+    fn image_cursor(&self) -> (Line, Column);
+    /// Writes `written` default-style blanks carrying the anchor of image
+    /// `key` (whose box is `size` cells), from column `col0` on each row of
+    /// the box, starting on the cursor's line. With `move_cursor` each
+    /// further row is a linefeed (so it scrolls) and the cursor is left
+    /// after the last row's blanks; otherwise rows below the screen are
+    /// dropped and the cursor and its wrap state are restored. The pen is
+    /// restored either way.
+    fn write_anchor_rows(
+        &mut self,
+        key: &str,
+        col0: usize,
+        size: (u16, u16),
+        written: usize,
+        move_cursor: bool,
+    );
+    /// The hyperlink URI of a visible cell.
+    fn link_uri_at(&self, line: Line, column: Column) -> Option<String>;
+    /// Rewrites cells as plain blanks through the emulator, so the change is
+    /// tracked like output. The cursor is left exactly as it was.
+    fn blank_cells(&mut self, positions: &[(Line, Column)]);
 
     /// Parses `bytes`, cutting image sequences out of the stream. Replies to
     /// sequences that end inside the first `historical_bytes` are dropped.
     /// `csi_only`: every escape in `bytes` is a CSI (see `only_csi_escapes`),
     /// so none can open an image sequence.
-    pub(crate) fn advance_with_images(
+    fn advance_with_images(
         &mut self,
         bytes: &[u8],
         historical_bytes: usize,
         csi_only: bool,
         index: Option<C0Index<'_>>,
     ) {
-        let Some(images) = self.images.as_mut() else {
+        let Some(images) = self.images_mut() else {
             self.advance_parser(bytes, index);
             return;
         };
@@ -299,7 +341,7 @@ impl HeadlessScreen {
         };
         let mut position = 0;
         while position < input.len() {
-            let images = self.images.as_mut().expect("images");
+            let images = self.images_mut().expect("images");
             if let Some(collecting) = images.collecting.as_mut() {
                 match collect(
                     collecting,
@@ -349,7 +391,7 @@ impl HeadlessScreen {
                 }
                 Next::Partial(start) => {
                     self.advance_parser(&input[position..position + start], here);
-                    let images = self.images.as_mut().expect("images");
+                    let images = self.images_mut().expect("images");
                     images.held.extend_from_slice(&input[position + start..]);
                     position = input.len();
                 }
@@ -361,7 +403,7 @@ impl HeadlessScreen {
                     } else {
                         SequenceKind::Iterm
                     };
-                    self.images.as_mut().expect("images").collecting = Some(Collecting {
+                    self.images_mut().expect("images").collecting = Some(Collecting {
                         kind,
                         body: Vec::new(),
                         overflow: false,
@@ -372,44 +414,10 @@ impl HeadlessScreen {
         }
     }
 
-    /// Hands bytes to the emulator's parser, with their part of the read's
-    /// C0 index when there is one.
-    fn advance_parser(&mut self, bytes: &[u8], index: Option<C0Index<'_>>) {
-        match index {
-            Some(index) => self.parser.advance_indexed(&mut self.term, bytes, index),
-            None => self.parser.advance(&mut self.term, bytes),
-        }
-    }
-
-    /// Bytes held back or collected across reads; bounded by
-    /// [`MAX_SEQUENCE_BYTES`] plus one prefix.
-    #[cfg(test)]
-    pub(crate) fn image_carry_bytes(&self) -> usize {
-        self.images.as_ref().map_or(0, |images| {
-            images.held.len()
-                + images
-                    .collecting
-                    .as_ref()
-                    .map_or(0, |collecting| collecting.body.capacity())
-        })
-    }
-
-    fn reply(&mut self, historical: bool, reply: &[u8]) {
-        if historical {
-            return;
-        }
-        // The emulator's replies to everything before this sequence are
-        // still queued as events; they go first.
-        self.drain_events();
-        self.replies.extend_from_slice(reply);
-    }
-
     fn dispatch(&mut self, collecting: Collecting, historical: bool) {
         // Bytes a synchronized update holds back were written before this
         // image; they must land first.
-        if self.parser.sync_timeout().sync_timeout().is_some() {
-            self.parser.stop_sync(&mut self.term);
-        }
+        self.release_held_update();
         match collecting.kind {
             SequenceKind::Kitty => self.kitty(&collecting.body, collecting.overflow, historical),
             SequenceKind::Iterm => self.iterm(&collecting.body, collecting.overflow, historical),
@@ -424,7 +432,7 @@ impl HeadlessScreen {
             None => (body, &[][..]),
         };
         let parsed = KittyCommand::parse(control);
-        let images = self.images.as_mut().expect("images");
+        let images = self.images_mut().expect("images");
         // A chunk of a transmission in progress carries only `m` (and `q`).
         if let Some(mut upload) = images.kitty_upload.take() {
             if overflow {
@@ -479,7 +487,7 @@ impl HeadlessScreen {
             data = Vec::new();
         }
         if command.more {
-            self.images.as_mut().expect("images").kitty_upload = Some(KittyUpload {
+            self.images_mut().expect("images").kitty_upload = Some(KittyUpload {
                 command,
                 data,
                 error,
@@ -511,7 +519,7 @@ impl HeadlessScreen {
             self.kitty_reply(&command, command.id, "OK", historical);
             return;
         }
-        let images = self.images.as_mut().expect("images");
+        let images = self.images_mut().expect("images");
         let kitty_id = if command.number != 0 {
             images.store.kitty_number(command.number)
         } else {
@@ -527,7 +535,7 @@ impl HeadlessScreen {
     }
 
     fn kitty_put(&mut self, command: &KittyCommand, historical: bool) {
-        let images = self.images.as_mut().expect("images");
+        let images = self.images_mut().expect("images");
         let kitty_id = if command.number != 0 {
             images.store.kitty_by_number(command.number)
         } else {
@@ -547,8 +555,7 @@ impl HeadlessScreen {
             return;
         }
         let Some((width, height)) = self
-            .images
-            .as_ref()
+            .images_ref()
             .and_then(|images| images.store.dimensions(internal))
         else {
             return;
@@ -561,7 +568,7 @@ impl HeadlessScreen {
     }
 
     fn kitty_delete(&mut self, command: &KittyCommand) {
-        let images = self.images.as_mut().expect("images");
+        let images = self.images_mut().expect("images");
         let free = command.delete.is_ascii_uppercase();
         let target: Option<u32> = match command.delete.to_ascii_lowercase() {
             b'a' => None,
@@ -582,8 +589,8 @@ impl HeadlessScreen {
                 Some(found.1)
             }
             b'c' => {
-                let point = self.term.grid().cursor.point;
-                let Some(internal) = self.anchor_at(point.line, point.column) else {
+                let (line, column) = self.image_cursor();
+                let Some(internal) = self.anchor_at(line, column) else {
                     return;
                 };
                 Some(internal)
@@ -592,14 +599,14 @@ impl HeadlessScreen {
             // geometry is kept to answer them.
             _ => return,
         };
-        let store = &self.images.as_ref().expect("images").store;
+        let store = &self.images_ref().expect("images").store;
         let positions = self.visible_anchor_cells(&|internal| match target {
             Some(target) => internal == target,
             None => store.is_kitty(internal),
         });
         self.blank_cells(&positions);
         if free {
-            let store = &mut self.images.as_mut().expect("images").store;
+            let store = &mut self.images_mut().expect("images").store;
             match target {
                 Some(target) => store.remove(target),
                 None => store.remove_kitty(),
@@ -635,7 +642,7 @@ impl HeadlessScreen {
             Some(split) => (&body[..split], &body[split + 1..]),
             None => (body, &[][..]),
         };
-        let images = self.images.as_mut().expect("images");
+        let images = self.images_mut().expect("images");
         match command {
             b"File" => {
                 images.iterm_upload = None;
@@ -695,9 +702,9 @@ impl HeadlessScreen {
         if !dimensions_allowed(width, height) {
             return;
         }
-        let (cell_width, cell_height) = self.images.as_ref().expect("images").cell_pixels;
-        let cols = self.geometry.cols as u32;
-        let rows = self.geometry.rows as u32;
+        let (cell_width, cell_height) = self.images_ref().expect("images").cell_pixels;
+        let (cols, rows) = self.screen_size();
+        let (cols, rows) = (cols as u32, rows as u32);
         let resolve = |size: ItermSize, cell: u16, screen: u32| match size {
             ItermSize::Auto => None,
             ItermSize::Cells(count) => Some(count),
@@ -715,12 +722,7 @@ impl HeadlessScreen {
             height,
             data: data.into(),
         };
-        let internal = self
-            .images
-            .as_mut()
-            .expect("images")
-            .store
-            .insert(image, None);
+        let internal = self.images_mut().expect("images").store.insert(image, None);
         // iTerm2 shrinks an image given no size to fit the window.
         let fit_height = request == (None, None);
         self.place(
@@ -746,13 +748,11 @@ impl HeadlessScreen {
         fit_height: bool,
         move_cursor: bool,
     ) {
-        let images = self.images.as_ref().expect("images");
+        let images = self.images_ref().expect("images");
         let key = images.store.key(internal);
         let cell = images.cell_pixels;
-        let columns = self.geometry.cols;
-        let screen_lines = self.geometry.rows;
-        let cursor = self.term.grid().cursor.point;
-        let col0 = cursor.column.0.min(columns - 1);
+        let (columns, screen_lines) = self.screen_size();
+        let col0 = self.image_cursor().1.0.min(columns - 1);
         let available = (columns - col0) as u32;
         let (cols, rows) = cell_box(
             pixels,
@@ -761,9 +761,100 @@ impl HeadlessScreen {
             available,
             fit_height.then_some(screen_lines as u32),
         );
+        let written = usize::from(cols).min(columns - col0);
+        self.write_anchor_rows(&key, col0, (cols, rows), written, move_cursor);
+    }
+
+    /// The image whose anchor covers a visible cell.
+    fn anchor_at(&self, line: Line, column: Column) -> Option<u32> {
+        let (columns, screen_lines) = self.screen_size();
+        if line.0 < 0 || line.0 >= screen_lines as i32 || column.0 >= columns {
+            return None;
+        }
+        let uri = self.link_uri_at(line, column)?;
+        let anchor = ImageAnchor::parse(&uri)?;
+        self.images_ref()?.store.internal(&anchor.key)
+    }
+
+    fn visible_anchor_cells(&self, matches: &dyn Fn(u32) -> bool) -> Vec<(Line, Column)> {
+        let Some(images) = self.images_ref() else {
+            return Vec::new();
+        };
+        let (columns, screen_lines) = self.screen_size();
+        let mut positions = Vec::new();
+        for line in 0..screen_lines {
+            let line = Line(line as i32);
+            for column in 0..columns {
+                let column = Column(column);
+                let Some(uri) = self.link_uri_at(line, column) else {
+                    continue;
+                };
+                if let Some(anchor) = ImageAnchor::parse(&uri)
+                    && images.store.internal(&anchor.key).is_some_and(matches)
+                {
+                    positions.push((line, column));
+                }
+            }
+        }
+        positions
+    }
+}
+
+impl ImageHost for HeadlessScreen {
+    fn images_ref(&self) -> Option<&InlineImages> {
+        self.images.as_deref()
+    }
+
+    fn images_mut(&mut self) -> Option<&mut InlineImages> {
+        self.images.as_deref_mut()
+    }
+
+    /// Hands bytes to the emulator's parser, with their part of the read's
+    /// C0 index when there is one.
+    fn advance_parser(&mut self, bytes: &[u8], index: Option<C0Index<'_>>) {
+        match index {
+            Some(index) => self.parser.advance_indexed(&mut self.term, bytes, index),
+            None => self.parser.advance(&mut self.term, bytes),
+        }
+    }
+
+    fn reply(&mut self, historical: bool, reply: &[u8]) {
+        if historical {
+            return;
+        }
+        // The emulator's replies to everything before this sequence are
+        // still queued as events; they go first.
+        self.drain_events();
+        self.replies.extend_from_slice(reply);
+    }
+
+    fn release_held_update(&mut self) {
+        if self.parser.sync_timeout().sync_timeout().is_some() {
+            self.parser.stop_sync(&mut self.term);
+        }
+    }
+
+    fn screen_size(&self) -> (usize, usize) {
+        (self.geometry.cols, self.geometry.rows)
+    }
+
+    fn image_cursor(&self) -> (Line, Column) {
+        let point = self.term.grid().cursor.point;
+        (point.line, point.column)
+    }
+
+    fn write_anchor_rows(
+        &mut self,
+        key: &str,
+        col0: usize,
+        (cols, rows): (u16, u16),
+        written: usize,
+        move_cursor: bool,
+    ) {
+        let screen_lines = self.geometry.rows;
+        let cursor = self.term.grid().cursor.point;
         let saved_template = self.term.grid().cursor.template.clone();
         let saved_wrap = self.term.grid().cursor.input_needs_wrap;
-        let written = usize::from(cols).min(columns - col0);
         let mut line = cursor.line;
         for row in 0..rows {
             if row > 0 {
@@ -778,7 +869,7 @@ impl HeadlessScreen {
                 }
             }
             let anchor = ImageAnchor {
-                key: key.clone(),
+                key: key.to_owned(),
                 row,
                 col: col0 as u16,
                 cols,
@@ -803,39 +894,9 @@ impl HeadlessScreen {
         }
     }
 
-    /// The image whose anchor covers a visible cell.
-    fn anchor_at(&self, line: Line, column: Column) -> Option<u32> {
+    fn link_uri_at(&self, line: Line, column: Column) -> Option<String> {
         let grid = self.term.grid();
-        if line.0 < 0 || line.0 >= grid.screen_lines() as i32 || column.0 >= grid.columns() {
-            return None;
-        }
-        let link = grid[line][column].hyperlink()?;
-        let anchor = ImageAnchor::parse(link.uri())?;
-        self.images.as_ref()?.store.internal(&anchor.key)
-    }
-
-    fn visible_anchor_cells(&self, matches: &dyn Fn(u32) -> bool) -> Vec<(Line, Column)> {
-        let Some(images) = self.images.as_ref() else {
-            return Vec::new();
-        };
-        let grid = self.term.grid();
-        let mut positions = Vec::new();
-        for line in 0..grid.screen_lines() {
-            let line = Line(line as i32);
-            let row = &grid[line];
-            for column in 0..grid.columns() {
-                let column = Column(column);
-                let Some(link) = row[column].hyperlink() else {
-                    continue;
-                };
-                if let Some(anchor) = ImageAnchor::parse(link.uri())
-                    && images.store.internal(&anchor.key).is_some_and(matches)
-                {
-                    positions.push((line, column));
-                }
-            }
-        }
-        positions
+        Some(grid[line][column].hyperlink()?.uri().to_owned())
     }
 
     /// Rewrites cells as plain blanks through the emulator, so the change is
@@ -860,6 +921,33 @@ impl HeadlessScreen {
         grid.cursor.template = saved_template;
         grid.cursor.point = saved_point;
         grid.cursor.input_needs_wrap = saved_wrap;
+    }
+}
+
+impl HeadlessScreen {
+    /// Parses `bytes`, cutting image sequences out of the stream (see
+    /// [`ImageHost::advance_with_images`]).
+    pub(crate) fn advance_with_images(
+        &mut self,
+        bytes: &[u8],
+        historical_bytes: usize,
+        csi_only: bool,
+        index: Option<C0Index<'_>>,
+    ) {
+        ImageHost::advance_with_images(self, bytes, historical_bytes, csi_only, index);
+    }
+
+    /// Bytes held back or collected across reads; bounded by
+    /// [`MAX_SEQUENCE_BYTES`] plus one prefix.
+    #[cfg(test)]
+    pub(crate) fn image_carry_bytes(&self) -> usize {
+        self.images.as_ref().map_or(0, |images| {
+            images.held.len()
+                + images
+                    .collecting
+                    .as_ref()
+                    .map_or(0, |collecting| collecting.body.capacity())
+        })
     }
 }
 
@@ -1071,7 +1159,7 @@ impl ImageStore {
 // MARK: Kitty command
 
 #[derive(Clone, Debug)]
-struct KittyCommand {
+pub(crate) struct KittyCommand {
     action: u8,
     format: u32,
     medium: u8,
@@ -1219,7 +1307,7 @@ impl KittyCommand {
 // MARK: iTerm2 arguments
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum ItermSize {
+pub(crate) enum ItermSize {
     #[default]
     Auto,
     Cells(u32),
@@ -1241,7 +1329,7 @@ impl ItermSize {
 }
 
 #[derive(Clone, Debug, Default)]
-struct ItermArgs {
+pub(crate) struct ItermArgs {
     inline: bool,
     width: ItermSize,
     height: ItermSize,
