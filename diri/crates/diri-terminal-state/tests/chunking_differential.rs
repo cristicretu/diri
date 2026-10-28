@@ -852,6 +852,36 @@ fn adversarial_inputs_parse_the_same_however_they_are_read() {
     }
 }
 
+/// `soup06` from the review: strings of every kind cut short by ESC, CAN,
+/// SUB and 8-bit C1 controls (an SOS ended by a raw ST among them), REP and
+/// synchronized updates. On the base its cursor, text and replies depended on
+/// where reads split (one read and a byte at a time ended on different
+/// cursors). Checked alone so a regression names it.
+#[test]
+fn soup06_ends_in_one_state_however_it_is_read() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/adversarial/soup06.bin");
+    let stream = std::fs::read(path).expect("fixture");
+    let observe = |chunks: Vec<&[u8]>| {
+        let mut observed = observe_chunks(chunks);
+        observed.clipboard = observed.clipboard.pop().into_iter().collect();
+        observed
+    };
+    let expected = observe(vec![&stream[..]]);
+    assert_same(
+        &expected,
+        &observe(stream.chunks(1).collect()),
+        "a byte at a time",
+    );
+    for split in 1..stream.len() {
+        assert_same(
+            &expected,
+            &observe(vec![&stream[..split], &stream[split..]]),
+            &format!("split at {split} of {}", stream.len()),
+        );
+    }
+}
+
 #[test]
 fn can_or_sub_cancels_an_image_command_like_any_other_string() {
     // The parser drops an APC at CAN or SUB, executes the byte and goes on
