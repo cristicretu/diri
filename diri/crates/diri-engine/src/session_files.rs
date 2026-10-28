@@ -53,6 +53,89 @@ pub fn remove_log_files(logs_dir: &Path, id: &str) -> io::Result<()> {
     first_error.map_or(Ok(()), Err)
 }
 
+/// The suffix of a Holder's child record (see
+/// [`crate::holder::paths::HolderPaths::child_record`]). The Holder writes it
+/// at spawn and, unlike its socket and pid file, never removes it, so an
+/// Engine that arrives after the child exited can still bind the run.
+pub const HOLDER_RECORD_SUFFIX: &str = ".child";
+
+/// Deletes the Holder child record of a session that is gone for good. Once
+/// its record is removed nothing can bind that run, and the Holder leaves the
+/// file behind: one per session ever started, forever.
+pub fn remove_holder_record(holders_dir: &Path, id: &str) -> io::Result<()> {
+    let path = crate::holder::paths::HolderPaths::new(holders_dir, id).child_record();
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
+
+/// Removes child records in the Holders directory (`holders` is the resolved
+/// one, see [`crate::holder::paths::safe_directory`]) whose session is not in
+/// `referenced`. Same rules as [`sweep_orphans`]: exact daemon names only,
+/// regular files only, recent files kept. Counts go into `report`.
+pub fn sweep_holder_records(
+    holders: &Path,
+    referenced: &HashSet<String>,
+    options: &SweepOptions,
+    report: &mut SweepReport,
+) {
+    let now = SystemTime::now();
+    let Ok(entries) = std::fs::read_dir(holders) else {
+        return;
+    };
+    let mut budget = options.max_entries;
+    for entry in entries {
+        if budget == 0 {
+            report.truncated = true;
+            break;
+        }
+        budget -= 1;
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|name| name.strip_suffix(HOLDER_RECORD_SUFFIX))
+            .filter(|id| is_daemon_session_id(id))
+        else {
+            continue;
+        };
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.file_type().is_file() {
+            report.skipped_foreign += 1;
+            continue;
+        }
+        if referenced.contains(id) {
+            report.kept_referenced += 1;
+            continue;
+        }
+        let recent = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_none_or(|age| age < options.min_age);
+        if recent {
+            report.kept_recent += 1;
+            continue;
+        }
+        if options.dry_run {
+            report.removed_files += 1;
+            report.removed_bytes += metadata.len();
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => {
+                report.removed_files += 1;
+                report.removed_bytes += metadata.len();
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => report.failed += 1,
+        }
+    }
+}
+
 /// The session id a daemon-created file name belongs to: exactly `s_` plus
 /// twelve lowercase hex digits (see `control::next_session_id`), followed by
 /// one of [`LOG_SUFFIXES`]. Anything else is not ours to judge.
@@ -277,17 +360,187 @@ pub fn startup_sweep(
     let holders = crate::holder::paths::HolderPaths::new(holders_dir, "probe").directory;
     referenced.extend(ids_named_in(&holders, &[".sock", ".pid"]));
     referenced.extend(ids_named_in(remote_bindings_dir, &[".json"]));
-    Some(sweep_orphans(
-        logs_dir,
-        Some(&recovery_root),
-        &referenced,
-        options,
-    ))
+    let mut report = sweep_orphans(logs_dir, Some(&recovery_root), &referenced, options);
+    let started = Instant::now();
+    sweep_holder_records(&holders, &referenced, options, &mut report);
+    report.elapsed += started.elapsed();
+    Some(report)
+}
+
+/// Upper bound on entries one [`tighten_private_roots`] pass inspects. A real
+/// install holds a few hundred; the bound only stops a pathological tree.
+pub const TIGHTEN_MAX_ENTRIES: usize = 50_000;
+
+/// Every directory Diri writes its own state into for `home`: data, state,
+/// config, runtime and cache, plus the app's preference directory. Nested
+/// and duplicate roots collapse into their outermost one. A root that is
+/// `home` itself or one of its ancestors (a misconfigured override) is never
+/// returned: those hold the user's files, not Diri's.
+pub fn private_roots(home: &Path) -> Vec<std::path::PathBuf> {
+    use diri_proto::paths::DirijorPaths;
+    let mut candidates = vec![
+        DirijorPaths::app_support(home),
+        DirijorPaths::state_dir(home),
+        DirijorPaths::config_dir(home),
+        DirijorPaths::runtime_dir(home),
+        DirijorPaths::cache_dir(home),
+    ];
+    if let Some(prefs) = DirijorPaths::prefs_file(home).parent() {
+        candidates.push(prefs.to_path_buf());
+    }
+    outermost_private_roots(home, candidates)
+}
+
+fn outermost_private_roots(
+    home: &Path,
+    mut candidates: Vec<std::path::PathBuf>,
+) -> Vec<std::path::PathBuf> {
+    candidates.retain(|root| root.is_absolute() && !home.starts_with(root));
+    candidates.sort();
+    candidates.dedup();
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    for root in candidates {
+        if !roots.iter().any(|outer| root.starts_with(outer)) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+/// One-shot startup repair for state written before every writer created its
+/// files owner-only: strips group/other bits under [`private_roots`]. Runs off
+/// the accept path, once per Engine start; it is never repeated while idle.
+pub fn tighten_private_roots(home: &Path) -> diri_platform::private::Tightened {
+    tighten_roots(&private_roots(home))
+}
+
+fn tighten_roots(roots: &[std::path::PathBuf]) -> diri_platform::private::Tightened {
+    let mut total = diri_platform::private::Tightened::default();
+    for root in roots {
+        let remaining = TIGHTEN_MAX_ENTRIES.saturating_sub(total.visited);
+        let pass = diri_platform::private::tighten_tree(root, remaining);
+        total.visited += pass.visited;
+        total.changed += pass.changed;
+    }
+    total
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn holder_records_of_gone_sessions_are_swept() {
+        let temp = tempfile::tempdir().expect("temp");
+        // Where the Holders of a `temp` holders directory really live (a
+        // long temp path resolves to a short one under /tmp).
+        let resolved = crate::holder::paths::HolderPaths::new(temp.path(), "probe").directory;
+        std::fs::create_dir_all(&resolved).expect("holders dir");
+        let dir = resolved.as_path();
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        let write = |name: &str, aged: bool| {
+            let path = dir.join(name);
+            std::fs::write(&path, b"{}").expect("write");
+            if aged {
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .and_then(|file| file.set_modified(old))
+                    .expect("age");
+            }
+        };
+        write("s_00000000000a.child", true); // removed long ago
+        write("s_00000000000b.child", true); // still a record
+        write("s_00000000000c.child", false); // just spawned
+        write("s_00000000000d.child.bak", true); // not ours
+        write("manager-v2.pid", true);
+        let referenced = HashSet::from(["s_00000000000b".to_owned()]);
+        let mut report = SweepReport::default();
+        sweep_holder_records(dir, &referenced, &SweepOptions::default(), &mut report);
+        let mut left: Vec<String> = std::fs::read_dir(dir)
+            .expect("dir")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "manager-v2.pid",
+                "s_00000000000b.child",
+                "s_00000000000c.child",
+                "s_00000000000d.child.bak"
+            ]
+        );
+        assert_eq!(report.removed_files, 1);
+        assert_eq!(report.kept_referenced, 1);
+        assert_eq!(report.kept_recent, 1);
+
+        remove_holder_record(temp.path(), "s_00000000000b").expect("remove");
+        remove_holder_record(temp.path(), "s_00000000000b").expect("missing is fine");
+        assert!(!dir.join("s_00000000000b.child").exists());
+        if resolved != temp.path() {
+            let _ = std::fs::remove_dir_all(&resolved);
+        }
+    }
+
+    #[test]
+    fn private_roots_collapse_nesting_and_never_include_home() {
+        let home = Path::new("/home/u");
+        let roots = outermost_private_roots(
+            home,
+            vec![
+                "/home/u/.local/state/diri".into(),
+                "/home/u/.local/state/diri/run".into(),
+                "/home/u/.config/diri".into(),
+                "/home/u/.config/diri".into(),
+                "/home/u".into(),
+                "/home".into(),
+                "relative".into(),
+            ],
+        );
+        assert_eq!(
+            roots,
+            vec![
+                std::path::PathBuf::from("/home/u/.config/diri"),
+                "/home/u/.local/state/diri".into(),
+            ]
+        );
+        for root in private_roots(home) {
+            assert!(
+                !home.starts_with(&root),
+                "{} would expose the home",
+                root.display()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_tightening_makes_older_world_readable_state_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Dirijor");
+        let logs = root.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let checkpoint = logs.join("s_0123456789ab.screen.plist");
+        let hosts = root.join("hosts.json");
+        std::fs::write(&checkpoint, b"x").unwrap();
+        std::fs::write(&hosts, b"{}").unwrap();
+        for path in [&root, &logs] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        for path in [&checkpoint, &hosts] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let report = tighten_roots(std::slice::from_ref(&root));
+        assert_eq!((report.visited, report.changed), (4, 4));
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(mode(&logs), 0o700);
+        assert_eq!(mode(&checkpoint), 0o600);
+        assert_eq!(mode(&hosts), 0o600);
+    }
 
     #[test]
     fn only_daemon_names_parse() {

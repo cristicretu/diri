@@ -1234,6 +1234,19 @@ impl StatusReducer {
         self.manifest_id.as_deref() == Some("shell")
     }
 
+    /// Whether a [`StatusSignal::Tick`] could change anything now. When it
+    /// cannot, a quiet session's pump may sleep until the next real signal:
+    /// only a turn in progress, startup grace, a submit's chrome hold or a
+    /// fading blocker run on the clock.
+    #[must_use]
+    pub fn wants_tick(&self) -> bool {
+        matches!(
+            self.status,
+            SessionStatus::Working | SessionStatus::Starting
+        ) || self.state.submitted_at.is_some()
+            || (self.state.screen_blocker_active && self.state.blocker_miss_since.is_some())
+    }
+
     /// Whether the session should ask its PTY owner if the shell's job is
     /// waiting on a line: a job has run with its terminal still for the
     /// settle, or the question it asked is still up. Asking costs a walk of
