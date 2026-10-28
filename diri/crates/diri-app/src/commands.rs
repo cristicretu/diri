@@ -141,6 +141,7 @@ actions!(
         EnterCopyMode,
         FindSelection,
         InsertPath,
+        GoToDirectory,
         ExportScrollback,
         PreviousPrompt,
         NextPrompt,
@@ -246,6 +247,7 @@ pub enum CommandId {
     EnterCopyMode,
     FindSelection,
     InsertPath,
+    GoToDirectory,
     ExportScrollback,
     PreviousPrompt,
     NextPrompt,
@@ -1208,6 +1210,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         "insert path file picker fuzzy terminal"
     ),
     spec!(
+        GoToDirectory,
+        "terminal-go-to-directory",
+        Some("cmd-alt-e"),
+        Some("⌥⌘E"),
+        Some(TERMINAL_CONTEXT),
+        "command.go_to_directory.palette_title",
+        "folder",
+        "go to directory cd change folder recent jump shell"
+    ),
+    spec!(
         ExportScrollback,
         "terminal-export",
         Some("cmd-shift-e"),
@@ -1526,6 +1538,7 @@ impl CommandSpec {
             CommandId::EnterCopyMode => KeyBinding::new(key, EnterCopyMode, context),
             CommandId::FindSelection => KeyBinding::new(key, FindSelection, context),
             CommandId::InsertPath => KeyBinding::new(key, InsertPath, context),
+            CommandId::GoToDirectory => KeyBinding::new(key, GoToDirectory, context),
             CommandId::ExportScrollback => KeyBinding::new(key, ExportScrollback, context),
             CommandId::PreviousPrompt => KeyBinding::new(key, PreviousPrompt, context),
             CommandId::NextPrompt => KeyBinding::new(key, NextPrompt, context),
@@ -2137,6 +2150,11 @@ impl CommandId {
                 description: t("command.insert_path.description"),
                 category: ShortcutCategory::Terminal,
             },
+            Self::GoToDirectory => ShortcutMetadata {
+                title: t("command.go_to_directory.title"),
+                description: t("command.go_to_directory.description"),
+                category: ShortcutCategory::Terminal,
+            },
             Self::ExportScrollback => ShortcutMetadata {
                 title: t("command.export_scrollback.title"),
                 description: t("command.export_scrollback.description"),
@@ -2337,6 +2355,7 @@ impl CommandId {
             Self::EnterCopyMode => Box::new(EnterCopyMode),
             Self::FindSelection => Box::new(FindSelection),
             Self::InsertPath => Box::new(InsertPath),
+            Self::GoToDirectory => Box::new(GoToDirectory),
             Self::ExportScrollback => Box::new(ExportScrollback),
             Self::PreviousPrompt => Box::new(PreviousPrompt),
             Self::NextPrompt => Box::new(NextPrompt),

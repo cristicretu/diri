@@ -62,6 +62,7 @@ mod palette_chrome;
 mod palette_workspace;
 mod pane_fade;
 mod path_picker;
+mod path_recents;
 mod peek_settle;
 mod perf_overlay;
 mod phone_access;
