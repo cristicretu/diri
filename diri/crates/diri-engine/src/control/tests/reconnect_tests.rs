@@ -77,6 +77,7 @@ impl Fixture {
             output_offset: 0,
             snapshot_sequence: 1,
             foreground_pid: Some(pid as i32),
+            grid_resume: None,
             child_identity: None,
         };
         let mut screen = crate::screen::HeadlessScreen::new(80, 24);

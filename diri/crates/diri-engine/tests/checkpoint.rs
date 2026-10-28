@@ -60,6 +60,7 @@ fn shell_spec(
 fn record(id: &str) -> diri_proto::SessionRecord {
     use diri_proto::*;
     SessionRecord {
+        command_run: None,
         attention_state: None,
         id: SessionId(id.into()),
         kind: AgentKind::SHELL,
@@ -151,6 +152,7 @@ fn synthetic_grid(text: &str) -> GridUpdate {
         cursor_visible: true,
         is_full_snapshot: true,
         changed_rows: rows,
+        cursor_style: Default::default(),
     }
 }
 

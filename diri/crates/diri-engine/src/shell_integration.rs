@@ -134,7 +134,7 @@ fn last_value<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
 }
 
 fn create_private_dir(path: &Path) -> io::Result<()> {
-    std::fs::create_dir_all(path)?;
+    diri_platform::private::create_dir_all(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

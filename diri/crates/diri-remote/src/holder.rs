@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 use diri_proto::frames::{Frame, FrameType, MAX_FRAME_BYTES};
 use diri_proto::remote_pty::{
     ANNOTATED_HOLDER_CAPABILITIES, ControlGranted, ControlRevoked,
-    FOREGROUND_PROCESS_PROTOCOL_MINOR, ForegroundProcess, FullSnapshot, GridDelta, Hello, HelloAck,
-    ImageChunk, ImageResponse, LaunchRequest, LaunchResult, ProcessExit, RemoteCodec, RemoteError,
+    FOREGROUND_PROCESS_PROTOCOL_MINOR, ForegroundProcess, FullSnapshot, GRID_RESUME_PROTOCOL_MINOR,
+    GridDelta, GridResume, GridResumeDecline, GridResumeOutcome, Hello, HelloAck, ImageChunk,
+    ImageResponse, LaunchRequest, LaunchResult, ProcessExit, RemoteCodec, RemoteError,
     RemoteMessage, RemoteProcessState, ScrollbackResponse, validate_terminal_dimensions,
 };
 use diri_pty::{Exit, ExitWatcher, Pty, PtySpec, PtyStream};
@@ -32,6 +33,15 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// One 120 Hz display interval. Remote links still coalesce sustained output,
 /// but never force a ProMotion client down to 60 fps.
 const DIFF_COALESCE: Duration = Duration::from_millis(8);
+/// How long the PTY must stay quiet before a pending diff is published on
+/// its leading edge, once [`DIFF_COALESCE`] has passed since the last one.
+///
+/// A PTY read cannot say a burst is over, so waiting out the whole interval
+/// put ~8 ms between every lone piece of output nobody typed for (a
+/// background program's line, a spinner tick) and the controller. A short
+/// quiet window still folds in a write that spans several reads, or several
+/// writes issued back to back. See [`grid_due`].
+const OUTPUT_QUIET: Duration = Duration::from_millis(1);
 const INTERACTIVE_GRID_BUDGET: u8 = 2;
 /// How long a destructive repaint's redraw may take to arrive, from when the
 /// batch that erased opened. The local Engine pump's partial-repaint ceiling,
@@ -432,6 +442,14 @@ struct Holder {
     pending_connection: Option<Connection>,
     pending_input: PendingBytes,
     dirty_since: Option<Instant>,
+    /// The latest PTY read, which the leading edge waits to go quiet.
+    last_output: Option<Instant>,
+    /// When the last grid diff went out, which paces the leading edge.
+    last_grid_publication: Option<Instant>,
+    /// Filled cells when the last batch ended. A batch that leaves fewer is
+    /// a repaint caught between its erase and its redraw, and keeps the
+    /// whole interval for the redraw to arrive instead of the leading edge.
+    published_filled: usize,
     /// Filled cells when the pending batch opened, which is what the last
     /// publication showed.
     batch_filled: usize,
@@ -543,6 +561,9 @@ impl Holder {
             pending_connection: None,
             pending_input: PendingBytes::default(),
             dirty_since: None,
+            last_output: None,
+            last_grid_publication: None,
+            published_filled: 0,
             batch_filled: 0,
             repaint_hold: None,
             pending_output: Vec::with_capacity(OUTPUT_FRAME_BYTES),
@@ -814,9 +835,12 @@ impl Holder {
         let synchronized = self.screen.synchronized_updates_completed();
         self.screen.feed(bytes);
         self.answer_queries();
+        self.last_output = Some(Instant::now());
         // A closed synchronized update is a whole frame however much it
         // erased. A keystroke may remove up to one row (backspace, kill
-        // line) without being mistaken for a repaint.
+        // line) without being mistaken for a repaint, and a line edit on
+        // the cursor's row (a progress line rewritten shorter) has no redraw
+        // coming.
         let complete = self.screen.synchronized_updates_completed() != synchronized
             && !self.screen.in_synchronized_update();
         let allowance = if self.interactive_grid_budget > 0 {
@@ -825,8 +849,9 @@ impl Holder {
             0
         };
         self.repaint_hold = (!complete
-            && self.screen.filled_cells() + allowance < self.batch_filled)
-            .then_some(since + REPAINT_HOLD);
+            && self.screen.filled_cells() + allowance < self.batch_filled
+            && !self.screen.lost_cells_only_on_cursor_row())
+        .then_some(since + REPAINT_HOLD);
         if self
             .connection
             .as_ref()
@@ -1298,12 +1323,34 @@ impl Holder {
             ));
         }
         connection.terminal_reset = reset_requested;
+        // Styles are negotiated by name: only a controller that asks for
+        // terminal-styles-v1 (and speaks a minor that defines it) gets spans
+        // and cursor bits; every other controller gets the legacy grid.
+        let styles_requested = hello
+            .required_capabilities
+            .contains(&diri_proto::remote_pty::RemoteCapability::TerminalStyles);
+        if styles_requested
+            && hello.protocol.minor < diri_proto::remote_pty::TERMINAL_STYLES_PROTOCOL_MINOR
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "terminal-styles-v1 requires protocol minor 18",
+            ));
+        }
+        connection.terminal_styles = styles_requested;
         connection.inline_images =
             hello.protocol.minor >= diri_proto::remote_pty::INLINE_IMAGES_PROTOCOL_MINOR;
         connection.query_replies =
             hello.protocol.minor >= diri_proto::remote_pty::QUERY_REPLIES_PROTOCOL_MINOR;
         ensure_keyboard_controller(self.screen.input_keyboard_state(), enhanced_keyboard)?;
         connection.enhanced_keyboard = enhanced_keyboard;
+        // Judged against the lease as it stands before this attach claims it:
+        // the request must name the controller that held it last.
+        let grid_resume = hello
+            .grid_resume
+            .as_ref()
+            .filter(|_| hello.protocol.minor >= GRID_RESUME_PROTOCOL_MINOR)
+            .map(|request| (request.base_sequence, self.resume_grid(request)));
         self.state.controller_epoch = self.state.controller_epoch.saturating_add(1);
         let epoch = self.state.controller_epoch;
         connection.epoch = Some(epoch);
@@ -1334,14 +1381,75 @@ impl Holder {
             output_offset: self.state.output_offset,
             snapshot_sequence: self.state.snapshot_sequence,
             foreground_pid,
+            grid_resume: grid_resume
+                .as_ref()
+                .map(|(base_sequence, grid)| match grid {
+                    Ok(_) => GridResumeOutcome::Accepted {
+                        base_sequence: *base_sequence,
+                    },
+                    Err(reason) => GridResumeOutcome::Declined { reason: *reason },
+                }),
         }))?;
         self.queue_replay(connection, hello.last_acknowledged_output_offset)?;
         self.state.snapshot_sequence = self.state.snapshot_sequence.saturating_add(1);
-        self.queue_snapshot(connection)?;
+        if let Some((_, Ok(grid))) = grid_resume {
+            // Only the rows the controller does not already show. Its InputModes
+            // travel with this delta; no reset boundary precedes it, because
+            // an accepted resume means the generation is unchanged.
+            connection.queue(RemoteMessage::GridDelta(GridDelta {
+                sequence: self.state.snapshot_sequence,
+                alt_screen: self.screen.is_alt_screen(),
+                bracketed_paste: self.screen.bracketed_paste(),
+                mouse: self.screen.mouse_modes(),
+                grid,
+            }))?;
+        } else {
+            self.queue_snapshot(connection)?;
+        }
         connection.queue(RemoteMessage::ControlGranted(ControlGranted {
             controller_epoch: epoch,
         }))?;
         self.checkpoint.submit(self.state.clone())
+    }
+
+    /// The rows a resuming controller lacks, or why it must take a snapshot.
+    /// Equal keyed digests mean the controller already shows that exact row,
+    /// so the result reproduces the Holder's grid on the controller's side
+    /// however many publications it missed. Nothing is retained between
+    /// attaches: the request carries all the state the comparison needs.
+    fn resume_grid(
+        &self,
+        request: &GridResume,
+    ) -> Result<diri_proto::grid::GridUpdate, GridResumeDecline> {
+        if request.controller_epoch == 0 || request.controller_epoch != self.state.controller_epoch
+        {
+            return Err(GridResumeDecline::StaleControllerEpoch);
+        }
+        if request.reset_generation != self.reset_generation {
+            return Err(GridResumeDecline::ResetGenerationChanged);
+        }
+        let mut grid = self.screen.full_snapshot();
+        let (Some(key), Some(digests)) = (request.key(), request.digests()) else {
+            // Hello decoding already rejects malformed requests.
+            return Err(GridResumeDecline::GeometryChanged);
+        };
+        if grid.cols != request.cols || grid.rows != request.rows {
+            return Err(GridResumeDecline::GeometryChanged);
+        }
+        // Controllers at grid-resume-v1 negotiate annotations and inline
+        // images, so these rows need no per-connection projection.
+        let cols = grid.cols;
+        grid.changed_rows.retain(|row| {
+            digests.get(usize::from(row.y)).copied()
+                != Some(diri_proto::remote_pty::grid_resume_row_digest(
+                    &key,
+                    cols,
+                    &row.cells,
+                    &row.metadata,
+                ))
+        });
+        grid.is_full_snapshot = false;
+        Ok(grid)
     }
 
     fn queue_replay(
@@ -1478,16 +1586,40 @@ impl Holder {
         Ok(())
     }
 
-    /// When the pending diff is due without a keystroke's fast path: the
-    /// coalescing interval, or a destructive repaint's longer hold.
+    /// When the pending grid diff is due, if one is pending, without a
+    /// keystroke's fast path: a destructive repaint's hold, the coalescing
+    /// interval, or the leading edge.
     fn grid_due(&self) -> Option<Instant> {
-        self.dirty_since
-            .map(|since| self.repaint_hold.unwrap_or(since + DIFF_COALESCE))
+        self.dirty_since.map(|since| {
+            if let Some(hold) = self.repaint_hold {
+                // A destructive repaint waits for its redraw (or the hold).
+                return hold;
+            }
+            if self.screen.filled_cells() < self.published_filled
+                && !self.screen.lost_cells_only_on_cursor_row()
+            {
+                // Content was removed and may be about to be redrawn: give
+                // the redraw the whole interval, as before the leading edge.
+                // A line edit on the cursor's row (backspace, a progress
+                // line rewritten shorter) has no redraw coming, so it goes
+                // out on the leading edge like output that adds, as the
+                // local Engine pump does.
+                return since + DIFF_COALESCE;
+            }
+            grid_due(
+                since,
+                self.last_output.unwrap_or(since),
+                self.last_grid_publication,
+            )
+        })
     }
 
     fn emit_grid_delta(&mut self) -> io::Result<()> {
         self.interactive_grid_budget = self.interactive_grid_budget.saturating_sub(1);
         self.dirty_since = None;
+        self.last_grid_publication = Some(Instant::now());
+        self.published_filled = self.screen.filled_cells();
+        self.screen.mark_row_baseline();
         self.repaint_hold = None;
         if self
             .connection
@@ -1795,6 +1927,7 @@ fn strip_image_anchors(metadata: &mut diri_proto::grid::RowMetadata) {
 struct Connection {
     enhanced_keyboard: bool,
     terminal_reset: bool,
+    terminal_styles: bool,
     /// The controller speaks `inline-images-v1`: it may read images, and
     /// image anchors in the grid are meaningful to it.
     inline_images: bool,
@@ -1816,6 +1949,7 @@ impl Connection {
         Self {
             enhanced_keyboard: false,
             terminal_reset: false,
+            terminal_styles: false,
             inline_images: false,
             query_replies: false,
             reset_state: None,
@@ -1846,6 +1980,23 @@ impl Connection {
                     }
                 }
                 RemoteMessage::ScrollbackResponse(value) => value.result.metadata.clear(),
+                _ => {}
+            }
+        }
+        if !self.terminal_styles {
+            // An older controller rejects unknown annotation fields; it gets
+            // the plain underline bit and the default cursor it always drew.
+            match &mut message {
+                RemoteMessage::HelloAck(value) => value.capabilities.retain(|capability| {
+                    *capability != diri_proto::remote_pty::RemoteCapability::TerminalStyles
+                }),
+                RemoteMessage::FullSnapshot(value) => value.grid.strip_styles(),
+                RemoteMessage::GridDelta(value) => value.grid.strip_styles(),
+                RemoteMessage::ScrollbackResponse(value) => value
+                    .result
+                    .metadata
+                    .iter_mut()
+                    .for_each(|metadata| metadata.styles.clear()),
                 _ => {}
             }
         }
@@ -1889,6 +2040,13 @@ impl Connection {
                 }
                 _ => {}
             }
+        }
+        if self.protocol_minor < GRID_RESUME_PROTOCOL_MINOR
+            && let RemoteMessage::HelloAck(value) = &mut message
+        {
+            value.capabilities.retain(|capability| {
+                *capability != diri_proto::remote_pty::RemoteCapability::GridResume
+            });
         }
         if !self.query_replies
             && let RemoteMessage::HelloAck(value) = &mut message
@@ -2067,6 +2225,26 @@ fn allowed_signal(signal: i32) -> bool {
     )
 }
 
+/// When a pending grid diff is due: once the PTY has been quiet for
+/// [`OUTPUT_QUIET`], provided the last diff is at least [`DIFF_COALESCE`]
+/// old, and never later than [`DIFF_COALESCE`] after the batch opened.
+///
+/// Output after a pause is published on its leading edge; output that never
+/// pauses for the quiet window is still published at most once per
+/// interval, so a stream cannot exceed one diff per [`DIFF_COALESCE`].
+fn grid_due(
+    dirty_since: Instant,
+    last_output: Instant,
+    last_published: Option<Instant>,
+) -> Instant {
+    let ceiling = dirty_since + DIFF_COALESCE;
+    let cadence = last_published.map_or(dirty_since, |at| at + DIFF_COALESCE);
+    ceiling.min(cadence.max(last_output + OUTPUT_QUIET))
+}
+
+/// Milliseconds until `deadline`, rounded up: poll(2) takes whole
+/// milliseconds, and rounding down would spin poll(0) through the last
+/// fraction of every wait (all of a sub-millisecond quiet window).
 fn poll_timeout(deadline: Instant) -> libc::c_int {
     let now = Instant::now();
     if deadline <= now {
@@ -2074,7 +2252,8 @@ fn poll_timeout(deadline: Instant) -> libc::c_int {
     }
     deadline
         .duration_since(now)
-        .as_millis()
+        .as_micros()
+        .div_ceil(1_000)
         .min(libc::c_int::MAX as u128) as libc::c_int
 }
 
@@ -2209,6 +2388,68 @@ mod tests {
 
     use super::*;
 
+    const MS: Duration = Duration::from_millis(1);
+
+    #[test]
+    fn output_after_quiet_is_due_after_the_quiet_window_only() {
+        let start = Instant::now();
+        // Nothing published yet, or long enough ago: due once the PTY has
+        // been silent for OUTPUT_QUIET (was the whole interval).
+        assert_eq!(grid_due(start, start, None), start + OUTPUT_QUIET);
+        assert_eq!(
+            grid_due(start + 500 * MS, start + 500 * MS, Some(start)),
+            start + 500 * MS + OUTPUT_QUIET
+        );
+        assert_eq!(
+            grid_due(start + DIFF_COALESCE, start + DIFF_COALESCE, Some(start)),
+            start + DIFF_COALESCE + OUTPUT_QUIET
+        );
+        // More output inside the window moves it along.
+        assert_eq!(
+            grid_due(start, start + 600 * Duration::from_micros(1), None),
+            start + 1_600 * Duration::from_micros(1)
+        );
+    }
+
+    #[test]
+    fn continuous_output_stays_paced_by_the_interval() {
+        let start = Instant::now();
+        // A batch that opened 1 ms after the last diff waits for the cadence,
+        // even once the PTY goes quiet.
+        assert_eq!(
+            grid_due(start + MS, start + MS, Some(start)),
+            start + DIFF_COALESCE
+        );
+        // Output that never pauses is due at the batch's ceiling, never later.
+        assert_eq!(
+            grid_due(start + MS, start + 30 * MS, Some(start)),
+            start + MS + DIFF_COALESCE
+        );
+        assert_eq!(
+            grid_due(start, start + 30 * MS, None),
+            start + DIFF_COALESCE
+        );
+        // Whatever the inputs, consecutive diffs are at least one interval
+        // apart unless the batch itself reached its ceiling, which can only
+        // open after the previous diff.
+        for opened in 0..20 {
+            for quiet in 0..40 {
+                let opened = start + opened * MS / 2;
+                let due = grid_due(opened, opened + quiet * MS / 4, Some(start));
+                assert!(due >= start + DIFF_COALESCE || due == opened + DIFF_COALESCE);
+                assert!(due <= opened + DIFF_COALESCE);
+            }
+        }
+    }
+
+    #[test]
+    fn poll_timeouts_round_up_instead_of_spinning() {
+        let deadline = Instant::now() + 300 * Duration::from_micros(1);
+        assert_eq!(poll_timeout(deadline), 1);
+        assert_eq!(poll_timeout(Instant::now() - MS), 0);
+        assert!(OUTPUT_QUIET * 4 <= DIFF_COALESCE);
+    }
+
     #[test]
     fn only_a_valid_resize_followed_by_a_resize_is_superseded() {
         let resize = |cols, rows| RemoteMessage::Terminal(Frame::resize(cols, rows));
@@ -2264,6 +2505,7 @@ mod tests {
                 cursor_visible: true,
                 is_full_snapshot: true,
                 changed_rows: Vec::new(),
+                cursor_style: Default::default(),
             };
             grid.is_full_snapshot = true;
             grid.changed_rows.push(row);
@@ -2290,6 +2532,67 @@ mod tests {
                 .unwrap(),
             "\"terminal-annotations-v1\""
         );
+    }
+
+    #[test]
+    fn styles_are_negotiated_without_breaking_old_controllers() {
+        use diri_proto::grid::{
+            ChangedRow, CursorShape, CursorStyle, GridCell, GridUpdate, StyleSpan, UnderlineKind,
+        };
+        // A current-minor controller that did not ask gets the legacy grid.
+        for (minor, requested) in [(16, false), (18, false), (18, true)] {
+            let (stream, _peer) = UnixStream::pair().unwrap();
+            let mut connection = Connection::new(stream);
+            connection.protocol_minor = minor;
+            connection.terminal_styles = requested;
+            let mut row = ChangedRow::new(0, vec![GridCell::default(); 4]);
+            row.metadata.styles.push(StyleSpan {
+                start: 0,
+                end: 4,
+                underline: UnderlineKind::Curly,
+                underline_color: None,
+                overline: false,
+            });
+            let grid = GridUpdate {
+                cols: 4,
+                rows: 1,
+                cursor_col: 0,
+                cursor_row: 0,
+                cursor_visible: true,
+                is_full_snapshot: true,
+                changed_rows: vec![row],
+                cursor_style: CursorStyle {
+                    shape: CursorShape::Bar,
+                    steady: true,
+                },
+            };
+            connection
+                .queue(RemoteMessage::FullSnapshot(FullSnapshot {
+                    sequence: 1,
+                    alt_screen: false,
+                    bracketed_paste: false,
+                    mouse: Default::default(),
+                    grid,
+                }))
+                .unwrap();
+            let messages = RemoteCodec::new().feed(&connection.outbound).unwrap();
+            // A controller with input modes gets its mode state first.
+            let Some(snapshot) = messages.iter().find_map(|message| match message {
+                RemoteMessage::FullSnapshot(snapshot) => Some(snapshot),
+                _ => None,
+            }) else {
+                panic!("snapshot");
+            };
+            let capable = requested;
+            assert_eq!(
+                snapshot.grid.changed_rows[0].metadata.styles.len(),
+                usize::from(capable)
+            );
+            assert_eq!(
+                snapshot.grid.cursor_style.shape == CursorShape::Bar,
+                capable
+            );
+        }
     }
 
     #[test]
@@ -2378,6 +2681,9 @@ mod tests {
             pending_connection: None,
             pending_input: PendingBytes::default(),
             dirty_since: None,
+            last_output: None,
+            last_grid_publication: None,
+            published_filled: 0,
             batch_filled: 0,
             repaint_hold: None,
             pending_output: Vec::new(),
@@ -2391,6 +2697,33 @@ mod tests {
             foreground_probe_deadline: None,
         };
         (temp, holder, request)
+    }
+
+    /// A line edit on the cursor's row is published on the leading edge
+    /// like output that adds; an erase anywhere else still gives its redraw
+    /// the whole interval.
+    #[test]
+    fn a_line_edit_is_not_held_like_a_repaint() {
+        let (_temp, mut holder, _request) = waiting_holder();
+        let long_ago = Instant::now() - Duration::from_secs(1);
+        holder
+            .consume_output(b"row one\r\nrow two\r\n$ echo hello world")
+            .unwrap();
+        holder.emit_grid_delta().unwrap();
+        for edit in [&b"\x08 \x08"[..], b"\r\x1b[K$ true"] {
+            holder.last_grid_publication = Some(long_ago);
+            holder.consume_output(edit).unwrap();
+            let since = holder.dirty_since.unwrap();
+            assert!(
+                holder.grid_due().unwrap() < since + DIFF_COALESCE,
+                "{edit:?} is due on the leading edge"
+            );
+            holder.emit_grid_delta().unwrap();
+        }
+        holder.last_grid_publication = Some(long_ago);
+        holder.consume_output(b"\x1b[H\x1b[2J").unwrap();
+        let since = holder.dirty_since.unwrap();
+        assert_eq!(holder.grid_due(), Some(since + REPAINT_HOLD));
     }
 
     /// An erase holds its diff (even after a keystroke) until the redraw
@@ -2438,9 +2771,15 @@ mod tests {
         holder.emit_grid_delta().unwrap();
         holder.consume_output(b"more").unwrap();
         assert_eq!(holder.repaint_hold, None);
+        // Additive output is due on the leading edge, never later than the
+        // coalescing interval.
         assert_eq!(
             holder.grid_due(),
-            Some(holder.dirty_since.unwrap() + DIFF_COALESCE)
+            Some(grid_due(
+                holder.dirty_since.unwrap(),
+                holder.last_output.unwrap(),
+                holder.last_grid_publication,
+            ))
         );
     }
 
@@ -2490,6 +2829,7 @@ mod tests {
             },
             last_acknowledged_output_offset: None,
             last_acknowledged_grid_sequence: None,
+            grid_resume: None,
         };
         let named = |holder: &mut Holder, minor, enhanced| {
             let (stream, _peer) = UnixStream::pair().unwrap();
@@ -2535,6 +2875,7 @@ mod tests {
             },
             last_acknowledged_output_offset: None,
             last_acknowledged_grid_sequence: None,
+            grid_resume: None,
         };
         let legacy = hello(false);
         let capable = hello(true);
@@ -2644,6 +2985,7 @@ mod tests {
             required_capabilities: capabilities,
             last_acknowledged_output_offset: None,
             last_acknowledged_grid_sequence: None,
+            grid_resume: None,
         };
         let (stream, _peer) = UnixStream::pair().unwrap();
         let mut connection = Connection::new(stream);
@@ -2937,6 +3279,7 @@ mod tests {
             required_capabilities: vec![],
             last_acknowledged_output_offset: None,
             last_acknowledged_grid_sequence: None,
+            grid_resume: None,
         }
     }
 

@@ -40,7 +40,7 @@ use crate::switcher::{
 };
 
 pub use prefs::{
-    DictationShortcut, FileEditor, InspectorTab, InterfaceStyle, NewAgentStart, PaneDensity, Prefs,
+    CursorBlinkPref, CursorShapePref, DictationShortcut, FileEditor, InspectorTab, InterfaceStyle, NewAgentStart, PaneDensity, Prefs,
     SavedWindow, SidebarGrouping, SidebarOrdering, TabOrientation, TalkAnswer, UiLanguage,
     WindowMaterial, WindowMode, WindowPlacement,
 };
@@ -2096,6 +2096,9 @@ impl SessionStore {
             && !self.migrating.contains(&id)
             && !self.auto_resuming.contains(&id)
             && clean_exit
+            // A command spawned to keep its tab (`--keep-open`) stays even
+            // after a success.
+            && !session.command_keeps_tab()
             && (disposable || quit_after_running)
             // Closing the tab closes its ⌘J terminals too, and an exit is no
             // confirmation that a dev server running in one may go.
@@ -2963,13 +2966,53 @@ impl SessionStore {
     }
 
     /// The session a pane belongs to in the sidebar: a pane shell's parent,
-    /// otherwise the session itself.
+    /// otherwise the session itself. A pane shell moved into a tab its
+    /// parent is not in belongs to that tab's first session with a row, so
+    /// the tab stays one row and focusing the shell keeps that row selected.
     pub fn pane_owner(&self, session: &SessionId) -> SessionId {
-        self.sessions
+        use diri_proto::workspace::LayoutNode;
+        fn leaves<'a>(node: &'a LayoutNode, out: &mut Vec<&'a SessionId>) {
+            match node {
+                LayoutNode::Pane { session_id, .. } => out.push(session_id),
+                LayoutNode::Split { first, second, .. } => {
+                    leaves(first, out);
+                    leaves(second, out);
+                }
+            }
+        }
+        let Some(parent) = self
+            .sessions
             .get(session)
             .filter(|record| is_auxiliary_terminal(record))
             .and_then(|record| record.parent.clone())
-            .unwrap_or_else(|| session.clone())
+        else {
+            return session.clone();
+        };
+        let Some(snapshot) = self.workspaces.snapshot() else {
+            return parent;
+        };
+        let mut panes = Vec::new();
+        for tab in snapshot.workspaces.iter().flat_map(|w| &w.tabs) {
+            if !matches!(tab.layout, LayoutNode::Split { .. }) {
+                continue;
+            }
+            panes.clear();
+            leaves(&tab.layout, &mut panes);
+            if !panes.contains(&session) {
+                continue;
+            }
+            if panes.contains(&&parent) {
+                return parent;
+            }
+            if let Some(head) = panes.iter().find(|id| {
+                self.sessions
+                    .get(**id)
+                    .is_some_and(|record| !is_auxiliary_terminal(record))
+            }) {
+                return (*head).clone();
+            }
+        }
+        parent
     }
 
     /// The tab that shows `owner`, as its sidebar row sums it up: how many
@@ -2999,7 +3042,7 @@ impl SessionStore {
                     .iter()
                     .filter_map(|id| self.sessions.get(*id))
                     .filter(|session| {
-                        session.parent.as_ref() == Some(owner) && is_auxiliary_terminal(session)
+                        is_auxiliary_terminal(session) && self.pane_owner(&session.id) == *owner
                     })
                     .cloned()
                     .collect();
@@ -3042,7 +3085,7 @@ impl SessionStore {
         self.last_action_failure = None;
         self.emit(StoreEffect::SpawnPane {
             pane,
-            params: SessionSpawnParams {
+            params: SessionSpawnParams { keep_open: None,
                 appearance: None,
                 kind: AgentKind::SHELL,
                 cwd: session.cwd.clone(),
@@ -3089,7 +3132,7 @@ impl SessionStore {
         self.last_action_failure = None;
         self.emit(StoreEffect::SpawnAuxiliary {
             slot,
-            params: SessionSpawnParams {
+            params: SessionSpawnParams { keep_open: None,
                 appearance: None,
                 kind: AgentKind::SHELL,
                 cwd: session.cwd.clone(),
@@ -3203,7 +3246,7 @@ impl SessionStore {
             .map_or((None, None, None), |worktree| {
                 (Some(worktree.create), worktree.branch, worktree.base)
             });
-        SessionSpawnParams {
+        SessionSpawnParams { keep_open: None,
             appearance: Some(crate::app_theme::spawn_appearance(self.theme_id())),
             kind,
             cwd,

@@ -107,6 +107,21 @@ foreground, cursor, selection, 16 ANSI colors), diri's selection and find
 overlays were derived from it, and ten themes whose default text is below
 3:1 contrast were left out.
 
+Nerd Fonts symbols (https://github.com/ryanoasis/nerd-fonts)
+------------------------------------------------------------
+diri/crates/diri-term/fonts/DiriSymbolsMono-Regular.ttf is derived from
+Symbols Nerd Font Mono 3.5.1 (NerdFontsSymbolsOnly.zip), Copyright (c) 2014
+Ryan L McIntyre, MIT License. Its glyphs come from icon sets under their own
+licenses: Font Awesome and Codicons (CC BY 4.0), Material Design Icons
+(Apache-2.0), Pomicons and Weather Icons (SIL OFL 1.1), and Devicons,
+Octicons, Seti UI, Font Awesome Extension, Powerline and Power Symbols (MIT).
+Logos are trademarks of their owners. The per-set table and the MIT text are
+in diri/crates/diri-term/fonts/LICENSE.txt.
+
+Changes made: only the Private Use Area glyphs were kept, every glyph was
+scaled into one terminal cell, and the family was renamed "Diri Symbols Mono"
+(diri/crates/diri-term/fonts/make_symbols_font.py).
+
 ONNX Runtime (https://github.com/microsoft/onnxruntime)
 -------------------------------------------------------
 Copyright (c) Microsoft Corporation. Licensed under the MIT License.

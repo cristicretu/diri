@@ -1519,7 +1519,7 @@ mod tests {
                 0,
             )
             .expect("remote client");
-            let (generation, mut output) = client.connect(0, None).expect("connect");
+            let (generation, mut output) = client.connect(0, None, None).expect("connect");
             let (sender, receiver) = mpsc::channel();
             let reader = std::thread::spawn(move || {
                 let mut codec = RemoteCodec::new();

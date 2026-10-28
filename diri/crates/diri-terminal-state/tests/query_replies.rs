@@ -173,7 +173,8 @@ fn decrqss_reports_sgr_margins_and_cursor_style() {
         reply(&mut screen, "\x1b[5;10r\x1bP$qr\x1b\\\x1b[r"),
         "\x1bP1$r5;10r\x1b\\"
     );
-    assert_eq!(reply(&mut screen, "\x1bP$q q\x1b\\"), "\x1bP1$r2 q\x1b\\");
+    // An unset cursor is the blinking block Diri draws (DECSCUSR 1).
+    assert_eq!(reply(&mut screen, "\x1bP$q q\x1b\\"), "\x1bP1$r1 q\x1b\\");
     assert_eq!(
         reply(&mut screen, "\x1b[5 q\x1bP$q q\x1b\\"),
         "\x1bP1$r5 q\x1b\\"

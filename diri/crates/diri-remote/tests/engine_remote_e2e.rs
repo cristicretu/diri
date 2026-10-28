@@ -1555,6 +1555,294 @@ fn token_for_retry() -> SessionToken {
     SessionToken::new("abcdef0123456789abcdef0123456789").expect("token")
 }
 
+/// Remote output nobody typed for, timed end to end through the fake-ssh
+/// bridge: one byte written to the remote child's TTY from outside, to the
+/// Grid frame that shows it on a local Engine attach. Then a continuous
+/// writer, counting Grid frames a second at that attach.
+///
+/// ```sh
+/// cargo test --release -p diri-remote --test engine_remote_e2e \
+///     remote_output_leading_edge -- --ignored --nocapture
+/// ```
+///
+/// `DIRI_LEADING_EDGE_SAMPLES` sets the sample count (default 200). Writes
+/// are 30 ms apart so each starts after quiet. The fixture Holder and its
+/// tempdir are removed on exit.
+#[test]
+#[ignore = "measurement: run with --release -- --ignored --nocapture"]
+fn remote_output_leading_edge_to_engine_attach() {
+    use diri_engine::control::ControlServer;
+    use diri_engine::registry::Registry;
+    use diri_proto::frames::{FrameCodec, FrameType};
+    use serde_json::json;
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+    use std::sync::Mutex;
+
+    let samples: usize = std::env::var("DIRI_LEADING_EDGE_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(200);
+    let temporary = tempfile::tempdir_in("/tmp").expect("temp");
+    let home = temporary.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let tty_file = temporary.path().join("tty");
+    let manager = Arc::new(
+        RemoteManager::new(
+            ProcessExecutor::new(write_fake_ssh(
+                temporary.path(),
+                &home,
+                &temporary.path().join("remote-state"),
+            )),
+            ArtifactCatalog::from_native_helper(Path::new(helper())).unwrap(),
+            temporary.path().join("control"),
+        )
+        .unwrap(),
+    );
+    let host = HostEntry {
+        transport: Default::default(),
+        id: "leading-edge".into(),
+        name: None,
+        ssh: "fixture".into(),
+        default_cwd: None,
+        node: None,
+    };
+    let installed = manager.ensure_helper(&host).unwrap();
+    let token = token_for_retry();
+    let id = unique_stop_session_id("leading-edge");
+    let request = LaunchRequest {
+        session_id: id.clone(),
+        session_token: token.clone(),
+        argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!(
+                "tty > '{}'; stty -echo; printf 'ready\\r\\n'; exec cat",
+                tty_file.display()
+            ),
+        ],
+        cwd: "/".into(),
+        environment: vec![],
+        cols: 80,
+        rows: 24,
+        persistence: PersistenceCapability::NativeDetach,
+        keyboard_enhancements: false,
+    };
+    let registry = Arc::new(Mutex::new(Registry::new(
+        Arc::new(ManifestEngine::new(Vec::new())),
+        temporary.path().join("state.json"),
+    )));
+    let record = serde_json::from_value(json!({
+        "id":id, "kind":{"shell":{}}, "cwd":"/", "projectID":"p",
+        "title":"leading-edge", "titleSource":0, "status":{"starting":{}},
+        "resumability":"notResumable", "createdAt":0, "updatedAt":0, "pinned":false,
+        "host":host.id,
+    }))
+    .unwrap();
+    registry
+        .lock()
+        .unwrap()
+        .spawn(
+            SessionSpec {
+                id: id.clone(),
+                pty: PtySpec::new(request.argv.clone(), "/").size(80, 24),
+                manifest_id: "shell".into(),
+                authority: Authority::ProcessOnly,
+                logs_dir: temporary.path().join("logs"),
+                holder: None,
+                defer_launch: false,
+                remote: Some(RemoteSessionSpec {
+                    manager: Arc::clone(&manager),
+                    helper: installed.clone(),
+                    launch: request,
+                    host_id: host.id.clone(),
+                    binding_store: RemoteBindingStore::new(temporary.path().join("bindings"))
+                        .unwrap(),
+                }),
+            },
+            record,
+        )
+        .unwrap();
+    wait_for_grid(registry.lock().unwrap().get(&id).unwrap(), "ready");
+    struct Cleanup {
+        manager: Arc<RemoteManager>,
+        helper: diri_engine::remote::manager::InstalledHelper,
+        selector: SessionSelector,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = self.manager.kill(&self.helper, &self.selector);
+        }
+    }
+    let _cleanup = Cleanup {
+        manager: Arc::clone(&manager),
+        helper: installed,
+        selector: SessionSelector {
+            session_id: id.clone(),
+            session_token: token,
+            expected_incarnation: None,
+        },
+    };
+    let tty = {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(path) = fs::read_to_string(&tty_file)
+                && path.trim().starts_with("/dev/")
+            {
+                break path.trim().to_string();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the child never reported its tty"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+
+    let server = Arc::new(ControlServer::new(
+        Arc::clone(&registry),
+        temporary.path().join("daemon.sock"),
+    ));
+    let (mut attach, attach_server) = UnixStream::pair().unwrap();
+    attach
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let attach_worker = {
+        let server = Arc::clone(&server);
+        std::thread::spawn(move || {
+            let _ = server.serve(attach_server);
+        })
+    };
+    attach
+        .write_all(format!("{{\"attach\":\"{id}\"}}\n").as_bytes())
+        .unwrap();
+    let (sender, frames) = std::sync::mpsc::channel();
+    {
+        let mut attach = attach.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let mut codec = FrameCodec::new();
+            let mut bytes = vec![0; 1 << 16];
+            while let Ok(count) = attach.read(&mut bytes) {
+                if count == 0 {
+                    return;
+                }
+                let Ok(decoded) = codec.feed(&bytes[..count]) else {
+                    return;
+                };
+                for frame in decoded {
+                    if frame.frame_type == FrameType::Grid {
+                        let text = frame
+                            .grid_payload()
+                            .ok()
+                            .flatten()
+                            .map(|update| grid_update_text(&update))
+                            .unwrap_or_default();
+                        if sender.send((Instant::now(), text)).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+    }
+    let until = |what: &str, mut predicate: Box<dyn FnMut(&str) -> bool + '_>| -> Instant {
+        loop {
+            let (at, text) = frames
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+            if predicate(&text) {
+                return at;
+            }
+        }
+    };
+    until("the seed grid", Box::new(|_| true));
+    std::thread::sleep(Duration::from_millis(200));
+    while frames.try_recv().is_ok() {}
+
+    let mut terminal = fs::OpenOptions::new().write(true).open(&tty).unwrap();
+    let mut latencies = Vec::with_capacity(samples);
+    let mut printed = String::new();
+    for index in 0..samples {
+        if index % 60 == 0 {
+            terminal.write_all(b"\r\n").unwrap();
+            printed.clear();
+            std::thread::sleep(Duration::from_millis(40));
+            while frames.try_recv().is_ok() {}
+        }
+        printed.push(char::from(b'a' + (index % 26) as u8));
+        let sent = Instant::now();
+        terminal
+            .write_all(&printed.as_bytes()[printed.len() - 1..])
+            .unwrap();
+        let at = until(
+            "the printed byte",
+            Box::new(|text| text.lines().any(|line| line == printed)),
+        );
+        latencies.push(at.duration_since(sent));
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    latencies.sort_unstable();
+    let at = |percentile: usize| latencies[(latencies.len() * percentile).div_ceil(100) - 1];
+    eprintln!(
+        "remote unsolicited write -> Grid at Engine attach: p50 {}us p90 {}us p99 {}us min {}us (n={})",
+        at(50).as_micros(),
+        at(90).as_micros(),
+        at(99).as_micros(),
+        latencies[0].as_micros(),
+        latencies.len()
+    );
+
+    // Continuous output: one small write about every 200 us.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let stop = Arc::clone(&stop);
+        let tty = tty.clone();
+        std::thread::spawn(move || {
+            let mut terminal = fs::OpenOptions::new().write(true).open(&tty).unwrap();
+            let mut index = 0_u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = write!(terminal, "line {index}\r\n");
+                index += 1;
+                std::thread::sleep(Duration::from_micros(200));
+            }
+        })
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    while frames.try_recv().is_ok() {}
+    let started = Instant::now();
+    let mut grids = 0_u32;
+    while started.elapsed() < Duration::from_secs(1) {
+        if frames.recv_timeout(Duration::from_millis(50)).is_ok() {
+            grids += 1;
+        }
+    }
+    let elapsed = started.elapsed();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+    eprintln!(
+        "remote continuous output: {grids} Grid frames at Engine attach in {elapsed:?} ({:.0}/s)",
+        f64::from(grids) / elapsed.as_secs_f64()
+    );
+    drop(attach);
+    let _ = attach_worker.join();
+}
+
+fn grid_update_text(update: &diri_proto::grid::GridUpdate) -> String {
+    update
+        .changed_rows
+        .iter()
+        .map(|row| {
+            row.cells
+                .iter()
+                .map(|cell| char::from_u32(cell.scalar).unwrap_or(' '))
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Launches `argv` as a remote session through the fake `ssh` and the real
 /// bootstrapped Helper, attached by a real Engine `Session`.
 fn spawn_remote_program(

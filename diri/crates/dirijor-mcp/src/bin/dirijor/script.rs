@@ -141,6 +141,18 @@ fn parse_key(token: &str) -> Option<Input> {
         "f10" => Some(NamedKey::F10),
         "f11" => Some(NamedKey::F11),
         "f12" => Some(NamedKey::F12),
+        "f13" => Some(NamedKey::F13),
+        "f14" => Some(NamedKey::F14),
+        "f15" => Some(NamedKey::F15),
+        "f16" => Some(NamedKey::F16),
+        "f17" => Some(NamedKey::F17),
+        "f18" => Some(NamedKey::F18),
+        "f19" => Some(NamedKey::F19),
+        "f20" => Some(NamedKey::F20),
+        "f21" => Some(NamedKey::F21),
+        "f22" => Some(NamedKey::F22),
+        "f23" => Some(NamedKey::F23),
+        "f24" => Some(NamedKey::F24),
         _ => None,
     };
     if let Some(named) = named {
