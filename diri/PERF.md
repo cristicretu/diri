@@ -1,5 +1,71 @@
 # diri performance record
 
+## Holder PTY drain: blocking reads while output streams (2026-10-28)
+
+After the parser work, a 100 MB `cat` spent most of the Holder's time in
+system calls: a macOS PTY master returns about 1 KiB per read whatever the
+buffer size (the terminal driver's output queue; the line speed does not
+change it), and the pump paid a `poll`, a read and an `EAGAIN` read for each
+kilobyte, plus a condvar wakeup of the subscriber's writer per kilobyte.
+
+A C replica of the read loop on the same payload (105.8 MB with ONLCR, 104k
+reads) isolates the wait itself:
+
+| Read loop | Drain | CPU (sys) |
+| --- | ---: | ---: |
+| blocking `read` | 0.57 s | 0.28 s (0.27) |
+| `poll` + read until `EAGAIN` | 0.73-0.75 s | 0.44 s (0.40) |
+| `poll` + one read | 0.73-0.75 s | 0.41 s (0.38) |
+| persistent `kqueue` + read until `EAGAIN` | 0.70-0.74 s | 0.39 s (0.35) |
+
+The read count is the same in every row; what differs is how fast a sleeping
+reader is woken. Waiting in `read` is the only fast path.
+
+**What changed.**
+
+- `holder/pty_read.rs`: after four reads in a row of at least 512 bytes (the
+  kernel queue was full), the pump clears `O_NONBLOCK` and sleeps in `read`.
+  The first read shorter than that puts it back in `poll` on the PTY and the
+  exit pipe, so a quiet session waits exactly as before (no deadline, no
+  wakeups). macOS only; Linux keeps the polling path.
+- `O_NONBLOCK` is on the shared file description, so `write_pty` sets it
+  around each write while the pump streams (under the PTY lock it already
+  held) and the 1 s give-up for a child that stops reading input still holds.
+  While the pump polls, writes are unchanged.
+- The exit path cannot reach a pump asleep in `read` through the pipe. The
+  leader's exit revokes its terminal, which normally ends the read; otherwise
+  a no-op `SIGURG` handler without `SA_RESTART` interrupts it, repeated every
+  millisecond until the pump returns.
+- `FrameQueue::pop_within`: a subscriber writer lingering for the next frame
+  of a stream is no longer woken per pushed frame, only at its 100 µs
+  deadline or once 64 KiB are waiting, and gets everything joined in one
+  frame.
+
+**Measured** (M4 Max, load 2.5-4, 6 interleaved rounds, medians; reference
+terminal multiplexer on an isolated server, one attached stream):
+
+| | Reference | Base (#907) | Branch |
+| --- | ---: | ---: | ---: |
+| `catbench` drain | 0.664 s | 0.716 s | **0.640 s** |
+| `catbench` last line at client | 0.664 s (raw bytes) | 0.724 s | **0.667 s** |
+| `catbench` Holder CPU | — | 0.78 s | **0.38 s** |
+| `drainbench` drain, no subscriber | — | 0.702 s | **0.587 s** |
+| `drainbench` drain, discarding subscriber | — | 0.747 s | **0.592 s** |
+| `drainbench` CPU, discarding subscriber | — | 0.88 s | **0.41 s** |
+| `drainbench` involuntary switches, subscriber | — | 172k | **5.5k** |
+
+Blocking `read` floor (C, same run): 0.574 s. Every Diri run parsed every
+byte (`skipped-MB 0.00`). End to end, the Engine session thread (0.65 s CPU)
+is now the limit, not the Holder.
+
+Footprint: no thread, timer or allocation per session; one `AtomicBool` per
+Holder and one process-wide signal handler. Idle sessions are unchanged.
+
+```sh
+cargo build --release -p diri-engine --bin diri-holder --example catbench --example drainbench
+target/release/examples/drainbench <log> attach 3
+```
+
 ## History encoding and per-read costs: Engine parse +25% (2026-10-27)
 
 The Engine session thread is the limit when output floods a held session: on

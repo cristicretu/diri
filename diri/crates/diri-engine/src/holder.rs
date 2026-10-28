@@ -55,6 +55,8 @@ pub mod server;
 mod fanout;
 #[cfg(unix)]
 mod log_feed;
+#[cfg(unix)]
+mod pty_read;
 
 pub use client::{HolderClient, HolderManagerClient, HolderOutputStream};
 
