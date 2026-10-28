@@ -229,7 +229,7 @@ Only `diri-terminal-state` (`HeadlessScreen`, `GridMirror` helpers, `inline_imag
 Each PR lands on its own, behind the single `core-v2` cargo feature of `diri-terminal-state`, which the Engine and the Remote Helper leave off until the last PR. The current core stays until parity is proven, and is removed in a separate PR afterwards.
 
 1. **This PR (design + prototype).**
-   - What lands: the vendored `vte` hooks (`ground_bytes`/`input_bytes`, `input_repeat`; defaults keep today's behavior), the public grapheme module, the `core_v2` prototype, its differential tests, the `HeadlessScreen::from_core_v2` bridge and the bench with the golden check.
+   - What lands: the vendored `vte` hooks (`ground_bytes`/`input_bytes`, `input_repeat`; defaults keep today's behavior), the public grapheme module, the `core_v2` prototype, its differential tests, the `HeadlessScreen::from_core_v2` bridge, the bench with the golden check (v2 and, switch off, the Engine on all six workloads), and CI running the switch both ways (arm64 NEON and x86_64 scalar).
 2. **Complete grid semantics.**
    - Implement every `Handler` method with the current semantics: scroll regions, `IL`/`DL`/`ICH`/`DCH`/`ECH`, `ED` variants (including Diri's "bare `ED 2` scrolls into history"), save/restore, charsets, origin mode, insert mode, alternate screen, tabs, resets, OSC 8 links and OSC 133 marks.
    - The `unsupported` counter must reach zero on the whole terminal-state test corpus. Each sequence family gets a differential test against the current core.

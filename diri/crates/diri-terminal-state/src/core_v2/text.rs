@@ -188,10 +188,23 @@ impl Tables {
         }
     }
 
+    /// The same, one character at a time.
     #[cfg(not(target_arch = "aarch64"))]
     #[inline(always)]
-    pub fn wide_run16(&self, _bytes: &[u8], _out: &mut [u32; 16]) -> usize {
-        0
+    pub fn wide_run16(&self, bytes: &[u8], out: &mut [u32; 16]) -> usize {
+        debug_assert!(bytes.len() >= 48);
+        for (k, slot) in out.iter_mut().enumerate() {
+            let (b0, b1, b2) = (bytes[3 * k], bytes[3 * k + 1], bytes[3 * k + 2]);
+            if b0 & 0xF0 != 0xE0 || b1 & 0xC0 != 0x80 || b2 & 0xC0 != 0x80 {
+                return k;
+            }
+            let block = ((b0 & 0x0F) as usize) << 6 | (b1 & 0x3F) as usize;
+            if self.wide_blocks[block >> 3] & (1 << (block & 7)) == 0 {
+                return k;
+            }
+            *slot = ((b0 & 0x0F) as u32) << 12 | ((b1 & 0x3F) as u32) << 6 | (b2 & 0x3F) as u32;
+        }
+        16
     }
 }
 
@@ -234,9 +247,7 @@ mod tests {
         let mut out = [0u32; 16];
         let mut bytes = "漢".repeat(16).into_bytes();
         bytes[3 * 5 + 2] = b'A';
-        if cfg!(target_arch = "aarch64") {
-            assert_eq!(tables.wide_run16(&bytes, &mut out), 5);
-        }
+        assert_eq!(tables.wide_run16(&bytes, &mut out), 5);
     }
 
     #[test]
@@ -246,7 +257,7 @@ mod tests {
         let text: String = "漢字かな交じり文、日本語の文章です。ありがとう".into();
         let bytes = text.as_bytes();
         let count = tables.wide_run16(&bytes[..48], &mut out);
-        if cfg!(target_arch = "aarch64") {
+        {
             // 漢字 are CJK; か falls in a block with combining marks.
             let expected = text
                 .chars()
