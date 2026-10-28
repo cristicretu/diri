@@ -638,7 +638,7 @@ pub(crate) mod plan {
         Ok(ScheduleSpec {
             title,
             when,
-            spawn: SessionSpawnParams {
+            spawn: SessionSpawnParams { keep_open: None,
                 appearance: None,
                 account_profile_id: None,
                 kind: agent,

@@ -9,6 +9,7 @@ use diri_proto::attention::{
 };
 
 use crate::status::{ClaudeHook, ReducerOutcome, StatusSignal};
+use diri_terminal_state::ProgramState;
 use rusqlite::{Connection, OptionalExtension};
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -67,8 +68,11 @@ impl From<&StatusSignal> for Evidence {
                         ..
                     }
             ) || matches!(
+                // `idle` is a result only for programs whose manifest says
+                // so; the reducer reports that as `turn_completed`.
                 signal,
-                StatusSignal::ProgramStatus(Some(record)) if !record.state.is_transient()
+                StatusSignal::ProgramStatus(Some(record))
+                    if matches!(record.state, ProgramState::Done | ProgramState::Error)
             ),
             queued: matches!(signal, StatusSignal::Screen(observation) if observation.matched_rule_id == "queued-follow-up-question"),
             subagent: matches!(
@@ -325,6 +329,7 @@ impl AttentionLifecycle {
             && outcome.needs_input.is_none()
             && outcome.status_change.is_none()
             && !outcome.turn_completed
+            && !outcome.turn_abandoned
             && !evidence.completion
             && !outcome.line_prompt_ended
             && identity.completion.is_none()
@@ -343,6 +348,14 @@ impl AttentionLifecycle {
         if submitted {
             self.resolve(None);
             self.state.active_tools.clear();
+            self.responding = false;
+        }
+        // Cancelled or denied: what the turn asked is settled, and it ended
+        // with nothing to announce.
+        if outcome.turn_abandoned {
+            self.resolve(None);
+            self.state.active_tools.clear();
+            self.state.working = false;
             self.responding = false;
         }
         if continuation && self.responding {
@@ -377,7 +390,11 @@ impl AttentionLifecycle {
             self.state.working = true;
             self.state.last_native_completion = None;
             for event in &mut self.state.events {
-                if event.kind == AttentionKind::Completion {
+                // A new turn settles the last one's result, failed or not.
+                if matches!(
+                    event.kind,
+                    AttentionKind::Completion | AttentionKind::Failure
+                ) {
                     event.resolved = true;
                 }
             }
@@ -466,12 +483,21 @@ impl AttentionLifecycle {
                     }
                 }
             }
+            // A program that reported `error` failed the turn: one Failure
+            // in place of the Completion.
+            let kind = if outcome.turn_failed {
+                AttentionKind::Failure
+            } else {
+                AttentionKind::Completion
+            };
             if self.state.working
-                || !self.state.events.iter().any(|event| {
-                    event.kind == AttentionKind::Completion && event.turn == self.state.turn
-                })
+                || !self
+                    .state
+                    .events
+                    .iter()
+                    .any(|event| event.kind == kind && event.turn == self.state.turn)
             {
-                self.append(AttentionKind::Completion, outcome, now);
+                self.append(kind, outcome, now);
             }
             self.state.working = false;
             self.state.active_tools.clear();

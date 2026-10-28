@@ -135,8 +135,9 @@ impl ClientCore {
     /// IF YOU ADD AN EVENT KIND THAT DIRI NEEDS, ADD IT HERE TOO. Server-side
     /// filtering means an unlisted kind never reaches `route_message`, and the
     /// symptom is silence, not an error.
-    const EVENT_KINDS: [&'static str; 10] = [
+    const EVENT_KINDS: [&'static str; 11] = [
         EventName::SESSION_UPDATED,
+        EventName::AGENT_ACTION,
         EventName::COMPUTER_SETUP_NEEDED,
         EventName::SESSION_API_REQUEST,
         EventName::SESSION_NOTIFICATION,
@@ -644,6 +645,7 @@ impl DaemonClient {
             &SessionRenameParams {
                 session_id: session_id.clone(),
                 title,
+                by: None,
             },
         )
         .await
@@ -663,6 +665,25 @@ impl DaemonClient {
             )
             .await?;
         Ok(())
+    }
+
+    /// Clear Screen and Scrollback: the Engine drops history and the rows
+    /// above the cursor's line. `Ok(false)` means the alternate screen was
+    /// showing and nothing changed. Remote sessions return
+    /// `terminal_clear_unsupported`.
+    pub async fn clear_scrollback(&self, session_id: &SessionId) -> Result<bool, ClientError> {
+        let result: JsonValue = self
+            .core
+            .request_typed(
+                Method::SESSION_CLEAR_SCROLLBACK,
+                Some(&session_params(session_id)),
+                None,
+            )
+            .await?;
+        Ok(result
+            .get("cleared")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(true))
     }
 
     /// Remote sessions currently return `terminal_title_unsupported`.
@@ -1952,6 +1973,7 @@ mod tests {
 
             let spawned_id = client
                 .spawn(SessionSpawnParams {
+                    keep_open: None,
                     appearance: None,
                     kind: AgentKind::SHELL,
                     cwd: scratch.to_string_lossy().into_owned(),

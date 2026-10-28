@@ -709,3 +709,164 @@ fn returning_to_an_unchanged_workspace_tab_moves_the_keyboard_into_it(
         assert!(keyboard_reaches_app_commands(window, cx));
     });
 }
+
+fn command(template: &SessionRecord, id: &str, run: diri_proto::CommandRun) -> SessionRecord {
+    let mut command = shell(template, id);
+    command.kind = AgentKind::new(AgentKind::GENERIC_ID);
+    command.command_run = Some(run);
+    command
+}
+
+fn quick(ran_ms: u64) -> diri_proto::CommandRun {
+    diri_proto::CommandRun {
+        keep_open: false,
+        ran_ms: Some(ran_ms),
+    }
+}
+
+/// A command that failed or was killed as it started stays on screen: the
+/// window does not move on, the pane keeps its last screen under the exit
+/// pill, and no toast stands in for the error the pane already shows.
+fn check_the_command_stays_on_screen(
+    cx: &mut gpui::TestAppContext,
+    run: diri_proto::CommandRun,
+    status: SessionStatus,
+) {
+    cx.update(|cx| commands::bind_keys(cx, &Default::default()));
+    let services = test_services();
+    let runtime = services.store.clone();
+    let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+    let mut running = command(&fixture.list.sessions[0], "failing-command", run.clone());
+    running.command_run = Some(diri_proto::CommandRun {
+        ran_ms: None,
+        ..run.clone()
+    });
+    let failing = running.id.clone();
+    let previous = {
+        let mut store = runtime.store.write().unwrap();
+        store.hydrate(fixture.list);
+        store.upsert_session(running);
+        store
+            .ordered_sessions()
+            .into_iter()
+            .find(|session| session.id != failing && !session.is_archived())
+            .unwrap()
+            .id
+    };
+    let previous_tab = tab("previous", &previous);
+    let failing_tab = tab("failing", &failing);
+    runtime
+        .store
+        .write()
+        .unwrap()
+        .seed_workspace_snapshot_for_test(snapshot(
+            1,
+            vec![previous_tab, failing_tab.clone()],
+            &failing_tab,
+        ));
+    let (root, cx) = cx.add_window_view({
+        let previous = previous.clone();
+        let failing = failing.clone();
+        move |window, cx| {
+            let root = RootView::new(services, false, PreviewScenario::Empty, window, cx);
+            root.window_store.write().unwrap().select(previous);
+            root.window_store.write().unwrap().select(failing);
+            root.sidebar.update(cx, |sidebar, cx| {
+                sidebar.activate_workspace(Some(WorkspaceId::new("focus-workspace")), cx)
+            });
+            root
+        }
+    });
+    cx.simulate_resize(size(px(1100.0), px(800.0)));
+    cx.run_until_parked();
+    root.update_in(cx, |root, _, cx| {
+        assert_eq!(root.active_session_id(cx), Some(failing.clone()));
+    });
+
+    {
+        let mut store = runtime.store.write().unwrap();
+        let mut record = store.sessions()[&failing].as_ref().clone();
+        record.status = status;
+        record.command_run = Some(run);
+        store.upsert_session(record);
+    }
+    runtime.publish_local_change();
+    cx.run_until_parked();
+    assert!(
+        runtime.store.read().unwrap().is_open(&failing),
+        "the command's tab stays"
+    );
+    // The pill over the last screen, or the card when (as here, with no
+    // Engine) the screen has no content: either says how it ended.
+    assert!(
+        cx.debug_bounds("exit-pill").is_some() || cx.debug_bounds("exited-card").is_some(),
+        "the pane shows how the command ended"
+    );
+    root.update_in(cx, |root, _, cx| {
+        assert_eq!(
+            root.active_session_id(cx),
+            Some(failing.clone()),
+            "the window stays on the command"
+        );
+        assert!(root.pending_tab.is_none());
+        assert!(root.toast.current().is_none(), "the pane says it already");
+    });
+}
+
+#[gpui::test]
+fn a_command_that_fails_as_it_starts_stays_on_screen(cx: &mut gpui::TestAppContext) {
+    // `dirijor session run -- missing-tool`: 127 within milliseconds.
+    check_the_command_stays_on_screen(cx, quick(4), exited(127));
+}
+
+#[gpui::test]
+fn a_command_killed_as_it_starts_stays_on_screen(cx: &mut gpui::TestAppContext) {
+    check_the_command_stays_on_screen(
+        cx,
+        quick(30),
+        SessionStatus::Exited(ExitInfo {
+            reason: ExitReason::Signaled,
+            code: None,
+            signal: Some(9),
+            system_restart: false,
+            interrupted: true,
+        }),
+    );
+}
+
+#[gpui::test]
+fn a_keep_open_command_stays_on_screen_after_a_success(cx: &mut gpui::TestAppContext) {
+    check_the_command_stays_on_screen(
+        cx,
+        diri_proto::CommandRun {
+            keep_open: true,
+            ran_ms: Some(2_000),
+        },
+        exited(0),
+    );
+}
+
+/// The policy is for commands only: a quick success still closes, and a
+/// command that failed after running a while is listed and announced the
+/// way a crashed session is.
+#[gpui::test]
+fn a_quick_successful_command_closes_like_a_shell(cx: &mut gpui::TestAppContext) {
+    check_the_window_moves_on_in_place(
+        cx,
+        |template| command(template, "quick-success", quick(5)),
+        Ending::Process(exited(0)),
+        None,
+    );
+}
+
+#[gpui::test]
+fn a_command_that_fails_after_running_moves_on_and_is_announced(
+    cx: &mut gpui::TestAppContext,
+) {
+    check_the_window_moves_on_in_place(
+        cx,
+        |template| command(template, "slow-failure", quick(600)),
+        Ending::Process(exited(3)),
+        Some("exited with code 3"),
+    );
+}

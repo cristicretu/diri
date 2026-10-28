@@ -22,7 +22,11 @@ unicode-width = "0.2.2"
 
 [dev-dependencies]
 diri-terminal-state.workspace = true
-criterion = "0.5.1"
+# The output-to-photon probe (examples/output_photon_probe.rs) runs a private
+# in-process Engine with a real Holder behind the real renderer.
+diri-engine.workspace = true
+tokio.workspace = true
+criterion = "0.8.2"
 gpui = { workspace = true, features = ["bench"] }
 gpui_platform = { workspace = true, features = ["test-support"] }
 
@@ -41,3 +45,7 @@ harness = false
 [[bench]]
 name = "terminal_interactions"
 harness = false
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# The probe keeps its panel out of the Dock and the app switcher.
+objc = "0.2"

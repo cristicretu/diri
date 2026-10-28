@@ -100,7 +100,7 @@ fn move_file(from: &Path, to: &Path) -> io::Result<bool> {
 }
 
 fn create_private_dir(path: &Path) -> io::Result<()> {
-    fs::create_dir_all(path)?;
+    diri_platform::private::create_dir_all(path)?;
     diri_platform::security::owner_only(path, true)
 }
 

@@ -70,7 +70,7 @@ Short verbs for shell scripts, modelled on tmux. They do the same things as the 
 | `list` | `--all`, `--json` | List sessions. Same as `session list`. |
 | `new` | `--kind KIND` (default `shell`), `--cwd PATH`, `--name TEXT`, `--prompt TEXT`, `--host ID`, `--json` | Open a shell or agent tab. Prints only the new session id. |
 | `send TARGET [--] TOKEN...` | `-l`, `--json` | Type into a session, like `tmux send-keys`. Each token is a key name or literal text; text tokens are joined without spaces. Reads stdin as literal text when no tokens are given. `-l` types every token literally. |
-| `capture TARGET` | `--lines N`, `--scrollback`, `--json` | Print the visible screen as plain text, or the whole scrollback. Trailing blanks and empty rows are dropped, so `--lines N` gives the last N rows of output. |
+| `capture TARGET` | `--lines N`, `--scrollback`, `--unwrap`, `--ansi`, `--trim`, `--json` | Print the visible screen as plain text, or the whole scrollback. Trailing blanks and empty rows are dropped, so `--lines N` gives the last N rows of output. `--unwrap` joins rows the terminal wrapped at its width back into the line the program wrote, so long URLs, paths and JSON come out whole (`--lines N` then counts those lines). `--ansi` keeps colours and text styles as escape sequences. `--trim` is accepted for scripts written for other tools; trimming is always on. |
 | `run -- PROGRAM [ARG...]` | `--wait`, `--timeout SECONDS`, `--rm`, `--cwd PATH`, `--name TEXT`, `--host ID`, `--json` | Run a command in a new terminal tab and print its id. With `--wait`, block until it exits, print its output and exit with its status. `--rm` closes the tab afterwards. |
 
 `send` key names (case-insensitive): `Enter`, `Tab`, `Escape`, `BSpace`, `Space`, `Up`, `Down`, `Left`, `Right`, `Home`, `End`, `PageUp`, `PageDown`, `Insert`, `Delete`, `F1` to `F12`. Prefix `C-` for Control, `M-` for Alt and `S-` for Shift, for example `C-c`, `M-b` or `S-Tab`. Anything else is typed as text.
@@ -95,7 +95,7 @@ dirijor run --wait --rm -- cargo test --workspace && echo green
 | `session key ID KEY` | `--ctrl`, `--alt`, `--shift`, `--cmd`, `--repeat`, `--json` | Press one key. `send` takes any target and several keys. |
 | `session wait TARGET` | `--until STATUS` (repeatable), `--timeout SECONDS`, `--json` | Block until the session reaches a status. Default `--until done`, default timeout 600 seconds. |
 | `session spawn KIND` | `--cwd PATH`, `--worktree`, `--branch NAME`, `--prompt TEXT`, `--title TEXT`, `--host ID`, `--json` | Start an agent, for example `claude` or `codex`. The folder defaults to the current one. |
-| `session run -- PROGRAM [ARG...]` | `--cwd PATH`, `--host ID`, `--title TEXT`, `--json` | Run a command in a new terminal session. A remote run needs `--cwd` with an absolute path on that host. |
+| `session run -- PROGRAM [ARG...]` | `--cwd PATH`, `--host ID`, `--title TEXT`, `--keep-open`, `--json` | Run a command in a new terminal session. A remote run needs `--cwd` with an absolute path on that host. The tab closes when the command succeeds and stays open when it fails or is killed within 250 ms, so you can read the error. `--keep-open` keeps it open after any exit. |
 | `session fork TARGET` | `--json` | Fork the conversation into a new session (agents that support fork). |
 | `session release TARGET` | `--remove`, `--json` | Stop the session. `--remove` also deletes its record. |
 | `session archive TARGET` | `--undo`, `--json` | Archive the session, or unarchive it with `--undo`. |

@@ -101,7 +101,9 @@ requests fail explicitly when that state is unavailable. Desktop arrows and
 Home/End retain their historical normal-cursor CSI encoding for these legacy
 sessions instead of disabling navigation after an upgrade. This compatibility
 choice does not claim or persist known modes; observed application-cursor modes
-always override it. Keypad input still requires observed modes. Controller and
+always override it. Keypad keys type their characters in every legacy mode
+(DECKPAM is observed but, as on a Num Lock keypad, changes no bytes), so they
+need no observed modes; kitty-flag programs get keypad key codes. Controller and
 enhanced-keyboard admission checks remain enforced by the Engine.
 
 Local app/client `Modes` frames retain their existing first byte and gain an
@@ -517,6 +519,18 @@ The local Engine sends a structured launch request containing:
 The PTY child executes `argv` directly. Agent launches are never assembled by
 concatenating shell text.
 
+A program that cannot be executed is reported the way a shell reports it
+(October 2026, shared `diri-pty` exec path for the local Holder, its launchd
+helper, and the remote Helper): the child writes `diri: <argv[0]>: command not
+found` (or the `execve` error) to the PTY and exits 127, or 126 when the file
+exists but cannot be run. The search uses the launch's own `PATH`. The launch
+itself succeeds, so the output log, exit marker and exit facts carry the
+failure like any other exit. This is not a protocol change: before, the child
+aborted (SIGABRT) because the descriptors it closes include the Rust runtime's
+exec-error pipe. The Engine-side tab policy for one-off commands
+(`SessionRecord.commandRun`, `keepOpen`) is local-only and never crosses the
+Helper protocol.
+
 Local credentials, local Unix sockets, authentication responses, and local
 process environment are not copied wholesale. Sensitive or irrelevant local
 variables, including local-only `DIRI_` and `SSH_` state, are removed. The
@@ -679,7 +693,13 @@ wire mode byte retains its historical any-mouse bit and uses previously unused
 bits for those details. A live protocol 1.3 Holder exposes only the historical
 bit, so the Engine preserves those details as unknown: it does not synthesize
 button or motion reports, while wheel intent remains encoded by that Holder's
-authoritative parser. Scrollback is bounded to 4 MiB and served on demand
+authoritative parser. A `Scroll` frame for a program on the alternate screen
+that does not read the mouse becomes Up/Down arrow keys (alternate scroll,
+DECSET 1007, cursor-key mode honoured) in Helper builds that include it; an
+older live Holder keeps ignoring that wheel. No frame or capability changes.
+A controller encodes wheel reports for a program whose mouse details it
+knows, with modifiers and the sideways axis, and sends them as mouse input
+like its clicks. Scrollback is bounded to 4 MiB and served on demand
 through `Scroll`. Raw output is bounded to 32 MiB.
 
 On-demand history reads use the Engine's bounded background-request pool. The
@@ -693,7 +713,23 @@ no protocol or binary update.
 The PTY reader must never block on a client. The Holder uses bounded queues. It
 coalesces background output for no more than 8 ms, while up to two grid
 publications after interactive input bypass that wait (one trailing publication
-may already be in flight before the actual response). If a destructive repaint
+may already be in flight before the actual response). Output that follows a
+pause is published on its leading edge: once the last diff is at least 8 ms
+old, a pending diff goes out after 1 ms of PTY quiet instead of waiting out the
+interval, so a background program's lone line leaves the Holder about 1.4 ms
+after it is written rather than 8 ms. Output that never pauses for 1 ms is
+still published at most once per 8 ms, and a batch that leaves fewer filled
+cells than the last publication (an erase whose redraw may follow) keeps the
+whole 8 ms interval. The exception is a line edit: when the only row holding
+fewer cells than at the last publication is the row of the visible cursor (a
+backspace-erase, a kill to end of line, a progress line rewritten shorter),
+no redraw is coming, so the diff goes out on the leading edge like output
+that adds. Hidden cursors (full-screen programs mid-draw), scrolls that shorten
+other rows and resizes keep the hold. The local Engine pump applies the same
+predicate (`HeadlessScreen::lost_cells_only_on_cursor_row`, shared through
+`diri-terminal-state`). This is a Holder-only timing rule with no protocol change
+or capability; Holders launched by older Helper builds keep the 8 ms trailing
+wait until their session is relaunched with a new Helper. If a destructive repaint
 temporarily removes screen content, the Holder instead gives its redraw bytes up
 to 16 ms to arrive, returning immediately when they do. That longer ceiling is
 isolated from typed echo and additive scrolling. When no client is attached, it
@@ -846,9 +882,13 @@ Retain up to 10,000 physical history rows under a 4 MiB stored-history allowance
 compressed payload, allocated block/row indexes, and editable history cells.
 Discard only oldest history when either limit is reached. Visible cells,
 cell-extra heap allocations, temporary codec/read/reflow work and caller-owned
-response buffers are separate from this allowance. Reflow can alter physical row
-count and therefore evict oldest rows at the same cap. History capacity no longer
-shrinks merely because the terminal becomes wider.
+response buffers are separate from this allowance. A resize does not evict: when
+re-wrapping needs more physical rows (a narrower screen, or fewer screen rows),
+the row limit rises to the rows the reflow produced, up to four times the cap,
+and returns toward the cap as widening, a clear or the byte allowance leaves
+fewer rows. New output then recycles the oldest row at that limit. Checkpoints
+carry only the newest 10,000 rows, within read admission. History capacity no
+longer shrinks merely because the terminal becomes wider.
 
 History reads decode bounded row blocks and release caches at exclusive borrow
 boundaries. Resizing untouched hard lines retains compressed payloads and pads
@@ -893,6 +933,24 @@ completed rejection is remembered for the attached session lifetime, and the
 Engine keeps following its durable log without probing on every wakeup.
 Transport failures and interrupted supported streams remain retryable. This
 changes no local or remote wire format and never replaces a live Holder.
+
+The local output stream additively accepts `resumeFrom`, the first offset the
+Engine has not parsed. A Holder that understands it answers `resumed: true` and
+serves the bytes between that offset (or its log's oldest kept byte, if later)
+and its live offset from its own log before the live frames. The Engine owns
+the session's terminal state; it is not a display client. So while it keeps
+taking bytes, backlog or queue, the Holder waits for queue room before reading
+more from the PTY: a program that prints faster than the Engine parses is paced
+to the Engine, as a terminal emulator's own reads pace it, and can no longer
+lap the 32 MiB session log and have output silently skipped. The Holder gives
+up on a subscriber only after 500 ms in which it took nothing (a hung Engine);
+the program then runs free and the Engine resumes from its offset when it
+returns. Display clients are unaffected: they attach to the Engine, whose
+bounded per-client queues still drop stale diffs and reseed with a Full
+Snapshot. An older live Holder ignores `resumeFrom` and omits `resumed`; the
+Engine keeps its previous behaviour for that Holder (follow the log, subscribe
+at the live offset once drained). The remote Helper protocol is unchanged: the
+remote Holder feeds its parser on the loop that reads its PTY.
 
 The local Holder's `OutputLog` writer retains no raw-output ring: no Holder
 operation reads it. Durable file output, offsets, rotation and exit markers

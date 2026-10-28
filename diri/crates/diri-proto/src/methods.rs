@@ -50,6 +50,10 @@ impl Method {
     /// Resets the emulator (screens, history, modes, title) without touching
     /// the PTY or process. Acceptance means queued to the terminal owner.
     pub const SESSION_RESET_TERMINAL: &'static str = "session.reset_terminal";
+    /// Clear Screen and Scrollback for a local session (`SessionIdParams`).
+    /// Replies `{"sessionID", "cleared"}`; `cleared` is false while the
+    /// alternate screen shows. Remote sessions: `terminal_clear_unsupported`.
+    pub const SESSION_CLEAR_SCROLLBACK: &'static str = "session.clear_scrollback";
     /// Sets the palette local terminals answer color queries from
     /// ([`TerminalPalette`]). Engine-wide; the result is empty.
     pub const TERMINAL_SET_PALETTE: &'static str = "terminal.set_palette";
@@ -169,6 +173,9 @@ impl EventName {
     /// An Agent called `computer` before setup was finished
     /// (`ComputerSetupNeededEvent`). The app offers to finish it.
     pub const COMPUTER_SETUP_NEEDED: &'static str = "computer.setup_needed";
+    /// An Agent changed what the window shows
+    /// (`agent_action::AgentActionEvent`). The app names it in a notice.
+    pub const AGENT_ACTION: &'static str = "agent.action";
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -562,6 +569,13 @@ pub struct SessionSpawnParams {
     /// Absent keeps the manifest's launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub argv: Option<Vec<String>>,
+    /// For a command (an `argv`, or a `generic` kind's command line): keep its
+    /// tab after any exit, a clean one included. Without it a command's tab
+    /// closes on success and stays when it failed or was killed within
+    /// [`crate::QUICK_EXIT_MILLIS`]. Rejected for Agents and login shells,
+    /// whose tabs already outlive their programs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_open: Option<bool>,
 }
 
 /// The light or dark family of the terminal theme a Session is shown in.
@@ -711,9 +725,37 @@ pub struct SessionRenameParams {
     #[serde(rename = "sessionID")]
     pub session_id: SessionId,
     pub title: String,
+    /// Who is naming the session. Absent is the user (every older client),
+    /// whose name always lands and is never replaced by an Agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<RenameAuthor>,
 }
 
+/// Who asked for a [`SessionRenameParams`] rename besides the user.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RenameAuthor {
+    /// The session's own Agent naming it after its task. Refused over a
+    /// name the user or Diri gave, and while the setting is off.
+    Agent,
+    /// The Agent passing on a name the user asked it for: lands like an
+    /// explicit name, so later Agent names never replace it.
+    AgentForUser,
+}
+
+/// The user's rename answers `{}`; an Agent's says what happened.
 pub type SessionRenameResult = EmptyResult;
+
+/// What an Agent's rename did. `applied` false leaves the title as it was;
+/// `reason` says why: `userNamed`, `namingOff`, `invalid`, or `unchanged`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRenameResult {
+    pub applied: bool,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -831,6 +873,26 @@ impl<'de> Deserialize<'de> for ClientRole {
             _ => Self::Unknown,
         })
     }
+}
+
+/// `session.read_screen` parameters. Every option is additive and defaults
+/// off, so a bare `{"sessionID"}` request reads exactly as before: one line
+/// per visible row, trailing blanks and trailing empty rows removed.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadScreenParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    /// Join rows the terminal soft-wrapped at its width back into the one
+    /// line the program wrote, so URLs, paths and JSON arrive whole.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unwrap: bool,
+    /// Keep colours and text attributes as SGR escape sequences.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ansi: bool,
+    /// Read the retained history above the screen too, oldest first.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub scrollback: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

@@ -918,3 +918,136 @@ fn multi_chunk_redraw_timing() {
         p90.as_micros()
     );
 }
+
+/// Output nobody typed for, written to a held session's TTY from outside the
+/// way a background program prints, reaches an attached client as soon as it
+/// goes quiet. Before, a lone write waited out the whole 8 ms output batch for
+/// the empty poll that proved its burst had ended (9 ms at the median).
+#[test]
+fn unsolicited_output_reaches_the_client_without_waiting_out_the_batch() {
+    // Short root: Holder sockets live under it and must fit SUN_LEN.
+    let root = std::path::PathBuf::from(format!("/tmp/diri-lead-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("root");
+    let tty_file = root.join("tty");
+    let registry = Arc::new(Mutex::new(Registry::new(engine(), root.join("state.json"))));
+    let server = Arc::new(
+        ControlServer::new(Arc::clone(&registry), root.join("daemon.sock"))
+            .with_logs_dir(root.join("logs"))
+            .with_holder(diri_engine::session::HolderConfig {
+                holders_dir: root.join("holders"),
+                executable: env!("CARGO_BIN_EXE_diri-holder").into(),
+            }),
+    );
+    let listener = server.bind().expect("bind");
+    {
+        let server = Arc::clone(&server);
+        std::thread::spawn(move || {
+            while let Ok((stream, _)) = listener.accept() {
+                let server = Arc::clone(&server);
+                std::thread::spawn(move || {
+                    let _ = server.serve(stream);
+                });
+            }
+        });
+    }
+    let control = UnixStream::connect(server.socket_path()).expect("connect control");
+    let send = |message: &ControlMessage| {
+        let mut bytes = serde_json::to_vec(message).expect("encode");
+        bytes.push(b'\n');
+        (&control).write_all(&bytes).expect("write");
+    };
+    send(&ControlMessage::Request {
+        id: 1,
+        method: "session.spawn".into(),
+        params: Some(json!({
+            "kind": { "shell": {} },
+            "cwd": "/tmp",
+            "argv": [
+                "/bin/sh",
+                "-c",
+                format!("tty > '{}'; stty -echo; printf 'ready\\r\\n'; exec cat", tty_file.display()),
+            ],
+        })),
+    });
+    let id = {
+        use std::io::BufRead;
+        let mut reader = std::io::BufReader::new(control.try_clone().expect("clone"));
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("spawn reply");
+        match serde_json::from_str(&line).expect("decode") {
+            ControlMessage::Response {
+                result: Ok(result), ..
+            } => result["id"].as_str().expect("id").to_string(),
+            other => panic!("spawn failed: {other:?}"),
+        }
+    };
+    let mut data = UnixStream::connect(server.socket_path()).expect("connect data");
+    let mut attach = serde_json::to_vec(&json!({ "attach": id })).expect("encode");
+    attach.push(b'\n');
+    data.write_all(&attach).expect("attach");
+    let mut frames = FrameReader::new(data.try_clone().expect("clone data"));
+    frames.until("the seed grid", |frame| frame.frame_type == FrameType::Grid);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let tty = loop {
+        if let Ok(path) = std::fs::read_to_string(&tty_file)
+            && path.trim().starts_with("/dev/")
+        {
+            break path.trim().to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the child never reported its tty"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    frames.until("the ready line", |frame| {
+        frame.frame_type == FrameType::Grid
+            && frame
+                .grid_payload()
+                .ok()
+                .flatten()
+                .is_some_and(|update| grid_text(&update).contains("ready"))
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    let mut terminal = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&tty)
+        .expect("open tty");
+    let mut latencies = Vec::new();
+    let mut printed = String::new();
+    // The first writes warm up the Holder's output subscription, which the
+    // pump takes only once it has drained the log; they are not measured.
+    for index in 0..26 {
+        let byte = b'a' + (index % 26) as u8;
+        printed.push(char::from(byte));
+        let sent = Instant::now();
+        terminal.write_all(&[byte]).expect("tty write");
+        frames.until("the printed byte", |frame| {
+            frame.frame_type == FrameType::Grid
+                && frame.grid_payload().ok().flatten().is_some_and(|update| {
+                    grid_text(&update)
+                        .lines()
+                        .any(|line| line.trim_end() == printed)
+                })
+        });
+        if index >= 5 {
+            latencies.push(sent.elapsed());
+        }
+        // Paced, so every write starts after quiet.
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    send(&ControlMessage::Request {
+        id: 2,
+        method: "session.kill".into(),
+        params: Some(json!({ "sessionID": id })),
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = std::fs::remove_dir_all(&root);
+    let median = percentile(&mut latencies, 0.5);
+    eprintln!("unsolicited output: median {}us", median.as_micros());
+    assert!(
+        median <= Duration::from_millis(5),
+        "a lone write took {median:?} (median) to reach the client; it must not wait out the 8 ms batch"
+    );
+}

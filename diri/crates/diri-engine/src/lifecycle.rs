@@ -81,6 +81,7 @@ mod tests {
 
     fn record() -> SessionRecord {
         SessionRecord {
+            command_run: None,
             attention_state: None,
             id: SessionId::new("session"),
             kind: AgentKind::CODEX,
@@ -115,6 +116,7 @@ mod tests {
             pull_requests: None,
             listening_ports: None,
             foreground_agent: None,
+            foreground_program: None,
             terminal_cwd: None,
             agent_workspace: None,
             note_id: None,
