@@ -2908,6 +2908,11 @@ impl TerminalPane {
                     .filter(|plan| !plan.is_empty())
                     .map(|plan| plan.headline().into()),
                 importing_herdr: store.herdr().importing,
+                terminal_setup: store
+                    .terminal_setup()
+                    .plans()
+                    .first()
+                    .map(|plan| plan.source.name()),
             }
         };
         let canonical = Arc::clone(&self.runtime.store);

@@ -501,6 +501,10 @@ pub(crate) enum UtilitySurfacesEvent {
     RefreshUsageLimits,
     /// A What's New thumbnail was clicked: open the sheet on that highlight.
     ShowWhatsNew(usize),
+    /// Settings › General › Import: review another terminal's setup.
+    ShowTerminalImport,
+    /// Settings › General › Import: take the last import back.
+    UndoTerminalImport,
 }
 impl gpui::EventEmitter<UtilitySurfacesEvent> for UtilitySurfaces {}
 
@@ -1985,6 +1989,12 @@ impl UtilitySurfaces {
             self.refresh_release_notes(cx);
             self.load_whats_new_posters(cx);
         }
+        if self.settings_tab == SettingsTab::General {
+            self.store
+                .write()
+                .expect("session store lock poisoned")
+                .request_terminal_setup_scan();
+        }
         cx.notify();
     }
 
@@ -2087,10 +2097,9 @@ impl UtilitySurfaces {
             self.refresh_accounts(cx);
         }
         if tab == SettingsTab::General {
-            self.store
-                .write()
-                .expect("session store lock poisoned")
-                .request_herdr_scan();
+            let mut store = self.store.write().expect("session store lock poisoned");
+            store.request_herdr_scan();
+            store.request_terminal_setup_scan();
         }
         self.settings_search_active = false;
         if tab != SettingsTab::Usage {
@@ -11189,6 +11198,15 @@ mod tests {
                     .write()
                     .expect("preview store")
                     .set_herdr_plan(Some(plan));
+            }
+            // `DIRI_VISUAL_TERMINAL_SETUP=ghostty` seeds the Import section's
+            // terminal row with a scan of that test fixture.
+            if let Ok(fixture) = std::env::var("DIRI_VISUAL_TERMINAL_SETUP") {
+                runtime
+                    .store
+                    .write()
+                    .expect("preview store")
+                    .set_terminal_setup_scan(crate::terminal_import::fixture_scan(&fixture));
             }
             if std::env::var_os("DIRI_VISUAL_LIGHT").is_some() {
                 runtime

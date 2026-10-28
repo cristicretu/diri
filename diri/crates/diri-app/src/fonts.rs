@@ -52,6 +52,14 @@ pub fn terminal_family(configured: &str) -> &str {
     if usable { configured } else { mono_family() }
 }
 
+/// The installed family a configured name (a family, or a PostScript face
+/// name such as `JetBrainsMono-Regular`) means, if any.
+pub fn installed_family(name: &str) -> Option<String> {
+    let installed = installed();
+    let names = installed.as_ref()?;
+    crate::terminal_import::match_font_family(name, names.iter().map(String::as_str))
+}
+
 /// The terminal font for a stored family preference (empty = default).
 /// Called on every terminal frame, so the last answer is reused.
 pub fn terminal_font(configured: &str) -> Font {
