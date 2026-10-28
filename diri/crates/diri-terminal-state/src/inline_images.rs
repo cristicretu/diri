@@ -55,7 +55,7 @@ const MAX_SEQUENCE_BYTES: usize = MAX_IMAGE_BYTES / 3 * 4 + 64 * 1024;
 /// monospace face at 2x. Only the size images are given in cells depends on
 /// it; clients fit each image into its cell box at whatever cell size they
 /// draw.
-pub const DEFAULT_CELL_PIXELS: (u16, u16) = (16, 34);
+pub const DEFAULT_CELL_PIXELS: (u16, u16) = diri_proto::terminal::NOMINAL_CELL_PIXELS;
 
 const KITTY_PREFIX: &[u8] = b"\x1b_G";
 const ITERM_PREFIX: &[u8] = b"\x1b]1337;";

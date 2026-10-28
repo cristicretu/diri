@@ -39,6 +39,16 @@ impl LiveWorkspace {
     }
 
     pub(crate) fn start_with_agent_script(script: &str, agent: diri_proto::AgentKind) -> Self {
+        Self::start_with_options(script, agent, None)
+    }
+
+    /// `holder`: run each session under a real Holder (sockets under its
+    /// short `holders_dir`) instead of the direct PTY path.
+    pub(crate) fn start_with_options(
+        script: &str,
+        agent: diri_proto::AgentKind,
+        holder: Option<diri_engine::session::HolderConfig>,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("engine.sock");
         let state = directory.path().join("state.json");
@@ -66,7 +76,7 @@ impl LiveWorkspace {
                         manifest_id: agent.id().into(),
                         authority: Authority::ProcessOnly,
                         logs_dir: directory.path().join("logs"),
-                        holder: None,
+                        holder: holder.clone(),
                         remote: None,
                         defer_launch: false,
                     },

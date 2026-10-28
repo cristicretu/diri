@@ -21,6 +21,11 @@ path = "tests/find_native_appkit.rs"
 harness = false
 
 [[test]]
+name = "app_photon_appkit"
+path = "tests/app_photon_appkit.rs"
+harness = false
+
+[[test]]
 name = "terminal_accessibility_appkit"
 path = "tests/terminal_accessibility_appkit.rs"
 harness = false

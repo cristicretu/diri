@@ -48,6 +48,8 @@
   "settings.appearance.mode_system": "跟随系统",
   "settings.appearance.paste_protection": "粘贴命令前确认",
   "settings.appearance.paste_protection_detail": "向 shell 粘贴多行内容或含控制字符的文本前先询问。",
+  "settings.appearance.reduce_motion": "减弱动态效果",
+  "settings.appearance.reduce_motion_detail": "关闭 Diri 的动画。在“系统设置 › 辅助功能”中开启“减弱动态效果”时也会关闭。",
   "settings.appearance.regular_face": "常规字重",
   "settings.appearance.shell_integration": "Shell 集成",
   "settings.appearance.shell_integration_detail": "在新终端中标记 zsh 和 bash 的提示符与命令结果。更改后打开的终端生效。",

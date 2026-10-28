@@ -460,6 +460,16 @@ checkpoint or protocol change. Test:
 `lines_after_narrowing_a_full_history_cost_what_they_did_before`
 (`diri-terminal-state`); probe: `--bench narrow_history`.
 
+## SGR-Pixels mouse (DECSET 1016)
+
+`TermMode::SGR_PIXEL_MOUSE` (bit 26) records DECSET 1016. It is one of the
+mutually exclusive mouse encodings, as in xterm: setting 1005, 1006 or 1016
+clears the other two, and resetting 1016 leaves the legacy X10 encoding.
+DECRQM answers `1`/`2` for it (it was recognized only to answer `4`). The
+mode is state only; the host encodes the reports. RIS clears it with the rest
+of the mode bits. Mode 69 (DECLRMM) still answers `4`: left and right margins
+are not implemented.
+
 ## Reply helpers for core v2
 
 `term::xtgettcap_reply`, `term::da2_version`, `term::osc52_store_text` and

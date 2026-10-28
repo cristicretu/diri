@@ -1367,7 +1367,9 @@ impl HeadlessScreen {
         } else {
             MouseTrackingMode::Off
         };
-        let encoding = if mode.contains(TermMode::SGR_MOUSE) {
+        let encoding = if mode.contains(TermMode::SGR_PIXEL_MOUSE) {
+            MouseEncoding::SgrPixels
+        } else if mode.contains(TermMode::SGR_MOUSE) {
             MouseEncoding::Sgr
         } else {
             MouseEncoding::Legacy
@@ -1768,8 +1770,10 @@ impl HeadlessScreen {
         if let Some(mode) = mouse.tracking.dec_private_mode() {
             bytes.extend_from_slice(format!("\x1b[?{mode}h").as_bytes());
         }
-        if matches!(mouse.encoding, MouseEncoding::Sgr) {
-            bytes.extend_from_slice(b"\x1b[?1006h");
+        match mouse.encoding {
+            MouseEncoding::Sgr => bytes.extend_from_slice(b"\x1b[?1006h"),
+            MouseEncoding::SgrPixels => bytes.extend_from_slice(b"\x1b[?1016h"),
+            MouseEncoding::Legacy | MouseEncoding::Unknown => {}
         }
         bytes.extend_from_slice(if update.cursor_visible {
             b"\x1b[?25h"
@@ -4917,6 +4921,41 @@ mod tests {
             MouseModes::new(MouseTrackingMode::Off, MouseEncoding::Sgr),
             "1006 is independent of tracking"
         );
+    }
+
+    /// DECSET 1016 is one of the exclusive mouse encodings, set, reset and
+    /// reported like the others (DECRQM `1`/`2`, not the `4` it answered
+    /// when it was only recognized), and survives a checkpoint restore.
+    #[test]
+    fn sgr_pixel_mouse_is_an_exclusive_encoding_reported_and_restored() {
+        let mut screen = HeadlessScreen::new(80, 24);
+        let modes = |screen: &mut HeadlessScreen| {
+            screen.feed(b"\x1b[?1006$p\x1b[?1016$p");
+            String::from_utf8(screen.take_replies()).unwrap()
+        };
+        assert_eq!(modes(&mut screen), "\x1b[?1006;2$y\x1b[?1016;2$y");
+        screen.feed(b"\x1b[?1002h\x1b[?1006h\x1b[?1016h");
+        assert_eq!(
+            screen.mouse_modes(),
+            MouseModes::new(MouseTrackingMode::ButtonMotion, MouseEncoding::SgrPixels)
+        );
+        assert_eq!(modes(&mut screen), "\x1b[?1006;2$y\x1b[?1016;1$y");
+
+        let snapshot = screen.full_snapshot();
+        let mut restored = HeadlessScreen::new(80, 24);
+        assert!(restored.restore(&[], &snapshot, false, false, screen.mouse_modes()));
+        assert_eq!(restored.mouse_modes(), screen.mouse_modes());
+
+        screen.feed(b"\x1b[?1006h");
+        assert_eq!(
+            screen.mouse_modes().encoding,
+            MouseEncoding::Sgr,
+            "last set wins"
+        );
+        screen.feed(b"\x1b[?1016h\x1b[?1016l");
+        assert_eq!(screen.mouse_modes().encoding, MouseEncoding::Legacy);
+        screen.feed(b"\x1b[?1016h\x1bc");
+        assert_eq!(screen.mouse_modes(), MouseModes::OFF, "RIS clears it");
     }
 
     /// Wheel bytes per mode, as a reference xterm-compatible emulator sends
