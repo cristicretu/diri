@@ -328,6 +328,35 @@ impl HolderOutputStream {
         Ok(())
     }
 
+    /// The socket to wait on for the next frame, or `None` when bytes are
+    /// already buffered here and a read would not block at all.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn wait_descriptor(&self) -> Option<i32> {
+        use std::os::fd::AsRawFd;
+        self.stream
+            .buffer()
+            .is_empty()
+            .then(|| self.stream.get_ref().as_raw_fd())
+    }
+
+    /// Swaps the read buffer for a fresh one once the stream is idle and the
+    /// buffer empty. A burst touches every page of the old buffer; the new
+    /// allocation costs no memory until the next burst reads into it.
+    pub fn release_idle_buffer(&mut self) {
+        if !self.stream.buffer().is_empty() {
+            return;
+        }
+        let Ok(placeholder) = self.stream.get_ref().try_clone() else {
+            return;
+        };
+        let old = std::mem::replace(
+            &mut self.stream,
+            std::io::BufReader::with_capacity(0, placeholder),
+        );
+        self.stream = std::io::BufReader::with_capacity(OUTPUT_READ_BUFFER, old.into_inner());
+    }
+
     /// Whether the Holder honoured the resume offset: the stream then starts
     /// there, or at the oldest byte the log still keeps if that is later, and
     /// the Holder will not drop it for being behind while it keeps reading.

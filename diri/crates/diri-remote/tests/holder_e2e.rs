@@ -2197,8 +2197,17 @@ fn continuous_output_stays_capped_at_one_publication_per_interval() {
 /// The leading edge never publishes a repaint caught between its erase and
 /// its redraw: output that removed content keeps the whole coalescing
 /// interval for the redraw to arrive, as before.
+///
+/// The redraw follows the erase by 3 ms, but a shared CI runner can stall
+/// this writer (or the Holder) past the 8 ms interval, and then publishing
+/// the erase alone is correct. So every attempt checks the invariant that
+/// holds regardless of scheduling (an erase published alone was held for the
+/// whole interval), and the repaint must be folded whole in at least one
+/// attempt, which it never is without the hold.
 #[test]
 fn an_erase_waits_for_its_redraw_instead_of_the_leading_edge() {
+    const INTERVAL: Duration = Duration::from_millis(8);
+    const ATTEMPTS: usize = 10;
     let temporary = tempfile::tempdir_in("/tmp").expect("temp");
     let state_dir = temporary.path().join("state");
     let (mut attach, tty, selector) = quiet_tty_holder(&state_dir, "erase-hold");
@@ -2206,25 +2215,48 @@ fn an_erase_waits_for_its_redraw_instead_of_the_leading_edge() {
         .write(true)
         .open(&tty)
         .expect("open tty");
-    terminal.write_all(b"before\r\n").expect("tty write");
-    attach.receive_until(Duration::from_secs(2), |message| {
-        !matches!(message, RemoteMessage::Terminal(_)) && message_contains(message, "before")
-    });
-    std::thread::sleep(Duration::from_millis(50));
-    // Clear, then redraw 3 ms later: past the quiet window, inside the
-    // interval.
-    terminal.write_all(b"\x1b[2J\x1b[H").expect("tty write");
-    std::thread::sleep(Duration::from_millis(3));
-    terminal.write_all(b"redrawn\r\n").expect("tty write");
-    let first = attach.receive_until(Duration::from_secs(2), |message| {
-        matches!(
-            message,
-            RemoteMessage::GridDelta(_) | RemoteMessage::FullSnapshot(_)
-        )
-    });
+    let mut outcomes = Vec::new();
+    for attempt in 0..ATTEMPTS {
+        let before = format!("before {attempt}");
+        let redrawn = format!("redrawn {attempt}");
+        write!(terminal, "{before}\r\n").expect("tty write");
+        attach.receive_until(Duration::from_secs(2), |message| {
+            !matches!(message, RemoteMessage::Terminal(_)) && message_contains(message, &before)
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        while attach.messages.try_recv().is_ok() {}
+        // Clear, then redraw 3 ms later: past the quiet window, inside the
+        // interval. Spin rather than sleep, so timer slack cannot stretch
+        // the gap.
+        let erased_at = Instant::now();
+        terminal.write_all(b"\x1b[2J\x1b[H").expect("tty write");
+        while erased_at.elapsed() < Duration::from_millis(3) {
+            std::hint::spin_loop();
+        }
+        write!(terminal, "{redrawn}\r\n").expect("tty write");
+        let gap = erased_at.elapsed();
+        let first = attach.receive_until(Duration::from_secs(2), |message| {
+            matches!(
+                message,
+                RemoteMessage::GridDelta(_) | RemoteMessage::FullSnapshot(_)
+            )
+        });
+        let received = erased_at.elapsed();
+        let whole = message_contains(first.last().expect("a publication"), &redrawn);
+        assert!(
+            whole || received >= INTERVAL,
+            "the erased half of a repaint was published on its own {received:?} after the \
+             erase, inside the {INTERVAL:?} interval (redraw written after {gap:?})"
+        );
+        outcomes.push((gap, received, whole));
+        if whole {
+            break;
+        }
+    }
     let _: SessionInspection = run_json("kill", &state_dir, Some(&selector));
     assert!(
-        message_contains(first.last().expect("a publication"), "redrawn"),
-        "the erased half of a repaint was published on its own"
+        outcomes.iter().any(|(_, _, whole)| *whole),
+        "the erased half of a repaint was published on its own in every attempt \
+         (redraw gap, publication received): {outcomes:?}"
     );
 }

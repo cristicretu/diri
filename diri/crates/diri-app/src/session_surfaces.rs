@@ -2804,7 +2804,7 @@ mod tests {
                     div().flex_1().pt(px(2.0)).pb(px(10.0)).px(px(12.0)).child(
                         self.page
                             .clone()
-                            .font(crate::fonts::terminal_font(""))
+                            .font(crate::fonts::terminal_font("", true))
                             .font_size(px(13.0))
                             .theme(theme),
                     ),

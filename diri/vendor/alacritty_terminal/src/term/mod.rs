@@ -86,12 +86,12 @@ bitflags! {
         const REPORT_ALTERNATE_KEYS   = 1 << 20;
         const REPORT_ALL_KEYS_AS_ESC  = 1 << 21;
         const REPORT_ASSOCIATED_TEXT  = 1 << 22;
-        /// DECSET 2027: grapheme cluster widths by the clustering rule.
-        const GRAPHEME_CLUSTERING     = 1 << 25;
         /// DIRI PATCH: DECSET 2031, color-scheme change reports.
         const COLOR_SCHEME_UPDATES    = 1 << 23;
         /// DIRI PATCH: DECSET 2048, in-band resize reports.
         const IN_BAND_RESIZE          = 1 << 24;
+        /// DECSET 2027: grapheme cluster widths by the clustering rule.
+        const GRAPHEME_CLUSTERING     = 1 << 25;
         const MOUSE_MODE              = Self::MOUSE_REPORT_CLICK.bits() | Self::MOUSE_MOTION.bits() | Self::MOUSE_DRAG.bits();
         const KITTY_KEYBOARD_PROTOCOL = Self::DISAMBIGUATE_ESC_CODES.bits()
                                       | Self::REPORT_EVENT_TYPES.bits()
@@ -430,6 +430,11 @@ pub struct Term<T> {
     /// Modified terminal colors.
     colors: Colors,
 
+    /// DIRI PATCH: advances whenever a color cells are painted with (0–255
+    /// and the default foreground and background) changes, so a recolor that
+    /// moves no cell is still noticed.
+    colors_generation: u64,
+
     /// Current style of the cursor.
     cursor_style: Option<CursorStyle>,
 
@@ -521,6 +526,46 @@ pub enum Osc52 {
 }
 
 impl<T> Term<T> {
+    /// Release the primary grid's history caches once output is idle.
+    #[cfg(feature = "compact-history")]
+    pub fn release_idle_history(&mut self) {
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            self.inactive_grid
+                .as_mut()
+                .expect("primary grid")
+                .release_idle_history();
+        } else {
+            self.grid.release_idle_history();
+        }
+    }
+
+    /// DIRI PATCH: history rows of the primary screen, also while the
+    /// alternate screen is shown.
+    pub fn primary_history_size(&self) -> usize {
+        match (
+            &self.inactive_grid,
+            self.mode.contains(TermMode::ALT_SCREEN),
+        ) {
+            (Some(primary), true) => primary.history_size(),
+            _ => self.grid.history_size(),
+        }
+    }
+
+    /// DIRI PATCH: changes only the history row limit, as `set_options` does
+    /// for `scrolling_history`, without its damage and title side effects. A
+    /// lower limit drops the oldest rows; the limit survives a reset.
+    pub fn set_scrolling_history(&mut self, limit: usize) {
+        self.config.scrolling_history = limit;
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            self.inactive_grid
+                .as_mut()
+                .expect("alternate screen retains the primary grid")
+                .update_history(limit);
+        } else {
+            self.grid.update_history(limit);
+        }
+    }
+
     /// Bound primary history to `budget` stored bytes. The configured
     /// `scrolling_history` is only a ceiling: see
     /// [`Grid::bound_history_storage`].
@@ -605,6 +650,7 @@ impl<T> Term<T> {
             vi_mode_cursor: Default::default(),
             cursor_style: Default::default(),
             colors: color::Colors::default(),
+            colors_generation: 0,
             title_stack: Default::default(),
             is_focused: Default::default(),
             #[cfg(test)]
@@ -1291,6 +1337,12 @@ impl<T> Term<T> {
 
     pub fn colors(&self) -> &Colors {
         &self.colors
+    }
+
+    /// DIRI PATCH: see `colors_generation`. The cursor color does not count;
+    /// no cell is painted with it.
+    pub fn colors_generation(&self) -> u64 {
+        self.colors_generation
     }
 
     /// Insert a linebreak at the current cursor position.
@@ -2449,6 +2501,7 @@ impl<T: EventListener> Handler for Term<T> {
         // Damage terminal if the color changed and it's not the cursor.
         if index != NamedColor::Cursor as usize && self.colors[index] != Some(color) {
             self.mark_fully_damaged();
+            self.colors_generation += 1;
         }
 
         self.colors[index] = Some(color);
@@ -2479,6 +2532,7 @@ impl<T: EventListener> Handler for Term<T> {
         // Damage terminal if the color changed and it's not the cursor.
         if index != NamedColor::Cursor as usize && self.colors[index].is_some() {
             self.mark_fully_damaged();
+            self.colors_generation += 1;
         }
 
         self.colors[index] = None;
@@ -2644,6 +2698,12 @@ impl<T: EventListener> Handler for Term<T> {
         // DIRI PATCH: RIS resets the title too; listeners track it by event.
         if self.title.take().is_some() {
             self.event_proxy.send_event(Event::ResetTitle);
+        }
+        // DIRI PATCH: and the colors a program set with OSC 4/10/11/12, as
+        // xterm and libghostty do: `reset` restores the configured palette.
+        if (0..color::COUNT).any(|index| self.colors[index].is_some()) {
+            self.colors = color::Colors::default();
+            self.colors_generation += 1;
         }
         self.selection = None;
         self.vi_mode_cursor = Default::default();

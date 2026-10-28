@@ -180,6 +180,9 @@ pub enum TerminalMouseEvent {
     Motion(Option<TerminalMouseButton>),
     WheelUp,
     WheelDown,
+    /// Horizontal wheel (xterm buttons 6 and 7, reported as 66 and 67).
+    WheelLeft,
+    WheelRight,
 }
 
 impl TerminalMouseEvent {
@@ -190,6 +193,8 @@ impl TerminalMouseEvent {
             Self::Motion(None) => 35,
             Self::WheelUp => 64,
             Self::WheelDown => 65,
+            Self::WheelLeft => 66,
+            Self::WheelRight => 67,
         }
     }
 
@@ -253,6 +258,24 @@ pub fn encode_mouse_event(
         }
         MouseEncoding::Unknown => None,
     }
+}
+
+/// Encodes `count` identical wheel reports (one per scrolled line), the way
+/// xterm reports each wheel step as its own button press. Empty when the
+/// program has not asked for reports or the coordinate cannot be encoded.
+#[must_use]
+pub fn encode_mouse_wheel(
+    modes: MouseModes,
+    event: TerminalMouseEvent,
+    modifiers: TerminalMouseModifiers,
+    col: u16,
+    row: u16,
+    count: usize,
+) -> Vec<u8> {
+    let Some(report) = encode_mouse_event(modes, event, modifiers, col, row) else {
+        return Vec::new();
+    };
+    report.repeat(count)
 }
 
 #[cfg(test)]
@@ -378,6 +401,107 @@ mod tests {
             ),
             Some(b"\x1b[<43;10;5M".to_vec())
         );
+    }
+
+    /// Bytes a reference xterm-compatible emulator sent a program reading
+    /// its raw input, for the same events, in a 320x90 grid.
+    #[test]
+    fn reports_match_the_reference_bytes_for_each_supported_mode() {
+        use TerminalMouseButton::{Left, Middle, Right};
+        use TerminalMouseEvent::{
+            Motion, Press, Release, WheelDown, WheelLeft, WheelRight, WheelUp,
+        };
+        let none = TerminalMouseModifiers::default();
+        let ctrl = TerminalMouseModifiers {
+            control: true,
+            ..none
+        };
+        let alt = TerminalMouseModifiers { alt: true, ..none };
+        let shift = TerminalMouseModifiers {
+            shift: true,
+            ..none
+        };
+        let all = TerminalMouseModifiers {
+            shift: true,
+            alt: true,
+            control: true,
+        };
+        let legacy = MouseModes::new(MouseTrackingMode::ButtonEvents, MouseEncoding::Legacy);
+        let sgr = MouseModes::new(MouseTrackingMode::ButtonEvents, MouseEncoding::Sgr);
+        let drag_sgr = MouseModes::new(MouseTrackingMode::ButtonMotion, MouseEncoding::Sgr);
+        let any_sgr = MouseModes::new(MouseTrackingMode::AnyMotion, MouseEncoding::Sgr);
+        let any_legacy = MouseModes::new(MouseTrackingMode::AnyMotion, MouseEncoding::Legacy);
+        type Case = (
+            MouseModes,
+            TerminalMouseEvent,
+            TerminalMouseModifiers,
+            u16,
+            u16,
+            &'static [u8],
+        );
+        let cases: &[Case] = &[
+            (sgr, Press(Left), none, 3, 4, b"\x1b[<0;4;5M"),
+            (sgr, Release(Left), none, 3, 4, b"\x1b[<0;4;5m"),
+            (sgr, Press(Middle), none, 3, 4, b"\x1b[<1;4;5M"),
+            (sgr, Release(Right), none, 3, 4, b"\x1b[<2;4;5m"),
+            (sgr, Press(Middle), ctrl, 3, 4, b"\x1b[<17;4;5M"),
+            (sgr, Release(Middle), ctrl, 3, 4, b"\x1b[<17;4;5m"),
+            (sgr, Press(Middle), alt, 3, 4, b"\x1b[<9;4;5M"),
+            (sgr, Press(Middle), all, 3, 4, b"\x1b[<29;4;5M"),
+            (sgr, Press(Right), shift, 3, 4, b"\x1b[<6;4;5M"),
+            (sgr, WheelUp, none, 3, 4, b"\x1b[<64;4;5M"),
+            (sgr, WheelDown, none, 3, 4, b"\x1b[<65;4;5M"),
+            (sgr, WheelLeft, none, 3, 4, b"\x1b[<66;4;5M"),
+            (sgr, WheelRight, none, 3, 4, b"\x1b[<67;4;5M"),
+            (sgr, WheelDown, ctrl, 3, 4, b"\x1b[<81;4;5M"),
+            (sgr, WheelUp, shift, 3, 4, b"\x1b[<68;4;5M"),
+            (sgr, WheelDown, alt, 3, 4, b"\x1b[<73;4;5M"),
+            (sgr, Press(Middle), none, 0, 0, b"\x1b[<1;1;1M"),
+            (sgr, Press(Middle), none, 223, 0, b"\x1b[<1;224;1M"),
+            (sgr, Release(Middle), none, 300, 89, b"\x1b[<1;301;90m"),
+            (sgr, WheelDown, none, 300, 89, b"\x1b[<65;301;90M"),
+            (drag_sgr, Motion(Some(Left)), none, 8, 8, b"\x1b[<32;9;9M"),
+            (drag_sgr, Motion(Some(Left)), alt, 9, 8, b"\x1b[<40;10;9M"),
+            (any_sgr, Motion(None), none, 7, 8, b"\x1b[<35;8;9M"),
+            (any_sgr, Motion(Some(Right)), none, 9, 8, b"\x1b[<34;10;9M"),
+            (legacy, Press(Left), none, 3, 4, b"\x1b[M $%"),
+            (legacy, Release(Left), none, 3, 4, b"\x1b[M#$%"),
+            (legacy, Press(Middle), ctrl, 3, 4, b"\x1b[M1$%"),
+            (legacy, Release(Middle), ctrl, 3, 4, b"\x1b[M3$%"),
+            (legacy, Press(Middle), all, 3, 4, b"\x1b[M=$%"),
+            (legacy, Release(Middle), all, 3, 4, b"\x1b[M?$%"),
+            (legacy, Release(Right), shift, 3, 4, b"\x1b[M'$%"),
+            (legacy, WheelUp, none, 3, 4, b"\x1b[M`$%"),
+            (legacy, WheelLeft, none, 3, 4, b"\x1b[Mb$%"),
+            (legacy, WheelRight, none, 3, 4, b"\x1b[Mc$%"),
+            (legacy, WheelDown, ctrl, 3, 4, b"\x1b[Mq$%"),
+            (legacy, WheelUp, shift, 3, 4, b"\x1b[Md$%"),
+            (legacy, WheelDown, alt, 3, 4, b"\x1b[Mi$%"),
+            (legacy, Press(Middle), none, 94, 0, b"\x1b[M!\x7f!"),
+            (legacy, Press(Middle), none, 95, 0, b"\x1b[M!\x80!"),
+            (legacy, Press(Middle), none, 222, 0, b"\x1b[M!\xff!"),
+            (any_legacy, Motion(None), none, 7, 8, b"\x1b[MC()"),
+            (any_legacy, Motion(Some(Left)), alt, 9, 8, b"\x1b[MH*)"),
+        ];
+        for &(modes, event, modifiers, col, row, expected) in cases {
+            assert_eq!(
+                encode_mouse_event(modes, event, modifiers, col, row).as_deref(),
+                Some(expected),
+                "{modes:?} {event:?} {modifiers:?} at {col},{row}"
+            );
+        }
+        // Neither emulator can name a column past 223 in the legacy encoding.
+        for (col, row) in [(223, 0), (300, 89), (0, 223)] {
+            assert_eq!(
+                encode_mouse_event(legacy, Press(Middle), none, col, row),
+                None
+            );
+        }
+        assert_eq!(
+            encode_mouse_wheel(sgr, WheelLeft, ctrl, 3, 4, 2),
+            b"\x1b[<82;4;5M\x1b[<82;4;5M".to_vec()
+        );
+        assert!(encode_mouse_wheel(MouseModes::OFF, WheelUp, none, 3, 4, 2).is_empty());
     }
 
     #[test]

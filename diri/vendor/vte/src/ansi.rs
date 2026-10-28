@@ -402,6 +402,15 @@ impl<T: Timeout> Processor<T> {
         }
     }
 
+    /// DIRI PATCH: give back the synchronized-update buffer's capacity
+    /// while no update is open. A repaint can grow it to megabytes, and an
+    /// idle terminal would otherwise keep that allocation forever.
+    pub fn release_idle_buffers(&mut self) {
+        if self.state.sync_state.buffer.is_empty() {
+            self.state.sync_state.buffer = Vec::new();
+        }
+    }
+
     /// Number of bytes in the synchronization buffer.
     #[inline]
     pub fn sync_bytes_count(&self) -> usize {
@@ -1012,13 +1021,13 @@ impl PrivateMode {
             1049 => Self::Named(NamedPrivateMode::SwapScreenAndSetRestoreCursor),
             2004 => Self::Named(NamedPrivateMode::BracketedPaste),
             2026 => Self::Named(NamedPrivateMode::SyncUpdate),
-            2027 => Self::Named(NamedPrivateMode::GraphemeClustering),
             47 => Self::Named(NamedPrivateMode::LegacyAltScreen),
             69 => Self::Named(NamedPrivateMode::LeftRightMargins),
             1016 => Self::Named(NamedPrivateMode::SgrPixelMouse),
             1047 => Self::Named(NamedPrivateMode::ClearingAltScreen),
             2031 => Self::Named(NamedPrivateMode::ColorSchemeUpdates),
             2048 => Self::Named(NamedPrivateMode::InBandResize),
+            2027 => Self::Named(NamedPrivateMode::GraphemeClustering),
             _ => Self::Unknown(mode),
         }
     }
@@ -1070,9 +1079,6 @@ pub enum NamedPrivateMode {
     BracketedPaste = 2004,
     /// The mode is handled automatically by [`Processor`].
     SyncUpdate = 2026,
-    /// Grapheme cluster widths by the first codepoint and variation
-    /// selectors, instead of the default `stringWidth`-compatible rule.
-    GraphemeClustering = 2027,
     /// DIRI PATCH: xterm's legacy alternate screen. The cursor is shared and
     /// neither screen is cleared.
     LegacyAltScreen = 47,
@@ -1090,6 +1096,9 @@ pub enum NamedPrivateMode {
     ColorSchemeUpdates = 2031,
     /// DIRI PATCH: in-band window resize notifications (`CSI 48 ; … t`).
     InBandResize = 2048,
+    /// Grapheme cluster widths by the first codepoint and variation
+    /// selectors, instead of the default `stringWidth`-compatible rule.
+    GraphemeClustering = 2027,
 }
 
 /// Mode for clearing line.

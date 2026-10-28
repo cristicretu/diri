@@ -30,6 +30,112 @@ impl UiLanguage {
     }
 }
 
+/// Where one kind of session news is announced, besides the session's own
+/// row: a system notification (only while Diri is in the background), a
+/// sound, the Dock badge, and one bounce of the Dock icon (also only in the
+/// background).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AttentionRoute {
+    pub notify: bool,
+    pub sound: bool,
+    pub badge: bool,
+    pub bounce: bool,
+}
+
+impl Default for AttentionRoute {
+    fn default() -> Self {
+        Self {
+            notify: true,
+            sound: true,
+            badge: true,
+            bounce: false,
+        }
+    }
+}
+
+/// Per-state routing. Working has no entry: it only ever marks the row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", from = "RawAttentionRoutes")]
+pub struct AttentionRoutes {
+    /// A permission prompt or question is waiting.
+    pub blocked: AttentionRoute,
+    /// The program failed or exited with an error.
+    pub error: AttentionRoute,
+    /// A turn finished.
+    pub done: AttentionRoute,
+}
+
+impl Default for AttentionRoutes {
+    /// Every channel on, except the Dock bounce, which only a session that
+    /// is waiting on you earns.
+    fn default() -> Self {
+        Self {
+            blocked: AttentionRoute {
+                bounce: true,
+                ..AttentionRoute::default()
+            },
+            error: AttentionRoute::default(),
+            done: AttentionRoute::default(),
+        }
+    }
+}
+
+/// [`AttentionRoutes`] as stored, so a channel missing from saved prefs takes
+/// its own state's default (a blocked route saved before the bounce channel
+/// existed still bounces).
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct RawAttentionRoutes {
+    blocked: RawAttentionRoute,
+    error: RawAttentionRoute,
+    done: RawAttentionRoute,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct RawAttentionRoute {
+    notify: Option<bool>,
+    sound: Option<bool>,
+    badge: Option<bool>,
+    bounce: Option<bool>,
+}
+
+impl RawAttentionRoute {
+    fn or(self, default: AttentionRoute) -> AttentionRoute {
+        AttentionRoute {
+            notify: self.notify.unwrap_or(default.notify),
+            sound: self.sound.unwrap_or(default.sound),
+            badge: self.badge.unwrap_or(default.badge),
+            bounce: self.bounce.unwrap_or(default.bounce),
+        }
+    }
+}
+
+impl From<RawAttentionRoutes> for AttentionRoutes {
+    fn from(raw: RawAttentionRoutes) -> Self {
+        let defaults = Self::default();
+        Self {
+            blocked: raw.blocked.or(defaults.blocked),
+            error: raw.error.or(defaults.error),
+            done: raw.done.or(defaults.done),
+        }
+    }
+}
+
+/// What the Dock badge counts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DockBadge {
+    /// Sessions that are blocked, failed or finished and not looked at yet:
+    /// one per session however many notifications it posted.
+    #[default]
+    Sessions,
+    /// Every unread entry in the notification inbox (the behavior before
+    /// per-session counting).
+    Notifications,
+}
+
 /// Who listens for a spoken answer after a reading.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -212,6 +318,74 @@ impl PaneDensity {
     }
 }
 
+/// The terminal cursor's resting shape. A name this build does not know
+/// reads as a block.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CursorShapePref {
+    Bar,
+    Underline,
+    #[default]
+    #[serde(other)]
+    Block,
+}
+
+impl CursorShapePref {
+    pub const ALL: [Self; 3] = [Self::Block, Self::Bar, Self::Underline];
+
+    pub const fn shape(self) -> diri_proto::grid::CursorShape {
+        match self {
+            Self::Block => diri_proto::grid::CursorShape::Block,
+            Self::Bar => diri_proto::grid::CursorShape::Bar,
+            Self::Underline => diri_proto::grid::CursorShape::Underline,
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        crate::i18n::t(match self {
+            Self::Block => "cursor.shape.block",
+            Self::Bar => "cursor.shape.bar",
+            Self::Underline => "cursor.shape.underline",
+        })
+    }
+}
+
+/// How fast the terminal cursor blinks once the user stops typing. A name
+/// this build does not know reads as normal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CursorBlinkPref {
+    Off,
+    Slow,
+    Fast,
+    #[default]
+    #[serde(other)]
+    Normal,
+}
+
+impl CursorBlinkPref {
+    pub const ALL: [Self; 4] = [Self::Off, Self::Slow, Self::Normal, Self::Fast];
+
+    pub const fn rate(self) -> diri_term::cursor_motion::BlinkRate {
+        use diri_term::cursor_motion::BlinkRate;
+        match self {
+            Self::Off => BlinkRate::Off,
+            Self::Slow => BlinkRate::Slow,
+            Self::Normal => BlinkRate::Normal,
+            Self::Fast => BlinkRate::Fast,
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        crate::i18n::t(match self {
+            Self::Off => "cursor.blink.off",
+            Self::Slow => "cursor.blink.slow",
+            Self::Normal => "cursor.blink.normal",
+            Self::Fast => "cursor.blink.fast",
+        })
+    }
+}
+
 /// Where a new Agent opened from a project (⌘T, New Agent) starts. Stored
 /// per project; a missing entry, or a name this build does not know, is the
 /// current checkout, which is what every project did before the choice.
@@ -240,6 +414,27 @@ pub enum FileEditor {
     DefaultApp,
     /// The first of Cursor, VS Code and Zed that is installed, otherwise the
     /// file's default app. Last because serde's catch-all must be.
+    #[default]
+    #[serde(other)]
+    Automatic,
+}
+
+/// Which Option keys a terminal treats as Meta (`ESC` + key, readline's
+/// `M-b`) rather than as the key that types the layout's characters.
+/// Stored by name; an unknown name reads as `Automatic`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OptionAsMeta {
+    /// Left Option is Meta, right Option types characters.
+    Left,
+    /// Right Option is Meta, left Option types characters.
+    Right,
+    /// Both Option keys are Meta.
+    Both,
+    /// Neither: Option types the layout's characters.
+    Off,
+    /// Meta on US layouts, characters on layouts that need Option to type
+    /// ASCII. Last because serde's catch-all must be.
     #[default]
     #[serde(other)]
     Automatic,
@@ -412,6 +607,26 @@ fn terminal_follows_last_directory_default() -> bool {
     true
 }
 
+fn terminal_ligatures_default() -> bool {
+    true
+}
+
+const fn terminal_font_weight_default() -> u16 {
+    400
+}
+
+const fn terminal_bold_weight_default() -> u16 {
+    700
+}
+
+const fn terminal_cell_width_default() -> u16 {
+    100
+}
+
+const fn terminal_font_smoothing_default() -> bool {
+    true
+}
+
 /// A style this build does not know, written by a newer diri, reads as
 /// unset (the material decides) rather than failing the whole file.
 fn deserialize_interface_style<'de, D: Deserializer<'de>>(
@@ -449,6 +664,10 @@ pub struct Prefs {
     pub confirm_before_closing_session: bool,
     pub status_sounds: bool,
     pub status_notifications: bool,
+    /// Which channels blocked, failed and finished sessions reach.
+    pub attention_routes: AttentionRoutes,
+    /// What the Dock badge counts.
+    pub dock_badge: DockBadge,
     /// Read the relevant part of a finished turn's reply aloud (`crate::voice`).
     #[serde(default)]
     pub talk_with_agent: bool,
@@ -524,17 +743,55 @@ pub struct Prefs {
     /// Row height as a multiple of the font's own line height.
     #[serde(default = "terminal_line_height_default")]
     pub terminal_line_height: f32,
+    /// Let the terminal font form its ligatures (`=>`, `!=`). On is the
+    /// font's own default, so files written before the field read as on.
+    #[serde(default = "terminal_ligatures_default")]
+    pub terminal_ligatures: bool,
+    /// CSS weight of the regular face (400 Regular, 500 Medium, 300 Light).
+    /// The family's nearest face is used, so a weight it lacks is harmless.
+    #[serde(default = "terminal_font_weight_default")]
+    pub terminal_font_weight: u16,
+    /// CSS weight of the face bold cells use.
+    #[serde(default = "terminal_bold_weight_default")]
+    pub terminal_bold_weight: u16,
+    /// CSS weight of the italic face; unset follows the regular weight.
+    #[serde(default)]
+    pub terminal_italic_weight: Option<u16>,
+    /// Cell width as a percentage of the font's advance.
+    #[serde(default = "terminal_cell_width_default")]
+    pub terminal_cell_width: u16,
+    /// Platform font smoothing (macOS thickens light-on-dark text by its
+    /// luminance). On is what the terminal always did.
+    #[serde(default = "terminal_font_smoothing_default")]
+    pub terminal_font_smoothing: bool,
+    /// Extra stroke around every glyph, in quarters of a device pixel, for
+    /// thin fonts on low-resolution displays. 0 is off.
+    #[serde(default)]
+    pub terminal_font_thicken: u8,
     pub terminal_copy_on_select: bool,
     /// Open a terminal URL on a plain click. When off, links still open with
     /// Command- or Control-click.
     pub terminal_open_links_on_click: bool,
+    /// Link schemes other than the web's that open without asking
+    /// (`ssh`, `vscode`, …), added by "Always Open" on the ask sheet.
+    #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub terminal_trusted_link_schemes: std::collections::BTreeSet<String>,
     pub terminal_hide_pointer: bool,
+    /// The cursor a terminal draws until a program asks for another.
+    pub terminal_cursor_shape: CursorShapePref,
+    pub terminal_cursor_blink: CursorBlinkPref,
+    /// Let programs change the cursor's shape and blink (vim's bar in
+    /// insert mode). Off, every terminal keeps the shape above.
+    pub terminal_cursor_follows_programs: bool,
     /// Give new zsh and bash terminals Diri's OSC 133 prompt and command
     /// marks. The Engine applies it; the store pushes it on every change.
     pub terminal_shell_integration: bool,
     /// Where a clicked `file:line` reference in terminal output opens.
     #[serde(default)]
     pub terminal_file_editor: FileEditor,
+    /// Which Option keys are Meta in a terminal.
+    #[serde(default)]
+    pub terminal_option_as_meta: OptionAsMeta,
     /// Start a new terminal in the directory the last terminal was in,
     /// instead of its project's root. Missing files pick this up as on.
     #[serde(default = "terminal_follows_last_directory_default")]
@@ -640,6 +897,17 @@ pub struct Prefs {
     pub render_counters: bool,
 }
 
+impl Prefs {
+    /// The cursor preferences every terminal pane draws with.
+    pub fn cursor_preferences(&self) -> diri_term::cursor_motion::CursorPreferences {
+        diri_term::cursor_motion::CursorPreferences {
+            shape: self.terminal_cursor_shape.shape(),
+            blink: self.terminal_cursor_blink.rate(),
+            follow_program: self.terminal_cursor_follows_programs,
+        }
+    }
+}
+
 impl Default for Prefs {
     fn default() -> Self {
         Self {
@@ -650,6 +918,8 @@ impl Default for Prefs {
             confirm_before_closing_session: true,
             status_sounds: true,
             status_notifications: true,
+            attention_routes: AttentionRoutes::default(),
+            dock_badge: DockBadge::default(),
             talk_with_agent: false,
             agents_name_sessions: true,
             talk_dictation: false,
@@ -672,11 +942,23 @@ impl Default for Prefs {
             terminal_font_size: 13.0,
             terminal_font_family: String::new(),
             terminal_line_height: terminal_line_height_default(),
+            terminal_ligatures: true,
+            terminal_font_weight: terminal_font_weight_default(),
+            terminal_bold_weight: terminal_bold_weight_default(),
+            terminal_italic_weight: None,
+            terminal_cell_width: terminal_cell_width_default(),
+            terminal_font_smoothing: true,
+            terminal_font_thicken: 0,
             terminal_copy_on_select: false,
             terminal_open_links_on_click: true,
+            terminal_trusted_link_schemes: Default::default(),
             terminal_hide_pointer: true,
+            terminal_cursor_shape: CursorShapePref::Block,
+            terminal_cursor_blink: CursorBlinkPref::Normal,
+            terminal_cursor_follows_programs: true,
             terminal_shell_integration: true,
             terminal_file_editor: FileEditor::Automatic,
+            terminal_option_as_meta: OptionAsMeta::Automatic,
             terminal_follows_last_directory: true,
             terminal_paste_protection: false,
             window_material: WindowMaterial::Glass,
@@ -742,6 +1024,10 @@ impl Prefs {
     pub const MAX_TERMINAL_FONT_SIZE: f32 = 20.0;
     pub const MIN_TERMINAL_LINE_HEIGHT: f32 = 1.0;
     pub const MAX_TERMINAL_LINE_HEIGHT: f32 = 2.0;
+    pub const MIN_TERMINAL_CELL_WIDTH: u16 = 80;
+    pub const MAX_TERMINAL_CELL_WIDTH: u16 = 150;
+    pub const TERMINAL_CELL_WIDTH_STEP: u16 = 5;
+    pub const MAX_TERMINAL_FONT_THICKEN: u8 = gpui::GlyphRasterStyle::MAX_STROKE;
 
     pub fn path() -> PathBuf {
         let home = diri_platform::home_dir()
@@ -779,17 +1065,26 @@ impl Prefs {
         let parent = path.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "preference path has no parent")
         })?;
-        fs::create_dir_all(parent)?;
+        diri_platform::private::create_dir_all(parent)?;
         let bytes = serde_json::to_vec_pretty(&normalized)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let temporary = path.with_extension("json.tmp");
-        fs::write(&temporary, bytes)?;
-        fs::rename(temporary, path)
+        diri_platform::private::replace_via(&path.with_extension("json.tmp"), path, bytes)
     }
 
     pub fn zoom_terminal(&mut self, delta: f32) {
         self.terminal_font_size = (self.terminal_font_size + delta)
             .clamp(Self::MIN_TERMINAL_FONT_SIZE, Self::MAX_TERMINAL_FONT_SIZE);
+    }
+
+    /// Chooses the terminal family. The faces chosen for the previous family
+    /// go back to Regular and Bold: another family's Medium may not exist.
+    pub fn set_terminal_font_family(&mut self, family: String) {
+        if family != self.terminal_font_family {
+            self.terminal_font_weight = terminal_font_weight_default();
+            self.terminal_bold_weight = terminal_bold_weight_default();
+            self.terminal_italic_weight = None;
+        }
+        self.terminal_font_family = family;
     }
 
     pub fn reset_terminal_zoom(&mut self) {
@@ -865,6 +1160,16 @@ impl Prefs {
         } else {
             terminal_line_height_default()
         };
+        let weight = |weight: u16| weight.clamp(100, 900);
+        self.terminal_font_weight = weight(self.terminal_font_weight);
+        self.terminal_bold_weight = weight(self.terminal_bold_weight);
+        self.terminal_italic_weight = self.terminal_italic_weight.map(weight);
+        self.terminal_cell_width = self
+            .terminal_cell_width
+            .clamp(Self::MIN_TERMINAL_CELL_WIDTH, Self::MAX_TERMINAL_CELL_WIDTH);
+        self.terminal_font_thicken = self
+            .terminal_font_thicken
+            .min(Self::MAX_TERMINAL_FONT_THICKEN);
         let family = self.terminal_font_family.trim();
         if family.len() != self.terminal_font_family.len() {
             self.terminal_font_family = family.to_owned();
@@ -906,6 +1211,28 @@ impl Prefs {
 mod tests {
     use super::*;
     use crate::launch_recipe::{LaunchRecipe, RecipeProject};
+
+    #[test]
+    fn only_a_waiting_session_bounces_the_dock_by_default_and_saved_routes_keep_it() {
+        let fresh: Prefs = serde_json::from_str("{}").unwrap();
+        let routes = fresh.attention_routes;
+        assert!(routes.blocked.bounce);
+        assert!(!routes.error.bounce && !routes.done.bounce);
+        // Routes saved before the bounce channel existed: each state takes
+        // its own default for the missing channel and keeps what was saved.
+        let saved: Prefs = serde_json::from_str(
+            r#"{"attentionRoutes":{"blocked":{"notify":false},"done":{"sound":false}}}"#,
+        )
+        .unwrap();
+        let routes = saved.attention_routes;
+        assert!(!routes.blocked.notify && routes.blocked.bounce && routes.blocked.badge);
+        assert!(!routes.done.sound && !routes.done.bounce && routes.done.notify);
+        let mut changed = Prefs::default();
+        changed.attention_routes.blocked.bounce = false;
+        changed.attention_routes.done.bounce = true;
+        let read: Prefs = serde_json::from_str(&serde_json::to_string(&changed).unwrap()).unwrap();
+        assert_eq!(read.attention_routes, changed.attention_routes);
+    }
 
     #[test]
     fn agent_session_names_default_on_and_are_read_where_the_engine_looks() {
@@ -957,6 +1284,34 @@ mod tests {
         assert_eq!(prefs.pane_density, PaneDensity::Comfortable);
         let prefs: Prefs = serde_json::from_str(r#"{"interfaceStyle":"neon"}"#).unwrap();
         assert_eq!(prefs.interface_style(), InterfaceStyle::Blended);
+    }
+
+    #[test]
+    fn cursor_preferences_default_to_the_shipped_cursor_and_round_trip() {
+        // A file written before the settings existed changes nothing.
+        let older: Prefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            older.cursor_preferences(),
+            diri_term::cursor_motion::CursorPreferences::default()
+        );
+        let prefs: Prefs = serde_json::from_str(
+            r#"{"terminalCursorShape":"bar","terminalCursorBlink":"off","terminalCursorFollowsPrograms":false}"#,
+        )
+        .unwrap();
+        let cursor = prefs.cursor_preferences();
+        assert_eq!(cursor.shape, diri_proto::grid::CursorShape::Bar);
+        assert_eq!(cursor.blink, diri_term::cursor_motion::BlinkRate::Off);
+        assert!(!cursor.follow_program);
+        let again: Prefs =
+            serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+        assert_eq!(again.cursor_preferences(), cursor);
+        // Names from a newer build fall back instead of failing the file.
+        let newer: Prefs = serde_json::from_str(
+            r#"{"terminalCursorShape":"hollow","terminalCursorBlink":"pulse"}"#,
+        )
+        .unwrap();
+        assert_eq!(newer.terminal_cursor_shape, CursorShapePref::Block);
+        assert_eq!(newer.terminal_cursor_blink, CursorBlinkPref::Normal);
     }
 
     #[test]
@@ -1024,6 +1379,29 @@ mod tests {
     }
 
     #[test]
+    fn option_as_meta_defaults_to_automatic_and_round_trips() {
+        let legacy: Prefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.terminal_option_as_meta, OptionAsMeta::Automatic);
+        let unknown: Prefs =
+            serde_json::from_str(r#"{"terminalOptionAsMeta":"middle"}"#).unwrap();
+        assert_eq!(unknown.terminal_option_as_meta, OptionAsMeta::Automatic);
+        for choice in [
+            OptionAsMeta::Left,
+            OptionAsMeta::Right,
+            OptionAsMeta::Both,
+            OptionAsMeta::Off,
+        ] {
+            let prefs = Prefs {
+                terminal_option_as_meta: choice,
+                ..Prefs::default()
+            };
+            let restored: Prefs =
+                serde_json::from_slice(&serde_json::to_vec(&prefs).unwrap()).unwrap();
+            assert_eq!(restored.terminal_option_as_meta, choice);
+        }
+    }
+
+    #[test]
     fn ui_language_persists_as_a_tag_and_unknown_tags_follow_the_system() {
         let legacy: Prefs = serde_json::from_str("{}").unwrap();
         assert_eq!(legacy.ui_language, UiLanguage::System);
@@ -1048,10 +1426,12 @@ mod tests {
         let legacy: Prefs = serde_json::from_str(r#"{"terminalFontSize":14}"#).unwrap();
         assert_eq!(legacy.terminal_font_family, "");
         assert_eq!(legacy.terminal_line_height, 1.0);
+        assert!(legacy.terminal_ligatures, "a file without the field keeps ligatures");
 
         let mut prefs = Prefs {
             terminal_font_family: "  JetBrains Mono ".to_owned(),
             terminal_line_height: 1.2999,
+            terminal_ligatures: false,
             ..legacy
         };
         prefs.normalize();
@@ -1068,6 +1448,72 @@ mod tests {
             prefs.normalize();
             assert_eq!(prefs.terminal_line_height, repaired);
         }
+    }
+
+    #[test]
+    fn font_faces_cell_width_and_thickening_default_round_trip_and_repair() {
+        // A file from before these settings paints exactly as it did.
+        let legacy: Prefs = serde_json::from_str(r#"{"terminalFontSize":14}"#).unwrap();
+        assert_eq!(legacy.terminal_font_weight, 400);
+        assert_eq!(legacy.terminal_bold_weight, 700);
+        assert_eq!(legacy.terminal_italic_weight, None);
+        assert_eq!(legacy.terminal_cell_width, 100);
+        assert!(legacy.terminal_font_smoothing);
+        assert_eq!(legacy.terminal_font_thicken, 0);
+
+        let prefs = Prefs {
+            terminal_font_weight: 500,
+            terminal_bold_weight: 800,
+            terminal_italic_weight: Some(300),
+            terminal_cell_width: 110,
+            terminal_font_smoothing: false,
+            terminal_font_thicken: 2,
+            ..Prefs::default()
+        };
+        let json = serde_json::to_value(&prefs).unwrap();
+        assert_eq!(json["terminalFontWeight"], 500);
+        assert_eq!(json["terminalCellWidth"], 110);
+        assert_eq!(json["terminalFontThicken"], 2);
+        let restored: Prefs = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, prefs);
+
+        let mut wild = Prefs {
+            terminal_font_weight: 0,
+            terminal_bold_weight: 5000,
+            terminal_italic_weight: Some(50),
+            terminal_cell_width: 400,
+            terminal_font_thicken: 200,
+            ..Prefs::default()
+        };
+        wild.normalize();
+        assert_eq!(wild.terminal_font_weight, 100);
+        assert_eq!(wild.terminal_bold_weight, 900);
+        assert_eq!(wild.terminal_italic_weight, Some(100));
+        assert_eq!(wild.terminal_cell_width, Prefs::MAX_TERMINAL_CELL_WIDTH);
+        assert_eq!(wild.terminal_font_thicken, Prefs::MAX_TERMINAL_FONT_THICKEN);
+        let mut narrow = Prefs {
+            terminal_cell_width: 10,
+            ..Prefs::default()
+        };
+        narrow.normalize();
+        assert_eq!(narrow.terminal_cell_width, Prefs::MIN_TERMINAL_CELL_WIDTH);
+
+        // Faces belong to a family; choosing another one resets them, and
+        // choosing the same one again keeps them.
+        let mut chosen = prefs.clone();
+        chosen.set_terminal_font_family(String::new());
+        assert_eq!(chosen.terminal_font_weight, 500);
+        chosen.set_terminal_font_family("Menlo".to_owned());
+        assert_eq!(chosen.terminal_font_family, "Menlo");
+        assert_eq!(
+            (
+                chosen.terminal_font_weight,
+                chosen.terminal_bold_weight,
+                chosen.terminal_italic_weight
+            ),
+            (400, 700, None)
+        );
+        assert_eq!(chosen.terminal_cell_width, 110, "cell width is not a face");
     }
 
     #[test]
