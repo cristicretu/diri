@@ -7,6 +7,9 @@ pub struct CellMetrics {
     pub line_height: Pixels,
     pub ascent: Pixels,
     pub font_id: FontId,
+    /// How far each glyph sits right of its cell's left edge: half of what a
+    /// widened cell adds to the font's own advance, so glyphs stay centred.
+    pub glyph_inset: Pixels,
 }
 
 impl CellMetrics {
@@ -49,7 +52,28 @@ impl CellMetrics {
             line_height: px(raw_height.round().max(1.0)),
             ascent,
             font_id,
+            glyph_inset: px(0.0),
         }
+    }
+
+    /// Widen or narrow cells to `scale` times the font's advance (Ghostty's
+    /// `adjust-cell-width`). Glyphs keep their own width and are centred in
+    /// the cell; 1.0 leaves the metrics untouched.
+    #[must_use]
+    pub fn with_cell_width_scale(mut self, scale: f32) -> Self {
+        if scale.is_finite() && scale > 0.0 && scale != 1.0 {
+            let natural = self.cell_width;
+            self.cell_width = px((f32::from(natural) * scale).max(1.0));
+            self.glyph_inset = (self.cell_width - natural) / 2.0;
+        }
+        self
+    }
+
+    /// Where a line of text starting at `origin` (a cell's left edge) is
+    /// painted from.
+    #[must_use]
+    pub fn text_origin(self, origin: gpui::Point<Pixels>) -> gpui::Point<Pixels> {
+        gpui::point(origin.x + self.glyph_inset, origin.y)
     }
 
     /// Stretch rows to `scale` times the font's own height, the way
@@ -117,6 +141,25 @@ mod tests {
             px(14.0)
         );
         assert_eq!(metrics().with_line_height_scale(1.2).cell_width, px(7.75));
+    }
+
+    #[test]
+    fn cell_width_scale_widens_cells_and_centres_glyphs() {
+        let natural = metrics();
+        assert_eq!(natural.with_cell_width_scale(1.0), natural);
+        assert_eq!(natural.with_cell_width_scale(f32::NAN), natural);
+        let wide = natural.with_cell_width_scale(1.2);
+        assert!((f32::from(wide.cell_width) - 9.3).abs() < 1e-4);
+        assert!((f32::from(wide.glyph_inset) - 0.775).abs() < 1e-4);
+        assert_eq!(wide.line_height, natural.line_height);
+        let narrow = natural.with_cell_width_scale(0.9);
+        assert!(narrow.glyph_inset < px(0.0));
+        assert_eq!(
+            wide.text_origin(gpui::point(px(10.0), px(4.0))),
+            gpui::point(px(10.0) + wide.glyph_inset, px(4.0))
+        );
+        // Columns step by the widened cell, with no drift.
+        assert_eq!(wide.x_for_col(10), wide.cell_width * 10.0);
     }
 
     #[test]

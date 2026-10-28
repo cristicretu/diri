@@ -224,44 +224,6 @@ fn new_terminals_run_the_configured_shell_command() {
 }
 
 #[test]
-fn capture_unwrap_rejoins_a_line_longer_than_the_terminal() {
-    let fixture = Fixture::new();
-    // 300 columns is wider than any default pane, so the terminal wraps it.
-    let long = format!("https://example.com/{}", "a".repeat(280));
-    let id = fixture
-        .ok(&[
-            "run",
-            "--",
-            "/bin/sh",
-            "-c",
-            &format!("printf '\\033[1;31m%s\\033[0m\\n' '{long}'; echo done; sleep 5"),
-        ])
-        .trim()
-        .to_owned();
-    fixture.capture_until(&id, "done");
-    let wrapped = fixture.ok(&["capture", &id]);
-    assert!(!wrapped.contains(&long), "{wrapped:?}");
-
-    let unwrapped = fixture.ok(&["capture", &id, "--unwrap", "--trim"]);
-    assert_eq!(
-        unwrapped.lines().collect::<Vec<_>>(),
-        [long.as_str(), "done"]
-    );
-    assert_eq!(
-        fixture.ok(&["capture", &id, "--unwrap", "--lines", "2"]),
-        unwrapped,
-        "--lines counts the lines the program wrote"
-    );
-    let styled = fixture.ok(&["capture", &id, "--unwrap", "--ansi"]);
-    let first = styled.lines().next().unwrap();
-    assert!(
-        first.starts_with("\x1b[0;1;38;5;1;49mhttps://example.com/") && first.ends_with("\x1b[0m"),
-        "{first:?}"
-    );
-    fixture.ok(&["session", "release", &id, "--remove"]);
-}
-
-#[test]
 fn run_wait_prints_output_and_exits_with_the_command_status() {
     let fixture = Fixture::new();
     let output = fixture.cli(&[

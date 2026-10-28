@@ -6,6 +6,21 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(super) fn run(scope: &str, arguments: &[String]) -> Result<(), CliError> {
     let (parsed_words, expected) = words(arguments)?;
+    // Read-only listings, in session ids, for scripts.
+    match (scope, parsed_words.as_slice()) {
+        ("tab", [list]) if matches!(list.as_str(), "list" | "ls") => {
+            return super::verbs::tab_list(has_flag(arguments, "--json"));
+        }
+        ("pane", [list, rest @ ..])
+            if matches!(list.as_str(), "list" | "ls") && rest.len() <= 1 =>
+        {
+            return super::verbs::pane_list(
+                rest.first().map(String::as_str),
+                has_flag(arguments, "--json"),
+            );
+        }
+        _ => {}
+    }
     if scope == "workspace" && parsed_words == ["list"] && expected.is_none() {
         print_json(&request(Method::WORKSPACE_SNAPSHOT, json!({}), TIMEOUT)?);
         return Ok(());

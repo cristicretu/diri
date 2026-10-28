@@ -94,9 +94,6 @@ pub fn wall_clock_seconds() -> f64 {
 /// it that way.
 pub struct StatusGlyph {
     kind: AgentKind,
-    /// What a terminal's foreground program is, drawn in place of the
-    /// shell caret. Kinds with a mark of their own ignore it.
-    glyph: Option<crate::IconName>,
     state: StatusState,
     size: f32,
     colors: SemanticColors,
@@ -106,17 +103,9 @@ impl StatusGlyph {
     pub fn new(kind: AgentKind, state: StatusState, size: f32, colors: SemanticColors) -> Self {
         Self {
             kind,
-            glyph: None,
             state,
             size,
             colors,
-        }
-    }
-
-    pub fn set_glyph(&mut self, glyph: Option<crate::IconName>, cx: &mut Context<Self>) {
-        if self.glyph != glyph {
-            self.glyph = glyph;
-            cx.notify();
         }
     }
 
@@ -145,7 +134,6 @@ impl StatusGlyph {
     pub fn rendered_mark(&self) -> gpui::AnyElement {
         static_mark(
             self.kind,
-            self.glyph,
             self.size,
             static_status_color(self.kind, self.state, self.colors),
             1.0,
@@ -186,7 +174,6 @@ impl Render for StatusGlyph {
 
 fn static_mark(
     kind: AgentKind,
-    glyph: Option<crate::IconName>,
     size: f32,
     color: gpui::Rgba,
     visual_scale: f32,
@@ -199,8 +186,6 @@ fn static_mark(
     } else if kind == AgentKind::Note {
         crate::Icon::new(crate::IconName::File, size * 0.86 * visual_scale, color)
             .into_any_element()
-    } else if let Some(glyph) = glyph {
-        crate::Icon::new(glyph, size * 0.86 * visual_scale, color).into_any_element()
     } else {
         shell_caret(size, color, visual_scale)
     }

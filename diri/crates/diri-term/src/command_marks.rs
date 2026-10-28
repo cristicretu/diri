@@ -236,6 +236,58 @@ impl LastCommandOutput {
     }
 }
 
+/// Finds the same output as [`LastCommandOutput`] over the whole history
+/// while reading it backward from the live end, page by page, so the read
+/// stops a page or two above the newest finished command instead of
+/// covering every retained row.
+///
+/// After each page the rows held so far are read forward. Any output found
+/// there is the newest one overall: a newer output would have to start above
+/// these rows, but the end found here closes every output started before it.
+/// When nothing is found, rows below the topmost held prompt can no longer
+/// matter (an output that crossed that prompt was abandoned by it), so only
+/// rows up to that prompt row are kept. That bounds what is held to about
+/// one command's rows.
+#[derive(Default)]
+pub struct NewestCommandOutput {
+    /// Held rows in reading order, the first one being the topmost read.
+    rows: std::collections::VecDeque<(Vec<GridCell>, Option<RowMetadata>)>,
+    cells: usize,
+}
+
+impl NewestCommandOutput {
+    /// Feeds the page of rows directly above every row fed so far, in
+    /// reading order. Returns the newest finished output once it is known.
+    pub fn push_page_above(
+        &mut self,
+        page: impl DoubleEndedIterator<Item = (Vec<GridCell>, Option<RowMetadata>)>,
+    ) -> Option<OutputRows> {
+        for row in page.rev() {
+            self.cells += row.0.len();
+            self.rows.push_front(row);
+        }
+        let mut last = LastCommandOutput::default();
+        for (cells, metadata) in &self.rows {
+            last.push_row(cells, metadata.as_ref());
+        }
+        if let Some(output) = last.finish() {
+            return Some(output);
+        }
+        if let Some(prompt) = self.rows.iter().position(|(cells, _)| starts_prompt(cells)) {
+            for (cells, _) in self.rows.drain(prompt + 1..) {
+                self.cells -= cells.len();
+            }
+        }
+        None
+    }
+
+    /// Cells held between pages, to bound the read.
+    #[must_use]
+    pub fn held_cells(&self) -> usize {
+        self.cells
+    }
+}
+
 /// Columns `start..end` of a row. Cells before `start` become empty cells
 /// (scalar 0, which text export skips) so grapheme columns in the metadata
 /// stay valid.
@@ -405,6 +457,90 @@ mod tests {
         assert_eq!(output.rows.len(), 2, "the end's own row holds no output");
         assert_eq!(output.rows[0].0[0].scalar, u32::from('a'));
     }
+    #[test]
+    fn the_newest_output_read_backward_matches_a_full_forward_read() {
+        let histories: Vec<Vec<Vec<GridCell>>> = vec![
+            session(),
+            rows(&["{A}$ ls", "{C}a", "b", "{0}{A}$"]),
+            // The newest end has no output of its own (an empty command),
+            // so the answer is the older one.
+            rows(&["{A}$ ls", "{C}a", "b", "{0}{A}$", "{?}{A}$", "{?}{A}$", ""]),
+            // An output abandoned by a prompt before it ended.
+            rows(&["{A}$ cat", "{C}one", "two", "{0}{A}$ x", "{C}lost", "{A}$"]),
+            // A whole command on one row, then a long running one.
+            rows(&[
+                "{A}$ x{C}out{0}",
+                "{A}$ make",
+                "{C}building",
+                "more",
+                "more",
+            ]),
+            // No finished command at all.
+            rows(&["{A}$ make", "{C}building", "more"]),
+            rows(&["plain", "text"]),
+            rows(&[]),
+        ];
+        for history in &histories {
+            let mut forward = LastCommandOutput::default();
+            for row in history {
+                forward.push_row(row, None);
+            }
+            let expected = forward.finish();
+            for page in 1..=history.len().max(1) {
+                let mut backward = NewestCommandOutput::default();
+                let mut end = history.len();
+                let mut found = None;
+                while end > 0 && found.is_none() {
+                    let first = end.saturating_sub(page);
+                    found = backward
+                        .push_page_above(history[first..end].iter().map(|row| (row.clone(), None)));
+                    end = first;
+                }
+                assert_eq!(found, expected, "page {page} of {history:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_backward_read_stops_near_the_newest_command_and_holds_little() {
+        let mut history = vec![];
+        for _ in 0..1_000 {
+            history.extend(rows(&["{A}$ ls", "{C}a", "b"]));
+            history.extend(rows(&["{0}"]));
+        }
+        history.extend(rows(&["{A}$ make", "{C}building", "more"]));
+        let mut backward = NewestCommandOutput::default();
+        let mut end = history.len();
+        let mut read = 0;
+        let output = loop {
+            let first = end.saturating_sub(2);
+            read += end - first;
+            if let Some(output) =
+                backward.push_page_above(history[first..end].iter().map(|row| (row.clone(), None)))
+            {
+                break output;
+            }
+            end = first;
+        };
+        assert_eq!(output.rows.len(), 2);
+        assert!(read <= 8, "read {read} of {} rows", history.len());
+
+        // With no finished command, what is held stays one command's rows.
+        let mut backward = NewestCommandOutput::default();
+        for _ in 0..1_000 {
+            assert!(
+                backward
+                    .push_page_above(
+                        rows(&["{A}$ sleep", "{C}waiting"])
+                            .into_iter()
+                            .map(|row| (row, None))
+                    )
+                    .is_none()
+            );
+            assert!(backward.held_cells() <= 2 * 12);
+        }
+    }
+
     #[test]
     fn the_nearest_prompt_is_read_outward_and_never_guessed() {
         let session = session();

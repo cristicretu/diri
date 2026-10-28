@@ -91,6 +91,10 @@ pub enum ClaudeHook {
         message: Option<String>,
     },
     Stop,
+    /// A Stop whose final message ends on a question to the user.
+    StopAsking {
+        question: String,
+    },
     SubagentStart(String),
     SubagentStop(String),
     SessionEnd,
@@ -707,7 +711,9 @@ impl StatusReducer {
                     hook,
                     is_subagent,
                     pending_work,
-                } if *is_subagent || !raises_blocker(hook) => {
+                } if *is_subagent
+                    || !self.hook_applies_while_program_reports(hook, *pending_work) =>
+                {
                     self.state.last_signal_at = now;
                     match hook {
                         ClaudeHook::SubagentStart(id) => {
@@ -1142,6 +1148,12 @@ impl StatusReducer {
                 self.set_status(SessionStatus::NeedsInput(kind), outcome);
             }
             Some(record) if record.state == ProgramState::Working => {
+                if self.asking_at_turn_end() {
+                    // The turn ended on a question; the work the program
+                    // still reports runs in the background. Only a new turn,
+                    // a result or another blocker ends the question.
+                    return;
+                }
                 self.state.pending_needs_input = None;
                 self.go_working(now, false, outcome);
             }
@@ -1538,10 +1550,76 @@ impl StatusReducer {
             ClaudeHook::Stop => {
                 self.handle_claude_completion(pending_work.unwrap_or(false), now, outcome)
             }
+            ClaudeHook::StopAsking { question } => {
+                let pending = pending_work.unwrap_or(false);
+                if pending && matches!(self.status, SessionStatus::Working | SessionStatus::Unknown)
+                {
+                    self.ask_at_turn_end(&question, now, outcome);
+                } else {
+                    self.handle_claude_completion(pending, now, outcome);
+                }
+            }
             // A hint only.
             ClaudeHook::SessionEnd => {}
             ClaudeHook::SubagentStart(_) | ClaudeHook::SubagentStop(_) => {}
         }
+    }
+
+    /// Whether the session waits on a question its last turn ended with.
+    fn asking_at_turn_end(&self) -> bool {
+        self.status == SessionStatus::NeedsInput(NeedsInputKind::Question)
+            && self
+                .state
+                .pending_needs_input
+                .as_ref()
+                .is_some_and(|detail| detail.source == NeedsInputSource::ClaudeStopHook)
+    }
+
+    /// A hook that moves status even while a program reports its own: one
+    /// raising a blocker, a turn ending on a question while background work
+    /// keeps the program busy, and the next turn that ends such a question.
+    fn hook_applies_while_program_reports(
+        &self,
+        hook: &ClaudeHook,
+        pending_work: Option<bool>,
+    ) -> bool {
+        match hook {
+            ClaudeHook::StopAsking { .. } => {
+                pending_work == Some(true) && self.status == SessionStatus::Working
+            }
+            ClaudeHook::UserPromptSubmit | ClaudeHook::PreToolUse | ClaudeHook::PostToolUse => {
+                self.asking_at_turn_end()
+            }
+            hook => raises_blocker(hook),
+        }
+    }
+
+    /// The turn handed back to the user with a question, while background
+    /// work it started keeps running. That work is why the session would
+    /// otherwise read Working, hiding that the user is the one being waited
+    /// on. A turn with nothing left in the background reads Done instead,
+    /// as any finished turn does.
+    fn ask_at_turn_end(&mut self, question: &str, now: SystemTime, outcome: &mut ReducerOutcome) {
+        let detail = NeedsInputDetail {
+            kind: NeedsInputKind::Question,
+            source: NeedsInputSource::ClaudeStopHook,
+            tool_name: None,
+            summary: question.to_owned(),
+            prompt_excerpt: Some(question.to_owned()),
+            options: None,
+            risk_hint: classify_risk(question),
+            secret: false,
+            occurred_at: now.into(),
+        };
+        self.state.claude_pending_work = true;
+        self.cancel_idle_candidacy();
+        self.state.hold_idle_against_screen = false;
+        self.state.screen_blocker_active = false;
+        self.state.blocker_miss_scans = 0;
+        self.state.blocker_miss_since = None;
+        self.state.pending_needs_input = Some(detail.clone());
+        outcome.needs_input = Some(detail);
+        self.set_status(SessionStatus::NeedsInput(NeedsInputKind::Question), outcome);
     }
 
     fn handle_claude_completion(
@@ -1551,6 +1629,11 @@ impl StatusReducer {
         outcome: &mut ReducerOutcome,
     ) {
         self.state.claude_pending_work = pending_work;
+        if pending_work && self.asking_at_turn_end() {
+            // A reminder that background work is still running does not
+            // answer the question the turn ended on.
+            return;
+        }
         if pending_work {
             // The foreground response ended, but Claude still has live work.
             // Keep screen idle and subsequent metadata-free reminders from
@@ -1675,6 +1758,12 @@ impl StatusReducer {
             self.state.hold_idle_against_screen = false;
             self.cancel_idle_candidacy();
             self.set_status(SessionStatus::NeedsInput(kind), outcome);
+            return;
+        }
+
+        // "Waiting for background agents" and the free composer are what a
+        // turn that ended on a question looks like; neither answers it.
+        if self.asking_at_turn_end() {
             return;
         }
 

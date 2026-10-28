@@ -3106,29 +3106,24 @@ impl ControlServer {
     }
 
     fn session_read_screen(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
-        let p: diri_proto::ReadScreenParams = decode(params)?;
-        let options = diri_terminal_state::TextOptions {
-            unwrap: p.unwrap,
-            ansi: p.ansi,
-            scrollback: p.scrollback,
-        };
+        let p: diri_proto::SessionIdParams = decode(params)?;
         {
             let registry = self.registry.lock().map_err(poisoned)?;
             if let Some(session) = registry.get(&p.session_id.0) {
                 let (cols, rows) = session.screen_size();
                 return encode(&diri_proto::ReadScreenResult {
-                    text: session.screen_text(options).join("\n"),
+                    text: session.screen_lines().join("\n"),
                     cols: cols as i64,
                     rows: rows as i64,
                 });
             }
         }
-        let mut screen = self
+        let screen = self
             .completed_terminal_screen(&p.session_id.0)?
             .ok_or_else(|| self.no_retained_terminal(&p.session_id.0))?;
         let (cols, rows) = screen.size();
         encode(&diri_proto::ReadScreenResult {
-            text: screen.text_lines(options).join("\n"),
+            text: screen.lines().join("\n"),
             cols: cols as i64,
             rows: rows as i64,
         })
@@ -4216,7 +4211,8 @@ impl ControlServer {
         record.parent = Some(p.parent.clone().unwrap_or_else(|| source.id.clone()));
         record.host = source.host.clone();
         record.remote_persistence = remote_persistence;
-        crate::registry::name_fork(&mut record, &source.title);
+        record.title = format!("Fork of {}", source.title);
+        record.title_source = diri_proto::TitleSource::DirijorAssigned;
 
         if spec.remote.is_some() {
             self.spawn_session_unlocked(spec, Some(record))?;
@@ -5744,7 +5740,6 @@ pub(crate) fn new_record(id: &str, kind: &str, cwd: &str) -> diri_proto::Session
         pull_requests: None,
         listening_ports: None,
         foreground_agent: None,
-        foreground_program: None,
         terminal_cwd: None,
         agent_workspace: None,
         note_id: None,
@@ -8140,7 +8135,6 @@ mod tests {
             pull_requests: None,
             listening_ports: None,
             foreground_agent: None,
-            foreground_program: None,
             terminal_cwd: None,
             agent_workspace: None,
             note_id: None,
@@ -8759,7 +8753,6 @@ mod tests {
         let key = crate::completed_terminal::CompletedRunKey::bind(&record, child, 10).unwrap();
         let mut screen = diri_terminal_state::HeadlessScreen::new(40, 4);
         screen.feed(b"line one\r\nline two\r\nline three\r\nline four\r\nline five");
-        screen.feed(b"\r\nhttps://example.com/a/very/long/path/that/wraps.json");
         let checkpoint = crate::checkpoint::ScreenCheckpoint {
             keyboard_snapshot: screen.keyboard_snapshot(),
             keyboard: Some(screen.keyboard_state()),
@@ -8805,26 +8798,6 @@ mod tests {
         assert!(
             result["text"].as_str().unwrap().contains("line five"),
             "{result}"
-        );
-        // The wrap survives the retained checkpoint: an unwrapped read hands
-        // the URL over whole, and scrollback reaches the rows above.
-        assert!(
-            !result["text"]
-                .as_str()
-                .unwrap()
-                .contains("https://example.com/a/very/long/path/that/wraps.json"),
-            "{result}"
-        );
-        let unwrapped = ok_of(call(
-            &server,
-            "session.read_screen",
-            Some(json!({ "sessionID": "finished", "unwrap": true, "scrollback": true })),
-        ));
-        assert_eq!(
-            unwrapped["text"],
-            "line one\nline two\nline three\nline four\nline five\n\
-             https://example.com/a/very/long/path/that/wraps.json",
-            "{unwrapped}"
         );
         let scrollback = ok_of(call(
             &server,

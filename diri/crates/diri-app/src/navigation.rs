@@ -61,6 +61,9 @@ const SURFACE_WIDTH: f32 = 460.0;
 const KEYCAP_WIDTH: f32 = 28.0;
 const KEYCAP_HEIGHT: f32 = 20.0;
 const CHAT_PREVIEW_LIMIT: usize = 5;
+/// The command palette's hint line: the highlighted command's "Change
+/// shortcut ⌘↩", and the recorder's prompt and choices while one records.
+const FOOTER_HEIGHT: f32 = 28.0;
 const PAGE_DURATION: Duration = Duration::from_millis(140);
 
 /// Where the overlay sits and how tall its list may grow in this window.
@@ -112,6 +115,19 @@ enum Overlay {
 enum CommandSelection {
     Action(PaletteCommand),
     Session(SessionId),
+}
+
+/// A shortcut being recorded for the highlighted command, in place.
+struct PaletteRebind {
+    command: CommandId,
+    /// The key just pressed belongs to another command; ↩ replaces, ⇥ swaps.
+    clash: Option<crate::commands::ShortcutClash>,
+    error: Option<String>,
+    #[cfg(target_os = "macos")]
+    _global_recording: crate::macos::global_shortcut::Recording,
+    /// Bound combos run their action before key listeners see them, so the
+    /// recorder takes every key from an interceptor while it listens.
+    _keystrokes: gpui::Subscription,
 }
 
 struct PageState {
@@ -173,6 +189,8 @@ pub struct NavigationOverlay {
     page_direction: f32,
     /// The list height of the page being left, for the page-change motion.
     previous_list_height: f32,
+    previous_footer_height: f32,
+    rebind: Option<PaletteRebind>,
     last_theme_id: String,
     theme_matches: Vec<TermTheme>,
     page_error: Option<String>,
@@ -306,6 +324,8 @@ impl NavigationOverlay {
             page_generation: 0,
             page_direction: 1.0,
             previous_list_height: LIST_HEIGHT,
+            previous_footer_height: 0.0,
+            rebind: None,
             last_theme_id: String::new(),
             theme_matches: Vec::new(),
             page_error: None,
@@ -367,6 +387,8 @@ impl NavigationOverlay {
             page_generation: 0,
             page_direction: 1.0,
             previous_list_height: LIST_HEIGHT,
+            previous_footer_height: 0.0,
+            rebind: None,
             last_theme_id: String::new(),
             theme_matches: Vec::new(),
             page_error: None,
@@ -508,6 +530,7 @@ impl NavigationOverlay {
         }
         self.back_stack.clear();
         self.previous_list_height = self.page_list_height();
+        self.previous_footer_height = self.footer_height();
         self.page_generation = if self.is_open() {
             self.page_generation + 1
         } else {
@@ -519,6 +542,7 @@ impl NavigationOverlay {
     }
 
     fn clear_overlay(&mut self, cx: &mut Context<Self>) {
+        self.rebind = None;
         self.cancel_theme_preview();
         self.refresh_main_window(cx);
         self.back_stack.clear();
@@ -763,6 +787,13 @@ impl NavigationOverlay {
             "down" => self.move_highlight(1, cx),
             "p" if modifiers.control => self.move_highlight(-1, cx),
             "n" if modifiers.control => self.move_highlight(1, cx),
+            "enter"
+                if modifiers.platform
+                    && !modifiers.shift
+                    && self.overlay == Some(Overlay::CommandPalette) =>
+            {
+                self.begin_rebind(window, cx)
+            }
             "enter" => self.run_highlighted(modifiers.platform, window, cx),
             _ => self.edit_query(event, cx),
         }
@@ -869,6 +900,152 @@ impl NavigationOverlay {
         }
     }
 
+    /// The registered command on the highlighted palette row, which ⌘↩
+    /// can rebind. Agent, session and page rows have no keymap entry of
+    /// their own; the global show-Diri hotkey is recorded in Settings.
+    fn highlighted_rebindable(&self) -> Option<CommandId> {
+        if self.overlay != Some(Overlay::CommandPalette) {
+            return None;
+        }
+        let ranked = self
+            .ranked_actions
+            .get(self.highlight.checked_sub(self.ranked_sessions.len())?)?;
+        match ranked.item.command {
+            PaletteCommand::Action(id) if id != CommandId::ShowApp => Some(id),
+            _ => None,
+        }
+    }
+
+    fn begin_rebind(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(command) = self.highlighted_rebindable() else {
+            return;
+        };
+        let entity = cx.entity();
+        let recording_window = window.window_handle();
+        let keystrokes = cx.intercept_keystrokes(move |event, window, cx| {
+            if window.window_handle() != recording_window || entity.read(cx).rebind.is_none() {
+                return;
+            }
+            let keystroke = event.keystroke.clone();
+            entity.update(cx, |this, cx| this.handle_rebind_key(&keystroke, cx));
+            cx.stop_propagation();
+        });
+        self.rebind = Some(PaletteRebind {
+            command,
+            clash: None,
+            error: None,
+            #[cfg(target_os = "macos")]
+            _global_recording: crate::macos::global_shortcut::Recording::begin(),
+            _keystrokes: keystrokes,
+        });
+        cx.notify();
+    }
+
+    fn cancel_rebind(&mut self, cx: &mut Context<Self>) {
+        if self.rebind.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn handle_rebind_key(&mut self, key: &gpui::Keystroke, cx: &mut Context<Self>) {
+        let clash = self.rebind.as_ref().and_then(|rebind| rebind.clash.clone());
+        let key = crate::shortcut_recorder::classify(key, clash.as_ref());
+        self.apply_recorder_key(key, cx);
+    }
+
+    /// One recorder step, from a key or from the footer's matching hint.
+    fn apply_recorder_key(
+        &mut self,
+        key: crate::shortcut_recorder::RecorderKey,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::commands::{assign_shortcut, reset_shortcut, unassign_shortcut};
+        use crate::shortcut_recorder::RecorderKey;
+        let Some((command, clash)) = self
+            .rebind
+            .as_ref()
+            .map(|rebind| (rebind.command, rebind.clash.clone()))
+        else {
+            return;
+        };
+        let current = self.saved_shortcuts();
+        let Some(rebind) = self.rebind.as_mut() else {
+            return;
+        };
+        let next = match key {
+            RecorderKey::Cancel => return self.cancel_rebind(cx),
+            RecorderKey::Ignore => return,
+            RecorderKey::NeedsModifier => {
+                rebind.clash = None;
+                rebind.error = Some(t("settings.shortcuts.needs_modifier").to_owned());
+                return cx.notify();
+            }
+            RecorderKey::Remove => unassign_shortcut(&current, command),
+            RecorderKey::Reset => reset_shortcut(&current, command),
+            RecorderKey::Resolve(resolution) => {
+                let Some(clash) = clash else { return };
+                match assign_shortcut(&current, command, &clash.binding, Some(resolution)) {
+                    Ok(next) => next,
+                    Err(_) => return,
+                }
+            }
+            RecorderKey::Record(binding) => {
+                match assign_shortcut(&current, command, &binding, None) {
+                    Ok(next) => next,
+                    Err(clash) => {
+                        rebind.error = None;
+                        rebind.clash = Some(clash);
+                        return cx.notify();
+                    }
+                }
+            }
+        };
+        self.save_shortcuts(next, cx);
+    }
+
+    fn saved_shortcuts(&self) -> crate::commands::ShortcutOverrides {
+        self.store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .shortcut_overrides
+            .clone()
+    }
+
+    /// Saves the user keymap layer and makes every surface read it at once:
+    /// key bindings, the menu bar's key equivalents, these rows, and the
+    /// tooltips and Settings rows that read the active layer when shown.
+    fn save_shortcuts(&mut self, next: crate::commands::ShortcutOverrides, cx: &mut Context<Self>) {
+        let saved = next.clone();
+        let result = self
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .update_preferences(move |prefs| prefs.shortcut_overrides = saved);
+        if result.is_err() {
+            if let Some(rebind) = &mut self.rebind {
+                rebind.error = Some(t("settings.shortcuts.save_failed").to_owned());
+            }
+            return cx.notify();
+        }
+        self.rebind = None;
+        crate::commands::rebind_keys(cx, &next);
+        crate::refresh_app_menus(cx);
+        let highlighted = self.highlighted_command();
+        self.refresh_command_items();
+        self.restore_highlight(highlighted.as_ref());
+        self._runtime.publish_local_change();
+        cx.notify();
+    }
+
+    fn footer_height(&self) -> f32 {
+        if self.overlay == Some(Overlay::CommandPalette) {
+            FOOTER_HEIGHT
+        } else {
+            0.0
+        }
+    }
+
     fn run_highlighted(&mut self, secondary: bool, window: &mut Window, cx: &mut Context<Self>) {
         match self.overlay {
             Some(Overlay::CommandPalette) => {
@@ -948,6 +1125,11 @@ impl NavigationOverlay {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A click while recording ends the recording, nothing more.
+        if self.rebind.take().is_some() {
+            cx.notify();
+            return;
+        }
         match selection {
             CommandSelection::Session(id) => {
                 let selected = {
@@ -1279,6 +1461,7 @@ impl NavigationOverlay {
     }
 
     fn prepare_page(&mut self, page: Overlay, cx: &mut Context<Self>) {
+        self.rebind = None;
         self.rank_task = None;
         self.cancel_theme_preview();
         self.refresh_main_window(cx);
@@ -1347,6 +1530,7 @@ impl NavigationOverlay {
 
     fn push_page(&mut self, page: Overlay, _window: &mut Window, cx: &mut Context<Self>) {
         self.previous_list_height = self.page_list_height();
+        self.previous_footer_height = self.footer_height();
         if let Some(current) = self.overlay {
             self.back_stack.push(PageState {
                 page: current,
@@ -1362,6 +1546,7 @@ impl NavigationOverlay {
 
     fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.previous_list_height = self.page_list_height();
+        self.previous_footer_height = self.footer_height();
         if let Some(previous) = self.back_stack.pop() {
             self.prepare_page(previous.page, cx);
             self.query = previous.query;
@@ -1540,8 +1725,13 @@ impl NavigationOverlay {
     fn palette_content(&mut self, layout: OverlayLayout, cx: &mut Context<Self>) -> AnyElement {
         let colors = self.colors();
         let panels = self.uses_floating_panel(cx);
-        let list_height = layout.list_height.min(px(self.page_list_height()));
+        let footer_height = self.footer_height();
+        let previous_footer_height = self.previous_footer_height;
+        let list_height = (layout.list_height - px(footer_height))
+            .max(px(0.0))
+            .min(px(self.page_list_height()));
         let previous_list_height = layout.list_height.min(px(self.previous_list_height));
+        let footer = (footer_height > 0.0).then(|| self.render_footer(colors, cx));
         let count = self.visible_count();
         let entity = cx.entity();
         let page = self.overlay.expect("open palette");
@@ -1768,7 +1958,8 @@ impl NavigationOverlay {
                                 }),
                         )
                     }),
-            );
+            )
+            .children(footer);
         // Only page changes animate. Typing, selection, and theme previews have
         // stable IDs and do not restart motion or schedule idle frames.
         let direction = self.page_direction;
@@ -1780,10 +1971,10 @@ impl NavigationOverlay {
                     ("palette-page", self.page_generation),
                     Animation::new(PAGE_DURATION).with_easing(ease_out_quint()),
                     move |view, value| {
+                        let previous = previous_list_height + px(previous_footer_height);
+                        let current = list_height + px(footer_height);
                         view.opacity(value)
-                            .h(px(CHROME_HEIGHT)
-                                + previous_list_height
-                                + (list_height - previous_list_height) * value)
+                            .h(px(CHROME_HEIGHT) + previous + (current - previous) * value)
                             .overflow_hidden()
                             .relative()
                             .left(px((1.0 - value) * 8.0 * direction))
@@ -1793,6 +1984,130 @@ impl NavigationOverlay {
         } else {
             content.into_any_element()
         }
+    }
+
+    /// The command palette's hint line. At rest it offers ⌘↩ for a command
+    /// row; while recording it carries the clash or error on the left and
+    /// the recorder's choices, each with its key, on the right.
+    fn render_footer(&mut self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        use crate::shortcut_recorder::RecorderKey;
+        use crate::commands::ShortcutResolution;
+        let mut message: Option<(String, gpui::Hsla)> = None;
+        let mut hints: Vec<(&'static str, &'static str, &'static str, FooterStep)> = Vec::new();
+        match &self.rebind {
+            None => {
+                if self.highlighted_rebindable().is_some() {
+                    hints.push(("change", "nav.rebind.change", "⌘↩", FooterStep::Change));
+                }
+                match self.highlighted_command() {
+                    Some(CommandSelection::Action(command)) if !opens_page(&command) => {
+                        hints.push(("run", "nav.footer.run", "↩", FooterStep::Run));
+                    }
+                    Some(_) => hints.push(("run", "nav.history.open", "↩", FooterStep::Run)),
+                    None => {}
+                }
+            }
+            Some(rebind) => {
+                if let Some(error) = &rebind.error {
+                    message = Some((error.clone(), Ink::DANGER.into()));
+                }
+                if let Some(clash) = &rebind.clash {
+                    message = Some((
+                        tf(
+                            "nav.rebind.used_by",
+                            &[
+                                ("shortcut", &crate::commands::keystroke_label(&clash.binding)),
+                                ("command", &clash.holder.shortcut_metadata().title),
+                            ],
+                        ),
+                        colors.primary.into(),
+                    ));
+                    if clash.can_replace {
+                        hints.push((
+                            "replace",
+                            "nav.rebind.replace",
+                            "↩",
+                            FooterStep::Key(RecorderKey::Resolve(ShortcutResolution::Replace)),
+                        ));
+                    }
+                    if clash.can_swap {
+                        hints.push((
+                            "swap",
+                            "nav.rebind.swap",
+                            "⇥",
+                            FooterStep::Key(RecorderKey::Resolve(ShortcutResolution::Swap)),
+                        ));
+                    }
+                } else {
+                    let overrides = self.saved_shortcuts();
+                    let spec = crate::commands::command(rebind.command);
+                    if !spec.effective_keystrokes(&overrides).is_empty() {
+                        hints.push(("remove", "nav.rebind.remove", "⌫", FooterStep::Key(RecorderKey::Remove)));
+                    }
+                    if spec.is_overridden(&overrides) {
+                        hints.push(("reset", "nav.rebind.reset", "⇥", FooterStep::Key(RecorderKey::Reset)));
+                    }
+                }
+                hints.push((
+                    "cancel",
+                    "nav.rebind.cancel",
+                    "esc",
+                    FooterStep::Key(RecorderKey::Cancel),
+                ));
+            }
+        }
+        let hints = hints.into_iter().map(|(name, label, key, step)| {
+            div()
+                .id(SharedString::from(format!("palette-hint-{name}")))
+                .debug_selector(move || format!("palette-hint-{name}"))
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .px(px(6.0))
+                .h(px(20.0))
+                .rounded(px(Radius::CHIP))
+                .cursor_pointer()
+                .hover(move |style| style.bg(Fill::hover(colors, true)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    let step = step.clone();
+                    this.in_main(window, cx, move |this, window, cx| match step {
+                        FooterStep::Change => this.begin_rebind(window, cx),
+                        FooterStep::Run => this.run_highlighted(false, window, cx),
+                        FooterStep::Key(step) => this.apply_recorder_key(step, cx),
+                    })
+                }))
+                .child(div().text_color(colors.secondary).child(t(label)))
+                .child(div().text_color(colors.tertiary).child(key))
+        });
+        div()
+            .id("palette-footer")
+            .debug_selector(|| "palette-footer".into())
+            .h(px(FOOTER_HEIGHT))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            // The row text column: the rows' inset plus their own padding,
+            // less a hint's inner padding on the right.
+            .pl(px(PALETTE_ROW_INSET + 10.0))
+            .pr(px(PALETTE_ROW_INSET + 4.0))
+            .border_t_1()
+            .border_color(colors.primary.alpha(0.06))
+            .text_size(px(11.5))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .when_some(message, |view, (message, color)| {
+                        view.text_color(color).child(message)
+                    }),
+            )
+            .children(hints)
+            .into_any_element()
     }
 
     /// The palette's pixels for its floating panel.
@@ -2110,17 +2425,19 @@ impl NavigationOverlay {
         let action = ranked.item;
         let command = action.command.clone();
         let enabled = action.enabled;
-        let opens_page = matches!(
-            command,
-            PaletteCommand::Themes
-                | PaletteCommand::InterfaceStyles
-                | PaletteCommand::Action(
-                    CommandId::ToggleQuickOpen
-                        | CommandId::ToggleHistory
-                        | CommandId::SearchNotes
-                        | CommandId::OpenSettings
+        let recording = self
+            .rebind
+            .as_ref()
+            .filter(|rebind| {
+                index == self.highlight && command == PaletteCommand::Action(rebind.command)
+            })
+            .map(|rebind| {
+                rebind.clash.as_ref().map_or_else(
+                    || t("settings.shortcuts.press_keys").to_owned(),
+                    |clash| crate::commands::keystroke_label(&clash.binding),
                 )
-        );
+            });
+        let opens_page = opens_page(&command);
         let trailing = if matches!(command, PaletteCommand::Workspace(_)) {
             action
                 .detail
@@ -2138,6 +2455,11 @@ impl NavigationOverlay {
                 .map(SharedString::from)
                 .collect()
         };
+        let trailing = if recording.is_some() {
+            Vec::new()
+        } else {
+            trailing
+        };
         palette_row(
             palette_match_label(action.title, &ranked.title_matches),
             sf_symbol(action.system_image, 12.5, ink.secondary),
@@ -2147,11 +2469,29 @@ impl NavigationOverlay {
             enabled,
             colors,
         )
+        .when_some(recording, |row, label| {
+            row.child(
+                div()
+                    .debug_selector(|| "palette-recording".into())
+                    .flex_none()
+                    .h(px(20.0))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(Radius::CHIP))
+                    .border_1()
+                    .border_color(ink.primary.alpha(0.55))
+                    .bg(ink.primary.alpha(0.12))
+                    .text_size(px(12.0))
+                    .text_color(ink.primary)
+                    .child(label),
+            )
+        })
         .when(opens_page, |row| {
             row.child(sf_symbol("chevron.right", 11.0, ink.secondary))
         })
         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-            if *hovered && this.highlight != index {
+            if *hovered && this.highlight != index && this.rebind.is_none() {
                 this.highlight = index;
                 cx.notify();
             }
@@ -2201,7 +2541,7 @@ impl NavigationOverlay {
         )
         .child(identity)
         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-            if *hovered && this.highlight != index {
+            if *hovered && this.highlight != index && this.rebind.is_none() {
                 this.highlight = index;
                 cx.notify();
             }
@@ -2403,6 +2743,29 @@ impl Render for NavigationOverlay {
             root.size(px(0.0))
         }
     }
+}
+
+/// A footer hint's click: the same step its key takes.
+#[derive(Clone)]
+enum FooterStep {
+    Change,
+    Run,
+    Key(crate::shortcut_recorder::RecorderKey),
+}
+
+/// Rows that push a palette page rather than run something; they end in ›.
+fn opens_page(command: &PaletteCommand) -> bool {
+    matches!(
+        command,
+        PaletteCommand::Themes
+            | PaletteCommand::InterfaceStyles
+            | PaletteCommand::Action(
+                CommandId::ToggleQuickOpen
+                    | CommandId::ToggleHistory
+                    | CommandId::SearchNotes
+                    | CommandId::OpenSettings
+            )
+    )
 }
 
 fn landing_action_order(action: &PaletteAction) -> Option<u8> {
@@ -3124,7 +3487,27 @@ mod tests {
             view.downcast::<CommandPalettePreviewHarness>()
                 .unwrap()
                 .update(cx, |view, cx| {
-                    view.overlay.update(cx, |_, cx| cx.notify());
+                    view.overlay.update(cx, |overlay, cx| {
+                        // DIRI_VISUAL_REBIND=recording|clash records a new
+                        // shortcut for the highlighted command; `clash`
+                        // presses ⌘N, which New Session holds.
+                        let rebind = std::env::var("DIRI_VISUAL_REBIND").ok();
+                        if rebind.is_some() {
+                            overlay.begin_rebind(window, cx);
+                        }
+                        if rebind.as_deref() == Some("clash")
+                            && let Some(rebind) = overlay.rebind.as_mut()
+                        {
+                            rebind.clash = crate::commands::assign_shortcut(
+                                &Default::default(),
+                                rebind.command,
+                                "cmd-n",
+                                None,
+                            )
+                            .err();
+                        }
+                        cx.notify()
+                    });
                 });
             window.refresh();
         })

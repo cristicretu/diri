@@ -5547,6 +5547,7 @@ mod tests {
                             scanning: false,
                             herdr: self.herdr.map(Into::into),
                             importing_herdr: false,
+                            terminal_setup: None,
                         },
                         crate::empty_workbench::EmptyWorkbenchActions {
                             install: std::rc::Rc::new(|_, _| {}),
