@@ -22,6 +22,8 @@
 //! for `diri-engine`'s `vtbench` (the same workloads through Holder and
 //! Engine).
 //!
+//! `DIRI_VT_BENCH_ONLY=ascii,unicode` runs only the named workloads.
+//!
 //! `DIRI_VT_BENCH_READ` sets the read size (default 64 KiB; a macOS PTY hands
 //! over about 1 KiB per read). Reported: MB/s (10^6 bytes) of wall time for
 //! `feed` alone, median of 7 runs of at least 64 MB each.
@@ -199,7 +201,11 @@ fn main() {
         }
         return;
     }
+    let only = std::env::var("DIRI_VT_BENCH_ONLY").ok();
     for name in WORKLOADS {
+        if only.as_deref().is_some_and(|only| !only.split(',').any(|n| n == name)) {
+            continue;
+        }
         let (data, source) = match &dir {
             Some(dir) => (
                 std::fs::read(std::path::Path::new(dir).join(format!("{name}.bin")))

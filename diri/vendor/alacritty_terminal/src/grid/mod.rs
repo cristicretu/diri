@@ -28,6 +28,13 @@ pub trait GridCell: Sized {
     /// Perform an opinionated cell reset based on a template cell.
     fn reset(&mut self, template: &Self);
 
+    /// Whether `reset(template)` always yields the default cell. Rows use it
+    /// to know their cells past the occupancy are default cells.
+    #[inline]
+    fn resets_to_default(_template: &Self) -> bool {
+        false
+    }
+
     fn flags(&self) -> &Flags;
     fn flags_mut(&mut self) -> &mut Flags;
 }

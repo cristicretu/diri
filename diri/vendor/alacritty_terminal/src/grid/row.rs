@@ -22,6 +22,13 @@ pub struct Row<T> {
     /// This is the upper bound on the number of elements in the row, which have been modified
     /// since the last reset. All cells after this point are guaranteed to be equal.
     pub(crate) occ: usize,
+
+    /// Every cell at or after `occ` is `T::default()`. Writes through the
+    /// index operators only raise `occ`, so they keep it; operations that
+    /// place cells past `occ` clear it. History encoding reads it to skip
+    /// a row's blank tail without comparing its cells.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) blank_tail: bool,
 }
 
 impl<T: PartialEq> PartialEq for Row<T> {
@@ -52,7 +59,7 @@ impl<T: Default> Row<T> {
             inner.set_len(columns);
         }
 
-        Row { inner, occ: 0 }
+        Row { inner, occ: 0, blank_tail: true }
     }
 
     /// Increase the number of columns in the row.
@@ -113,6 +120,8 @@ impl<T: Default> Row<T> {
             item.reset(template);
         }
 
+        self.blank_tail =
+            T::resets_to_default(template) && (self.blank_tail || self.occ == len);
         self.occ = 0;
     }
 }
@@ -121,7 +130,22 @@ impl<T: Default> Row<T> {
 impl<T> Row<T> {
     #[inline]
     pub fn from_vec(vec: Vec<T>, occ: usize) -> Row<T> {
-        Row { inner: vec, occ }
+        let blank_tail = occ >= vec.len();
+        Row { inner: vec, occ, blank_tail }
+    }
+
+    /// `from_vec` of cells whose cells at or after `occ` are known to be
+    /// `T::default()`.
+    #[inline]
+    pub(crate) fn from_vec_blank_tail(vec: Vec<T>, occ: usize) -> Row<T> {
+        Row { inner: vec, occ, blank_tail: true }
+    }
+
+    /// Cells through the last one that can differ from `T::default()`: the
+    /// occupancy when the cells after it are known to be default cells.
+    #[inline]
+    pub(crate) fn content_bound(&self) -> usize {
+        if self.blank_tail { self.occ.min(self.inner.len()) } else { self.inner.len() }
     }
 
     #[inline]
@@ -145,6 +169,8 @@ impl<T> Row<T> {
     where
         T: GridCell,
     {
+        // Appended cells land past the occupancy when it is below the length.
+        self.blank_tail &= self.occ >= self.inner.len();
         self.occ += vec.len();
         self.inner.append(vec);
     }

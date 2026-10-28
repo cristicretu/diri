@@ -274,6 +274,11 @@ impl GridCell for Cell {
     }
 
     #[inline]
+    fn resets_to_default(template: &Self) -> bool {
+        template.bg == Color::Named(NamedColor::Background)
+    }
+
+    #[inline]
     fn reset(&mut self, template: &Self) {
         *self = Cell {
             bg: template.bg,
