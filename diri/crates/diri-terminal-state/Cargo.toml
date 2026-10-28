@@ -69,5 +69,9 @@ name = "narrow_history"
 harness = false
 
 [[example]]
+name = "core_v2_screen_bench"
+required-features = ["core-v2", "bench-verify"]
+
+[[example]]
 name = "core_v2_bench"
 required-features = ["core-v2"]

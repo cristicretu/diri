@@ -3133,7 +3133,30 @@ pub(crate) fn only_csi_escapes(bytes: &[u8]) -> bool {
         let t = word ^ (ONES * u64::from(byte));
         !(((t & LOW).wrapping_add(LOW)) | t | LOW)
     };
-    let mut at = 0;
+    // Plain text has no ESC at all: skip to the first one.
+    let Some(mut at) = memchr::memchr(0x1b, bytes) else {
+        return true;
+    };
+    // Sixteen bytes per step: an ESC whose next byte is not `[`.
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        while at + 17 <= bytes.len() {
+            // SAFETY: NEON is baseline on aarch64; `at + 17 <= len` bounds
+            // both 16-byte loads.
+            let bad = unsafe {
+                let here = vld1q_u8(bytes.as_ptr().add(at));
+                let next = vld1q_u8(bytes.as_ptr().add(at + 1));
+                let esc = vceqq_u8(here, vdupq_n_u8(0x1b));
+                let csi = vceqq_u8(next, vdupq_n_u8(b'['));
+                vmaxvq_u8(vbicq_u8(esc, csi))
+            };
+            if bad != 0 {
+                return false;
+            }
+            at += 16;
+        }
+    }
     while at + 9 <= bytes.len() {
         let word = u64::from_le_bytes(bytes[at..at + 8].try_into().expect("eight bytes"));
         let next = u64::from_le_bytes(bytes[at + 1..at + 9].try_into().expect("eight bytes"));
@@ -3279,7 +3302,7 @@ mod tests {
             seed ^= seed << 13;
             seed ^= seed >> 7;
             seed ^= seed << 17;
-            let length = (seed % 40) as usize;
+            let length = (seed % 80) as usize;
             let bytes: Vec<u8> = (0..length)
                 .map(|index| b"\x1b\x1b[[]_a\x9b"[(seed >> (index % 56)) as usize % 8])
                 .collect();
