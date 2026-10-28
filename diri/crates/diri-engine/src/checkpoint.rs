@@ -164,6 +164,20 @@ impl ScreenCheckpoint {
 
     /// Writes atomically (temp file + rename) as a binary plist.
     pub fn write_atomically(&self, path: &Path) -> std::io::Result<()> {
+        let payload = GridRowCodec::encode_rows(&self.history).map_err(std::io::Error::other)?;
+        self.write_with_history(path, self.history.len(), &payload)
+    }
+
+    /// [`Self::write_atomically`] with the history already encoded by
+    /// [`GridRowCodec::append_row`] (`history_rows` rows, oldest first); the
+    /// `history` field is ignored. Lets the periodic checkpoint encode rows
+    /// as it reads them instead of copying every cell first.
+    pub fn write_with_history(
+        &self,
+        path: &Path,
+        history_rows: usize,
+        history_payload: &[u8],
+    ) -> std::io::Result<()> {
         let mut dict = plist::Dictionary::new();
         let enhancements = self.keyboard.and_then(|keyboard| keyboard.enhancements);
         if enhancements.map(|flags| flags.bits())
@@ -222,16 +236,14 @@ impl ScreenCheckpoint {
         dict.insert(
             "historyRowCount".into(),
             plist::Value::Integer(
-                u64::try_from(self.history.len())
+                u64::try_from(history_rows)
                     .map_err(std::io::Error::other)?
                     .into(),
             ),
         );
         dict.insert(
             "historyPayload".into(),
-            plist::Value::Data(
-                GridRowCodec::encode_rows(&self.history).map_err(std::io::Error::other)?,
-            ),
+            plist::Value::Data(history_payload.to_vec()),
         );
         dict.insert(
             "markerBuffer".into(),

@@ -1014,6 +1014,11 @@ impl HeadlessScreen {
         (self.geometry.cols, self.geometry.rows)
     }
 
+    /// Rows above the visible grid.
+    pub fn history_rows(&self) -> usize {
+        self.term.grid().history_size()
+    }
+
     pub fn invalidate_keyboard_enhancements(&mut self) {
         self.keyboard_enhancements_known = false;
     }
@@ -1291,6 +1296,7 @@ impl HeadlessScreen {
     /// these alongside the visible snapshot so adoption does not collapse a
     /// long session to a single scrollback row.
     pub fn history_snapshot(&mut self) -> Vec<Vec<GridCell>> {
+        self.prepare_history_read();
         let history = self.term.grid().history_size();
         let cols = self.geometry.cols;
         let mut rows = Vec::with_capacity(history);
@@ -1307,7 +1313,32 @@ impl HeadlessScreen {
         rows
     }
 
+    /// [`Self::history_snapshot`] already encoded with
+    /// [`diri_proto::grid::GridRowCodec::append_row`], oldest row first, and
+    /// its row count. One row is decoded at a time, so the transient is one
+    /// row of cells plus the compact payload instead of a cell copy of every
+    /// row.
+    pub fn history_payload(&mut self) -> (usize, Vec<u8>) {
+        self.prepare_history_read();
+        let history = self.term.grid().history_size();
+        let cols = self.geometry.cols;
+        let mut payload = Vec::new();
+        let mut row = Vec::with_capacity(cols);
+        for index in 0..history {
+            let line = Line(index as i32 - history as i32);
+            row.clear();
+            let source = &self.term.grid()[line];
+            row.extend((0..cols).map(|x| wire_cell(&source[Column(x)])));
+            // A row is at most the terminal width, far below the codec's
+            // u16 cell limit, so encoding cannot fail.
+            let _ = diri_proto::grid::GridRowCodec::append_row(&row, &mut payload);
+            self.finish_history_read_batch(index + 1, index + 1 == history);
+        }
+        (history, payload)
+    }
+
     pub fn history_metadata(&mut self) -> Vec<RowMetadata> {
+        self.prepare_history_read();
         let count = self.term.grid().history_size();
         let mut rows = Vec::with_capacity(count);
         for index in 0..count {
@@ -1315,6 +1346,14 @@ impl HeadlessScreen {
             self.finish_history_read_batch(index + 1, index + 1 == count);
         }
         rows
+    }
+
+    /// Before reading history rows: a reflow the compact store deferred is
+    /// stored a block at a time now, rather than rebuilt whole (every row at
+    /// the new width, tens of MB) by the first read.
+    fn prepare_history_read(&mut self) {
+        #[cfg(feature = "compact-history")]
+        self.term.grid_mut().prepare_history_read();
     }
 
     fn finish_history_read_batch(&mut self, completed: usize, finished: bool) {
@@ -1553,6 +1592,7 @@ impl HeadlessScreen {
     /// deep scrollback across heavy output may refetch; the visible region and
     /// recent history are exact.
     pub fn scrollback(&mut self) -> diri_proto::ReadScrollbackResult {
+        self.prepare_history_read();
         let history = self.term.grid().history_size();
         let rows = self.geometry.rows;
         let cols = self.geometry.cols;
@@ -1619,6 +1659,7 @@ impl HeadlessScreen {
         first_row: i64,
         max_rows: i64,
     ) -> diri_proto::ReadScrollbackCellsResult {
+        self.prepare_history_read();
         let history = self.term.grid().history_size();
         let cols = self.geometry.cols;
         let total = history + self.geometry.rows;
@@ -1844,7 +1885,10 @@ impl HeadlessScreen {
     /// of scrollback: text with soft-wrapped rows rejoined (a URL longer than
     /// the terminal is one logical line), and every OSC 8 hyperlink target,
     /// which is often the only place the URL of a `[title](url)` link exists.
-    pub fn link_source(&self, history_rows: usize) -> LinkSource {
+    pub fn link_source(&mut self, history_rows: usize) -> LinkSource {
+        if history_rows > 0 {
+            self.prepare_history_read();
+        }
         let grid = self.term.grid();
         let history = grid.history_size().min(history_rows);
         let cols = self.geometry.cols;
