@@ -10,6 +10,8 @@ pub(crate) enum PaneCommand {
     Cycle(bool),
     /// A new shell pane on this side of the focused pane.
     Split(DockEdge),
+    /// A new shell pane across the focused pane's longer side.
+    SplitBestFit,
     Equalize,
     Zoom,
     Remove,
@@ -28,6 +30,9 @@ impl PaneCommand {
             CommandId::FocusPaneDown => Self::Focus(DockEdge::Bottom),
             CommandId::SplitPaneRight => Self::Split(DockEdge::Right),
             CommandId::SplitPaneBelow => Self::Split(DockEdge::Bottom),
+            CommandId::SplitPaneLeft => Self::Split(DockEdge::Left),
+            CommandId::SplitPaneAbove => Self::Split(DockEdge::Top),
+            CommandId::SplitPaneBestFit => Self::SplitBestFit,
             CommandId::FocusPreviousPane => Self::Cycle(false),
             CommandId::FocusNextPane => Self::Cycle(true),
             CommandId::EqualizePanes => Self::Equalize,
@@ -60,6 +65,20 @@ impl PaneCommand {
             Self::Focus(DockEdge::Right | DockEdge::Bottom) | Self::Cycle(true) => Some(true),
             _ => None,
         }
+    }
+}
+
+/// Where Best Fit puts a new pane: across the longer side of `bounds`, in
+/// points, so both halves keep the most readable shape. A wide pane splits
+/// into columns, a tall one into rows; a square one into columns, like
+/// ⌘D. Points rather than cells: a cell is about twice as tall as it is wide,
+/// so comparing columns with rows would cut a 56×33 pane into 28-column
+/// strips.
+pub(crate) fn best_fit_edge(bounds: Rect) -> DockEdge {
+    if bounds.height > bounds.width {
+        DockEdge::Bottom
+    } else {
+        DockEdge::Right
     }
 }
 
@@ -225,7 +244,16 @@ impl WorkspaceWorkbench {
         {
             return true;
         }
-        if let PaneCommand::Split(edge) = command {
+        let split = match command {
+            PaneCommand::Split(edge) => Some(edge),
+            PaneCommand::SplitBestFit => geometry
+                .panes
+                .iter()
+                .find(|pane| pane.identity.pane == focused)
+                .map(|pane| best_fit_edge(pane.bounds)),
+            _ => None,
+        };
+        if let Some(edge) = split {
             let Some(source) = pane_session(&tab.layout, &focused) else {
                 return true;
             };
@@ -323,7 +351,10 @@ impl WorkspaceWorkbench {
                     edge,
                 }
             }
-            PaneCommand::Focus(_) | PaneCommand::Cycle(_) | PaneCommand::Split(_) => return true,
+            PaneCommand::Focus(_)
+            | PaneCommand::Cycle(_)
+            | PaneCommand::Split(_)
+            | PaneCommand::SplitBestFit => return true,
         };
         self.runtime
             .store
@@ -674,8 +705,40 @@ mod tests {
             Some(PaneCommand::Split(DockEdge::Bottom))
         ));
         assert!(matches!(
+            PaneCommand::from_id(CommandId::SplitPaneLeft),
+            Some(PaneCommand::Split(DockEdge::Left))
+        ));
+        assert!(matches!(
+            PaneCommand::from_id(CommandId::SplitPaneAbove),
+            Some(PaneCommand::Split(DockEdge::Top))
+        ));
+        assert!(matches!(
+            PaneCommand::from_id(CommandId::SplitPaneBestFit),
+            Some(PaneCommand::SplitBestFit)
+        ));
+        assert!(matches!(
             PaneCommand::from_id(CommandId::EqualizePanes),
             Some(PaneCommand::Equalize)
         ));
+        assert_eq!(PaneCommand::SplitBestFit.session_fallback(), None);
+    }
+
+    #[test]
+    fn best_fit_splits_the_longer_side_in_points() {
+        let rect = |width, height| Rect {
+            width,
+            height,
+            ..Default::default()
+        };
+        // A full 1280×780 window: columns.
+        assert_eq!(best_fit_edge(rect(1280.0, 780.0)), DockEdge::Right);
+        // Its right half, 640×780, is taller than wide: rows, although it
+        // is ~80 columns by ~43 rows. Splitting by cells would leave two
+        // 40-column strips.
+        assert_eq!(best_fit_edge(rect(640.0, 780.0)), DockEdge::Bottom);
+        // A quarter, 640×390: columns again.
+        assert_eq!(best_fit_edge(rect(640.0, 390.0)), DockEdge::Right);
+        // A square splits like ⌘D.
+        assert_eq!(best_fit_edge(rect(500.0, 500.0)), DockEdge::Right);
     }
 }

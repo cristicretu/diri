@@ -1,7 +1,7 @@
 # Diri VTE patch
 
 Source: crates.io `vte` 0.15.0, copied from the Cargo registry. Original
-Apache-2.0/MIT licenses and upstream tests are retained. There are five
+Apache-2.0/MIT licenses and upstream tests are retained. There are six
 production changes. The first is `SyncState::default`: its byte buffer starts empty instead of reserving
 the 2 MiB synchronization limit for every terminal, including idle shells.
 
@@ -76,6 +76,17 @@ Test: `completed_synchronized_updates_are_counted`.
 14 (text area in pixels) and 18 (text area in cells). Image tools such as
 `chafa` and `timg` size their output from it. Only Diri's local Engine answers,
 and only for terminals that place inline images; others ignore it as before.
+
+## Character after a split UTF-8 sequence
+
+Upstream bug, fixed here. When a read ended inside a multi-byte character,
+`advance_partial_utf8` copied up to three bytes of the next read to finish it.
+If those bytes held the rest of the character, an ASCII byte and the start of
+another multi-byte character (`e\u{301}a\u{308}` split inside `\u{301}`), it
+printed the first character but reported all the valid bytes as consumed, so
+the ASCII byte was never parsed: the letter vanished, and only when that read
+boundary fell there. It now consumes only the first character's bytes.
+Test: `partial_utf8_then_ascii_then_partial_utf8`.
 
 ## Mode 2027
 
