@@ -81,6 +81,12 @@ impl SessionRowView {
         self.props.held_hint
     }
 
+}
+
+// The window-key test that reads these compiles on every platform (Linux and
+// Windows CI run `clippy --all-targets`), so they must not be macOS-only.
+#[cfg(test)]
+impl SessionRowView {
     pub(super) fn look_for_test(&self) -> crate::chrome_focus::ChromeLook {
         self.props.look
     }

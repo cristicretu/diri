@@ -323,7 +323,7 @@ impl JsonStateFile {
 
     fn create_parent(&self) -> io::Result<()> {
         if let Some(parent) = self.path().parent() {
-            std::fs::create_dir_all(parent)?;
+            diri_platform::private::create_dir_all(parent)?;
         }
         Ok(())
     }

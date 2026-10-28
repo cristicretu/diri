@@ -28,7 +28,9 @@ pub(super) struct QolState {
     feedback_timer: Option<Task<()>>,
     /// Selection drag held past an edge: cell under the pointer and signed
     /// pixels past the edge, positive above the top.
-    pub drag: Option<(SessionId, usize, usize, f32)>,
+    /// Session, pointer cell column, nearest column edge, row, and how far
+    /// past the grid the pointer is.
+    pub drag: Option<(SessionId, usize, usize, usize, f32)>,
     pub autoscroll: Option<Autoscroll>,
     autoscroll_generation: u64,
     export_files: Vec<tempfile::NamedTempFile>,
@@ -238,17 +240,119 @@ impl TerminalPane {
         cx: &mut Context<Self>,
     ) {
         match reference {
-            TerminalReference::Url(url) => cx.open_url(&url),
+            TerminalReference::Url(url) => match diri_term::link_scheme::kind(&url) {
+                Some(diri_term::link_scheme::LinkKind::Web) => cx.open_url(&url),
+                Some(diri_term::link_scheme::LinkKind::App) => self.open_app_link(url, window, cx),
+                None => {}
+            },
             TerminalReference::File(reference) => {
-                let opened = self
-                    .local_file(&reference)
-                    .and_then(|file| crate::file_links::open_url(&file, self.file_editor()));
-                match opened {
-                    Some(url) => cx.open_url(&url),
-                    None => self.show_terminal_feedback(t("terminal.file_not_local"), window, cx),
+                let Some(file) = self.local_file(&reference) else {
+                    self.show_terminal_feedback(t("terminal.file_not_local"), window, cx);
+                    return;
+                };
+                let Some(url) = crate::file_links::open_url(&file, self.file_editor()) else {
+                    self.show_terminal_feedback(t("terminal.file_not_local"), window, cx);
+                    return;
+                };
+                // The system opener runs an app, script or installer it is
+                // handed. Ask every time; there is no "always" for these.
+                if url.starts_with("file://") && crate::file_links::runs_when_opened(&file.path) {
+                    let name = file
+                        .path
+                        .file_name()
+                        .map_or_else(|| file.display(), |name| name.to_string_lossy().into_owned());
+                    self.ask_before_opening(
+                        url,
+                        tf("terminal.link.run_title", &[("name", &name)]),
+                        tf("terminal.link.run_detail", &[("path", &file.display())]),
+                        None,
+                        window,
+                        cx,
+                    );
+                    return;
                 }
+                cx.open_url(&url);
             }
         }
+    }
+
+    /// A link to another app (`ssh://`, `vscode://`, `mailto:`): opens at
+    /// once if its scheme is trusted, otherwise after the user says so.
+    fn open_app_link(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(scheme) = diri_term::link_scheme::scheme(&url) else {
+            return;
+        };
+        let trusted = self
+            .runtime
+            .store
+            .read()
+            .expect("store")
+            .preferences()
+            .terminal_trusted_link_schemes
+            .contains(&scheme);
+        if trusted {
+            cx.open_url(&url);
+            return;
+        }
+        let shown: String = url.chars().take(300).collect();
+        self.ask_before_opening(
+            url,
+            tf("terminal.link.ask_title", &[("scheme", &scheme)]),
+            tf("terminal.link.ask_detail", &[("url", &shown)]),
+            Some(scheme),
+            window,
+            cx,
+        );
+    }
+
+    /// The window's sheet: Open, Always Open (when `trust` names a scheme),
+    /// Cancel. Nothing opens until a button is pressed.
+    fn ask_before_opening(
+        &mut self,
+        url: String,
+        title: String,
+        detail: String,
+        trust: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut buttons = vec![gpui::PromptButton::ok(t("terminal.link.open"))];
+        if let Some(scheme) = &trust {
+            buttons.push(gpui::PromptButton::new(tf(
+                "terminal.link.always",
+                &[("scheme", scheme)],
+            )));
+        }
+        buttons.push(gpui::PromptButton::cancel(t("terminal.paste.cancel")));
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            &title,
+            Some(&detail),
+            &buttons,
+            cx,
+        );
+        let always = trust.as_ref().map(|_| 1);
+        cx.spawn_in(window, async move |this, cx| {
+            let choice = answer.await.ok();
+            let _ = crate::floating::update_in_owner(&this, cx, |this, _, cx| {
+                if choice == Some(0) || (choice.is_some() && choice == always) {
+                    if choice == always
+                        && let Some(scheme) = trust
+                    {
+                        let _ = this
+                            .runtime
+                            .store
+                            .write()
+                            .expect("store")
+                            .update_preferences(|prefs| {
+                                prefs.terminal_trusted_link_schemes.insert(scheme);
+                            });
+                    }
+                    cx.open_url(&url);
+                }
+            });
+        })
+        .detach();
     }
 
     pub(super) fn show_terminal_feedback(
@@ -524,6 +628,7 @@ impl TerminalPane {
         &mut self,
         position: Point<Pixels>,
         col: usize,
+        edge: usize,
         row: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -548,7 +653,7 @@ impl TerminalPane {
             self.qol.autoscroll = None;
             return;
         }
-        self.qol.drag = Some((id, col, row, past));
+        self.qol.drag = Some((id, col, edge, row, past));
         if self.qol.autoscroll.is_some() {
             return;
         }
@@ -596,7 +701,7 @@ impl TerminalPane {
         };
         let elapsed = now.saturating_duration_since(run.last);
         run.last = now;
-        let Some((id, col, row, past)) = self.qol.drag.clone() else {
+        let Some((id, col, edge, row, past)) = self.qol.drag.clone() else {
             return false;
         };
         if self.selected_id().as_ref() != Some(&id) || !self.focus.is_focused(window) {
@@ -634,7 +739,7 @@ impl TerminalPane {
             self.qol.drag = None;
             return false;
         }
-        resident.element.drag_selection(col, row);
+        resident.element.drag_selection_to_edge(col, edge, row);
         self.pump_scrollback_fetch(&id, rows);
         cx.notify();
         true
@@ -807,16 +912,12 @@ impl TerminalPane {
             }
             _ => {}
         }
-        if mode.selecting {
-            resident
-                .element
-                .drag_selection((mode.col + 1).min(cols), mode.row);
-        } else {
+        // Both the cell `v` started on and the cursor's cell are selected,
+        // whichever way the cursor moved.
+        if !mode.selecting {
             resident.element.begin_selection(mode.col, mode.row);
-            resident
-                .element
-                .drag_selection((mode.col + 1).min(cols), mode.row);
         }
+        resident.element.drag_selection_cells(mode.col, mode.row);
         self.qol.copy_mode = Some(mode);
         self.pump_scrollback_fetch(&id, rows);
         cx.notify();
@@ -869,6 +970,80 @@ impl TerminalPane {
                 };
                 this.show_terminal_feedback(message, window, cx);
                 cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Clear Screen and Scrollback. The view returns to the live edge first so
+    /// no fetched history is left on screen; the Engine's next grid is the
+    /// cleared one. Feedback only when nothing changed or it failed.
+    pub(super) fn clear_scrollback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        if !self.residents.contains_key(&id) {
+            return;
+        }
+        self.return_to_live(&id, cx);
+        let client = Arc::clone(self.runtime.client());
+        let request_id = id.clone();
+        let task = self
+            .tokio
+            .spawn(async move { client.clear_scrollback(&request_id).await });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
+                if this.selected_id().as_ref() != Some(&id) {
+                    return;
+                }
+                let message = match result {
+                    Ok(Ok(true)) => return,
+                    Ok(Ok(false)) => t("terminal.clear.alt_screen"),
+                    Ok(Err(diri_client::ClientError::Control(error)))
+                        if error.code == "terminal_clear_unsupported" =>
+                    {
+                        t("terminal.clear.remote_unsupported")
+                    }
+                    _ => t("terminal.clear.failed"),
+                };
+                this.show_terminal_feedback(message, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Reset Terminal: blanks the emulator and restores default modes for a
+    /// garbled screen, local or remote; the child keeps running.
+    pub(super) fn reset_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        if !self.residents.contains_key(&id) {
+            return;
+        }
+        self.return_to_live(&id, cx);
+        let client = Arc::clone(self.runtime.client());
+        let request_id = id.clone();
+        let task = self
+            .tokio
+            .spawn(async move { client.reset_terminal(&request_id).await });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
+                if this.selected_id().as_ref() != Some(&id) {
+                    return;
+                }
+                let message = match result {
+                    Ok(Ok(())) => return,
+                    Ok(Err(diri_client::ClientError::Control(error)))
+                        if error.code == "terminal_reset_unsupported" =>
+                    {
+                        t("terminal.reset.unsupported")
+                    }
+                    _ => t("terminal.reset.failed"),
+                };
+                this.show_terminal_feedback(message, window, cx);
             });
         })
         .detach();

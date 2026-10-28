@@ -1,5 +1,5 @@
-//! Box drawing, braille and the core powerline separators are terminal
-//! geometry too.
+//! Box drawing, braille, sextants, octants and the powerline separators and
+//! caps are terminal geometry too.
 //!
 //! A font draws them for its own advance and line height, so on the cell grid
 //! frames gap or overlap, braille graphs change texture with the fallback
@@ -72,6 +72,13 @@ pub(crate) enum Shape {
     },
     /// A convex polygon of `len` points, antialiased.
     Polygon { points: [[f32; 2]; 4], len: usize },
+    /// Half a disc filling `bounds`, flat along one side and round on the
+    /// other; outlined `thickness` wide when that is not `None`.
+    HalfDisc {
+        bounds: DeviceRect,
+        round_right: bool,
+        thickness: Option<f32>,
+    },
 }
 
 /// The device-pixel grid sprites are laid out on.
@@ -135,6 +142,13 @@ impl SpriteGrid {
                 thickness,
             } => self.arc(bounds, corner, thickness, color).paint(window),
             Shape::Polygon { points, len } => self.polygon(&points[..len], color).paint(window),
+            Shape::HalfDisc {
+                bounds,
+                round_right,
+                thickness,
+            } => self
+                .half_disc(bounds, round_right, thickness, color)
+                .paint(window),
         });
     }
 
@@ -157,6 +171,11 @@ impl SpriteGrid {
             Shape::Polygon { points, len } => {
                 antialiased.push(self.polygon(&points[..len], color));
             }
+            Shape::HalfDisc {
+                bounds,
+                round_right,
+                thickness,
+            } => antialiased.push(self.half_disc(bounds, round_right, thickness, color)),
         });
     }
 
@@ -214,6 +233,52 @@ impl SpriteGrid {
             Corner::TopRight => quad.corner_radii.top_right = radius,
             Corner::BottomRight => quad.corner_radii.bottom_right = radius,
             Corner::BottomLeft => quad.corner_radii.bottom_left = radius,
+        }
+        AntialiasedShape::Arc {
+            quad,
+            clip: self.bounds(bounds),
+        }
+    }
+
+    /// A quad twice the cell wide whose round side has corners as large as
+    /// the cell is wide, clipped back to the cell: the straight top and
+    /// bottom runs are clipped away and the flat side lies on the cell edge.
+    fn half_disc(
+        &self,
+        bounds: DeviceRect,
+        round_right: bool,
+        thickness: Option<f32>,
+        color: Rgba,
+    ) -> AntialiasedShape {
+        let radius = bounds.width().min(bounds.height() / 2.0);
+        let mut outer = bounds;
+        if round_right {
+            outer.left = bounds.right - 2.0 * bounds.width();
+        } else {
+            outer.right = bounds.left + 2.0 * bounds.width();
+        }
+        let radius = px(radius / self.scale);
+        let mut quad = match thickness {
+            None => fill(self.bounds(outer), color),
+            Some(thickness) => {
+                let mut quad = fill(self.bounds(outer), gpui::transparent_black());
+                quad.border_color = Hsla::from(color);
+                let width = px(thickness / self.scale);
+                quad.border_widths = Edges {
+                    top: width,
+                    right: width,
+                    bottom: width,
+                    left: width,
+                };
+                quad
+            }
+        };
+        if round_right {
+            quad.corner_radii.top_right = radius;
+            quad.corner_radii.bottom_right = radius;
+        } else {
+            quad.corner_radii.top_left = radius;
+            quad.corner_radii.bottom_left = radius;
         }
         AntialiasedShape::Arc {
             quad,
@@ -343,7 +408,11 @@ impl Sprite {
     /// A range check: every scalar in these blocks is drawn here.
     pub(crate) const fn from_scalar(scalar: u32) -> Option<Self> {
         match scalar {
-            0x2500..=0x257f | 0x2800..=0x28ff | 0xe0b0..=0xe0b3 => Some(Self(scalar)),
+            0x2500..=0x257f
+            | 0x2800..=0x28ff
+            | 0xe0b0..=0xe0bf
+            | 0x1fb00..=0x1fb3b
+            | 0x1cd00..=0x1cde5 => Some(Self(scalar)),
             _ => None,
         }
     }
@@ -360,6 +429,9 @@ impl Sprite {
         match self.0 {
             0x2800..=0x28ff => braille(self.0 as u8, cell, emit),
             0xe0b0..=0xe0b3 => powerline(self.0 - 0xe0b0, cell, light, emit),
+            0xe0b4..=0xe0bf => powerline_extra(self.0, cell, light, emit),
+            0x1fb00..=0x1fb3b => mosaic(sextant_bits(self.0), 3, cell, emit),
+            0x1cd00..=0x1cde5 => mosaic(OCTANTS[(self.0 - 0x1cd00) as usize], 4, cell, emit),
             scalar => match scalar - 0x2500 {
                 offset @ (0x04..=0x0b | 0x4c..=0x4f) => {
                     let count = if offset >= 0x4c {
@@ -696,6 +768,106 @@ fn powerline(which: u32, cell: DeviceRect, light: f32, emit: &mut impl FnMut(Sha
     }
 }
 
+/// U+E0B4–U+E0BF: the round caps, the diagonal wedges and the slashes
+/// between them. Every flat side lies on a snapped cell edge, so a cap or
+/// wedge meets the segment it closes with no seam.
+fn powerline_extra(scalar: u32, cell: DeviceRect, light: f32, emit: &mut impl FnMut(Shape)) {
+    let DeviceRect {
+        left,
+        top,
+        right,
+        bottom,
+    } = cell;
+    let triangle = |a: [f32; 2], b: [f32; 2], c: [f32; 2]| Shape::Polygon {
+        points: [a, b, c, [0.0; 2]],
+        len: 3,
+    };
+    match scalar {
+        0xe0b4..=0xe0b7 => emit(Shape::HalfDisc {
+            bounds: cell,
+            round_right: scalar < 0xe0b6,
+            thickness: (scalar & 1 == 1).then_some(light),
+        }),
+        0xe0b8 => emit(triangle([left, top], [left, bottom], [right, bottom])),
+        0xe0ba => emit(triangle([right, top], [right, bottom], [left, bottom])),
+        0xe0bc => emit(triangle([left, top], [right, top], [left, bottom])),
+        0xe0be => emit(triangle([left, top], [right, top], [right, bottom])),
+        // ╲ for U+E0B9 and U+E0BF, ╱ for U+E0BB and U+E0BD.
+        0xe0b9 | 0xe0bf => diagonals(2, cell, light, emit),
+        _ => diagonals(1, cell, light, emit),
+    }
+}
+
+/// The cells a sextant (U+1FB00–U+1FB3B) fills, numbered as Unicode names
+/// them: 1 2 / 3 4 / 5 6, bit `n - 1` for cell `n`. The block omits the
+/// patterns other blocks already encode (blank, full, left and right half).
+const fn sextant_bits(scalar: u32) -> u8 {
+    let mut bits = scalar - 0x1fb00 + 1;
+    if bits >= 0b01_0101 {
+        bits += 1;
+    }
+    if bits >= 0b10_1010 {
+        bits += 1;
+    }
+    bits as u8
+}
+
+/// The cells each octant (U+1CD00–U+1CDE5) fills, numbered 1 2 / 3 4 / 5 6 /
+/// 7 8 with bit `n - 1` for cell `n`, from the Unicode 16 character names.
+/// Patterns other blocks already encode (halves, quadrants, eighths) are
+/// skipped there, so the table is not a counting sequence.
+#[rustfmt::skip]
+const OCTANTS: [u8; 230] = [
+    0x04, 0x06, 0x07, 0x08, 0x09, 0x0b, 0x0c, 0x0d, 0x0e, 0x10, 0x11, 0x12,
+    0x13, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+    0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x29, 0x2a, 0x2b, 0x2c,
+    0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
+    0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46,
+    0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x51, 0x52, 0x53,
+    0x54, 0x56, 0x57, 0x58, 0x59, 0x5b, 0x5c, 0x5d, 0x5e, 0x60, 0x61, 0x62,
+    0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e,
+    0x6f, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a,
+    0x7b, 0x7c, 0x7d, 0x7e, 0x7f, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
+    0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f, 0x90, 0x91, 0x92, 0x93,
+    0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f,
+    0xa1, 0xa2, 0xa3, 0xa4, 0xa6, 0xa7, 0xa8, 0xa9, 0xab, 0xac, 0xad, 0xae,
+    0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xbb,
+    0xbc, 0xbd, 0xbe, 0xbf, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8,
+    0xc9, 0xca, 0xcb, 0xcc, 0xcd, 0xce, 0xcf, 0xd0, 0xd1, 0xd2, 0xd3, 0xd4,
+    0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xdb, 0xdc, 0xdd, 0xde, 0xdf, 0xe0,
+    0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xeb, 0xec,
+    0xed, 0xee, 0xef, 0xf1, 0xf2, 0xf3, 0xf4, 0xf6, 0xf7, 0xf8, 0xf9, 0xfb,
+    0xfd, 0xfe,
+];
+
+/// A 2-wide, `rows`-high mosaic. Edges are snapped within the cell, so a
+/// filled pattern next to another meets it on the same pixel and a graph
+/// drawn in sextants or octants has no seams between cells.
+fn mosaic(bits: u8, rows: u32, cell: DeviceRect, emit: &mut impl FnMut(Shape)) {
+    let middle = cell.left + (cell.width() / 2.0).round();
+    let edge = |row: u32| cell.top + (cell.height() * row as f32 / rows as f32).round();
+    for (column, left, right) in [(0, cell.left, middle), (1, middle, cell.right)] {
+        // Consecutive filled cells in a column are one rectangle.
+        let mut row = 0;
+        while row < rows {
+            if bits & (1 << (2 * row + column)) == 0 {
+                row += 1;
+                continue;
+            }
+            let start = row;
+            while row < rows && bits & (1 << (2 * row + column)) != 0 {
+                row += 1;
+            }
+            emit(Shape::Rect(DeviceRect::new(
+                left,
+                edge(start),
+                right,
+                edge(row),
+            )));
+        }
+    }
+}
+
 /// Dots on a regular 2×4 lattice with half a pitch of margin, so graphs keep
 /// their rhythm across cell boundaries.
 fn braille(dots: u8, cell: DeviceRect, emit: &mut impl FnMut(Shape)) {
@@ -772,7 +944,7 @@ mod tests {
                     rects.push(DeviceRect::new(left, row.0, right, row.1));
                     rects.push(DeviceRect::new(column.0, rest.0, column.1, rest.1));
                 }
-                Shape::Polygon { .. } => {}
+                Shape::Polygon { .. } | Shape::HalfDisc { .. } => {}
             });
         rects
     }
@@ -1059,12 +1231,168 @@ mod tests {
         }
     }
 
+    fn mosaic_rects(scalar: u32, cell: DeviceRect) -> Vec<DeviceRect> {
+        let mut rects = Vec::new();
+        Sprite::from_scalar(scalar)
+            .unwrap()
+            .shapes(cell, 1.0, &mut |shape| match shape {
+                Shape::Rect(rect) => rects.push(rect),
+                other => panic!("{other:?}"),
+            });
+        rects
+    }
+
+    fn area(rects: &[DeviceRect]) -> f32 {
+        rects.iter().map(|rect| rect.width() * rect.height()).sum()
+    }
+
+    #[test]
+    fn sextants_follow_their_unicode_names() {
+        // BLOCK SEXTANT-1, -2, -12, -3, then the gaps where U+258C (135) and
+        // U+2590 (246) already exist, and the last, SEXTANT-23456.
+        assert_eq!(sextant_bits(0x1fb00), 0b00_0001);
+        assert_eq!(sextant_bits(0x1fb01), 0b00_0010);
+        assert_eq!(sextant_bits(0x1fb02), 0b00_0011);
+        assert_eq!(sextant_bits(0x1fb03), 0b00_0100);
+        assert_eq!(sextant_bits(0x1fb13), 0b01_0100); // SEXTANT-35
+        assert_eq!(sextant_bits(0x1fb14), 0b01_0110); // SEXTANT-235
+        assert_eq!(sextant_bits(0x1fb27), 0b10_1001); // SEXTANT-146
+        assert_eq!(sextant_bits(0x1fb28), 0b10_1011); // SEXTANT-1246
+        assert_eq!(sextant_bits(0x1fb3b), 0b11_1110);
+    }
+
+    #[test]
+    fn octants_are_distinct_patterns_not_encoded_elsewhere() {
+        assert!(OCTANTS.windows(2).all(|pair| pair[0] < pair[1]));
+        // Blank, full, the halves and the quadrant-only patterns live in
+        // Block Elements; the octant block never repeats them.
+        for elsewhere in [0x00, 0xff, 0x55, 0xaa, 0x0f, 0xf0, 0x05, 0x0a, 0x50, 0xa0] {
+            assert!(!OCTANTS.contains(&elsewhere), "{elsewhere:#04x}");
+        }
+        // BLOCK OCTANT-3, -23, -123, -4 and the last, OCTANT-2345678.
+        assert_eq!(OCTANTS[..4], [0x04, 0x06, 0x07, 0x08]);
+        assert_eq!(OCTANTS[229], 0xfe);
+    }
+
+    #[test]
+    fn mosaics_fill_exactly_their_share_of_the_cell_on_whole_pixels() {
+        for font_size in 10..=24 {
+            for scale in [1.0, 2.0] {
+                let grid = grid(font_size as f32 + 0.5, scale);
+                let cell = grid.cell(7, 3);
+                for scalar in (0x1fb00..=0x1fb3b).chain(0x1cd00..=0x1cde5) {
+                    let rects = mosaic_rects(scalar, cell);
+                    for rect in &rects {
+                        for edge in [rect.left, rect.top, rect.right, rect.bottom] {
+                            assert_eq!(edge, edge.round(), "U+{scalar:X}");
+                        }
+                        assert!(rect.left >= cell.left && rect.right <= cell.right);
+                        assert!(rect.top >= cell.top && rect.bottom <= cell.bottom);
+                    }
+                    for (index, a) in rects.iter().enumerate() {
+                        for b in &rects[index + 1..] {
+                            let overlap = (a.right.min(b.right) - a.left.max(b.left)).max(0.0)
+                                * (a.bottom.min(b.bottom) - a.top.max(b.top)).max(0.0);
+                            assert_eq!(overlap, 0.0, "U+{scalar:X}");
+                        }
+                    }
+                    assert!(area(&rects) > 0.0 && area(&rects) < cell.width() * cell.height());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mosaic_columns_tile_into_neighbouring_cells_without_seams() {
+        for font_size in 10..=24 {
+            for scale in [1.0, 2.0] {
+                let grid = grid(font_size as f32 + 0.25, scale);
+                let here = grid.cell(4, 2);
+                let right = grid.cell(5, 2);
+                let top_third = mosaic_rects(0x1fb02, here);
+                let next = mosaic_rects(0x1fb02, right);
+                assert_eq!(top_third.len(), 2);
+                // The pair reads as one bar: same top and bottom, and the
+                // first cell's right half ends where the next cell begins.
+                let edge = top_third.iter().map(|rect| rect.right).fold(0.0, f32::max);
+                let start = next.iter().map(|rect| rect.left).fold(f32::MAX, f32::min);
+                assert_eq!(edge, start);
+                assert_eq!(top_third[0].top, here.top);
+                assert_eq!(top_third[0].top, next[0].top);
+                assert_eq!(top_third[0].bottom, next[0].bottom);
+                // OCTANT-45678: both columns run to the bottom edge, where
+                // the cell below starts, and split at the same middle.
+                let below = mosaic_rects(0x1cde1, here);
+                assert_eq!(below.len(), 2);
+                assert!(below.iter().all(|rect| rect.bottom == here.bottom));
+                assert_eq!(below[0].right, below[1].left);
+                assert_eq!((below[0].left, below[1].right), (here.left, here.right));
+            }
+        }
+    }
+
+    #[test]
+    fn caps_and_wedges_lie_on_their_cell_edges() {
+        let cell = DeviceRect::new(40.0, 60.0, 56.0, 94.0);
+        let shapes = |scalar| {
+            let mut shapes = Vec::new();
+            Sprite::from_scalar(scalar)
+                .unwrap()
+                .shapes(cell, 2.0, &mut |shape| shapes.push(shape));
+            shapes
+        };
+        for (scalar, round_right, outlined) in [
+            (0xe0b4, true, false),
+            (0xe0b5, true, true),
+            (0xe0b6, false, false),
+            (0xe0b7, false, true),
+        ] {
+            assert_eq!(
+                shapes(scalar),
+                [Shape::HalfDisc {
+                    bounds: cell,
+                    round_right,
+                    thickness: outlined.then_some(2.0),
+                }]
+            );
+        }
+        let triangle = |scalar| match shapes(scalar).as_slice() {
+            [Shape::Polygon { points, len: 3 }] => points[..3].to_vec(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(triangle(0xe0b8), [[40.0, 60.0], [40.0, 94.0], [56.0, 94.0]]);
+        assert_eq!(triangle(0xe0ba), [[56.0, 60.0], [56.0, 94.0], [40.0, 94.0]]);
+        assert_eq!(triangle(0xe0bc), [[40.0, 60.0], [56.0, 60.0], [40.0, 94.0]]);
+        assert_eq!(triangle(0xe0be), [[40.0, 60.0], [56.0, 60.0], [56.0, 94.0]]);
+        // The slashes are the box-drawing diagonals.
+        let mut backslash = Vec::new();
+        Sprite::from_scalar(0x2572)
+            .unwrap()
+            .shapes(cell, 2.0, &mut |shape| backslash.push(shape));
+        let mut slash = Vec::new();
+        Sprite::from_scalar(0x2571)
+            .unwrap()
+            .shapes(cell, 2.0, &mut |shape| slash.push(shape));
+        assert_eq!(shapes(0xe0b9), backslash);
+        assert_eq!(shapes(0xe0bf), backslash);
+        assert_eq!(shapes(0xe0bb), slash);
+        assert_eq!(shapes(0xe0bd), slash);
+    }
+
     #[test]
     fn only_the_drawn_ranges_are_sprites() {
-        for scalar in [0x2500, 0x257f, 0x2800, 0x28ff, 0xe0b0, 0xe0b3] {
+        for scalar in [
+            0x2500, 0x257f, 0x2800, 0x28ff, 0xe0b0, 0xe0b4, 0xe0bf, 0x1fb00, 0x1fb3b, 0x1cd00,
+            0x1cde5,
+        ] {
             assert!(Sprite::from_scalar(scalar).is_some());
         }
-        for scalar in [0x41, 0x24ff, 0x2580, 0x2588, 0x27ff, 0x2900, 0xe0af, 0xe0b4] {
+        // Block elements are drawn by `blocks`; the Nerd Font icons around the
+        // separators (U+E0A0 branch, U+E0C0 flames) by the bundled font.
+        for scalar in [
+            0x41, 0x24ff, 0x2580, 0x2588, 0x27ff, 0x2900, 0xe0a0, 0xe0af, 0xe0c0, 0x1fb3c, 0x1caff,
+            0x1cde6,
+        ] {
             assert!(Sprite::from_scalar(scalar).is_none());
         }
         for ch in ['─', '━', '═'] {

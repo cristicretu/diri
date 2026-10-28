@@ -71,6 +71,7 @@ pub enum IconName {
     Code,
     Comment,
     Cube,
+    Database,
     Download,
     ExternalLink,
     File,
@@ -145,6 +146,7 @@ pub enum IconName {
     AlignRight,
     Link,
     Globe,
+    Hammer,
     Speaker,
     SpeakerOff,
     Smartphone,
@@ -153,7 +155,7 @@ pub enum IconName {
 }
 
 impl IconName {
-    pub const ALL: [Self; 104] = [
+    pub const ALL: [Self; 106] = [
         Self::Account,
         Self::Activity,
         Self::Archive,
@@ -179,6 +181,7 @@ impl IconName {
         Self::Code,
         Self::Comment,
         Self::Cube,
+        Self::Database,
         Self::Download,
         Self::ExternalLink,
         Self::File,
@@ -253,6 +256,7 @@ impl IconName {
         Self::AlignRight,
         Self::Link,
         Self::Globe,
+        Self::Hammer,
         Self::Speaker,
         Self::SpeakerOff,
         Self::Smartphone,
@@ -287,6 +291,7 @@ impl IconName {
             Self::Code => "icons/code.svg",
             Self::Comment => "icons/comment.svg",
             Self::Cube => "icons/cube.svg",
+            Self::Database => "icons/database.svg",
             Self::Download => "icons/download.svg",
             Self::ExternalLink => "icons/external-link.svg",
             Self::File => "icons/file.svg",
@@ -361,6 +366,7 @@ impl IconName {
             Self::AlignRight => "icons/align-right.svg",
             Self::Link => "icons/link.svg",
             Self::Globe => "icons/globe.svg",
+            Self::Hammer => "icons/hammer.svg",
             Self::Speaker => "icons/speaker.svg",
             Self::SpeakerOff => "icons/speaker-off.svg",
             Self::Smartphone => "icons/smartphone.svg",
@@ -571,6 +577,8 @@ fn embedded_svg(path: &str) -> Option<&'static [u8]> {
         "icons/align-right.svg" => include_bytes!("../assets/icons/align-right.svg"),
         "icons/link.svg" => include_bytes!("../assets/icons/link.svg"),
         "icons/globe.svg" => include_bytes!("../assets/icons/globe.svg"),
+        "icons/hammer.svg" => include_bytes!("../assets/icons/hammer.svg"),
+        "icons/database.svg" => include_bytes!("../assets/icons/database.svg"),
         "icons/speaker.svg" => include_bytes!("../assets/icons/speaker.svg"),
         "icons/speaker-off.svg" => include_bytes!("../assets/icons/speaker-off.svg"),
         "icons/account.svg" => include_bytes!("../assets/icons/account.svg"),

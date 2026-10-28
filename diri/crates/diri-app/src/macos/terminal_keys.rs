@@ -2,6 +2,19 @@
 use diri_term::keys::{KeyEvent, KeypadKey};
 use gpui::KeyDownEvent;
 
+/// The layout's unshifted and shifted characters for a character key, so the
+/// kitty encoder can name the key GPUI resolved Shift into (`@` → `2`).
+pub(crate) fn layout_chars(event: &KeyDownEvent) -> Option<(char, char)> {
+    let (unshifted, shifted) = gpui_macos::current_key_layout_chars(event)?;
+    let single = |text: String| {
+        let mut chars = text.chars();
+        chars
+            .next()
+            .filter(|ch| chars.next().is_none() && !ch.is_control())
+    };
+    Some((single(unshifted)?, single(shifted)?))
+}
+
 pub(crate) fn keypad_event(event: &KeyDownEvent) -> Option<KeyEvent> {
     // Apple SDK HIToolbox/Events.h: kVK_ANSI_Keypad* and kVK_JIS_KeypadComma.
     let key = match gpui_macos::current_native_key_code(event)? {
@@ -70,11 +83,13 @@ mod tests {
 
     #[test]
     fn native_keypad_uses_shared_encoder_without_changing_text_or_shortcuts() {
+        // A Mac keypad has no Num Lock: it types its characters whether or
+        // not the program enabled DECKPAM, as xterm with Num Lock on does.
         for (logical, code, numeric, application) in [
-            ("1", 0x53, b"1".as_slice(), b"\x1bOq".as_slice()),
-            ("enter", 0x4c, b"\r", b"\x1bOM"),
-            (".", 0x41, b".", b"\x1bOn"),
-            ("+", 0x45, b"+", b"\x1bOk"),
+            ("1", 0x53, b"1".as_slice(), b"1".as_slice()),
+            ("enter", 0x4c, b"\r", b"\r"),
+            (".", 0x41, b".", b"."),
+            ("+", 0x45, b"+", b"+"),
         ] {
             let mut event = KeyDownEvent {
                 keystroke: Keystroke::parse(logical).unwrap(),

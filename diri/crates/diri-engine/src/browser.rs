@@ -175,7 +175,7 @@ impl BrowserPool {
         let node =
             resolve_node().ok_or("node not found on PATH — install Node.js to use test_run")?;
         let sidecar = locate_sidecar().ok_or("test sidecar not found")?;
-        let _ = std::fs::create_dir_all(&self.artifact_dir);
+        let _ = diri_platform::private::create_dir_all(&self.artifact_dir);
 
         let mut command = Command::new(&node);
         command
