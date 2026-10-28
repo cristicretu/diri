@@ -6,10 +6,9 @@
 
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
-use alacritty_terminal::term::cell::{Cell as GridCell, Flags};
+use alacritty_terminal::term::cell::{Cell as GridCell, Hyperlink};
 
 use super::Core;
-use super::cell::{LEADING, SPACER, WIDE};
 use crate::HeadlessScreen;
 
 impl HeadlessScreen {
@@ -28,11 +27,7 @@ impl HeadlessScreen {
             for col in 0..cols {
                 let cell = core.cell(line, col);
                 let style = core.style_of(line, cell);
-                let mut flags = Flags::from_bits_retain(style.flags);
-                flags.set(Flags::WIDE_CHAR, cell.has(WIDE));
-                flags.set(Flags::WIDE_CHAR_SPACER, cell.has(SPACER));
-                flags.set(Flags::LEADING_WIDE_CHAR_SPACER, cell.has(LEADING));
-                flags.set(Flags::WRAPLINE, col + 1 == cols && core.wrapped(line));
+                let flags = super::check::flags_of(core, line, col, cell, &style);
                 let mut out = GridCell {
                     c: cell.ch(),
                     fg: style.fg,
@@ -43,6 +38,9 @@ impl HeadlessScreen {
                 out.set_underline_color(style.underline);
                 for z in core.zerowidth(line, col) {
                     out.push_zerowidth(z);
+                }
+                if let Some(link) = core.link_at(line, col) {
+                    out.set_hyperlink(Some(Hyperlink::new(link.id, link.uri)));
                 }
                 grid[Line(line)][Column(col)] = out;
             }

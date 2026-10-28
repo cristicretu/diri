@@ -526,6 +526,14 @@ mode is state only; the host encodes the reports. RIS clears it with the rest
 of the mode bits. Mode 69 (DECLRMM) still answers `4`: left and right margins
 are not implemented.
 
+## Reply helpers for core v2
+
+`term::xtgettcap_reply`, `term::da2_version`, `term::osc52_store_text` and
+`term::osc52_load_reply` (all `#[doc(hidden)]`) expose the existing XTGETTCAP
+answer table, the DA2 version and the OSC 52 base64 handling, so the core v2
+prototype in `diri-terminal-state` answers exactly as `Term` does instead of
+keeping a second copy. `Term`'s own code paths are unchanged.
+
 ## Test-only `observe` feature
 
 `observe = ["vte/observe"]` only forwards the vendored VTE's test-only OSC

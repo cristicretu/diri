@@ -203,6 +203,27 @@ fn literal_send_does_not_interpret_key_names() {
 }
 
 #[test]
+fn new_terminals_run_the_configured_shell_command() {
+    let fixture = Fixture::new();
+    // What `terminal.configure` persists beside the socket: the Engine reads
+    // it when a terminal starts. The script is one argv word; only the
+    // `sh -c` the user chose interprets it.
+    std::fs::write(
+        fixture.temp.path().join("terminal.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "shellIntegration": true,
+            "shellCommand": ["/bin/sh", "-c", "echo \"custom shell $((40 + 2))\"; sleep 5"],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let id = fixture.ok(&["new"]).trim().to_owned();
+    assert!(id.starts_with("s_"), "{id:?}");
+    fixture.capture_until(&id, "custom shell 42");
+    fixture.ok(&["session", "release", &id, "--remove"]);
+}
+
+#[test]
 fn run_wait_prints_output_and_exits_with_the_command_status() {
     let fixture = Fixture::new();
     let output = fixture.cli(&[

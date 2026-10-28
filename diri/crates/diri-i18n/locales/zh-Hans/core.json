@@ -36,7 +36,7 @@
   "settings.keywords.schedules": "计划任务 定时 每天 工作日 早上 稍后运行 补跑 睡眠 唤醒",
   "settings.keywords.shortcuts": "快捷键 键盘 绑定 热键 命令 按键 导航 会话 终端",
   "settings.keywords.skills": "技能 目录 指令 个人 项目 插件 搜索",
-  "settings.keywords.terminal": "终端 拷贝 选择 链接 点击 文件 编辑器 指针 鼠标 粘贴 保护 shell 集成 zsh bash 提示符 文件夹 默认 mailto vscode app-links 键盘 option alt meta 布局",
+  "settings.keywords.terminal": "终端 拷贝 选择 链接 点击 文件 编辑器 指针 鼠标 粘贴 保护 shell 集成 zsh bash 提示符 文件夹 默认 mailto vscode app-links 键盘 option alt meta 布局 命令 程序 nix tmux 登录",
   "settings.keywords.usage": "用量 费用 令牌 花费 缓存 节省 模型 每日",
   "settings.keywords.voice": "语音 朗读 对话 听写 回答 收听 麦克风 wispr flow kokoro",
   "settings.keywords.whats_new": "新功能 版本说明 最新 更新 改进",
