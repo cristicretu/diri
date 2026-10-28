@@ -2,6 +2,8 @@
 //! changes selection; clearing restores the exact unfiltered projection.
 use crate::store::{SidebarProjection, SidebarRow};
 use crate::switcher::display_title;
+use diri_proto::{SessionId, SessionRecord};
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -31,14 +33,33 @@ pub(super) fn filter_projection(
     if query.trim().is_empty() {
         return projection;
     }
+    retain_sessions(projection, |session| {
+        label_match(&display_title(session), query).is_some()
+    })
+}
+
+/// The Activity filter: only the sessions in `keep` (those working, waiting
+/// on you, or holding news you have not seen), under the same project
+/// headings, flat like a search. Archived sessions never qualify.
+pub(super) fn activity_projection(
+    projection: Arc<SidebarProjection>,
+    keep: &HashSet<SessionId>,
+) -> Arc<SidebarProjection> {
+    retain_sessions(projection, |session| {
+        !session.is_archived() && keep.contains(&session.id)
+    })
+}
+
+/// The projection with only the sessions `keep` accepts, flattened within
+/// their project headings.
+fn retain_sessions(
+    projection: Arc<SidebarProjection>,
+    keep: impl Fn(&SessionRecord) -> bool,
+) -> Arc<SidebarProjection> {
     let mut filtered = (*projection).clone();
     for group in &mut filtered.projects {
-        group
-            .active
-            .retain(|session| label_match(&display_title(session), query).is_some());
-        group
-            .archived
-            .retain(|session| label_match(&display_title(session), query).is_some());
+        group.active.retain(|session| keep(session));
+        group.archived.retain(|session| keep(session));
         // Search is a flat list within each existing project heading. Folded
         // descendants participate without changing their saved disclosure.
         group.sessions = group

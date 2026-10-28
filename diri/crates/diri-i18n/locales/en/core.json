@@ -28,7 +28,7 @@
   "settings.keywords.accounts": "accounts profiles work personal login authentication codex claude default config home",
   "settings.keywords.agents": "agents codex claude cursor gemini executable installed command line quick create default",
   "settings.keywords.appearance": "appearance color theme light dark system font text size zoom line height interface style density compact comfortable transparency glass blur import export iterm2 ghostty cursor caret block bar beam underline blink",
-  "settings.keywords.general": "general default agent startup login sessions close confirmation sounds chimes quick open search roots choose folder finder picker updates channel nightly diri-include include gitignore worktrees hidden folders import herdr migrate move tmux language interface english chinese spanish",
+  "settings.keywords.general": "general default agent startup login sessions close confirmation sounds chimes quick open search roots choose folder finder picker updates channel nightly diri-include include gitignore worktrees hidden folders import herdr migrate move tmux language interface english chinese spanish alerts notifications dock badge",
   "settings.keywords.phone": "phone iphone ios mobile pairing qr tailscale awake",
   "settings.keywords.privacy": "privacy diagnostics telemetry share report bug name support id send copy finder developer performance perf overlay fps frame rate render counters debug",
   "settings.keywords.remote": "remote ssh openssh hosts machines connections execution tailscale network",

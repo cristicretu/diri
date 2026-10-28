@@ -18,9 +18,7 @@ inside a Diri pane your own id is $DIRIJOR_SESSION_ID):
   dirijor send TARGET [-l] [--] TOKEN...      tokens: text, or keys Enter Tab Escape BSpace
                                                Up Down Left Right Home End PageUp PageDown
                                                Insert Delete Space F1..F12 C-x M-x S-x
-  dirijor capture TARGET [--lines N] [--scrollback] [--unwrap] [--ansi] [--trim] [--json]
-                                               --unwrap joins soft-wrapped rows, --ansi keeps
-                                               colours as SGR; trailing blank rows are always trimmed
+  dirijor capture TARGET [--lines N] [--scrollback] [--json]
   dirijor run [--wait [--timeout SECONDS] [--rm]] [--cwd PATH] [--name TEXT] [--json] -- PROGRAM [ARG ...]
 
 Exit codes: 0 ok, 1 failure, 2 timed out, 3 no such target, 4 Engine unreachable,
@@ -33,7 +31,7 @@ pub(super) fn list(arguments: &[String]) -> Result<(), CliError> {
 
 pub(super) fn new(arguments: &[String]) -> Result<(), CliError> {
     let kind = option_value(arguments, "--kind").unwrap_or_else(|| "shell".into());
-    let cwd = match option_value(arguments, "--cwd") {
+    let cwd = match option_value(arguments, "--cwd").or_else(|| option_value(arguments, "-c")) {
         Some(cwd) => cwd,
         None => std::env::current_dir()
             .map_err(|error| {
@@ -48,7 +46,9 @@ pub(super) fn new(arguments: &[String]) -> Result<(), CliError> {
         "kind": kind,
         "cwd": cwd,
         "prompt": option_value(arguments, "--prompt"),
-        "name": option_value(arguments, "--name").or_else(|| option_value(arguments, "--title")),
+        "name": option_value(arguments, "--name")
+            .or_else(|| option_value(arguments, "--title"))
+            .or_else(|| option_value(arguments, "--label")),
         "host": option_value(arguments, "--host"),
     });
     params
@@ -242,11 +242,8 @@ pub(super) fn send(arguments: &[String]) -> Result<(), CliError> {
 }
 
 pub(super) fn capture(arguments: &[String]) -> Result<(), CliError> {
-    let target = positional(arguments, 0).ok_or_else(|| {
-        CliError::failure(
-            "capture TARGET [--lines N] [--scrollback] [--unwrap] [--ansi] [--trim] [--json]",
-        )
-    })?;
+    let target = positional(arguments, 0)
+        .ok_or_else(|| CliError::failure("capture TARGET [--lines N] [--scrollback] [--json]"))?;
     let lines = match option_value(arguments, "--lines") {
         Some(raw) => Some(
             raw.parse::<usize>()
@@ -258,14 +255,7 @@ pub(super) fn capture(arguments: &[String]) -> Result<(), CliError> {
     };
     let sessions = sessions()?;
     let record = resolve_session(&target, &sessions)?;
-    // `--trim` is accepted for scripts written against other multiplexers;
-    // trailing blank rows are always dropped.
-    let options = CaptureOptions {
-        scrollback: has_flag(arguments, "--scrollback"),
-        unwrap: has_flag(arguments, "--unwrap"),
-        ansi: has_flag(arguments, "--ansi"),
-    };
-    let text = captured_lines(&record.id.0, options, lines)?;
+    let text = captured_lines(&record.id.0, has_flag(arguments, "--scrollback"), lines)?;
     if has_flag(arguments, "--json") {
         print_json(&json!({"id": record.id.0, "lines": text}));
     } else {
@@ -276,42 +266,14 @@ pub(super) fn capture(arguments: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
-/// What `capture` reads: the screen or all retained history, and whether
-/// soft-wrapped rows are rejoined and styles kept.
-#[derive(Clone, Copy, Default)]
-struct CaptureOptions {
-    scrollback: bool,
-    unwrap: bool,
-    ansi: bool,
-}
-
 /// Terminal rows as plain text: trailing blanks trimmed from each row and
 /// trailing empty rows dropped, so `--lines N` counts rows that hold output.
-/// With `unwrap` a line is the one the program wrote, however many rows the
-/// terminal wrapped it over.
 fn captured_lines(
     session: &str,
-    options: CaptureOptions,
+    scrollback: bool,
     last: Option<usize>,
 ) -> Result<Vec<String>, CliError> {
-    let mut lines: Vec<String> = if options.unwrap || options.ansi {
-        let result = request(
-            Method::SESSION_READ_SCREEN,
-            json!({
-                "sessionID": session,
-                "scrollback": options.scrollback,
-                "unwrap": options.unwrap,
-                "ansi": options.ansi,
-            }),
-            Duration::from_secs(10),
-        )?;
-        result["text"]
-            .as_str()
-            .unwrap_or_default()
-            .split('\n')
-            .map(str::to_owned)
-            .collect()
-    } else if options.scrollback {
+    let mut lines: Vec<String> = if scrollback {
         let result = request(
             Method::SESSION_READ_SCROLLBACK,
             json!({"sessionID": session}),
@@ -360,12 +322,7 @@ pub(super) fn run(arguments: &[String]) -> Result<(), CliError> {
     let wait = has_flag(options, "--wait");
     let remove = has_flag(options, "--rm");
     let timeout = match option_value(options, "--timeout") {
-        Some(raw) => Some(
-            raw.parse::<f64>()
-                .ok()
-                .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
-                .ok_or_else(|| CliError::failure("--timeout expects seconds"))?,
-        ),
+        Some(raw) => Some(super::verbs::parse_duration(&raw)?.as_secs_f64()),
         None => None,
     };
     if !wait && (remove || timeout.is_some()) {
@@ -384,12 +341,19 @@ pub(super) fn run(arguments: &[String]) -> Result<(), CliError> {
             _ => forwarded.push(option.clone()),
         }
     }
+    // `--split`, `--beside`, `--ratio` and `--focus` place the new session;
+    // everything else is `session run`'s.
+    let placement = super::verbs::Placement::take(&mut forwarded)?;
     if let Some(separator) = separator {
         forwarded.extend_from_slice(&arguments[separator..]);
     }
     if !wait {
-        let (params, json_output) = session_run_params(&forwarded)?;
-        let result = request(Method::SESSION_SPAWN, params, Duration::from_secs(120))?;
+        let (mut params, json_output) = session_run_params(&forwarded)?;
+        let anchor = placement.apply(&mut params)?;
+        let mut result = request(Method::SESSION_SPAWN, params, Duration::from_secs(120))?;
+        if let Some(id) = result["id"].as_str().map(str::to_owned) {
+            result["layout"] = placement.finish(&id, anchor.as_ref())?;
+        }
         if json_output {
             print_json(&result);
         } else {
@@ -407,9 +371,13 @@ pub(super) fn run(arguments: &[String]) -> Result<(), CliError> {
         },
         message: error.message,
     };
-    let (params, json_output) = session_run_params(&forwarded).map_err(reserve)?;
+    let (mut params, json_output) = session_run_params(&forwarded).map_err(reserve)?;
+    let anchor = placement.apply(&mut params).map_err(reserve)?;
     let spawned =
         request(Method::SESSION_SPAWN, params, Duration::from_secs(120)).map_err(reserve)?;
+    if let Some(id) = spawned["id"].as_str() {
+        placement.finish(id, anchor.as_ref()).map_err(reserve)?;
+    }
     let id = spawned["id"]
         .as_str()
         .ok_or_else(|| CliError {
@@ -418,15 +386,7 @@ pub(super) fn run(arguments: &[String]) -> Result<(), CliError> {
         })?
         .to_owned();
     let exit = wait_for_exit(&id, timeout).map_err(reserve)?;
-    let lines = captured_lines(
-        &id,
-        CaptureOptions {
-            scrollback: true,
-            ..CaptureOptions::default()
-        },
-        None,
-    )
-    .map_err(reserve)?;
+    let lines = captured_lines(&id, true, None).map_err(reserve)?;
     if remove {
         request(
             Method::SESSION_REMOVE,

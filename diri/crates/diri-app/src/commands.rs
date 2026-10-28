@@ -44,6 +44,7 @@ actions!(
         ToggleQuickOpen,
         ToggleHistory,
         ToggleNotifications,
+        ToggleActivity,
         ToggleOverview,
         ToggleTabPeek,
         ReviewLaunches,
@@ -105,6 +106,7 @@ actions!(
         SelectNextAttentionSession,
         CheckForUpdates,
         ShowWhatsNew,
+        ImportTerminalSetup,
         ToggleReadAloud,
         ToggleReadThisTab,
         ReadOnlyThisTab,
@@ -173,6 +175,7 @@ pub enum CommandId {
     ToggleQuickOpen,
     ToggleHistory,
     ToggleNotifications,
+    ToggleActivity,
     ToggleOverview,
     ToggleTabPeek,
     ReviewLaunches,
@@ -229,6 +232,7 @@ pub enum CommandId {
     SelectNextAttentionSession,
     CheckForUpdates,
     ShowWhatsNew,
+    ImportTerminalSetup,
     ToggleReadAloud,
     ToggleReadThisTab,
     ReadOnlyThisTab,
@@ -1014,6 +1018,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         "inbox unread alerts attention"
     ),
     spec!(
+        ToggleActivity,
+        "toggle-activity",
+        Some("cmd-."),
+        Some("⌘."),
+        Some(APP_CONTEXT),
+        "command.toggle_activity.palette_title",
+        "waveform.circle",
+        "activity working waiting blocked finished status filter"
+    ),
+    spec!(
         CheckForUpdates,
         "check-for-updates",
         None,
@@ -1032,6 +1046,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         "command.show_whats_new.palette_title",
         "sparkles",
         "whats new release highlights features changelog demo video tour"
+    ),
+    spec!(
+        ImportTerminalSetup,
+        "import-terminal-setup",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.import_terminal_setup.palette_title",
+        "arrow.down",
+        "import ghostty iterm iterm2 wezterm kitty alacritty terminal font theme cursor setup migrate"
     ),
     spec!(
         ToggleReadAloud,
@@ -1523,6 +1547,7 @@ impl CommandSpec {
             CommandId::ToggleQuickOpen => KeyBinding::new(key, ToggleQuickOpen, context),
             CommandId::ToggleHistory => KeyBinding::new(key, ToggleHistory, context),
             CommandId::ToggleNotifications => KeyBinding::new(key, ToggleNotifications, context),
+            CommandId::ToggleActivity => KeyBinding::new(key, ToggleActivity, context),
             CommandId::ToggleOverview => KeyBinding::new(key, ToggleOverview, context),
             CommandId::ReviewLaunches => KeyBinding::new(key, ReviewLaunches, context),
             CommandId::ToggleTabPeek => KeyBinding::new(key, ToggleTabPeek, context),
@@ -1592,6 +1617,7 @@ impl CommandSpec {
             }
             CommandId::CheckForUpdates => KeyBinding::new(key, CheckForUpdates, context),
             CommandId::ShowWhatsNew => KeyBinding::new(key, ShowWhatsNew, context),
+            CommandId::ImportTerminalSetup => KeyBinding::new(key, ImportTerminalSetup, context),
             CommandId::ToggleReadAloud => KeyBinding::new(key, ToggleReadAloud, context),
             CommandId::ToggleReadThisTab => KeyBinding::new(key, ToggleReadThisTab, context),
             CommandId::ReadOnlyThisTab => KeyBinding::new(key, ReadOnlyThisTab, context),
@@ -1912,6 +1938,11 @@ impl CommandId {
             Self::ToggleNotifications => ShortcutMetadata {
                 title: t("command.toggle_notifications.title"),
                 description: t("command.toggle_notifications.description"),
+                category: Navigation,
+            },
+            Self::ToggleActivity => ShortcutMetadata {
+                title: t("command.toggle_activity.title"),
+                description: t("command.toggle_activity.description"),
                 category: Navigation,
             },
             Self::SelectNextAttentionSession => ShortcutMetadata {
@@ -2322,6 +2353,11 @@ impl CommandId {
                 description: t("command.show_whats_new.description"),
                 category: Application,
             },
+            Self::ImportTerminalSetup => ShortcutMetadata {
+                title: t("command.import_terminal_setup.title"),
+                description: t("command.import_terminal_setup.description"),
+                category: Application,
+            },
             Self::ToggleReadThisTab
             | Self::ReadOnlyThisTab
             | Self::ReadAllExceptThisTab
@@ -2400,6 +2436,7 @@ impl CommandId {
             Self::ToggleQuickOpen => Box::new(ToggleQuickOpen),
             Self::ToggleHistory => Box::new(ToggleHistory),
             Self::ToggleNotifications => Box::new(ToggleNotifications),
+            Self::ToggleActivity => Box::new(ToggleActivity),
             Self::ToggleOverview => Box::new(ToggleOverview),
             Self::ToggleTabPeek => Box::new(ToggleTabPeek),
             Self::ReviewLaunches => Box::new(ReviewLaunches),
@@ -2457,6 +2494,7 @@ impl CommandId {
             Self::SelectNextAttentionSession => Box::new(SelectNextAttentionSession),
             Self::CheckForUpdates => Box::new(CheckForUpdates),
             Self::ShowWhatsNew => Box::new(ShowWhatsNew),
+            Self::ImportTerminalSetup => Box::new(ImportTerminalSetup),
             Self::ToggleReadAloud => Box::new(ToggleReadAloud),
             Self::ToggleReadThisTab => Box::new(ToggleReadThisTab),
             Self::ReadOnlyThisTab => Box::new(ReadOnlyThisTab),

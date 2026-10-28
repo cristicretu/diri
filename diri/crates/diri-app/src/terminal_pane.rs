@@ -1403,8 +1403,7 @@ impl TerminalPane {
                     .store
                     .read()
                     .expect("session store lock poisoned");
-                let prefs = store.preferences();
-                crate::fonts::terminal_font(&prefs.terminal_font_family, prefs.terminal_ligatures)
+                crate::fonts::terminal_font_from(store.preferences())
             };
             let generation = self.next_attachment_generation;
             self.next_attachment_generation = self.next_attachment_generation.wrapping_add(1);
@@ -2958,6 +2957,11 @@ impl TerminalPane {
                     .filter(|plan| !plan.is_empty())
                     .map(|plan| plan.headline().into()),
                 importing_herdr: store.herdr().importing,
+                terminal_setup: store
+                    .terminal_setup()
+                    .plans()
+                    .first()
+                    .map(|plan| plan.source.name()),
             }
         };
         let canonical = Arc::clone(&self.runtime.store);
@@ -5196,6 +5200,9 @@ impl TerminalPane {
             .font(typeface.font.clone())
             .font_size(px(typeface.size))
             .line_height_scale(typeface.line_height)
+            .cell_width_scale(typeface.cell_width)
+            .faces(typeface.faces)
+            .glyph_raster(typeface.raster)
             .focus_handle(self.focus.clone())
             .reduce_motion(cx.reduce_motion())
             .cursor_preferences(cursor_preferences)
@@ -6907,23 +6914,27 @@ struct TerminalType {
     font: gpui::Font,
     size: f32,
     line_height: f32,
+    cell_width: f32,
+    faces: diri_term::glyphs::TerminalFaces,
+    raster: gpui::GlyphRasterStyle,
 }
 
 impl TerminalType {
     fn from_prefs(prefs: &crate::store::Prefs) -> Self {
         Self {
-            font: crate::fonts::terminal_font(
-                &prefs.terminal_font_family,
-                prefs.terminal_ligatures,
-            ),
+            font: crate::fonts::terminal_font_from(prefs),
             size: prefs.terminal_font_size,
             line_height: prefs.terminal_line_height,
+            cell_width: f32::from(prefs.terminal_cell_width) / 100.0,
+            faces: crate::fonts::terminal_faces(prefs),
+            raster: crate::fonts::glyph_raster(prefs),
         }
     }
 
     fn metrics(&self, window: &Window) -> CellMetrics {
         CellMetrics::measure(window.text_system(), &self.font, px(self.size))
             .with_line_height_scale(self.line_height)
+            .with_cell_width_scale(self.cell_width)
     }
 }
 

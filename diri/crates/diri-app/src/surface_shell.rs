@@ -131,6 +131,10 @@ enum SettingsMenu {
     DefaultAgent,
     TerminalTheme,
     TerminalFont,
+    RegularFace,
+    BoldFace,
+    ItalicFace,
+    FontThicken,
     HibernateAfter,
     MemoryLimit,
     FileEditor,
@@ -176,7 +180,7 @@ const OPTION_AS_META_OPTIONS: [crate::store::OptionAsMeta; 5] = [
     crate::store::OptionAsMeta::Off,
 ];
 
-fn option_as_meta_label(choice: crate::store::OptionAsMeta) -> &'static str {
+pub(crate) fn option_as_meta_label(choice: crate::store::OptionAsMeta) -> &'static str {
     use crate::store::OptionAsMeta;
     crate::i18n::t(match choice {
         OptionAsMeta::Automatic => "settings.terminal.option_automatic",
@@ -522,14 +526,24 @@ pub(crate) enum UtilitySurfacesEvent {
     RefreshUsageLimits,
     /// A What's New thumbnail was clicked: open the sheet on that highlight.
     ShowWhatsNew(usize),
+    /// Settings › General › Import: review another terminal's setup.
+    ShowTerminalImport,
+    /// Settings › General › Import: take the last import back.
+    UndoTerminalImport,
 }
 impl gpui::EventEmitter<UtilitySurfacesEvent> for UtilitySurfaces {}
+
+/// A family's faces and the (family, ligatures) they were listed for.
+type FontFacesListing = ((String, bool), std::rc::Rc<[crate::fonts::FontFace]>);
 
 pub struct UtilitySurfaces {
     /// Installed monospace families, read when the font picker opens.
     terminal_font_families: std::rc::Rc<[String]>,
     /// The listing that picker opening started, off the main thread.
     terminal_font_listing: Option<Task<()>>,
+    /// The terminal family's faces, for the face pickers, keyed by the
+    /// family and ligature setting they were read for.
+    terminal_font_faces: std::cell::RefCell<Option<FontFacesListing>>,
     /// Voices for "Talk with your agent", read from the helper when the
     /// menu opens.
     talk_voices: Vec<crate::voice::VoiceOption>,
@@ -872,6 +886,7 @@ impl UtilitySurfaces {
             show_version_picker: false,
             terminal_font_families: std::rc::Rc::from([]),
             terminal_font_listing: None,
+            terminal_font_faces: std::cell::RefCell::new(None),
             talk_voices: Vec::new(),
             activity: "Connected client · shared daemon remains untouched".to_owned(),
             diagnostics_report,
@@ -2006,6 +2021,12 @@ impl UtilitySurfaces {
             self.refresh_release_notes(cx);
             self.load_whats_new_posters(cx);
         }
+        if self.settings_tab == SettingsTab::General {
+            self.store
+                .write()
+                .expect("session store lock poisoned")
+                .request_terminal_setup_scan();
+        }
         cx.notify();
     }
 
@@ -2108,10 +2129,9 @@ impl UtilitySurfaces {
             self.refresh_accounts(cx);
         }
         if tab == SettingsTab::General {
-            self.store
-                .write()
-                .expect("session store lock poisoned")
-                .request_herdr_scan();
+            let mut store = self.store.write().expect("session store lock poisoned");
+            store.request_herdr_scan();
+            store.request_terminal_setup_scan();
         }
         self.settings_search_active = false;
         if tab != SettingsTab::Usage {
@@ -4127,6 +4147,157 @@ impl UtilitySurfaces {
         options.into_any_element()
     }
 
+    /// Where blocked, failed and finished sessions are announced: one row
+    /// per state, one switch per channel. Working only ever marks its row,
+    /// so it has none. Notifications and Dock bounces happen only while Diri
+    /// is in the background.
+    fn alert_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::store::{AttentionRoute, AttentionRoutes, DockBadge};
+        type Pick = fn(&mut AttentionRoutes) -> &mut AttentionRoute;
+        let colors = self.settings_colors();
+        let routes = self.prefs.attention_routes;
+        let states: [(&'static str, &'static str, &'static str, AttentionRoute, Pick); 3] = [
+            (
+                "blocked",
+                t("settings.general.alert_blocked"),
+                t("settings.general.alert_blocked_detail"),
+                routes.blocked,
+                |routes| &mut routes.blocked,
+            ),
+            (
+                "error",
+                t("settings.general.alert_error"),
+                t("settings.general.alert_error_detail"),
+                routes.error,
+                |routes| &mut routes.error,
+            ),
+            (
+                "done",
+                t("settings.general.alert_done"),
+                t("settings.general.alert_done_detail"),
+                routes.done,
+                |routes| &mut routes.done,
+            ),
+        ];
+        let column = |label: &'static str| {
+            div()
+                .w(px(ALERT_COLUMN_WIDTH))
+                .flex()
+                .justify_center()
+                .child(label)
+        };
+        let mut list = div().flex().flex_col().child(
+            div()
+                .h(px(30.0))
+                .px(px(12.0))
+                .flex()
+                .items_center()
+                .text_size(px(Typo::META.size))
+                .text_color(colors.tertiary)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .child(t("settings.general.alerts_detail")),
+                )
+                .child(column(t("settings.general.alert_notify")))
+                .child(column(t("settings.general.alert_sound")))
+                .child(column(t("settings.general.alert_badge")))
+                .child(column(t("settings.general.alert_bounce"))),
+        );
+        for (key, label, detail, route, pick) in states {
+            type Channel = fn(&mut AttentionRoute) -> &mut bool;
+            let channels: [(&'static str, bool, Channel); 4] = [
+                ("notify", route.notify, |route| &mut route.notify),
+                ("sound", route.sound, |route| &mut route.sound),
+                ("badge", route.badge, |route| &mut route.badge),
+                ("bounce", route.bounce, |route| &mut route.bounce),
+            ];
+            let row = div()
+                .min_h(px(SETTINGS_ROW_HEIGHT))
+                .px(px(12.0))
+                .flex()
+                .items_center()
+                .gap(px(12.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .child(setting_text_stack(label.into(), detail.into(), colors)),
+                );
+            let mut cells = div().flex().flex_none();
+            for (channel, on, field) in channels {
+                let id: SharedString = format!("alert-{key}-{channel}").into();
+                cells = cells.child(
+                    div()
+                        .w(px(ALERT_COLUMN_WIDTH))
+                        .flex()
+                        .justify_center()
+                        .child(alert_check(id, on, colors).on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.update_prefs(|prefs| {
+                                    let value = field(pick(&mut prefs.attention_routes));
+                                    *value = !*value;
+                                });
+                                cx.notify();
+                            },
+                        ))),
+                );
+            }
+            list = list
+                .child(setting_divider(colors))
+                .child(row.child(cells));
+        }
+        let badge = self.prefs.dock_badge;
+        let segment = |id: &'static str, label: &'static str, value: DockBadge| {
+            let selected = badge == value;
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .h(px(24.0))
+                .px(px(9.0))
+                .rounded(px(Radius::CHIP))
+                .flex()
+                .items_center()
+                .text_size(px(Typo::META.size))
+                .text_color(if selected {
+                    colors.primary
+                } else {
+                    colors.secondary
+                })
+                .when(selected, |segment| segment.bg(colors.primary.alpha(0.10)))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.update_prefs(|prefs| prefs.dock_badge = value);
+                    cx.notify();
+                }))
+                .child(label)
+        };
+        list = list.child(setting_divider(colors)).child(setting_row(
+            t("settings.general.dock_badge"),
+            t("settings.general.dock_badge_detail"),
+            div()
+                .flex_none()
+                .p(px(2.0))
+                .rounded(px(Radius::BADGE))
+                .bg(colors.primary.alpha(0.05))
+                .flex()
+                .gap(px(2.0))
+                .child(segment(
+                    "dock-badge-sessions",
+                    t("settings.general.dock_badge_sessions"),
+                    DockBadge::Sessions,
+                ))
+                .child(segment(
+                    "dock-badge-notifications",
+                    t("settings.general.dock_badge_notifications"),
+                    DockBadge::Notifications,
+                )),
+            colors,
+        ));
+        setting_section(t("settings.general.alerts"), list, colors)
+    }
+
     fn general_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.settings_colors();
         settings_page(
@@ -4219,6 +4390,7 @@ impl UtilitySurfaces {
                         )),
                     colors,
                 ))
+                .child(self.alert_settings(cx))
                 .children(self.import_settings(cx))
                 .child(self.update_settings(cx))
                 .child(setting_section(
@@ -5371,6 +5543,11 @@ impl UtilitySurfaces {
             SettingsMenu::DefaultAgent => (self.default_agent_options(colors, cx), 204.0),
             SettingsMenu::TerminalTheme => (self.terminal_theme_options(colors, cx), 252.0),
             SettingsMenu::TerminalFont => (self.terminal_font_options(colors, cx), 252.0),
+            SettingsMenu::RegularFace | SettingsMenu::BoldFace | SettingsMenu::ItalicFace => {
+                let menu = self.settings_menu.unwrap_or(SettingsMenu::RegularFace);
+                (self.font_face_options(menu, colors, cx), 204.0)
+            }
+            SettingsMenu::FontThicken => (self.font_thicken_options(colors, cx), 172.0),
             SettingsMenu::HibernateAfter => (self.hibernate_options(colors, cx), 172.0),
             SettingsMenu::MemoryLimit => (self.memory_options(colors, cx), 132.0),
             SettingsMenu::FileEditor => (self.file_editor_options(colors, cx), 204.0),
@@ -6267,6 +6444,19 @@ impl UtilitySurfaces {
             cx,
             |prefs, step| prefs.terminal_line_height += step * 0.1,
         );
+        let cell_width_control = settings_stepper(
+            "cell-width",
+            format!("{}%", self.prefs.terminal_cell_width),
+            self.prefs.terminal_cell_width > Prefs::MIN_TERMINAL_CELL_WIDTH,
+            self.prefs.terminal_cell_width < Prefs::MAX_TERMINAL_CELL_WIDTH,
+            colors,
+            cx,
+            |prefs, step| {
+                let step = Prefs::TERMINAL_CELL_WIDTH_STEP as f32 * step;
+                prefs.terminal_cell_width =
+                    (f32::from(prefs.terminal_cell_width) + step).round().max(0.0) as u16;
+            },
+        );
 
         let choices = div().w_full().flex().gap(px(12.0)).children(
             [
@@ -6305,6 +6495,7 @@ impl UtilitySurfaces {
                             crate::fonts::terminal_family(&self.prefs.terminal_font_family),
                             self.prefs.terminal_font_size,
                             self.prefs.terminal_line_height,
+                            self.prefs.terminal_font_weight,
                         )),
                 )
                 .child(setting_section(
@@ -6371,6 +6562,21 @@ impl UtilitySurfaces {
                         ))
                         .child(setting_divider(colors))
                         .child(row(
+                            t("settings.appearance.regular_face"),
+                            self.font_face_dropdown(SettingsMenu::RegularFace, cx),
+                        ))
+                        .child(setting_divider(colors))
+                        .child(row(
+                            t("settings.appearance.bold_face"),
+                            self.font_face_dropdown(SettingsMenu::BoldFace, cx),
+                        ))
+                        .child(setting_divider(colors))
+                        .child(row(
+                            t("settings.appearance.italic_face"),
+                            self.font_face_dropdown(SettingsMenu::ItalicFace, cx),
+                        ))
+                        .child(setting_divider(colors))
+                        .child(row(
                             t("settings.appearance.font_size"),
                             font_control.into_any_element(),
                         ))
@@ -6379,6 +6585,39 @@ impl UtilitySurfaces {
                             t("settings.appearance.line_height"),
                             line_height_control.into_any_element(),
                         ))
+                        .child(setting_divider(colors))
+                        .child(row(
+                            t("settings.appearance.cell_width"),
+                            cell_width_control.into_any_element(),
+                        ))
+                        .when(cfg!(target_os = "macos"), |rows| {
+                            rows.child(setting_divider(colors))
+                                .child(
+                                    setting_row(
+                                        t("settings.appearance.thicken"),
+                                        t("settings.appearance.thicken_detail"),
+                                        self.font_thicken_dropdown(cx),
+                                        colors,
+                                    )
+                                    .into_any_element(),
+                                )
+                                .child(setting_divider(colors))
+                                .child(toggle_row(
+                                    t("settings.appearance.font_smoothing"),
+                                    t("settings.appearance.font_smoothing_detail"),
+                                    self.prefs.terminal_font_smoothing,
+                                    "terminal_font_smoothing",
+                                    colors,
+                                    cx,
+                                    |this, cx| {
+                                        let enabled = !this.prefs.terminal_font_smoothing;
+                                        this.update_prefs(move |prefs| {
+                                            prefs.terminal_font_smoothing = enabled
+                                        });
+                                        cx.notify();
+                                    },
+                                ))
+                        })
                         .child(setting_divider(colors))
                         .child(toggle_row(
                             t("settings.appearance.ligatures"),
@@ -7514,6 +7753,144 @@ impl UtilitySurfaces {
         control.into_any_element()
     }
 
+    /// The terminal family's faces, read once per family.
+    fn terminal_font_faces(&self, cx: &App) -> std::rc::Rc<[crate::fonts::FontFace]> {
+        let key = (
+            self.prefs.terminal_font_family.clone(),
+            self.prefs.terminal_ligatures,
+        );
+        let mut cached = self.terminal_font_faces.borrow_mut();
+        if let Some((cached_key, faces)) = cached.as_ref()
+            && *cached_key == key
+        {
+            return std::rc::Rc::clone(faces);
+        }
+        let faces: std::rc::Rc<[_]> = crate::fonts::font_faces(cx, &self.prefs).into();
+        *cached = Some((key, std::rc::Rc::clone(&faces)));
+        faces
+    }
+
+    /// The weight a face picker shows: `None` is the italic picker's
+    /// "same as regular".
+    fn face_weight(&self, menu: SettingsMenu) -> Option<u16> {
+        match menu {
+            SettingsMenu::BoldFace => Some(self.prefs.terminal_bold_weight),
+            SettingsMenu::ItalicFace => self.prefs.terminal_italic_weight,
+            _ => Some(self.prefs.terminal_font_weight),
+        }
+    }
+
+    fn face_label(&self, weight: Option<u16>) -> String {
+        match weight {
+            Some(weight) => crate::fonts::weight_label(weight).to_owned(),
+            None => tf(
+                "settings.appearance.face_follows_regular",
+                &[(
+                    "face",
+                    &crate::fonts::weight_label(self.prefs.terminal_font_weight),
+                )],
+            ),
+        }
+    }
+
+    fn font_face_dropdown(&self, menu: SettingsMenu, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let open = self.settings_menu == Some(menu);
+        let id = match menu {
+            SettingsMenu::BoldFace => "bold-face-dropdown",
+            SettingsMenu::ItalicFace => "italic-face-dropdown",
+            _ => "regular-face-dropdown",
+        };
+        let mut control = div().relative().min_w(px(158.0)).child(settings_select_button(
+            self.face_label(self.face_weight(menu)),
+            id,
+            open,
+            menu,
+            colors,
+            cx,
+        ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    fn font_face_options(
+        &self,
+        menu: SettingsMenu,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let faces = self.terminal_font_faces(cx);
+        let italic = menu == SettingsMenu::ItalicFace;
+        let mut choices: Vec<Option<u16>> = crate::fonts::faces_for_picker(&faces, italic)
+            .into_iter()
+            .map(Some)
+            .collect();
+        if italic {
+            choices.insert(0, None);
+        }
+        let current = self.face_weight(menu);
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for (index, choice) in choices.into_iter().enumerate() {
+            options = options.child(settings_choice_row(
+                format!("font-face-option-{index}"),
+                self.face_label(choice),
+                choice == current,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.settings_menu = None;
+                    this.update_prefs(move |prefs| match menu {
+                        SettingsMenu::BoldFace => {
+                            prefs.terminal_bold_weight = choice.unwrap_or(700);
+                        }
+                        SettingsMenu::ItalicFace => prefs.terminal_italic_weight = choice,
+                        _ => prefs.terminal_font_weight = choice.unwrap_or(400),
+                    });
+                    cx.notify();
+                },
+            ));
+        }
+        options.into_any_element()
+    }
+
+    fn font_thicken_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let open = self.settings_menu == Some(SettingsMenu::FontThicken);
+        let mut control = div().relative().min_w(px(132.0)).child(settings_select_button(
+            thicken_label(self.prefs.terminal_font_thicken),
+            "font-thicken-dropdown",
+            open,
+            SettingsMenu::FontThicken,
+            colors,
+            cx,
+        ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    fn font_thicken_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for level in 0..=Prefs::MAX_TERMINAL_FONT_THICKEN {
+            options = options.child(settings_choice_row(
+                format!("font-thicken-option-{level}"),
+                thicken_label(level),
+                level == self.prefs.terminal_font_thicken,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.settings_menu = None;
+                    this.update_prefs(move |prefs| prefs.terminal_font_thicken = level);
+                    cx.notify();
+                },
+            ));
+        }
+        options.into_any_element()
+    }
+
     fn terminal_theme_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
         let selected = theme(&self.prefs.terminal_theme);
         let colors = self.settings_colors();
@@ -8182,6 +8559,43 @@ fn toggle_row(
                 .when(!enabled, |toggle| toggle.justify_start())
                 .child(div().size(px(14.0)).rounded(px(7.0)).bg(colors.primary)),
         )
+}
+
+/// One alert channel column in General > Alerts.
+const ALERT_COLUMN_WIDTH: f32 = 52.0;
+
+/// A channel's switch in the alerts grid: a small check box, so four fit
+/// on a row where four toggles would crowd it.
+fn alert_check(
+    id: SharedString,
+    on: bool,
+    colors: SemanticColors,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id.clone())
+        .debug_selector(move || id.to_string())
+        .role(gpui::Role::CheckBox)
+        .size(px(16.0))
+        .rounded(px(4.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .when(on, |check| check.bg(Ink::FRESH.alpha(0.72)))
+        .when(!on, |check| {
+            check
+                .border_1()
+                .border_color(colors.primary.alpha(0.22))
+                .hover(move |style| style.bg(colors.primary.alpha(0.06)))
+        })
+        .when(on, |check| {
+            check.child(sf_symbol_weighted(
+                "checkmark",
+                9.0,
+                SymbolWeight::Bold,
+                colors.primary,
+            ))
+        })
 }
 
 /// "Start diri at login". Unlike a plain preference toggle it shows what
@@ -9236,7 +9650,7 @@ fn terminal_font_option(
             let family = stored.clone();
             entity.update(cx, |this, cx| {
                 this.settings_menu = None;
-                this.update_prefs(move |prefs| prefs.terminal_font_family = family);
+                this.update_prefs(move |prefs| prefs.set_terminal_font_family(family));
                 cx.notify();
             });
         })
@@ -9421,11 +9835,23 @@ fn appearance_mode_card(
         )
 }
 
+/// The stroke thickening levels, Off to Maximum.
+fn thicken_label(level: u8) -> &'static str {
+    match level {
+        0 => t("settings.appearance.thicken_off"),
+        1 => t("settings.appearance.thicken_1"),
+        2 => t("settings.appearance.thicken_2"),
+        3 => t("settings.appearance.thicken_3"),
+        _ => t("settings.appearance.thicken_4"),
+    }
+}
+
 fn appearance_diff_preview(
     theme: TermTheme,
     family: &str,
     font_size: f32,
     line_height_scale: f32,
+    weight: u16,
 ) -> impl IntoElement {
     // Roughly a monospace face's natural row, stretched like the terminal's.
     let line_height = (font_size * 1.2 * line_height_scale).ceil();
@@ -9519,7 +9945,7 @@ fn appearance_diff_preview(
         .border_color(theme.foreground.alpha(0.09))
         .bg(theme.background)
         .font_family(SharedString::from(family.to_owned()))
-        .font_weight(FontWeight::NORMAL)
+        .font_weight(FontWeight(f32::from(weight)))
         .text_size(px(font_size))
         .flex()
         .child(column(false))
@@ -9839,6 +10265,27 @@ mod tests {
                             if std::env::var("DIRI_VISUAL_TALK").as_deref() == Ok("menu") {
                                 surfaces.settings_menu = Some(SettingsMenu::TalkVoice);
                             }
+                            cx.notify();
+                        });
+                    }
+                    // `DIRI_VISUAL_FONT=<family>` sets the terminal family with a
+                    // Medium regular face, 110% cells and Medium thickening;
+                    // `DIRI_VISUAL_FONT_MENU=regular|bold|italic|thicken` opens
+                    // that picker.
+                    if let Ok(family) = std::env::var("DIRI_VISUAL_FONT") {
+                        harness.surfaces.update(cx, |surfaces, cx| {
+                            surfaces.prefs.terminal_font_family = family;
+                            surfaces.prefs.terminal_font_weight = 500;
+                            surfaces.prefs.terminal_cell_width = 110;
+                            surfaces.prefs.terminal_font_thicken = 2;
+                            surfaces.settings_menu =
+                                match std::env::var("DIRI_VISUAL_FONT_MENU").as_deref() {
+                                    Ok("regular") => Some(SettingsMenu::RegularFace),
+                                    Ok("bold") => Some(SettingsMenu::BoldFace),
+                                    Ok("italic") => Some(SettingsMenu::ItalicFace),
+                                    Ok("thicken") => Some(SettingsMenu::FontThicken),
+                                    _ => None,
+                                };
                             cx.notify();
                         });
                     }
@@ -11340,6 +11787,15 @@ mod tests {
                     .write()
                     .expect("preview store")
                     .set_herdr_plan(Some(plan));
+            }
+            // `DIRI_VISUAL_TERMINAL_SETUP=ghostty` seeds the Import section's
+            // terminal row with a scan of that test fixture.
+            if let Ok(fixture) = std::env::var("DIRI_VISUAL_TERMINAL_SETUP") {
+                runtime
+                    .store
+                    .write()
+                    .expect("preview store")
+                    .set_terminal_setup_scan(crate::terminal_import::fixture_scan(&fixture));
             }
             if std::env::var_os("DIRI_VISUAL_LIGHT").is_some() {
                 runtime
