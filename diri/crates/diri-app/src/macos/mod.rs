@@ -95,7 +95,7 @@ pub(crate) fn observe_reduce_motion(cx: &mut gpui::App) {
     if MainThreadMarker::new().is_none() {
         return;
     }
-    cx.set_reduce_motion(system_reduce_motion());
+    crate::motion::set_system(system_reduce_motion(), cx);
 
     let (changed, mut changes) = tokio::sync::mpsc::channel::<()>(1);
     let handler = block2::RcBlock::new(move |_: std::ptr::NonNull<NSNotification>| {
@@ -122,7 +122,7 @@ pub(crate) fn observe_reduce_motion(cx: &mut gpui::App) {
     cx.spawn(async move |cx| {
         while changes.recv().await.is_some() {
             let reduce = system_reduce_motion();
-            cx.update(|cx| cx.set_reduce_motion(reduce));
+            cx.update(|cx| crate::motion::set_system(reduce, cx));
         }
     })
     .detach();

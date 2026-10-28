@@ -46,6 +46,7 @@ pub mod markdown;
 mod markdown_view;
 #[cfg(any(target_os = "macos", test))]
 mod menu_inbox;
+mod motion;
 #[cfg(any(target_os = "macos", windows))]
 mod native_notifications;
 pub mod navigation;
@@ -506,6 +507,16 @@ fn main() {
         diri_ui::set_mark_rasterizer(macos::brand_raster::raster_mark);
         #[cfg(target_os = "macos")]
         macos::observe_scroller_style(cx);
+        motion::set_preference(
+            services
+                .store
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .preferences()
+                .reduce_motion,
+            cx,
+        );
         #[cfg(target_os = "macos")]
         macos::observe_reduce_motion(cx);
         let shortcut_overrides = services

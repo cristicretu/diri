@@ -447,6 +447,9 @@ pub struct Prefs {
     /// `"en"`, `"zh-Hans"` or `"es"`.
     pub ui_language: UiLanguage,
     pub confirm_before_closing_session: bool,
+    /// Turn Diri's animations off even when macOS animates. Reduce Motion
+    /// in System Settings turns them off as well; see `crate::motion`.
+    pub reduce_motion: bool,
     pub status_sounds: bool,
     pub status_notifications: bool,
     /// Read the relevant part of a finished turn's reply aloud (`crate::voice`).
@@ -648,6 +651,7 @@ impl Default for Prefs {
             start_at_login: false,
             ui_language: UiLanguage::System,
             confirm_before_closing_session: true,
+            reduce_motion: false,
             status_sounds: true,
             status_notifications: true,
             talk_with_agent: false,
