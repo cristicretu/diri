@@ -325,7 +325,9 @@ string_enum! {
 
 string_enum! {
     /// Where a needs-input detail came from. `TerminalLine` is a terminal's
-    /// foreground job blocked reading a line.
+    /// foreground job blocked reading a line. `ClaudeStopHook` is a Claude
+    /// turn that ended on a question while its background work keeps the
+    /// session busy (additive: older decoders read `unknown`).
     pub enum NeedsInputSource {
         ClaudePermissionHook => "claudePermissionHook",
         ClaudeNotificationHook => "claudeNotificationHook",
@@ -333,6 +335,7 @@ string_enum! {
         ScreenScrape => "screenScrape",
         TerminalLine => "terminalLine",
         ProgramStatus => "programStatus",
+        ClaudeStopHook => "claudeStopHook",
     }
 }
 

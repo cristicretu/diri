@@ -87,3 +87,10 @@ printed the first character but reported all the valid bytes as consumed, so
 the ASCII byte was never parsed: the letter vanished, and only when that read
 boundary fell there. It now consumes only the first character's bytes.
 Test: `partial_utf8_then_ascii_then_partial_utf8`.
+
+## Mode 2027
+
+`NamedPrivateMode::GraphemeClustering` names DECSET 2027 so `Term` can set,
+reset and report it (DECRQM answers `1`/`2` instead of `0`). Parsing is
+otherwise unchanged; the width rules live in `alacritty_terminal`'s
+`term/grapheme.rs`.

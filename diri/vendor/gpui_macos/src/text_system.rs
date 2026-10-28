@@ -158,11 +158,23 @@ impl PlatformTextSystem for MacTextSystem {
                 .map(|font_id| lock.fonts[font_id.0].properties())
                 .collect::<SmallVec<[_; 4]>>();
 
+            // DIRI PATCH (font faces): a weight stored rounded (a face at
+            // 529.97 saved as 530) still selects that face. CSS matching is
+            // exact first and then directional, so without the snap 530 would
+            // pass over it for the next heavier face.
+            let mut weight = fontkit_weight(font.weight);
+            if let Some(face) = candidate_properties
+                .iter()
+                .map(|properties| properties.weight)
+                .find(|face| (face.0 - weight.0).abs() < 1.0)
+            {
+                weight = face;
+            }
             let ix = font_kit::matching::find_best_match(
                 &candidate_properties,
                 &font_kit::properties::Properties {
                     style: fontkit_style(font.style),
-                    weight: fontkit_weight(font.weight),
+                    weight,
                     stretch: Default::default(),
                 },
             )?;
@@ -213,6 +225,36 @@ impl PlatformTextSystem for MacTextSystem {
         _font_size: Pixels,
     ) -> TextRenderingMode {
         TextRenderingMode::Grayscale
+    }
+
+    fn font_faces(&self, font: &Font) -> Vec<(FontWeight, FontStyle)> {
+        // DIRI PATCH (font faces): the candidates `font_id` chooses from.
+        let mut lock = self.0.write();
+        let font_key = FontKey {
+            font_family: font.family.clone(),
+            font_features: font.features.clone(),
+            font_fallbacks: font.fallbacks.clone(),
+        };
+        if !lock.font_ids_by_font_key.contains_key(&font_key) {
+            let Ok(font_ids) =
+                lock.load_family(&font.family, &font.features, font.fallbacks.as_ref())
+            else {
+                return Vec::new();
+            };
+            lock.font_ids_by_font_key.insert(font_key.clone(), font_ids);
+        }
+        lock.font_ids_by_font_key[&font_key]
+            .iter()
+            .map(|font_id| {
+                let properties = lock.fonts[font_id.0].properties();
+                let style = match properties.style {
+                    FontkitStyle::Normal => FontStyle::Normal,
+                    FontkitStyle::Italic => FontStyle::Italic,
+                    FontkitStyle::Oblique => FontStyle::Oblique,
+                };
+                (FontWeight(properties.weight.0), style)
+            })
+            .collect()
     }
 
     fn glyph_dilation_for_color(&self, color: Hsla) -> u8 {
@@ -430,7 +472,10 @@ impl MacTextSystemState {
         )?);
 
         // Expand the bounds by 1 pixel on each side to give CG room for anti-aliasing.
-        Ok(bounds.dilate(DevicePixels(1)))
+        // DIRI PATCH (glyph raster style): and one more for a stroked outline,
+        // which reaches up to half a device pixel past the glyph's edge.
+        let margin = if params.stroke > 0 { 2 } else { 1 };
+        Ok(bounds.dilate(DevicePixels(margin)))
     }
 
     fn rasterize_glyph(
@@ -499,24 +544,35 @@ impl MacTextSystemState {
             cx.set_allows_font_subpixel_quantization(false);
             cx.set_should_subpixel_quantize_fonts(false);
 
-            if params.dilation > 0 {
+            let luminance = if params.dilation > 0 {
                 let luminance = params.dilation as f64 * 0.25;
                 cx.set_should_smooth_fonts(true);
-                cx.set_gray_fill_color(luminance, 1.0);
+                luminance
             } else {
-                cx.set_gray_fill_color(0.0, 1.0);
-            }
-            self.fonts[params.font_id.0]
+                0.0
+            };
+            cx.set_gray_fill_color(luminance, 1.0);
+            let font = self.fonts[params.font_id.0]
                 .native_font()
-                .clone_with_font_size(f32::from(params.font_size) as CGFloat)
-                .draw_glyphs(
-                    &[params.glyph_id.0 as CGGlyph],
-                    &[CGPoint::new(
-                        (subpixel_shift.x / params.scale_factor) as CGFloat,
-                        (subpixel_shift.y / params.scale_factor) as CGFloat,
-                    )],
-                    cx,
-                );
+                .clone_with_font_size(f32::from(params.font_size) as CGFloat);
+            let position = [CGPoint::new(
+                (subpixel_shift.x / params.scale_factor) as CGFloat,
+                (subpixel_shift.y / params.scale_factor) as CGFloat,
+            )];
+            font.draw_glyphs(&[params.glyph_id.0 as CGGlyph], &position, cx.clone());
+            // DIRI PATCH (glyph raster style): thicken by stroking the outline
+            // over the fill. A second pass rather than CGTextFillStroke, which
+            // drops the smoothing dilation the fill just got, so every level
+            // adds weight. `stroke` is in quarters of a device pixel and the
+            // context is already scaled to points.
+            if params.stroke > 0 && !params.is_emoji {
+                let device_width = f64::from(params.stroke.min(4)) * 0.25;
+                cx.set_text_drawing_mode(CGTextDrawingMode::CGTextStroke);
+                cx.set_line_width(device_width / params.scale_factor as CGFloat);
+                cx.set_line_join(core_graphics::context::CGLineJoin::CGLineJoinRound);
+                cx.set_rgb_stroke_color(luminance, luminance, luminance, 1.0);
+                font.draw_glyphs(&[params.glyph_id.0 as CGGlyph], &position, cx);
+            }
 
             if params.is_emoji {
                 // Convert from RGBA with premultiplied alpha to BGRA with straight alpha.

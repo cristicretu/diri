@@ -174,7 +174,13 @@ pub fn parse_claude_hook(
                 message,
             }
         }
-        "Stop" => ClaudeHook::Stop,
+        "Stop" => match string(payload, "last_assistant_message")
+            .as_deref()
+            .and_then(trailing_question)
+        {
+            Some(question) => ClaudeHook::StopAsking { question },
+            None => ClaudeHook::Stop,
+        },
         "SubagentStart" => {
             ClaudeHook::SubagentStart(string(payload, "agent_id").unwrap_or_else(|| "?".into()))
         }
@@ -281,6 +287,88 @@ pub fn parse_activity_seed(
         }
         _ => None,
     }
+}
+
+/// The longest question a turn-end detail carries.
+const TURN_QUESTION_MAX_CHARS: usize = 160;
+
+/// The question a turn's final message hands back, when it hands one back:
+/// the last question in its final paragraph, outside any code block. Agents
+/// often ask and then add a line of context ("Should I go ahead? It's a
+/// one-line change."), so the question need not be the last sentence. Only
+/// that question is kept, redacted. A message ending in code, results or
+/// statements asks nothing; a `?` inside a URL or word is not a question.
+pub(crate) fn trailing_question(message: &str) -> Option<String> {
+    let mut in_code = false;
+    let mut paragraph: Vec<&str> = Vec::new();
+    for line in message.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_code = !in_code;
+            paragraph.clear();
+            continue;
+        }
+        if in_code {
+            continue;
+        }
+        if trimmed.is_empty() {
+            paragraph.clear();
+        } else {
+            paragraph.push(trimmed);
+        }
+    }
+    if in_code {
+        return None;
+    }
+    paragraph
+        .iter()
+        .rev()
+        .find_map(|line| last_question_in(line))
+        .map(|question| {
+            let question = redact(&question);
+            match question.char_indices().nth(TURN_QUESTION_MAX_CHARS) {
+                Some((end, _)) => format!("{}…", &question[..end]),
+                None => question,
+            }
+        })
+}
+
+/// The last sentence of `line` that ends in a question mark followed by a
+/// space or the line's end, after closing emphasis. A mark that closes a
+/// quote or code span is quoted text (`the "switch plans?" dialog`).
+fn last_question_in(line: &str) -> Option<String> {
+    const CLOSERS: &str = "*_)]";
+    let line = line.trim_start_matches(|c: char| c.is_whitespace() || "*_>-#•".contains(c));
+    let mut end = None;
+    for (i, c) in line.char_indices() {
+        if c != '?' && c != '？' {
+            continue;
+        }
+        let after = line[i + c.len_utf8()..].trim_start_matches(|c: char| CLOSERS.contains(c));
+        if after.is_empty() || after.starts_with(char::is_whitespace) {
+            end = Some(i + c.len_utf8());
+        }
+    }
+    let end = end?;
+    let body = &line[..end];
+    let mark = body.chars().last()?.len_utf8();
+    let head = &body[..body.len() - mark];
+    // The sentence starts after the previous sentence's end.
+    let start = head
+        .char_indices()
+        .rev()
+        .find(|(i, c)| {
+            matches!(c, '.' | '!' | '?' | '。' | '？' | ':')
+                && head[i + c.len_utf8()..]
+                    .trim_start_matches(|c: char| CLOSERS.contains(c))
+                    .starts_with(char::is_whitespace)
+        })
+        .map_or(0, |(i, c)| i + c.len_utf8());
+    let sentence = body[start..]
+        .trim()
+        .trim_start_matches(|c: char| c.is_whitespace() || CLOSERS.contains(c));
+    // A word or two before the mark: "Go?" counts, a lone "?" does not.
+    (sentence.chars().filter(|c| c.is_alphanumeric()).count() >= 2).then(|| sentence.to_owned())
 }
 
 fn needs_input_kind(notification_type: Option<&str>) -> Option<NeedsInputKind> {
@@ -823,5 +911,83 @@ mod tests {
             title_from_prompt("explain /Users/me/project/main.rs"),
             "explain /Users/me/project/main.rs"
         );
+    }
+
+    #[test]
+    fn a_turn_ending_on_a_question_is_read_as_asking() {
+        for (message, question) in [
+            (
+                "Done.\n\nShould I also update the docs?",
+                Some("Should I also update the docs?"),
+            ),
+            (
+                "Tests pass. Want me to open a PR?",
+                Some("Want me to open a PR?"),
+            ),
+            (
+                "**Which branch should I use?**\n",
+                Some("Which branch should I use?"),
+            ),
+            ("- red\n- blue\n\n> Red or blue? ", Some("Red or blue?")),
+            ("要我继续吗？", Some("要我继续吗？")),
+            ("All done. Nothing else to do.", None),
+            (
+                "Should I go ahead? Each is a one-line change.",
+                Some("Should I go ahead?"),
+            ),
+            (
+                "**Which one:** FSL or AGPL? I'll update `LICENSE` once you pick.",
+                Some("FSL or AGPL?"),
+            ),
+            (
+                "It was stuck on the \"exit and stop background tasks?\" dialog.",
+                None,
+            ),
+            ("Asked `what changed?` in the panel. It answered.", None),
+            ("See https://x.dev/?share=abc and https://y.dev/a?b=1", None),
+            ("Run:\n```sh\nls -la # what?\n```", None),
+            ("```\nunterminated?", None),
+            ("?", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                trailing_question(message).as_deref(),
+                question,
+                "{message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stop_payload_carries_its_question_and_pending_work() {
+        let payload = json!({
+            "hook_event_name": "Stop",
+            "session_id": "s",
+            "last_assistant_message": "Started the agent.\n\nShould I wait for it?",
+            "background_tasks": [{"id": "a", "type": "subagent", "status": "running"}],
+        });
+        let (signal, _) = parse_claude_hook("Stop", &payload, now()).expect("parsed");
+        let StatusSignal::ClaudeHook {
+            hook, pending_work, ..
+        } = signal
+        else {
+            panic!("{signal:?}");
+        };
+        assert_eq!(
+            hook,
+            ClaudeHook::StopAsking {
+                question: "Should I wait for it?".into()
+            }
+        );
+        assert_eq!(pending_work, Some(true));
+        let plain = json!({"hook_event_name": "Stop", "last_assistant_message": "Done."});
+        let (signal, _) = parse_claude_hook("Stop", &plain, now()).expect("parsed");
+        assert!(matches!(
+            signal,
+            StatusSignal::ClaudeHook {
+                hook: ClaudeHook::Stop,
+                ..
+            }
+        ));
     }
 }

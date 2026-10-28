@@ -92,6 +92,125 @@ pub(crate) fn status_state(session: &SessionRecord, migrating: bool) -> StatusSt
     }
 }
 
+/// What a blocked session's row says in place of its title: the question or
+/// permission it is waiting on, when the program named it. A generic
+/// "Waiting for …" placeholder (every Engine fallback reads that way, and a
+/// password prompt never carries its text) keeps the title, which says more.
+pub(crate) fn blocker_line(session: &SessionRecord) -> Option<String> {
+    if session.hibernation.is_some()
+        || !matches!(session.attention(), ProtoAttentionLevel::NeedsInput)
+    {
+        return None;
+    }
+    let detail = session.needs_input.as_ref().filter(|detail| !detail.secret)?;
+    let text = one_line(&detail.summary);
+    (!text.is_empty() && !text.starts_with("Waiting for")).then(|| capitalized(&text))
+}
+
+/// The second line of a row in the Activity filter: what the session is
+/// doing or left for you, and since when (epoch milliseconds) for the
+/// states that wait on you.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ActivityLine {
+    pub(crate) text: String,
+    pub(crate) since_ms: Option<u64>,
+}
+
+/// `unseen` is the session's newest unread inbox entry, which is what an
+/// unseen mark stands for.
+pub(crate) fn activity_line(
+    session: &SessionRecord,
+    state: StatusState,
+    unseen: Option<&crate::notification_feed::NotificationEntry>,
+) -> ActivityLine {
+    use crate::i18n::{t, tf};
+    use crate::notification_feed::NotificationKind;
+    match state {
+        StatusState::NeedsInput { .. } => {
+            let detail = session.needs_input.as_ref();
+            let text = detail
+                .filter(|detail| !detail.secret)
+                .map(|detail| one_line(&detail.summary))
+                .filter(|text| !text.is_empty())
+                .map_or_else(|| t("activity.needs_you").to_owned(), |text| capitalized(&text));
+            ActivityLine {
+                text,
+                since_ms: detail.map(|detail| detail.occurred_at.0.max(0.0) as u64),
+            }
+        }
+        StatusState::Working => ActivityLine {
+            text: match session.terminal_progress {
+                Some(diri_proto::TerminalProgress {
+                    state: diri_proto::TerminalProgressState::Normal,
+                    percent,
+                }) => tf("activity.working_percent", &[("percent", &percent)]),
+                _ => t("activity.working").to_owned(),
+            },
+            since_ms: None,
+        },
+        _ => match unseen {
+            Some(entry) => ActivityLine {
+                text: match entry.kind {
+                    NotificationKind::Done => t("activity.done").to_owned(),
+                    NotificationKind::Failed => t("activity.failed").to_owned(),
+                    NotificationKind::NeedsInput => t("activity.needed_you").to_owned(),
+                    NotificationKind::Custom => one_line(&entry.title),
+                },
+                since_ms: Some(entry.created_at_ms),
+            },
+            // Finished per the Engine, with no inbox entry (posted before
+            // this launch, or never): its last turn is the news.
+            None if state == StatusState::DoneUnseen => ActivityLine {
+                text: t("activity.done").to_owned(),
+                since_ms: session
+                    .last_turn_completed_at
+                    .map(|at| at.0.max(0.0) as u64),
+            },
+            None if state == StatusState::Hibernated => ActivityLine {
+                text: t("session.sleeping").to_owned(),
+                since_ms: None,
+            },
+            None => ActivityLine {
+                text: t("activity.idle").to_owned(),
+                since_ms: None,
+            },
+        },
+    }
+}
+
+/// A compact age ("now", "7m", "3h", "2d") and the epoch millisecond at
+/// which it next reads differently, so a view can wake exactly then.
+pub(crate) fn age_label(since_ms: u64, now_ms: u64) -> (String, u64) {
+    use crate::i18n::{t, tf};
+    const MINUTE: u64 = 60_000;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    let elapsed = now_ms.saturating_sub(since_ms);
+    let (label, unit) = match elapsed {
+        0..MINUTE => (t("notify.age_now").to_owned(), MINUTE),
+        MINUTE..HOUR => (tf("notify.age_minutes", &[("n", &(elapsed / MINUTE))]), MINUTE),
+        HOUR..DAY => (tf("notify.age_hours", &[("n", &(elapsed / HOUR))]), HOUR),
+        _ => (tf("notify.age_days", &[("n", &(elapsed / DAY))]), DAY),
+    };
+    let next = since_ms.saturating_add((elapsed / unit + 1) * unit);
+    (label, next)
+}
+
+fn one_line(text: &str) -> String {
+    text.replace('`', "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
 pub(crate) fn is_loading(session: &SessionRecord, migrating: bool) -> bool {
     !migrating
         && session.hibernation.is_none()
@@ -116,6 +235,96 @@ pub(crate) fn ui_agent_kind(kind: &ProtoAgentKind) -> AgentKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn asking(summary: &str) -> SessionRecord {
+        use crate::sidebar::{PreviewScenario, SidebarPreviewFixture};
+        let mut session = SidebarPreviewFixture::make(PreviewScenario::Typical)
+            .list
+            .sessions
+            .into_iter()
+            .find(|session| session.kind == ProtoAgentKind::CLAUDE_CODE)
+            .expect("claude fixture");
+        session.hibernation = None;
+        session.status =
+            diri_proto::SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission);
+        session.needs_input = Some(diri_proto::NeedsInputDetail {
+            kind: diri_proto::NeedsInputKind::Permission,
+            source: diri_proto::NeedsInputSource::ProgramStatus,
+            tool_name: None,
+            summary: summary.into(),
+            prompt_excerpt: None,
+            options: None,
+            risk_hint: diri_proto::RiskHint::Neutral,
+            occurred_at: diri_proto::DateMillis(1_000.0),
+            secret: false,
+        });
+        session
+    }
+
+    #[test]
+    fn a_named_question_replaces_the_title_until_it_is_answered() {
+        assert_eq!(
+            blocker_line(&asking("Allow deploy to staging?")).as_deref(),
+            Some("Allow deploy to staging?")
+        );
+        // Engine phrasing is lower-case and quotes commands; the row reads
+        // as a sentence on one line.
+        assert_eq!(
+            blocker_line(&asking("wants to run `npm\n test`")).as_deref(),
+            Some("Wants to run npm test")
+        );
+        // Placeholders and password prompts keep the title.
+        assert_eq!(blocker_line(&asking("Waiting for permission")), None);
+        let mut secret = asking("Password:");
+        secret.needs_input.as_mut().unwrap().secret = true;
+        assert_eq!(blocker_line(&secret), None);
+        // Answered: the title is back.
+        let mut answered = asking("Allow deploy to staging?");
+        answered.status = diri_proto::SessionStatus::Working;
+        assert_eq!(blocker_line(&answered), None);
+    }
+
+    #[test]
+    fn activity_lines_name_the_state_and_date_what_waits_on_you() {
+        use crate::notification_feed::{NotificationEntry, NotificationKind};
+        let session = asking("Allow deploy to staging?");
+        let line = activity_line(&session, StatusState::NeedsInput { destructive: false }, None);
+        assert_eq!(line.text, "Allow deploy to staging?");
+        assert_eq!(line.since_ms, Some(1_000));
+        let mut working = session.clone();
+        working.terminal_progress = Some(diri_proto::TerminalProgress {
+            state: diri_proto::TerminalProgressState::Normal,
+            percent: 40,
+        });
+        let line = activity_line(&working, StatusState::Working, None);
+        assert_eq!((line.text.as_str(), line.since_ms), ("Working · 40%", None));
+        let entry = |kind| NotificationEntry {
+            id: "e".into(),
+            session_id: session.id.clone(),
+            incarnation: 0,
+            kind,
+            title: "Build finished".into(),
+            body: String::new(),
+            created_at_ms: 5_000,
+            read: false,
+            resolved: false,
+            blocker: String::new(),
+        };
+        let done = activity_line(&session, StatusState::DoneUnseen, Some(&entry(NotificationKind::Done)));
+        assert_eq!((done.text.as_str(), done.since_ms), ("Finished", Some(5_000)));
+        let failed = activity_line(&session, StatusState::DoneUnseen, Some(&entry(NotificationKind::Failed)));
+        assert_eq!(failed.text, "Failed");
+        assert_eq!(activity_line(&session, StatusState::IdleSeen, None).text, "Idle");
+    }
+
+    #[test]
+    fn ages_change_exactly_at_their_next_boundary() {
+        assert_eq!(age_label(0, 59_999), ("now".to_owned(), 60_000));
+        assert_eq!(age_label(0, 60_000), ("1m".to_owned(), 120_000));
+        assert_eq!(age_label(0, 7 * 60_000 + 5), ("7m".to_owned(), 8 * 60_000));
+        assert_eq!(age_label(0, 3_600_000), ("1h".to_owned(), 7_200_000));
+        assert_eq!(age_label(10, 0), ("now".to_owned(), 60_010));
+    }
 
     #[test]
     fn plain_terminal_has_no_loading_or_working_indicator() {
