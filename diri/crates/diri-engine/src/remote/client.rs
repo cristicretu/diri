@@ -647,6 +647,31 @@ impl RemoteSessionClient {
         )
     }
 
+    /// One directory level relative to the remote child's live working
+    /// directory (`list-dir-v1`). A short-lived Helper process answers it, so
+    /// neither the attach channel nor the Holder's PTY loop is involved.
+    pub(crate) fn list_dir(
+        &self,
+        query: &diri_proto::ListDirQuery,
+        deadline: std::time::Instant,
+    ) -> io::Result<diri_proto::remote_pty::ListDirResult> {
+        let timeout = diri_pty::unix_socket::remaining(deadline)?;
+        let request = diri_proto::remote_pty::ListDirRequest {
+            selector: SessionSelector {
+                session_id: self.session_id.clone(),
+                session_token: self.token.clone(),
+                expected_incarnation: Some(self.incarnation.clone()),
+            },
+            path: query.path.clone(),
+            include_files: query.include_files,
+            prefix: query.prefix.clone(),
+            limit: query.limit,
+            timeout_ms: (timeout.as_millis() as u32)
+                .clamp(1, diri_proto::remote_pty::MAX_LIST_DIR_TIMEOUT_MS),
+        };
+        self.manager.list_dir(&self.helper, &request, deadline)
+    }
+
     pub fn read_scrollback_cells(
         &self,
         first_row: i64,

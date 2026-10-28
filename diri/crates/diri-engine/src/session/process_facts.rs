@@ -109,6 +109,27 @@ impl ProcessFactsReader {
         Ok(facts)
     }
 }
+impl ProcessFactsReader {
+    /// `list-dir-v1` for a remote session. Local sessions are listed by the
+    /// app on this Mac and are refused as unsupported here.
+    pub(crate) fn list_dir(
+        &self,
+        query: &diri_proto::ListDirQuery,
+        deadline: Instant,
+    ) -> io::Result<diri_proto::remote_pty::ListDirResult> {
+        self.check_live(deadline)?;
+        let Transport::Remote(client) = &self.transport else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "local sessions are listed on this machine",
+            ));
+        };
+        let _admission = Admission::acquire()?;
+        let result = client.list_dir(query, deadline)?;
+        self.check_live(deadline)?;
+        Ok(result)
+    }
+}
 fn unsupported() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,

@@ -18,7 +18,11 @@ use crate::grid::{GridCodecError, GridUpdate};
 use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 20;
+pub const PROTOCOL_MINOR: u16 = 21;
+/// `list-dir-v1`: the Helper lists one directory level resolved against the
+/// session child's live working directory. Minors 19 and 20 belong to
+/// `query-replies-v1` and `kitty-keyboard-v1`.
+pub const LIST_DIR_PROTOCOL_MINOR: u16 = 21;
 pub const GRID_RESUME_PROTOCOL_MINOR: u16 = 17;
 /// Minor 17 belongs to `grid-resume-v1`; styles are negotiated by name.
 pub const TERMINAL_STYLES_PROTOCOL_MINOR: u16 = 18;
@@ -48,6 +52,16 @@ pub const MAX_DIRECTORY_ENTRIES: usize = 512;
 pub const MAX_DIRECTORY_SCANNED_ENTRIES: usize = 16_384;
 pub const MAX_DIRECTORY_RESPONSE_BYTES: usize = 512 * 1024;
 pub const MAX_EXECUTABLE_QUERIES: usize = 128;
+/// Entries one `list-dir-v1` answer may carry.
+pub const MAX_LIST_DIR_ENTRIES: usize = 2_000;
+/// Directory entries one listing reads before it stops and says `truncated`,
+/// so a huge directory costs bounded time on the remote host.
+pub const MAX_LIST_DIR_SCANNED_ENTRIES: usize = 65_536;
+/// Encoded answer bound, well inside the Engine's 2 MiB RPC ceiling.
+pub const MAX_LIST_DIR_RESPONSE_BYTES: usize = 1024 * 1024;
+pub const MAX_LIST_DIR_PATH_BYTES: usize = 4_096;
+pub const MAX_LIST_DIR_PREFIX_BYTES: usize = 255;
+pub const MAX_LIST_DIR_TIMEOUT_MS: u32 = 2_000;
 /// Image bytes per `ImageResponse`. Small enough that one read never holds
 /// interactive output behind it for long on a slow link; the Engine asks for
 /// the next chunk only after this one arrived.
@@ -155,6 +169,10 @@ pub enum RemoteCapability {
     EnvironmentCapture,
     /// Helper CLI can return one bounded directory level.
     DirectoryList,
+    /// Helper CLI can list one bounded directory level resolved against an
+    /// authenticated session child's live working directory.
+    #[serde(rename = "list-dir-v1")]
+    ListDir,
     /// Helper can resolve a bounded batch of executable names against the
     /// account login PATH and validate user-selected executable paths.
     ExecutableDiscovery,
@@ -201,6 +219,7 @@ impl RemoteCapability {
             Self::SessionManagement => "session-management",
             Self::EnvironmentCapture => "environment-capture",
             Self::DirectoryList => "directory-list",
+            Self::ListDir => "list-dir-v1",
             Self::ExecutableDiscovery => "executable-discovery",
             Self::TranscriptUsage => "transcript-usage",
             Self::PersistenceProbe => "persistence-probe",
@@ -288,6 +307,7 @@ pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::InlineImages,
     RemoteCapability::GridResume,
     RemoteCapability::TerminalStyles,
+    RemoteCapability::ListDir,
 ];
 
 /// Authentication bearer shared only by the local Engine and one Holder.
@@ -1033,6 +1053,109 @@ pub struct ProcessInspectionRequest {
 
 fn default_process_inspection_timeout() -> u32 {
     1000
+}
+
+/// `list-dir-v1`: one directory level as a program in the session would see
+/// it. `path` is resolved like a shell argument: empty means the session
+/// child's live working directory, `~` and `~/…` the account home, an
+/// absolute path itself, anything else relative to that working directory.
+/// The listing never descends, reports entry kinds without following
+/// symlinks, and is bounded in entries, bytes and time.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListDirRequest {
+    #[serde(flatten)]
+    pub selector: SessionSelector,
+    #[serde(default)]
+    pub path: String,
+    /// Directories only unless set.
+    #[serde(default)]
+    pub include_files: bool,
+    /// Case-insensitive name prefix; empty lists every entry.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prefix: String,
+    #[serde(default = "default_list_dir_limit")]
+    pub limit: u32,
+    #[serde(default = "default_list_dir_timeout")]
+    pub timeout_ms: u32,
+}
+
+fn default_list_dir_limit() -> u32 {
+    MAX_LIST_DIR_ENTRIES as u32
+}
+
+fn default_list_dir_timeout() -> u32 {
+    1000
+}
+
+impl ListDirRequest {
+    pub fn validate(&self) -> Result<(), RemoteCodecError> {
+        self.selector.validate()?;
+        let invalid = |message: &str| Err(RemoteCodecError::InvalidLaunch(message.into()));
+        if self.path.len() > MAX_LIST_DIR_PATH_BYTES || self.path.as_bytes().contains(&0) {
+            return invalid("list-dir path must be NUL-free and at most 4096 bytes");
+        }
+        if self.prefix.len() > MAX_LIST_DIR_PREFIX_BYTES
+            || self.prefix.bytes().any(|byte| byte == 0 || byte == b'/')
+        {
+            return invalid("list-dir prefix must be one NUL-free name of at most 255 bytes");
+        }
+        if self.limit == 0 || self.limit as usize > MAX_LIST_DIR_ENTRIES {
+            return invalid("list-dir limit must be 1..=2000");
+        }
+        if !(1..=MAX_LIST_DIR_TIMEOUT_MS).contains(&self.timeout_ms) {
+            return invalid("list-dir timeout must be 1..=2000 ms");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ListDirEntryKind {
+    Directory,
+    File,
+    /// Sockets, FIFOs, devices, and symlinks whose target is missing.
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListDirEntry {
+    pub name: String,
+    /// What the entry resolves to. A symlink is reported by its target's
+    /// kind (one `stat`, never a walk) and flagged.
+    pub kind: ListDirEntryKind,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub symlink: bool,
+}
+
+/// Why a resolved directory could not be listed. The session itself was
+/// authenticated and live; these are ordinary filesystem answers, reported
+/// with the resolved path instead of failing the RPC.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListDirFailure {
+    PermissionDenied,
+    NotFound,
+    NotADirectory,
+    #[serde(other)]
+    Unreadable,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListDirResult {
+    /// The session child's live working directory on the remote host.
+    pub cwd: String,
+    /// The directory listed, lexically resolved against `cwd`.
+    pub path: String,
+    /// Sorted by name; at most the request's limit.
+    pub entries: Vec<ListDirEntry>,
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<ListDirFailure>,
 }
 
 impl SessionSelector {
@@ -2870,5 +2993,87 @@ mod usage_tests {
         );
         assert!(!PHASE_ONE_HOLDER_CAPABILITIES.contains(&RemoteCapability::TerminalStyles));
         assert!(ANNOTATED_HOLDER_CAPABILITIES.contains(&RemoteCapability::TerminalStyles));
+    }
+
+    #[test]
+    fn list_dir_is_an_optional_minor_21_helper_capability() {
+        const {
+            assert!(LIST_DIR_PROTOCOL_MINOR == 21);
+            assert!(LIST_DIR_PROTOCOL_MINOR <= PROTOCOL_MINOR);
+            assert!(LIST_DIR_PROTOCOL_MINOR > TERMINAL_STYLES_PROTOCOL_MINOR);
+        }
+        assert_eq!(
+            serde_json::to_string(&RemoteCapability::ListDir).unwrap(),
+            "\"list-dir-v1\""
+        );
+        assert_eq!(RemoteCapability::ListDir.wire_name(), "list-dir-v1");
+        // A Helper CLI command, never part of a Holder attach.
+        assert!(!ANNOTATED_HOLDER_CAPABILITIES.contains(&RemoteCapability::ListDir));
+        assert!(!PHASE_ONE_HELPER_CAPABILITIES.contains(&RemoteCapability::ListDir));
+        assert!(ANNOTATED_HELPER_CAPABILITIES.contains(&RemoteCapability::ListDir));
+    }
+
+    #[test]
+    fn list_dir_requests_are_bounded() {
+        let request = ListDirRequest {
+            selector: SessionSelector {
+                session_id: "session-1".into(),
+                session_token: SessionToken::new("0123456789abcdef0123").unwrap(),
+                expected_incarnation: Some("incarnation-1".into()),
+            },
+            path: "src/../docs".into(),
+            include_files: true,
+            prefix: "Re".into(),
+            limit: MAX_LIST_DIR_ENTRIES as u32,
+            timeout_ms: 1000,
+        };
+        assert!(request.validate().is_ok());
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(wire["sessionId"], "session-1");
+        assert_eq!(wire["includeFiles"], true);
+        let decoded: ListDirRequest = serde_json::from_value(serde_json::json!({
+            "sessionId": "session-1",
+            "sessionToken": "0123456789abcdef0123",
+            "expectedIncarnation": null,
+        }))
+        .unwrap();
+        assert_eq!(decoded.path, "");
+        assert_eq!(decoded.limit as usize, MAX_LIST_DIR_ENTRIES);
+        for bad in [
+            ListDirRequest {
+                limit: MAX_LIST_DIR_ENTRIES as u32 + 1,
+                ..request.clone()
+            },
+            ListDirRequest {
+                limit: 0,
+                ..request.clone()
+            },
+            ListDirRequest {
+                prefix: "a/b".into(),
+                ..request.clone()
+            },
+            ListDirRequest {
+                path: "a\0b".into(),
+                ..request.clone()
+            },
+            ListDirRequest {
+                path: "x".repeat(MAX_LIST_DIR_PATH_BYTES + 1),
+                ..request.clone()
+            },
+            ListDirRequest {
+                timeout_ms: MAX_LIST_DIR_TIMEOUT_MS + 1,
+                ..request.clone()
+            },
+        ] {
+            assert!(bad.validate().is_err());
+        }
+        let result: ListDirResult = serde_json::from_value(serde_json::json!({
+            "cwd": "/w", "path": "/w", "truncated": false,
+            "entries": [{"name": "s", "kind": "socket-from-a-newer-helper"}],
+            "failure": "something_newer",
+        }))
+        .unwrap();
+        assert_eq!(result.entries[0].kind, ListDirEntryKind::Other);
+        assert_eq!(result.failure, Some(ListDirFailure::Unreadable));
     }
 }
