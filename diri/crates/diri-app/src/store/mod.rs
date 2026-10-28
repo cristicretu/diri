@@ -41,9 +41,8 @@ use crate::switcher::{
 };
 
 pub use prefs::{
-    DictationShortcut, FileEditor, InspectorTab, InterfaceStyle, NewAgentStart, PaneDensity, Prefs,
-    SavedWindow, SidebarGrouping, SidebarOrdering, TabOrientation, TalkAnswer, TerminalCursorShape,
-    UiLanguage,
+    CursorBlinkPref, CursorShapePref, DictationShortcut, FileEditor, InspectorTab, InterfaceStyle, NewAgentStart, PaneDensity, Prefs,
+    SavedWindow, SidebarGrouping, SidebarOrdering, TabOrientation, TalkAnswer, UiLanguage,
     WindowMaterial, WindowMode, WindowPlacement,
 };
 pub use projection::{SidebarProject, SidebarProjection, SidebarRow};

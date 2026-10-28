@@ -11,7 +11,7 @@ use plist::{Dictionary, Value};
 
 use super::{Colors, LineHeight, Roots, Setup, SkipReason, ThemeChoice, read_bytes};
 use crate::i18n::t;
-use crate::store::TerminalCursorShape;
+use crate::store::CursorShapePref;
 
 const PLIST: &str = "com.googlecode.iterm2.plist";
 
@@ -81,12 +81,15 @@ fn read_profile(profile: &Dictionary, setup: &mut Setup) {
         setup.line_height = Some(LineHeight::Scale(spacing));
     }
     setup.cursor_shape = match profile.get("Cursor Type").and_then(integer) {
-        Some(0) => Some(TerminalCursorShape::Underline),
-        Some(1) => Some(TerminalCursorShape::Bar),
-        Some(2) => Some(TerminalCursorShape::Block),
+        Some(0) => Some(CursorShapePref::Underline),
+        Some(1) => Some(CursorShapePref::Bar),
+        Some(2) => Some(CursorShapePref::Block),
         _ => None,
     };
-    setup.cursor_blink = profile.get("Blinking Cursor").and_then(Value::as_boolean);
+    setup.cursor_blink = profile
+        .get("Blinking Cursor")
+        .and_then(Value::as_boolean)
+        .map(super::blink_from_bool);
     let sends = |key: &str| profile.get(key).and_then(integer).unwrap_or(0);
     if sends("Option Key Sends") != 0 || sends("Right Option Key Sends") != 0 {
         setup.skip(t("terminal_import.setting.option_as_alt"), SkipReason::OptionKey);

@@ -22,7 +22,7 @@ use diri_term::themes;
 use gpui::Rgba;
 
 use crate::i18n::{t, tf};
-use crate::store::{Prefs, TerminalCursorShape};
+use crate::store::{CursorBlinkPref, CursorShapePref, Prefs};
 
 mod alacritty;
 mod ghostty;
@@ -147,8 +147,8 @@ pub(crate) struct Setup {
     pub font_size: Option<f32>,
     pub line_height: Option<LineHeight>,
     pub theme: Option<ThemeChoice>,
-    pub cursor_shape: Option<TerminalCursorShape>,
-    pub cursor_blink: Option<bool>,
+    pub cursor_shape: Option<CursorShapePref>,
+    pub cursor_blink: Option<CursorBlinkPref>,
     pub copy_on_select: Option<bool>,
     /// Read, but Diri has no matching setting: (setting, why).
     pub skipped: Vec<Skipped>,
@@ -352,6 +352,29 @@ pub(super) fn parse_color(value: &str) -> Option<Rgba> {
     theme_file::parse_color(value)
 }
 
+/// A blinking cursor on or off, at Diri's normal speed when on.
+pub(super) fn blink_from_bool(blinks: bool) -> CursorBlinkPref {
+    if blinks {
+        CursorBlinkPref::Normal
+    } else {
+        CursorBlinkPref::Off
+    }
+}
+
+/// The speed nearest a full on-and-off cycle of `seconds` (Diri's Fast,
+/// Normal and Slow cycles are 0.72, 1.2 and 1.8 s); zero or less is off.
+pub(super) fn blink_from_cycle(seconds: f32) -> CursorBlinkPref {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        CursorBlinkPref::Off
+    } else if seconds < 0.96 {
+        CursorBlinkPref::Fast
+    } else if seconds < 1.5 {
+        CursorBlinkPref::Normal
+    } else {
+        CursorBlinkPref::Slow
+    }
+}
+
 pub(super) fn parse_bool(value: &str) -> Option<bool> {
     match value.trim().trim_matches(['"', '\'']).to_ascii_lowercase().as_str() {
         "true" | "yes" | "on" | "1" => Some(true),
@@ -393,8 +416,8 @@ pub(crate) struct Apply {
     pub font_size: Option<f32>,
     pub line_height: Option<f32>,
     pub theme: Option<ThemeTarget>,
-    pub cursor_shape: Option<TerminalCursorShape>,
-    pub cursor_blink: Option<bool>,
+    pub cursor_shape: Option<CursorShapePref>,
+    pub cursor_blink: Option<CursorBlinkPref>,
     pub copy_on_select: Option<bool>,
 }
 
@@ -739,14 +762,17 @@ fn format_points(size: f32) -> String {
     }
 }
 
-fn cursor_label(shape: TerminalCursorShape, blink: bool) -> String {
-    if blink {
-        tf(
+fn cursor_label(shape: CursorShapePref, blink: CursorBlinkPref) -> String {
+    match blink {
+        CursorBlinkPref::Off => shape.title().to_owned(),
+        CursorBlinkPref::Normal => tf(
             "terminal_import.value.cursor_blinking",
             &[("shape", &shape.title())],
-        )
-    } else {
-        shape.title().to_owned()
+        ),
+        speed => tf(
+            "terminal_import.value.cursor_blinking_speed",
+            &[("shape", &shape.title()), ("speed", &speed.title())],
+        ),
     }
 }
 
@@ -873,8 +899,8 @@ pub(crate) struct PreviousPrefs {
     pub line_height: f32,
     pub theme: String,
     pub follow_system_theme: bool,
-    pub cursor_shape: TerminalCursorShape,
-    pub cursor_blink: bool,
+    pub cursor_shape: CursorShapePref,
+    pub cursor_blink: CursorBlinkPref,
     pub copy_on_select: bool,
 }
 

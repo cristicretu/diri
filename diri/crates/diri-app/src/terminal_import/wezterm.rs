@@ -11,7 +11,7 @@ use super::{
     Colors, LineHeight, Roots, Setup, SkipReason, ThemeChoice, parse_color, read_text,
 };
 use crate::i18n::t;
-use crate::store::TerminalCursorShape;
+use crate::store::CursorShapePref;
 
 pub(super) fn config_file(roots: &Roots) -> Option<PathBuf> {
     roots
@@ -43,8 +43,22 @@ pub(super) fn read(roots: &Roots) -> Option<Setup> {
         files: vec![file.clone()],
         ..Setup::default()
     };
+    let mut blink_rate = None;
     for (key, value) in assignments(&text) {
+        if key == "cursor_blink_rate" {
+            // Milliseconds per phase; 0 never blinks.
+            blink_rate = match value {
+                Some(Literal::Number(ms)) => Some(ms),
+                _ => None,
+            };
+            continue;
+        }
         apply(&key, value, &mut setup, roots, &file);
+    }
+    if let (Some(ms), Some(blink)) = (blink_rate, setup.cursor_blink)
+        && blink != crate::store::CursorBlinkPref::Off
+    {
+        setup.cursor_blink = Some(super::blink_from_cycle(2.0 * ms / 1000.0));
     }
     Some(setup)
 }
@@ -196,13 +210,13 @@ fn apply(key: &str, value: Option<Literal>, setup: &mut Setup, roots: &Roots, fi
             let blinking = style.starts_with("Blinking");
             let shape = style.trim_start_matches("Blinking").trim_start_matches("Steady");
             setup.cursor_shape = match shape {
-                "Bar" => Some(TerminalCursorShape::Bar),
-                "Underline" => Some(TerminalCursorShape::Underline),
-                "Block" => Some(TerminalCursorShape::Block),
+                "Bar" => Some(CursorShapePref::Bar),
+                "Underline" => Some(CursorShapePref::Underline),
+                "Block" => Some(CursorShapePref::Block),
                 _ => None,
             };
             if setup.cursor_shape.is_some() {
-                setup.cursor_blink = Some(blinking);
+                setup.cursor_blink = Some(super::blink_from_bool(blinking));
             }
         }
         (

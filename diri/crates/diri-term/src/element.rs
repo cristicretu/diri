@@ -3,9 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
-use diri_proto::grid::{
-    CommandEnd, CursorShape, CursorStyle, GridCell, GridUpdate, StyleSpan, UnderlineKind,
-};
+use diri_proto::grid::{CommandEnd, CursorShape, GridCell, GridUpdate, StyleSpan, UnderlineKind};
 use diri_proto::terminal::MouseModes;
 use gpui::{
     App, Bounds, ContentMask, Element, ElementId, FocusHandle, Font, FontFallbacks, FontId,
@@ -16,7 +14,9 @@ use gpui::{
 
 use crate::blocks::BlockGlyph;
 use crate::buffer::{ApplySummary, ChangedRenderRow, GridBuffer};
-use crate::cursor_motion::{CursorCell, CursorDamage, CursorDriver, CursorFrame, CursorSchedule};
+use crate::cursor_motion::{
+    CursorCell, CursorDamage, CursorDriver, CursorFrame, CursorPreferences, CursorSchedule,
+};
 use crate::find::{
     FindSnapshot, FindSpan, NavigationTarget, SearchJob, SearchRequest, SearchResult,
     TerminalFindModel,
@@ -102,9 +102,6 @@ pub struct TerminalElement {
     /// Multiple of the font's natural line height; 1.0 paints rows exactly
     /// as tall as the font asks for.
     line_height_scale: f32,
-    /// The cursor drawn while the program has not asked for one (its
-    /// DECSCUSR style is still the protocol default).
-    default_cursor: CursorStyle,
     focus_handle: Option<FocusHandle>,
     text_input: Option<TextInputCallback>,
     ime_state: Arc<Mutex<TerminalImeState>>,
@@ -113,6 +110,7 @@ pub struct TerminalElement {
     hovered_reference: Option<ReferenceHit>,
     reduce_motion: bool,
     cursor_hidden: bool,
+    cursor_preferences: CursorPreferences,
 }
 
 /// Selection and reading state only: deliberately does not retain an input
@@ -829,7 +827,6 @@ impl TerminalElement {
             font: terminal_font,
             font_size: px(13.0),
             line_height_scale: 1.0,
-            default_cursor: CursorStyle::default(),
             focus_handle: None,
             text_input: None,
             ime_state: Arc::new(Mutex::new(TerminalImeState::default())),
@@ -837,6 +834,7 @@ impl TerminalElement {
             suspended: false,
             hovered_reference: None,
             reduce_motion: false,
+            cursor_preferences: CursorPreferences::default(),
             cursor_hidden: false,
         }
     }
@@ -925,14 +923,6 @@ impl TerminalElement {
         self
     }
 
-    /// The cursor shown until the program picks one; a program's DECSCUSR
-    /// (other than a reset to the default) still wins.
-    #[must_use]
-    pub fn default_cursor(mut self, style: CursorStyle) -> Self {
-        self.default_cursor = style;
-        self
-    }
-
     #[must_use]
     pub fn focus_handle(mut self, focus_handle: FocusHandle) -> Self {
         self.focus_handle = Some(focus_handle);
@@ -980,6 +970,14 @@ impl TerminalElement {
     #[must_use]
     pub fn reduce_motion(mut self, reduce_motion: bool) -> Self {
         self.reduce_motion = reduce_motion;
+        self
+    }
+
+    /// The user's cursor shape, blink speed, and whether programs may
+    /// change the shape.
+    #[must_use]
+    pub fn cursor_preferences(mut self, preferences: CursorPreferences) -> Self {
+        self.cursor_preferences = preferences;
         self
     }
 
@@ -2048,6 +2046,7 @@ impl TerminalElement {
             return None;
         };
         driver.motion.set_steady(cursor.steady);
+        driver.motion.set_blink(self.cursor_preferences.blink);
         let cell = CursorCell {
             col: cursor.col,
             row: cursor.row,
@@ -2816,7 +2815,7 @@ impl Element for TerminalElement {
                 .as_ref()
                 .and_then(|row| tint_at(&row.tints, usize::from(cursor.col)));
             let (cursor_fill, cursor_text) = self.theme.cursor_colors(cell, cursor_tint);
-            let style = effective_cursor_style(cursor.style, self.default_cursor);
+            let style = self.cursor_preferences.resolve(cursor.style);
             let shape = style.shape;
             let block = shape == CursorShape::Block;
             // A bar or underline glyph is drawn by the row itself.
@@ -3314,17 +3313,6 @@ fn record_paint(cost: Duration, cache_misses: u64, grid: impl FnOnce() -> (u16, 
             rows = rows,
             shape_misses = cache_misses
         );
-    }
-}
-
-/// The program's cursor, or the person's default while the program has not
-/// chosen one. DECSCUSR 0 (reset) reads as the default too, which is what
-/// that request means.
-fn effective_cursor_style(program: CursorStyle, default: CursorStyle) -> CursorStyle {
-    if program == CursorStyle::default() {
-        default
-    } else {
-        program
     }
 }
 
@@ -4338,27 +4326,6 @@ mod block_tests {
             &mut Vec::new(),
         );
         assert_eq!(foregrounds.len(), 1);
-    }
-
-    #[test]
-    fn the_default_cursor_applies_until_the_program_picks_one() {
-        let bar = CursorStyle {
-            shape: CursorShape::Bar,
-            steady: true,
-        };
-        let underline = CursorStyle {
-            shape: CursorShape::Underline,
-            steady: false,
-        };
-        // A program that never sent DECSCUSR (or reset it) gets the default.
-        assert_eq!(effective_cursor_style(CursorStyle::default(), bar), bar);
-        // A program's own choice wins over it.
-        assert_eq!(effective_cursor_style(underline, bar), underline);
-        // With no default set, nothing changes from before.
-        assert_eq!(
-            effective_cursor_style(CursorStyle::default(), CursorStyle::default()),
-            CursorStyle::default()
-        );
     }
 
     #[test]

@@ -12,7 +12,7 @@ use plist::{Dictionary, Value};
 
 use super::{Colors, LineHeight, Roots, Setup, SkipReason, ThemeChoice, read_bytes};
 use crate::i18n::t;
-use crate::store::TerminalCursorShape;
+use crate::store::CursorShapePref;
 
 const ANSI_KEYS: [&str; 8] = [
     "Black", "Red", "Green", "Yellow", "Blue", "Magenta", "Cyan", "White",
@@ -59,12 +59,15 @@ pub(super) fn read(roots: &Roots) -> Option<Setup> {
         setup.line_height = Some(LineHeight::Scale(spacing));
     }
     setup.cursor_shape = match profile.get("CursorType").and_then(Value::as_signed_integer) {
-        Some(0) => Some(TerminalCursorShape::Block),
-        Some(1) => Some(TerminalCursorShape::Underline),
-        Some(2) => Some(TerminalCursorShape::Bar),
+        Some(0) => Some(CursorShapePref::Block),
+        Some(1) => Some(CursorShapePref::Underline),
+        Some(2) => Some(CursorShapePref::Bar),
         _ => None,
     };
-    setup.cursor_blink = profile.get("CursorBlink").and_then(Value::as_boolean);
+    setup.cursor_blink = profile
+        .get("CursorBlink")
+        .and_then(Value::as_boolean)
+        .map(super::blink_from_bool);
     if profile
         .get("useOptionAsMetaKey")
         .and_then(Value::as_boolean)

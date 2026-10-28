@@ -6,7 +6,7 @@ use gpui::{TestAppContext, VisualTestContext};
 
 use super::tests::test_services;
 use super::*;
-use crate::store::TerminalCursorShape;
+use crate::store::CursorShapePref;
 
 struct Opened<'a> {
     root: Entity<RootView>,
@@ -62,8 +62,8 @@ fn import_applies_every_change_at_once_and_undo_restores_them(cx: &mut TestAppCo
     let after = prefs(&root, cx);
     assert_eq!(after.terminal_font_size, 15.0);
     assert_eq!(after.terminal_line_height, 1.2);
-    assert_eq!(after.terminal_cursor_shape, TerminalCursorShape::Bar);
-    assert!(!after.terminal_cursor_blink);
+    assert_eq!(after.terminal_cursor_shape, CursorShapePref::Bar);
+    assert_eq!(after.terminal_cursor_blink, crate::store::CursorBlinkPref::Off);
     assert!(after.terminal_copy_on_select);
     assert_eq!(after.terminal_theme, "imported-night-owl-custom");
     let toast = root.read_with(cx, |root, _| root.toast.current().cloned());

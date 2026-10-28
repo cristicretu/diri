@@ -8,7 +8,7 @@ use super::{
     parse_color, read_text, resolve_path,
 };
 use crate::i18n::t;
-use crate::store::TerminalCursorShape;
+use crate::store::CursorShapePref;
 
 pub(super) fn config_file(roots: &Roots) -> Option<PathBuf> {
     roots
@@ -128,19 +128,26 @@ fn apply(key: &str, value: &str, state: &mut State) {
         }
         "cursor_shape" => {
             setup.cursor_shape = match value {
-                "beam" => Some(TerminalCursorShape::Bar),
-                "underline" => Some(TerminalCursorShape::Underline),
-                "block" => Some(TerminalCursorShape::Block),
+                "beam" => Some(CursorShapePref::Bar),
+                "underline" => Some(CursorShapePref::Underline),
+                "block" => Some(CursorShapePref::Block),
                 _ => setup.cursor_shape,
             };
         }
         "cursor_blink_interval" => {
-            // 0 turns blinking off; a negative value is the system rate.
+            // Seconds per phase; 0 turns blinking off and a negative value
+            // is the system rate.
             setup.cursor_blink = value
                 .split_whitespace()
                 .next()
                 .and_then(|interval| interval.parse::<f32>().ok())
-                .map(|interval| interval != 0.0);
+                .map(|interval| {
+                    if interval < 0.0 {
+                        crate::store::CursorBlinkPref::Normal
+                    } else {
+                        super::blink_from_cycle(2.0 * interval)
+                    }
+                });
         }
         "copy_on_select" => {
             setup.copy_on_select = match value {

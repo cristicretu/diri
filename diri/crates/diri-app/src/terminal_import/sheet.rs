@@ -14,7 +14,7 @@ use gpui::{
 
 use super::{Plan, Source, ThemeTarget};
 use crate::i18n::{t, tf};
-use crate::store::{StoreRuntime, TerminalCursorShape};
+use crate::store::{StoreRuntime, CursorShapePref};
 use crate::whats_new::sheet_button;
 
 pub(crate) enum TerminalImportEvent {
@@ -49,7 +49,7 @@ struct Look {
     family: String,
     size: f32,
     line_height: f32,
-    cursor: TerminalCursorShape,
+    cursor: CursorShapePref,
 }
 
 impl TerminalImportSheet {
@@ -156,9 +156,9 @@ fn preview(look: &Look, width: f32) -> impl IntoElement {
             .whitespace_nowrap()
     };
     let cursor_mark = match look.cursor {
-        TerminalCursorShape::Block => div().w(px(cell)).h(px(look.size * 1.2)).bg(cursor),
-        TerminalCursorShape::Bar => div().w(px(2.0)).h(px(look.size * 1.2)).bg(cursor),
-        TerminalCursorShape::Underline => div()
+        CursorShapePref::Block => div().w(px(cell)).h(px(look.size * 1.2)).bg(cursor),
+        CursorShapePref::Bar => div().w(px(2.0)).h(px(look.size * 1.2)).bg(cursor),
+        CursorShapePref::Underline => div()
             .w(px(cell))
             .h(px(look.size * 1.2))
             .flex()

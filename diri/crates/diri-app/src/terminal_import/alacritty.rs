@@ -10,7 +10,8 @@ use super::{
     read_text, resolve_path,
 };
 use crate::i18n::t;
-use crate::store::TerminalCursorShape;
+use super::blink_from_cycle;
+use crate::store::{CursorBlinkPref, CursorShapePref};
 
 const ANSI_NAMES: [&str; 8] = [
     "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
@@ -178,9 +179,9 @@ fn read_cursor(item: &Item, setup: &mut Setup) {
         .or_else(|| style.and_then(|style| get(style, &["shape"])).and_then(Item::as_str));
     if let Some(shape) = shape {
         setup.cursor_shape = match shape.to_ascii_lowercase().as_str() {
-            "beam" => Some(TerminalCursorShape::Bar),
-            "underline" => Some(TerminalCursorShape::Underline),
-            "block" => Some(TerminalCursorShape::Block),
+            "beam" => Some(CursorShapePref::Bar),
+            "underline" => Some(CursorShapePref::Underline),
+            "block" => Some(CursorShapePref::Block),
             _ => setup.cursor_shape,
         };
     }
@@ -189,8 +190,12 @@ fn read_cursor(item: &Item, setup: &mut Setup) {
         .and_then(Item::as_str)
     {
         setup.cursor_blink = match blinking.to_ascii_lowercase().as_str() {
-            "on" | "always" => Some(true),
-            "off" | "never" => Some(false),
+            // `blink_interval` is how long each phase lasts (default 750 ms).
+            "on" | "always" => Some(
+                number(get(item, &["blink_interval"]))
+                    .map_or(CursorBlinkPref::Normal, |ms| blink_from_cycle(2.0 * ms / 1000.0)),
+            ),
+            "off" | "never" => Some(CursorBlinkPref::Off),
             _ => setup.cursor_blink,
         };
     }

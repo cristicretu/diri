@@ -61,8 +61,8 @@ fn ghostty_reads_includes_named_themes_and_only_what_was_set() {
     // `config-file` includes load after the file and override it.
     assert_eq!(setup.font_size, Some(15.0));
     assert_eq!(setup.line_height, Some(LineHeight::Scale(1.2)));
-    assert_eq!(setup.cursor_shape, Some(TerminalCursorShape::Bar));
-    assert_eq!(setup.cursor_blink, Some(false));
+    assert_eq!(setup.cursor_shape, Some(CursorShapePref::Bar));
+    assert_eq!(setup.cursor_blink, Some(CursorBlinkPref::Off));
     assert_eq!(setup.copy_on_select, Some(true));
     let theme = setup.theme.as_ref().unwrap();
     // `light:A,dark:B` takes the dark theme; inline colors beat the theme's.
@@ -95,8 +95,8 @@ fn kitty_reads_includes_and_kitten_theme_names() {
     assert_eq!(setup.font_family.as_deref(), Some("Fira Code"));
     assert_eq!(setup.font_size, Some(12.5));
     assert_eq!(setup.line_height, Some(LineHeight::Scale(1.1)));
-    assert_eq!(setup.cursor_shape, Some(TerminalCursorShape::Bar));
-    assert_eq!(setup.cursor_blink, Some(false));
+    assert_eq!(setup.cursor_shape, Some(CursorShapePref::Bar));
+    assert_eq!(setup.cursor_blink, Some(CursorBlinkPref::Off));
     assert_eq!(setup.copy_on_select, Some(true));
     assert_eq!(setup.theme.as_ref().unwrap().name, "Tokyo Night Test");
     let spec = spec(&setup);
@@ -126,8 +126,8 @@ fn alacritty_reads_imports_first_and_the_main_file_wins() {
     assert_eq!(setup.font_family.as_deref(), Some("Menlo"));
     assert_eq!(setup.font_size, Some(16.0));
     assert_eq!(setup.line_height, Some(LineHeight::Points(4.0)));
-    assert_eq!(setup.cursor_shape, Some(TerminalCursorShape::Underline));
-    assert_eq!(setup.cursor_blink, Some(true));
+    assert_eq!(setup.cursor_shape, Some(CursorShapePref::Underline));
+    assert_eq!(setup.cursor_blink, Some(CursorBlinkPref::Normal));
     assert_eq!(setup.copy_on_select, Some(true));
     let spec = spec(&setup);
     // The main file's background overrides the imported theme's.
@@ -169,8 +169,8 @@ fn wezterm_reads_literals_and_never_guesses_at_code() {
     assert_eq!(setup.font_size, None);
     // Not 2.0 from inside an `if`, nor anything set in a callback.
     assert_eq!(setup.line_height, Some(LineHeight::Scale(1.3)));
-    assert_eq!(setup.cursor_shape, Some(TerminalCursorShape::Underline));
-    assert_eq!(setup.cursor_blink, Some(false));
+    assert_eq!(setup.cursor_shape, Some(CursorShapePref::Underline));
+    assert_eq!(setup.cursor_blink, Some(CursorBlinkPref::Off));
     let theme = setup.theme.as_ref().unwrap();
     assert_eq!(theme.name, "My Scheme");
     assert_eq!(hex(Some(spec(&setup).background)).as_deref(), Some("#1f1f28"));
@@ -212,8 +212,8 @@ fn iterm_reads_the_default_profile_not_the_first() {
     assert_eq!(setup.font_family.as_deref(), Some("JetBrainsMono-Regular"));
     assert_eq!(setup.font_size, Some(15.0));
     assert_eq!(setup.line_height, Some(LineHeight::Scale(1.1)));
-    assert_eq!(setup.cursor_shape, Some(TerminalCursorShape::Bar));
-    assert_eq!(setup.cursor_blink, Some(true));
+    assert_eq!(setup.cursor_shape, Some(CursorShapePref::Bar));
+    assert_eq!(setup.cursor_blink, Some(CursorBlinkPref::Normal));
     assert_eq!(setup.copy_on_select, Some(true));
     assert_eq!(setup.theme.as_ref().unwrap().name, "iTerm2 Work");
     let spec = spec(&setup);
@@ -238,8 +238,8 @@ fn terminal_decodes_archived_fonts_and_colors() {
     assert_eq!(setup.font_family.as_deref(), Some("SFMono-Regular"));
     assert_eq!(setup.font_size, Some(12.0));
     assert_eq!(setup.line_height, Some(LineHeight::Scale(1.2)));
-    assert_eq!(setup.cursor_shape, Some(TerminalCursorShape::Bar));
-    assert_eq!(setup.cursor_blink, Some(true));
+    assert_eq!(setup.cursor_shape, Some(CursorShapePref::Bar));
+    assert_eq!(setup.cursor_blink, Some(CursorBlinkPref::Normal));
     let spec = spec(&setup);
     // A gray-space color (NSWhite) and an RGB one.
     assert_eq!(hex(Some(spec.background)).as_deref(), Some("#000000"));
@@ -437,8 +437,8 @@ fn apply_then_undo_restores_preferences_and_the_themes_folder() {
     .expect("applied");
     assert_eq!(prefs.terminal_font_family, "JetBrains Mono");
     assert_eq!(prefs.terminal_font_size, 15.0);
-    assert_eq!(prefs.terminal_cursor_shape, TerminalCursorShape::Bar);
-    assert!(!prefs.terminal_cursor_blink);
+    assert_eq!(prefs.terminal_cursor_shape, CursorShapePref::Bar);
+    assert_eq!(prefs.terminal_cursor_blink, CursorBlinkPref::Off);
     assert!(prefs.terminal_copy_on_select);
     assert_eq!(prefs.terminal_theme, "imported-apply-then-undo");
     let file = dir.join("apply-then-undo.diritheme");
@@ -545,5 +545,31 @@ fn live_scan_timing() {
             detected.setup.skipped.len(),
             detected.setup.unknown.len()
         );
+    }
+}
+
+#[test]
+fn blink_intervals_become_the_nearest_speed() {
+    assert_eq!(blink_from_cycle(0.0), CursorBlinkPref::Off);
+    assert_eq!(blink_from_cycle(0.6), CursorBlinkPref::Fast);
+    // kitty's and Alacritty's ~0.5-0.75 s phases are Diri's normal cycle.
+    assert_eq!(blink_from_cycle(1.0), CursorBlinkPref::Normal);
+    assert_eq!(blink_from_cycle(1.5), CursorBlinkPref::Slow);
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join(".config/kitty");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (interval, expected) in [
+        ("0.3", CursorBlinkPref::Fast),
+        ("-1", CursorBlinkPref::Normal),
+        ("1.0 ease-in-out", CursorBlinkPref::Slow),
+        ("0", CursorBlinkPref::Off),
+    ] {
+        std::fs::write(
+            dir.join("kitty.conf"),
+            format!("cursor_blink_interval {interval}\n"),
+        )
+        .unwrap();
+        let setup = kitty::read(&Roots::in_home(temp.path())).unwrap();
+        assert_eq!(setup.cursor_blink, Some(expected), "{interval}");
     }
 }

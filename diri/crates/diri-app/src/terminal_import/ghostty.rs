@@ -8,7 +8,7 @@ use super::{
     parse_color, read_text, resolve_path,
 };
 use crate::i18n::t;
-use crate::store::TerminalCursorShape;
+use crate::store::CursorShapePref;
 
 pub(super) fn config_files(roots: &Roots) -> Vec<PathBuf> {
     let xdg = roots.xdg_config.join("ghostty");
@@ -168,13 +168,13 @@ fn apply(key: &str, value: &str, state: &mut State) {
         }
         "cursor-style" => {
             setup.cursor_shape = match value {
-                "bar" => Some(TerminalCursorShape::Bar),
-                "underline" => Some(TerminalCursorShape::Underline),
-                "block" | "block_hollow" => Some(TerminalCursorShape::Block),
+                "bar" => Some(CursorShapePref::Bar),
+                "underline" => Some(CursorShapePref::Underline),
+                "block" | "block_hollow" => Some(CursorShapePref::Block),
                 _ => setup.cursor_shape,
             };
         }
-        "cursor-style-blink" => setup.cursor_blink = parse_bool(value),
+        "cursor-style-blink" => setup.cursor_blink = parse_bool(value).map(super::blink_from_bool),
         "copy-on-select" => {
             setup.copy_on_select = match value {
                 "clipboard" => Some(true),
