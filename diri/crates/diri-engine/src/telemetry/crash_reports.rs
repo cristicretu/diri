@@ -374,9 +374,9 @@ pub fn scan(reports: &Path, state_dir: &Path) -> usize {
         recorded += 1;
     }
     if newest != watermark {
-        let _ = std::fs::create_dir_all(diri_telemetry::telemetry_dir(state_dir));
+        let _ = diri_platform::private::create_dir_all(&diri_telemetry::telemetry_dir(state_dir));
         if let Ok(bytes) = serde_json::to_vec(&Watermark { mtime_ms: newest }) {
-            let _ = std::fs::write(&watermark_path, bytes);
+            let _ = diri_platform::private::write(&watermark_path, bytes);
         }
     }
     recorded
@@ -568,11 +568,15 @@ mod tests {
         let state = temp.path().join("state");
 
         assert_eq!(scan(&reports, &state), 1);
-        assert!(
-            diri_telemetry::telemetry_dir(&state)
-                .join(WATERMARK_FILE)
-                .exists()
-        );
+        let watermark = diri_telemetry::telemetry_dir(&state).join(WATERMARK_FILE);
+        assert!(watermark.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&watermark), 0o600);
+            assert_eq!(mode(watermark.parent().unwrap()), 0o700);
+        }
         assert_eq!(scan(&reports, &state), 0);
     }
 }

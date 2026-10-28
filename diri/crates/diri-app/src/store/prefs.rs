@@ -501,6 +501,10 @@ fn terminal_follows_last_directory_default() -> bool {
     true
 }
 
+fn terminal_ligatures_default() -> bool {
+    true
+}
+
 /// A style this build does not know, written by a newer diri, reads as
 /// unset (the material decides) rather than failing the whole file.
 fn deserialize_interface_style<'de, D: Deserializer<'de>>(
@@ -613,10 +617,18 @@ pub struct Prefs {
     /// Row height as a multiple of the font's own line height.
     #[serde(default = "terminal_line_height_default")]
     pub terminal_line_height: f32,
+    /// Let the terminal font form its ligatures (`=>`, `!=`). On is the
+    /// font's own default, so files written before the field read as on.
+    #[serde(default = "terminal_ligatures_default")]
+    pub terminal_ligatures: bool,
     pub terminal_copy_on_select: bool,
     /// Open a terminal URL on a plain click. When off, links still open with
     /// Command- or Control-click.
     pub terminal_open_links_on_click: bool,
+    /// Link schemes other than the web's that open without asking
+    /// (`ssh`, `vscode`, …), added by "Always Open" on the ask sheet.
+    #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub terminal_trusted_link_schemes: std::collections::BTreeSet<String>,
     pub terminal_hide_pointer: bool,
     /// The cursor a terminal draws until a program asks for another.
     pub terminal_cursor_shape: CursorShapePref,
@@ -781,8 +793,10 @@ impl Default for Prefs {
             terminal_font_size: 13.0,
             terminal_font_family: String::new(),
             terminal_line_height: terminal_line_height_default(),
+            terminal_ligatures: true,
             terminal_copy_on_select: false,
             terminal_open_links_on_click: true,
+            terminal_trusted_link_schemes: Default::default(),
             terminal_hide_pointer: true,
             terminal_cursor_shape: CursorShapePref::Block,
             terminal_cursor_blink: CursorBlinkPref::Normal,
@@ -892,12 +906,10 @@ impl Prefs {
         let parent = path.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "preference path has no parent")
         })?;
-        fs::create_dir_all(parent)?;
+        diri_platform::private::create_dir_all(parent)?;
         let bytes = serde_json::to_vec_pretty(&normalized)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let temporary = path.with_extension("json.tmp");
-        fs::write(&temporary, bytes)?;
-        fs::rename(temporary, path)
+        diri_platform::private::replace_via(&path.with_extension("json.tmp"), path, bytes)
     }
 
     pub fn zoom_terminal(&mut self, delta: f32) {
@@ -1212,10 +1224,12 @@ mod tests {
         let legacy: Prefs = serde_json::from_str(r#"{"terminalFontSize":14}"#).unwrap();
         assert_eq!(legacy.terminal_font_family, "");
         assert_eq!(legacy.terminal_line_height, 1.0);
+        assert!(legacy.terminal_ligatures, "a file without the field keeps ligatures");
 
         let mut prefs = Prefs {
             terminal_font_family: "  JetBrains Mono ".to_owned(),
             terminal_line_height: 1.2999,
+            terminal_ligatures: false,
             ..legacy
         };
         prefs.normalize();

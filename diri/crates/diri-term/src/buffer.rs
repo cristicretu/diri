@@ -195,8 +195,9 @@ impl GridBuffer {
             if cell.scalar == 0 {
                 continue;
             }
+            // A tab's cell searches as the blank it left, as it copies.
             let ch = char::from_u32(cell.scalar)
-                .filter(|ch| *ch != '\n' && *ch != '\r')
+                .filter(|ch| !matches!(ch, '\n' | '\r' | '\t'))
                 .unwrap_or(' ');
             // Match the shared parser's width rules, including older Helpers
             // whose wire cells do not distinguish wide bases from other glyphs.

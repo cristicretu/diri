@@ -100,15 +100,11 @@ pub(crate) fn import(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<TermTh
         slug if slug.is_empty() => "theme".to_owned(),
         slug => slug,
     };
-    std::fs::create_dir_all(dir).map_err(|_| ImportError::Write)?;
+    diri_platform::private::create_dir_all(dir).map_err(|_| ImportError::Write)?;
     let target = dir.join(format!("{stem}.{DIRI_THEME_EXTENSION}"));
     let temporary = dir.join(format!(".{stem}.{}.tmp", std::process::id()));
-    std::fs::write(&temporary, theme_file::write_diri(&spec))
-        .and_then(|()| std::fs::rename(&temporary, &target))
-        .map_err(|_| {
-            let _ = std::fs::remove_file(&temporary);
-            ImportError::Write
-        })?;
+    diri_platform::private::replace_via(&temporary, &target, theme_file::write_diri(&spec))
+        .map_err(|_| ImportError::Write)?;
     let theme = build(&stem, &spec);
     themes::add_imported(theme);
     Ok(theme)
