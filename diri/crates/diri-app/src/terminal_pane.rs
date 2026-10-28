@@ -3341,6 +3341,16 @@ impl TerminalPane {
         position: gpui::Point<gpui::Pixels>,
         window: &mut Window,
     ) -> Option<(usize, usize)> {
+        self.grid_point_at(position, window)
+            .map(|point| (point.col, point.row))
+    }
+
+    /// The cell under `position` and the column boundary nearest it.
+    fn grid_point_at(
+        &self,
+        position: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+    ) -> Option<GridPoint> {
         self.selected_session()?;
         let store = self
             .runtime
@@ -3363,9 +3373,10 @@ impl TerminalPane {
             .grid_row_overflow(grid_rows, &typeface, window)
             .map_or(0.0, |grid_height| self.grid_inner_height() - grid_height);
         let grid_y = viewport.y + self.header_height() + 2.0 + anchor;
-        let col = ((f32::from(position.x) - grid_x) / f32::from(metrics.cell_width))
-            .floor()
-            .max(0.0) as usize;
+        let (col, edge) = pointer_columns(
+            f32::from(position.x) - grid_x,
+            f32::from(metrics.cell_width),
+        );
         let resident = self.selected_id().and_then(|id| self.residents.get(&id))?;
         // A reading view resting between rows is painted this far above its
         // whole-row positions, and shows part of one more row at the bottom.
@@ -3380,16 +3391,21 @@ impl TerminalPane {
         // The extra row is addressable for selection and links. A program
         // reading the mouse is only ever told about rows of its own screen.
         let extra_row = shift > 0.0 && !resident.element.mouse_modes().is_reporting();
+        let cols = resident.element.grid_cols();
         clamp_grid_cell(
             col,
             row,
-            resident.element.grid_cols(),
+            cols,
             resident
                 .element
                 .grid_rows()
                 .saturating_add(u16::from(extra_row)),
         )
-        .map(|(col, row)| (usize::from(col), usize::from(row)))
+        .map(|(col, row)| GridPoint {
+            col: usize::from(col),
+            row: usize::from(row),
+            edge: edge.min(usize::from(cols)),
+        })
     }
 
     fn handle_pointer_down(
@@ -3401,7 +3417,7 @@ impl TerminalPane {
         let Some(id) = self.selected_id() else {
             return;
         };
-        let Some((col, row)) = self.grid_cell_at(event.position, window) else {
+        let Some(GridPoint { col, row, edge }) = self.grid_point_at(event.position, window) else {
             return;
         };
         self.reset_qol_session(&id);
@@ -3459,9 +3475,9 @@ impl TerminalPane {
                 };
                 match event.click_count {
                     1 if event.modifiers.alt && event.modifiers.shift => {
-                        resident.element.begin_rectangle_selection(col, row)
+                        resident.element.begin_rectangle_selection(edge, row)
                     }
-                    1 => resident.element.begin_selection(col, row),
+                    1 => resident.element.begin_selection(edge, row),
                     2 => resident.element.select_word(col, row),
                     _ => resident.element.select_line(row),
                 }
@@ -3609,7 +3625,7 @@ impl TerminalPane {
         let Some(id) = self.selected_id() else {
             return;
         };
-        let Some((col, row)) = self.grid_cell_at(event.position, window) else {
+        let Some(GridPoint { col, row, edge }) = self.grid_point_at(event.position, window) else {
             return;
         };
         self.reset_qol_session(&id);
@@ -3634,7 +3650,7 @@ impl TerminalPane {
             r.pointer_owner == Some((MouseButton::Left, PointerOwner::LocalSelection))
         });
         if selecting {
-            self.update_selection_autoscroll(event.position, col, row, window, cx);
+            self.update_selection_autoscroll(event.position, col, edge, row, window, cx);
         }
         let (dispatch, attachment) = {
             let Some(resident) = self.residents.get_mut(&id) else {
@@ -3647,7 +3663,7 @@ impl TerminalPane {
                     .map(|(_, owner)| owner)
             });
             if owner == Some(PointerOwner::LocalSelection) {
-                resident.element.drag_selection(col, row);
+                resident.element.drag_selection_to_edge(col, edge, row);
                 cx.notify();
                 return;
             }
@@ -5819,6 +5835,27 @@ impl TerminalPane {
     }
 }
 
+/// A pointer position on the grid: the cell under it, and the column
+/// boundary nearest it (`0..=cols`), where a character selection starts or
+/// ends. A cell is selected once the pointer passes its middle, as in xterm
+/// and Ghostty, and the right edge of the last column is reachable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GridPoint {
+    col: usize,
+    row: usize,
+    edge: usize,
+}
+
+/// The cell under a pointer `x` pixels into the grid, and the column
+/// boundary nearest it, both before clamping to the grid.
+fn pointer_columns(x: f32, cell_width: f32) -> (usize, usize) {
+    let columns = x / cell_width;
+    (
+        columns.floor().max(0.0) as usize,
+        columns.round().max(0.0) as usize,
+    )
+}
+
 fn clamp_grid_cell(col: usize, row: usize, cols: u16, rows: u16) -> Option<(u16, u16)> {
     if cols == 0 || rows == 0 {
         return None;
@@ -6868,6 +6905,20 @@ mod tests {
             pointer_owner(MouseModes::OFF, MouseButton::Left, &Modifiers::default()),
             PointerOwner::LocalSelection
         );
+    }
+
+    #[test]
+    fn a_drag_selects_a_cell_past_its_middle_and_reaches_the_last_column() {
+        // 10 px cells on a 6-column grid.
+        let edge = |x: f32| pointer_columns(x, 10.0).1.min(6);
+        let cell = |x: f32| clamp_grid_cell(pointer_columns(x, 10.0).0, 0, 6, 1).unwrap().0;
+        assert_eq!((cell(14.0), edge(14.0)), (1, 1), "left half: cell 1 not yet in");
+        assert_eq!((cell(16.0), edge(16.0)), (1, 2), "right half: cell 1 joins");
+        // The right half of the last cell, and past the grid, end after it;
+        // a cell-floor end could never include column 5.
+        assert_eq!((cell(57.0), edge(57.0)), (5, 6));
+        assert_eq!((cell(90.0), edge(90.0)), (5, 6));
+        assert_eq!(edge(-4.0), 0);
     }
 
     #[test]

@@ -25,7 +25,9 @@ pub(super) struct QolState {
     feedback_timer: Option<Task<()>>,
     /// Selection drag held past an edge: cell under the pointer and signed
     /// pixels past the edge, positive above the top.
-    pub drag: Option<(SessionId, usize, usize, f32)>,
+    /// Session, pointer cell column, nearest column edge, row, and how far
+    /// past the grid the pointer is.
+    pub drag: Option<(SessionId, usize, usize, usize, f32)>,
     pub autoscroll: Option<Autoscroll>,
     autoscroll_generation: u64,
     export_files: Vec<tempfile::NamedTempFile>,
@@ -521,6 +523,7 @@ impl TerminalPane {
         &mut self,
         position: Point<Pixels>,
         col: usize,
+        edge: usize,
         row: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -545,7 +548,7 @@ impl TerminalPane {
             self.qol.autoscroll = None;
             return;
         }
-        self.qol.drag = Some((id, col, row, past));
+        self.qol.drag = Some((id, col, edge, row, past));
         if self.qol.autoscroll.is_some() {
             return;
         }
@@ -593,7 +596,7 @@ impl TerminalPane {
         };
         let elapsed = now.saturating_duration_since(run.last);
         run.last = now;
-        let Some((id, col, row, past)) = self.qol.drag.clone() else {
+        let Some((id, col, edge, row, past)) = self.qol.drag.clone() else {
             return false;
         };
         if self.selected_id().as_ref() != Some(&id) || !self.focus.is_focused(window) {
@@ -631,7 +634,7 @@ impl TerminalPane {
             self.qol.drag = None;
             return false;
         }
-        resident.element.drag_selection(col, row);
+        resident.element.drag_selection_to_edge(col, edge, row);
         self.pump_scrollback_fetch(&id, rows);
         cx.notify();
         true
@@ -804,16 +807,12 @@ impl TerminalPane {
             }
             _ => {}
         }
-        if mode.selecting {
-            resident
-                .element
-                .drag_selection((mode.col + 1).min(cols), mode.row);
-        } else {
+        // Both the cell `v` started on and the cursor's cell are selected,
+        // whichever way the cursor moved.
+        if !mode.selecting {
             resident.element.begin_selection(mode.col, mode.row);
-            resident
-                .element
-                .drag_selection((mode.col + 1).min(cols), mode.row);
         }
+        resident.element.drag_selection_cells(mode.col, mode.row);
         self.qol.copy_mode = Some(mode);
         self.pump_scrollback_fetch(&id, rows);
         cx.notify();

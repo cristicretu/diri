@@ -1472,9 +1472,26 @@ impl TerminalElement {
     }
 
     pub fn drag_selection(&self, col: usize, window_row: usize) {
+        self.drag_selection_to_edge(col, col, window_row);
+    }
+
+    /// A pointer drag: `col` is the cell under the pointer and `edge` the
+    /// cell boundary nearest it, `0..=cols`. See
+    /// [`TerminalSelection::drag_in_view_to_edge`].
+    ///
+    /// [`TerminalSelection::drag_in_view_to_edge`]: crate::selection::TerminalSelection::drag_in_view_to_edge
+    pub fn drag_selection_to_edge(&self, col: usize, edge: usize, window_row: usize) {
         let viewport = mutex_lock(&self.shared.viewport);
         let buffer = read_lock(&self.buffer);
-        mutex_lock(&self.shared.selection).drag_in_view(&viewport, &buffer, window_row, col);
+        mutex_lock(&self.shared.selection)
+            .drag_in_view_to_edge(&viewport, &buffer, window_row, col, edge);
+    }
+
+    /// Keyboard copy mode: selects from the cell [`Self::begin_selection`]
+    /// started at through this one, both included.
+    pub fn drag_selection_cells(&self, col: usize, window_row: usize) {
+        let row = mutex_lock(&self.shared.viewport).absolute_row(window_row);
+        mutex_lock(&self.shared.selection).drag_cells_to(SelectionPoint { row, col });
     }
 
     pub fn begin_rectangle_selection(&self, col: usize, row: usize) {
