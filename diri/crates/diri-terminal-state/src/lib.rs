@@ -804,12 +804,20 @@ impl HeadlessScreen {
     /// Parses all terminal bytes while excluding a replay prefix from product
     /// notifications. A partial historical OSC cannot leak into live output.
     pub fn feed_with_history(&mut self, bytes: &[u8], historical_bytes: usize) {
-        self.scan_progress(bytes);
+        // Colors and cursor moves are nearly every escape in bulk output. When
+        // they are the only ones, no side scanner below can find anything, so
+        // they are skipped instead of each looking at every escape.
+        let csi_only = only_csi_escapes(bytes);
+        if !(csi_only && self.progress_carry.is_empty()) {
+            self.scan_progress(bytes);
+        }
         if let Some(parser) = &mut self.notifications {
             if historical_bytes != 0 {
                 parser.reset_sequence();
             }
-            parser.feed(&bytes[historical_bytes.min(bytes.len())..]);
+            if !(csi_only && parser.is_idle()) {
+                parser.feed(&bytes[historical_bytes.min(bytes.len())..]);
+            }
             // An `OSC 7501` support query is answered ahead of the emulator's
             // replies for the same chunk. Programs detect support by sending
             // the query and then a device-attributes request, and read an
@@ -820,7 +828,7 @@ impl HeadlessScreen {
                 self.replies.append(&mut parser.replies);
             }
         }
-        self.advance_with_images(bytes, historical_bytes);
+        self.advance_with_images(bytes, historical_bytes, csi_only);
         self.settle();
     }
 
@@ -2688,6 +2696,37 @@ fn append_color(color: TermColor, foreground: bool, codes: &mut Vec<String>) {
     }
 }
 
+/// Whether every ESC in `bytes` introduces a CSI (`ESC [`), and the last
+/// byte is not an ESC whose next byte is still to come.
+///
+/// Eight bytes are tested at a time, each against its successor: a byte is
+/// an ESC not followed by `[` exactly where the masks below disagree.
+fn only_csi_escapes(bytes: &[u8]) -> bool {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const LOW: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    // The high bit of each byte of `word` that equals `byte`.
+    let equal = |word: u64, byte: u8| {
+        let t = word ^ (ONES * u64::from(byte));
+        !(((t & LOW).wrapping_add(LOW)) | t | LOW)
+    };
+    let mut at = 0;
+    while at + 9 <= bytes.len() {
+        let word = u64::from_le_bytes(bytes[at..at + 8].try_into().expect("eight bytes"));
+        let next = u64::from_le_bytes(bytes[at + 1..at + 9].try_into().expect("eight bytes"));
+        if equal(word, 0x1b) & !equal(next, b'[') != 0 {
+            return false;
+        }
+        at += 8;
+    }
+    while at < bytes.len() {
+        if bytes[at] == 0x1b && bytes.get(at + 1) != Some(&b'[') {
+            return false;
+        }
+        at += 1;
+    }
+    true
+}
+
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
         return None;
@@ -2780,6 +2819,83 @@ fn emulator_color(color: TermColor) -> Color {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_csi_escapes_matches_a_bytewise_check() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..20_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let length = (seed % 40) as usize;
+            let bytes: Vec<u8> = (0..length)
+                .map(|index| b"\x1b\x1b[[]_a\x9b"[(seed >> (index % 56)) as usize % 8])
+                .collect();
+            let expected = bytes
+                .iter()
+                .enumerate()
+                .all(|(index, &byte)| byte != 0x1b || bytes.get(index + 1) == Some(&b'['));
+            assert_eq!(super::only_csi_escapes(&bytes), expected, "{bytes:?}");
+        }
+    }
+
+    /// Chunks of colored output skip the progress, notification and image
+    /// scanners. Wherever the chunk boundaries fall, what they find must not
+    /// change.
+    #[test]
+    fn side_scanners_find_the_same_reports_however_output_is_split() {
+        let pieces: &[&[u8]] = &[
+            b"\x1b[31mred\x1b[0m ",
+            b"plain ",
+            b"\r\n",
+            b"\x1b]9;4;1;40\x07",
+            b"\x1b]9;4;2;70\x1b\\",
+            b"\x1b]9;done\x07",
+            b"\x1b]777;notify;title;body\x07",
+            b"\x1b]133;A\x07",
+            b"\x1b]133;D;0\x07",
+            b"\x1b_Ga=T,f=24,s=1,v=1;AAAA\x1b\\",
+            b"\x1b[38;2;1;2;3mx",
+            b"\x1b",
+        ];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let observe = |screen: &mut super::HeadlessScreen| {
+            (
+                screen.progress(),
+                screen.progress_reports(),
+                format!("{:?}", screen.take_notifications()),
+                screen.shell_phase(),
+                screen.take_replies(),
+                screen.lines(),
+            )
+        };
+        for _ in 0..200 {
+            let stream: Vec<u8> = (0..60)
+                .flat_map(|_| pieces[next() as usize % pieces.len()].iter().copied())
+                .collect();
+            let screen = || {
+                super::HeadlessScreen::new(30, 6)
+                    .with_notifications()
+                    .with_inline_images()
+            };
+            let mut whole = screen();
+            whole.feed(&stream);
+            let mut split = screen();
+            let mut at = 0;
+            while at < stream.len() {
+                let end = (at + 1 + next() as usize % 24).min(stream.len());
+                split.feed(&stream[at..end]);
+                at = end;
+            }
+            assert_eq!(observe(&mut split), observe(&mut whole), "{stream:?}");
+        }
+    }
+
     #[test]
     fn keyboard_mode_only_changes_leave_cells_unchanged_and_reset_independently() {
         let mut screen = super::HeadlessScreen::new(20, 3);

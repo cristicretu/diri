@@ -155,6 +155,23 @@ impl<T> Row<T> {
             .map_or(0, |i| i + 1)
     }
 
+    /// DIRI PATCH: lets `write` fill a prefix of the cells from `start` on
+    /// (it returns how many it wrote) and raises the occupancy only over
+    /// those, as indexing each written range would.
+    #[inline]
+    pub(crate) fn write_from(
+        &mut self,
+        start: usize,
+        write: impl FnOnce(&mut [T]) -> usize,
+    ) -> usize {
+        let written = write(&mut self.inner[start..]);
+        debug_assert!(start + written <= self.inner.len());
+        if written != 0 {
+            self.occ = max(self.occ, start + written);
+        }
+        written
+    }
+
     #[inline]
     pub fn from_vec(vec: Vec<T>, occ: usize) -> Row<T> {
         Row { inner: vec, occ }

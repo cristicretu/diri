@@ -84,6 +84,12 @@ impl ShellPhase {
 pub const AGENT_EXIT_OSC: &str = "6973;agent-exit;";
 
 impl NotificationParser {
+    /// Between sequences: output whose escapes are all CSIs leaves the
+    /// parser exactly as it is.
+    pub fn is_idle(&self) -> bool {
+        self.state == 0
+    }
+
     pub fn reset_sequence(&mut self) {
         self.state = 0;
         self.payload.clear();

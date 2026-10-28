@@ -18,7 +18,8 @@ const TAIL: usize = 8;
 
 #[inline]
 fn read_u32(bytes: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+    // One bounds check and one load, where four indexed bytes take four.
+    u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"))
 }
 
 #[inline]
@@ -63,25 +64,43 @@ fn emit(out: &mut Vec<u8>, literals: &[u8], matched: Option<(usize, usize)>) {
 #[inline]
 fn match_length(input: &[u8], earlier: usize, later: usize) -> usize {
     let end = input.len() - TAIL;
+    // `earlier < later`, so both runs fit in `later..end`'s length (empty
+    // when `later` is already in the tail); slicing once lets the loops
+    // below index without further checks.
+    let available = end.saturating_sub(later);
+    let (a, b) = (
+        &input[earlier..earlier + available],
+        &input[later.min(end)..end],
+    );
     let mut len = 0;
-    while later + len + 8 <= end {
-        let a = u64::from_le_bytes(input[earlier + len..earlier + len + 8].try_into().unwrap());
-        let b = u64::from_le_bytes(input[later + len..later + len + 8].try_into().unwrap());
+    for (a, b) in a.chunks_exact(8).zip(b.chunks_exact(8)) {
+        let a = u64::from_le_bytes(a.try_into().expect("eight bytes"));
+        let b = u64::from_le_bytes(b.try_into().expect("eight bytes"));
         let difference = a ^ b;
         if difference != 0 {
             return len + (difference.trailing_zeros() / 8) as usize;
         }
         len += 8;
     }
-    while later + len < end && input[earlier + len] == input[later + len] {
-        len += 1;
-    }
-    len
+    len + a[len..]
+        .iter()
+        .zip(&b[len..])
+        .take_while(|(a, b)| a == b)
+        .count()
 }
 
+#[cfg(test)]
 pub(super) fn compress(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len() / 2 + 16);
-    put_varint(&mut out, input.len());
+    let mut out = Vec::new();
+    compress_into(input, &mut out);
+    out
+}
+
+/// [`compress`] into `out`, replacing what it held and keeping its capacity.
+pub(super) fn compress_into(input: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(input.len() / 2 + 16);
+    put_varint(out, input.len());
     let mut table = [u32::MAX; 1 << HASH_BITS];
     let mut anchor = 0;
     let mut position = 0;
@@ -103,7 +122,7 @@ pub(super) fn compress(input: &[u8]) -> Vec<u8> {
         misses = 0;
         let len = MIN_MATCH + match_length(input, candidate + MIN_MATCH, position + MIN_MATCH);
         emit(
-            &mut out,
+            out,
             &input[anchor..position],
             Some((position - candidate, len)),
         );
@@ -116,8 +135,7 @@ pub(super) fn compress(input: &[u8]) -> Vec<u8> {
         position += len;
         anchor = position;
     }
-    emit(&mut out, &input[anchor..], None);
-    out
+    emit(out, &input[anchor..], None);
 }
 
 struct Cursor<'a> {
@@ -188,4 +206,42 @@ pub(super) fn decompress(bytes: &[u8]) -> Vec<u8> {
     }
     assert_eq!(out.len(), raw_len, "internally encoded length");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The common run, a byte at a time, never reaching the literal tail.
+    fn bytewise_match_length(input: &[u8], earlier: usize, later: usize) -> usize {
+        let end = input.len() - TAIL;
+        let mut len = 0;
+        while later + len < end && input[earlier + len] == input[later + len] {
+            len += 1;
+        }
+        len
+    }
+
+    #[test]
+    fn match_length_agrees_with_a_bytewise_scan() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..2000 {
+            let length = TAIL + 1 + next() as usize % 300;
+            // Two symbols make long common runs likely.
+            let input: Vec<u8> = (0..length).map(|_| b"ab"[next() as usize % 2]).collect();
+            let later = 1 + next() as usize % (length - 1);
+            let earlier = next() as usize % later;
+            assert_eq!(
+                match_length(&input, earlier, later),
+                bytewise_match_length(&input, earlier, later),
+                "earlier {earlier} later {later} of {length}"
+            );
+        }
+    }
 }

@@ -631,7 +631,7 @@ impl<T> Deferred<T> {
 
 /// An encoded block and the facts storage needs without decoding it.
 struct Encoded {
-    bytes: Box<[u8]>,
+    bytes: Arc<[u8]>,
     /// The narrowest width every row can reflow to without discarding
     /// content, or `None` when any row soft-wraps.
     resize_floor: Option<usize>,
@@ -685,7 +685,7 @@ impl<T> Block<T> {
     fn new(rows: &[Row<T>], codec: RowCodec<T>) -> Self {
         let encoded = (codec.encode)(rows);
         Self {
-            bytes: encoded.bytes.into(),
+            bytes: encoded.bytes,
             start: 0,
             count: rows.len(),
             columns: rows.first().map_or(0, Row::len),
@@ -737,7 +737,7 @@ impl<T> Block<T> {
         if let Some(rows) = self.decoded.take() {
             if self.dirty {
                 let encoded = (codec.encode)(&rows);
-                self.bytes = encoded.bytes.into();
+                self.bytes = encoded.bytes;
                 self.start = 0;
                 self.resize_floor = encoded.resize_floor;
                 self.blank_on_reset = encoded.blank_on_reset;
@@ -1166,9 +1166,11 @@ impl<T> CompactRows<T> {
         }
     }
 
-    /// Drop the row allocations kept for recycling (see `spare`).
+    /// Drop the row allocations kept for recycling (see `spare`), and this
+    /// thread's encoding buffers with them.
     pub fn release_spare_rows(&mut self) {
         self.spare = Vec::new();
+        release_encode_scratch();
     }
 
     /// Discard only the oldest history when the retained representation is full.
@@ -1176,6 +1178,7 @@ impl<T> CompactRows<T> {
     pub fn bound_history_bytes(&mut self, budget: usize) {
         if !self.keep_spare && self.spare.capacity() != 0 {
             self.spare = Vec::new();
+            release_encode_scratch();
         }
         if !self.needs_maintenance && self.last_budget == budget {
             return;
@@ -2186,6 +2189,28 @@ fn push_scalar(text: &mut Vec<u8>, c: char) {
     }
 }
 
+/// Appends the text of the leading cells that are ASCII and have the plain
+/// style `key`, and returns how many there were.
+///
+/// Most of a history row is such a run. Writing into reserved capacity
+/// keeps the length out of memory between characters.
+#[inline]
+fn extend_ascii_run(cells: &[Cell], key: u128, text: &mut Vec<u8>) -> usize {
+    text.reserve(cells.len());
+    let mut count = 0;
+    for (cell, slot) in cells.iter().zip(text.spare_capacity_mut()) {
+        let c = u32::from(cell.c);
+        if c >= 0x80 || cell.extra.is_some() || plain_style_key(cell) != key {
+            break;
+        }
+        slot.write(c as u8);
+        count += 1;
+    }
+    // SAFETY: the first `count` spare bytes were just written.
+    unsafe { text.set_len(text.len() + count) };
+    count
+}
+
 /// The flags of the spacer a paired run stores implicitly after each wide
 /// character of `style`.
 #[inline]
@@ -2389,10 +2414,11 @@ fn encode_cells(rows: &[Row<Cell>]) -> Encoded {
     let width = rows.first().map_or(0, Row::len);
     let mut blank_on_reset = 0;
     let mut table = StyleTable::default();
-    let mut raw = Vec::with_capacity(rows.iter().map(|row| row.len() + 8).sum::<usize>() + 64);
+    // The working buffers keep their capacity from one block to the next.
+    let (mut raw, mut text, mut runs, mut packed) = ENCODE_SCRATCH.take();
+    raw.clear();
+    raw.reserve(rows.iter().map(|row| row.len() + 8).sum::<usize>() + 64);
     raw.extend_from_slice(&[0; 4]);
-    let mut text = Vec::new();
-    let mut runs = Vec::new();
     let mut floor = Some(1);
     for (index, row) in rows.iter().enumerate() {
         let cells = &row[..];
@@ -2439,13 +2465,16 @@ fn encode_cells(rows: &[Row<Cell>]) -> Encoded {
                         end += 2;
                     }
                 } else {
-                    while end < stored {
-                        let next = &cells[end];
-                        if next.extra.is_some() || plain_style_key(next) != key {
-                            break;
+                    loop {
+                        end += extend_ascii_run(&cells[end..stored], key, &mut text);
+                        // A character of the same style that is not ASCII.
+                        match cells[end..stored].first() {
+                            Some(next) if next.extra.is_none() && plain_style_key(next) == key => {
+                                push_scalar(&mut text, next.c);
+                                end += 1;
+                            }
+                            _ => break,
                         }
-                        push_scalar(&mut text, next.c);
-                        end += 1;
                     }
                 }
             }
@@ -2475,11 +2504,30 @@ fn encode_cells(rows: &[Row<Cell>]) -> Encoded {
     for style in &table.styles {
         put_style(&mut raw, style);
     }
+    // One allocation of the exact size, shared by the block from here on.
+    lz::compress_into(&raw, &mut packed);
+    let bytes = Arc::from(&packed[..]);
+    ENCODE_SCRATCH.set((raw, text, runs, packed));
     Encoded {
-        bytes: lz::compress(&raw).into_boxed_slice(),
+        bytes,
         resize_floor: floor,
         blank_on_reset,
     }
+}
+
+/// Frees [`ENCODE_SCRATCH`]: whatever keeps spare rows only while output
+/// streams keeps these the same way, so an idle terminal holds neither.
+fn release_encode_scratch() {
+    drop(ENCODE_SCRATCH.take());
+}
+
+thread_local! {
+    /// [`encode_cells`]'s payload, row text, row run and compressed payload
+    /// buffers, kept from one block to the next while output streams (about
+    /// 20 KiB at 160 columns).
+    #[allow(clippy::type_complexity)]
+    static ENCODE_SCRATCH: std::cell::Cell<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> =
+        const { std::cell::Cell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
 }
 
 struct Reader<'a> {

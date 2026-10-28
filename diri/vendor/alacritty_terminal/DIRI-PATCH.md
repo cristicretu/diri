@@ -332,3 +332,37 @@ Tests: `wide_character_pairs_round_trip_with_their_spacers`,
 `a_coloured_line_widened_and_then_recycled_clears_its_old_columns` (fails
 before the `grow` change), and the existing randomized codec and storage
 tests, whose synthetic rows now keep the occupancy rule (`obey_occupancy`).
+
+## Fewer passes per printed cell
+
+Measured on a 107 MB log of plain, truecolor SGR and CJK lines (`feedbench`,
+64 KiB feeds): 14.4 G instructions before, 11.5 G after, for the same grid.
+
+- **`input_ascii` in one pass.** The segment used to be scanned for wide cells
+  and then written; now each cell is checked and written in the same loop
+  (`Row::write_from` raises occupancy only over the cells written, as indexing
+  each written range did). The ASCII charset skips the mapping call, and a
+  cell whose old and new extra storage are both empty skips the reference
+  count.
+- **Wide characters written as pairs.** `Term::write_wide_pair` writes a wide
+  character and its spacer with one row lookup, when neither cell belongs to
+  an earlier wide character (otherwise the old two `write_at_cursor` calls
+  clear its partner). `Handler::input_text` (from the vendored VTE) loops over
+  a run of characters beyond ASCII and takes that path for each wide
+  character that continues no cluster, without a call per character;
+  everything else goes to `input`.
+- **History encoding.** An ASCII run of one plain style is copied into the row
+  text through reserved capacity (`extend_ascii_run`), keeping the length out
+  of memory between characters. The payload, text, run and compressed-payload
+  buffers are reused across blocks (thread-local), and a block's bytes are
+  one exact-size `Arc<[u8]>` instead of a shrinking reallocation and a copy.
+- **LZ bounds checks.** `read_u32` is one checked load, and `match_length`
+  slices both runs once so its loops index without checks. Its result is
+  unchanged (`match_length_agrees_with_a_bytewise_scan`), so payloads are
+  byte-identical.
+
+Tests: `non_ascii_runs_match_per_character_input` compares `input_text` with
+`input` per character, with the second terminal writing wide characters the
+old way (`reference_wide_writes`), across wrapping, insert mode, charsets,
+hyperlinks, prompt marks, mode 2027, scroll regions and the alternate screen;
+`ascii_runs_match_per_character_input` covers the one-pass writer.
