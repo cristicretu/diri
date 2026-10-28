@@ -16,6 +16,7 @@ use crate::tools::{ToolDefinition, tool_definitions_for};
 mod api;
 #[cfg(test)]
 mod audit_tests;
+pub mod cli;
 mod layout;
 mod notes;
 pub use notes::NoteSpawn;
