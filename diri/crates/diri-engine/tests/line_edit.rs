@@ -29,6 +29,10 @@ use serde_json::json;
 /// over what a loaded runner adds to an unheld publication.
 const UNHELD_MEDIAN: Duration = Duration::from_millis(9);
 
+/// The Engine's hold on output that erased without its redraw
+/// (`OUTPUT_REPAINT_CEILING`), timed from when the Engine read the erase.
+const ERASE_HOLD: Duration = Duration::from_millis(16);
+
 struct Engine {
     control: UnixStream,
     socket: PathBuf,
@@ -105,6 +109,32 @@ impl Engine {
         );
         result["id"].as_str().expect("id").to_string()
     }
+
+    /// A session that prints `first` and then idles, and its terminal opened
+    /// for writing: what the test writes there is the child's output, sent
+    /// exactly when and in the pieces the test chooses.
+    fn spawn_writable(&self, root: &Path, first: &str) -> (String, std::fs::File) {
+        let tty_path = root.join("tty");
+        let id = self.spawn(&format!(
+            "printf '{first}'; tty > '{}'; stty -echo; exec cat",
+            tty_path.display()
+        ));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let tty = loop {
+            if let Ok(path) = std::fs::read_to_string(&tty_path)
+                && path.ends_with('\n')
+            {
+                break path.trim().to_string();
+            }
+            assert!(Instant::now() < deadline, "the child never named its tty");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let tty = std::fs::OpenOptions::new()
+            .write(true)
+            .open(tty)
+            .expect("open tty");
+        (id, tty)
+    }
 }
 
 /// An attached data channel that reports when each grid frame arrived and
@@ -161,14 +191,15 @@ impl Attach {
         }
     }
 
-    /// Every cursor column published until one sits at `column`.
-    fn columns_until(&mut self, column: u16, within: Duration) -> Vec<u16> {
+    /// Every grid frame published, with when it arrived and its cursor
+    /// column, until one sits at `column`.
+    fn frames_until(&mut self, column: u16, within: Duration) -> Vec<(Instant, u16)> {
         let deadline = Instant::now() + within;
         let mut seen = Vec::new();
         let mut chunk = [0u8; 64 << 10];
         loop {
-            while let Some((_, cursor)) = self.pending.pop_front() {
-                seen.push(cursor);
+            while let Some((at, cursor)) = self.pending.pop_front() {
+                seen.push((at, cursor));
                 if cursor == column {
                     return seen;
                 }
@@ -266,26 +297,8 @@ fn a_key_answered_by_a_shorter_line_is_published_at_once() {
 fn an_unsolicited_line_edit_is_published_at_once() {
     let root = root("line-out");
     let engine = engine(&root);
-    let tty_path = root.join("tty");
-    let id = engine.spawn(&format!(
-        "printf 'context above the line\\r\\n'; tty > '{}'; stty -echo; exec cat",
-        tty_path.display()
-    ));
+    let (id, mut tty) = engine.spawn_writable(&root, "context above the line\\r\\n");
     let mut attach = Attach::open(&engine.socket, &id);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let tty = loop {
-        if let Ok(path) = std::fs::read_to_string(&tty_path)
-            && path.ends_with('\n')
-        {
-            break path.trim().to_string();
-        }
-        assert!(Instant::now() < deadline, "the child never named its tty");
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    let mut tty = std::fs::OpenOptions::new()
-        .write(true)
-        .open(tty)
-        .expect("open tty");
     std::thread::sleep(Duration::from_millis(300));
     let mut latencies = Vec::new();
     for round in 0..15u16 {
@@ -324,29 +337,65 @@ fn an_unsolicited_line_edit_is_published_at_once() {
 
 /// A pager clears its prompt row before drawing the next page, a few ms
 /// later. The cursor row cleared to nothing is the start of that redraw, not
-/// a line edit, so the empty row must never be published on its own.
+/// a line edit, so the empty row must never be published before the erase
+/// hold runs out.
+///
+/// The hold opens when the Engine reads the clear, which is after the test
+/// wrote it, so "no empty prompt row sooner than [`ERASE_HOLD`] after the
+/// write" holds however slow the runner is; a line edit is published at
+/// once. Each round checks it twice: for a clear with no redraw coming (the
+/// empty row may only appear once the hold is over), and for a clear and
+/// its redraw written apart well inside the hold (normally the empty row is
+/// never published; on a runner stalled past the hold it may be, but still
+/// not sooner).
 #[test]
 fn a_prompt_row_cleared_for_its_redraw_is_still_held() {
     let root = root("line-pager");
     let engine = engine(&root);
     let prompt = "lines 1-30 --More--";
-    let id = engine.spawn(&format!(
-        "printf 'page text above\\r\\n{prompt}'; stty raw -echo; \
-         while k=$(dd bs=1 count=1 2>/dev/null); do \
-           printf '\\r\\033[K'; sleep 0.004; printf 'next page\\r\\n{prompt}'; done"
-    ));
+    let (id, mut tty) = engine.spawn_writable(&root, &format!("page text above\\r\\n{prompt}"));
     let mut attach = Attach::open(&engine.socket, &id);
     let end = prompt.len() as u16;
-    attach.columns_until(end, Duration::from_secs(10));
+    assert!(
+        attach.until_column(end, Duration::from_secs(10)).is_some(),
+        "the pager never drew its prompt"
+    );
     std::thread::sleep(Duration::from_millis(300));
-    for _ in 0..10 {
-        attach.key(b" ");
-        let seen = attach.columns_until(end, Duration::from_secs(2));
+    let clear = b"\r\x1b[K";
+    let redraw = format!("next page\r\n{prompt}");
+    for round in 0..10 {
+        let sent = Instant::now();
+        tty.write_all(clear).unwrap();
+        let at = attach
+            .until_column(0, Duration::from_secs(2))
+            .unwrap_or_else(|| panic!("round {round}: the cleared row never published"));
+        let held = at.duration_since(sent);
         assert!(
-            !seen.contains(&0),
-            "the cleared prompt row was published alone: {seen:?}"
+            held >= ERASE_HOLD,
+            "round {round}: the cleared prompt row was published after {held:?}"
         );
-        std::thread::sleep(Duration::from_millis(80));
+        tty.write_all(redraw.as_bytes()).unwrap();
+        attach
+            .until_column(end, Duration::from_secs(2))
+            .unwrap_or_else(|| panic!("round {round}: the redraw never published"));
+        std::thread::sleep(Duration::from_millis(40));
+
+        let sent = Instant::now();
+        tty.write_all(clear).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        tty.write_all(redraw.as_bytes()).unwrap();
+        let early: Vec<Duration> = attach
+            .frames_until(end, Duration::from_secs(2))
+            .into_iter()
+            .filter(|&(_, column)| column == 0)
+            .map(|(at, _)| at.duration_since(sent))
+            .filter(|&after| after < ERASE_HOLD)
+            .collect();
+        assert!(
+            early.is_empty(),
+            "round {round}: the cleared prompt row was published alone after {early:?}"
+        );
+        std::thread::sleep(Duration::from_millis(40));
     }
     engine.request(2, "session.kill", json!({ "sessionID": id }));
     let _ = std::fs::remove_dir_all(&root);

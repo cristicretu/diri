@@ -415,6 +415,12 @@ change and never republished the screen. `reset_state` (RIS, `ESC c`) also
 clears every color a program set, as xterm and libghostty do; upstream kept
 them across `reset`. No wire, checkpoint or protocol change.
 
+## Public grapheme module
+
+`term::grapheme` (`Info`, `Class`, `Cluster`, `breaks`, `may_join`, …) is
+public (and `#[doc(hidden)]`) so the core v2 prototype in
+`diri-terminal-state` measures widths and clusters with the same tables
+instead of a copy. Visibility only; no behavior change.
 ## Styles with extra storage by hash map
 
 `StyleTable::extra_id` found a style with extra storage (combining marks, an
@@ -453,3 +459,13 @@ O(1) amortized. Release builds compile none of it; no behavior, wire,
 checkpoint or protocol change. Test:
 `lines_after_narrowing_a_full_history_cost_what_they_did_before`
 (`diri-terminal-state`); probe: `--bench narrow_history`.
+
+## SGR-Pixels mouse (DECSET 1016)
+
+`TermMode::SGR_PIXEL_MOUSE` (bit 26) records DECSET 1016. It is one of the
+mutually exclusive mouse encodings, as in xterm: setting 1005, 1006 or 1016
+clears the other two, and resetting 1016 leaves the legacy X10 encoding.
+DECRQM answers `1`/`2` for it (it was recognized only to answer `4`). The
+mode is state only; the host encodes the reports. RIS clears it with the rest
+of the mode bits. Mode 69 (DECLRMM) still answers `4`: left and right margins
+are not implemented.

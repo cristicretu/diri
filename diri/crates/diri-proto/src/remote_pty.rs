@@ -1626,7 +1626,8 @@ impl RemoteCodec {
                     // older peer remains compatible with this additive mode
                     // byte extension.
                     | (u8::from(value.mouse.is_reporting()) << 2)
-                    | (value.mouse.detail_bits() << 3);
+                    | (value.mouse.detail_bits() << 3)
+                    | (u8::from(value.mouse.pixel_reports()) << 6);
                 output.push(modes);
                 if !value.grid.is_full_snapshot {
                     return rollback(
@@ -1647,7 +1648,8 @@ impl RemoteCodec {
                 let modes = u8::from(value.alt_screen)
                     | (u8::from(value.bracketed_paste) << 1)
                     | (u8::from(value.mouse.is_reporting()) << 2)
-                    | (value.mouse.detail_bits() << 3);
+                    | (value.mouse.detail_bits() << 3)
+                    | (u8::from(value.mouse.pixel_reports()) << 6);
                 output.push(modes);
                 if value.grid.is_full_snapshot {
                     return rollback(
@@ -1936,7 +1938,8 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
                 sequence,
                 alt_screen: modes & 1 != 0,
                 bracketed_paste: modes & 2 != 0,
-                mouse: MouseModes::from_detail_bits(modes >> 3, modes & 4 != 0),
+                mouse: MouseModes::from_detail_bits(modes >> 3, modes & 4 != 0)
+                    .with_pixel_reports(modes & (1 << 6) != 0),
                 grid,
             }))
         }
@@ -1960,7 +1963,8 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
                 sequence,
                 alt_screen: modes & 1 != 0,
                 bracketed_paste: modes & 2 != 0,
-                mouse: MouseModes::from_detail_bits(modes >> 3, modes & 4 != 0),
+                mouse: MouseModes::from_detail_bits(modes >> 3, modes & 4 != 0)
+                    .with_pixel_reports(modes & (1 << 6) != 0),
                 grid,
             }))
         }
@@ -2437,6 +2441,44 @@ mod tests {
             RemoteCodec::new().feed(&encoded).expect("decode"),
             vec![message]
         );
+    }
+
+    #[test]
+    fn sgr_pixel_mouse_rides_bit_six_and_reads_as_sgr_without_it() {
+        let mut snapshot = snapshot();
+        snapshot.mouse = MouseModes::new(
+            crate::terminal::MouseTrackingMode::AnyMotion,
+            crate::terminal::MouseEncoding::SgrPixels,
+        );
+        for message in [
+            RemoteMessage::FullSnapshot(snapshot.clone()),
+            RemoteMessage::GridDelta(GridDelta {
+                sequence: 43,
+                alt_screen: snapshot.alt_screen,
+                bracketed_paste: snapshot.bracketed_paste,
+                mouse: snapshot.mouse,
+                grid: GridUpdate {
+                    is_full_snapshot: false,
+                    ..snapshot.grid.clone()
+                },
+            }),
+        ] {
+            let mut encoded = RemoteCodec::encode(&message).expect("encode");
+            assert_eq!(encoded[13] & 0b0100_0000, 0b0100_0000);
+            assert_eq!(
+                RemoteCodec::new().feed(&encoded).expect("decode"),
+                vec![message.clone()]
+            );
+            // A peer that predates the bit sees what it always did: SGR.
+            encoded[13] &= !0b0100_0000;
+            let decoded = RemoteCodec::new().feed(&encoded).expect("decode");
+            let mouse = match &decoded[0] {
+                RemoteMessage::FullSnapshot(value) => value.mouse,
+                RemoteMessage::GridDelta(value) => value.mouse,
+                other => panic!("unexpected {other:?}"),
+            };
+            assert_eq!(mouse.encoding, crate::terminal::MouseEncoding::Sgr);
+        }
     }
 
     #[test]
