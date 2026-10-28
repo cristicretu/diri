@@ -440,7 +440,7 @@
   "terminal.back_to_latest": "Back to the latest output",
   "terminal.clear.alt_screen": "A full-screen program owns this screen; nothing was cleared",
   "terminal.clear.failed": "Could not clear this terminal",
-  "terminal.clear.remote_unsupported": "Clearing scrollback is not available in remote sessions yet",
+  "terminal.clear.remote_unsupported": "This host's Diri helper is too old to clear its scrollback",
   "terminal.command_output.copied": "Command output copied",
   "terminal.command_output.none": "No finished command output (needs OSC 133 marks)",
   "terminal.command_output.too_large": "Command output is too large to copy",

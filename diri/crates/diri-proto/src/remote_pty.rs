@@ -18,7 +18,10 @@ use crate::grid::{GridCodecError, GridUpdate};
 use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 18;
+pub const PROTOCOL_MINOR: u16 = 22;
+/// Minors 19-21 belong to `query-replies-v1`, `kitty-keyboard-v1` and
+/// `list-dir-v1`; clearing is negotiated by name like every capability.
+pub const TERMINAL_CLEAR_PROTOCOL_MINOR: u16 = 22;
 pub const GRID_RESUME_PROTOCOL_MINOR: u16 = 17;
 /// Minor 17 belongs to `grid-resume-v1`; styles are negotiated by name.
 pub const TERMINAL_STYLES_PROTOCOL_MINOR: u16 = 18;
@@ -73,6 +76,8 @@ const KIND_TERMINAL_RESET: u8 = 48;
 const KIND_TERMINAL_RESET_STATE: u8 = 49;
 const KIND_IMAGE_REQUEST: u8 = 50;
 const KIND_IMAGE_RESPONSE: u8 = 51;
+// 52 is `TerminalPalette` (query-replies-v1).
+const KIND_TERMINAL_CLEAR: u8 = 53;
 const IMAGE_RESPONSE_HEADER_LENGTH_BYTES: usize = 4;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -113,6 +118,10 @@ pub enum RemoteCapability {
     StopSession,
     #[serde(rename = "terminal-reset-v1")]
     TerminalReset,
+    /// Clear Screen and Scrollback in the Holder. Requires
+    /// `terminal-reset-v1`, whose boundary frames announce the cleared grid.
+    #[serde(rename = "terminal-clear-v1")]
+    TerminalClear,
     /// The Holder intercepts Kitty graphics and iTerm2 inline images, answers
     /// their support probes and serves stored pixels by `ImageRequest`.
     #[serde(rename = "inline-images-v1")]
@@ -168,6 +177,7 @@ impl RemoteCapability {
             Self::ProcessFacts => "process-facts-v1",
             Self::StopSession => "stop-session-v1",
             Self::TerminalReset => "terminal-reset-v1",
+            Self::TerminalClear => "terminal-clear-v1",
             Self::InlineImages => "inline-images-v1",
             Self::GridResume => "grid-resume-v1",
             Self::TerminalStyles => "terminal-styles-v1",
@@ -238,6 +248,7 @@ pub const ANNOTATED_HOLDER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::ProcessIdentity,
     RemoteCapability::StopSession,
     RemoteCapability::TerminalReset,
+    RemoteCapability::TerminalClear,
     RemoteCapability::InlineImages,
     RemoteCapability::GridResume,
     RemoteCapability::TerminalStyles,
@@ -263,6 +274,7 @@ pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::ProcessIdentity,
     RemoteCapability::StopSession,
     RemoteCapability::TerminalReset,
+    RemoteCapability::TerminalClear,
     RemoteCapability::InlineImages,
     RemoteCapability::GridResume,
     RemoteCapability::TerminalStyles,
@@ -1054,6 +1066,16 @@ pub struct TerminalReset {
     pub expected_incarnation: String,
 }
 
+/// Clear Screen and Scrollback, admitted like [`TerminalReset`]: history and
+/// the rows above the cursor's logical line go, that line stays at the top,
+/// and the child is not told. A no-op on the alternate screen.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TerminalClear {
+    pub controller_epoch: u64,
+    pub expected_incarnation: String,
+}
+
 /// Reset boundary paired with an authoritative full grid. Offset is the raw
 /// output boundary at the last reset, not the snapshot's latest output offset.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1313,6 +1335,7 @@ pub enum RemoteMessage {
     StopSession(StopSession),
     TerminalReset(TerminalReset),
     TerminalResetState(TerminalResetState),
+    TerminalClear(TerminalClear),
     AcquireControl(AcquireControl),
     ControlGranted(ControlGranted),
     ControlRevoked(ControlRevoked),
@@ -1498,6 +1521,10 @@ impl RemoteCodec {
             RemoteMessage::TerminalResetState(value) => {
                 value.validate()?;
                 append_json(KIND_TERMINAL_RESET_STATE, value, output, start)
+            }
+            RemoteMessage::TerminalClear(value) => {
+                validate_identifier("clear incarnation", &value.expected_incarnation)?;
+                append_json(KIND_TERMINAL_CLEAR, value, output, start)
             }
             RemoteMessage::AcquireControl(value) => {
                 validate_identifier("client nonce", &value.client_nonce)?;
@@ -1793,6 +1820,11 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
             state.validate()?;
             Ok(RemoteMessage::TerminalResetState(state))
         }
+        KIND_TERMINAL_CLEAR => {
+            let request: TerminalClear = decode_json(kind, payload)?;
+            validate_identifier("clear incarnation", &request.expected_incarnation)?;
+            Ok(RemoteMessage::TerminalClear(request))
+        }
         KIND_ACQUIRE_CONTROL => {
             let value: AcquireControl = decode_json(kind, payload)?;
             validate_identifier("client nonce", &value.client_nonce)?;
@@ -1829,6 +1861,7 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
 fn validate_kind(kind: u8) -> Result<(), RemoteCodecError> {
     if (1..=FrameType::Mouse as u8).contains(&kind)
         || (KIND_HELLO..=KIND_IMAGE_RESPONSE).contains(&kind)
+        || kind == KIND_TERMINAL_CLEAR
     {
         Ok(())
     } else {
@@ -2191,6 +2224,50 @@ mod tests {
             serde_json::json!("terminal-reset-v1")
         );
         assert!(ANNOTATED_HOLDER_CAPABILITIES.contains(&RemoteCapability::TerminalReset));
+    }
+
+    #[test]
+    fn terminal_clear_is_an_optional_minor_22_capability() {
+        const {
+            assert!(TERMINAL_CLEAR_PROTOCOL_MINOR == 22);
+            assert!(TERMINAL_CLEAR_PROTOCOL_MINOR <= PROTOCOL_MINOR);
+            assert!(TERMINAL_CLEAR_PROTOCOL_MINOR > TERMINAL_RESET_PROTOCOL_MINOR);
+            assert!(KIND_TERMINAL_CLEAR > KIND_IMAGE_RESPONSE);
+        }
+        let message = RemoteMessage::TerminalClear(TerminalClear {
+            controller_epoch: 7,
+            expected_incarnation: "incarnation-1".into(),
+        });
+        let encoded = RemoteCodec::encode(&message).unwrap();
+        assert_eq!(encoded[0], KIND_TERMINAL_CLEAR);
+        for split in 0..=encoded.len() {
+            let mut codec = RemoteCodec::new();
+            let mut decoded = codec.feed(&encoded[..split]).unwrap();
+            decoded.extend(codec.feed(&encoded[split..]).unwrap());
+            assert_eq!(decoded, vec![message.clone()]);
+        }
+        assert!(
+            RemoteCodec::encode(&RemoteMessage::TerminalClear(TerminalClear {
+                controller_epoch: 1,
+                expected_incarnation: "../escape".into(),
+            }))
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::to_string(&RemoteCapability::TerminalClear).unwrap(),
+            "\"terminal-clear-v1\""
+        );
+        assert_eq!(
+            RemoteCapability::TerminalClear.wire_name(),
+            "terminal-clear-v1"
+        );
+        // An older peer decodes the name as Unknown and ignores it.
+        assert_eq!(
+            serde_json::from_str::<RemoteCapability>("\"terminal-clear-v2\"").unwrap(),
+            RemoteCapability::Unknown
+        );
+        assert!(ANNOTATED_HOLDER_CAPABILITIES.contains(&RemoteCapability::TerminalClear));
+        assert!(ANNOTATED_HELPER_CAPABILITIES.contains(&RemoteCapability::TerminalClear));
     }
 
     #[test]
@@ -2739,7 +2816,7 @@ mod usage_tests {
     #[test]
     fn terminal_styles_is_an_optional_minor_18_capability() {
         const {
-            assert!(TERMINAL_STYLES_PROTOCOL_MINOR == PROTOCOL_MINOR);
+            assert!(TERMINAL_STYLES_PROTOCOL_MINOR < PROTOCOL_MINOR);
             assert!(TERMINAL_STYLES_PROTOCOL_MINOR > INLINE_IMAGES_PROTOCOL_MINOR);
         }
         assert_eq!(

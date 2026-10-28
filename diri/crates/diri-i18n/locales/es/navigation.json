@@ -440,7 +440,7 @@
   "terminal.back_to_latest": "De vuelta a la salida más reciente",
   "terminal.clear.alt_screen": "Un programa a pantalla completa controla esta pantalla; no se borró nada",
   "terminal.clear.failed": "No se pudo borrar esta terminal",
-  "terminal.clear.remote_unsupported": "Borrar el historial aún no está disponible en sesiones remotas",
+  "terminal.clear.remote_unsupported": "El asistente de Diri de este host es demasiado antiguo para borrar su historial",
   "terminal.command_output.copied": "Salida del comando copiada",
   "terminal.command_output.none": "No hay salida de un comando terminado (requiere marcas OSC 133)",
   "terminal.command_output.too_large": "La salida del comando es demasiado grande para copiarla",

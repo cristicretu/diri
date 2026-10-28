@@ -2129,6 +2129,43 @@ starts from the blinking default, so a DECRQM `?12` query reports the blink
 and never turns the cursor steady. Checkpoint restore replays spans and the
 cursor style. No Holder task, timer or queue is added.
 
+## Terminal clear (protocol minor 22)
+
+Protocol minor 22 adds optional `terminal-clear-v1`, so Clear Screen and
+Scrollback works in remote sessions as it does locally. Minors 19-21 belong to
+`query-replies-v1`, `kitty-keyboard-v1` and `list-dir-v1`; this capability
+must merge after them so a minor-22 Helper always defines all three.
+
+A clear is an emulator mutation owned by the Holder, like a reset: it drops
+history and every row above the cursor's logical line (a wrapped prompt keeps
+its first row), leaves that line at the top and sends nothing to the child.
+The PTY, process tree, incarnation, controller lease and raw output log are
+untouched. On the alternate screen it is a no-op, because a full-screen
+program owns that screen.
+
+`TerminalClear` (frame kind 53, JSON) carries the controller epoch and the
+expected incarnation and is admitted exactly like `TerminalReset`: a stale
+epoch, a wrong incarnation or a controller that did not negotiate the
+capability is refused with no state change. The capability requires
+`terminal-reset-v1` in the same Hello, because a clear is announced through
+the reset boundary: the Holder publishes parsed output first, applies the
+clear, advances the reset generation and snapshot sequence and queues
+`TerminalResetState` plus an authoritative `FullSnapshot`. The Engine
+therefore drops in-flight scrollback reads and publishes a full grid to the
+attached client, with no new Engine state. Acceptance means queued, not
+applied; a clear is never coalesced, retained for reconnect or retried after
+an uncertain write.
+
+The Engine lists `terminal-clear-v1` in `Hello.requiredCapabilities` only for
+a Helper at minor 22 or above and fails closed if the acknowledgement omits
+it. A Holder rejects the request below minor 22 or without
+`terminal-reset-v1`, and strips the capability from `HelloAck` for a
+controller that did not ask. Older Holders never receive kind 53; the Engine
+refuses locally and the control layer reports `terminal_clear_unsupported`,
+which the desktop shows as an out-of-date Helper. The Engine answers
+`cleared: false` without contacting the Holder when its mirror shows the
+alternate screen. Footprint: one boolean per Holder connection.
+
 ## Read-only output log ownership
 
 Opening a raw output log as a reader never creates directories, creates a missing
