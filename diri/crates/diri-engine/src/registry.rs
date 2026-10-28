@@ -2606,6 +2606,14 @@ fn apply_cursor_conversation(
     changed
 }
 
+/// Titles a fork "Fork of …" after its source. That is Diri's placeholder,
+/// not a chosen name: automatic titles keep off it, but the forked Agent may
+/// name itself after its new task and the user's rename wins as always.
+pub(crate) fn name_fork(record: &mut SessionRecord, source_title: &str) {
+    record.title = format!("Fork of {source_title}");
+    record.title_source = TitleSource::Forked;
+}
+
 /// A name someone chose on purpose: the user's own, or one Diri or a parent
 /// Agent gave at spawn. Agents never replace these.
 fn is_explicit_title(source: TitleSource) -> bool {
@@ -2709,6 +2717,7 @@ fn fold_session_view(record: &mut SessionRecord, view: &SessionView) {
         TitleSource::AgentProvided
             | TitleSource::AgentNamed
             | TitleSource::DirijorAssigned
+            | TitleSource::Forked
             | TitleSource::UserRename
     ) {
         return;
@@ -2762,6 +2771,7 @@ fn fold_shell_view(record: &mut SessionRecord, view: &SessionView) {
         TitleSource::AgentProvided
             | TitleSource::AgentNamed
             | TitleSource::DirijorAssigned
+            | TitleSource::Forked
             | TitleSource::UserRename
     ) {
         return;
@@ -5779,6 +5789,70 @@ mod tests {
                 .name_by_agent("claude", "other-task", false)
                 .unwrap(),
             AgentNaming::Explicit("Release prep: v2".into())
+        );
+    }
+
+    #[test]
+    fn a_forked_agent_may_rename_its_fork_title_but_automatic_titles_may_not() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut fork = record("fork");
+        fork.kind = AgentKind::CLAUDE_CODE;
+        name_fork(&mut fork, "fix-login-redirect");
+        assert_eq!(fork.title, "Fork of fix-login-redirect");
+        assert_eq!(fork.title_source, TitleSource::Forked);
+
+        // Automatic titles keep off it, as they do off Diri's own names.
+        let mut automatic = fork.clone();
+        assert!(!apply_native_title(
+            &mut automatic,
+            "Investigate login redirect"
+        ));
+        assert!(!apply_provider_title(
+            &mut automatic,
+            &crate::history::ProviderTitle {
+                title: "a later prompt".into(),
+                source: TitleSource::FirstPrompt,
+            }
+        ));
+        fold_session_view(&mut automatic, &titled_view("fork", "✳ Claude Code: other"));
+        assert_eq!(automatic.title, "Fork of fix-login-redirect");
+        assert_eq!(automatic.title_source, TitleSource::Forked);
+        let mut shell = fork.clone();
+        shell.kind = AgentKind::SHELL;
+        fold_session_view(&mut shell, &titled_view("fork", "vim notes.md"));
+        assert_eq!(shell.title_source, TitleSource::Forked);
+
+        // The forked Agent names itself after its new task.
+        registry.insert_record(fork);
+        assert_eq!(
+            registry
+                .name_by_agent("fork", "audit-redirect-tests", false)
+                .unwrap(),
+            AgentNaming::Named("audit-redirect-tests".into())
+        );
+        assert_eq!(
+            registry.record("fork").unwrap().title_source,
+            TitleSource::AgentNamed
+        );
+
+        // The user's name still wins over the Agent's.
+        registry.rename("fork", "Redirect follow-up").unwrap();
+        assert_eq!(
+            registry.name_by_agent("fork", "other-task", false).unwrap(),
+            AgentNaming::Explicit("Redirect follow-up".into())
+        );
+
+        // A fork the user renamed before the Agent named it stays the user's.
+        let mut renamed = record("renamed-fork");
+        name_fork(&mut renamed, "source");
+        registry.insert_record(renamed);
+        registry.rename("renamed-fork", "Mine").unwrap();
+        assert_eq!(
+            registry
+                .name_by_agent("renamed-fork", "agent-name", false)
+                .unwrap(),
+            AgentNaming::Explicit("Mine".into())
         );
     }
 

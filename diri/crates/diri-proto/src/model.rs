@@ -552,6 +552,11 @@ pub enum TitleSource {
     /// The Agent named its own session after its task (`name_session`).
     /// Above every automatic title, below the user's and Diri's.
     AgentNamed,
+    /// Diri's "Fork of …" title for a forked session. Kept against every
+    /// automatic title like Diri's own names, but the forked Agent may
+    /// replace it with its own name (`name_session`), and the user's rename
+    /// replaces it as always. Older readers decode it as `Unknown`.
+    Forked,
     Unknown,
 }
 
@@ -568,6 +573,7 @@ impl Serialize for TitleSource {
             Self::UserRename => 4,
             Self::TerminalTitle => 5,
             Self::AgentNamed => 6,
+            Self::Forked => 7,
             Self::Unknown => -1,
         })
     }
@@ -586,6 +592,7 @@ impl<'de> Deserialize<'de> for TitleSource {
             4 => Self::UserRename,
             5 => Self::TerminalTitle,
             6 => Self::AgentNamed,
+            7 => Self::Forked,
             _ => Self::Unknown,
         })
     }
@@ -1139,4 +1146,34 @@ where
         .get("_0")
         .ok_or_else(|| E::custom("associated-value payload is missing _0"))?;
     serde_json::from_value(value.clone()).map_err(E::custom)
+}
+
+#[cfg(test)]
+mod title_source_tests {
+    use super::TitleSource;
+
+    #[test]
+    fn title_sources_keep_their_numeric_wire_values() {
+        for (source, wire) in [
+            (TitleSource::Placeholder, 0),
+            (TitleSource::FirstPrompt, 1),
+            (TitleSource::AgentProvided, 2),
+            (TitleSource::DirijorAssigned, 3),
+            (TitleSource::UserRename, 4),
+            (TitleSource::TerminalTitle, 5),
+            (TitleSource::AgentNamed, 6),
+            (TitleSource::Forked, 7),
+        ] {
+            assert_eq!(serde_json::to_value(source).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<TitleSource>(wire.into()).unwrap(),
+                source
+            );
+        }
+        assert_eq!(
+            serde_json::from_value::<TitleSource>(8.into()).unwrap(),
+            TitleSource::Unknown,
+            "a newer source reads as Unknown"
+        );
+    }
 }

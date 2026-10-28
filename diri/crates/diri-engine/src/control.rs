@@ -4136,8 +4136,7 @@ impl ControlServer {
         record.parent = Some(p.parent.clone().unwrap_or_else(|| source.id.clone()));
         record.host = source.host.clone();
         record.remote_persistence = remote_persistence;
-        record.title = format!("Fork of {}", source.title);
-        record.title_source = diri_proto::TitleSource::DirijorAssigned;
+        crate::registry::name_fork(&mut record, &source.title);
 
         if spec.remote.is_some() {
             self.spawn_session_unlocked(spec, Some(record))?;
