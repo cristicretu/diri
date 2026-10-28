@@ -335,6 +335,8 @@ impl Registry {
                     // Progress is a live report; whatever reported it is gone
                     // or will report again.
                     record.terminal_progress = None;
+                    // Likewise the foreground job: the next fold reads it again.
+                    record.foreground_program = None;
                     repair_persisted_agent_title(&mut record);
                     // Resolve the owning project before repairing its
                     // location namespace. In particular, a linked worktree's
@@ -2744,6 +2746,12 @@ fn fold_session_view(record: &mut SessionRecord, view: &SessionView) {
 /// A remote shell reports none of this and keeps its placeholder.
 fn fold_shell_view(record: &mut SessionRecord, view: &SessionView) {
     record.foreground_agent = view.foreground_agent.clone().map(AgentKind::new);
+    // A recognised Agent shows its own mark, so only a plain program is kept.
+    record.foreground_program = if record.foreground_agent.is_none() && !view.exited {
+        view.foreground_program.clone()
+    } else {
+        None
+    };
     if view.terminal_cwd.is_some() {
         record.terminal_cwd.clone_from(&view.terminal_cwd);
     }
@@ -3155,6 +3163,7 @@ fn recovered_record(capsule: diri_proto::recovery::SessionRecoveryCapsule) -> Se
         pull_requests: None,
         listening_ports: None,
         foreground_agent: None,
+        foreground_program: None,
         terminal_cwd: None,
         agent_workspace: None,
         note_id: None,
@@ -3398,6 +3407,7 @@ mod tests {
             pull_requests: None,
             listening_ports: None,
             foreground_agent: None,
+            foreground_program: None,
             terminal_cwd: None,
             agent_workspace: None,
             note_id: None,
@@ -4786,8 +4796,10 @@ mod tests {
         assert_eq!(shell.cwd, "/work/diri", "the launch cwd owns the project");
         assert_eq!(shell.effective_kind(), &AgentKind::SHELL);
 
+        assert_eq!(shell.foreground_program, None, "a prompt runs nothing");
         fold_session_view(&mut shell, &view(Some("vim"), None, Some("notes.md - VIM")));
         assert_eq!(shell.title, "vim");
+        assert_eq!(shell.foreground_program.as_deref(), Some("vim"));
 
         // Claude started by hand: its icon, then its own task title.
         fold_session_view(
@@ -4797,6 +4809,10 @@ mod tests {
         assert_eq!(shell.effective_kind(), &AgentKind::CLAUDE_CODE);
         assert_eq!(shell.kind, AgentKind::SHELL);
         assert_eq!(shell.title, "claude");
+        assert_eq!(
+            shell.foreground_program, None,
+            "an Agent shows its own mark"
+        );
         fold_session_view(
             &mut shell,
             &view(
@@ -4818,6 +4834,7 @@ mod tests {
 
         fold_session_view(&mut shell, &view(None, None, None));
         assert_eq!(shell.foreground_agent, None);
+        assert_eq!(shell.foreground_program, None);
         assert_eq!(shell.title, "crates");
 
         shell.title = "Build server".into();

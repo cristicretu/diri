@@ -947,6 +947,11 @@ pub struct SessionRecord {
     /// `kind` stays `shell`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub foreground_agent: Option<AgentKind>,
+    /// The program name (never its arguments) of a local shell's foreground
+    /// job, `vim` or `psql`, so a client can mark the tab with what it runs.
+    /// Live state, absent at a prompt; additive, so older clients ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreground_program: Option<String>,
     /// A local shell's live working directory, which `cd` moves. `cwd` stays
     /// the launch directory, which owns the Session's project and worktree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
