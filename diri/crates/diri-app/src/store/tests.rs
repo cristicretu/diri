@@ -3020,8 +3020,13 @@ async fn a_rejected_close_restores_the_retained_session_and_allows_a_retry() {
 
     let listed = visible_ids(&mut store.write().unwrap());
     assert_eq!(listed.len(), 2);
-    store.write().unwrap().request_close(vec![id("one")]);
-    assert_eq!(visible_ids(&mut store.write().unwrap()), vec![id("two")]);
+    {
+        // Close and look under one lock: the fake Engine rejects at once, and
+        // its reply could otherwise restore the row before the check.
+        let mut store = store.write().unwrap();
+        store.request_close(vec![id("one")]);
+        assert_eq!(visible_ids(&mut store), vec![id("two")]);
+    }
 
     eventually("the rejection is reported", || {
         store.read().unwrap().action_failure().is_some()
@@ -4348,4 +4353,23 @@ fn read_aloud_can_pick_one_tab_or_all_but_one() {
     assert!(store.tab_reads_aloud(&SessionId("later".into())));
     store.set_read_aloud(a.id.clone(), ReadAloudChoice::All);
     assert!(store.reads_aloud(&a.id) && store.reads_aloud(&b.id));
+}
+
+#[cfg(unix)]
+#[test]
+fn preferences_are_owner_only_even_over_an_older_world_readable_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let folder = directory.path().join("Application Support/diri");
+    let path = folder.join("prefs.json");
+    Prefs::default().save(&path).unwrap();
+    assert_eq!(mode(&path), 0o600);
+    assert_eq!(mode(&folder), 0o700);
+
+    let stale = path.with_extension("json.tmp");
+    std::fs::write(&stale, b"{").unwrap();
+    std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
+    Prefs::default().save(&path).unwrap();
+    assert_eq!(mode(&path), 0o600);
 }

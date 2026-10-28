@@ -12,6 +12,8 @@ mod find_overlay;
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) mod find_workflow_tests;
 #[cfg(all(test, target_os = "macos"))]
+mod key_encoding_tests;
+#[cfg(all(test, target_os = "macos"))]
 mod keystroke_latency_tests;
 mod messages;
 #[cfg(all(test, target_os = "macos"))]
@@ -31,6 +33,7 @@ use diri_client::attachment::{SessionAttachment, TerminalChunk};
 use diri_proto::grid::GridUpdate;
 use diri_proto::terminal::{
     MouseModes, TerminalMouseButton, TerminalMouseEvent, TerminalMouseModifiers, encode_mouse_event,
+    encode_mouse_wheel,
 };
 use diri_proto::{
     AgentKind as ProtoAgentKind, ExitReason, Resumability, RiskHint, SessionId, SessionRecord,
@@ -48,7 +51,7 @@ use diri_term::keys::{
 #[cfg(test)]
 use diri_term::keys::{TermInputModes, encode_key};
 use diri_term::metrics::CellMetrics;
-use diri_term::scrollback::{WheelDelta, WheelEvent, WheelRoute};
+use diri_term::scrollback::{HorizontalWheel, WheelDelta, WheelEvent, WheelRoute};
 use diri_term::theme::TermTheme;
 use diri_ui::{
     AgentKind as UiAgentKind, Fill, FloatingSurface, Ink, Metrics, Radius, SemanticColors,
@@ -283,6 +286,14 @@ impl MouseMotionLimiter {
         self.last_sent_at = None;
         self.last_cell = None;
         self.cancel_pending();
+    }
+
+    /// A press was reported at `cell`. As in xterm, motion is reported only
+    /// once the pointer leaves the cell the program last heard about, so a
+    /// press is not followed by a zero-distance drag.
+    fn pressed_at(&mut self, cell: (u16, u16)) {
+        self.reset();
+        self.last_cell = Some(cell);
     }
 
     fn push(&mut self, now: Instant, cell: (u16, u16), bytes: Vec<u8>) -> MotionDispatch {
@@ -684,6 +695,7 @@ struct ResidentTerminal {
     last_size: (u16, u16),
     pointer_owner: Option<(MouseButton, PointerOwner)>,
     mouse_motion: MouseMotionLimiter,
+    horizontal_wheel: HorizontalWheel,
     extent_probe: HistoryExtentProbe,
     trace: PaneTrace,
 }
@@ -966,6 +978,10 @@ pub struct TerminalPane {
     drag_settle: Option<((u16, u16), Task<()>)>,
     /// A mid-drag size that has rested long enough to send.
     drag_settled: Option<(u16, u16)>,
+    /// Keys pressed while a program asked for kitty release events, as the
+    /// press encoded them. A key-up carries no native key code, so its keypad
+    /// identity and layout come from here, matched by GPUI's key name.
+    held_keys: Vec<(String, TermKeyEvent, bool)>,
     started_at: Instant,
     session_source: SessionSource,
     /// Last selection observed by the primary pane. Spawn responses select the
@@ -1252,6 +1268,7 @@ impl TerminalPane {
             last_resize_sent: None,
             drag_settle: None,
             drag_settled: None,
+            held_keys: Vec::new(),
             started_at: Instant::now(),
             session_source,
             observed_selected_id,
@@ -1465,6 +1482,7 @@ impl TerminalPane {
                     last_size,
                     pointer_owner: None,
                     mouse_motion: MouseMotionLimiter::default(),
+                    horizontal_wheel: HorizontalWheel::default(),
                     extent_probe: HistoryExtentProbe::default(),
                     trace,
                 },
@@ -3341,6 +3359,16 @@ impl TerminalPane {
         position: gpui::Point<gpui::Pixels>,
         window: &mut Window,
     ) -> Option<(usize, usize)> {
+        self.grid_point_at(position, window)
+            .map(|point| (point.col, point.row))
+    }
+
+    /// The cell under `position` and the column boundary nearest it.
+    fn grid_point_at(
+        &self,
+        position: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+    ) -> Option<GridPoint> {
         self.selected_session()?;
         let store = self
             .runtime
@@ -3363,9 +3391,10 @@ impl TerminalPane {
             .grid_row_overflow(grid_rows, &typeface, window)
             .map_or(0.0, |grid_height| self.grid_inner_height() - grid_height);
         let grid_y = viewport.y + self.header_height() + 2.0 + anchor;
-        let col = ((f32::from(position.x) - grid_x) / f32::from(metrics.cell_width))
-            .floor()
-            .max(0.0) as usize;
+        let (col, edge) = pointer_columns(
+            f32::from(position.x) - grid_x,
+            f32::from(metrics.cell_width),
+        );
         let resident = self.selected_id().and_then(|id| self.residents.get(&id))?;
         // A reading view resting between rows is painted this far above its
         // whole-row positions, and shows part of one more row at the bottom.
@@ -3380,16 +3409,21 @@ impl TerminalPane {
         // The extra row is addressable for selection and links. A program
         // reading the mouse is only ever told about rows of its own screen.
         let extra_row = shift > 0.0 && !resident.element.mouse_modes().is_reporting();
+        let cols = resident.element.grid_cols();
         clamp_grid_cell(
             col,
             row,
-            resident.element.grid_cols(),
+            cols,
             resident
                 .element
                 .grid_rows()
                 .saturating_add(u16::from(extra_row)),
         )
-        .map(|(col, row)| (usize::from(col), usize::from(row)))
+        .map(|(col, row)| GridPoint {
+            col: usize::from(col),
+            row: usize::from(row),
+            edge: edge.min(usize::from(cols)),
+        })
     }
 
     fn handle_pointer_down(
@@ -3401,7 +3435,7 @@ impl TerminalPane {
         let Some(id) = self.selected_id() else {
             return;
         };
-        let Some((col, row)) = self.grid_cell_at(event.position, window) else {
+        let Some(GridPoint { col, row, edge }) = self.grid_point_at(event.position, window) else {
             return;
         };
         self.reset_qol_session(&id);
@@ -3459,9 +3493,9 @@ impl TerminalPane {
                 };
                 match event.click_count {
                     1 if event.modifiers.alt && event.modifiers.shift => {
-                        resident.element.begin_rectangle_selection(col, row)
+                        resident.element.begin_rectangle_selection(edge, row)
                     }
-                    1 => resident.element.begin_selection(col, row),
+                    1 => resident.element.begin_selection(edge, row),
                     2 => resident.element.select_word(col, row),
                     _ => resident.element.select_line(row),
                 }
@@ -3484,6 +3518,7 @@ impl TerminalPane {
                     col as u16,
                     row as u16,
                 ) {
+                    resident.mouse_motion.pressed_at((col as u16, row as u16));
                     resident.attachment.mouse(bytes);
                 }
                 cx.stop_propagation();
@@ -3609,7 +3644,7 @@ impl TerminalPane {
         let Some(id) = self.selected_id() else {
             return;
         };
-        let Some((col, row)) = self.grid_cell_at(event.position, window) else {
+        let Some(GridPoint { col, row, edge }) = self.grid_point_at(event.position, window) else {
             return;
         };
         self.reset_qol_session(&id);
@@ -3634,7 +3669,7 @@ impl TerminalPane {
             r.pointer_owner == Some((MouseButton::Left, PointerOwner::LocalSelection))
         });
         if selecting {
-            self.update_selection_autoscroll(event.position, col, row, window, cx);
+            self.update_selection_autoscroll(event.position, col, edge, row, window, cx);
         }
         let (dispatch, attachment) = {
             let Some(resident) = self.residents.get_mut(&id) else {
@@ -3647,7 +3682,7 @@ impl TerminalPane {
                     .map(|(_, owner)| owner)
             });
             if owner == Some(PointerOwner::LocalSelection) {
-                resident.element.drag_selection(col, row);
+                resident.element.drag_selection_to_edge(col, edge, row);
                 cx.notify();
                 return;
             }
@@ -4130,10 +4165,19 @@ impl TerminalPane {
             return;
         }
         let option = OptionKey::for_layout(cx.keyboard_layout().id());
-        let Some((term_event, modifiers)) = terminal_key_event(event, option) else {
+        let Some(mapped) = terminal_key_event(event, option) else {
             cx.propagate();
             return;
         };
+        let (term_event, modifiers) = kitty_key_event(event, resident.keyboard, mapped);
+        if reports_key_releases(resident.keyboard) {
+            remember_held_key(
+                &mut self.held_keys,
+                &event.keystroke,
+                &term_event,
+                modifiers.shift,
+            );
+        }
         let bytes = match diri_term::keys::encode_interactive_action(
             &term_event,
             modifiers,
@@ -4209,20 +4253,20 @@ impl TerminalPane {
         let Some(resident) = self.residents.get_mut(&id) else {
             return;
         };
-        let reports_releases = resident
-            .keyboard
-            .and_then(|keyboard| keyboard.enhancements)
-            .is_some_and(|flags| {
-                flags.contains(diri_proto::terminal_input::enhanced::KeyboardEnhancements::EVENT_TYPES)
-            });
-        if !reports_releases || resident.find.is_some() {
+        let held = take_held_key(&mut self.held_keys, &event.keystroke);
+        if !reports_key_releases(resident.keyboard) || resident.find.is_some() {
             return;
         }
         let option = OptionKey::for_layout(cx.keyboard_layout().id());
-        let Some((term_event, modifiers)) = terminal_keystroke_event(&event.keystroke, option)
+        let Some((mut term_event, mut modifiers)) =
+            terminal_keystroke_event(&event.keystroke, option)
         else {
             return;
         };
+        if let Some((pressed, shift)) = held {
+            term_event = pressed;
+            modifiers.shift |= shift;
+        }
         if let Ok(bytes) = diri_term::keys::encode_interactive_action(
             &term_event,
             modifiers,
@@ -4342,22 +4386,49 @@ impl TerminalPane {
                 .preferences(),
         );
         let metrics = typeface.metrics(window);
-        let viewport = self.viewport.unwrap_or_default();
-        let grid_x = viewport.x + GRID_HORIZONTAL_PADDING / 2.0;
-        let grid_y = viewport.y + self.header_height() + 2.0;
-        let col = ((f32::from(event.position.x) - grid_x) / f32::from(metrics.cell_width))
-            .floor()
-            .max(0.0) as u16;
-        let row = ((f32::from(event.position.y) - grid_y) / f32::from(metrics.line_height))
-            .floor()
-            .max(0.0) as u16;
-        let delta = match event.delta {
-            ScrollDelta::Pixels(point) => WheelDelta::PrecisePoints(f32::from(point.y)),
-            ScrollDelta::Lines(point) => WheelDelta::Lines(point.y),
+        // The same cell a click there would report (bottom-anchored grids and
+        // a reading view between rows included), clamped to the grid.
+        let (col, row) = self
+            .grid_cell_at(event.position, window)
+            .map_or((0, 0), |(col, row)| (col as u16, row as u16));
+        let (sideways, delta) = match event.delta {
+            ScrollDelta::Pixels(point) => (
+                WheelDelta::PrecisePoints(f32::from(point.x)),
+                WheelDelta::PrecisePoints(f32::from(point.y)),
+            ),
+            ScrollDelta::Lines(point) => (WheelDelta::Lines(point.x), WheelDelta::Lines(point.y)),
         };
+        let vertical = match delta {
+            WheelDelta::PrecisePoints(delta) | WheelDelta::Lines(delta) => delta,
+        };
+        let modifiers = terminal_mouse_modifiers(&event.modifiers);
         let Some(resident) = self.residents.get_mut(&id) else {
             return;
         };
+        let mouse = resident.element.mouse_modes();
+        // A program that reads the mouse gets wheel reports encoded here,
+        // like its clicks, so they carry the modifiers and the sideways axis.
+        // Everything else (alternate-scroll arrows, a Holder whose mode
+        // details are unknown) is encoded by the session's own screen.
+        let reports = mouse.is_reporting() && mouse.has_known_details();
+        let mut sent = false;
+        if reports
+            && let Some(steps) =
+                resident
+                    .horizontal_wheel
+                    .steps(sideways, vertical, f32::from(metrics.cell_width))
+        {
+            let wheel = if steps > 0 {
+                TerminalMouseEvent::WheelLeft
+            } else {
+                TerminalMouseEvent::WheelRight
+            };
+            let count = steps.unsigned_abs() as usize;
+            resident
+                .attachment
+                .mouse(encode_mouse_wheel(mouse, wheel, modifiers, col, row, count));
+            sent = true;
+        }
         let visible_rows = resident.last_size.1.max(1);
         let route = resident.element.route_wheel(WheelEvent {
             delta,
@@ -4372,10 +4443,31 @@ impl TerminalPane {
                 lines,
                 col,
                 row,
+            }) if reports => {
+                let wheel = if direction == 0 {
+                    TerminalMouseEvent::WheelUp
+                } else {
+                    TerminalMouseEvent::WheelDown
+                };
+                resident.attachment.mouse(encode_mouse_wheel(
+                    mouse,
+                    wheel,
+                    modifiers,
+                    col,
+                    row,
+                    usize::from(lines),
+                ));
+            }
+            Some(WheelRoute::Daemon {
+                direction,
+                lines,
+                col,
+                row,
             }) => resident.attachment.scroll(direction, lines, col, row),
             Some(WheelRoute::Local { .. }) => {
                 self.pump_scrollback_fetch(&id, usize::from(visible_rows));
             }
+            None if sent => {}
             None => return,
         }
         cx.stop_propagation();
@@ -5819,6 +5911,27 @@ impl TerminalPane {
     }
 }
 
+/// A pointer position on the grid: the cell under it, and the column
+/// boundary nearest it (`0..=cols`), where a character selection starts or
+/// ends. A cell is selected once the pointer passes its middle, as in xterm
+/// and Ghostty, and the right edge of the last column is reachable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GridPoint {
+    col: usize,
+    row: usize,
+    edge: usize,
+}
+
+/// The cell under a pointer `x` pixels into the grid, and the column
+/// boundary nearest it, both before clamping to the grid.
+fn pointer_columns(x: f32, cell_width: f32) -> (usize, usize) {
+    let columns = x / cell_width;
+    (
+        columns.floor().max(0.0) as usize,
+        columns.round().max(0.0) as usize,
+    )
+}
+
 fn clamp_grid_cell(col: usize, row: usize, cols: u16, rows: u16) -> Option<(u16, u16)> {
     if cols == 0 || rows == 0 {
         return None;
@@ -5866,6 +5979,12 @@ fn pointer_owner(
         } else {
             PointerOwner::Ignored
         };
+    }
+    // Shift-drag selects locally even while a program reads the mouse, the
+    // xterm convention. Only the left button: Shift with the others is still
+    // reported to the program with its modifier bit.
+    if modifiers.shift && button == MouseButton::Left {
+        return PointerOwner::LocalSelection;
     }
     if mouse.is_reporting() && mouse.has_known_details() && terminal_mouse_button(button).is_some()
     {
@@ -6166,6 +6285,96 @@ fn terminal_key_event(
     terminal_keystroke_event(&event.keystroke, option)
 }
 
+/// The same key with its layout characters, for a program that negotiated
+/// kitty flags. Only then is the layout looked up, so legacy typing pays
+/// nothing for it.
+fn kitty_key_event(
+    event: &KeyDownEvent,
+    keyboard: Option<diri_term::keys::KeyboardState>,
+    mapped: (TermKeyEvent, TermModifiers),
+) -> (TermKeyEvent, TermModifiers) {
+    #[cfg(target_os = "macos")]
+    {
+        let kitty = keyboard
+            .and_then(|keyboard| keyboard.enhancements)
+            .is_some_and(|flags| flags.bits() & 0b1011 != 0);
+        if kitty && let Some((unshifted, shifted)) = crate::macos::terminal_keys::layout_chars(event)
+        {
+            let (mut term_event, mut modifiers) = mapped;
+            apply_key_layout(&mut term_event, &mut modifiers, unshifted, shifted);
+            return (term_event, modifiers);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (event, keyboard);
+    mapped
+}
+
+fn reports_key_releases(keyboard: Option<diri_term::keys::KeyboardState>) -> bool {
+    keyboard
+        .and_then(|keyboard| keyboard.enhancements)
+        .is_some_and(|flags| {
+            flags.contains(diri_proto::terminal_input::enhanced::KeyboardEnhancements::EVENT_TYPES)
+        })
+}
+
+/// Held keys are few; a lost key-up (focus moved mid-press) must not grow
+/// the list, so it keeps only the most recent presses.
+const HELD_KEY_LIMIT: usize = 8;
+
+fn remember_held_key(
+    held: &mut Vec<(String, TermKeyEvent, bool)>,
+    keystroke: &gpui::Keystroke,
+    event: &TermKeyEvent,
+    shift: bool,
+) {
+    held.retain(|(key, ..)| *key != keystroke.key);
+    if held.len() == HELD_KEY_LIMIT {
+        held.remove(0);
+    }
+    held.push((keystroke.key.clone(), event.clone(), shift));
+}
+
+fn take_held_key(
+    held: &mut Vec<(String, TermKeyEvent, bool)>,
+    keystroke: &gpui::Keystroke,
+) -> Option<(TermKeyEvent, bool)> {
+    let index = held.iter().position(|(key, ..)| *key == keystroke.key)?;
+    let (_, event, shift) = held.remove(index);
+    Some((event, shift))
+}
+
+/// Records what the layout types on a character key with and without Shift.
+/// GPUI resolves Shift into the logical key for non-letters (`@`, Shift
+/// cleared), which legacy encoding wants (Ctrl-@ is NUL), but the kitty
+/// protocol names the unshifted key with a Shift modifier (Ctrl-Shift-2 is
+/// `CSI 50;6u`). A key the layout does not account for (a Command-layout
+/// fallback) is left alone.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn apply_key_layout(
+    event: &mut TermKeyEvent,
+    modifiers: &mut TermModifiers,
+    unshifted: char,
+    shifted: char,
+) {
+    let TermKey::Character(logical) = &event.key else {
+        return;
+    };
+    let mut chars = logical.chars();
+    let Some(key) = chars.next().filter(|_| chars.next().is_none()) else {
+        return;
+    };
+    if key == shifted && shifted != unshifted {
+        modifiers.shift = true;
+    } else if key != unshifted {
+        return;
+    }
+    event.layout = diri_term::keys::KeyLayout {
+        unshifted: Some(unshifted),
+        shifted: Some(shifted),
+    };
+}
+
 /// The terminal key a keystroke names, for presses and releases alike.
 fn terminal_keystroke_event(
     keystroke: &gpui::Keystroke,
@@ -6204,6 +6413,18 @@ fn terminal_keystroke_event(
         "f10" => Some(NamedKey::F10),
         "f11" => Some(NamedKey::F11),
         "f12" => Some(NamedKey::F12),
+        "f13" => Some(NamedKey::F13),
+        "f14" => Some(NamedKey::F14),
+        "f15" => Some(NamedKey::F15),
+        "f16" => Some(NamedKey::F16),
+        "f17" => Some(NamedKey::F17),
+        "f18" => Some(NamedKey::F18),
+        "f19" => Some(NamedKey::F19),
+        "f20" => Some(NamedKey::F20),
+        "f21" => Some(NamedKey::F21),
+        "f22" => Some(NamedKey::F22),
+        "f23" => Some(NamedKey::F23),
+        "f24" => Some(NamedKey::F24),
         _ => None,
     };
     if let Some(named) = named {
@@ -6240,6 +6461,7 @@ fn terminal_keystroke_event(
         TermKeyEvent {
             key: TermKey::Character(logical),
             text: Some(text),
+            layout: Default::default(),
         },
         modifiers,
     ))
@@ -6871,6 +7093,20 @@ mod tests {
     }
 
     #[test]
+    fn a_drag_selects_a_cell_past_its_middle_and_reaches_the_last_column() {
+        // 10 px cells on a 6-column grid.
+        let edge = |x: f32| pointer_columns(x, 10.0).1.min(6);
+        let cell = |x: f32| clamp_grid_cell(pointer_columns(x, 10.0).0, 0, 6, 1).unwrap().0;
+        assert_eq!((cell(14.0), edge(14.0)), (1, 1), "left half: cell 1 not yet in");
+        assert_eq!((cell(16.0), edge(16.0)), (1, 2), "right half: cell 1 joins");
+        // The right half of the last cell, and past the grid, end after it;
+        // a cell-floor end could never include column 5.
+        assert_eq!((cell(57.0), edge(57.0)), (5, 6));
+        assert_eq!((cell(90.0), edge(90.0)), (5, 6));
+        assert_eq!(edge(-4.0), 0);
+    }
+
+    #[test]
     fn pointer_ownership_preserves_local_escape_hatches_and_reporting_off() {
         let plain = Modifiers::default();
         let option = Modifiers {
@@ -6937,6 +7173,24 @@ mod tests {
             PointerOwner::LocalSelection,
             "an old remote Holder must not receive a guessed click encoding"
         );
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            pointer_owner(reporting, MouseButton::Left, &shift),
+            PointerOwner::LocalSelection,
+            "Shift-drag selects locally over a mouse-reporting program"
+        );
+        assert_eq!(
+            pointer_owner(reporting, MouseButton::Right, &shift),
+            PointerOwner::Terminal,
+            "Shift with another button is still reported, with its bit"
+        );
+        assert_eq!(
+            pointer_owner(reporting, MouseButton::Middle, &shift),
+            PointerOwner::Terminal
+        );
     }
 
     #[test]
@@ -6983,6 +7237,23 @@ mod tests {
         assert_eq!(clamp_grid_cell(usize::MAX, 100, 80, 24), Some((79, 23)));
         assert_eq!(clamp_grid_cell(0, 0, 0, 24), None);
         assert_eq!(clamp_grid_cell(0, 0, 80, 0), None);
+    }
+
+    #[test]
+    fn a_press_is_not_followed_by_a_drag_inside_its_own_cell() {
+        let started = Instant::now();
+        let mut limiter = MouseMotionLimiter::default();
+        limiter.pressed_at((4, 2));
+        assert_eq!(
+            limiter.push(started, (4, 2), b"jitter".to_vec()),
+            MotionDispatch::None,
+            "xterm reports motion only when the pointer changes cell"
+        );
+        assert_eq!(
+            limiter.push(started, (5, 2), b"drag".to_vec()),
+            MotionDispatch::SendNow(b"drag".to_vec()),
+            "the first real move is not held back by the cadence"
+        );
     }
 
     #[test]
@@ -7911,6 +8182,20 @@ mod tests {
                         ).as_bytes());
                         grid = screen.full_snapshot();
                     }
+                    if scene == "weights" {
+                        // SGR 1 and SGR 2 apart and together, then the way
+                        // an agent mixes them, in default text and colour.
+                        let mut screen = diri_engine::HeadlessScreen::new(60, 10);
+                        screen.feed(concat!(
+                            "normal \x1b[1mbold\x1b[0m \x1b[2mfaint\x1b[0m \x1b[1;2mboth\x1b[0m\r\n",
+                            "\x1b[32mnormal \x1b[1mbold\x1b[0m\x1b[32m \x1b[2mfaint\x1b[0m\x1b[32m \x1b[1;2mboth\x1b[0m\r\n",
+                            "\r\n",
+                            "\x1b[32m●\x1b[0m \x1b[1mUpdate\x1b[0m(crates/diri-term/src/metrics.rs)\r\n",
+                            "  ⎿  \x1b[2mUpdated with 3 additions and 1 removal\x1b[0m\r\n",
+                            "\x1b[1mTotal cost:\x1b[0m $0.42  \x1b[2m(ctrl+o to expand)\x1b[0m",
+                        ).as_bytes());
+                        grid = screen.full_snapshot();
+                    }
                     if scene.starts_with("commands") {
                         // A shell with OSC 133 marks: two commands that
                         // passed, one that failed, and one still running.
@@ -8694,6 +8979,85 @@ mod tests {
         (pane, id, cx)
     }
 
+    /// Wheel bytes a reference xterm-compatible emulator sends a program,
+    /// recorded from that program's raw input: modifiers ride on the wheel
+    /// button, and a sideways wheel is buttons 66/67.
+    #[gpui::test]
+    fn wheel_reports_carry_modifiers_and_the_sideways_axis(cx: &mut TestAppContext) {
+        let (pane, id, cx) = drop_target_pane(cx);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let lines = |x: f32, y: f32| gpui::ScrollDelta::Lines(gpui::point(x, y));
+        let event = |delta, modifiers| gpui::ScrollWheelEvent {
+            position: gpui::point(px(200.0), px(150.0)),
+            delta,
+            modifiers,
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+        let control = Modifiers {
+            control: true,
+            ..Modifiers::default()
+        };
+        let shift_option = Modifiers {
+            shift: true,
+            alt: true,
+            ..Modifiers::default()
+        };
+        pane.update_in(cx, |pane, window, cx| {
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.attachment.mouse_observer = Some(tx);
+            resident.element.set_modes(
+                true,
+                MouseModes::new(
+                    diri_proto::terminal::MouseTrackingMode::ButtonEvents,
+                    diri_proto::terminal::MouseEncoding::Sgr,
+                ),
+            );
+            for (delta, modifiers) in [
+                (lines(0.0, 1.0), Modifiers::default()),
+                (lines(0.0, -1.0), control),
+                (lines(0.0, 1.0), shift_option),
+                (lines(1.0, 0.0), Modifiers::default()),
+                (lines(-1.0, 0.0), control),
+                (lines(0.2, 1.0), Modifiers::default()),
+            ] {
+                pane.handle_scroll(&event(delta, modifiers), window, cx);
+            }
+            // The legacy encoding carries the same buttons.
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.element.set_modes(
+                true,
+                MouseModes::new(
+                    diri_proto::terminal::MouseTrackingMode::ButtonEvents,
+                    diri_proto::terminal::MouseEncoding::Legacy,
+                ),
+            );
+            pane.handle_scroll(&event(lines(-1.0, 0.0), Modifiers::default()), window, cx);
+            // A program that does not read the mouse: the alternate screen's
+            // wheel goes to the session, which turns it into arrow keys.
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.element.set_modes(true, MouseModes::OFF);
+            pane.handle_scroll(&event(lines(0.0, -1.0), control), window, cx);
+            pane.handle_scroll(&event(lines(1.0, 0.0), Modifiers::default()), window, cx);
+        });
+        let sent: Vec<Vec<u8>> = rx.try_iter().collect();
+        let expected: Vec<&[u8]> = vec![
+            b"\x1b[<64;1;1M",
+            b"\x1b[<81;1;1M",
+            b"\x1b[<76;1;1M",
+            b"\x1b[<66;1;1M",
+            b"\x1b[<83;1;1M",
+            b"\x1b[<64;1;1M",
+            b"\x1b[Mc!!",
+            b"scroll 1 1 0 0",
+        ];
+        assert_eq!(
+            sent.iter().map(|bytes| bytes.as_slice()).collect::<Vec<_>>(),
+            expected,
+            "a mostly-vertical notch sends no sideways report, and only a \
+             reporting program gets a sideways wheel"
+        );
+    }
+
     #[gpui::test]
     fn files_dragged_over_a_pane_tick_on_arrival_and_again_when_taken(cx: &mut TestAppContext) {
         use gpui::FileDropEvent;
@@ -8812,6 +9176,98 @@ mod tests {
             events.try_recv().is_err(),
             "repeated rejection must not flood toasts"
         );
+    }
+
+    /// Links to other apps ask on the window's sheet; "Always Open" trusts
+    /// the scheme. Files the system opener would run always ask.
+    #[gpui::test]
+    fn app_links_and_runnable_files_ask_before_opening(cx: &mut TestAppContext) {
+        let launch = tempfile::tempdir().unwrap();
+        std::fs::write(launch.path().join("deploy.command"), "#!/bin/sh\n").unwrap();
+        std::fs::write(launch.path().join("notes.md"), "# notes").unwrap();
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let mut session = fixture_session();
+        session.host = None;
+        session.kind = ProtoAgentKind::SHELL;
+        session.cwd = launch.path().display().to_string();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session.clone());
+            store.select(session.id);
+            store
+                .update_preferences(|prefs| {
+                    prefs.terminal_file_editor = crate::store::FileEditor::DefaultApp;
+                })
+                .unwrap();
+        }
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        let open = |cx: &mut gpui::VisualTestContext, reference: TerminalReference| {
+            pane.update_in(cx, |pane, window, cx| pane.open_reference(reference, window, cx));
+            cx.run_until_parked();
+        };
+
+        // Web links open at once, as before.
+        open(cx, TerminalReference::Url("https://example.com".into()));
+        assert!(!cx.has_pending_prompt());
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com"));
+
+        // An app link waits for the sheet; Cancel opens nothing.
+        open(cx, TerminalReference::Url("ssh://forge".into()));
+        assert!(cx.has_pending_prompt(), "the sheet asks");
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com"));
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com"));
+
+        // Open opens once and trusts nothing.
+        open(cx, TerminalReference::Url("ssh://forge".into()));
+        cx.simulate_prompt_answer("Open");
+        cx.run_until_parked();
+        assert_eq!(cx.opened_url().as_deref(), Some("ssh://forge"));
+        open(cx, TerminalReference::Url("ssh://forge/2".into()));
+        assert!(cx.has_pending_prompt(), "still asks");
+
+        // Always Open trusts the scheme from then on.
+        cx.simulate_prompt_answer("Always Open ssh Links");
+        cx.run_until_parked();
+        assert_eq!(cx.opened_url().as_deref(), Some("ssh://forge/2"));
+        open(cx, TerminalReference::Url("ssh://other".into()));
+        assert!(!cx.has_pending_prompt());
+        assert_eq!(cx.opened_url().as_deref(), Some("ssh://other"));
+        pane.update_in(cx, |pane, _, _| {
+            let store = pane.runtime.store.read().unwrap();
+            let trusted = &store.preferences().terminal_trusted_link_schemes;
+            assert_eq!(trusted.iter().collect::<Vec<_>>(), ["ssh"]);
+        });
+        // Trust is per scheme.
+        open(cx, TerminalReference::Url("vscode://file/a.rs".into()));
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        // Refused schemes never open, and never ask.
+        open(cx, TerminalReference::Url("javascript:alert(1)".into()));
+        assert!(!cx.has_pending_prompt());
+        assert_eq!(cx.opened_url().as_deref(), Some("ssh://other"));
+
+        // A script the default app would run asks, with no Always.
+        open(cx, TerminalReference::File("deploy.command".into()));
+        assert!(cx.has_pending_prompt());
+        assert_eq!(cx.opened_url().as_deref(), Some("ssh://other"));
+        cx.simulate_prompt_answer("Open");
+        cx.run_until_parked();
+        assert!(cx.opened_url().unwrap().ends_with("/deploy.command"));
+        // A document does not.
+        open(cx, TerminalReference::File("notes.md".into()));
+        assert!(!cx.has_pending_prompt());
+        assert!(cx.opened_url().unwrap().ends_with("/notes.md"));
     }
 
     #[gpui::test]
@@ -11352,8 +11808,9 @@ mod tests {
                 ("alt-space", Some(" "), b"\x1b "),
                 // A layout whose Option leaves the key unchanged.
                 ("alt-b", Some("b"), b"\x1bb"),
-                // Control claims the chord before Option can compose.
-                ("ctrl-alt-a", None, b"\x01"),
+                // Control claims the chord before Option can compose, and
+                // Option is Meta: ESC ^A, as xterm sends Emacs C-M-a.
+                ("ctrl-alt-a", None, b"\x1b\x01"),
             ] {
                 assert_eq!(
                     option_bytes(&option_key(chord, key_char), option),

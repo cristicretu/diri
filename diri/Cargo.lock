@@ -1661,6 +1661,7 @@ dependencies = [
 name = "diri-notes"
 version = "0.1.0"
 dependencies = [
+ "diri-platform",
  "diri-proto",
  "getrandom 0.4.3",
  "libc",
@@ -1677,6 +1678,7 @@ dependencies = [
  "libc",
  "sha2 0.11.0",
  "socket2",
+ "tempfile",
  "tokio",
  "uds_windows",
  "windows-sys 0.61.2",

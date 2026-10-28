@@ -114,6 +114,13 @@ impl<T> Storage<T> {
     }
 
     #[cfg(feature = "compact-history")]
+    pub fn prepare_history_read(&mut self) {
+        if let Some(compact) = &mut self.compact {
+            compact.prepare_history_read();
+        }
+    }
+
+    #[cfg(feature = "compact-history")]
     pub fn release_read_cache(&mut self) {
         if let Some(compact) = &mut self.compact {
             compact.release_read_cache();

@@ -199,7 +199,11 @@ editable rows (the screen, the newest history and any line ending there) to
   without reflow reflow everything eagerly, as before.
 - Reading deferred history builds every row at the current width once, and the
   next read-cache release stores them as blocks: a history that is read is
-  reflowed once, not per read. Editing a deferred row does the same. Dropping
+  reflowed once, not per read. Editing a deferred row does the same. A caller
+  about to read every history row in order (`Grid::prepare_history_read`: a
+  screen checkpoint, a link scan) has the deferred history reflowed straight
+  into blocks one block at a time instead, so the read never holds every row
+  decoded at once (58 MB → 1 MB at 10,000 rows of 97 columns). Dropping
   the oldest rows (history limit, byte budget) skips content cells without
   decoding. Recycling a greedy line's oldest row at full history needs no
   payload either: it resets to template cells, as a row with recipe bits does.

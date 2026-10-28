@@ -285,9 +285,125 @@ pub fn startup_sweep(
     ))
 }
 
+/// Upper bound on entries one [`tighten_private_roots`] pass inspects. A real
+/// install holds a few hundred; the bound only stops a pathological tree.
+pub const TIGHTEN_MAX_ENTRIES: usize = 50_000;
+
+/// Every directory Diri writes its own state into for `home`: data, state,
+/// config, runtime and cache, plus the app's preference directory. Nested
+/// and duplicate roots collapse into their outermost one. A root that is
+/// `home` itself or one of its ancestors (a misconfigured override) is never
+/// returned: those hold the user's files, not Diri's.
+pub fn private_roots(home: &Path) -> Vec<std::path::PathBuf> {
+    use diri_proto::paths::DirijorPaths;
+    let mut candidates = vec![
+        DirijorPaths::app_support(home),
+        DirijorPaths::state_dir(home),
+        DirijorPaths::config_dir(home),
+        DirijorPaths::runtime_dir(home),
+        DirijorPaths::cache_dir(home),
+    ];
+    if let Some(prefs) = DirijorPaths::prefs_file(home).parent() {
+        candidates.push(prefs.to_path_buf());
+    }
+    outermost_private_roots(home, candidates)
+}
+
+fn outermost_private_roots(
+    home: &Path,
+    mut candidates: Vec<std::path::PathBuf>,
+) -> Vec<std::path::PathBuf> {
+    candidates.retain(|root| root.is_absolute() && !home.starts_with(root));
+    candidates.sort();
+    candidates.dedup();
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    for root in candidates {
+        if !roots.iter().any(|outer| root.starts_with(outer)) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+/// One-shot startup repair for state written before every writer created its
+/// files owner-only: strips group/other bits under [`private_roots`]. Runs off
+/// the accept path, once per Engine start; it is never repeated while idle.
+pub fn tighten_private_roots(home: &Path) -> diri_platform::private::Tightened {
+    tighten_roots(&private_roots(home))
+}
+
+fn tighten_roots(roots: &[std::path::PathBuf]) -> diri_platform::private::Tightened {
+    let mut total = diri_platform::private::Tightened::default();
+    for root in roots {
+        let remaining = TIGHTEN_MAX_ENTRIES.saturating_sub(total.visited);
+        let pass = diri_platform::private::tighten_tree(root, remaining);
+        total.visited += pass.visited;
+        total.changed += pass.changed;
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_roots_collapse_nesting_and_never_include_home() {
+        let home = Path::new("/home/u");
+        let roots = outermost_private_roots(
+            home,
+            vec![
+                "/home/u/.local/state/diri".into(),
+                "/home/u/.local/state/diri/run".into(),
+                "/home/u/.config/diri".into(),
+                "/home/u/.config/diri".into(),
+                "/home/u".into(),
+                "/home".into(),
+                "relative".into(),
+            ],
+        );
+        assert_eq!(
+            roots,
+            vec![
+                std::path::PathBuf::from("/home/u/.config/diri"),
+                "/home/u/.local/state/diri".into(),
+            ]
+        );
+        for root in private_roots(home) {
+            assert!(
+                !home.starts_with(&root),
+                "{} would expose the home",
+                root.display()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_tightening_makes_older_world_readable_state_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Dirijor");
+        let logs = root.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let checkpoint = logs.join("s_0123456789ab.screen.plist");
+        let hosts = root.join("hosts.json");
+        std::fs::write(&checkpoint, b"x").unwrap();
+        std::fs::write(&hosts, b"{}").unwrap();
+        for path in [&root, &logs] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        for path in [&checkpoint, &hosts] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let report = tighten_roots(std::slice::from_ref(&root));
+        assert_eq!((report.visited, report.changed), (4, 4));
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(mode(&logs), 0o700);
+        assert_eq!(mode(&checkpoint), 0o600);
+        assert_eq!(mode(&hosts), 0o600);
+    }
 
     #[test]
     fn only_daemon_names_parse() {

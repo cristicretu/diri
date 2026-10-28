@@ -476,7 +476,7 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
 }
 
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
+    diri_platform::private::create_dir_all(dir)?;
     set_mode(dir, 0o700)
 }
 
