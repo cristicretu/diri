@@ -12657,6 +12657,43 @@ mod tests {
         }
     }
 
+    #[gpui::test]
+    fn a_split_strip_tab_shows_its_waiting_pane_and_its_layout(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_asset_source_for_test(diri_ui::IconAssets));
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| {
+                let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                seed_split_presentation(&mut sidebar.store.write().unwrap());
+                sidebar
+                    .set_tab_orientation(crate::store::TabOrientation::Horizontal, cx)
+                    .unwrap();
+                sidebar
+            });
+            SplitStripShot { sidebar }
+        });
+        cx.run_until_parked();
+        let sidebar = view.read_with(cx, |view, _| view.sidebar.clone());
+        let (title, state) = sidebar.read_with(cx, |sidebar, cx| {
+            let props = sidebar.strip_tab_views[&SessionId::new("preview-codex")]
+                .read(cx)
+                .props_for_test();
+            (props.title.clone(), props.state)
+        });
+        // Codex itself is working; the deploy pane beside it is asking, and
+        // the tab says so the way its sidebar row does.
+        assert_eq!(title, "Allow deploy to staging?");
+        assert!(matches!(state, StatusState::NeedsInput { .. }));
+        assert!(
+            cx.debug_bounds("horizontal-tab-panes-preview-codex")
+                .is_some()
+        );
+        assert!(
+            cx.debug_bounds("horizontal-tab-panes-preview-spawned-deep")
+                .is_none(),
+            "a single-pane tab keeps its plain close button"
+        );
+    }
+
     /// Split tabs in the sidebar and in the horizontal strip, at rest and
     /// with the pointer on the selected tab. Writes
     /// `split-{sidebar,strip,strip-hover}-{dark,light}.png` to

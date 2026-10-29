@@ -79,6 +79,13 @@ pub(in crate::sidebar) struct StripTabView {
     pub(super) renders: usize,
 }
 
+#[cfg(test)]
+impl StripTabView {
+    pub(super) fn props_for_test(&self) -> &StripTabProps {
+        &self.props
+    }
+}
+
 impl Render for StripTabView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(test)]
