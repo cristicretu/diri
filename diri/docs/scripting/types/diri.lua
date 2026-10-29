@@ -327,6 +327,12 @@ function diri.session.list_dir(params, opts) end
 ---@return table # CaptureFindResult
 function diri.session.capture_find(params, opts) end
 
+---One bounded page of a search over a session's whole history, by stable row.
+---@param params {sessionID: string, query: string, beforeRow?: integer, cols?: integer, maxMatches: integer, budgetMs: integer}
+---@param opts? {timeout?: number}
+---@return table # FindHistoryResult
+function diri.session.find_history(params, opts) end
+
 ---The terminal history as text.
 ---@param params {sessionID: string}
 ---@param opts? {timeout?: number}
