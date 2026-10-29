@@ -141,7 +141,7 @@ impl Clusters {
     /// Empties the arena for the next page, keeping a small one's
     /// capacity (a page of marks takes a few KiB) and freeing a large one.
     fn reuse(&mut self) {
-        const KEEP: usize = 16 << 10;
+        const KEEP: usize = 256 << 10;
         if self.spans.capacity() * 8 + self.chars.capacity() * 4 > KEEP {
             *self = Clusters::default();
         } else {
