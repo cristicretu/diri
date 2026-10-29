@@ -239,6 +239,7 @@ pub fn read_only(message: &Value) -> bool {
                     | "list_notes"
                     | "read_note"
                     | "note_links"
+                    | "list_actions"
             )
         )
 }

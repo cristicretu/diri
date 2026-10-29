@@ -965,6 +965,14 @@ impl DaemonClient {
             .await
     }
 
+    /// One page of Find over a local terminal's whole history.
+    pub async fn find_history(
+        &self,
+        params: &diri_proto::find::FindHistoryParams,
+    ) -> Result<diri_proto::find::FindHistoryResult, ClientError> {
+        self.typed(Method::SESSION_FIND_HISTORY, params).await
+    }
+
     pub async fn read_scrollback(
         &self,
         session_id: &SessionId,
@@ -1020,6 +1028,26 @@ impl DaemonClient {
     pub async fn set_active(&self, active: bool) -> Result<(), ClientError> {
         self.empty(Method::CLIENT_SET_ACTIVE, &ClientActiveParams { active })
             .await
+    }
+
+    /// Publishes this app's window actions; this connection then performs
+    /// them (`app.perform_requested` arrives as an event). Republished on
+    /// every reconnect, since the Engine forgets a closed connection's.
+    pub async fn publish_app_actions(
+        &self,
+        params: &diri_proto::app_actions::AppActionsPublishParams,
+    ) -> Result<(), ClientError> {
+        self.request(Method::APP_ACTIONS_PUBLISH, Some(params), None)
+            .await
+            .map(|_| ())
+    }
+
+    /// The answer to one `app.perform_requested`.
+    pub async fn reply_app_action(
+        &self,
+        params: &diri_proto::app_actions::AppReplyParams,
+    ) -> Result<(), ClientError> {
+        self.empty(Method::APP_REPLY, params).await
     }
 
     pub async fn configure_governor(

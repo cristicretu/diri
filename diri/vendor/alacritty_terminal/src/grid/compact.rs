@@ -10,12 +10,15 @@ use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use super::cold::{ColdStore, PageOut};
 use super::{GridCell, Row};
 use crate::term::cell::ResetDiscriminant;
 
+mod arena;
 mod lz;
 use crate::term::cell::{Cell, CellExtra, Flags, Hyperlink};
 use crate::vte::ansi::{Color, NamedColor, Rgb};
+use arena::{Arena, Slice};
 
 /// Whether a debug consistency check that walks `len` items runs now.
 ///
@@ -86,6 +89,9 @@ pub struct RowCodec<T> {
     clone_row: fn(&Row<T>) -> Row<T>,
     /// Reset a row to default cells: equal to `Row::new` of its width.
     clear_row: fn(&mut Row<T>),
+    /// A row of default cells: `Row::new` of the width. Stands in for the
+    /// rows of a stored payload that cannot be read back (see [`Payload`]).
+    blank_row: fn(usize) -> Row<T>,
     #[cfg(test)]
     rows_equal: RowsEqual<T>,
 }
@@ -451,7 +457,7 @@ impl<T> Deferred<T> {
         let mut previous = std::ptr::null();
         let mut payload = 0;
         for block in &self.sources {
-            let ptr = block.bytes.as_ptr();
+            let ptr = block.bytes.id();
             if ptr != previous {
                 payload += payload_bytes(block);
             }
@@ -493,7 +499,7 @@ impl<T> Deferred<T> {
         } else {
             self.sources.back()
         };
-        if !neighbour.is_some_and(|next| next.bytes.as_ptr() == block.bytes.as_ptr()) {
+        if !neighbour.is_some_and(|next| next.bytes.id() == block.bytes.id()) {
             self.payload -= payload_bytes(&block);
         }
     }
@@ -711,7 +717,9 @@ impl<T> Deferred<T> {
 
 /// An encoded block and the facts storage needs without decoding it.
 struct Encoded {
-    bytes: Arc<[u8]>,
+    /// The payload, in the encoder's scratch buffer: copied into the
+    /// history's arena, then handed back (see [`Block::encoded`]).
+    bytes: Vec<u8>,
     /// The narrowest width every row can reflow to without discarding
     /// content, or `None` when any row soft-wraps.
     resize_floor: Option<usize>,
@@ -721,6 +729,80 @@ struct Encoded {
     blank_on_reset: u64,
 }
 type ResetRow<T> = fn(&EvictIndex<T>, usize, &T, usize) -> Option<Row<T>>;
+
+/// A block's encoded rows: in memory, or paged out to a [`ColdStore`] while
+/// the terminal is idle (see [`CompactRows::page_out`]).
+///
+/// Ranges split from one payload share it, so its identity ([`Self::id`])
+/// tells shared payloads apart for the history budget. Paging out keeps that
+/// grouping and the length, so the budget counts a stored payload exactly as
+/// it counted it in memory and retention never depends on paging.
+#[derive(Clone)]
+enum Payload {
+    /// In this history's own memory (see [`arena`]).
+    Resident(Slice),
+    Stored(Arc<StoredPayload>),
+}
+
+/// A payload in a [`ColdStore`]. Its slot is released when the last range
+/// referring to it is dropped.
+struct StoredPayload {
+    store: Arc<dyn ColdStore>,
+    slot: u64,
+    len: usize,
+}
+
+impl Drop for StoredPayload {
+    fn drop(&mut self) {
+        self.store.release(self.slot, self.len);
+    }
+}
+
+impl std::fmt::Debug for Payload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Payload::Resident(slice) => write!(f, "Resident({} bytes)", slice.len()),
+            Payload::Stored(stored) => {
+                write!(f, "Stored(slot {}, {} bytes)", stored.slot, stored.len)
+            }
+        }
+    }
+}
+
+impl Payload {
+    fn len(&self) -> usize {
+        match self {
+            Payload::Resident(slice) => slice.len(),
+            Payload::Stored(stored) => stored.len,
+        }
+    }
+
+    /// The payload's identity: equal for ranges split from one payload.
+    fn id(&self) -> *const u8 {
+        match self {
+            Payload::Resident(slice) => slice.as_ptr(),
+            Payload::Stored(stored) => Arc::as_ptr(stored).cast(),
+        }
+    }
+
+    fn same(&self, other: &Payload) -> bool {
+        self.id() == other.id()
+    }
+
+    /// The encoded bytes, read back from the store a payload at a time when
+    /// it is paged out; nothing of it stays in memory after the caller is
+    /// done. `None` when the store cannot give it back (the store reports
+    /// why); callers then use blank rows rather than fail a read.
+    fn bytes(&self) -> Option<std::borrow::Cow<'_, [u8]>> {
+        match self {
+            Payload::Resident(slice) => Some(std::borrow::Cow::Borrowed(slice.as_slice())),
+            Payload::Stored(stored) => match stored.store.load(stored.slot, stored.len) {
+                Ok(bytes) if bytes.len() == stored.len => Some(std::borrow::Cow::Owned(bytes)),
+                _ => None,
+            },
+        }
+    }
+}
 
 /// A decompressed history payload with row offsets, kept for the oldest block
 /// while bounded-history scrolling recycles its rows one at a time.
@@ -733,7 +815,7 @@ pub struct EvictIndex<T> {
 
 #[derive(Clone, Debug)]
 struct EvictCache<T> {
-    bytes: Arc<[u8]>,
+    bytes: Payload,
     index: EvictIndex<T>,
 }
 
@@ -746,7 +828,7 @@ impl<T> Clone for RowCodec<T> {
 
 #[derive(Clone, Debug)]
 struct Block<T> {
-    bytes: Arc<[u8]>,
+    bytes: Payload,
     /// First payload row of this range (payloads hold at most 64 rows). The
     /// narrow type keeps `Block`, which the history budget counts, the same
     /// size with `blank_on_reset`.
@@ -762,20 +844,22 @@ struct Block<T> {
 }
 
 impl<T> Block<T> {
-    fn new(rows: &[Row<T>], codec: RowCodec<T>) -> Self {
-        Self::encoded(rows, (codec.encode)(rows))
+    fn new(rows: &[Row<T>], codec: RowCodec<T>, arena: &mut Arena) -> Self {
+        Self::encoded(rows, (codec.encode)(rows), arena)
     }
 
     /// A block of `rows`, which are left default cells with occupancy zero
     /// (see [`RowCodec::encode_recycled`]).
-    fn recycling(rows: &mut [Row<T>], codec: RowCodec<T>) -> Self {
+    fn recycling(rows: &mut [Row<T>], codec: RowCodec<T>, arena: &mut Arena) -> Self {
         let encoded = (codec.encode_recycled)(rows);
-        Self::encoded(rows, encoded)
+        Self::encoded(rows, encoded, arena)
     }
 
-    fn encoded(rows: &[Row<T>], encoded: Encoded) -> Self {
+    fn encoded(rows: &[Row<T>], encoded: Encoded, arena: &mut Arena) -> Self {
+        let bytes = arena.alloc(&encoded.bytes);
+        recycle_packed(encoded.bytes);
         Self {
-            bytes: encoded.bytes,
+            bytes: Payload::Resident(bytes),
             start: 0,
             count: rows.len(),
             columns: rows.first().map_or(0, Row::len),
@@ -798,7 +882,12 @@ impl<T> Block<T> {
     }
 
     fn decode_rows(&self, codec: RowCodec<T>) -> Vec<Row<T>> {
-        let rows = (codec.decode)(&self.bytes);
+        let Some(bytes) = self.bytes.bytes() else {
+            return (0..self.count)
+                .map(|_| (codec.blank_row)(self.columns))
+                .collect();
+        };
+        let rows = (codec.decode)(&bytes);
         if self.start == 0
             && self.count == rows.len()
             && rows.iter().all(|row| row.len() == self.columns)
@@ -823,11 +912,12 @@ impl<T> Block<T> {
         &mut self.decoded.get_mut().expect("initialized row block")[index]
     }
 
-    fn release_cache(&mut self, codec: RowCodec<T>) {
+    fn release_cache(&mut self, codec: RowCodec<T>, arena: &mut Arena) {
         if let Some(rows) = self.decoded.take() {
             if self.dirty {
                 let encoded = (codec.encode)(&rows);
-                self.bytes = encoded.bytes;
+                self.bytes = Payload::Resident(arena.alloc(&encoded.bytes));
+                recycle_packed(encoded.bytes);
                 self.start = 0;
                 self.resize_floor = encoded.resize_floor;
                 self.blank_on_reset = encoded.blank_on_reset;
@@ -841,6 +931,15 @@ impl<T> Block<T> {
             .take()
             .unwrap_or_else(|| self.decode_rows(codec))
     }
+}
+
+/// Where history payloads live; see [`CompactRows::payload_residency`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PayloadResidency {
+    pub resident: usize,
+    pub resident_bytes: usize,
+    pub stored: usize,
+    pub stored_bytes: usize,
 }
 
 /// Recent editable rows followed by compressed history and an oldest row tail.
@@ -880,6 +979,8 @@ pub struct CompactRows<T> {
     /// History a column change did not reflow, older than every block and
     /// newer than `oldest`.
     deferred: Option<Box<Deferred<T>>>,
+    /// Where this history's payloads are copied (see [`arena`]).
+    arena: Arena,
     /// Reflow every column change eagerly: the oracle for deferral tests.
     #[cfg(test)]
     pub(crate) eager_reflow: bool,
@@ -929,6 +1030,7 @@ impl<T> CompactRows<T> {
             payload_bytes: Some(0),
             read_cache: ReadCacheFlag::default(),
             deferred: None,
+            arena: Arena::default(),
             #[cfg(test)]
             eager_reflow: false,
         };
@@ -1142,7 +1244,7 @@ impl<T> CompactRows<T> {
                 // Re-encoding replaces the payload.
                 self.payload_bytes = None;
             }
-            block.release_cache(self.codec);
+            block.release_cache(self.codec, &mut self.arena);
         }
         if self
             .deferred
@@ -1171,6 +1273,147 @@ impl<T> CompactRows<T> {
         self.blocks.shrink_to_fit();
     }
 
+    /// Move idle history out of memory into `store`: every block payload
+    /// except the newest blocks holding at least `keep_rows` rows (the recent
+    /// window a short scroll reads), deferred reflow sources included. Caches
+    /// are released first (see [`Self::release_idle`]). Payloads already in
+    /// the store stay there without being written again, so an idle
+    /// transition writes only what was sealed since the last one. When fewer
+    /// than `min_bytes` would move, nothing does.
+    ///
+    /// Nothing observable changes: a read decodes a stored block from the
+    /// store a block at a time and keeps nothing of it beyond the read cache,
+    /// and the history budget counts a stored payload as it did in memory.
+    /// On a store error history stays in memory, unchanged.
+    pub fn page_out(
+        &mut self,
+        store: &Arc<dyn ColdStore>,
+        keep_rows: usize,
+        min_bytes: usize,
+    ) -> std::io::Result<PageOut> {
+        self.release_idle();
+        let mut report = PageOut::default();
+        let mut kept_rows = 0;
+        let mut kept = 0;
+        let mut kept_ids = Vec::new();
+        for block in &self.blocks {
+            if kept_rows >= keep_rows {
+                break;
+            }
+            kept_rows += block.count;
+            kept += 1;
+            if kept_ids.last() != Some(&block.bytes.id()) {
+                kept_ids.push(block.bytes.id());
+                report.kept_bytes += block.bytes.len();
+            }
+        }
+        let deferred_sources = self
+            .deferred
+            .as_deref()
+            .map(|deferred| deferred.sources.iter())
+            .into_iter()
+            .flatten();
+        let mut moving: Vec<Slice> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for block in self.blocks.iter().skip(kept).chain(deferred_sources) {
+            let id = block.bytes.id();
+            // A range sharing its payload with the recent window stays too.
+            if kept_ids.contains(&id) || !seen.insert(id) {
+                continue;
+            }
+            match &block.bytes {
+                Payload::Resident(slice) => moving.push(slice.clone()),
+                Payload::Stored(_) => report.already_stored += 1,
+            }
+        }
+        let bytes: usize = moving.iter().map(|payload| payload.len()).sum();
+        if moving.is_empty() || bytes < min_bytes {
+            return Ok(PageOut {
+                payloads: 0,
+                bytes: 0,
+                ..report
+            });
+        }
+        let slots = {
+            let payloads: Vec<&[u8]> = moving.iter().map(Slice::as_slice).collect();
+            store.store(&payloads)?
+        };
+        assert_eq!(slots.len(), moving.len(), "one slot per stored payload");
+        let stored: HashMap<*const u8, Payload> = moving
+            .iter()
+            .zip(slots)
+            .map(|(payload, slot)| {
+                let stored = Payload::Stored(Arc::new(StoredPayload {
+                    store: Arc::clone(store),
+                    slot,
+                    len: payload.len(),
+                }));
+                (payload.as_ptr(), stored)
+            })
+            .collect();
+        drop(moving);
+        let swap = |block: &mut Block<T>| {
+            if let Some(payload) = stored.get(&block.bytes.id()) {
+                block.bytes = payload.clone();
+            }
+        };
+        self.blocks.iter_mut().skip(kept).for_each(swap);
+        if let Some(deferred) = &mut self.deferred {
+            deferred.sources.iter_mut().for_each(swap);
+        }
+        // The recent window moves to a fresh chunk, so the chunks that held
+        // the paged-out payloads are unmapped whole.
+        self.arena.retire();
+        let mut moved: Vec<(*const u8, Payload)> = Vec::new();
+        for block in self.blocks.iter_mut().take(kept) {
+            let Payload::Resident(slice) = &block.bytes else {
+                continue;
+            };
+            let id = slice.as_ptr();
+            let payload = match moved.iter().find(|(old, _)| *old == id) {
+                Some((_, payload)) => payload.clone(),
+                None => {
+                    let payload = Payload::Resident(self.arena.alloc(slice.as_slice()));
+                    moved.push((id, payload.clone()));
+                    payload
+                }
+            };
+            block.bytes = payload;
+        }
+        report.payloads = stored.len();
+        report.bytes = bytes;
+        Ok(report)
+    }
+
+    /// Payloads in memory and in a cold store, and their bytes.
+    pub fn payload_residency(&self) -> PayloadResidency {
+        let deferred_sources = self
+            .deferred
+            .as_deref()
+            .map(|deferred| deferred.sources.iter())
+            .into_iter()
+            .flatten();
+        let mut residency = PayloadResidency::default();
+        let mut previous = std::ptr::null();
+        for block in self.blocks.iter().chain(deferred_sources) {
+            if block.bytes.id() == previous {
+                continue;
+            }
+            previous = block.bytes.id();
+            match block.bytes {
+                Payload::Resident(_) => {
+                    residency.resident += 1;
+                    residency.resident_bytes += block.bytes.len();
+                }
+                Payload::Stored(_) => {
+                    residency.stored += 1;
+                    residency.stored_bytes += block.bytes.len();
+                }
+            }
+        }
+        residency
+    }
+
     #[cfg(test)]
     fn payload_bytes(&self) -> usize {
         self.payload_bytes
@@ -1185,7 +1428,7 @@ impl<T> CompactRows<T> {
         let mut previous = std::ptr::null();
         let mut payload = 0;
         for block in &self.blocks {
-            let ptr = block.bytes.as_ptr();
+            let ptr = block.bytes.id();
             if ptr != previous {
                 payload += payload_bytes(block);
             }
@@ -1199,7 +1442,7 @@ impl<T> CompactRows<T> {
         let shared = self
             .blocks
             .front()
-            .is_some_and(|front| front.bytes.as_ptr() == block.bytes.as_ptr());
+            .is_some_and(|front| front.bytes.id() == block.bytes.id());
         if let Some(payload) = &mut self.payload_bytes {
             if !shared {
                 *payload += payload_bytes(&block);
@@ -1214,7 +1457,7 @@ impl<T> CompactRows<T> {
         let shared = self
             .blocks
             .back()
-            .is_some_and(|back| back.bytes.as_ptr() == block.bytes.as_ptr());
+            .is_some_and(|back| back.bytes.id() == block.bytes.id());
         if let Some(payload) = &mut self.payload_bytes {
             if !shared {
                 *payload -= payload_bytes(&block);
@@ -1596,7 +1839,9 @@ impl<T> CompactRows<T> {
         if !self.oldest.is_empty() {
             let rows: Vec<_> = self.oldest.drain(..).collect();
             for chunk in rows.chunks(MAX_BLOCK_ROWS) {
-                deferred.sources.push_back(Block::new(chunk, codec));
+                deferred
+                    .sources
+                    .push_back(Block::new(chunk, codec, &mut self.arena));
             }
             for line in older.into_iter().rev() {
                 deferred.lines.push_back(line);
@@ -1649,15 +1894,17 @@ impl<T> CompactRows<T> {
         match deferred.read.take() {
             Some(rows) => {
                 for chunk in rows.chunks(self.block_rows) {
-                    self.blocks.push_back(Block::new(chunk, codec));
+                    self.blocks
+                        .push_back(Block::new(chunk, codec, &mut self.arena));
                 }
             }
             // Nothing read it yet: encode one block at a time rather than
             // reflowing every row first (tens of MB for full history).
             None => {
                 let blocks = &mut self.blocks;
+                let arena = &mut self.arena;
                 deferred.for_each_row_chunk(codec, self.block_rows, |rows| {
-                    blocks.push_back(Block::new(rows, codec));
+                    blocks.push_back(Block::new(rows, codec, arena));
                 });
             }
         }
@@ -1724,7 +1971,7 @@ impl<T> CompactRows<T> {
                 let first = &self.blocks[start];
                 (1..group).all(|offset| {
                     let block = &self.blocks[start + offset];
-                    Arc::ptr_eq(&first.bytes, &block.bytes)
+                    first.bytes.same(&block.bytes)
                         && block.start as usize == first.start as usize + offset * self.block_rows
                 })
             });
@@ -1850,20 +2097,25 @@ impl<T> CompactRows<T> {
             let cached = self
                 .evict_cache
                 .as_ref()
-                .is_some_and(|cache| Arc::ptr_eq(&cache.bytes, &block.bytes));
+                .is_some_and(|cache| cache.bytes.same(&block.bytes));
             if !cached {
-                self.evict_cache = Some(Box::new(EvictCache {
-                    bytes: block.bytes.clone(),
-                    index: (self.codec.index)(&block.bytes),
-                }));
+                // A payload the store cannot give back takes the decoding
+                // path below, which reads it as blank rows.
+                self.evict_cache = block.bytes.bytes().map(|bytes| {
+                    Box::new(EvictCache {
+                        bytes: block.bytes.clone(),
+                        index: (self.codec.index)(&bytes),
+                    })
+                });
             }
-            let cache = self.evict_cache.as_ref().expect("oldest block index");
-            let row = (self.codec.reset_row)(
-                &cache.index,
-                block.start as usize + block.count - 1,
-                template,
-                block.columns,
-            );
+            let row = self.evict_cache.as_ref().and_then(|cache| {
+                (self.codec.reset_row)(
+                    &cache.index,
+                    block.start as usize + block.count - 1,
+                    template,
+                    block.columns,
+                )
+            });
             if let Some(row) = row {
                 self.drop_oldest();
                 return row;
@@ -1920,11 +2172,11 @@ impl<T> CompactRows<T> {
             // the default template, and `Row::reset` overwrites every cell
             // for any other.
             let block = if self.spare.is_empty() {
-                let block = Block::recycling(&mut rows, self.codec);
+                let block = Block::recycling(&mut rows, self.codec, &mut self.arena);
                 self.spare = rows;
                 block
             } else {
-                Block::new(&rows, self.codec)
+                Block::new(&rows, self.codec, &mut self.arena)
             };
             self.push_block_front(block);
         }
@@ -2047,6 +2299,7 @@ pub fn cell_codec() -> RowCodec<Cell> {
         reflow_line: cell_reflow_line,
         clone_row: Row::clone,
         clear_row: |row| row.reset(&Cell::default()),
+        blank_row: Row::new,
         #[cfg(test)]
         rows_equal: |a, b| a == b,
     }
@@ -2851,10 +3104,11 @@ impl BlockEncoder {
         for style in &self.table.styles {
             put_style(raw, style);
         }
-        // One allocation of the exact size, shared by the block from here on.
+        // Copied into the history's arena by the caller, which then hands
+        // the buffer back (see `recycle_packed`).
         lz::compress_into(raw, &mut self.packed);
-        let bytes = Arc::from(&self.packed[..]);
-        ENCODE_SCRATCH.set((self.raw, self.text, self.runs, self.packed, self.clear_runs));
+        let bytes = std::mem::take(&mut self.packed);
+        ENCODE_SCRATCH.set((self.raw, self.text, self.runs, Vec::new(), self.clear_runs));
         // Emptied now so the scratch table holds no cell's extra storage.
         let mut table = self.table;
         table.clear();
@@ -2873,6 +3127,17 @@ impl BlockEncoder {
 fn release_encode_scratch() {
     drop(ENCODE_SCRATCH.take());
     drop(STYLE_SCRATCH.take());
+}
+
+/// Hands an encoded payload's buffer (see [`Encoded::bytes`]) back to
+/// [`ENCODE_SCRATCH`] once it has been copied, so the next block reuses it.
+fn recycle_packed(mut bytes: Vec<u8>) {
+    let mut scratch = ENCODE_SCRATCH.take();
+    if scratch.3.capacity() < bytes.capacity() {
+        bytes.clear();
+        scratch.3 = bytes;
+    }
+    ENCODE_SCRATCH.set(scratch);
 }
 
 type EncodeScratch = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<(usize, bool)>);
@@ -4026,6 +4291,212 @@ mod tests {
         assert_eq!(actual.into_rows(), expected);
     }
 
+    /// A [`ColdStore`] in memory that counts its traffic and can be told
+    /// to fail.
+    #[derive(Default)]
+    struct MemoryStore {
+        slots: std::sync::Mutex<HashMap<u64, Vec<u8>>>,
+        next: std::sync::atomic::AtomicU64,
+        stored: std::sync::atomic::AtomicUsize,
+        loads: std::sync::atomic::AtomicUsize,
+        fail_loads: AtomicBool,
+        fail_stores: AtomicBool,
+    }
+
+    impl ColdStore for MemoryStore {
+        fn store(&self, payloads: &[&[u8]]) -> std::io::Result<Vec<u64>> {
+            if self.fail_stores.load(Ordering::Relaxed) {
+                return Err(std::io::Error::other("disk full"));
+            }
+            let mut slots = self.slots.lock().unwrap();
+            Ok(payloads
+                .iter()
+                .map(|payload| {
+                    let slot = self.next.fetch_add(1, Ordering::Relaxed);
+                    self.stored.fetch_add(payload.len(), Ordering::Relaxed);
+                    slots.insert(slot, payload.to_vec());
+                    slot
+                })
+                .collect())
+        }
+
+        fn load(&self, slot: u64, len: usize) -> std::io::Result<Vec<u8>> {
+            self.loads.fetch_add(1, Ordering::Relaxed);
+            if self.fail_loads.load(Ordering::Relaxed) {
+                return Err(std::io::Error::other("unreadable"));
+            }
+            let slots = self.slots.lock().unwrap();
+            let bytes = slots.get(&slot).expect("live slot").clone();
+            assert_eq!(bytes.len(), len);
+            Ok(bytes)
+        }
+
+        fn release(&self, slot: u64, len: usize) {
+            let removed = self.slots.lock().unwrap().remove(&slot);
+            assert_eq!(removed.map(|bytes| bytes.len()), Some(len), "released once");
+        }
+    }
+
+    impl MemoryStore {
+        fn live(&self) -> usize {
+            self.slots.lock().unwrap().len()
+        }
+    }
+
+    fn cold(store: &Arc<MemoryStore>) -> Arc<dyn ColdStore> {
+        Arc::clone(store) as Arc<dyn ColdStore>
+    }
+
+    #[test]
+    fn a_payload_is_the_size_of_a_shared_slice() {
+        // The history budget counts `Block`s; paging must not change them.
+        assert_eq!(
+            std::mem::size_of::<Payload>(),
+            std::mem::size_of::<Arc<[u8]>>()
+        );
+    }
+
+    #[test]
+    fn paged_out_history_reads_the_same_and_counts_the_same() {
+        let rows = parser_rows();
+        let mut resident = CompactRows::new(rows.clone(), 24, 80, cell_codec());
+        let mut paged = CompactRows::new(rows.clone(), 24, 80, cell_codec());
+        let store = Arc::new(MemoryStore::default());
+        let before = paged.history_storage_bytes();
+        let report = paged.page_out(&cold(&store), 64, 0).unwrap();
+        assert!(report.payloads > 0);
+        assert!(report.kept_bytes > 0, "the newest block stays in memory");
+        assert_eq!(paged.history_storage_bytes(), before);
+        let residency = paged.payload_residency();
+        assert_eq!(residency.stored, report.payloads);
+        assert_eq!(residency.resident, 1);
+        assert_eq!(store.live(), report.payloads);
+        assert_rows(&paged, &rows);
+        assert!(store.loads.load(Ordering::Relaxed) >= report.payloads);
+        // Reads keep nothing: the payloads stay out of memory.
+        paged.release_read_cache();
+        assert_eq!(paged.payload_residency(), residency);
+
+        // A second idle transition writes nothing already stored.
+        let again = paged.page_out(&cold(&store), 64, 0).unwrap();
+        assert_eq!(again.payloads, 0);
+        assert_eq!(again.already_stored, report.payloads);
+
+        // Below the minimum, nothing moves.
+        let rows_small = parser_rows();
+        let mut small = CompactRows::new(rows_small, 24, 80, cell_codec());
+        let none = small.page_out(&cold(&store), 64, usize::MAX).unwrap();
+        assert_eq!(none.payloads, 0);
+        assert_eq!(small.payload_residency().stored, 0);
+
+        resident.bound_history_bytes(16 * 1024);
+        paged.bound_history_bytes(16 * 1024);
+        assert_eq!(paged.len(), resident.len());
+        assert_eq!(
+            paged.history_storage_bytes(),
+            resident.history_storage_bytes()
+        );
+        // Evicted payloads are released from the store.
+        assert_eq!(store.live(), paged.payload_residency().stored);
+        drop(paged);
+        assert_eq!(store.live(), 0, "every slot released with its history");
+    }
+
+    #[test]
+    fn paging_out_unmaps_the_memory_that_held_the_payloads() {
+        let live = || arena::LIVE_CHUNKS.with(std::cell::Cell::get);
+        let before = live();
+        let mut rows = Vec::new();
+        for _ in 0..12 {
+            rows.extend(parser_rows());
+        }
+        let mut storage = CompactRows::new(rows, 24, 80, cell_codec());
+        assert!(live() - before > 1, "history spans several chunks");
+        let store = Arc::new(MemoryStore::default());
+        storage.page_out(&cold(&store), 64, 0).unwrap();
+        assert_eq!(live() - before, 1, "only the recent window's chunk is left");
+        drop(storage);
+        assert_eq!(live(), before);
+    }
+
+    #[test]
+    fn a_store_error_leaves_history_in_memory_or_reads_blank() {
+        let rows = parser_rows();
+        let mut storage = CompactRows::new(rows.clone(), 24, 80, cell_codec());
+        let store = Arc::new(MemoryStore::default());
+        store.fail_stores.store(true, Ordering::Relaxed);
+        assert!(storage.page_out(&cold(&store), 0, 0).is_err());
+        assert_eq!(storage.payload_residency().stored, 0);
+        assert_rows(&storage, &rows);
+
+        store.fail_stores.store(false, Ordering::Relaxed);
+        storage.page_out(&cold(&store), 0, 0).unwrap();
+        store.fail_loads.store(true, Ordering::Relaxed);
+        // An unreadable payload reads as blank rows instead of failing.
+        let cold_row = storage.len() - 1;
+        assert!(storage.row(cold_row).is_clear());
+        storage.release_read_cache();
+        // Scrolling recycles through it without panicking.
+        storage.rotate_reset(storage.len() - 24, &Cell::default());
+        assert_eq!(storage.len(), rows.len());
+    }
+
+    #[test]
+    fn random_storage_operations_match_with_history_paged_out() {
+        let rows = parser_rows();
+        let mut expected = CompactRows::new(rows.clone(), 24, 80, cell_codec());
+        let mut actual = CompactRows::new(rows, 24, 80, cell_codec());
+        let store = Arc::new(MemoryStore::default());
+        let mut seed = 0x7a11_0c4e_u64;
+        for step in 0..800 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let n = (seed >> 32) as usize;
+            if step % 9 == 0 {
+                let keep = [0, 1, 64, 200][(n >> 4) % 4];
+                actual.page_out(&cold(&store), keep, 0).unwrap();
+            }
+            for storage in [&mut expected, &mut actual] {
+                match n % 6 {
+                    0 => {
+                        let count = (1 + n % 40).min(storage.len());
+                        storage.rotate_reset(count, &Cell::default());
+                    }
+                    1 => {
+                        storage.bound_history_bytes([usize::MAX, 64 << 10, 16 << 10][(n >> 8) % 3])
+                    }
+                    2 => {
+                        let index = n % storage.len();
+                        storage.row_mut(index)[Column(step % 80)].c = '雪';
+                    }
+                    3 => storage.initialize(1 + n % 7, 80),
+                    4 => storage.rotate(-((1 + n % 25).min(storage.len()) as isize)),
+                    _ => {
+                        let len = storage.len().saturating_sub(n % 5).max(30);
+                        storage.truncate(len.min(storage.len()));
+                    }
+                }
+                storage.set_visible(24);
+            }
+            assert_eq!(actual.len(), expected.len(), "step {step}");
+            assert_eq!(
+                actual.history_storage_bytes(),
+                expected.history_storage_bytes(),
+                "step {step}"
+            );
+            for index in 0..expected.len() {
+                assert_eq!(
+                    actual.row(index),
+                    expected.row(index),
+                    "step {step} row {index}"
+                );
+            }
+            actual.release_read_cache();
+            expected.release_read_cache();
+        }
+        drop(actual);
+        assert_eq!(store.live(), 0);
+    }
+
     #[test]
     fn frozen_history_can_be_edited_then_recompressed() {
         let mut expected = parser_rows();
@@ -4104,7 +4575,7 @@ mod tests {
         let mut codec = cell_codec();
         codec.decode = decode;
         let mut storage = CompactRows::new(original.clone(), 24, 80, codec);
-        let original_ptr = storage.blocks.back().unwrap().bytes.as_ptr();
+        let original_ptr = storage.blocks.back().unwrap().bytes.id();
         let count = storage.prepare_reflow(320, true, 0);
         assert!(count < storage.len());
         let mut recent = storage.drain_rows();
@@ -4118,7 +4589,7 @@ mod tests {
             "resize decoded cold history"
         );
         assert_eq!(storage.block_rows, 16);
-        assert_eq!(storage.blocks.back().unwrap().bytes.as_ptr(), original_ptr);
+        assert_eq!(storage.blocks.back().unwrap().bytes.id(), original_ptr);
         for (index, row) in original.iter().cloned().enumerate() {
             let mut expected = row;
             resize_cell_row(&mut expected, 320);
@@ -4135,7 +4606,7 @@ mod tests {
             storage.replace_rows(recent, 24, columns);
         }
         assert_eq!(storage.block_rows, block_rows::<Cell>(80));
-        assert_eq!(storage.blocks.back().unwrap().bytes.as_ptr(), original_ptr);
+        assert_eq!(storage.blocks.back().unwrap().bytes.id(), original_ptr);
         assert_rows(&storage, &original);
     }
 

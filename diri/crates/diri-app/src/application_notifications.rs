@@ -187,7 +187,7 @@ pub(crate) fn install(
                         if let Some(notification) = event.notification.filter(|_|deliver && (!active || event.in_app_banner.is_none())) { notifier.post(&notification); }
                     }
                     #[cfg(not(any(target_os = "macos", windows)))]
-                    let _ = active;
+                    let _ = (deliver, active);
                 }
                 change = changes.recv() => {
                     if matches!(change, Err(tokio::sync::broadcast::error::RecvError::Closed)) { break; }

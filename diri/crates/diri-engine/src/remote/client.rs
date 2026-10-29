@@ -1639,6 +1639,7 @@ pub(crate) mod tests {
 
     /// A Holder's HelloAck at `minor`; `capable` names `inline-images-v1`
     /// and `query-replies-v1`.
+    #[cfg(unix)]
     pub(crate) fn fixture_ack(minor: u16, capable: bool) -> HelloAck {
         use diri_proto::remote_pty::RemoteCapability;
         let mut capabilities = REQUIRED_CAPABILITIES.to_vec();

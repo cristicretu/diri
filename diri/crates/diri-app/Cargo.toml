@@ -83,6 +83,8 @@ rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 diri-i18n.workspace = true
+# init.lua: the Lua runtime and its script thread.
+diri-script.workspace = true
 sha2.workspace = true
 smallvec.workspace = true
 tempfile.workspace = true

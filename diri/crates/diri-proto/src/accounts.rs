@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AgentAccountProfile {
     pub id: String,
     pub label: String,
@@ -37,6 +38,7 @@ pub struct AgentAccountCatalog {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AgentAccountId {
     pub id: String,
 }
@@ -118,6 +120,7 @@ impl AgentAccountOverview {
 
 /// `account.adopt` and `account.add` name the Agent: `codex` or `claude-code`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AgentAccountAgent {
     pub agent: String,
 }
@@ -125,6 +128,7 @@ pub struct AgentAccountAgent {
 /// Switch conversations open in Diri tabs for this profile's Agent and execution host.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SwitchAccountParams {
     pub account_profile_id: String,
 }

@@ -42,8 +42,8 @@ use diri_proto::{
 use diri_term::buffer::GridBuffer;
 use diri_term::element::{ContentPaint, SharedGridBuffer, TerminalElement, TerminalReference};
 use diri_term::find::{
-    FindSearchScheduler, FindSnapshot, ReadCompletion, SearchRequest, SearchResult,
-    TerminalFindModel,
+    FindSearchScheduler, FindSnapshot, NavigationTarget, ReadCompletion, SearchRequest,
+    SearchResult, TerminalFindModel,
 };
 use diri_term::keys::{
     Key as TermKey, KeyEvent as TermKeyEvent, Modifiers as TermModifiers, NamedKey, paste,
@@ -379,6 +379,13 @@ enum PaneEvent {
         Option<FindSnapshot>,
     ),
     FindResult(SessionId, AttachmentGeneration, SearchRequest, SearchResult),
+    /// One page of the Engine's search of history older than the capture.
+    FindOlderPage(
+        SessionId,
+        AttachmentGeneration,
+        diri_term::find::OlderRequest,
+        Result<diri_proto::find::FindHistoryResult, ()>,
+    ),
     /// A scrollback reply, tagged like grid frames: a session id outlives the
     /// resident that asked, and a late reply must not reach its replacement.
     ScrollbackCells(
@@ -517,6 +524,17 @@ struct PaneMailboxState {
     /// producer set, and replacement generations overwrite detached work.
     find_completions: HashMap<SessionId, FindCompletion>,
     find_order: VecDeque<SessionId>,
+    /// The one older-history page a resident can have in flight. Never
+    /// dropped under queue pressure: the search waits for it.
+    older_pages: HashMap<
+        SessionId,
+        (
+            AttachmentGeneration,
+            diri_term::find::OlderRequest,
+            Result<diri_proto::find::FindHistoryResult, ()>,
+        ),
+    >,
+    older_order: VecDeque<SessionId>,
 }
 
 fn pane_event_channel() -> (PaneEventSender, PaneEventReceiver) {
@@ -579,6 +597,12 @@ impl PaneEventSender {
                     },
                 );
             }
+            PaneEvent::FindOlderPage(id, generation, request, page) => {
+                if !state.older_pages.contains_key(&id) {
+                    state.older_order.push_back(id.clone());
+                }
+                state.older_pages.insert(id, (generation, request, page));
+            }
             PaneEvent::FindResult(id, generation, request, result) => {
                 state.queue_find_completion(
                     id,
@@ -622,6 +646,11 @@ impl PaneEventReceiver {
         while let Some(id) = state.find_order.pop_front() {
             if let Some(completion) = state.find_completions.remove(&id) {
                 batch.push(completion.into_event(id));
+            }
+        }
+        while let Some(id) = state.older_order.pop_front() {
+            if let Some((generation, request, page)) = state.older_pages.remove(&id) {
+                batch.push(PaneEvent::FindOlderPage(id, generation, request, page));
             }
         }
         true
@@ -2220,9 +2249,28 @@ impl TerminalPane {
                     }
                     next = completion.into_next_request();
                 }
+                self.pump_older_find(&id);
                 if let Some(next) = next {
                     self.launch_find_read(id, generation, next);
                 }
+            }
+            PaneEvent::FindOlderPage(id, generation, request, page) => {
+                let current = self.attachment_is_current(&id, generation);
+                let visible = self.selected_id().as_ref() == Some(&id);
+                if let Some(resident) = self.residents.get_mut(&id)
+                    && let Some(find) = resident.find.as_mut()
+                {
+                    if !current {
+                        // Another attachment asked; this one asks again.
+                        find.release_older_request(&request);
+                    } else if find.apply_older_page(&request, page) {
+                        resident.element.sync_find_highlights(find);
+                        if visible {
+                            cx.notify();
+                        }
+                    }
+                }
+                self.pump_older_find(&id);
             }
             PaneEvent::ScrollbackCells(id, generation, result, visible_rows) => {
                 if !self.attachment_is_current(&id, generation) {
@@ -2909,6 +2957,33 @@ impl TerminalPane {
         });
     }
 
+    /// Asks the Engine for the next page of history older than the find
+    /// capture, if the search has one due. Each reply asks for the next, so
+    /// a search runs to the oldest row unless its query changes first.
+    fn pump_older_find(&mut self, id: &SessionId) {
+        let Some(resident) = self.residents.get_mut(id) else {
+            return;
+        };
+        let Some(request) = resident
+            .find
+            .as_mut()
+            .and_then(TerminalFindModel::take_older_request)
+        else {
+            return;
+        };
+        let generation = resident.attachment_generation;
+        let client = Arc::clone(self.runtime.client());
+        let pane_tx = self.pane_tx.clone();
+        let id = id.clone();
+        self.tokio.spawn(async move {
+            let page = client
+                .find_history(&request.params(id.clone()))
+                .await
+                .map_err(|_| ());
+            let _ = pane_tx.send(PaneEvent::FindOlderPage(id, generation, request, page));
+        });
+    }
+
     fn find_rescan_delay(&self, id: &SessionId) -> Duration {
         self.residents
             .get(id)
@@ -3342,12 +3417,17 @@ impl TerminalPane {
         let Some(find) = resident.find.as_mut() else {
             return;
         };
-        if backwards {
-            resident.element.find_previous(find);
+        let target = if backwards {
+            resident.element.find_previous(find)
         } else {
-            resident.element.find_next(find);
-        }
+            resident.element.find_next(find)
+        };
         resident.element.sync_find_highlights(find);
+        let rows = usize::from(resident.last_size.1);
+        if matches!(target, Some(NavigationTarget::History { .. })) {
+            // An older match is read from the Engine like scrolled history.
+            self.pump_scrollback_fetch(&id, rows);
+        }
         cx.stop_propagation();
         cx.notify();
     }
@@ -4247,12 +4327,16 @@ impl TerminalPane {
                     cx.notify();
                 }
                 "enter" => {
-                    if event.keystroke.modifiers.shift {
-                        resident.element.find_previous(find);
+                    let target = if event.keystroke.modifiers.shift {
+                        resident.element.find_previous(find)
                     } else {
-                        resident.element.find_next(find);
-                    }
+                        resident.element.find_next(find)
+                    };
                     resident.element.sync_find_highlights(find);
+                    let rows = usize::from(resident.last_size.1);
+                    if matches!(target, Some(NavigationTarget::History { .. })) {
+                        self.pump_scrollback_fetch(&id, rows);
+                    }
                     cx.notify();
                 }
                 // Everything else is text editing, through the same key map the
@@ -5548,7 +5632,7 @@ impl TerminalPane {
     ) -> Option<AnyElement> {
         let resident = self.residents.get(&session.id)?;
         let find = resident.find.as_ref()?;
-        let has_matches = !find.matches().is_empty();
+        let has_matches = find.match_count() > 0;
         let count = if !has_matches {
             if find.query().is_empty() {
                 String::new()
@@ -5556,7 +5640,7 @@ impl TerminalPane {
                 t("nav.no_matches").to_owned()
             }
         } else {
-            format!("{}/{}", find.current_index() + 1, find.matches().len())
+            format!("{}/{}", find.current_index() + 1, find.match_count())
         };
         let query = find_input::render(self, &session.id, colors, cx);
         let alt_screen = find.is_alt_screen();

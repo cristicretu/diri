@@ -41,6 +41,9 @@ pub enum AgentAction {
     SleepAgent,
     WakeAgent,
     ResumeAgent,
+    /// Ran one of the app's exported actions; the event's `command` names it
+    /// and the app shows that action's own title.
+    AppAction,
 }
 
 /// `agent.action`: `session_id` (the actor) did `action`.
@@ -49,6 +52,10 @@ pub struct AgentActionEvent {
     #[serde(rename = "sessionID")]
     pub session_id: SessionId,
     pub action: AgentAction,
+    /// For [`AgentAction::AppAction`]: the action's name (`toggle-sidebar`).
+    /// Additive; older apps drop the event's unknown action anyway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 /// Whether requests for `method` are stamped with an actor. Only methods
@@ -66,6 +73,7 @@ pub fn announces(method: &str) -> bool {
             | Method::SESSION_HIBERNATE
             | Method::SESSION_WAKE
             | Method::SESSION_RESUME
+            | Method::APP_PERFORM
     )
 }
 
@@ -85,9 +93,18 @@ pub fn announcement(method: &str, params: Option<&Value>) -> Option<AgentActionE
         .and_then(Value::as_str)
         .filter(|actor| !actor.is_empty())?;
     let action = action(method, params)?;
+    let command = (action == AgentAction::AppAction)
+        .then(|| {
+            params
+                .get("action")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .flatten();
     Some(AgentActionEvent {
         session_id: SessionId::new(actor),
         action,
+        command,
     })
 }
 
@@ -110,6 +127,7 @@ fn action(method: &str, params: &Value) -> Option<AgentAction> {
         Method::SESSION_HIBERNATE => AgentAction::SleepAgent,
         Method::SESSION_WAKE => AgentAction::WakeAgent,
         Method::SESSION_RESUME => AgentAction::ResumeAgent,
+        Method::APP_PERFORM => AgentAction::AppAction,
         _ => return None,
     })
 }
@@ -185,6 +203,7 @@ mod tests {
             Some(AgentActionEvent {
                 session_id: SessionId::new("agent-1"),
                 action: AgentAction::ZoomPane,
+                command: None,
             })
         );
         let cases = [
@@ -258,6 +277,7 @@ mod tests {
             Some(AgentActionEvent {
                 session_id: SessionId::new("agent-2"),
                 action: AgentAction::NewTab,
+                command: None,
             })
         );
         // Its strict params must never be stamped.
@@ -281,10 +301,33 @@ mod tests {
         let event = AgentActionEvent {
             session_id: SessionId::new("a"),
             action: AgentAction::EqualizePanes,
+            command: None,
         };
         assert_eq!(
             serde_json::to_value(&event).unwrap(),
             json!({"sessionID": "a", "action": "equalize_panes"})
+        );
+    }
+
+    #[test]
+    fn a_performed_app_action_names_the_action() {
+        let params = json!({"action": "toggle-sidebar", "args": {}, ACTOR_FIELD: "agent-1"});
+        assert!(announces(Method::APP_PERFORM));
+        assert_eq!(
+            announcement(Method::APP_PERFORM, Some(&params)),
+            Some(AgentActionEvent {
+                session_id: SessionId::new("agent-1"),
+                action: AgentAction::AppAction,
+                command: Some("toggle-sidebar".into()),
+            })
+        );
+        let wire = serde_json::to_value(announcement(Method::APP_PERFORM, Some(&params))).unwrap();
+        assert_eq!(wire["action"], "app_action");
+        assert_eq!(wire["command"], "toggle-sidebar");
+        // The person's own perform (no actor) is never announced.
+        assert_eq!(
+            announcement(Method::APP_PERFORM, Some(&json!({"action": "quit"}))),
+            None
         );
     }
 }

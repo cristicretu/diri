@@ -3,13 +3,16 @@ mod activity;
 mod arrivals;
 mod filter;
 mod hover_linger;
+mod hover_status;
 #[cfg(test)]
 mod hue_tests;
 mod lineage;
 mod pane_drop;
 mod project_picker;
+mod question_lines;
 mod rename_input;
 mod rows;
+mod split_mark;
 mod strip_tabs;
 mod tabs;
 pub(crate) use tabs::DraggedTab;
@@ -85,6 +88,11 @@ use lineage::{LineageRole, LineageSession, lineage_anchor, lineage_marks};
 const INSERT_BAND: f32 = Metrics::ROW_HEIGHT / 4.0;
 
 const PREVIEW_USAGE: f64 = 4.82;
+/// How often the remaining-quota footer re-reads its expiry and freshness.
+const QUOTA_TICK: Duration = Duration::from_secs(60);
+/// Limits older than this are refetched while the footer shows quota, well
+/// inside the six minutes after which `footer_quota` reads them as stale.
+const QUOTA_REFRESH_AFTER: i64 = 180;
 
 // Keep the navigation chrome on one quiet, predictable rhythm. The action
 // slots are fixed-width so revealing hover affordances never moves the title
@@ -716,6 +724,10 @@ pub struct Sidebar {
     hover_task: Option<Task<()>>,
     hover_keystrokes: Option<gpui::Subscription>,
     usage: Option<UsageSnapshot>,
+    /// Runs only while the footer shows remaining quota; see `sync_quota_refresh`.
+    quota_refresh: Option<Task<()>>,
+    quota_requested_at: i64,
+    quota_shown: Option<f64>,
     number_flows: crate::number_flow::Bank,
     accounts: accounts::MenuAccounts,
     update: UpdateState,
@@ -768,6 +780,8 @@ pub struct Sidebar {
     title_clock: fn() -> Instant,
     /// The instant every title in this pass is sampled at.
     title_now: Instant,
+    /// Waiting rows' question lines, opening and closing.
+    question_lines: question_lines::QuestionLines,
     /// The last paint asked the display link for another frame of a title
     /// settle.
     title_tick: bool,
@@ -947,6 +961,9 @@ impl Sidebar {
             hover_task: None,
             hover_keystrokes: None,
             usage: None,
+            quota_refresh: None,
+            quota_requested_at: 0,
+            quota_shown: None,
             number_flows: crate::number_flow::Bank::default(),
             accounts: accounts::MenuAccounts::new(preview),
             update: UpdateState::default(),
@@ -966,6 +983,7 @@ impl Sidebar {
             title_settles: TitleSettles::default(),
             title_clock: Instant::now,
             title_now: Instant::now(),
+            question_lines: Default::default(),
             title_tick: false,
             row_motion: Default::default(),
             hover_trails: hover_linger::HoverTrails::default(),
@@ -989,9 +1007,9 @@ impl Sidebar {
                 });
             }
             Ok("account") => sidebar.ui.popover = Some(Popover::Account),
-            Ok("layout") => sidebar.ui.popover = Some(Popover::SidebarLayout),
             _ => {}
         }
+        sidebar.sync_quota_refresh(cx);
         sidebar
     }
 
@@ -1129,16 +1147,78 @@ impl Sidebar {
         {
             cx.emit(SidebarEvent::RefreshUsageLimits);
         }
-        // Most refreshes only advance `updated_at`, which the sidebar does not
-        // show; redrawing for them costs a frame every few seconds.
+        // Timestamp-only ticks normally need no frame, except when the visible
+        // quota crosses freshness/reset expiry. Reuse incoming ticks, not a timer
+        // or another credential fetch, to invalidate that percentage.
+        let show_quota = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .sidebar_usage_indicator
+            == crate::store::SidebarUsageIndicator::RemainingQuota;
         let changed = self.usage.as_ref().is_none_or(|usage| {
-            UsageSnapshot {
-                updated_at: snapshot.updated_at,
-                ..usage.clone()
-            } != snapshot
+            (show_quota
+                && crate::usage::limits::footer_quota(&usage.limits, usage.updated_at)
+                    != crate::usage::limits::footer_quota(&snapshot.limits, snapshot.updated_at))
+                || UsageSnapshot {
+                    updated_at: snapshot.updated_at,
+                    ..usage.clone()
+                } != snapshot
         });
         self.usage = Some(snapshot);
         if changed {
+            cx.notify();
+        }
+    }
+
+    /// Limits are otherwise fetched only when the account menu opens, and usage
+    /// ticks only arrive with transcript activity, so a remaining-quota footer
+    /// read `—` from launch until the menu opened and again six minutes later.
+    /// Choosing that mode is the opt-in to these background limit reads; the
+    /// other modes keep the menu as the only trigger and start no timer.
+    fn sync_quota_refresh(&mut self, cx: &mut Context<Self>) {
+        let wanted = !self.preview
+            && self
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .preferences()
+                .sidebar_usage_indicator
+                == crate::store::SidebarUsageIndicator::RemainingQuota;
+        if wanted == self.quota_refresh.is_some() {
+            return;
+        }
+        self.quota_refresh = wanted.then(|| {
+            cx.spawn(async move |this, cx| {
+                loop {
+                    if this.update(cx, |this, cx| this.quota_tick(cx)).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(QUOTA_TICK).await;
+                }
+            })
+        });
+    }
+
+    fn quota_tick(&mut self, cx: &mut Context<Self>) {
+        let now = crate::usage::Clock::read(&crate::usage::SystemClock).unix_seconds;
+        let limits = self
+            .usage
+            .as_ref()
+            .map_or(&[][..], |usage| usage.limits.as_slice());
+        let mut live = limits.iter().filter(|limits| limits.live).peekable();
+        let stale = live.peek().is_none()
+            || live.any(|limits| now - limits.checked_at >= QUOTA_REFRESH_AFTER);
+        let shown = crate::usage::limits::footer_quota(limits, now)
+            .map(|quota| quota.remaining_percent.floor());
+        if stale && now - self.quota_requested_at >= QUOTA_REFRESH_AFTER {
+            self.quota_requested_at = now;
+            cx.emit(SidebarEvent::RefreshUsageLimits);
+        }
+        // An idle footer must still turn to `—` once its data expires.
+        if shown != self.quota_shown {
+            self.quota_shown = shown;
             cx.notify();
         }
     }
@@ -1750,69 +1830,6 @@ impl Sidebar {
 
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
-        if self.ui.popover == Some(Popover::SidebarLayout)
-            && !modifiers.platform
-            && !modifiers.control
-            && !modifiers.alt
-        {
-            let handled = match key {
-                "up" => {
-                    self.move_layout_menu_cursor(-1);
-                    true
-                }
-                "down" => {
-                    self.move_layout_menu_cursor(1);
-                    true
-                }
-                "home" => {
-                    self.ui.layout_menu_index = 0;
-                    true
-                }
-                "end" => {
-                    self.ui.layout_menu_index = self.layout_menu_item_count().saturating_sub(1);
-                    true
-                }
-                "enter" | "space" => {
-                    self.activate_layout_menu_cursor();
-                    true
-                }
-                "p" => {
-                    self.set_sidebar_grouping(SidebarGrouping::Project);
-                    true
-                }
-                "r" => {
-                    self.set_sidebar_grouping(SidebarGrouping::Recency);
-                    true
-                }
-                "c" => {
-                    let project_grouped = self
-                        .store
-                        .read()
-                        .expect("session store lock poisoned")
-                        .preferences()
-                        .sidebar_grouping
-                        == SidebarGrouping::Project;
-                    if project_grouped {
-                        self.set_sidebar_ordering(SidebarOrdering::Custom);
-                    }
-                    project_grouped
-                }
-                "n" => {
-                    self.set_sidebar_ordering(SidebarOrdering::NewestFirst);
-                    true
-                }
-                "o" => {
-                    self.set_sidebar_ordering(SidebarOrdering::OldestFirst);
-                    true
-                }
-                _ => false,
-            };
-            if handled {
-                cx.stop_propagation();
-                cx.notify();
-                return;
-            }
-        }
         if key == "escape" && self.cancel_delegation(cx) {
             cx.stop_propagation();
             return;
@@ -1840,11 +1857,6 @@ impl Sidebar {
                 self.filter_generation += 1;
                 self.filter_open = true;
                 self.filter_focus.focus(window, cx);
-                true
-            }
-            "g" => {
-                self.open_sidebar_layout_popover();
-                cx.notify();
                 true
             }
             // Deliberately consumed but unbound. Hold-to-peek owns Space in
@@ -2154,8 +2166,6 @@ impl Sidebar {
         let in_settings = self.settings_nav.is_some();
         let primary_control = if in_settings { "settings" } else { "search" };
         let primary_hover = self.ui.hovered_control == Some(primary_control);
-        let layout_open = self.ui.popover == Some(Popover::SidebarLayout);
-        let layout_hover = self.ui.hovered_control == Some("sidebar-layout") || layout_open;
         let toggle_hover = self.ui.hovered_control == Some("sidebar-toggle");
         // Search and Settings back share one fixed slot. Settings itself lives
         // in the account menu, keeping the everyday chrome to two controls.
@@ -2213,29 +2223,6 @@ impl Sidebar {
                 TRAILING_COLUMN_CENTER - Metrics::TOOLBAR_CONTROL_SIZE / 2.0
             ))
             .gap(px(Metrics::TOOLBAR_COMPACT_GAP))
-            .when(!in_settings, |bar| {
-                bar.child(icon_button(
-                    "sidebar-layout",
-                    t("sidebar.group_and_order"),
-                    None,
-                    "gearshape",
-                    layout_hover,
-                    colors,
-                    cx.listener(|this, _, window, cx| {
-                        this.focus_handle.focus(window, cx);
-                        if this.ui.popover == Some(Popover::SidebarLayout) {
-                            this.ui.popover = None;
-                        } else {
-                            this.open_sidebar_layout_popover();
-                        }
-                        cx.notify();
-                    }),
-                    cx.listener(|this, hovered: &bool, _, cx| {
-                        this.ui.hovered_control = hovered.then_some("sidebar-layout");
-                        cx.notify();
-                    }),
-                ))
-            })
             .child(primary_button)
             .child(crate::held_hints::below(
                 icon_button(
@@ -3148,7 +3135,9 @@ impl Sidebar {
         if frame.reveal > 0.0 {
             let mut children = Vec::new();
             for (row, presence, ghost) in super::row_motion::paint_order(&rows, &slots) {
-                let height = self.session_row_height() * presence.height;
+                let question = self.observe_question(row, cx.reduce_motion());
+                let natural = question.1;
+                let height = natural * presence.height;
                 let margin = 2.0 * presence.height;
                 let moving = presence != super::row_motion::Presence::FULL || ghost;
                 if !self.place_row(
@@ -3178,13 +3167,14 @@ impl Sidebar {
                     drop,
                     group.host.is_some(),
                     colors,
+                    question,
                     presence != super::row_motion::Presence::FULL || ghost,
                     window,
                     cx,
                 );
                 // A leaving row does not keep the activity tick alive.
                 self.working_row_rendered &= !ghost || working;
-                let rendered = self.row_slot(rendered, presence, ghost);
+                let rendered = self.row_slot(rendered, presence, natural, ghost);
                 let rendered = if collapsed || ghost {
                     rendered
                 } else {
@@ -3378,7 +3368,9 @@ impl Sidebar {
             let slots = self.arrange_rows(bucket.label(), &bucket_rows);
             let mut children = Vec::new();
             for (row, presence, ghost) in super::row_motion::paint_order(&bucket_rows, &slots) {
-                let height = self.session_row_height() * presence.height;
+                let question = self.observe_question(row, cx.reduce_motion());
+                let natural = question.1;
+                let height = natural * presence.height;
                 let margin = 2.0 * presence.height;
                 let moving = presence != super::row_motion::Presence::FULL || ghost;
                 if !self.place_row((!ghost).then(|| row.id()), margin, height, moving) {
@@ -3392,7 +3384,7 @@ impl Sidebar {
                     .flatten();
                 let working = self.working_row_rendered;
                 let rendered =
-                    self.mount_session_row(row, shortcut, drop, false, colors, moving, window, cx);
+                    self.mount_session_row(row, shortcut, drop, false, colors, question, moving, window, cx);
                 self.working_row_rendered &= !ghost || working;
                 // Buckets interleave every project and the row names none of
                 // them, so here the row wears its project's hue.
@@ -3401,7 +3393,7 @@ impl Sidebar {
                         .relative()
                         .child(rendered)
                         .child(
-                            crate::project_hue::row_tick(hue, self.session_row_height())
+                            crate::project_hue::row_tick(hue, natural)
                                 .debug_selector({
                                     let id = id.clone();
                                     move || format!("PROJECT_HUE_{}", id.0)
@@ -3410,7 +3402,7 @@ impl Sidebar {
                         .into_any_element(),
                     None => rendered,
                 };
-                let rendered = self.row_slot(rendered, presence, ghost);
+                let rendered = self.row_slot(rendered, presence, natural, ghost);
                 let rendered = if ghost {
                     rendered
                 } else {
@@ -3796,7 +3788,8 @@ impl Sidebar {
             ref drag_selection,
             migrating,
             activity_state,
-            ref blocker,
+            ref question,
+            height: row_height,
             ref activity,
             panes,
             progress,
@@ -3810,6 +3803,7 @@ impl Sidebar {
             held_hint,
             hover_linger,
             look,
+            ref split,
             ..
         } = *props;
         let drop = drop.clone();
@@ -3842,7 +3836,7 @@ impl Sidebar {
         ) - if loading { 60.0 } else { 0.0 }
             - if scheduled_run.is_some() { 18.0 } else { 0.0 }
             - if panes > 1 {
-                PANE_COUNT_WIDTH + 8.0
+                split_mark::WIDTH + 8.0
             } else {
                 0.0
             }
@@ -3885,7 +3879,7 @@ impl Sidebar {
                 .id(format!("rename:{}", id.0))
                 .pl(px(Space::ROW_H))
                 .pr(px(Space::ROW_H))
-                .h(px(self.session_row_height()))
+                .h(px(row_height))
                 .flex()
                 .items_center()
                 .gap(px(8.0))
@@ -3987,7 +3981,7 @@ impl Sidebar {
             // rows (New Agent, project headers).
             .pl(px(Space::ROW_H - 1.0))
             .pr(px(Space::ROW_H - 1.0))
-            .h(px(self.session_row_height()))
+            .h(px(row_height))
             .flex()
             .items_center()
             .gap(px(8.0))
@@ -4141,15 +4135,10 @@ impl Sidebar {
             ))
             .child(
                 {
-                    // A row waiting on a named question shows the question
-                    // in place of its title. Under Activity the question is
-                    // the second line instead, and a typed filter matches
-                    // titles, so both keep the title.
-                    let asking = blocker.is_some() && activity.is_none() && filter.trim().is_empty();
-                    let title = match blocker {
-                        Some(blocker) if asking => blocker.clone(),
-                        _ => title,
-                    };
+                    // A row waiting on a named question keeps its title and
+                    // reads the question on a second line, as Activity does.
+                    let question = question.as_ref().filter(|_| activity.is_none());
+                    let two_lines = activity.is_some() || question.is_some();
                     let element = if let Some(range) = super::filter::label_match(&title, filter) {
                     div()
                         .w(px(title_available_width))
@@ -4167,7 +4156,7 @@ impl Sidebar {
                         .into_any_element()
                 } else if let Some(settling) = self
                     .settling_title(&id, title_available_width)
-                    .filter(|_| !asking)
+                    .filter(|_| !two_lines)
                 {
                     // The marquee's own box, so the title stays where it is.
                     div()
@@ -4192,30 +4181,45 @@ impl Sidebar {
                     .font_weight(Typo::ROW.weight)
                     .into_any_element()
                 };
-                    match activity {
-                        // Two lines ellipsize to the room they get rather
-                        // than scroll on hover.
-                        Some((line, age)) => activity_title(
-                            if filter.trim().is_empty() {
-                                div()
-                                    .min_w(px(0.0))
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .text_size(px(Typo::ROW.size))
-                                    .font_weight(Typo::ROW.weight)
-                                    .text_color(title_color)
-                                    .child(display_title(session))
-                                    .into_any_element()
-                            } else {
-                                element
-                            },
+                    // Two lines ellipsize to the room they get rather than
+                    // scroll on hover.
+                    let still_title = if !two_lines {
+                        None
+                    } else if filter.trim().is_empty() {
+                        Some(
+                            div()
+                                .min_w(px(0.0))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_size(px(Typo::ROW.size))
+                                .font_weight(Typo::ROW.weight)
+                                .text_color(title_color)
+                                .child(display_title(session))
+                                .into_any_element(),
+                        )
+                    } else {
+                        None
+                    };
+                    let still_title = |element| still_title.unwrap_or(element);
+                    match (activity, question) {
+                        (Some((line, age)), _) => activity_title(
+                            still_title(element),
                             line,
                             age.as_deref(),
+                            1.0,
                             title_available_width,
                             colors,
                         ),
-                        None => element,
+                        (None, Some(question)) => activity_title(
+                            still_title(element),
+                            &question.text,
+                            None,
+                            question.reveal,
+                            title_available_width,
+                            colors,
+                        ),
+                        (None, None) => element,
                     }
                 },
             )
@@ -4267,9 +4271,10 @@ impl Sidebar {
                 // This session's agent runs on another machine.
                 element.child(remote_mark(colors))
             })
-            .when(panes > 1, |element| {
-                // A split tab is still one row; this says how many panes.
-                element.child(pane_count_mark(&id, panes, colors))
+            .when_some(split.as_ref(), |element, split| {
+                // A split tab is still one row; this draws its layout with
+                // each pane's state, so you can see which pane asks.
+                element.child(split.render(format!("session-panes:{}", id.0)))
             })
             .when_some(lineage, |element, role| {
                 element.child(lineage_glyph(&id, role, colors))
@@ -4928,7 +4933,15 @@ impl Sidebar {
     fn account_footer(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
         let hovered = self.ui.hovered_control == Some("account");
         let account_label = local_account_label(self.preview);
-        let cost = if self.preview {
+        let indicator = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .sidebar_usage_indicator;
+        let cost = if indicator != crate::store::SidebarUsageIndicator::EstimatedCost {
+            None
+        } else if self.preview {
             Some(PREVIEW_USAGE)
         } else {
             self.usage
@@ -4936,6 +4949,32 @@ impl Sidebar {
                 .map(|snapshot| snapshot.today().cost)
                 .filter(|cost| *cost > 0.0)
         };
+        let quota = (indicator == crate::store::SidebarUsageIndicator::RemainingQuota).then(|| {
+            let preview;
+            let limits = if self.preview {
+                preview = crate::usage::limits::preview();
+                preview.as_slice()
+            } else {
+                self.usage
+                    .as_ref()
+                    .map_or(&[][..], |usage| usage.limits.as_slice())
+            };
+            let now = crate::usage::Clock::read(&crate::usage::SystemClock).unix_seconds;
+            match crate::usage::limits::footer_quota(limits, now) {
+                Some(quota) => (
+                    format!("{:.0}%", quota.remaining_percent.floor()),
+                    tf(
+                        "sidebar.usage.quota_tooltip",
+                        &[
+                            ("agent", &quota.provider),
+                            ("account", &quota.account),
+                            ("window", &quota.window),
+                        ],
+                    ),
+                ),
+                None => ("—".to_owned(), t("sidebar.usage.unavailable").to_owned()),
+            }
+        });
         div()
             .flex_none()
             .px(px(Space::INSET))
@@ -4990,15 +5029,39 @@ impl Sidebar {
                             .child(account_label),
                     )
                     .when_some(cost, |row, cost| {
-                        row.child(self.number_flows.show_font(
-                            "sidebar-today",
-                            cost,
-                            UsageFormat::money(cost),
-                            Typo::META_MONO.size,
-                            colors.tertiary,
-                            FontWeight::NORMAL,
-                            Some(SharedString::from(crate::fonts::mono_family())),
+                        row.child(div().debug_selector(|| "sidebar-cost".into()).child(
+                            self.number_flows.show_font(
+                                "sidebar-today",
+                                cost,
+                                UsageFormat::money(cost),
+                                Typo::META_MONO.size,
+                                colors.tertiary,
+                                FontWeight::NORMAL,
+                                Some(SharedString::from(crate::fonts::mono_family())),
+                            ),
                         ))
+                    })
+                    .when_some(quota, |row, (label, tooltip)| {
+                        row.child(
+                            div()
+                                .id("sidebar-quota")
+                                .debug_selector(|| "sidebar-quota".into())
+                                .flex_none()
+                                .font_family(crate::fonts::mono_family())
+                                .text_size(px(Typo::META_MONO.size))
+                                .text_color(colors.tertiary)
+                                .aria_label(tooltip.clone())
+                                .child(label)
+                                .warm_tooltip(move |_, cx| {
+                                    cx.new(|_| {
+                                        crate::palette_chrome::PaletteTooltip(
+                                            tooltip.clone(),
+                                            colors,
+                                        )
+                                    })
+                                    .into()
+                                }),
+                        )
                     })
                     .child(
                         div()
@@ -5024,7 +5087,6 @@ impl Sidebar {
                 Some(self.new_agent_popover(directory, host, colors, cx))
             }
             Popover::Account => Some(self.account_popover(colors, cx)),
-            Popover::SidebarLayout => Some(self.sidebar_layout_popover(colors, cx)),
             Popover::ProjectActions { id, position } => {
                 Some(self.project_actions_popover(id, position, colors, cx))
             }
@@ -5034,115 +5096,7 @@ impl Sidebar {
         }
     }
 
-    fn sidebar_layout_popover(
-        &self,
-        colors: SemanticColors,
-        cx: &mut Context<Self>,
-    ) -> PopoverSpec {
-        let (grouping, ordering) = {
-            let store = self.store.read().expect("session store lock poisoned");
-            (
-                store.preferences().sidebar_grouping,
-                store.preferences().sidebar_ordering,
-            )
-        };
-        let section_label = |label: &'static str| {
-            div()
-                .px(px(9.0))
-                .pt(px(7.0))
-                .pb(px(3.0))
-                .text_size(px(Typo::SECTION_HEADER.size))
-                .font_weight(Typo::SECTION_HEADER.weight)
-                .text_color(colors.tertiary)
-                .child(label)
-        };
-        let mut content = div()
-            .id("sidebar-view-options")
-            .flex()
-            .flex_col()
-            .role(Role::Menu)
-            .aria_label(t("sidebar.layout.options"))
-            .rounded(px(Radius::FLOATING_MENU))
-            .p(px(4.0))
-            .child(section_label(t("sidebar.layout.grouping")))
-            .child(choice_menu_row(
-                "sidebar-group-project",
-                t("sidebar.layout.project"),
-                "P",
-                grouping == SidebarGrouping::Project,
-                self.ui.layout_menu_index == 0,
-                colors,
-                cx.listener(|this, _, _, cx| {
-                    this.set_sidebar_grouping(SidebarGrouping::Project);
-                    cx.notify();
-                }),
-            ))
-            .child(choice_menu_row(
-                "sidebar-group-recency",
-                t("sidebar.layout.recency"),
-                "R",
-                grouping == SidebarGrouping::Recency,
-                self.ui.layout_menu_index == 1,
-                colors,
-                cx.listener(|this, _, _, cx| {
-                    this.set_sidebar_grouping(SidebarGrouping::Recency);
-                    cx.notify();
-                }),
-            ))
-            .child(menu_divider(colors))
-            .child(section_label(t("sidebar.layout.ordering")));
-        if grouping == SidebarGrouping::Project {
-            content = content.child(choice_menu_row(
-                "sidebar-order-custom",
-                t("sidebar.layout.custom"),
-                "C",
-                ordering == SidebarOrdering::Custom,
-                self.ui.layout_menu_index == 2,
-                colors,
-                cx.listener(|this, _, _, cx| {
-                    this.set_sidebar_ordering(SidebarOrdering::Custom);
-                    cx.notify();
-                }),
-            ));
-        }
-        content = content
-            .child(choice_menu_row(
-                "sidebar-order-newest",
-                t("sidebar.layout.newest_first"),
-                "N",
-                ordering == SidebarOrdering::NewestFirst,
-                self.ui.layout_menu_index
-                    == if grouping == SidebarGrouping::Project {
-                        3
-                    } else {
-                        2
-                    },
-                colors,
-                cx.listener(|this, _, _, cx| {
-                    this.set_sidebar_ordering(SidebarOrdering::NewestFirst);
-                    cx.notify();
-                }),
-            ))
-            .child(choice_menu_row(
-                "sidebar-order-oldest",
-                t("sidebar.layout.oldest_first"),
-                "O",
-                ordering == SidebarOrdering::OldestFirst,
-                self.ui.layout_menu_index
-                    == if grouping == SidebarGrouping::Project {
-                        4
-                    } else {
-                        3
-                    },
-                colors,
-                cx.listener(|this, _, _, cx| {
-                    this.set_sidebar_ordering(SidebarOrdering::OldestFirst);
-                    cx.notify();
-                }),
-            ));
-        self.popover_shell(Metrics::TITLE_BAR - 2.0, content, colors, cx)
-    }
-
+    #[cfg(test)]
     fn set_sidebar_grouping(&mut self, grouping: SidebarGrouping) {
         let _ = self
             .store
@@ -5158,85 +5112,6 @@ impl Sidebar {
             });
         self.ui.popover = None;
         self.list_scroll.set_offset(point(px(0.0), px(0.0)));
-    }
-
-    fn open_sidebar_layout_popover(&mut self) {
-        let grouping = self
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .preferences()
-            .sidebar_grouping;
-        self.ui.layout_menu_index = usize::from(grouping == SidebarGrouping::Recency);
-        self.ui.popover = Some(Popover::SidebarLayout);
-    }
-
-    fn layout_menu_item_count(&self) -> usize {
-        let project_grouped = self
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .preferences()
-            .sidebar_grouping
-            == SidebarGrouping::Project;
-        if project_grouped { 5 } else { 4 }
-    }
-
-    fn move_layout_menu_cursor(&mut self, delta: isize) {
-        let count = self.layout_menu_item_count();
-        if count == 0 {
-            return;
-        }
-        self.ui.layout_menu_index =
-            (self.ui.layout_menu_index as isize + delta).rem_euclid(count as isize) as usize;
-    }
-
-    fn activate_layout_menu_cursor(&mut self) {
-        let grouping = self
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .preferences()
-            .sidebar_grouping;
-        match (grouping, self.ui.layout_menu_index) {
-            (_, 0) => self.set_sidebar_grouping(SidebarGrouping::Project),
-            (_, 1) => self.set_sidebar_grouping(SidebarGrouping::Recency),
-            (SidebarGrouping::Project, 2) => self.set_sidebar_ordering(SidebarOrdering::Custom),
-            (SidebarGrouping::Project, 3) | (SidebarGrouping::Recency, 2) => {
-                self.set_sidebar_ordering(SidebarOrdering::NewestFirst)
-            }
-            (SidebarGrouping::Project, 4) | (SidebarGrouping::Recency, 3) => {
-                self.set_sidebar_ordering(SidebarOrdering::OldestFirst)
-            }
-            _ => {}
-        }
-    }
-
-    fn set_sidebar_ordering(&mut self, ordering: SidebarOrdering) {
-        let _ = self
-            .store
-            .write()
-            .expect("session store lock poisoned")
-            .update_preferences(|prefs| prefs.sidebar_ordering = ordering);
-        self.ui.popover = None;
-        self.list_scroll.set_offset(point(px(0.0), px(0.0)));
-    }
-
-    fn popover_shell(
-        &self,
-        top: f32,
-        child: impl IntoElement,
-        colors: SemanticColors,
-        cx: &mut Context<Self>,
-    ) -> PopoverSpec {
-        self.popover_shell_at(
-            point(px(12.0), px(top)),
-            Anchor::TopLeft,
-            276.0,
-            child,
-            colors,
-            cx,
-        )
     }
 
     /// Anchors above the account footer (Swift: popover opens upward).
@@ -6354,9 +6229,10 @@ impl Sidebar {
         panel
     }
 
-    /// Version and update state, always present: Check when idle, Download
-    /// or Restart when an update is available or staged, no action while a
-    /// check or download runs or on builds that cannot update themselves.
+    /// "Check for Updates…" beside the running version when idle; otherwise
+    /// the update state itself, which downloads or restarts when clicked and
+    /// does nothing while a check or download runs or on builds that cannot
+    /// update themselves.
     fn update_menu_row(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
         let unsupported = matches!(self.update.phase, UpdatePhase::Unsupported(_));
         let command = match &self.update.phase {
@@ -6370,52 +6246,25 @@ impl Sidebar {
                 user_initiated: true,
             }),
         };
-        let label = if self.preview {
-            format!("diri {}", crate::updates::CURRENT_VERSION)
-        } else {
-            self.update.summary()
-        };
-        let mut row = div()
-            .id("account-version")
-            .debug_selector(|| "account-version".into())
-            .mx(px(6.0))
-            .px(px(8.0))
-            .h(px(ACCOUNT_MENU_ACTION_ROW_HEIGHT))
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
-            .text_size(px(Typo::ROW.size))
-            .text_color(if unsupported {
-                colors.tertiary
-            } else {
-                colors.primary
-            })
-            .child(
-                div()
-                    .min_w(px(0.0))
-                    .flex_1()
-                    .whitespace_nowrap()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .child(label),
+        let idle = self.preview
+            || matches!(
+                self.update.phase,
+                UpdatePhase::Idle | UpdatePhase::UpToDate
             );
+        let (label, trailing) = if idle {
+            (
+                t("sidebar.update.check_for_updates").to_owned(),
+                Some(SharedString::from(crate::updates::CURRENT_VERSION)),
+            )
+        } else {
+            (self.update.summary(), None)
+        };
+        let mut row = account_menu_item("account-version", label, None, trailing, colors)
+            .when(unsupported, |row| row.text_color(colors.tertiary));
         if let Some(command) = command {
-            let action = match command {
-                UpdateCommand::Download => t("sidebar.update.download"),
-                UpdateCommand::Install => t("sidebar.update.restart"),
-                _ => t("sidebar.update.check"),
-            };
             row = row
                 .cursor_pointer()
                 .glass_menu_row(colors, false)
-                .child(
-                    div()
-                        .flex_none()
-                        .text_size(px(Typo::META.size))
-                        .text_color(colors.tertiary)
-                        .child(action),
-                )
                 .on_click(cx.listener(move |this, _, _, cx: &mut Context<Self>| {
                     cx.emit(SidebarEvent::Update(command.clone()));
                     this.ui.popover = None;
@@ -6458,7 +6307,7 @@ impl Sidebar {
                 div()
                     .mx(px(6.0))
                     .px(px(8.0))
-                    .h(px(32.0))
+                    .h(px(ACCOUNT_MENU_ACTION_ROW_HEIGHT + 4.0))
                     .flex()
                     .items_center()
                     .gap(px(8.0))
@@ -6473,13 +6322,6 @@ impl Sidebar {
                             .text_size(px(Typo::ROW.size))
                             .text_color(colors.primary)
                             .child(account_label),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(Typo::META.size))
-                            .text_color(colors.tertiary)
-                            .child(t("sidebar.account.this_mac")),
                     ),
             )
             .child(menu_divider(colors))
@@ -6491,19 +6333,26 @@ impl Sidebar {
                 colors,
             ))
             .child(menu_divider(colors))
-            .child(account_action_row(
-                "account-settings",
-                t("sidebar.account.settings"),
-                crate::commands::command(CommandId::OpenSettings).shortcut_label(),
-                colors,
-                cx.listener(|this, _, window, cx| {
+            .child(
+                account_menu_item(
+                    "account-settings",
+                    t("sidebar.account.settings"),
+                    None,
+                    crate::commands::command(CommandId::OpenSettings)
+                        .shortcut_label()
+                        .map(SharedString::from),
+                    colors,
+                )
+                .cursor_pointer()
+                .glass_menu_row(colors, false)
+                .on_click(cx.listener(|this, _, window, cx| {
                     this.ui.popover = None;
                     this.in_main_window(window, cx, |_, window, cx| {
                         window.dispatch_action(Box::new(OpenSettings), cx);
                     });
                     cx.notify();
-                }),
-            ))
+                })),
+            )
             .child(self.update_menu_row(colors, cx))
             .child(div().h(px(3.0)));
         self.popover_shell_above_footer(content, colors, cx)
@@ -7098,11 +6947,21 @@ impl Sidebar {
     ) -> Option<(gpui::Stateful<gpui::Div>, Bounds<Pixels>)> {
         let id = self.ui.hover_card.as_ref()?;
         let row = *self.row_bounds.borrow().get(id)?;
-        let (session, project) = {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0.0, |elapsed| elapsed.as_secs_f64() * 1000.0);
+        let (session, project, status) = {
             let store = self.store.read().expect("session store lock poisoned");
             let session = store.sessions().get(id)?.clone();
             let project = store.projects().get(&session.project_id).cloned();
-            (session, project)
+            let status = hover_status::HoverStatus::of(
+                &session,
+                store.split_layout_of(id),
+                |pane| store.sessions().get(pane).cloned(),
+                store.migrating().contains(id),
+                now_ms,
+            );
+            (session, project, status)
         };
         let mut details = div().flex().flex_col().gap(px(5.0));
         if session.hibernation.is_some() {
@@ -7160,6 +7019,7 @@ impl Sidebar {
                     .text_color(colors.primary)
                     .child(display_title(&session)),
             )
+            .when_some(status, |card, status| card.child(status.render(now_ms, colors)))
             .child(details);
         Some((card, row))
     }
@@ -7280,6 +7140,7 @@ impl Sidebar {
     /// One publication from the shared store.
     pub(crate) fn store_changed(&mut self, cx: &mut Context<Self>) {
         self.store.write().expect("store").reconcile();
+        self.sync_quota_refresh(cx);
         // Rows read the store only through their props.
         self.notify_without_staling_rows(cx);
     }
@@ -7311,8 +7172,10 @@ impl Sidebar {
             .entry(session.id.clone())
             .or_insert_with(|| cx.new(|_| StatusGlyph::new(kind, state, 16.0, colors)))
             .clone();
+        let program = crate::session_presentation::program_glyph(session);
         entity.update(cx, |glyph, cx| {
             glyph.set_kind(kind, cx);
+            glyph.set_glyph(program, cx);
             glyph.set_state(state, window, cx);
             glyph.set_colors(colors, cx);
         });
@@ -8793,10 +8656,12 @@ impl Sidebar {
             .unwrap_or_default();
         self.lineage_roles = lineage_roles;
         retain_live_glyphs(&mut self.glyphs, &projection.display_order);
+        self.question_lines.retain(&projection.display_order);
         self.end_lift_if_released(cx);
         // The session list is the sidebar's most expensive frame work,
         // and settings has no use for it.
         self.row_motion.begin_layout(self.title_now);
+        self.question_lines.begin_pass();
         let list = self.settings_nav.is_none().then(|| {
             let mut list = div()
                 .id("sidebar-list")
@@ -8836,7 +8701,8 @@ impl Sidebar {
             list
         });
         self.row_motion.end_layout();
-        self.disclosure_animating |= self.row_motion.is_animating(self.title_now);
+        self.disclosure_animating |= self.row_motion.is_animating(self.title_now)
+            || self.question_lines.is_animating(self.title_now);
         self.rows_mounted = list.is_some();
         self.rows_stale = false;
         self.notify_keeps_rows = false;
@@ -9337,34 +9203,6 @@ fn archive_count(count: usize, colors: SemanticColors) -> AnyElement {
 /// rather than the host's name: the name repeated down a whole project reads
 /// as a wall of chips, while one small server mark says "not this machine"
 /// without competing with the titles.
-const PANE_COUNT_WIDTH: f32 = 24.0;
-
-/// A split tab's pane count: a quiet two-column glyph and the number.
-fn pane_count_mark(id: &SessionId, panes: usize, colors: SemanticColors) -> AnyElement {
-    div()
-        .debug_selector({
-            let id = id.clone();
-            move || format!("session-panes:{}", id.0)
-        })
-        .id(format!("session-panes:{}", id.0))
-        .role(Role::Image)
-        .aria_label(tf("session.pane_count", &[("count", &panes)]))
-        .flex_none()
-        .w(px(PANE_COUNT_WIDTH))
-        .flex()
-        .items_center()
-        .justify_end()
-        .gap(px(2.0))
-        .child(sf_symbol("rectangle.split.2x1", 9.0, colors.tertiary))
-        .child(
-            div()
-                .text_size(px(Typo::META.size))
-                .text_color(colors.tertiary)
-                .child(panes.to_string()),
-        )
-        .into_any_element()
-}
-
 fn remote_mark(colors: SemanticColors) -> AnyElement {
     div()
         .debug_selector(|| "remote-mark".to_owned())
@@ -9440,68 +9278,6 @@ fn menu_row(
         .text_size(px(Typo::ROW.size))
         .text_color(colors.primary)
         .child(label)
-        .on_click(on_click)
-        .into_any_element()
-}
-
-fn choice_menu_row(
-    id: &'static str,
-    label: &'static str,
-    shortcut: &'static str,
-    selected: bool,
-    focused: bool,
-    colors: SemanticColors,
-    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-) -> AnyElement {
-    div()
-        .id(id)
-        .debug_selector(move || id.into())
-        .role(Role::MenuItem)
-        .aria_label(label)
-        .aria_description(if selected {
-            t("sidebar.a11y.selected")
-        } else {
-            t("sidebar.a11y.not_selected")
-        })
-        .aria_keyshortcuts(shortcut)
-        .px(px(8.0))
-        .h(px(30.0))
-        .flex()
-        .items_center()
-        .gap(px(8.0))
-        .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
-        .cursor_pointer()
-        // The checkmark names the current choice; the keyboard cursor and the
-        // pointer share the sidebar's selected pill.
-        .bg(Fill::selected(colors, selected && !focused))
-        .glass_menu_row(colors, focused)
-        .active(|element| element.opacity(0.74))
-        .text_size(px(Typo::ROW.size))
-        .text_color(colors.primary)
-        .child(
-            div()
-                .size(px(14.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .when(selected, |slot| {
-                    slot.child(sf_symbol_weighted(
-                        "checkmark",
-                        9.0,
-                        SymbolWeight::Bold,
-                        colors.primary,
-                    ))
-                }),
-        )
-        .child(div().min_w(px(0.0)).flex_1().child(label))
-        .child(
-            div()
-                .font_family(crate::fonts::mono_family())
-                .text_size(px(Typo::META_MONO.size))
-                .text_color(colors.tertiary)
-                .child(shortcut),
-        )
         .on_click(on_click)
         .into_any_element()
 }
@@ -9643,9 +9419,12 @@ fn account_avatar(label: &str, size: f32, colors: SemanticColors) -> AnyElement 
         .into_any_element()
 }
 
-/// Height of the plain action rows at the bottom of the account menu.
 const PROJECT_MENU_WIDTH: f32 = 252.0;
+/// Height of the clickable rows in the account menu.
 const ACCOUNT_MENU_ACTION_ROW_HEIGHT: f32 = 28.0;
+
+/// Where account menu text starts: row margin plus padding.
+const ACCOUNT_MENU_TEXT_INSET: f32 = 6.0 + 8.0;
 
 /// Height of the single-line stat rows in the account menu.
 const ACCOUNT_MENU_STAT_ROW_HEIGHT: f32 = 22.0;
@@ -9704,7 +9483,8 @@ fn account_limits_menu(
 /// One quiet line of status under an eyebrow: loading, stale, or an error.
 fn menu_note(text: impl Into<SharedString>, colors: SemanticColors) -> AnyElement {
     div()
-        .px(px(14.0))
+        .pl(px(ACCOUNT_MENU_TEXT_INSET))
+        .pr(px(14.0))
         .py(px(3.0))
         .text_size(px(Typo::META.size))
         .text_color(colors.tertiary)
@@ -9755,8 +9535,8 @@ fn account_meter_row(
     div()
         .id(id)
         .debug_selector(move || selector.to_string())
-        .mx(px(6.0))
-        .px(px(8.0))
+        .pl(px(ACCOUNT_MENU_TEXT_INSET))
+        .pr(px(14.0))
         .h(px(ACCOUNT_MENU_STAT_ROW_HEIGHT))
         .flex()
         .items_center()
@@ -9821,40 +9601,64 @@ fn account_meter_row(
         .into_any_element()
 }
 
-/// A plain menu action: label on the left, shortcut or hint on the right.
-fn account_action_row(
-    id: &'static str,
-    label: &'static str,
-    trailing: Option<String>,
+/// One account menu item: the label, then a shortcut or hint and, for
+/// choices, a checkmark slot on the right. Callers add the hover pill and click when it acts.
+fn account_menu_item(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    check: Option<bool>,
+    trailing: Option<SharedString>,
     colors: SemanticColors,
-    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-) -> AnyElement {
+) -> gpui::Stateful<gpui::Div> {
+    let id = id.into();
+    let selector = id.clone();
     div()
         .id(id)
-        .debug_selector(move || id.into())
+        .debug_selector(move || selector.to_string())
         .mx(px(6.0))
         .px(px(8.0))
         .h(px(ACCOUNT_MENU_ACTION_ROW_HEIGHT))
         .flex()
         .items_center()
-        .gap(px(8.0))
+        .gap(px(6.0))
         .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
-        .cursor_pointer()
-        .glass_menu_row(colors, false)
         .text_size(px(Typo::ROW.size))
         .text_color(colors.primary)
-        .child(div().min_w(px(0.0)).flex_1().child(label))
+        .child(
+            div()
+                .min_w(px(0.0))
+                .flex_1()
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(label.into()),
+        )
         .when_some(trailing, |row, trailing| {
             row.child(
                 div()
                     .flex_none()
+                    .max_w(px(96.0))
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_ellipsis()
                     .text_size(px(Typo::META.size))
                     .text_color(colors.tertiary)
                     .child(trailing),
             )
         })
-        .on_click(on_click)
-        .into_any_element()
+        // Rows that can be checked keep the slot so their hints line up.
+        .when_some(check, |row, checked| {
+            row.child(
+                div()
+                    .flex_none()
+                    .w(px(12.0))
+                    .flex()
+                    .justify_center()
+                    .when(checked, |slot| {
+                        slot.child(sf_symbol("checkmark", 9.0, colors.secondary))
+                    }),
+            )
+        })
 }
 
 fn hover_detail(icon: &str, text: &str, mono: bool, colors: SemanticColors) -> AnyElement {
@@ -10203,12 +10007,15 @@ fn read_toggle(session: &diri_proto::SessionRecord, notification_unread: bool) -
 
 /// Unread inbox entries share the completion mark, while active work and
 /// requests for input retain priority. There is never a second unread dot.
-/// A row's title over its Activity line: what it is doing or left for you,
-/// and the age right-aligned.
+/// A row's title over its second line: under Activity, what it is doing or
+/// left for you, and the age right-aligned; elsewhere, the question it waits
+/// on. `reveal` (0–1) is how far that line has opened: it grows from no
+/// height, fading in, so the title rises with the row as it grows.
 fn activity_title(
     title: AnyElement,
     line: &str,
     age: Option<&str>,
+    reveal: f32,
     width: f32,
     colors: SemanticColors,
 ) -> AnyElement {
@@ -10219,13 +10026,18 @@ fn activity_title(
         .overflow_hidden()
         .flex()
         .flex_col()
-        .gap(px(1.0))
+        .gap(px(1.0 * reveal))
         .child(div().flex().items_center().overflow_hidden().child(title))
         .child(
             div()
                 .flex()
                 .items_center()
                 .gap(px(8.0))
+                .when(reveal < 1.0, |line| {
+                    line.h(px(SECOND_LINE_HEIGHT * reveal))
+                        .overflow_hidden()
+                        .opacity(reveal)
+                })
                 .text_size(px(Typo::META.size))
                 .child(
                     div()
@@ -10250,6 +10062,10 @@ fn activity_title(
         )
         .into_any_element()
 }
+
+/// The second line's own height at the META size, which the row's growth
+/// from one line to two makes room for.
+const SECOND_LINE_HEIGHT: f32 = 18.0;
 
 fn sidebar_activity_state(state: StatusState, unread: bool) -> StatusState {
     match state {
@@ -10738,9 +10554,24 @@ mod tests {
         };
         let everything = listed(cx);
         assert!(sidebar.read_with(cx, |sidebar, _| sidebar.age_wake.is_none()));
-        assert!(cx.debug_bounds("session-activity-line").is_none());
-        // The waiting row reads its question in place of its title.
-        assert_eq!(row_bounds(&sidebar, cx, "preview-claude").size.height, px(30.0));
+        assert!(cx.debug_bounds("session-activity-age").is_none());
+        // The waiting row keeps its title and reads its question on a
+        // second line, the same line Activity shows.
+        let claude = SessionId::new("preview-claude");
+        let (question, title) = sidebar.read_with(cx, |sidebar, cx| {
+            let props = &sidebar.session_row_views[&claude].read(cx).props;
+            (
+                props.question.as_ref().map(|line| line.text.clone()),
+                display_title(&props.row.session),
+            )
+        });
+        assert_eq!(question.as_deref(), Some("Wants to publish the release tag"));
+        assert_ne!(title, "Wants to publish the release tag");
+        assert_eq!(
+            row_bounds(&sidebar, cx, "preview-claude").size.height,
+            px(super::activity::ACTIVITY_ROW_HEIGHT)
+        );
+        assert!(cx.debug_bounds("session-activity-line").is_some());
 
         sidebar.update(cx, |sidebar, cx| sidebar.toggle_activity_filter(cx));
         cx.run_until_parked();
@@ -10781,13 +10612,19 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(listed(cx), everything);
         assert!(sidebar.read_with(cx, |sidebar, _| sidebar.age_wake.is_none()));
-        assert_eq!(row_bounds(&sidebar, cx, "preview-claude").size.height, px(30.0));
+        assert_eq!(
+            row_bounds(&sidebar, cx, "preview-claude").size.height,
+            px(super::activity::ACTIVITY_ROW_HEIGHT),
+            "a waiting row keeps its second line"
+        );
+        assert_eq!(row_bounds(&sidebar, cx, "preview-codex").size.height, px(30.0));
     }
 
-    /// A question replaces only its own row's title, re-renders only that
-    /// row, and gives the title back once answered.
+    /// A question keeps its row's title and opens a second line under it:
+    /// the change re-renders only that row, the row grows over the arrival
+    /// time instead of jumping, and the line closes once answered.
     #[gpui::test]
-    fn a_blocker_retitles_only_its_own_row(cx: &mut TestAppContext) {
+    fn a_blocker_opens_a_second_line_under_only_its_own_row(cx: &mut TestAppContext) {
         let (sidebar, _, cx) = drag_harness(cx);
         sidebar.update(cx, |sidebar, _| sidebar.use_manual_title_clock());
         cx.run_until_parked();
@@ -10795,6 +10632,7 @@ mod tests {
         let record = sidebar.read_with(cx, |sidebar, _| {
             sidebar.store.read().unwrap().sessions()[&id].as_ref().clone()
         });
+        let title = display_title(&record);
         let mut asking = record.clone();
         asking.status = diri_proto::SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Question);
         asking.needs_input = Some(diri_proto::NeedsInputDetail {
@@ -10810,24 +10648,94 @@ mod tests {
         });
         let shown = |cx: &mut VisualTestContext| {
             sidebar.read_with(cx, |sidebar, cx| {
-                sidebar.session_row_views[&id].read(cx).props.blocker.clone()
+                let props = &sidebar.session_row_views[&id].read(cx).props;
+                (
+                    props.question.as_ref().map(|line| (line.text.clone(), line.reveal)),
+                    display_title(&props.row.session),
+                )
             })
         };
-        assert_eq!(shown(cx), None);
+        let settle = |cx: &mut VisualTestContext| {
+            super::titles::testing::advance(crate::sidebar::row_motion::ENTER);
+            sidebar.update(cx, |sidebar, cx| sidebar.store_changed(cx));
+            cx.run_until_parked();
+        };
+        // Every other row's top, and how far it moves: rows below the
+        // asking row by its growth, rows above it not at all.
+        let tops = |cx: &mut VisualTestContext| {
+            sidebar.read_with(cx, |sidebar, _| {
+                let mut tops: Vec<(String, f32)> = sidebar
+                    .row_bounds
+                    .borrow()
+                    .iter()
+                    .filter(|(row, _)| **row != id)
+                    .map(|(row, bounds)| (row.0.clone(), f32::from(bounds.top())))
+                    .collect();
+                tops.sort_by(|a, b| a.0.cmp(&b.0));
+                tops
+            })
+        };
+        assert_eq!(shown(cx), (None, title.clone()));
+        let cursor_top = row_bounds(&sidebar, cx, "preview-cursor").top();
+        assert_eq!(row_bounds(&sidebar, cx, "preview-cursor").size.height, px(30.0));
+        let resting = tops(cx);
+        assert!(
+            resting.iter().any(|(_, top)| *top > f32::from(cursor_top)),
+            "a row sits below the asking row"
+        );
+        let grown: Vec<(String, f32)> = resting
+            .iter()
+            .map(|(row, top)| {
+                let shift = if *top > f32::from(cursor_top) {
+                    super::activity::ACTIVITY_ROW_HEIGHT - 30.0
+                } else {
+                    0.0
+                };
+                (row.clone(), top + shift)
+            })
+            .collect();
+
         render_probe::take();
         sidebar.update(cx, |sidebar, cx| {
             sidebar.store.write().unwrap().upsert_session(asking);
             sidebar.store_changed(cx);
         });
         cx.run_until_parked();
-        assert_eq!(shown(cx).as_deref(), Some("Allow deploy to staging?"));
         assert_eq!(render_probe::take().0, 1, "only the asking row renders");
+        // The row starts from one line, so nothing below it jumps.
+        assert_eq!(row_bounds(&sidebar, cx, "preview-cursor").size.height, px(30.0));
+        assert_eq!(tops(cx), resting);
+        let reveal = sidebar.read_with(cx, |sidebar, _| {
+            sidebar.question_lines.is_animating(sidebar.title_now)
+        });
+        assert!(reveal, "the second line opens over time");
+
+        settle(cx);
+        assert_eq!(
+            shown(cx),
+            (Some(("Allow deploy to staging?".to_owned(), 1.0)), title.clone()),
+            "the title stays; the question is the second line"
+        );
+        assert_eq!(
+            row_bounds(&sidebar, cx, "preview-cursor").size.height,
+            px(super::activity::ACTIVITY_ROW_HEIGHT)
+        );
+        assert_eq!(tops(cx), grown);
+        // At rest, a redraw with nothing new reuses every row.
+        render_probe::take();
+        sidebar.update(cx, |sidebar, cx| sidebar.store_changed(cx));
+        cx.run_until_parked();
+        assert_eq!(render_probe::take().0, 0, "unchanged rows are reused");
+
         sidebar.update(cx, |sidebar, cx| {
             sidebar.store.write().unwrap().upsert_session(record);
             sidebar.store_changed(cx);
         });
         cx.run_until_parked();
-        assert_eq!(shown(cx), None);
+        settle(cx);
+        assert_eq!(shown(cx), (None, title));
+        assert_eq!(row_bounds(&sidebar, cx, "preview-cursor").size.height, px(30.0));
+        assert_eq!(tops(cx), resting);
     }
 
     /// Held-⌘ hints fade in and out on cached session rows: the fade reaches
@@ -11243,7 +11151,7 @@ mod tests {
         sidebar.update_in(cx, |sidebar, window, cx| {
             sidebar.conceal(cx);
             sidebar.peek(window, cx);
-            sidebar.ui.popover = Some(Popover::SidebarLayout);
+            sidebar.ui.popover = Some(Popover::Account);
             cx.notify();
         });
         cx.run_until_parked();
@@ -11343,7 +11251,7 @@ mod tests {
                     "blur" => cx.deactivate_window(),
                     "hide" => sidebar.update(cx, |sidebar, cx| sidebar.conceal(cx)),
                     "menu" => sidebar.update(cx, |sidebar, cx| {
-                        sidebar.ui.popover = Some(Popover::SidebarLayout);
+                        sidebar.ui.popover = Some(Popover::Account);
                         cx.notify();
                     }),
                     "leave" => cx.simulate_mouse_move(
@@ -12627,7 +12535,6 @@ mod tests {
         cx.update(|cx| crate::fonts::init(cx));
         for popover in [
             Popover::Account,
-            Popover::SidebarLayout,
             Popover::NewAgent {
                 directory: None,
                 host: None,
@@ -12769,6 +12676,454 @@ mod tests {
             .unwrap();
     }
 
+    /// Gives `preview-claude` a tab it shares with two of its terminals:
+    /// a test run reporting 40 % and an idle dev server, stacked on the
+    /// right of the Agent.
+    fn seed_split_tab(store: &mut crate::store::SessionStore) {
+        use diri_proto::workspace::*;
+        let shell = (**store.sessions().get(&SessionId::new("preview-shell")).unwrap()).clone();
+        let pane_shell = |id: &str, title: &str| {
+            let mut pane = shell.clone();
+            pane.id = SessionId::new(id);
+            pane.title = title.into();
+            pane.parent = Some(SessionId::new("preview-claude"));
+            pane.listening_ports = None;
+            pane
+        };
+        let mut tests = pane_shell("pane-tests", "cargo test -p diri-app");
+        tests.status = diri_proto::SessionStatus::Working;
+        tests.terminal_progress = Some(diri_proto::TerminalProgress {
+            state: diri_proto::TerminalProgressState::Normal,
+            percent: 40,
+        });
+        store.upsert_session(tests);
+        store.upsert_session(pane_shell("pane-server", "pnpm dev · website"));
+        let leaf = |id: &str, session: &str| LayoutNode::Pane {
+            id: PaneId::new(id),
+            session_id: SessionId::new(session),
+        };
+        store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
+            revision: 3,
+            workspaces: vec![WorkspaceRecord {
+                project_id: None,
+                id: WorkspaceId::new("hover-workspace"),
+                name: "diri".into(),
+                selected_tab: Some(TabId::new("release")),
+                tabs: vec![WorkspaceTab {
+                    id: TabId::new("release"),
+                    title: None,
+                    focused_pane: PaneId::new("agent"),
+                    zoomed_pane: None,
+                    layout: LayoutNode::Split {
+                        id: SplitId::new("columns"),
+                        axis: LayoutAxis::Horizontal,
+                        fraction: 0.58,
+                        first: Box::new(leaf("agent", "preview-claude")),
+                        second: Box::new(LayoutNode::Split {
+                            id: SplitId::new("stack"),
+                            axis: LayoutAxis::Vertical,
+                            fraction: 0.55,
+                            first: Box::new(leaf("tests", "pane-tests")),
+                            second: Box::new(leaf("server", "pane-server")),
+                        }),
+                    },
+                }],
+            }],
+            ..Default::default()
+        });
+    }
+
+    #[gpui::test]
+    fn session_preview_says_what_each_pane_is_doing(cx: &mut TestAppContext) {
+        for split in [false, true] {
+            let (view, cx) = cx.add_window_view(|_, cx| {
+                let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+                if split {
+                    seed_split_tab(&mut sidebar.read(cx).store.write().unwrap());
+                }
+                SidebarPopoverHarness { sidebar }
+            });
+            let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+            cx.update(|window, _| window.activate_window());
+            cx.run_until_parked();
+            let row = row_bounds(&sidebar, cx, "preview-claude");
+            cx.simulate_mouse_move(row.center(), None, Modifiers::default());
+            cx.run_until_parked();
+            cx.executor().advance_clock(Duration::from_secs(1));
+            cx.run_until_parked();
+            assert!(cx.debug_bounds("session-hover-card").is_some(), "split={split}");
+            // One shape per tab: a single line for one pane, pane lines
+            // (and no single line) for a split.
+            assert_eq!(cx.debug_bounds("session-hover-state").is_some(), !split);
+            assert_eq!(cx.debug_bounds("session-hover-panes").is_some(), split);
+            if split {
+                let panes = cx.debug_bounds("session-hover-panes").unwrap();
+                let card = cx.debug_bounds("session-hover-card").unwrap();
+                assert!(panes.right() <= card.right(), "pane lines stay in the card");
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn session_preview_follows_a_status_change_while_it_shows(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let row = row_bounds(&sidebar, cx, "preview-shell");
+        cx.simulate_mouse_move(row.center(), None, Modifiers::default());
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("session-hover-card").is_some());
+        assert!(
+            cx.debug_bounds("session-hover-state").is_none(),
+            "a shell at its prompt has nothing to add"
+        );
+        sidebar.update(cx, |sidebar, cx| {
+            let mut store = sidebar.store.write().unwrap();
+            let mut shell = (**store.sessions().get(&SessionId::new("preview-shell")).unwrap()).clone();
+            shell.terminal_progress = Some(diri_proto::TerminalProgress {
+                state: diri_proto::TerminalProgressState::Normal,
+                percent: 25,
+            });
+            store.upsert_session(shell);
+            drop(store);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("session-hover-state").is_some(),
+            "the open card picks up the job's progress"
+        );
+    }
+
+    /// Two split tabs for the split presentation shots. Codex works beside
+    /// a test run at 40 % and a deploy script asking a question; Cursor
+    /// has finished beside a build at 75 %.
+    fn seed_split_presentation(store: &mut crate::store::SessionStore) {
+        use diri_proto::workspace::*;
+        let shell = (**store.sessions().get(&SessionId::new("preview-shell")).unwrap()).clone();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0.0, |elapsed| elapsed.as_secs_f64() * 1000.0);
+        let pane_shell = |id: &str, owner: &str, title: &str| {
+            let mut pane = shell.clone();
+            pane.id = SessionId::new(id);
+            pane.title = title.into();
+            pane.parent = Some(SessionId::new(owner));
+            pane.listening_ports = None;
+            pane
+        };
+        let mut tests = pane_shell("pane-tests", "preview-codex", "cargo test -p diri-app");
+        tests.status = diri_proto::SessionStatus::Working;
+        tests.terminal_progress = Some(diri_proto::TerminalProgress {
+            state: diri_proto::TerminalProgressState::Normal,
+            percent: 40,
+        });
+        store.upsert_session(tests);
+        let mut deploy = pane_shell("pane-deploy", "preview-codex", "./deploy.sh staging");
+        deploy.status =
+            diri_proto::SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Question);
+        deploy.needs_input = Some(diri_proto::NeedsInputDetail {
+            kind: diri_proto::NeedsInputKind::Question,
+            source: diri_proto::NeedsInputSource::ProgramStatus,
+            tool_name: None,
+            summary: "Allow deploy to staging?".into(),
+            prompt_excerpt: None,
+            options: None,
+            risk_hint: diri_proto::RiskHint::Neutral,
+            secret: false,
+            occurred_at: diri_proto::DateMillis(now - 30_000.0),
+        });
+        store.upsert_session(deploy);
+        let mut build = pane_shell("pane-build", "preview-cursor", "pnpm build");
+        build.status = diri_proto::SessionStatus::Working;
+        build.terminal_progress = Some(diri_proto::TerminalProgress {
+            state: diri_proto::TerminalProgressState::Normal,
+            percent: 75,
+        });
+        store.upsert_session(build);
+        let leaf = |id: &str, session: &str| LayoutNode::Pane {
+            id: PaneId::new(id),
+            session_id: SessionId::new(session),
+        };
+        let tab = |id: &str, focused: &str, layout: LayoutNode| WorkspaceTab {
+            id: TabId::new(id),
+            title: None,
+            focused_pane: PaneId::new(focused),
+            zoomed_pane: None,
+            layout,
+        };
+        store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
+            revision: 3,
+            workspaces: vec![WorkspaceRecord {
+                project_id: None,
+                id: WorkspaceId::new("split-workspace"),
+                name: "diri".into(),
+                selected_tab: Some(TabId::new("sidebar-craft")),
+                tabs: vec![
+                    tab(
+                        "sidebar-craft",
+                        "codex",
+                        LayoutNode::Split {
+                            id: SplitId::new("columns"),
+                            axis: LayoutAxis::Horizontal,
+                            fraction: 0.58,
+                            first: Box::new(leaf("codex", "preview-codex")),
+                            second: Box::new(LayoutNode::Split {
+                                id: SplitId::new("stack"),
+                                axis: LayoutAxis::Vertical,
+                                fraction: 0.5,
+                                first: Box::new(leaf("tests", "pane-tests")),
+                                second: Box::new(leaf("deploy", "pane-deploy")),
+                            }),
+                        },
+                    ),
+                    tab(
+                        "focus-fix",
+                        "cursor",
+                        LayoutNode::Split {
+                            id: SplitId::new("focus-columns"),
+                            axis: LayoutAxis::Horizontal,
+                            fraction: 0.5,
+                            first: Box::new(leaf("cursor", "preview-cursor")),
+                            second: Box::new(leaf("build", "pane-build")),
+                        },
+                    ),
+                ],
+            }],
+            ..Default::default()
+        });
+        store.select(SessionId::new("preview-codex"));
+    }
+
+    /// Paints only the horizontal strip, as the app does while horizontal
+    /// tabs hide the sidebar panel.
+    struct SplitStripShot {
+        sidebar: Entity<Sidebar>,
+    }
+
+    impl Render for SplitStripShot {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let background = self.sidebar.read(cx).colors().background;
+            div()
+                .size_full()
+                .bg(background)
+                .pt(px(7.0))
+                .child(self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.render_horizontal_tabs(720.0, None, window, cx)
+                }))
+        }
+    }
+
+    #[gpui::test]
+    fn a_split_strip_tab_marks_its_waiting_pane_and_draws_its_layout(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_asset_source_for_test(diri_ui::IconAssets));
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| {
+                let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                seed_split_presentation(&mut sidebar.store.write().unwrap());
+                sidebar
+                    .set_tab_orientation(crate::store::TabOrientation::Horizontal, cx)
+                    .unwrap();
+                sidebar
+            });
+            SplitStripShot { sidebar }
+        });
+        cx.run_until_parked();
+        let sidebar = view.read_with(cx, |view, _| view.sidebar.clone());
+        let (title, question, state) = sidebar.read_with(cx, |sidebar, cx| {
+            let props = sidebar.strip_tab_views[&SessionId::new("preview-codex")]
+                .read(cx)
+                .props_for_test();
+            (props.title.clone(), props.question.clone(), props.state)
+        });
+        // Codex itself is working; the deploy pane beside it is asking. The
+        // tab keeps its title, shows the pane's state, and its tooltip asks
+        // the pane's question.
+        assert_eq!(title, "Polish the left sidebar hierarchy");
+        assert_eq!(question.as_deref(), Some("Allow deploy to staging?"));
+        assert!(matches!(state, StatusState::NeedsInput { .. }));
+        assert!(
+            cx.debug_bounds("horizontal-tab-panes-preview-codex")
+                .is_some()
+        );
+        assert!(
+            cx.debug_bounds("horizontal-tab-panes-preview-spawned-deep")
+                .is_none(),
+            "a single-pane tab keeps its plain close button"
+        );
+    }
+
+    /// Split tabs in the sidebar and in the horizontal strip, at rest and
+    /// with the pointer on the selected tab. Writes
+    /// `split-{sidebar,strip,strip-hover}-{dark,light}.png` to
+    /// `DIRI_VISUAL_OUTPUT`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes split presentation PNGs to DIRI_VISUAL_OUTPUT"]
+    fn render_split_presentation_screenshots() {
+        let output =
+            PathBuf::from(std::env::var_os("DIRI_VISUAL_OUTPUT").expect("set DIRI_VISUAL_OUTPUT"));
+        std::fs::create_dir_all(&output).unwrap();
+        for (surface, horizontal, hover) in [
+            ("sidebar", false, false),
+            ("strip", true, false),
+            ("strip-hover", true, true),
+        ] {
+            for light in [false, true] {
+                let platform = gpui_platform::current_platform(true);
+                let mut cx = HeadlessAppContext::with_platform(
+                    platform.text_system(),
+                    Arc::new(diri_ui::IconAssets),
+                    gpui_platform::current_headless_renderer,
+                );
+                cx.update(|cx| {
+                    crate::fonts::init(cx);
+                    cx.set_reduce_motion(true);
+                });
+                let new_sidebar = move |cx: &mut Context<Sidebar>| {
+                    let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                    {
+                        let mut store = sidebar.store.write().unwrap();
+                        store
+                            .update_preferences(|prefs| {
+                                prefs.terminal_theme =
+                                    if light { "dirijor-light" } else { "dirijor-dark" }.into();
+                            })
+                            .unwrap();
+                        seed_split_presentation(&mut store);
+                    }
+                    if horizontal {
+                        sidebar
+                            .set_tab_orientation(crate::store::TabOrientation::Horizontal, cx)
+                            .unwrap();
+                    }
+                    sidebar
+                };
+                let window_size = if horizontal {
+                    size(px(720.0), px(44.0))
+                } else {
+                    size(px(300.0), px(330.0))
+                };
+                let window: gpui::AnyWindowHandle = if horizontal {
+                    cx.open_window(window_size, |_, cx| {
+                        let sidebar = cx.new(new_sidebar);
+                        cx.new(|_| SplitStripShot { sidebar })
+                    })
+                    .unwrap()
+                    .into()
+                } else {
+                    cx.open_window(window_size, |_, cx| {
+                        let sidebar = cx.new(new_sidebar);
+                        cx.new(|_| SidebarPopoverHarness { sidebar })
+                    })
+                    .unwrap()
+                    .into()
+                };
+                cx.run_until_parked();
+                cx.update_window(window, |_, window, _| window.activate_window())
+                    .unwrap();
+                cx.run_until_parked();
+                if hover {
+                    // The pointer on the selected (first) tab.
+                    cx.update_window(window, |_, window, cx| {
+                        window.simulate_mouse_move(point(px(190.0), px(22.0)), cx)
+                    })
+                    .unwrap();
+                    cx.run_until_parked();
+                }
+                cx.advance_clock(Duration::from_secs(1));
+                cx.update_window(window, |_, window, _| window.refresh())
+                    .unwrap();
+                cx.run_until_parked();
+                let appearance = if light { "light" } else { "dark" };
+                cx.capture_screenshot(window)
+                    .unwrap()
+                    .save(output.join(format!("split-{surface}-{appearance}.png")))
+                    .unwrap();
+                cx.update_window(window, |_, window, _| window.remove_window())
+                    .unwrap();
+                cx.run_until_parked();
+            }
+        }
+    }
+
+    /// The hover card's status section, rendered for the PR: a blocked
+    /// Agent alone, and the same Agent in a split tab with two terminals.
+    /// Writes `hover-{single,split}-{dark,light}.png` to `DIRI_VISUAL_OUTPUT`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes hover status PNGs to DIRI_VISUAL_OUTPUT"]
+    fn render_session_hover_status_screenshots() {
+        let output =
+            PathBuf::from(std::env::var_os("DIRI_VISUAL_OUTPUT").expect("set DIRI_VISUAL_OUTPUT"));
+        std::fs::create_dir_all(&output).unwrap();
+        for (name, split) in [("single", false), ("split", true)] {
+            for light in [false, true] {
+                let platform = gpui_platform::current_platform(true);
+                let mut cx = HeadlessAppContext::with_platform(
+                    platform.text_system(),
+                    Arc::new(diri_ui::IconAssets),
+                    gpui_platform::current_headless_renderer,
+                );
+                cx.update(|cx| {
+                    crate::fonts::init(cx);
+                    cx.set_reduce_motion(true);
+                });
+                let window = cx
+                    .open_window(size(px(640.0), px(420.0)), |_, cx| {
+                        let sidebar = cx.new(|cx| {
+                            let sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                            let mut store = sidebar.store.write().unwrap();
+                            store
+                                .update_preferences(|prefs| {
+                                    prefs.terminal_theme =
+                                        if light { "dirijor-light" } else { "dirijor-dark" }.into();
+                                })
+                                .unwrap();
+                            if split {
+                                seed_split_tab(&mut store);
+                            }
+                            drop(store);
+                            sidebar
+                        });
+                        cx.new(|_| SidebarPopoverHarness { sidebar })
+                    })
+                    .unwrap();
+                cx.run_until_parked();
+                cx.update_window(window.into(), |_, window, _| window.activate_window())
+                    .unwrap();
+                cx.run_until_parked();
+                cx.update_window(window.into(), |view, window, cx| {
+                    let view = view.downcast::<SidebarPopoverHarness>().unwrap();
+                    let sidebar = view.read(cx).sidebar.clone();
+                    let row = sidebar.read(cx).row_bounds.borrow()[&SessionId::new("preview-claude")];
+                    window.simulate_mouse_move(row.center(), cx);
+                })
+                .unwrap();
+                cx.run_until_parked();
+                cx.advance_clock(Duration::from_secs(1));
+                cx.run_until_parked();
+                cx.update_window(window.into(), |_, window, _| window.refresh())
+                    .unwrap();
+                cx.run_until_parked();
+                let appearance = if light { "light" } else { "dark" };
+                cx.capture_screenshot(window.into())
+                    .unwrap()
+                    .save(output.join(format!("hover-{name}-{appearance}.png")))
+                    .unwrap();
+                cx.update_window(window.into(), |_, window, _| window.remove_window())
+                    .unwrap();
+                cx.run_until_parked();
+            }
+        }
+    }
+
     /// Hovers `DIRI_LINEAGE_TARGET` (default `preview-cursor`) with one
     /// Anara session reparented under it, so a cross-project child shows.
     /// `DIRI_VISUAL_LIGHT=1` for the light shell.
@@ -12852,8 +13207,8 @@ mod tests {
     /// review without touching a running Diri instance. Set
     /// `DIRI_VISUAL_GROUPING=recency`, `DIRI_VISUAL_LIGHT=1`,
     /// `DIRI_VISUAL_THEME=<theme id>`, or
-    /// `DIRI_VISUAL_POPOVER=none|project|session|server|new-agent` to select
-    /// the state to capture (the default opens the grouping menu),
+    /// `DIRI_VISUAL_POPOVER=project|session|server|new-agent|account` to
+    /// open a menu (the default captures none),
     /// `DIRI_VISUAL_LANGUAGE=zh-Hans` to render in another catalog, and
     /// `DIRI_VISUAL_READ=seen|unseen` to finish that session's turn.
     /// `DIRI_VISUAL_BACKDROP=62616e` supplies a fixed RGB backdrop under glass;
@@ -12891,7 +13246,8 @@ mod tests {
                 directory: None,
                 host: None,
             }),
-            _ => Some(Popover::SidebarLayout),
+            "account" => Some(Popover::Account),
+            _ => None,
         };
         // DIRI_VISUAL_LANGUAGE=zh-Hans renders the sidebar in that catalog.
         // Ignored fixture only: the language is process-wide.
@@ -12958,6 +13314,25 @@ mod tests {
                             &title,
                             units..units,
                         );
+                    }
+                    // `DIRI_VISUAL_USAGE_INDICATOR=hidden|cost|quota` picks the
+                    // footer metric; `DIRI_VISUAL_QUOTA_UNKNOWN=1` leaves quota
+                    // mode without limits so the footer shows its `—`.
+                    if let Ok(mode) = std::env::var("DIRI_VISUAL_USAGE_INDICATOR") {
+                        let choice = match mode.as_str() {
+                            "hidden" => crate::store::SidebarUsageIndicator::Hidden,
+                            "quota" => crate::store::SidebarUsageIndicator::RemainingQuota,
+                            _ => crate::store::SidebarUsageIndicator::EstimatedCost,
+                        };
+                        sidebar
+                            .store
+                            .write()
+                            .expect("preview session store")
+                            .update_preferences(|prefs| prefs.sidebar_usage_indicator = choice)
+                            .expect("preview preferences");
+                    }
+                    if std::env::var_os("DIRI_VISUAL_QUOTA_UNKNOWN").is_some() {
+                        sidebar.preview = false;
                     }
                     let now = wall_clock_millis();
                     let mut store = sidebar.store.write().expect("preview session store");
@@ -13047,10 +13422,26 @@ mod tests {
                                 diri_proto::SessionStatus::Working,
                                 Some(ProtoAgentKind::CLAUDE_CODE),
                             ),
-                        ] {
+                        ]
+                        .into_iter()
+                        // `DIRI_VISUAL_TERMINALS=programs` adds a few more
+                        // programs, to show each terminal's program glyph.
+                        .chain(
+                            (std::env::var("DIRI_VISUAL_TERMINALS").as_deref() == Ok("programs"))
+                                .then_some([
+                                    ("preview-term-psql", "psql", "web", diri_proto::SessionStatus::Idle, None),
+                                    ("preview-term-cargo", "cargo", "diri", diri_proto::SessionStatus::Working, None),
+                                    ("preview-term-k9s", "k9s", "infra", diri_proto::SessionStatus::Idle, None),
+                                    ("preview-term-htop", "htop", "web", diri_proto::SessionStatus::Idle, None),
+                                ])
+                                .into_iter()
+                                .flatten(),
+                        ) {
                             let mut terminal = base.clone();
                             terminal.id = SessionId::new(id);
                             terminal.title = title.into();
+                            terminal.foreground_program = (agent.is_none() && id != "preview-term-web")
+                                .then(|| title.to_owned());
                             terminal.title_source = diri_proto::TitleSource::TerminalTitle;
                             terminal.terminal_cwd = Some(format!("{root}/{folder}"));
                             terminal.status = status;
@@ -13886,6 +14277,214 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[gpui::test]
+    fn footer_modes_preserve_account_menu_and_refresh(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("sidebar-cost").is_some(),
+            "default retains estimated cost"
+        );
+        assert!(cx.debug_bounds("sidebar-quota").is_none());
+        let refreshes = Rc::new(std::cell::Cell::new(0));
+        let observed = Rc::clone(&refreshes);
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&sidebar, move |_, event, _| {
+                if matches!(event, SidebarEvent::RefreshUsageLimits) {
+                    observed.set(observed.get() + 1);
+                }
+            })
+        });
+        for choice in crate::store::SidebarUsageIndicator::ALL {
+            sidebar.update(cx, |sidebar, cx| {
+                sidebar
+                    .store
+                    .write()
+                    .unwrap()
+                    .update_preferences(|prefs| {
+                        prefs.sidebar_usage_indicator = choice;
+                    })
+                    .unwrap();
+                cx.notify();
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                cx.debug_bounds("sidebar-cost").is_some(),
+                choice == crate::store::SidebarUsageIndicator::EstimatedCost
+            );
+            assert_eq!(
+                cx.debug_bounds("sidebar-quota").is_some(),
+                choice == crate::store::SidebarUsageIndicator::RemainingQuota
+            );
+            assert_eq!(
+                refreshes.get(),
+                0,
+                "changing a preference never fetches credentials"
+            );
+            // Leaving preview after construction exercises the production click
+            // handler over an isolated preview store, never the real preferences.
+            sidebar.update(cx, |sidebar, _| sidebar.preview = false);
+            let account = cx
+                .debug_bounds("account")
+                .expect("account row survives every mode");
+            cx.simulate_click(account.center(), Modifiers::default());
+            cx.run_until_parked();
+            assert!(sidebar.read_with(cx, |sidebar, _| sidebar.ui.popover
+                == Some(Popover::Account)));
+            assert_eq!(
+                refreshes.get(),
+                1,
+                "opening the menu keeps its existing refresh"
+            );
+            cx.simulate_click(account.center(), Modifiers::default());
+            cx.run_until_parked();
+            assert_eq!(refreshes.get(), 1, "closing the menu does not refresh");
+            sidebar.update(cx, |sidebar, _| sidebar.preview = true);
+            refreshes.set(0);
+        }
+    }
+
+    /// Quota mode must not wait for the account menu: it fetches limits on its
+    /// own, no more than once per `QUOTA_REFRESH_AFTER`, and only in that mode.
+    #[gpui::test]
+    fn footer_quota_mode_refreshes_limits_without_the_menu(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        cx.run_until_parked();
+        let refreshes = Rc::new(std::cell::Cell::new(0));
+        let observed = Rc::clone(&refreshes);
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&sidebar, move |_, event, _| {
+                if matches!(event, SidebarEvent::RefreshUsageLimits) {
+                    observed.set(observed.get() + 1);
+                }
+            })
+        });
+        let set_mode = |choice, cx: &mut VisualTestContext| {
+            sidebar.update(cx, |sidebar, cx| {
+                sidebar.preview = false;
+                sidebar
+                    .store
+                    .write()
+                    .unwrap()
+                    .update_preferences(|prefs| prefs.sidebar_usage_indicator = choice)
+                    .unwrap();
+                sidebar.sync_quota_refresh(cx);
+            });
+            cx.run_until_parked();
+        };
+
+        set_mode(crate::store::SidebarUsageIndicator::EstimatedCost, cx);
+        cx.executor().advance_clock(QUOTA_TICK * 10);
+        cx.run_until_parked();
+        assert_eq!(refreshes.get(), 0, "cost mode keeps the menu as the trigger");
+
+        set_mode(crate::store::SidebarUsageIndicator::RemainingQuota, cx);
+        assert_eq!(refreshes.get(), 1, "no limits yet: fetch at once");
+        cx.executor().advance_clock(QUOTA_TICK * 2);
+        cx.run_until_parked();
+        assert_eq!(refreshes.get(), 1, "rate limited to one per window");
+
+        let now = crate::usage::Clock::read(&crate::usage::SystemClock).unix_seconds;
+        let mut snapshot = UsageSnapshot {
+            updated_at: now,
+            limits: vec![crate::usage::limits::AccountLimits {
+                provider: "Claude",
+                profile_id: None,
+                plan: None,
+                account: "Fixture".into(),
+                live: true,
+                windows: vec![crate::usage::limits::LimitWindow {
+                    label: "Weekly".into(),
+                    used_percent: 25.0,
+                    resets_at: None,
+                }],
+                checked_at: now,
+                error: None,
+                signing_in: false,
+            }],
+            ..UsageSnapshot::default()
+        };
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_usage(snapshot.clone(), cx);
+            sidebar.quota_requested_at = 0;
+        });
+        cx.executor().advance_clock(QUOTA_TICK);
+        cx.run_until_parked();
+        assert_eq!(refreshes.get(), 1, "fresh limits need no fetch");
+
+        snapshot.limits[0].checked_at = now - QUOTA_REFRESH_AFTER;
+        sidebar.update(cx, |sidebar, cx| sidebar.set_usage(snapshot.clone(), cx));
+        cx.executor().advance_clock(QUOTA_TICK);
+        cx.run_until_parked();
+        assert_eq!(refreshes.get(), 2, "aging limits are refetched before expiry");
+
+        set_mode(crate::store::SidebarUsageIndicator::Hidden, cx);
+        sidebar.update(cx, |sidebar, _| sidebar.quota_requested_at = 0);
+        cx.executor().advance_clock(QUOTA_TICK * 10);
+        cx.run_until_parked();
+        assert_eq!(refreshes.get(), 2, "leaving quota mode stops the timer");
+        assert!(sidebar.read_with(cx, |sidebar, _| sidebar.quota_refresh.is_none()));
+    }
+
+    #[gpui::test]
+    fn footer_quota_timestamp_ticks_invalidate_only_on_expiry(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        cx.run_until_parked();
+        let notifications = Rc::new(std::cell::Cell::new(0));
+        let observed = Rc::clone(&notifications);
+        let _subscription =
+            cx.update(|_, cx| cx.observe(&sidebar, move |_, _| observed.set(observed.get() + 1)));
+        for reset in [None, Some(1_010)] {
+            let mut snapshot = UsageSnapshot {
+                updated_at: 1_000,
+                limits: vec![crate::usage::limits::AccountLimits {
+                    provider: "Claude",
+                    profile_id: None,
+                    plan: None,
+                    account: "Fixture".into(),
+                    live: true,
+                    windows: vec![crate::usage::limits::LimitWindow {
+                        label: "Weekly".into(),
+                        used_percent: 25.0,
+                        resets_at: reset,
+                    }],
+                    checked_at: 1_000,
+                    error: None,
+                    signing_in: false,
+                }],
+                ..UsageSnapshot::default()
+            };
+            sidebar.update(cx, |sidebar, cx| {
+                sidebar
+                    .store
+                    .write()
+                    .unwrap()
+                    .update_preferences(|prefs| {
+                        prefs.sidebar_usage_indicator =
+                            crate::store::SidebarUsageIndicator::RemainingQuota;
+                    })
+                    .unwrap();
+                sidebar.set_usage(snapshot.clone(), cx);
+            });
+            cx.run_until_parked();
+            notifications.set(0);
+            snapshot.updated_at = if reset.is_some() { 1_009 } else { 1_360 };
+            sidebar.update(cx, |sidebar, cx| sidebar.set_usage(snapshot.clone(), cx));
+            cx.run_until_parked();
+            assert_eq!(notifications.get(), 0, "a fresh timestamp needs no frame");
+            snapshot.updated_at += 1;
+            sidebar.update(cx, |sidebar, cx| sidebar.set_usage(snapshot.clone(), cx));
+            cx.run_until_parked();
+            assert!(
+                notifications.get() > 0,
+                "expiry must invalidate the displayed percentage"
+            );
+            assert!(
+                crate::usage::limits::footer_quota(&snapshot.limits, snapshot.updated_at).is_none()
+            );
+        }
     }
 
     #[gpui::test]

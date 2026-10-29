@@ -50,6 +50,7 @@ fn main() {
                     is_alt_screen: false,
                     visible_rows: 40,
                     partial: first > 0,
+                    history_origin: None,
                     cells: screen.find_capture_cells().unwrap(),
                 },
                 reservation,

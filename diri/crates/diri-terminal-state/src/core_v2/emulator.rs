@@ -531,9 +531,13 @@ impl Emulator for Screen {
     }
 
     fn history_origin(&self) -> u64 {
-        // Every row that left the primary screen entered history; those not
-        // kept left it from the oldest end.
-        let pages = self.core.primary_pages();
+        // Rows that entered the shown screen's history and left it from the
+        // oldest end. With no history allowed nothing ever enters it, as in
+        // the current core (the alternate screen).
+        let pages = &self.core.pages;
+        if pages.history_limit == 0 {
+            return 0;
+        }
         let entered = pages.total_rows() - self.core.lines() as u64;
         entered - pages.history_size() as u64
     }

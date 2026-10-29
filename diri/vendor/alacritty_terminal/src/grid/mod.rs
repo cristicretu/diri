@@ -11,6 +11,8 @@ use crate::term::cell::{Flags, ResetDiscriminant};
 use crate::vte::ansi::{CharsetIndex, StandardCharset};
 
 #[cfg(feature = "compact-history")]
+pub mod cold;
+#[cfg(feature = "compact-history")]
 pub mod compact;
 pub mod resize;
 mod row;
@@ -179,6 +181,23 @@ impl Grid<crate::term::cell::Cell> {
     /// Release history caches and spare allocations once output is idle.
     pub fn release_idle_history(&mut self) {
         self.raw.release_idle();
+    }
+
+    /// DIRI PATCH: move idle history payloads into `store`, keeping the
+    /// newest `keep_rows` history rows in memory; see
+    /// [`compact::CompactRows::page_out`].
+    pub fn page_out_history(
+        &mut self,
+        store: &std::sync::Arc<dyn cold::ColdStore>,
+        keep_rows: usize,
+        min_bytes: usize,
+    ) -> std::io::Result<cold::PageOut> {
+        self.raw.page_out(store, keep_rows, min_bytes)
+    }
+
+    /// Where history payloads live: in memory or in a cold store.
+    pub fn history_residency(&self) -> compact::PayloadResidency {
+        self.raw.payload_residency()
     }
 
     /// Discard the oldest history beyond `budget` stored bytes.

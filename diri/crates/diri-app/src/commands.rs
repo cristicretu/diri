@@ -17,6 +17,31 @@ pub const UTILITY_CONTEXT: &str = "DiriUtility";
 
 pub type ShortcutOverrides = BTreeMap<String, Option<String>>;
 
+/// A command's keys past its first are saved as `<stable id>#2`, `#3`, ...
+/// next to the `<stable id>` entry, each a single keystroke. An older Diri
+/// reads them as unknown ids: it keeps them on disk and binds only the first
+/// key, so going back a version never loses or misreads the keymap.
+const EXTRA_KEY_SEPARATOR: char = '#';
+
+/// The extra keys recorded for `stable_id`, in the order they were added.
+fn extra_keys<'a>(overrides: &'a ShortcutOverrides, stable_id: &str) -> Vec<&'a String> {
+    let prefix = format!("{stable_id}{EXTRA_KEY_SEPARATOR}");
+    let mut keys: Vec<(u32, &String)> = overrides
+        .range(prefix.clone()..)
+        .take_while(|(id, _)| id.starts_with(&prefix))
+        .filter_map(|(id, key)| Some((id[prefix.len()..].parse().ok()?, key.as_ref()?)))
+        .collect();
+    keys.sort_by_key(|(slot, _)| *slot);
+    keys.into_iter().map(|(_, key)| key).collect()
+}
+
+/// The command an extra-key entry belongs to, if `id` is one.
+fn extra_key_owner(id: &str) -> Option<&'static CommandSpec> {
+    let (owner, slot) = id.split_once(EXTRA_KEY_SEPARATOR)?;
+    slot.parse::<u32>().ok()?;
+    COMMANDS.iter().find(|command| command.stable_id == owner)
+}
+
 static ACTIVE_SHORTCUT_OVERRIDES: OnceLock<RwLock<ShortcutOverrides>> = OnceLock::new();
 
 actions!(
@@ -115,6 +140,7 @@ actions!(
         ReadAllTabs,
         TogglePerfOverlay,
         ToggleRenderCounters,
+        ReloadScripts,
         SelectPreviousSession,
         SelectNextSession,
         MoveSelectedSessionUp,
@@ -243,6 +269,7 @@ pub enum CommandId {
     ReadAllTabs,
     TogglePerfOverlay,
     ToggleRenderCounters,
+    ReloadScripts,
     SelectPreviousSession,
     SelectNextSession,
     MoveSelectedSessionUp,
@@ -1141,6 +1168,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         "square.stack.3d.up",
         "developer renders render count redraw views perf performance debug"
     ),
+    spec!(
+        ReloadScripts,
+        "reload-scripts",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.reload_scripts.palette_title",
+        "chevron.left.forwardslash.chevron.right",
+        "lua init.lua config script scripting reload refresh keymap plugins"
+    ),
     // ⌥⌘arrows and ⌘[ / ⌘] are pane keys now; in a one-pane tab they still
     // move between sessions (`PaneCommand::session_fallback`).
     spec!(
@@ -1445,6 +1482,19 @@ fn bind_active_keys(cx: &mut App, overrides: &ShortcutOverrides) {
     cx.bind_keys(crate::notes::key_bindings());
     // The Files surface's editor keys, likewise scoped to its contexts.
     cx.bind_keys(crate::code_viewer::key_bindings());
+    // init.lua's keys: over every default above, under the keys the person
+    // recorded (those are skipped). Empty unless a script is loaded.
+    crate::scripting::bind_keys(cx, overrides);
+}
+
+/// Rebuilds the keymap with the overrides already in force, after a script
+/// changed its keys.
+pub fn rebind_active_keys(cx: &mut App) {
+    let overrides = active_shortcut_overrides()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    rebind_keys(cx, &overrides);
 }
 
 fn active_shortcut_overrides() -> &'static RwLock<ShortcutOverrides> {
@@ -1477,6 +1527,15 @@ impl CommandSpec {
     }
 
     pub fn shortcut_label_for(&self, overrides: &ShortcutOverrides) -> Option<String> {
+        self.primary_label(overrides).or_else(|| {
+            // The first key was removed and an added one is left.
+            self.effective_keystrokes(overrides)
+                .first()
+                .map(|key| keystroke_label(key))
+        })
+    }
+
+    fn primary_label(&self, overrides: &ShortcutOverrides) -> Option<String> {
         if self.window_default_is_claimed(overrides) {
             return None;
         }
@@ -1507,10 +1566,27 @@ impl CommandSpec {
     }
 
     pub fn is_overridden(&self, overrides: &ShortcutOverrides) -> bool {
-        overrides.contains_key(self.stable_id)
+        overrides.contains_key(self.stable_id) || !extra_keys(overrides, self.stable_id).is_empty()
     }
 
+    /// Every key that performs this command: the first layer (the default
+    /// keys, or the one the user recorded) and then any keys added to it.
     pub fn effective_keystrokes(&self, overrides: &ShortcutOverrides) -> Vec<String> {
+        let mut keys = self.primary_keystrokes(overrides);
+        // The global hotkey is registered with the system by one physical key.
+        if self.id == CommandId::ShowApp {
+            return keys;
+        }
+        for extra in extra_keys(overrides, self.stable_id) {
+            if Keystroke::parse(extra).is_ok() && !keys.iter().any(|key| same_keystroke(key, extra))
+            {
+                keys.push(extra.clone());
+            }
+        }
+        keys
+    }
+
+    fn primary_keystrokes(&self, overrides: &ShortcutOverrides) -> Vec<String> {
         if self.window_default_is_claimed(overrides) {
             return Vec::new();
         }
@@ -1543,7 +1619,8 @@ impl CommandSpec {
         };
         overrides.iter().any(|(id, key)| {
             id != self.stable_id
-                && COMMANDS.iter().any(|command| command.stable_id == id)
+                && (COMMANDS.iter().any(|command| command.stable_id == id)
+                    || extra_key_owner(id).is_some_and(|owner| owner.id != self.id))
                 && key
                     .as_ref()
                     .and_then(|key| Keystroke::parse(key).ok())
@@ -1650,6 +1727,7 @@ impl CommandSpec {
             CommandId::ReadAllTabs => KeyBinding::new(key, ReadAllTabs, context),
             CommandId::TogglePerfOverlay => KeyBinding::new(key, TogglePerfOverlay, context),
             CommandId::ToggleRenderCounters => KeyBinding::new(key, ToggleRenderCounters, context),
+            CommandId::ReloadScripts => KeyBinding::new(key, ReloadScripts, context),
             CommandId::SelectPreviousSession => {
                 KeyBinding::new(key, SelectPreviousSession, context)
             }
@@ -1933,8 +2011,43 @@ fn same_keystroke(a: &str, b: &str) -> bool {
     }
 }
 
-/// Binds `binding` to `id` in the user layer. Without a `resolution` a clash
-/// is returned for the caller to show; with one it is resolved.
+/// Makes `keys` the complete list of keys for `id`, in order: the first is
+/// the `<id>` entry, the rest are extra-key entries. An empty list unbinds.
+pub fn set_shortcut_keys(
+    overrides: &ShortcutOverrides,
+    id: CommandId,
+    keys: &[String],
+) -> ShortcutOverrides {
+    let stable_id = command(id).stable_id;
+    let mut next = overrides.clone();
+    let prefix = format!("{stable_id}{EXTRA_KEY_SEPARATOR}");
+    next.retain(|entry, _| entry != stable_id && !entry.starts_with(&prefix));
+    let mut unique: Vec<&String> = Vec::with_capacity(keys.len());
+    for key in keys {
+        if !unique.iter().any(|kept| same_keystroke(kept, key)) {
+            unique.push(key);
+        }
+    }
+    next.insert(stable_id.to_owned(), unique.first().map(|key| (*key).clone()));
+    for (index, key) in unique.iter().enumerate().skip(1) {
+        next.insert(format!("{prefix}{}", index + 1), Some((*key).clone()));
+    }
+    next
+}
+
+/// The holder of a clashing key loses just that key and keeps the rest.
+fn without_key(overrides: &ShortcutOverrides, holder: CommandId, binding: &str) -> ShortcutOverrides {
+    let keys: Vec<String> = command(holder)
+        .effective_keystrokes(overrides)
+        .into_iter()
+        .filter(|key| !same_keystroke(key, binding))
+        .collect();
+    set_shortcut_keys(overrides, holder, &keys)
+}
+
+/// Binds `binding` to `id` in the user layer, in place of every key it had.
+/// Without a `resolution` a clash is returned for the caller to show; with
+/// one it is resolved.
 pub fn assign_shortcut(
     overrides: &ShortcutOverrides,
     id: CommandId,
@@ -1952,33 +2065,94 @@ pub fn assign_shortcut(
                 && id != CommandId::ShowApp
                 && !previous.is_empty(),
         };
-        let handed_over = match resolution {
-            Some(ShortcutResolution::Replace) if clash.can_replace => holder
-                .effective_keystrokes(overrides)
-                .into_iter()
-                .find(|key| !same_keystroke(key, binding)),
-            Some(ShortcutResolution::Swap) if clash.can_swap => previous.first().cloned(),
+        next = match resolution {
+            Some(ShortcutResolution::Replace) if clash.can_replace => {
+                without_key(overrides, holder.id, binding)
+            }
+            Some(ShortcutResolution::Swap) if clash.can_swap => {
+                // The holder takes this command's first key in the clashing
+                // key's place and keeps the rest of its own.
+                let handed: Vec<String> = holder
+                    .effective_keystrokes(overrides)
+                    .into_iter()
+                    .map(|key| {
+                        if same_keystroke(&key, binding) {
+                            previous[0].clone()
+                        } else {
+                            key
+                        }
+                    })
+                    .collect();
+                set_shortcut_keys(overrides, holder.id, &handed)
+            }
             _ => return Err(clash),
         };
-        next.insert(holder.stable_id.to_owned(), handed_over);
     }
-    next.insert(command(id).stable_id.to_owned(), Some(binding.to_owned()));
-    Ok(without_default_entries(next))
+    Ok(without_default_entries(set_shortcut_keys(
+        &next,
+        id,
+        &[binding.to_owned()],
+    )))
+}
+
+/// Adds `binding` to the keys `id` already has, or puts it where
+/// `in_place_of` was so the order (and the key menus show) is kept. A key
+/// another command performs is a clash; [`ShortcutResolution::Replace`]
+/// takes it from that command, and there is nothing to swap.
+pub fn add_shortcut(
+    overrides: &ShortcutOverrides,
+    id: CommandId,
+    binding: &str,
+    in_place_of: Option<&str>,
+    resolution: Option<ShortcutResolution>,
+) -> Result<ShortcutOverrides, ShortcutClash> {
+    let mut keys = command(id).effective_keystrokes(overrides);
+    let only_key = in_place_of.is_some() && keys.len() <= 1;
+    if keys.is_empty() || only_key || id == CommandId::ShowApp {
+        return assign_shortcut(overrides, id, binding, resolution);
+    }
+    let mut next = overrides.clone();
+    if let Some(holder) = shortcut_conflict(id, binding, overrides) {
+        let clash = ShortcutClash {
+            binding: binding.to_owned(),
+            holder: holder.id,
+            can_replace: holder.id != CommandId::ShowApp,
+            can_swap: false,
+        };
+        match resolution {
+            Some(ShortcutResolution::Replace) if clash.can_replace => {
+                next = without_key(overrides, holder.id, binding);
+            }
+            _ => return Err(clash),
+        }
+    }
+    match in_place_of.and_then(|old| keys.iter().position(|key| same_keystroke(key, old))) {
+        Some(index) => keys[index] = binding.to_owned(),
+        None => keys.push(binding.to_owned()),
+    }
+    Ok(without_default_entries(set_shortcut_keys(&next, id, &keys)))
+}
+
+/// Takes one key away from `id`; its other keys keep working.
+pub fn remove_shortcut_key(
+    overrides: &ShortcutOverrides,
+    id: CommandId,
+    binding: &str,
+) -> ShortcutOverrides {
+    without_default_entries(without_key(overrides, id, binding))
 }
 
 /// Unbinds `id`: it keeps its row everywhere but performs on no key.
 pub fn unassign_shortcut(overrides: &ShortcutOverrides, id: CommandId) -> ShortcutOverrides {
-    let mut next = overrides.clone();
-    next.insert(command(id).stable_id.to_owned(), None);
-    without_default_entries(next)
+    without_default_entries(set_shortcut_keys(overrides, id, &[]))
 }
 
-/// Drops `id`'s recorded shortcut so the default shows through again. A
+/// Drops `id`'s recorded shortcuts so the default shows through again. A
 /// default another command has since taken stays with that command, so a
 /// reset never makes one key perform two actions.
 pub fn reset_shortcut(overrides: &ShortcutOverrides, id: CommandId) -> ShortcutOverrides {
     let spec = command(id);
-    let mut next = overrides.clone();
+    let mut next = set_shortcut_keys(overrides, id, &[]);
     next.remove(spec.stable_id);
     let defaults = spec.effective_keystrokes(&next);
     let free: Vec<String> = defaults
@@ -1994,11 +2168,11 @@ pub fn reset_shortcut(overrides: &ShortcutOverrides, id: CommandId) -> ShortcutO
 
 /// An entry that restates what the defaults already do is not a change.
 /// Dropping it keeps "Reset all (n)" honest and lets a swap made twice read
-/// as unmodified again.
+/// as unmodified again. Extra-key entries are judged the same way.
 fn without_default_entries(mut overrides: ShortcutOverrides) -> ShortcutOverrides {
     let ids: Vec<String> = overrides.keys().cloned().collect();
     for id in ids {
-        if !COMMANDS.iter().any(|spec| spec.stable_id == id) {
+        if !COMMANDS.iter().any(|spec| spec.stable_id == id) && extra_key_owner(&id).is_none() {
             continue;
         }
         let mut without = overrides.clone();
@@ -2529,6 +2703,11 @@ impl CommandId {
                 description: t("command.toggle_render_counters.description"),
                 category: Application,
             },
+            Self::ReloadScripts => ShortcutMetadata {
+                title: t("command.reload_scripts.title"),
+                description: t("command.reload_scripts.description"),
+                category: Application,
+            },
             Self::NewWindow => ShortcutMetadata {
                 title: t("command.new_window.title"),
                 description: t("command.new_window.description"),
@@ -2651,6 +2830,7 @@ impl CommandId {
             Self::ReadAllTabs => Box::new(ReadAllTabs),
             Self::TogglePerfOverlay => Box::new(TogglePerfOverlay),
             Self::ToggleRenderCounters => Box::new(ToggleRenderCounters),
+            Self::ReloadScripts => Box::new(ReloadScripts),
             Self::SelectPreviousSession => Box::new(SelectPreviousSession),
             Self::SelectNextSession => Box::new(SelectNextSession),
             Self::MoveSelectedSessionUp => Box::new(MoveSelectedSessionUp),
@@ -2904,6 +3084,138 @@ mod tests {
         )
         .unwrap();
         assert!(back.is_empty(), "{back:?}");
+    }
+
+    #[test]
+    fn a_command_keeps_its_default_and_gains_added_keys() {
+        let sidebar = command(CommandId::ToggleSidebar);
+        let added = add_shortcut(
+            &ShortcutOverrides::new(),
+            CommandId::ToggleSidebar,
+            &test_chords("cmd-alt-y"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            sidebar.effective_keystrokes(&added),
+            vec![test_chords("cmd-b"), test_chords("cmd-alt-y")]
+        );
+        // Only the added key is stored, in an entry older builds ignore.
+        assert_eq!(
+            added,
+            ShortcutOverrides::from([(
+                "toggle-sidebar#2".into(),
+                Some(test_chords("cmd-alt-y"))
+            )])
+        );
+        assert!(sidebar.is_overridden(&added));
+        // Both keys are bound and both clash for other commands.
+        assert_eq!(sidebar.key_bindings(&added).len(), 2);
+        assert_eq!(
+            shortcut_conflict(CommandId::OpenLauncher, &test_chords("cmd-alt-y"), &added)
+                .map(|holder| holder.id),
+            Some(CommandId::ToggleSidebar)
+        );
+
+        // A third key, then replacing the middle one in place.
+        let third = add_shortcut(&added, CommandId::ToggleSidebar, &test_chords("cmd-alt-u"), None, None)
+            .unwrap();
+        let replaced = add_shortcut(
+            &third,
+            CommandId::ToggleSidebar,
+            &test_chords("cmd-alt-i"),
+            Some(&test_chords("cmd-alt-y")),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            sidebar.effective_keystrokes(&replaced),
+            vec![
+                test_chords("cmd-b"),
+                test_chords("cmd-alt-i"),
+                test_chords("cmd-alt-u")
+            ]
+        );
+
+        // Removing the default keeps the others working.
+        let removed = remove_shortcut_key(&replaced, CommandId::ToggleSidebar, &test_chords("cmd-b"));
+        assert_eq!(
+            sidebar.effective_keystrokes(&removed),
+            vec![test_chords("cmd-alt-i"), test_chords("cmd-alt-u")]
+        );
+        assert!(command(CommandId::ToggleSidebar).key_bindings(&removed).len() == 2);
+
+        // Reset drops every recorded key at once.
+        assert!(reset_shortcut(&removed, CommandId::ToggleSidebar).is_empty());
+        // Recording one key in the pencil editor replaces all of them.
+        let assigned =
+            assign_shortcut(&removed, CommandId::ToggleSidebar, &test_chords("cmd-alt-shift-j"), None)
+                .unwrap();
+        assert_eq!(sidebar.effective_keystrokes(&assigned), vec![test_chords("cmd-alt-shift-j")]);
+        assert_eq!(assigned.len(), 1, "{assigned:?}");
+    }
+
+    #[test]
+    fn removing_an_added_key_reads_as_unmodified_again() {
+        let added = add_shortcut(
+            &ShortcutOverrides::new(),
+            CommandId::ToggleSidebar,
+            &test_chords("cmd-alt-y"),
+            None,
+            None,
+        )
+        .unwrap();
+        let removed = remove_shortcut_key(&added, CommandId::ToggleSidebar, &test_chords("cmd-alt-y"));
+        assert!(removed.is_empty(), "{removed:?}");
+    }
+
+    #[test]
+    fn adding_a_held_key_takes_only_that_key_from_its_holder() {
+        let sidebar = CommandId::ToggleSidebar;
+        let clash = add_shortcut(&ShortcutOverrides::new(), sidebar, &test_chords("cmd-n"), None, None)
+            .unwrap_err();
+        assert_eq!(clash.holder, CommandId::OpenLauncher);
+        assert!(clash.can_replace && !clash.can_swap, "an added key has nothing to swap");
+        let taken = add_shortcut(
+            &ShortcutOverrides::new(),
+            sidebar,
+            &test_chords("cmd-n"),
+            None,
+            Some(ShortcutResolution::Replace),
+        )
+        .unwrap();
+        assert_eq!(
+            command(sidebar).effective_keystrokes(&taken),
+            vec![test_chords("cmd-b"), test_chords("cmd-n")]
+        );
+        assert!(command(CommandId::OpenLauncher).effective_keystrokes(&taken).is_empty());
+
+        // An added key is taken away the same way when another command
+        // claims it, and the first command keeps its default.
+        let claimed = assign_shortcut(
+            &taken,
+            CommandId::OpenLauncher,
+            &test_chords("cmd-n"),
+            Some(ShortcutResolution::Replace),
+        )
+        .unwrap();
+        assert_eq!(command(sidebar).effective_keystrokes(&claimed), vec![test_chords("cmd-b")]);
+        assert!(claimed.is_empty(), "{claimed:?}");
+    }
+
+    #[test]
+    fn extra_keys_survive_an_unknown_reader_and_order_by_slot() {
+        // `#10` sorts before `#2` as text; the slot number decides the order.
+        let overrides = ShortcutOverrides::from([
+            ("toggle-sidebar#10".into(), Some(test_chords("cmd-alt-u"))),
+            ("toggle-sidebar#2".into(), Some(test_chords("cmd-alt-y"))),
+            ("toggle-sidebar#x".into(), Some(test_chords("cmd-alt-z"))),
+        ]);
+        assert_eq!(
+            command(CommandId::ToggleSidebar).effective_keystrokes(&overrides),
+            vec![test_chords("cmd-b"), test_chords("cmd-alt-y"), test_chords("cmd-alt-u")]
+        );
     }
 
     #[test]

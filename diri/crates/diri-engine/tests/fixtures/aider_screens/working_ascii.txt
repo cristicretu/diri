@@ -1,0 +1,20 @@
+Analytics have been permanently disabled.
+────────────────────────────────────────────────────────────────────────────────
+You can skip this check with --no-gitignore
+Add .aider* to .gitignore (recommended)? (Y)es/(N)o [Yes]:
+Added .aider* to .gitignore
+Warning for openai/fake: Unknown context window size and costs, using sane
+defaults.
+You can skip this check with --no-show-model-warnings
+
+https://aider.chat/docs/llms/warnings.html
+Open documentation url for more info? (Y)es/(N)o/(D)on't ask again [Yes]: n
+
+Aider v0.86.2
+Model: openai/fake with diff edit format
+Git repo: .git with 1 files
+Repo-map: disabled
+────────────────────────────────────────────────────────────────────────────────
+diff> SLOW hi
+
+      =#   Waiting for openai/fake

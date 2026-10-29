@@ -45,9 +45,12 @@ pub mod detect;
 pub mod dev_build;
 pub mod directories;
 pub mod events;
+#[doc(hidden)]
+pub mod find_history;
 pub mod git;
 pub mod governor;
 pub mod history;
+pub mod history_swap;
 pub mod holder;
 pub mod hooks;
 pub mod hosts;

@@ -198,6 +198,7 @@ bits 48..64  cluster index in the page's arena (with GRAPHEME)
   - Debug builds decode every logged row and compare it with the cells.
   - This cut packing from about 0.07 s to 0.01 s per 64 MiB of ASCII. The remaining cost is appending to the log as text is written.
 - **Unpacking.** A packed page is unpacked into a one-page cache on demand, for `Scroll`, find capture or a checkpoint export. The cache is not counted in the budget, and readers release it after a batch.
+- **Idle pages on disk.** A packed page is an immutable byte string, so it pages out through the same seam compact history uses today (`grid::cold::ColdStore`, see `docs/idle-history-swap.md`): the Engine's idle ladder hands a quiet session's packed pages to its encrypted swap file, the one-page unpack cache loads a stored page back, and the budget counts a stored page at its packed length so retention never depends on paging.
 
 ### Footprint
 
