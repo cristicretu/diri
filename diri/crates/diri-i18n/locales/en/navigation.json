@@ -256,6 +256,7 @@
   "palette.new_agent_session": "New {agent} Session",
   "palette.new_terminal": "New Terminal",
   "palette.new_terminal_on": "New Terminal on {host}",
+  "palette.script": "Script",
   "palette.switch_account": "Switch {agent} to {account}",
   "palette.sync_prefs_to": "Sync Prefs to {host}",
   "palette.workspace.all_sessions": "All sessions",

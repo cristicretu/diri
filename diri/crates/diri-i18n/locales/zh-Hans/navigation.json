@@ -256,6 +256,7 @@
   "palette.new_agent_session": "新建 {agent} 会话",
   "palette.new_terminal": "新建终端",
   "palette.new_terminal_on": "在 {host} 上新建终端",
+  "palette.script": "脚本",
   "palette.switch_account": "将 {agent} 切换到 {account}",
   "palette.sync_prefs_to": "将偏好设置同步到 {host}",
   "palette.workspace.all_sessions": "所有会话",
