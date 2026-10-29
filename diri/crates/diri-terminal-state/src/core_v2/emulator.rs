@@ -71,6 +71,8 @@ pub(crate) struct Screen {
     thawed: Option<usize>,
     layout: Layout,
     cursor_line: usize,
+    /// The program colors' generation at the last clear.
+    colors_seen: u64,
     /// Everything is damaged (options changed).
     full_damage: bool,
     /// Per screen line, where its cells were at the last
@@ -78,6 +80,10 @@ pub(crate) struct Screen {
     /// valid while `moved_known`.
     moved: Vec<u32>,
     moved_known: bool,
+    /// The dirty screen lines [`Emulator::collect_damage`] found, valid
+    /// while `dirty_listed`.
+    dirty: Vec<u32>,
+    dirty_listed: bool,
 }
 
 /// One row read from a [`Screen`].
@@ -206,34 +212,6 @@ impl Screen {
         if let Some(p) = self.thawed.take() {
             self.core.pages.refreeze(p);
         }
-    }
-
-    /// Where each screen line's cells were at the last clear, so moved rows
-    /// keep their fingerprints (as the current core reports them). Rows only
-    /// move by being appended at the bottom (the screen is the newest rows
-    /// of the page list), so line `y` holds what line `y + appended` held,
-    /// unless a write since marked it dirty or it is new. Unknown across a
-    /// screen swap or an options change.
-    fn track_moved_lines(&mut self) {
-        let now = self.layout();
-        self.moved_known =
-            !self.full_damage && now.swaps == self.layout.swaps && now.total >= self.layout.total;
-        if !self.moved_known {
-            return;
-        }
-        let appended = now.total - self.layout.total;
-        let lines = self.core.lines();
-        let pages = &self.core.pages;
-        self.moved.clear();
-        self.moved.extend((0..lines).map(|y| {
-            let (p, r) = pages.locate(y);
-            let source = y as u64 + appended;
-            if pages.page(p).meta[r].dirty || source >= lines as u64 {
-                CONTENT_CHANGED
-            } else {
-                source as u32
-            }
-        }));
     }
 
     fn layout(&self) -> Layout {
@@ -381,9 +359,12 @@ impl Emulator for Screen {
             thawed: None,
             layout: Layout::default(),
             cursor_line: 0,
+            colors_seen: 0,
             full_damage: true,
             moved: Vec::new(),
             moved_known: false,
+            dirty: Vec::new(),
+            dirty_listed: false,
         };
         screen.layout = screen.layout();
         screen
@@ -527,22 +508,58 @@ impl Emulator for Screen {
         self.core.cursor_style()
     }
 
+    /// Every write marks its row dirty (the print path included), so the
+    /// dirty rows are the damage. The current core also reports the rows the
+    /// cursor was on and is on, which re-hashes them on every read; here
+    /// that happens only after the program colors changed, the one change
+    /// to those rows' shown colors that writes no cell (and which the
+    /// current core shows through them). A read that changes nothing
+    /// reports nothing, and settling it hashes no row.
+    ///
+    /// One walk over the screen finds the dirty rows (which
+    /// [`Emulator::clear_damage`] then clears alone) and where each line's
+    /// cells were at the last clear, so moved rows keep their fingerprints
+    /// (as the current core reports them). Rows only move by being appended
+    /// at the bottom (the screen is the newest rows of the page list), so
+    /// line `y` holds what line `y + appended` held, unless a write since
+    /// marked it dirty or it is new. That is unknown across a screen swap
+    /// or an options change.
     fn collect_damage(&mut self, mut on_line: impl FnMut(usize)) -> bool {
-        self.track_moved_lines();
-        if self.full_damage || self.layout() != self.layout {
-            return true;
-        }
+        let now = self.layout();
+        self.moved_known =
+            !self.full_damage && now.swaps == self.layout.swaps && now.total >= self.layout.total;
+        let full = self.full_damage || now != self.layout;
+        let appended = now.total.wrapping_sub(self.layout.total);
+        let lines = self.core.lines();
         let pages = &self.core.pages;
-        for y in 0..self.core.lines() {
+        self.moved.clear();
+        self.dirty.clear();
+        for y in 0..lines {
             let (p, r) = pages.locate(y);
-            if pages.page(p).meta[r].dirty {
-                on_line(y);
+            let dirty = pages.page(p).meta[r].dirty;
+            if dirty {
+                self.dirty.push(y as u32);
+            }
+            if self.moved_known {
+                let source = y as u64 + appended;
+                self.moved.push(if dirty || source >= lines as u64 {
+                    CONTENT_CHANGED
+                } else {
+                    source as u32
+                });
             }
         }
-        // As the current core does, the rows the cursor was on and is on:
-        // the print path changes them.
-        on_line(self.cursor_line);
-        on_line(self.core.line);
+        self.dirty_listed = true;
+        if full {
+            return true;
+        }
+        for &y in &self.dirty {
+            on_line(y as usize);
+        }
+        if self.core.colors_generation() != self.colors_seen {
+            on_line(self.cursor_line);
+            on_line(self.core.line);
+        }
         false
     }
 
@@ -552,12 +569,22 @@ impl Emulator for Screen {
     }
 
     fn clear_damage(&mut self) {
-        for y in 0..self.core.lines() {
-            let (p, r) = self.core.pages.locate(y);
-            self.core.pages.page_mut(p).meta[r].dirty = false;
+        let lines = self.core.lines();
+        let pages = &mut self.core.pages;
+        if std::mem::take(&mut self.dirty_listed) {
+            for &y in &self.dirty {
+                let (p, r) = pages.locate(y as usize);
+                pages.page_mut(p).meta[r].dirty = false;
+            }
+        } else {
+            for y in 0..lines {
+                let (p, r) = pages.locate(y);
+                pages.page_mut(p).meta[r].dirty = false;
+            }
         }
         self.layout = self.layout();
         self.cursor_line = self.core.line;
+        self.colors_seen = self.core.colors_generation();
         self.full_damage = false;
     }
 
