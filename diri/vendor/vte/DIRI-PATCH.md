@@ -1,8 +1,11 @@
 # Diri VTE patch
 
 Source: crates.io `vte` 0.15.0, copied from the Cargo registry. Original
-Apache-2.0/MIT licenses and upstream tests are retained. There are six
-production changes. The first is `SyncState::default`: its byte buffer starts empty instead of reserving
+Apache-2.0/MIT licenses and upstream tests are retained. Each production
+change has a section below. The first is `SyncState::default`: its byte buffer starts empty instead of reserving
+
+Apache-2.0/MIT licenses and upstream tests are retained. Each production change has
+a section below. The first is `SyncState::default`: its byte buffer starts empty instead of reserving
 the 2 MiB synchronization limit for every terminal, including idle shells.
 
 Original crates.io archive SHA-256:
@@ -88,6 +91,11 @@ the ASCII byte was never parsed: the letter vanished, and only when that read
 boundary fell there. It now consumes only the first character's bytes.
 Test: `partial_utf8_then_ascii_then_partial_utf8`.
 
+## Mode 1016
+
+`NamedPrivateMode::SgrPixelMouse` names DECSET 1016 (SGR mouse reports in
+pixels); `alacritty_terminal` sets, resets and reports it.
+
 ## Mode 2027
 
 `NamedPrivateMode::GraphemeClustering` names DECSET 2027 so `Term` can set,
@@ -112,11 +120,12 @@ Characters beyond ASCII between ASCII bytes and C1 controls go over as one
 `Handler::input_text` (default: `input` per character), so a terminal can
 write a CJK run without a call per character.
 
-CSI parameter bytes (digits, `;`, `:`) are consumed in one loop
-(`advance_csi_params`) that takes the same action per byte as
-`advance_csi_param`; the byte after them goes through `change_state`. None of
-those bytes dispatches, so `advance_until_terminated` still stops exactly
-where it did.
+CSI parameter bytes (digits, `;`, `:`) are consumed in one loop that takes
+the same action per byte as `advance_csi_param`; the byte after them goes
+through `change_state`. None of those bytes dispatches, so
+`advance_until_terminated` still stops exactly where it did. (The loop is now
+`advance_csi`, which also takes the first parameter byte in CSI entry; see
+"String bodies and CSI parameters in runs".)
 
 Test: `single_scan_ground_and_csi_match_the_bytewise_parser` keeps the old
 parser as `advance_reference` and compares every dispatch over 400 random
@@ -124,6 +133,130 @@ soups of printable runs, controls, DEL, C1 in both encodings, valid,
 truncated and invalid UTF-8 and escapes of every kind, fed whole and in
 pieces of 1 to 40 bytes. `printable_runs_end_at_the_first_byte_outside_space_to_tilde`
 checks the word test for every byte value at every offset.
+
+### Characters beyond ASCII validated in the same pass
+
+A stretch of bytes at or above 0x80 was still read three times: once to find
+the next ASCII byte, once by `str::from_utf8`, and once more to split it at C1
+controls. `non_ascii_run_end` now validates and ends the run in one pass, with
+exactly `from_utf8`'s acceptance (overlongs, surrogates and code points past
+U+10FFFF rejected), stopping at the next ASCII byte, C1 control (`C2 80` to
+`C2 9F`, executed as before) or invalid or incomplete sequence; three-byte
+characters (CJK, kana, Hangul) take a short path. The run goes to
+`print_text` as before. Invalid and incomplete UTF-8 still goes through the
+error handling above, unchanged, starting where the run stopped.
+
+`Parser::set_per_character_print` (and `Processor::set_per_character_print`,
+both hidden) hands ground text to `print` one character at a time instead of
+`print_ascii`/`print_text` runs, everything else unchanged. Diri's
+`diri-terminal-state` uses it as the reference that its run paths, and the
+`vt_workloads` bench, are checked against.
+
+Upstream bug, fixed here: a C1 control completed across reads (`C2` at the end
+of one read, `85` at the start of the next) was printed as a character, where
+a whole read executes it. REP then repeated it instead of the character before,
+so the screen depended on where the read split. `advance_partial_utf8` now
+executes a completed C1 (see "C1 control completed across reads" below).
+
+Tests: `non_ascii_runs_end_where_from_utf8_and_c1_end_them` (300,000 byte
+strings built from UTF-8 edge bytes, against `from_utf8`),
+`per_character_print_dispatches_the_same_characters`,
+`a_c1_control_split_across_reads_is_executed`, and
+`single_scan_ground_and_csi_match_the_bytewise_parser` above.
+
+## String bodies and CSI parameters in runs
+
+Upstream walks every byte of an OSC, DCS, SOS, PM or APC body through the
+state dispatch, one call each. A Kitty image chunk or an 8 KiB OSC cost a
+dispatch per byte. Now:
+
+- **SOS/PM/APC and ignored DCS** skip to the next CAN, SUB or ESC with
+  `memchr3`; every other byte was ignored anyway.
+- **OSC** stores the body up to the next C0 byte as one copy. With `std`,
+  `osc_raw` keeps the `;` separators and `osc_end` splits the first
+  `MAX_OSC_PARAMS` of them, instead of recording each as it arrives. What is
+  dispatched is unchanged: the same parameters, C0 controls still dropped,
+  later separators still ignored. The 2 MiB limit still counts body bytes
+  without separators (exactly, once a body nears it), and separators past the
+  sixteenth are dropped, so the buffer stays below the limit plus 16. Without
+  `std` the fixed buffer keeps the per-byte rules.
+- **DCS passthrough** hands runs of `put` bytes to a new
+  `Perform::put_slice`, whose default calls `put` per byte. The ANSI
+  performer appends the run to its request with the same 1 KiB cap.
+- **CSI** digits, `;` and `:` update the parameters in a tight loop
+  (`advance_csi`, which replaces `advance_csi_params` and also covers the
+  first parameter byte in CSI entry) instead of a dispatch per byte. Any other byte goes through
+  the state machine as before, and the loop returns after it, so
+  `advance_until_terminated` still stops right after a synchronized-update
+  CSI.
+- **REP** (`CSI b`) of a printable ASCII character goes to `input_ascii` in
+  runs of up to 256 instead of `input` per repetition; `input_ascii` is
+  defined as equal to `input` per character.
+- An unhandled OSC no longer formats its whole body for a debug log line
+  nobody enabled (`log_enabled!` guard).
+
+The runs are found by `scan::run` (new module, public so Diri's own string
+scanners use the same code): NEON on aarch64 and SSE2 on x86_64, both
+baseline features of those targets, checking 64 bytes per step; a byte loop
+elsewhere. `scan::find_pair` finds a two-byte opener (`ESC ]`, `ESC _`) the
+same way. No new dependency and no per-parser memory.
+
+Tests: `osc_bodies_in_runs_dispatch_what_per_byte_storage_did` (random OSCs,
+controls, C1 bytes and every terminator, in random reads, against a model of
+the per-byte storage), `the_osc_limit_counts_body_bytes_not_separators`
+(bodies of the limit minus one, the limit and plus one, with 3, 40 and
+300,000 separators), and `scan`'s vector-against-byte-loop tests. Diri's
+`chunking_differential` tests compare one-shot, byte-at-a-time and every
+split offset.
+
+## One C0 index per read, and OSCs dispatched in place
+
+`scan::c0_positions` lists the offsets of every byte below 0x20 in a read,
+and `scan::C0Index` answers "the next C0 byte (of these values) from here".
+Diri builds one per read that contains string sequences (capped at 4,096
+entries, beyond which every layer scans as before). The progress, notification
+and image scanners and this parser then all find string terminators there, so
+an OSC or APC body is scanned once per read instead of once per layer.
+`Processor::advance_indexed` and `Parser::advance_until_terminated_indexed`
+take the index; string states end their runs where it says. Bytes held for a
+synchronized update are parsed without it.
+
+With `std`, an OSC that starts with nothing stored and ends in the same read
+is dispatched straight from the read: its parameters are slices of the
+caller's buffer, split at the first 16 separators exactly as `osc_end` splits
+`osc_raw`, and the terminator then does what `advance_osc_string` does after
+`osc_end`. Bodies over the 2 MiB limit, and OSCs that span reads, are stored
+as before.
+
+Tests: `indexed_parsing_dispatches_what_scanning_does` (2,000 random soups of
+every escape kind, string bodies, controls, C1 and UTF-8, in small and whole
+reads, with and without the index); the OSC oracle tests also run indexed.
+
+## Test-only OSC observation
+
+Feature `observe` (off by default; no product crate enables it) adds
+`vte::observe`: per-thread totals of `osc_dispatch` calls, their parameters
+and parameter bytes, and, when turned on with `observe::reset(true)`, an
+order-sensitive FNV-1a checksum of every parameter byte. `vt_workloads`
+compares these with a reference parse, because an OSC nothing reads (the
+long-escapes workload is OSC 6) leaves no terminal state that would expose a
+parser skipping its body. Both dispatch paths record: `osc_dispatch` and
+the in-place `osc_finish_in_place`. Without the feature the dispatch paths
+are unchanged.
+
+parser skipping its body. Without the feature the dispatch path is unchanged.
+
+Test: `diri-terminal-state`'s `tests/osc_observe.rs`
+(`cargo test -p diri-terminal-state --features bench-verify --test osc_observe`).
+
+## C1 control completed across reads
+
+Upstream bug, fixed here. A C1 control sent as UTF-8 (`C2 80` to `C2 9F`)
+executes when both bytes arrive in one read, but `advance_partial_utf8`
+printed it when a read ended between them. The printed C1 then became the
+character `REP` repeats, so `5 C2 9C ESC [ b` showed `55` in one read and
+`5` split. A character completed across reads now goes through the same
+C1 check as the whole-text path. Test: `split_utf8_c1_control_executes_as_whole`.
 
 ## Ground-state text and REP hooks (core v2 prototype)
 
@@ -138,11 +271,35 @@ defaults that keep every existing performer and handler unchanged:
   the effect of the calls the parser would make, and must stop before ESC,
   other C0, DEL, C1, or invalid or incomplete UTF-8. The defaults consume
   nothing, so the parser handles every byte as before.
-- `Handler::input_repeat(char, usize)` for REP (`CSI b`), whose default calls
-  `input` `count` times, as the parser did.
+- `Handler::input_repeat(char, usize)` for REP (`CSI b`). Its default is the
+  REP run described under "String bodies and CSI parameters in runs": a
+  printable ASCII character goes to `input_ascii` in runs of up to 256, any
+  other character to `input` `count` times.
 
 No new dependency; the Remote Helper Build ID changes with the source.
 Tests: `diri-terminal-state` `core_v2::tests` (feature `core-v2`) feed the
 prototype one-shot, byte by byte, at every split and in random reads and
 compare with the current core's byte-at-a-time state; `cargo test -p vte`
 covers the unchanged defaults.
+
+## Test-only OSC observation
+
+Feature `observe` (off by default; no product crate enables it) adds
+`vte::observe`: per-thread totals of `osc_dispatch` calls, their parameters
+and parameter bytes, and, when turned on with `observe::reset(true)`, an
+order-sensitive FNV-1a checksum of every parameter byte. `vt_workloads`
+compares these with a reference parse, because an OSC nothing reads (the
+long-escapes workload is OSC 6) leaves no terminal state that would expose a
+parser skipping its body. Without the feature the dispatch path is unchanged.
+
+Test: `diri-terminal-state`'s `tests/osc_observe.rs`
+(`cargo test -p diri-terminal-state --features bench-verify --test osc_observe`).
+
+## C1 control completed across reads
+
+Upstream bug, fixed here. A C1 control sent as UTF-8 (`C2 80` to `C2 9F`)
+executes when both bytes arrive in one read, but `advance_partial_utf8`
+printed it when a read ended between them. The printed C1 then became the
+character `REP` repeats, so `5 C2 9C ESC [ b` showed `55` in one read and
+`5` split. A character completed across reads now goes through the same
+C1 check as the whole-text path. Test: `split_utf8_c1_control_executes_as_whole`.

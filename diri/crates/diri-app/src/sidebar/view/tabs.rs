@@ -14,7 +14,7 @@ const TAB_TITLE_WIDTH: f32 = TAB_WIDTH - 2.0 - 20.0 - 18.0 - 7.0 - 18.0 - 7.0;
 /// A session tab picked up in the horizontal strip. It carries no ghost:
 /// the tab itself is lifted by the strip, locked to the strip's axis.
 #[derive(Clone)]
-pub(super) struct DraggedTab(pub(super) SessionId);
+pub(crate) struct DraggedTab(pub(crate) SessionId);
 
 impl Render for DraggedTab {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {

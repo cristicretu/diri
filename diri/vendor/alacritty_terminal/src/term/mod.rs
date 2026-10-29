@@ -94,6 +94,9 @@ bitflags! {
         const IN_BAND_RESIZE          = 1 << 24;
         /// DECSET 2027: grapheme cluster widths by the clustering rule.
         const GRAPHEME_CLUSTERING     = 1 << 25;
+        /// DIRI PATCH: DECSET 1016, SGR mouse reports in pixels. Exclusive
+        /// with the other encodings, like 1005 and 1006.
+        const SGR_PIXEL_MOUSE         = 1 << 26;
         const MOUSE_MODE              = Self::MOUSE_REPORT_CLICK.bits() | Self::MOUSE_MOTION.bits() | Self::MOUSE_DRAG.bits();
         const KITTY_KEYBOARD_PROTOCOL = Self::DISAMBIGUATE_ESC_CODES.bits()
                                       | Self::REPORT_EVENT_TYPES.bits()
@@ -1373,6 +1376,220 @@ impl<T> Term<T> {
         self.damage_cursor();
     }
 
+    /// DIRI PATCH: `input` for a character that is not a control, with its
+    /// `info` already looked up.
+    #[inline(never)]
+    fn input_measured(&mut self, c: char, info: grapheme::Info)
+    where
+        T: EventListener,
+    {
+        if grapheme::may_join(c, info) && self.continue_cluster(c, info) {
+            return;
+        }
+        let width = info.width();
+
+        // Handle zero-width characters.
+        if width == 0 {
+            // Get previous column.
+            let mut column = self.grid.cursor.point.column;
+            if !self.grid.cursor.input_needs_wrap {
+                column.0 = column.saturating_sub(1);
+            }
+
+            // Put zerowidth characters over first fullwidth character cell.
+            let line = self.grid.cursor.point.line;
+            if self.grid[line][column]
+                .flags
+                .contains(Flags::WIDE_CHAR_SPACER)
+            {
+                column.0 = column.saturating_sub(1);
+            }
+
+            self.grid[line][column].push_zerowidth(c);
+            return;
+        }
+
+        // Move cursor to next line.
+        if self.grid.cursor.input_needs_wrap {
+            self.wrapline();
+        }
+
+        // If in insert mode, first shift cells to the right.
+        let columns = self.columns();
+        if self.mode.contains(TermMode::INSERT) && self.grid.cursor.point.column + width < columns {
+            let line = self.grid.cursor.point.line;
+            let col = self.grid.cursor.point.column;
+            let row = &mut self.grid[line][..];
+
+            for col in (col.0..(columns - width)).rev() {
+                row.swap(col + width, col);
+            }
+        }
+
+        if width == 1 {
+            self.write_at_cursor(c);
+        } else {
+            if self.grid.cursor.point.column + 1 >= columns {
+                if self.mode.contains(TermMode::LINE_WRAP) {
+                    // Insert placeholder before wide char if glyph does not fit in this row.
+                    self.grid
+                        .cursor
+                        .template
+                        .flags
+                        .insert(Flags::LEADING_WIDE_CHAR_SPACER);
+                    self.write_at_cursor(' ');
+                    self.grid
+                        .cursor
+                        .template
+                        .flags
+                        .remove(Flags::LEADING_WIDE_CHAR_SPACER);
+                    self.wrapline();
+                } else {
+                    // Prevent out of bounds crash when linewrapping is disabled.
+                    self.grid.cursor.input_needs_wrap = true;
+                    return;
+                }
+            }
+
+            if !self.write_wide_pair(c) {
+                // Write full width glyph to current cursor cell.
+                self.grid.cursor.template.flags.insert(Flags::WIDE_CHAR);
+                self.write_at_cursor(c);
+                self.grid.cursor.template.flags.remove(Flags::WIDE_CHAR);
+
+                // Write spacer to cell following the wide glyph.
+                self.grid.cursor.point.column += 1;
+                self.grid
+                    .cursor
+                    .template
+                    .flags
+                    .insert(Flags::WIDE_CHAR_SPACER);
+                self.write_at_cursor(' ');
+                self.grid
+                    .cursor
+                    .template
+                    .flags
+                    .remove(Flags::WIDE_CHAR_SPACER);
+            }
+        }
+
+        if self.grid.cursor.point.column + 1 < columns {
+            self.grid.cursor.point.column += 1;
+        } else {
+            self.grid.cursor.input_needs_wrap = true;
+        }
+    }
+
+    /// DIRI PATCH: writes the characters of `text` from byte `start` that
+    /// start a cluster of their own and fit in the cursor row, as `input`
+    /// would, and returns where it stopped. Writes one character through
+    /// `input` when none can take this path.
+    #[inline]
+    fn input_row_segment(&mut self, text: &str, start: usize) -> usize
+    where
+        T: EventListener,
+    {
+        // Columns of a character that starts a cluster of its own and takes
+        // one or two columns, as `input` measures it; `None` for anything
+        // that may join the cluster before it or is zero-width.
+        #[inline(always)]
+        fn own_width(c: char, info: grapheme::Info) -> Option<usize> {
+            if grapheme::may_join(c, info) {
+                return None;
+            }
+            match info.width() {
+                width @ (1 | 2) => Some(width),
+                _ => None,
+            }
+        }
+        let first = text[start..]
+            .chars()
+            .next()
+            .expect("start is on a char boundary");
+        if first < '\u{A0}' {
+            // ASCII or a C1 control, from a caller other than the parser.
+            self.input(first);
+            return start + first.len_utf8();
+        }
+        let first_info = grapheme::Info::of(first);
+        if own_width(first, first_info).is_none() {
+            // Marks and joiners, one at a time, as `input` takes them.
+            self.input_measured(first, first_info);
+            return start + first.len_utf8();
+        }
+        let columns = self.columns();
+        let point = self.grid.cursor.point;
+        let mut column = point.column.0;
+        let mut index = start;
+        let mut wrap = false;
+        #[cfg(test)]
+        let fast = !self.reference_wide_writes;
+        #[cfg(not(test))]
+        let fast = true;
+        if fast && !self.grid.cursor.input_needs_wrap && !self.mode.contains(TermMode::INSERT) {
+            let charset = self.grid.cursor.charsets[self.active_charset];
+            let template = &self.grid.cursor.template;
+            let (fg, bg, flags) = (template.fg, template.bg, template.flags);
+            let extra = template.extra.clone();
+            let spacer = charset.map(' ');
+            let row = &mut self.grid[point.line];
+            for c in text[start..].chars() {
+                if c < '\u{A0}' {
+                    break;
+                }
+                let Some(width) = own_width(c, grapheme::Info::of(c)) else {
+                    break;
+                };
+                if column + width > columns {
+                    break;
+                }
+                // Overwriting a wide character or spacer also clears its
+                // partner cells; leave that to `input`.
+                let wide = Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER;
+                if row[Column(column)].flags.intersects(wide)
+                    || (width == 2 && row[Column(column + 1)].flags.intersects(wide))
+                {
+                    break;
+                }
+                let cells = &mut row[Column(column)..Column(column + width)];
+                let cell = &mut cells[0];
+                cell.c = charset.map(c);
+                cell.fg = fg;
+                cell.bg = bg;
+                cell.extra = extra.clone();
+                if width == 1 {
+                    cell.flags = flags | (cell.flags & Flags::SHELL_MARKS);
+                } else {
+                    cell.flags = flags | Flags::WIDE_CHAR | (cell.flags & Flags::SHELL_MARKS);
+                    let cell = &mut cells[1];
+                    cell.c = spacer;
+                    cell.fg = fg;
+                    cell.bg = bg;
+                    cell.flags =
+                        flags | Flags::WIDE_CHAR_SPACER | (cell.flags & Flags::SHELL_MARKS);
+                    cell.extra = extra.clone();
+                }
+                index += c.len_utf8();
+                column += width;
+                if column == columns {
+                    wrap = true;
+                    break;
+                }
+            }
+        }
+        if index == start {
+            self.input_measured(first, first_info);
+            return start + first.len_utf8();
+        }
+        if wrap {
+            self.grid.cursor.point.column = Column(columns - 1);
+            self.grid.cursor.input_needs_wrap = true;
+        } else {
+            self.grid.cursor.point.column = Column(column);
+        }
+        index
+    }
+
     /// DIRI PATCH: writes the wide character `c` and its spacer at the
     /// cursor, leaving the cursor on the spacer, when neither cell is part of
     /// an earlier wide character. Exactly the two `write_at_cursor` calls of
@@ -1790,9 +2007,16 @@ impl<T: EventListener> Handler for Term<T> {
                     cell.fg = fg;
                     cell.bg = bg;
                     cell.flags = flags | (cell.flags & Flags::SHELL_MARKS);
-                    // Most cells and templates have no extra storage; skip
-                    // the reference count when both are empty.
-                    if extra.is_some() || cell.extra.is_some() {
+                    // Most cells and templates have no extra storage, and a
+                    // rewritten cell (a repeated character, a redrawn row)
+                    // often already shares the template's: skip the atomic
+                    // reference-count round trip in both cases.
+                    let same_extra = match (&cell.extra, &extra) {
+                        (None, None) => true,
+                        (Some(cell), Some(extra)) => Arc::ptr_eq(cell, extra),
+                        _ => false,
+                    };
+                    if !same_extra {
                         cell.extra = extra.clone();
                     }
                     written += 1;
@@ -1817,27 +2041,18 @@ impl<T: EventListener> Handler for Term<T> {
 
     /// DIRI PATCH: characters beyond ASCII, none a C1 control.
     ///
-    /// Equivalent to `input` for each character. A wide character that
-    /// continues no cluster and fits on the row is written here with its
-    /// spacer, without a call per character; anything else takes `input`.
+    /// Equivalent to `input` for each character. Characters that start a
+    /// grapheme cluster of their own and take one or two columns are written
+    /// straight into the cursor row, a row segment at a time, while they fit
+    /// and land on no wide character or spacer, with no wrap pending and
+    /// insert mode off. Anything else (marks, joiners, variation selectors,
+    /// emoji modifiers, regional indicators, a wide character at the margin,
+    /// a pending wrap) takes `input`, cluster rules included.
     #[inline(never)]
     fn input_text(&mut self, text: &str) {
-        for c in text.chars() {
-            let info = grapheme::Info::of(c);
-            if info.width() == 2
-                && !grapheme::may_join(c, info)
-                && !self.grid.cursor.input_needs_wrap
-                && !self.mode.contains(TermMode::INSERT)
-                && self.write_wide_pair(c)
-            {
-                if self.grid.cursor.point.column + 1 < self.columns() {
-                    self.grid.cursor.point.column += 1;
-                } else {
-                    self.grid.cursor.input_needs_wrap = true;
-                }
-                continue;
-            }
-            self.input(c);
+        let mut index = 0;
+        while index < text.len() {
+            index = self.input_row_segment(text, index);
         }
     }
 
@@ -1850,102 +2065,7 @@ impl<T: EventListener> Handler for Term<T> {
         }
         // Number of cells the char will occupy, as Claude Code (Bun's
         // `stringWidth`) measures it; see `grapheme`.
-        let info = grapheme::Info::of(c);
-        if grapheme::may_join(c, info) && self.continue_cluster(c, info) {
-            return;
-        }
-        let width = info.width();
-
-        // Handle zero-width characters.
-        if width == 0 {
-            // Get previous column.
-            let mut column = self.grid.cursor.point.column;
-            if !self.grid.cursor.input_needs_wrap {
-                column.0 = column.saturating_sub(1);
-            }
-
-            // Put zerowidth characters over first fullwidth character cell.
-            let line = self.grid.cursor.point.line;
-            if self.grid[line][column]
-                .flags
-                .contains(Flags::WIDE_CHAR_SPACER)
-            {
-                column.0 = column.saturating_sub(1);
-            }
-
-            self.grid[line][column].push_zerowidth(c);
-            return;
-        }
-
-        // Move cursor to next line.
-        if self.grid.cursor.input_needs_wrap {
-            self.wrapline();
-        }
-
-        // If in insert mode, first shift cells to the right.
-        let columns = self.columns();
-        if self.mode.contains(TermMode::INSERT) && self.grid.cursor.point.column + width < columns {
-            let line = self.grid.cursor.point.line;
-            let col = self.grid.cursor.point.column;
-            let row = &mut self.grid[line][..];
-
-            for col in (col.0..(columns - width)).rev() {
-                row.swap(col + width, col);
-            }
-        }
-
-        if width == 1 {
-            self.write_at_cursor(c);
-        } else {
-            if self.grid.cursor.point.column + 1 >= columns {
-                if self.mode.contains(TermMode::LINE_WRAP) {
-                    // Insert placeholder before wide char if glyph does not fit in this row.
-                    self.grid
-                        .cursor
-                        .template
-                        .flags
-                        .insert(Flags::LEADING_WIDE_CHAR_SPACER);
-                    self.write_at_cursor(' ');
-                    self.grid
-                        .cursor
-                        .template
-                        .flags
-                        .remove(Flags::LEADING_WIDE_CHAR_SPACER);
-                    self.wrapline();
-                } else {
-                    // Prevent out of bounds crash when linewrapping is disabled.
-                    self.grid.cursor.input_needs_wrap = true;
-                    return;
-                }
-            }
-
-            if !self.write_wide_pair(c) {
-                // Write full width glyph to current cursor cell.
-                self.grid.cursor.template.flags.insert(Flags::WIDE_CHAR);
-                self.write_at_cursor(c);
-                self.grid.cursor.template.flags.remove(Flags::WIDE_CHAR);
-
-                // Write spacer to cell following the wide glyph.
-                self.grid.cursor.point.column += 1;
-                self.grid
-                    .cursor
-                    .template
-                    .flags
-                    .insert(Flags::WIDE_CHAR_SPACER);
-                self.write_at_cursor(' ');
-                self.grid
-                    .cursor
-                    .template
-                    .flags
-                    .remove(Flags::WIDE_CHAR_SPACER);
-            }
-        }
-
-        if self.grid.cursor.point.column + 1 < columns {
-            self.grid.cursor.point.column += 1;
-        } else {
-            self.grid.cursor.input_needs_wrap = true;
-        }
+        self.input_measured(c, grapheme::Info::of(c));
     }
 
     #[inline]
@@ -2870,12 +2990,18 @@ impl<T: EventListener> Handler for Term<T> {
             NamedPrivateMode::BracketedPaste => self.mode.insert(TermMode::BRACKETED_PASTE),
             // Mouse encodings are mutually exclusive.
             NamedPrivateMode::SgrMouse => {
-                self.mode.remove(TermMode::UTF8_MOUSE);
+                self.mode
+                    .remove(TermMode::UTF8_MOUSE | TermMode::SGR_PIXEL_MOUSE);
                 self.mode.insert(TermMode::SGR_MOUSE);
             }
             NamedPrivateMode::Utf8Mouse => {
-                self.mode.remove(TermMode::SGR_MOUSE);
+                self.mode
+                    .remove(TermMode::SGR_MOUSE | TermMode::SGR_PIXEL_MOUSE);
                 self.mode.insert(TermMode::UTF8_MOUSE);
+            }
+            NamedPrivateMode::SgrPixelMouse => {
+                self.mode.remove(TermMode::SGR_MOUSE | TermMode::UTF8_MOUSE);
+                self.mode.insert(TermMode::SGR_PIXEL_MOUSE);
             }
             NamedPrivateMode::AlternateScroll => self.mode.insert(TermMode::ALTERNATE_SCROLL),
             NamedPrivateMode::LineWrap => self.mode.insert(TermMode::LINE_WRAP),
@@ -2903,7 +3029,7 @@ impl<T: EventListener> Handler for Term<T> {
                     self.swap_alt_screen(AltScreen::ClearOnExit);
                 }
             }
-            NamedPrivateMode::LeftRightMargins | NamedPrivateMode::SgrPixelMouse => (),
+            NamedPrivateMode::LeftRightMargins => (),
             NamedPrivateMode::ColorSchemeUpdates => {
                 self.mode.insert(TermMode::COLOR_SCHEME_UPDATES)
             }
@@ -2951,6 +3077,7 @@ impl<T: EventListener> Handler for Term<T> {
             NamedPrivateMode::BracketedPaste => self.mode.remove(TermMode::BRACKETED_PASTE),
             NamedPrivateMode::SgrMouse => self.mode.remove(TermMode::SGR_MOUSE),
             NamedPrivateMode::Utf8Mouse => self.mode.remove(TermMode::UTF8_MOUSE),
+            NamedPrivateMode::SgrPixelMouse => self.mode.remove(TermMode::SGR_PIXEL_MOUSE),
             NamedPrivateMode::AlternateScroll => self.mode.remove(TermMode::ALTERNATE_SCROLL),
             NamedPrivateMode::LineWrap => self.mode.remove(TermMode::LINE_WRAP),
             NamedPrivateMode::Origin => self.mode.remove(TermMode::ORIGIN),
@@ -2974,7 +3101,7 @@ impl<T: EventListener> Handler for Term<T> {
                     self.swap_alt_screen(AltScreen::ClearOnExit);
                 }
             }
-            NamedPrivateMode::LeftRightMargins | NamedPrivateMode::SgrPixelMouse => (),
+            NamedPrivateMode::LeftRightMargins => (),
             NamedPrivateMode::ColorSchemeUpdates => {
                 self.mode.remove(TermMode::COLOR_SCHEME_UPDATES)
             }
@@ -3031,8 +3158,9 @@ impl<T: EventListener> Handler for Term<T> {
                 NamedPrivateMode::LegacyAltScreen | NamedPrivateMode::ClearingAltScreen => {
                     self.mode.contains(TermMode::ALT_SCREEN).into()
                 }
-                NamedPrivateMode::LeftRightMargins | NamedPrivateMode::SgrPixelMouse => {
-                    ModeState::PermanentlyReset
+                NamedPrivateMode::LeftRightMargins => ModeState::PermanentlyReset,
+                NamedPrivateMode::SgrPixelMouse => {
+                    self.mode.contains(TermMode::SGR_PIXEL_MOUSE).into()
                 }
                 NamedPrivateMode::ColorSchemeUpdates => {
                     self.mode.contains(TermMode::COLOR_SCHEME_UPDATES).into()
@@ -3340,6 +3468,46 @@ impl<T: EventListener> Handler for Term<T> {
         };
         self.event_proxy.send_event(Event::PtyWrite(text));
     }
+}
+
+/// DIRI PATCH (core v2): the XTGETTCAP reply for one hex-encoded name, as
+/// `request_termcap` writes it, so the core v2 prototype answers alike.
+#[doc(hidden)]
+pub fn xtgettcap_reply(hex: &[u8]) -> String {
+    let name = decode_hex(hex);
+    match name.as_deref().and_then(termcap) {
+        Some(Some(value)) => format!(
+            "\x1bP1+r{}={}\x1b\\",
+            hex_name(hex),
+            encode_hex(value.as_bytes())
+        ),
+        Some(None) => format!("\x1bP1+r{}\x1b\\", hex_name(hex)),
+        None => format!("\x1bP0+r{}\x1b\\", hex_name(hex)),
+    }
+}
+
+/// DIRI PATCH (core v2): the text of an OSC 52 store, as `clipboard_store`
+/// decodes it.
+#[doc(hidden)]
+pub fn osc52_store_text(base64: &[u8]) -> Option<String> {
+    String::from_utf8(Base64.decode(base64).ok()?).ok()
+}
+
+/// DIRI PATCH (core v2): the OSC 52 load reply `clipboard_load` builds.
+#[doc(hidden)]
+pub fn osc52_load_reply(clipboard: u8, text: &str, terminator: &str) -> String {
+    format!(
+        "\x1b]52;{};{}{}",
+        clipboard as char,
+        Base64.encode(text),
+        terminator
+    )
+}
+
+/// DIRI PATCH (core v2): the version DA2 (`CSI > c`) reports.
+#[doc(hidden)]
+pub fn da2_version() -> usize {
+    version_number(env!("CARGO_PKG_VERSION"))
 }
 
 /// DIRI PATCH: XTGETTCAP answers. `Some(None)` is a boolean capability; the

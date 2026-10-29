@@ -43,7 +43,7 @@ pub fn compare<T>(core: &Core, reference: &Term<T>) -> Result<(), String> {
     if core.unsupported != 0 {
         return Err(format!("{} unsupported sequences", core.unsupported));
     }
-    let modes = !(TermMode::KITTY_KEYBOARD_PROTOCOL | TermMode::VI);
+    let modes = !TermMode::VI;
     if core.mode & modes != *reference.mode() & modes {
         return Err(format!(
             "modes {:?}, reference {:?}",

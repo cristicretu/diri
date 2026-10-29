@@ -6,10 +6,10 @@ use std::time::{Duration, Instant};
 use diri_proto::grid::{CommandEnd, CursorShape, GridCell, GridUpdate, StyleSpan, UnderlineKind};
 use diri_proto::terminal::MouseModes;
 use gpui::{
-    App, Bounds, ContentMask, Element, ElementId, FocusHandle, Font, FontId, GlobalElementId,
-    InputHandler, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels, Point, ShapedLine,
-    SharedString, Style, TextAlign, TextRun, UTF16Selection, Window, fill, point, px, relative,
-    size,
+    App, Bounds, ContentMask, Edges, Element, ElementId, FocusHandle, Font, FontId,
+    GlobalElementId, InputHandler, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels,
+    Point, ShapedLine, SharedString, Style, TextAlign, TextRun, UTF16Selection, Window, fill,
+    point, px, relative, size,
 };
 
 use crate::blocks::BlockGlyph;
@@ -116,6 +116,9 @@ pub struct TerminalElement {
     hovered_reference: Option<ReferenceHit>,
     reduce_motion: bool,
     cursor_hidden: bool,
+    /// Host padding around the grid that a full-screen program's own
+    /// background may extend into. Zero paints nothing outside the bounds.
+    padding_extend: Edges<Pixels>,
     cursor_preferences: CursorPreferences,
 }
 
@@ -940,6 +943,8 @@ pub struct TerminalPrepaintState {
     overlay_quads: Vec<PaintQuad>,
     /// Shell command marks, drawn in the padding left of the grid.
     gutter_quads: Vec<PaintQuad>,
+    /// A full-screen program's edge backgrounds, carried into the padding.
+    padding_quads: Vec<PaintQuad>,
     selection: SelectionPaint,
     /// Reading path: window row and the absolute row whose shape paint reads
     /// from the history cache, as the live path reads the row cache.
@@ -1060,6 +1065,7 @@ impl TerminalElement {
             reduce_motion: false,
             cursor_preferences: CursorPreferences::default(),
             cursor_hidden: false,
+            padding_extend: Edges::default(),
         }
     }
 
@@ -1223,6 +1229,17 @@ impl TerminalElement {
     #[must_use]
     pub fn without_cursor(mut self) -> Self {
         self.cursor_hidden = true;
+        self
+    }
+
+    /// The padding the host keeps around the grid. On the alternate screen,
+    /// an edge row a program painted end to end with its own background
+    /// (an editor colourscheme, `htop`, `k9s`) carries that colour out into
+    /// this padding, so the program no longer sits inside a theme-coloured
+    /// frame. The host must let the element paint that far outside its bounds.
+    #[must_use]
+    pub fn padding_extend(mut self, padding: Edges<Pixels>) -> Self {
+        self.padding_extend = padding;
         self
     }
 
@@ -2782,6 +2799,7 @@ impl Element for TerminalElement {
                 sprite_shapes: Vec::new(),
                 overlay_quads: Vec::new(),
                 gutter_quads: Vec::new(),
+                padding_quads: Vec::new(),
                 selection: SelectionPaint::default(),
                 lines: Vec::new(),
                 metrics: None,
@@ -2812,6 +2830,7 @@ impl Element for TerminalElement {
                 sprite_shapes: Vec::new(),
                 overlay_quads: Vec::new(),
                 gutter_quads: Vec::new(),
+                padding_quads: Vec::new(),
                 selection: SelectionPaint::default(),
                 lines: Vec::new(),
                 metrics: None,
@@ -2874,6 +2893,12 @@ impl Element for TerminalElement {
         let mut sprite_shapes = Vec::new();
         let mut overlay_quads = Vec::new();
         let mut gutter_quads = Vec::new();
+        let mut padding_quads = Vec::new();
+        // Only a full-screen program owns the whole grid; a shell's history
+        // scrolls, so its colours stay inside the grid.
+        let extend_padding = self.padding_extend != Edges::default()
+            && scroll_shift == px(0.0)
+            && mutex_lock(&self.shared.modes).alt_screen;
         let mut lines = Vec::with_capacity(visible_rows);
         let grid = SpriteGrid::new(bounds.origin, metrics, window.scale_factor());
         let cursor;
@@ -3089,6 +3114,23 @@ impl Element for TerminalElement {
                 let annotations = (prepared.graphemes.clone(), prepared.styles.clone());
                 cache[row] =
                     Some(self.prepare_row(cells, annotations, tints, row as u16, grid, window));
+            }
+            if extend_padding {
+                let rows: Vec<&[GridCell]> = cache
+                    .iter()
+                    .map(|row| {
+                        row.as_ref().map_or(&[][..], |row| {
+                            &row.cells[..row.cells.len().min(visible_cols)]
+                        })
+                    })
+                    .collect();
+                padding_quads = padding_extension_quads(
+                    &rows,
+                    bounds,
+                    metrics,
+                    self.padding_extend,
+                    self.theme,
+                );
             }
             cache_misses = misses;
             cache_hits = visible_rows as u64 - misses;
@@ -3333,6 +3375,7 @@ impl Element for TerminalElement {
             sprite_shapes,
             overlay_quads,
             gutter_quads,
+            padding_quads,
             selection,
             lines,
             metrics: Some(metrics),
@@ -3626,6 +3669,27 @@ impl Element for TerminalElement {
                 }
             }
         });
+        // Last, so the theme fill under the grid does not cover the sliver
+        // between the final whole cell and the bounds. Nothing else paints there.
+        if !prepaint.padding_quads.is_empty() {
+            let padded = Bounds::from_corners(
+                point(
+                    bounds.left() - self.padding_extend.left,
+                    bounds.top() - self.padding_extend.top,
+                ),
+                point(
+                    bounds.right() + self.padding_extend.right,
+                    bounds.bottom() + self.padding_extend.bottom,
+                ),
+            );
+            window.with_content_mask(Some(ContentMask { bounds: padded }), |window| {
+                window.paint_layer(padded, |window| {
+                    for quad in prepaint.padding_quads.drain(..) {
+                        window.paint_quad(quad);
+                    }
+                });
+            });
+        }
         window.replace_glyph_raster_style(previous_raster);
 
         self.report_first_content_paint();
@@ -3764,6 +3828,143 @@ fn cursor_bounds(
 /// program hid (DECTCEM) stays hidden in both, and a thumbnail has none.
 const fn cursor_should_render(host_shows_cursor: bool, protocol_visible: bool) -> bool {
     host_shows_cursor && protocol_visible
+}
+
+/// Powerline separators are drawn to fit their cell exactly; a row that
+/// uses them is a styled prompt or status bar whose colour stops there.
+const fn is_powerline(scalar: u32) -> bool {
+    matches!(scalar, 0xE0B0..=0xE0C8 | 0xE0CA | 0xE0CC..=0xE0D2 | 0xE0D4)
+}
+
+/// The background a row may carry into the padding: its edge cell's colour,
+/// when the program painted every cell of the row with a background of its
+/// own. A row with any default-background cell, a powerline glyph, or an
+/// edge in the theme's own colour keeps the theme padding.
+fn row_extension(row: &[GridCell], edge: GridCell, theme: TermTheme) -> Option<gpui::Rgba> {
+    let painted = |cell: &GridCell| {
+        (cell.style.contains(diri_proto::grid::TermStyle::INVERSE)
+            || !is_default_background(cell.bg))
+            && !is_powerline(cell.scalar)
+    };
+    if row.is_empty() || !row.iter().all(painted) {
+        return None;
+    }
+    let color = theme.resolve_cell(edge).background;
+    let byte = |channel: f32| (channel * 255.0).round() as u8;
+    let same =
+        |a: gpui::Rgba, b: gpui::Rgba| [a.r, a.g, a.b].map(byte) == [b.r, b.g, b.b].map(byte);
+    (!same(color, theme.background)).then_some(color)
+}
+
+/// Quads that carry a full-screen program's edge backgrounds out into the
+/// host padding around `bounds`: left and right per row, top and bottom per
+/// column of the first and last row (corners included), plus the sliver
+/// between the last whole cell and the bounds. Rows that do not qualify
+/// leave the padding to the theme.
+fn padding_extension_quads(
+    rows: &[&[GridCell]],
+    bounds: Bounds<Pixels>,
+    metrics: CellMetrics,
+    padding: Edges<Pixels>,
+    theme: TermTheme,
+) -> Vec<PaintQuad> {
+    let mut quads = Vec::new();
+    let Some(cols) = rows
+        .iter()
+        .map(|row| row.len())
+        .max()
+        .filter(|&cols| cols > 0)
+    else {
+        return quads;
+    };
+    let left = bounds.left() - padding.left;
+    let grid_right = bounds.left() + metrics.cell_width * cols as f32;
+    let right = bounds.right().max(grid_right) + padding.right;
+    let grid_bottom = bounds.top() + metrics.y_for_row(rows.len() as u16);
+    let bottom = bounds.bottom().max(grid_bottom) + padding.bottom;
+    let mut push = |x0: Pixels, y0: Pixels, x1: Pixels, y1: Pixels, color| {
+        if x1 > x0 && y1 > y0 {
+            quads.push(fill(
+                Bounds::from_corners(point(x0, y0), point(x1, y1)),
+                color,
+            ));
+        }
+    };
+
+    // Left and right, merging consecutive rows of one colour into one quad.
+    let mut sides: Vec<(Option<gpui::Rgba>, Option<gpui::Rgba>)> = Vec::with_capacity(rows.len());
+    for row in rows {
+        sides.push(match (row.first(), row.last()) {
+            (Some(&first), Some(&last)) if row.len() == cols => (
+                row_extension(row, first, theme),
+                row_extension(row, last, theme),
+            ),
+            _ => (None, None),
+        });
+    }
+    for side in [0, 1] {
+        let mut start = 0;
+        while start < sides.len() {
+            let color = if side == 0 {
+                sides[start].0
+            } else {
+                sides[start].1
+            };
+            let mut end = start + 1;
+            while end < sides.len()
+                && (if side == 0 {
+                    sides[end].0
+                } else {
+                    sides[end].1
+                }) == color
+            {
+                end += 1;
+            }
+            if let Some(color) = color {
+                let y0 = bounds.top() + metrics.y_for_row(start as u16);
+                let y1 = bounds.top() + metrics.y_for_row(end as u16);
+                if side == 0 {
+                    push(left, y0, bounds.left(), y1, color);
+                } else {
+                    push(grid_right, y0, right, y1, color);
+                }
+            }
+            start = end;
+        }
+    }
+
+    // Top and bottom follow the first and last row cell by cell, reaching
+    // into the corners with the edge cells' colours.
+    for (index, y0, y1) in [
+        (0, bounds.top() - padding.top, bounds.top()),
+        (rows.len() - 1, grid_bottom, bottom),
+    ] {
+        let row = rows[index];
+        if row.len() != cols || row_extension(row, row[0], theme).is_none() {
+            continue;
+        }
+        let mut col = 0;
+        while col < cols {
+            let color = theme.resolve_cell(row[col]).background;
+            let mut end = col + 1;
+            while end < cols && theme.resolve_cell(row[end]).background == color {
+                end += 1;
+            }
+            let x0 = if col == 0 {
+                left
+            } else {
+                bounds.left() + metrics.cell_width * col as f32
+            };
+            let x1 = if end == cols {
+                right
+            } else {
+                bounds.left() + metrics.cell_width * end as f32
+            };
+            push(x0, y0, x1, y1, color);
+            col = end;
+        }
+    }
+    quads
 }
 
 fn append_background_quads(
@@ -6637,5 +6838,123 @@ mod grapheme_paint_tests {
                 .0
                 .starts_with("e\u{301}")
         );
+    }
+}
+
+#[cfg(test)]
+mod padding_extend_tests {
+    use super::*;
+    use diri_proto::grid::{TermColor, TermStyle};
+
+    const BLUE: TermColor = TermColor::Rgb(0x20, 0x30, 0xa0);
+    const RED: TermColor = TermColor::Rgb(0xa0, 0x20, 0x20);
+
+    fn metrics() -> CellMetrics {
+        // 8 px cells, 16 px rows.
+        CellMetrics::from_measurements(px(8.0), px(12.0), px(4.0), px(0.0), FontId(0))
+    }
+
+    fn row(bgs: &[TermColor]) -> Vec<GridCell> {
+        bgs.iter()
+            .map(|&bg| GridCell::new(u32::from(' '), TermColor::Default, bg, TermStyle::empty()))
+            .collect()
+    }
+
+    fn quads(rows: &[Vec<GridCell>]) -> Vec<(Bounds<Pixels>, gpui::Hsla)> {
+        let rows: Vec<&[GridCell]> = rows.iter().map(Vec::as_slice).collect();
+        let theme = TermTheme::default();
+        // Four columns of 8 px in a 36 px wide box: a 4 px sliver remains.
+        let bounds = Bounds::new(point(px(100.0), px(50.0)), size(px(36.0), px(48.0)));
+        let padding = Edges {
+            top: px(2.0),
+            right: px(12.0),
+            bottom: px(10.0),
+            left: px(12.0),
+        };
+        padding_extension_quads(&rows, bounds, metrics(), padding, theme)
+            .into_iter()
+            .map(|quad| (quad.bounds, quad.background.as_solid().unwrap()))
+            .collect()
+    }
+
+    fn rgba(color: TermColor) -> gpui::Hsla {
+        TermTheme::default()
+            .resolve_cell(GridCell::new(
+                32,
+                TermColor::Default,
+                color,
+                TermStyle::empty(),
+            ))
+            .background
+            .into()
+    }
+
+    fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> Bounds<Pixels> {
+        Bounds::from_corners(point(px(x0), px(y0)), point(px(x1), px(y1)))
+    }
+
+    #[test]
+    fn a_fully_painted_screen_fills_every_side_of_the_padding() {
+        let screen = vec![row(&[BLUE; 4]); 3];
+        let quads = quads(&screen);
+        let blue = rgba(BLUE);
+        // Left and right merge the three rows; right includes the sliver.
+        assert!(quads.contains(&(rect(88.0, 50.0, 100.0, 98.0), blue)));
+        assert!(quads.contains(&(rect(132.0, 50.0, 148.0, 98.0), blue)));
+        // Top and bottom reach into the corners.
+        assert!(quads.contains(&(rect(88.0, 48.0, 148.0, 50.0), blue)));
+        assert!(quads.contains(&(rect(88.0, 98.0, 148.0, 108.0), blue)));
+        assert_eq!(quads.len(), 4);
+    }
+
+    #[test]
+    fn edges_follow_each_row_and_column() {
+        // A status line of its own colour, and a top row split in two.
+        let screen = vec![
+            row(&[RED, RED, BLUE, BLUE]),
+            row(&[BLUE; 4]),
+            row(&[RED; 4]),
+        ];
+        let quads = quads(&screen);
+        let (red, blue) = (rgba(RED), rgba(BLUE));
+        assert!(quads.contains(&(rect(88.0, 50.0, 100.0, 66.0), red)));
+        assert!(quads.contains(&(rect(88.0, 66.0, 100.0, 82.0), blue)));
+        assert!(quads.contains(&(rect(132.0, 50.0, 148.0, 82.0), blue)));
+        assert!(quads.contains(&(rect(88.0, 82.0, 100.0, 98.0), red)));
+        assert!(quads.contains(&(rect(88.0, 48.0, 116.0, 50.0), red)));
+        assert!(quads.contains(&(rect(116.0, 48.0, 148.0, 50.0), blue)));
+        assert!(quads.contains(&(rect(88.0, 98.0, 148.0, 108.0), red)));
+    }
+
+    #[test]
+    fn rows_with_default_cells_or_powerline_glyphs_keep_the_theme_padding() {
+        let mut prompt = row(&[BLUE; 4]);
+        prompt[1].scalar = 0xE0B0;
+        let screen = vec![
+            row(&[BLUE, BLUE, TermColor::Default, BLUE]),
+            prompt,
+            row(&[TermColor::Default; 4]),
+        ];
+        assert!(quads(&screen).is_empty());
+    }
+
+    #[test]
+    fn a_background_in_the_theme_colour_paints_nothing() {
+        let theme = TermTheme::default().background;
+        let own = TermColor::Rgb(
+            (theme.r * 255.0).round() as u8,
+            (theme.g * 255.0).round() as u8,
+            (theme.b * 255.0).round() as u8,
+        );
+        assert!(quads(&vec![row(&[own; 4]); 2]).is_empty());
+    }
+
+    #[test]
+    fn inverse_cells_count_as_painted() {
+        let mut screen = vec![row(&[TermColor::Default; 4])];
+        for cell in &mut screen[0] {
+            cell.style = TermStyle::INVERSE;
+        }
+        assert_eq!(quads(&screen).len(), 4);
     }
 }

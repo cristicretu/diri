@@ -49,7 +49,8 @@ manifest declares a native fork command.
 The bundled MCP bridge evaluates every write against a fresh Engine snapshot.
 Reads remain fleet-wide, but writes require a live `DIRIJOR_SESSION_ID`: a
 root agent may coordinate sessions in its project and message direct children on
-any host. Root agents may release only sessions in their project. A delegated
+any host. Root agents may release sessions in their project and their direct
+children on any project or host. A delegated
 agent may message its parent or direct children and release only direct children.
 Worktree writes are limited to the calling session's project. Unhosted MCP
 processes and stale, archived, or exited callers fail closed; user automation

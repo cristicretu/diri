@@ -934,6 +934,43 @@ impl RemoteManager {
         Ok(facts)
     }
 
+    /// `list-dir-v1` through the exact Helper build that owns the session:
+    /// one directory level resolved against its child's live working
+    /// directory. Older Helpers do not know the command and are refused here,
+    /// before any SSH channel opens.
+    pub fn list_dir(
+        &self,
+        helper: &InstalledHelper,
+        request: &diri_proto::remote_pty::ListDirRequest,
+        deadline: Instant,
+    ) -> io::Result<diri_proto::remote_pty::ListDirResult> {
+        if !supports_list_dir(helper) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote Helper does not support list-dir-v1",
+            ));
+        }
+        if request.selector.expected_incarnation.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "list-dir requires a pinned incarnation",
+            ));
+        }
+        request
+            .validate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let timeout = diri_pty::unix_socket::remaining(deadline)?;
+        let result: diri_proto::remote_pty::ListDirResult =
+            self.rpc(helper, HelperCommand::ListDir, request, timeout)?;
+        if result.entries.len() > request.limit as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "remote Helper exceeded the list-dir limit",
+            ));
+        }
+        Ok(result)
+    }
+
     pub(crate) fn inspect_for_reconnect(
         &self,
         helper: &InstalledHelper,
@@ -1180,6 +1217,13 @@ fn identity_from_inspection(
             "remote child identity disagrees with its process PID",
         )
     })
+}
+
+/// Whether `helper` answers `list-dir`. Optional operations may gate on the
+/// owning build's minor; close, restore and terminate never do.
+pub fn supports_list_dir(helper: &InstalledHelper) -> bool {
+    helper.protocol.major == ProtocolVersion::CURRENT.major
+        && helper.protocol.minor >= diri_proto::remote_pty::LIST_DIR_PROTOCOL_MINOR
 }
 
 fn require_rpc_success(output: CommandOutput) -> io::Result<CommandOutput> {

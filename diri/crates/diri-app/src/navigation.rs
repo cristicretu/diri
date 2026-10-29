@@ -1671,13 +1671,25 @@ impl NavigationOverlay {
         let Some(theme) = self.theme_matches.get(self.highlight).copied() else {
             return;
         };
+        let system_is_dark = matches!(
+            window.appearance(),
+            gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+        );
         let result = self
             .store
             .write()
             .expect("session store lock poisoned")
             .update_preferences(|prefs| {
-                prefs.follow_system_theme = false;
-                prefs.terminal_theme = theme.id.to_owned();
+                // Following the system, the pick is the theme for the side
+                // the OS is on now; otherwise it is the one theme.
+                if prefs.follow_system_theme {
+                    prefs.set_system_theme(system_is_dark, theme.id, system_is_dark);
+                } else {
+                    prefs.set_fixed_theme(
+                        theme.id,
+                        theme.appearance == diri_term::theme::ThemeAppearance::Dark,
+                    );
+                }
             });
         match result {
             Ok(()) => {

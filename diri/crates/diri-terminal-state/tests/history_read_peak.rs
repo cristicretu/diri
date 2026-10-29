@@ -41,10 +41,16 @@ fn full_history_reads_after_resizes_stay_small() {
     let mut screen = full_history_screen();
     for (step, cols) in [97usize, 171, 128, 80, 145].into_iter().enumerate() {
         screen.resize(cols, 30 + step);
+        // The payload is reserved at its bound up front (see
+        // `history_payload_growth.rs`); only what the read needs beyond its
+        // result counts.
+        let mut reserved = 0;
         let encoded = peak_of(|| {
             let (rows, payload) = screen.history_payload();
             assert!(rows > 0 && !payload.is_empty());
+            reserved = payload.capacity();
         });
+        let encoded = encoded.saturating_sub(reserved);
         assert!(
             encoded < MAX_READ_PEAK,
             "checkpoint read at {cols} columns peaked at {encoded} bytes"
