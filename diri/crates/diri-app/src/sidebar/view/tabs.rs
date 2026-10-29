@@ -634,10 +634,18 @@ impl Sidebar {
             Some(settling) => settling.into_any_element(),
             None => title_fade(title.clone()).into_any_element(),
         };
-        let location = props.location.clone();
+        // A waiting tab names its question first, then where it runs.
+        let tooltip = match (&props.question, &props.location) {
+            (Some(question), Some(place)) => Some(format!("{question}\n{place}")),
+            (question, place) => question.clone().or_else(|| place.clone()),
+        };
+        let label = match &props.question {
+            Some(question) => format!("{title}, {question}"),
+            None => title.clone(),
+        };
         let tab = session_tab_face(mark, face, active, colors)
             .id(SharedString::from(format!("horizontal-tab-{}", id.0)))
-            .when_some(location, |tab, place| {
+            .when_some(tooltip, |tab, place| {
                 tab.warm_tooltip(move |_, cx| {
                     cx.new(|_| crate::palette_chrome::PaletteTooltip(place.clone(), colors))
                         .into()
@@ -645,7 +653,7 @@ impl Sidebar {
             })
             .debug_selector(move || format!("horizontal-tab-{}", debug_id))
             .role(Role::Tab)
-            .aria_label(title.clone())
+            .aria_label(label)
             .aria_selected(active)
             .relative()
             .child(self.fade_probe(probe_key.clone()))
