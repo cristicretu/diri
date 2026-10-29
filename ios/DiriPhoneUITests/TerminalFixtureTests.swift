@@ -12,6 +12,7 @@ import XCTest
 /// `DIRI_SHOTS_DIR` additionally saves screenshots for PR media.
 @MainActor
 final class TerminalFixtureTests: XCTestCase {
+    private var springboard: XCUIApplication { XCUIApplication(bundleIdentifier: "com.apple.springboard") }
     private var dir = ""
     private var shots: String?
 
@@ -180,5 +181,66 @@ final class TerminalFixtureTests: XCTestCase {
         XCTAssertTrue(app.staticTexts["fixture-mac"].firstMatch.waitForExistence(timeout: 20), "paired again")
         XCTAssertFalse(app.buttons["pair-again"].exists)
         save("repaired")
+    }
+
+    /// A push end to end against the tailnet fixture: the gateway writes the
+    /// payload it would send to Apple (no session content in it), the app
+    /// composes it as its service extension does (the question comes from
+    /// the gateway), and Approve on the banner answers the prompt once.
+    func testAPushShowsTheQuestionAndApproveAnswersIt() throws {
+        let url = (try? String(contentsOfFile: dir + "/url", encoding: .utf8)) ?? ""
+        guard url.components(separatedBy: "token=").last?.trimmingCharacters(in: .whitespacesAndNewlines).count == 32
+        else { throw XCTSkip("Needs the tailnet fixture (DIRI_PHONE_FIXTURE_ADMIT=tailnet).") }
+        var app = try launch(nil)
+        let allow = springboard.buttons["Allow"]
+        if allow.waitForExistence(timeout: 8) { allow.tap() }
+        XCTAssertTrue(app.staticTexts["fixture-mac"].firstMatch.waitForExistence(timeout: 20))
+        // The simulator has no APNs token; register one for it so the
+        // gateway has somewhere to send.
+        let base = url.components(separatedBy: "/?").first ?? url
+        var request = URLRequest(url: URL(string: base + "/api/push/register")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["token": "00ff", "environment": "sandbox", "base": base])
+        let registered = expectation(description: "registered")
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            XCTAssertTrue(String(decoding: data ?? Data(), as: UTF8.self).contains("true"))
+            registered.fulfill()
+        }.resume()
+        wait(for: [registered], timeout: 10)
+
+        let pushes = dir + "/push"
+        let known = Set((try? FileManager.default.contentsOfDirectory(atPath: pushes)) ?? [])
+        try control("ask s_claude")
+        var payload: String?
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline, payload == nil {
+            payload = ((try? FileManager.default.contentsOfDirectory(atPath: pushes)) ?? [])
+                .filter { $0.hasSuffix(".apns") && !known.contains($0) }.first
+            settle(0.25)
+        }
+        let file = try XCTUnwrap(payload.map { pushes + "/" + $0 }, "the gateway sent a push")
+        let sent = try String(contentsOfFile: file, encoding: .utf8)
+        XCTAssertFalse(sent.contains("cargo test"), "the push carries no session content")
+        XCTAssertFalse(sent.contains("Fix the flaky"), "nor the title")
+
+        app.terminate()
+        app = XCUIApplication()
+        app.launchArguments = ["-endpoint", url, "-deliverPush", file]
+        app.launch()
+        XCUIDevice.shared.press(.home)
+        let before = typed()
+        let banner = springboard.descendants(matching: .any)
+            .matching(NSPredicate(format: "label CONTAINS 'cargo test -p diri-web'")).firstMatch
+        XCTAssertTrue(banner.waitForExistence(timeout: 20), "the question, from the gateway, is on the banner")
+        save("push-banner")
+        banner.press(forDuration: 1.2)
+        let approve = springboard.buttons["Approve"]
+        XCTAssertTrue(approve.waitForExistence(timeout: 5))
+        save("push-actions")
+        approve.tap()
+        let answered = Date().addingTimeInterval(15)
+        while Date() < answered, typed() == before { settle(0.25) }
+        XCTAssertEqual(String(typed().dropFirst(before.count)), "1\n", "Claude's approve key, typed once")
     }
 }

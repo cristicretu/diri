@@ -182,6 +182,58 @@ Both clients use the same gateway API and the same admission:
   `{url, label}` and the stored token is ignored. Native rendering, haptics,
   voice and (in phase 2) push stay app-only.
 
+### 4a. Push notifications (implemented)
+
+An agent that needs you, fails or finishes reaches the phone as a push,
+following the Mac's Settings › General › Alerts › Notify switches (Needs
+you / Failed / Finished; `diri_web::set_push_routes`).
+
+**Sender: the gateway itself, with the owner's APNs auth key.** No relay
+and no Diri server. The owner creates an APNs key (`.p8`) in their Apple
+developer account and writes `phone-push.json` beside the paired-device
+list:
+
+```json
+{"keyPath": "/path/AuthKey_ABC123.p8", "keyID": "ABC123", "teamID": "A56RVNJ69X", "topic": "dev.dirijor.ios"}
+```
+
+Without it push is off, and `/api/push/register` answers `{"enabled":
+false}`. The gateway signs an ES256 provider token (reused for 50 minutes)
+and posts to `api.push.apple.com` or `api.sandbox.push.apple.com` over
+HTTP/2. Both go through the system's `openssl` and `curl`, so there are no
+new crates: a TLS, HTTP/2 and ECDSA stack would be the gateway's largest
+dependency by far, for one request per alert. The JWT and the body reach
+curl on stdin and in a `0600` temporary file, never in `argv`. A relay (one
+key, many owners) is only needed for a distributed App Store build; it would
+see the same content-free payloads described below.
+
+**Trust model.**
+
+- **Apple sees no session content.** The payload is a generic banner
+  ("An agent is waiting for you") plus `{s: session id, k: needs|failed|done,
+  o: when the prompt was raised, b: the gateway address the phone
+  registered}`. It has no title, question, options, path or output.
+- **The phone writes the real banner itself.** Its notification service
+  extension fetches `GET /api/session/:id/attention` from `b`, inside the
+  tailnet. Under tailnet admission the gateway knows the phone by its
+  WireGuard identity, so the extension holds no credential. If the gateway
+  can't be reached, or it's a token gateway, the banner stays generic.
+- **Answers never travel in a push.**
+  - Approve and Deny on a banner make the phone call `/answer`. The gateway
+    re-checks that the prompt is the one shown (`occurredAt`) and writes the
+    agent's own key once (the notification id is the answer id).
+  - A destructive prompt's Approve needs the phone unlocked
+    (`.authenticationRequired`).
+  - Questions get no buttons. A numbered option typed blind can pick the
+    wrong one.
+- **Removing a device stops its pushes.** A registration carries the
+  device's tailnet node, and the sender drops any that is no longer paired.
+  A token Apple reports as dead (400/410) is dropped too.
+- **Logs** say only that a push failed: never the token, the JWT or the
+  payload.
+
+Registrations live owner-only in `phone-push-devices.json`.
+
 ### 5. Mac to Mac
 
 One Diri drives another Diri's sessions as a client of that Mac's gateway.

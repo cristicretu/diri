@@ -22,6 +22,10 @@ targets:
     platform: iOS
     sources:
       - path: DiriPhone
+      - path: Shared
+    dependencies:
+      - target: DiriNotificationService
+        embed: true
     info:
       path: DiriPhone/Info.plist
       properties:
@@ -71,9 +75,37 @@ targets:
         # The App Store Connect record ("Dirijor", team A56RVNJ69X) owns this ID.
         PRODUCT_BUNDLE_IDENTIFIER: dev.dirijor.ios
         DEVELOPMENT_TEAM: A56RVNJ69X
+        # Push: the development APNs environment; App Store export switches it.
+        CODE_SIGN_ENTITLEMENTS: DiriPhone/DiriPhone.entitlements
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+
+  # Writes notifications from the gateway's words; the push carries none.
+  DiriNotificationService:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: DiriNotificationService
+      - path: Shared
+    info:
+      path: DiriNotificationService/Info.plist
+      properties:
+        CFBundleDisplayName: Diri notifications
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        # Fetches from the gateway over the tailnet: plain HTTP inside
+        # WireGuard, as the app (see its NSAppTransportSecurity note).
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.usernotifications.service
+          NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).NotificationService"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.dirijor.ios.notifications
+        DEVELOPMENT_TEAM: A56RVNJ69X
+        GENERATE_INFOPLIST_FILE: NO
 
   DiriPhoneTests:
     type: bundle.unit-test

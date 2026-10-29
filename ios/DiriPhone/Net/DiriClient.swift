@@ -282,6 +282,14 @@ actor DiriClient {
         _ = try await send(try request(path, method: "POST", body: body))
     }
 
+    /// Asks this gateway to push to this phone. `enabled` is false when the
+    /// owner has not given that computer an APNs key.
+    func registerPush(token: String, environment: String, base: URL) async throws -> Bool {
+        let body: [String: Any] = ["token": token, "environment": environment, "base": base.absoluteString]
+        let reply = try await send(try request("/api/push/register", method: "POST", body: body))
+        return (try? JSONSerialization.jsonObject(with: reply) as? [String: Any])?["enabled"] as? Bool ?? false
+    }
+
     func kill(sessionID: String) async throws {
         _ = try await send(try request("/api/session/\(escape(sessionID))/kill", method: "POST"))
     }

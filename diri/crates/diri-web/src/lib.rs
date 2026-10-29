@@ -23,6 +23,7 @@ mod bench;
 mod devices;
 mod http;
 mod input_ledger;
+mod push;
 mod tailnet;
 mod terminal;
 #[cfg(test)]
@@ -31,6 +32,7 @@ mod turns;
 mod ui;
 
 pub use devices::{CODE_LIFETIME as PAIRING_CODE_LIFETIME, Device, Devices};
+pub use push::{PushConfig, set_push_routes};
 pub use tailnet::{LocalApi, Owner};
 pub use terminal::{TerminalPalette, set_terminal_palette};
 
@@ -436,13 +438,20 @@ async fn serve(config: Config, auth: Auth, minted: bool) -> Result<(), String> {
         eprintln!("diri-web: use `diri-web url` to show the private pairing link");
     }
 
-    let api = Arc::new(Api {
+    let mut api = Api {
         client: Arc::clone(&client),
         auth,
         host_label: config.host_label,
         inputs: Default::default(),
+        push: None,
         tailnet,
-    });
+    };
+    let push = start_push(&mut api);
+    if push.is_some() {
+        eprintln!("diri-web: pushing to registered phones (phone-push.json)");
+    }
+    let api = Arc::new(api);
+    spawn_push(&api, push);
 
     serve_connections(listener, api).await
 }
@@ -474,6 +483,46 @@ pub fn phone_devices_path() -> PathBuf {
 }
 
 const PHONE_DEVICES_FILE: &str = "phone-devices.json";
+
+/// The owner's APNs key settings (`{keyPath, keyID, teamID, topic}`); push
+/// is off without it. See `push.rs`.
+#[must_use]
+pub fn phone_push_config_path() -> PathBuf {
+    phone_token_path().with_file_name("phone-push.json")
+}
+
+/// Phones that asked for notifications.
+#[must_use]
+pub fn phone_push_devices_path() -> PathBuf {
+    phone_token_path().with_file_name("phone-push-devices.json")
+}
+
+/// Starts pushing for `api` when the owner configured an APNs key, and
+/// returns the registrations the API serves. A config that cannot be read
+/// leaves push off and says so once; it never stops phone access.
+fn start_push(api: &mut Api) -> Option<(push::Sender, Arc<push::Registrations>)> {
+    let sender = match std::env::var_os("DIRI_WEB_PUSH_DIRECTORY") {
+        // Fixtures: payloads become files a test hands to `simctl push`.
+        Some(dir) => push::Sender::Directory(dir.into()),
+        None => match push::PushConfig::load(&phone_push_config_path()) {
+            Ok(Some(config)) => push::Sender::Apns(push::Apns::new(config)),
+            Ok(None) => return None,
+            Err(error) => {
+                eprintln!("diri-web: push is off, phone-push.json is unreadable: {error}");
+                return None;
+            }
+        },
+    };
+    let registrations = Arc::new(push::Registrations::open(phone_push_devices_path()));
+    api.push = Some(Arc::clone(&registrations));
+    Some((sender, registrations))
+}
+
+fn spawn_push(api: &Arc<Api>, started: Option<(push::Sender, Arc<push::Registrations>)>) {
+    if let Some((sender, registrations)) = started {
+        tokio::spawn(push::run(Arc::clone(api), sender, registrations));
+    }
+}
 
 /// The link a phone opens (or scans) to present `secret` to the gateway on
 /// `address`: the bearer token, or a one-time pairing code.
@@ -532,13 +581,17 @@ pub async fn start_phone_access(
             (auth, phone_link(address, &code), Some(Arc::new(gate)))
         }
     };
-    let api = Arc::new(Api {
+    let mut api = Api {
         client,
         auth,
         host_label: label,
         inputs: Default::default(),
+        push: None,
         tailnet,
-    });
+    };
+    let push = start_push(&mut api);
+    let api = Arc::new(api);
+    spawn_push(&api, push);
     Ok((url, tokio::spawn(serve_connections(listener, api))))
 }
 
@@ -602,6 +655,7 @@ async fn handle(stream: TcpStream, peer: SocketAddr, api: Arc<Api>) -> std::io::
             (Some(gate), Some(Ok(identity))) => match gate.admits(identity, &request) {
                 Ok(()) => {
                     request.admitted = true;
+                    request.node = Some(identity.node.clone());
                     guard = Some((Arc::clone(&gate.devices), identity.node.clone()));
                 }
                 // Unpaired falls through to the page and the 401 below, so
@@ -895,6 +949,7 @@ mod tests {
             auth,
             host_label: "test".into(),
             inputs: Default::default(),
+            push: None,
             tailnet: None,
         });
         let server = tokio::spawn(serve_connections(listener, api));
@@ -940,6 +995,7 @@ mod tests {
             auth,
             host_label: "test".into(),
             inputs: Default::default(),
+            push: None,
             tailnet: None,
         });
         let server = tokio::spawn(serve_connections(listener, api));
@@ -1053,6 +1109,7 @@ mod tests {
             auth,
             host_label: "test".into(),
             inputs: Default::default(),
+            push: None,
             tailnet: None,
         });
         (
@@ -1374,6 +1431,7 @@ mod tests {
                 auth,
                 host_label: "test".into(),
                 inputs: Default::default(),
+                push: None,
                 tailnet: Some(Arc::clone(&gate)),
             });
             Gateway {
@@ -1932,13 +1990,22 @@ mod tests {
                 Some(_) => link(&devices.mint_code().unwrap()),
                 None => link(auth.token()),
             };
+            // Push: payloads are written to `push/` for `xcrun simctl push`
+            // instead of going to Apple.
+            let registrations = Arc::new(push::Registrations::open(dir.join("push-devices.json")));
             let api = Arc::new(Api {
                 client: Arc::clone(&engine.client),
                 auth,
                 host_label: "fixture-mac".into(),
                 inputs: Default::default(),
+                push: Some(Arc::clone(&registrations)),
                 tailnet: admission,
             });
+            tokio::spawn(push::run(
+                Arc::clone(&api),
+                push::Sender::Directory(dir.join("push")),
+                registrations,
+            ));
             let server = tokio::spawn(serve_connections(listener, api));
             std::fs::write(dir.join("url"), &url).unwrap();
             let control = dir.join("control");
@@ -2004,6 +2071,35 @@ mod tests {
                                 }
                                 (Some("code"), _, _) => {
                                     let _ = std::fs::write(dir.join("url"), link(&devices.mint_code().unwrap()));
+                                }
+                                (Some("ask"), Some(id), _) => {
+                                    // A new prompt on `id`, announced as the
+                                    // Engine does: the whole record.
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis() as f64;
+                                    let record = {
+                                        let mut list = answered.lock().unwrap();
+                                        let mut found = None;
+                                        for record in list["sessions"].as_array_mut().into_iter().flatten() {
+                                            if record["id"] == id {
+                                                record["status"] = json!({"needsInput": {"_0": "permission"}});
+                                                record["needsInput"] = json!({
+                                                    "kind": "permission", "source": "screen", "toolName": "Bash",
+                                                    "summary": "Run cargo test -p diri-web?",
+                                                    "promptExcerpt": "Bash(cargo test -p diri-web)",
+                                                    "riskHint": if id == "s_cleanup" { "destructive" } else { "neutral" },
+                                                    "occurredAt": now,
+                                                });
+                                                found = Some(record.clone());
+                                            }
+                                        }
+                                        found
+                                    };
+                                    if let Some(record) = record {
+                                        let _ = engine.events.send((diri_proto::EventName::SESSION_UPDATED.into(), record)).await;
+                                    }
                                 }
                                 (Some("stranger"), _, _) => {
                                     if let Some(local) = &local {

@@ -38,6 +38,9 @@ pub struct Api {
     /// `Some` when callers are admitted by Tailscale identity and pairing
     /// instead of the bearer token. The token is then never accepted.
     pub tailnet: Option<Arc<crate::tailnet::Admission>>,
+    /// `Some` when this gateway can push (the owner gave it an APNs key):
+    /// the phones that asked for notifications.
+    pub push: Option<Arc<crate::push::Registrations>>,
 }
 
 impl Api {
@@ -111,6 +114,9 @@ impl Api {
             ("GET", ["api", "session", id, "spoken"]) => self.spoken(id).await,
             ("POST", ["api", "session", id, "send"]) => self.send(id, request).await,
             ("POST", ["api", "session", id, "answer"]) => self.answer(id, request).await,
+            ("GET", ["api", "session", id, "attention"]) => self.attention(id).await,
+            ("POST", ["api", "push", "register"]) => self.register_push(request),
+            ("POST", ["api", "push", "unregister"]) => self.unregister_push(request),
             ("POST", ["api", "session", id, "key"]) => self.key(id, request).await,
             ("POST", ["api", "session", id, "resize"]) => self.resize(id, request).await,
             ("POST", ["api", "session", id, "seen"]) => self.seen(id).await,
@@ -490,6 +496,93 @@ impl Api {
         }
     }
 
+    /// What a notification shows, fetched by the phone's notification
+    /// extension over the tailnet so the push itself carries none of it.
+    async fn attention(&self, id: &str) -> Response {
+        let sessions = match self.client.sessions().await {
+            Ok(result) => result.sessions,
+            Err(error) => return daemon_error(&error),
+        };
+        let Some(record) = sessions.iter().find(|record| record.id.0 == id) else {
+            return Response::coded_error(404, "no_session", "That session is gone");
+        };
+        let waiting = matches!(record.status, diri_proto::SessionStatus::NeedsInput(_));
+        let detail = record.needs_input.as_ref().filter(|_| waiting);
+        let quick = match detail {
+            Some(detail)
+                if detail.kind == diri_proto::NeedsInputKind::Permission && !detail.secret =>
+            {
+                self.client
+                    .agent_readiness(diri_proto::AgentReadinessParams {
+                        host: record.host.clone(),
+                        force_refresh: false,
+                    })
+                    .await
+                    .ok()
+                    .and_then(|result| {
+                        result
+                            .descriptor(record.effective_kind())
+                            .map(|d| d.approve.is_some())
+                    })
+                    .unwrap_or(false)
+            }
+            _ => false,
+        };
+        Response::json(&json!({
+            "title": record.title,
+            "agent": record.effective_kind().id(),
+            "status": serde_json::to_value(&record.status).unwrap_or(Value::Null),
+            "waiting": waiting,
+            // A password prompt shows no terminal text, here as on the Mac.
+            "question": detail.filter(|d| !d.secret).map(|d| d.prompt_excerpt.clone().unwrap_or_else(|| d.summary.clone())),
+            "options": detail.filter(|d| !d.secret).and_then(|d| d.options.clone()),
+            "kind": detail.map(|d| serde_json::to_value(d.kind).unwrap_or(Value::Null)),
+            "risk": detail.map(|d| serde_json::to_value(d.risk_hint).unwrap_or(Value::Null)),
+            "occurredAt": detail.map(|d| d.occurred_at.0),
+            // Approve/Deny can be offered: a permission prompt whose agent
+            // declares a verified approve key.
+            "quickAnswer": quick,
+        }))
+    }
+
+    fn register_push(&self, request: &Request) -> Response {
+        let Some(registrations) = &self.push else {
+            return Response::json(&json!({ "enabled": false }));
+        };
+        let body = request.json();
+        let field = |name: &str| body.get(name).and_then(Value::as_str).map(str::to_owned);
+        let (Some(token), Some(base)) = (field("token"), field("base")) else {
+            return Response::error(400, "missing token or base");
+        };
+        if token.is_empty() || token.len() > 200 || !token.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Response::error(400, "token must be hex");
+        }
+        let environment = match field("environment").as_deref() {
+            Some("production") => "production",
+            _ => "sandbox",
+        };
+        let registration = crate::push::Registration {
+            token,
+            environment: environment.into(),
+            base,
+            node: request.node.clone(),
+        };
+        match registrations.register(registration) {
+            Ok(()) => Response::json(&json!({ "enabled": true })),
+            Err(_) => Response::error(500, "could not save the registration"),
+        }
+    }
+
+    fn unregister_push(&self, request: &Request) -> Response {
+        if let (Some(registrations), Some(token)) = (
+            &self.push,
+            request.json().get("token").and_then(Value::as_str),
+        ) {
+            let _ = registrations.unregister(token);
+        }
+        Response::json(&json!({ "ok": true }))
+    }
+
     async fn send(&self, id: &str, request: &Request) -> Response {
         let body = request.json();
         let Some(text) = body.get("text").and_then(Value::as_str) else {
@@ -734,6 +827,7 @@ mod tests {
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
             inputs: Default::default(),
+            push: None,
             tailnet: None,
         };
         for (path, method, body, expected) in [
@@ -843,6 +937,7 @@ mod tests {
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
             inputs: Default::default(),
+            push: None,
             tailnet: None,
         };
 
@@ -957,6 +1052,7 @@ mod tests {
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
             inputs: Default::default(),
+            push: None,
             tailnet: None,
         };
         let text = |line: &Value| line["runs"][0]["t"].as_str().unwrap().to_owned();
@@ -1041,6 +1137,7 @@ mod tests {
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
             inputs: Default::default(),
+            push: None,
             tailnet: None,
         };
         // Ctrl-C, Up, Escape and a paste: exactly these bytes, no Enter, no
@@ -1101,6 +1198,7 @@ mod tests {
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
             inputs: Default::default(),
+            push: None,
             tailnet: None,
         };
         let sent = |engine: &mut crate::testing::FakeEngine| {
@@ -1174,6 +1272,7 @@ mod tests {
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
             inputs: Default::default(),
+            push: None,
             tailnet: None,
         };
         let batch = json!({ "data": base64_encode(b"deploy\r"), "id": "b1" }).to_string();
@@ -1208,6 +1307,7 @@ mod tests {
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
             inputs: Default::default(),
+            push: None,
             tailnet: None,
         };
         for (method, path, body) in [
@@ -1243,6 +1343,7 @@ mod tests {
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
             inputs: Default::default(),
+            push: None,
             tailnet: None,
         });
         let request = tokio::spawn({
