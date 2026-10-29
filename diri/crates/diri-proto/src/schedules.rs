@@ -14,6 +14,7 @@ pub const MAX_SCHEDULE_RUNS: usize = 20;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum ScheduleWhen {
     /// Fires once, then the schedule disables itself.
     Once { at: DateMillis },
@@ -24,6 +25,7 @@ pub enum ScheduleWhen {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ScheduleSpec {
     pub title: String,
     pub when: ScheduleWhen,
@@ -136,6 +138,7 @@ pub type ScheduleCreateResult = ScheduleRecord;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ScheduleUpdateParams {
     pub id: String,
     #[serde(flatten)]
@@ -146,6 +149,7 @@ pub type ScheduleUpdateResult = ScheduleRecord;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ScheduleIdParams {
     pub id: String,
 }

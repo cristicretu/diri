@@ -1,4 +1,5 @@
 {
+  "agent_notice.app_action": "Ejecutar una acción",
   "agent_notice.change_workspaces": "Editar espacios de trabajo",
   "agent_notice.close_pane": "Cerrar panel",
   "agent_notice.close_tab": "Cerrar pestaña",

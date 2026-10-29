@@ -47,9 +47,9 @@ impl Sidebar {
     }
 }
 
-// Every user of the manual clock is a macOS test: the tests below and the
-// frame fixture in `root/title_settle_frames.rs`.
-#[cfg(all(test, target_os = "macos"))]
+// The sidebar's own tests (all platforms) and the macOS frame fixtures in
+// `root/` drive the manual clock.
+#[cfg(test)]
 pub(crate) mod testing {
     use std::cell::Cell;
     use std::time::{Duration, Instant};

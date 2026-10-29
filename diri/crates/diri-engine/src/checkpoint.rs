@@ -236,7 +236,12 @@ impl ScreenCheckpoint {
         );
         dict.insert(
             "gridPayload".into(),
-            plist::Value::Data(self.grid.encode().map_err(std::io::Error::other)?),
+            plist::Value::Data(
+                // On disk in the form that predates `grid-history-v1`.
+                self.grid
+                    .encode_without_history()
+                    .map_err(std::io::Error::other)?,
+            ),
         );
         dict.insert(
             "historyRowCount".into(),
@@ -390,6 +395,7 @@ mod tests {
                 is_full_snapshot: true,
                 changed_rows: vec![ChangedRow::new(0, cells.clone()), ChangedRow::new(1, cells)],
                 cursor_style: Default::default(),
+                history: None,
             },
             marker_buffer: vec![0x1b, b']'],
             alt_screen: true,

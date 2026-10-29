@@ -25,6 +25,7 @@ pub struct VoiceStateResult {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SpeakParams {
     #[serde(rename = "sessionID")]
     pub session_id: String,
@@ -32,6 +33,7 @@ pub struct SpeakParams {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SpokenParams {
     #[serde(rename = "sessionID")]
     pub session_id: String,
@@ -44,6 +46,7 @@ pub struct SpokenResult {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct LatestSpokenParams {
     #[serde(rename = "sessionID")]
     pub session_id: String,
@@ -60,6 +63,7 @@ pub struct LatestSpokenResult {
 /// `readAloud` set changes the phone reader flag; absent only reads it.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PhoneReaderParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_aloud: Option<bool>,

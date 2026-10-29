@@ -1039,6 +1039,7 @@ mod tests {
                 ],
             )],
             cursor_style: Default::default(),
+            history: None,
         };
         use diri_proto::frames::{Frame, FrameCodec};
         preview

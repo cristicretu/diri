@@ -50,6 +50,7 @@ fn terminal(text: &str, cell_width: f32) -> TerminalElement {
         is_full_snapshot: true,
         changed_rows: vec![ChangedRow::new(0, cells)],
         cursor_style: Default::default(),
+        history: None,
     });
     terminal
 }

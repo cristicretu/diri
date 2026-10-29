@@ -17,6 +17,7 @@ The server ships inside the app. Claude Code, Codex and Cursor get it automatica
 | Panes | `spawn_agent` with `split`, `manage_layout`, `get_layout` | Open a dev server or a helper agent in a split beside the agent, zoom it, or move it back to its own tab. |
 | Notes | `read_note`, `write_note`, `create_note`, `start_from_note` | Read a brief from a note, write findings back, tick its to-dos. |
 | Browser | `browser` | Drive a real browser isolated to the session. |
+| Window | `list_actions`, `perform_action` | Run any command the app's menus, keys and command palette run: split or zoom a pane, select a tab, toggle the sidebar, change the theme. The window names the agent while it changes. |
 
 You do not need to name tools. Ask in plain words and the agent picks them:
 

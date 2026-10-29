@@ -6,6 +6,7 @@ use serde_json::Value;
 use crate::SessionId;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ComputerActParams {
     #[serde(rename = "sessionID")]
     pub session_id: SessionId,
@@ -19,6 +20,7 @@ pub struct ComputerActParams {
 /// `computer.status`: whether Cua Driver is installed and allowed.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ComputerStatusParams {
     /// Start the driver's daemon if it is not running, so the grants can be
     /// read. Without it a stopped daemon reports them as unknown.
@@ -29,6 +31,7 @@ pub struct ComputerStatusParams {
 /// `computer.setup`: one setup step the person asked for.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum ComputerSetupAction {
     /// Install (or update to) the tested Cua Driver release, in the
     /// background. Answers at once; `computer.status` reports progress.
@@ -40,6 +43,7 @@ pub enum ComputerSetupAction {
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ComputerSetupParams {
     pub action: ComputerSetupAction,
 }

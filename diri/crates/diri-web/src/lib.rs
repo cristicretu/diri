@@ -757,6 +757,7 @@ mod tests {
                 })
                 .collect(),
             cursor_style: Default::default(),
+            history: None,
         }
     }
 

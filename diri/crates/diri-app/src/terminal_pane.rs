@@ -1789,6 +1789,7 @@ impl TerminalPane {
             is_full_snapshot: false,
             changed_rows: vec![diri_proto::grid::ChangedRow::new(row, cells)],
             cursor_style: Default::default(),
+            history: None,
         };
         self.apply_grid_updates(id, [update], window, cx);
     }
@@ -1829,6 +1830,7 @@ impl TerminalPane {
                 })
                 .collect(),
             cursor_style: Default::default(),
+            history: None,
         };
         self.apply_grid_updates(id, [update], window, cx);
     }
@@ -7137,6 +7139,7 @@ mod tests {
             is_full_snapshot: true,
             changed_rows: vec![ChangedRow::new(0, first_cells)],
             cursor_style: Default::default(),
+            history: None,
         };
         let mut final_cells = vec![GridCell::BLANK; 2];
         final_cells[1].scalar = u32::from('b');
@@ -7149,6 +7152,7 @@ mod tests {
             is_full_snapshot: false,
             changed_rows: vec![ChangedRow::new(0, final_cells.clone())],
             cursor_style: Default::default(),
+            history: None,
         };
 
         assert!(
@@ -7545,6 +7549,7 @@ mod tests {
             is_full_snapshot: true,
             changed_rows: vec![diri_proto::grid::ChangedRow::new(0, cells)],
             cursor_style: Default::default(),
+            history: None,
         });
         let option = Modifiers {
             alt: true,
@@ -7802,6 +7807,7 @@ mod tests {
             is_full_snapshot: full,
             changed_rows: Vec::new(),
             cursor_style: Default::default(),
+            history: None,
         }
     }
 
@@ -7821,6 +7827,7 @@ mod tests {
                 .map(|row| ChangedRow::new(row, vec![cell; usize::from(COLS)]))
                 .collect(),
             cursor_style: Default::default(),
+            history: None,
         }
     }
 
@@ -12170,6 +12177,7 @@ mod tests {
                 .map(|y| diri_proto::grid::ChangedRow::new(y, vec![GridCell::default(); cols.into()]))
                 .collect(),
             cursor_style: Default::default(),
+            history: None,
         }
     }
 

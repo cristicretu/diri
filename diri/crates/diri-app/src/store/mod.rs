@@ -283,6 +283,8 @@ pub enum StoreEffect {
     DetachAttachment(SessionId),
     /// T15 consumes this without involving daemon lifecycle operations.
     StatusTransition(StatusTransition),
+    /// Answer one `app.perform_requested` from the Engine.
+    AppReply(diri_proto::app_actions::AppReplyParams),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -514,6 +516,9 @@ pub struct SessionStore {
     pending_open_settings: bool,
     /// Requests agents asked to open in their API tab, oldest first.
     pending_api_requests: VecDeque<diri_proto::SessionOpenApiRequestParams>,
+    /// App actions the Engine asked a window to run, oldest first. Each
+    /// window takes the ones routed to it (see `take_app_performs`).
+    pub(super) pending_app_performs: VecDeque<diri_proto::app_actions::AppPerformRequest>,
     /// Remote host catalog from hosts.json. Empty when the file is absent or
     /// invalid (pickers show Local only). Reloaded on picker open.
     hosts: Vec<HostEntry>,
@@ -631,6 +636,7 @@ impl SessionStore {
                 pending_open_launcher: false,
                 pending_open_settings: false,
                 pending_api_requests: VecDeque::new(),
+                pending_app_performs: VecDeque::new(),
                 hosts: Vec::new(),
                 agents: HashMap::new(),
                 agent_catalog_scans: HashMap::new(),
@@ -1995,7 +2001,18 @@ impl SessionStore {
         else {
             return;
         };
-        let notice = crate::agent_notice::notice(actor, event.action);
+        let notice = match (event.action, event.command.as_deref()) {
+            // Named by the action's own title; an action this build does not
+            // export stays silent rather than showing an id.
+            (diri_proto::agent_action::AgentAction::AppAction, Some(command)) => {
+                let Some(title) = crate::app_actions::title(command) else {
+                    return;
+                };
+                crate::agent_notice::app_action_notice(actor, &title)
+            }
+            (diri_proto::agent_action::AgentAction::AppAction, None) => return,
+            (action, _) => crate::agent_notice::notice(actor, action),
+        };
         self.emit(StoreEffect::StatusTransition(StatusTransition {
             dismiss: Vec::new(),
             sound: None,
@@ -2036,6 +2053,15 @@ impl SessionStore {
                     serde_json::from_value::<diri_proto::SessionOpenApiRequestParams>(event.params)
                 {
                     self.accept_api_request(params);
+                }
+                return StoreEventChange::None;
+            }
+            EventName::APP_PERFORM_REQUESTED => {
+                if let Ok(request) = serde_json::from_value::<
+                    diri_proto::app_actions::AppPerformRequest,
+                >(event.params)
+                {
+                    self.accept_app_perform(request);
                 }
                 return StoreEventChange::None;
             }
@@ -2972,6 +2998,44 @@ impl SessionStore {
         true
     }
 
+    /// Queues an app action the Engine asked for and wakes the windows'
+    /// sync loops; the window it is routed to runs it and answers. Bounded:
+    /// past the cap the oldest is answered as dropped, never left hanging.
+    fn accept_app_perform(&mut self, request: diri_proto::app_actions::AppPerformRequest) {
+        const MAX_PENDING: usize = 16;
+        if self.pending_app_performs.len() >= MAX_PENDING
+            && let Some(dropped) = self.pending_app_performs.pop_front()
+        {
+            self.emit(StoreEffect::AppReply(diri_proto::app_actions::AppReplyParams {
+                request_id: dropped.request_id,
+                result: None,
+                error: Some(diri_proto::ControlError::new(
+                    "busy",
+                    "too many app actions are waiting; retry",
+                )),
+            }));
+        }
+        self.pending_app_performs.push_back(request);
+        self.emit(StoreEffect::PublishSnapshot);
+    }
+
+    /// Sends a window's answer to the Engine.
+    pub fn reply_app_perform(
+        &mut self,
+        request_id: u64,
+        result: Result<serde_json::Value, diri_proto::ControlError>,
+    ) {
+        let (result, error) = match result {
+            Ok(value) => (Some(value), None),
+            Err(error) => (None, Some(error)),
+        };
+        self.emit(StoreEffect::AppReply(diri_proto::app_actions::AppReplyParams {
+            request_id,
+            result,
+            error,
+        }));
+    }
+
     pub fn take_api_requests(&mut self) -> Vec<diri_proto::SessionOpenApiRequestParams> {
         self.pending_api_requests.drain(..).collect()
     }
@@ -2982,6 +3046,7 @@ impl SessionStore {
         self.pending_open_launcher
             || self.pending_open_settings
             || !self.pending_api_requests.is_empty()
+            || !self.pending_app_performs.is_empty()
     }
 
     pub fn rename(&mut self, id: SessionId, title: impl Into<String>) {
@@ -4127,6 +4192,11 @@ impl StoreRuntime {
                         let _ = state_client.set_active(active).await;
                         let _ = state_client.configure_governor(governor).await;
                         let _ = state_client.configure_terminal(terminal).await;
+                        // On this connection: the Engine sends this app the
+                        // actions Agents and scripts ask its windows to run.
+                        let _ = state_client
+                            .publish_app_actions(&crate::app_actions::publish_params())
+                            .await;
                         // Warm the default remote only after local catalog,
                         // session hydration and lifecycle state have completed.
                         // A slow SSH login can then never delay first paint.
@@ -4447,6 +4517,14 @@ async fn run_effects(
             }
             StoreEffect::SpawnPane { params, pane } => {
                 client.spawn_placed(params, pane).await.map(|_| ())
+            }
+            StoreEffect::AppReply(params) => {
+                // Off the serial loop: an answer never waits behind a close.
+                let client = Arc::clone(&client);
+                tokio::spawn(async move {
+                    let _ = client.reply_app_action(&params).await;
+                });
+                Ok(())
             }
             StoreEffect::RetryConnection => {
                 client.retry_now();
@@ -4835,6 +4913,7 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         ),
         StoreEffect::ReopenLast => ("Reopen session failed", None),
         StoreEffect::UiChanged
+        | StoreEffect::AppReply(_)
         | StoreEffect::WorkspaceSpawn { .. }
         | StoreEffect::RefreshWorkspaces { .. }
         | StoreEffect::MutateWorkspace { .. }

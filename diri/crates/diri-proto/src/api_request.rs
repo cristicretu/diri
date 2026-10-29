@@ -25,6 +25,7 @@ pub const API_REQUEST_MAX_NAME: usize = 200;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ApiRequestDraft {
     pub method: String,
     /// May carry `{{variable}}` placeholders filled from the environment.
@@ -45,6 +46,7 @@ pub struct ApiRequestDraft {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ApiHeaderDraft {
     pub name: String,
     pub value: String,
@@ -54,6 +56,7 @@ pub struct ApiHeaderDraft {
 /// when missing), which becomes the active one.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ApiEnvironmentDraft {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -63,6 +66,7 @@ pub struct ApiEnvironmentDraft {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ApiVariableDraft {
     pub name: String,
     pub value: String,
@@ -74,6 +78,7 @@ pub struct ApiVariableDraft {
 /// `session.open_api_request` params, and the `session.api_request` event.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionOpenApiRequestParams {
     #[serde(rename = "sessionID")]
     pub session_id: SessionId,

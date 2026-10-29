@@ -1,0 +1,7 @@
+Analytics have been permanently disabled
+.
+────────────────────────────────────────
+You can skip this check with
+--no-gitignore
+Add .aider* to .gitignore (recommended)?
+ (Y)es/(N)o [Yes]:

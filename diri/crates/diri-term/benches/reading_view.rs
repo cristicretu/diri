@@ -31,6 +31,7 @@ fn reading_view(c: &mut Criterion) {
             })
             .collect(),
         cursor_style: Default::default(),
+        history: None,
     });
     for held in [false, true] {
         element.set_view_offset(i64::from(held), usize::from(ROWS));
