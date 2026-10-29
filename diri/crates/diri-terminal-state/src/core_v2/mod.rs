@@ -6,11 +6,11 @@
 mod bridge;
 pub mod cell;
 pub mod check;
+#[cfg(feature = "core-v2-screen")]
+pub(crate) mod emulator;
 mod events;
 mod ops;
 pub mod page;
-#[cfg(feature = "core-v2-screen")]
-pub(crate) mod emulator;
 pub mod term;
 pub mod text;
 

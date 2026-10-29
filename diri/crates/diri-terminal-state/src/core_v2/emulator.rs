@@ -530,6 +530,14 @@ impl Emulator for Screen {
         self.core.pages.history_size()
     }
 
+    fn history_origin(&self) -> u64 {
+        // Every row that left the primary screen entered history; those not
+        // kept left it from the oldest end.
+        let pages = self.core.primary_pages();
+        let entered = pages.total_rows() - self.core.lines() as u64;
+        entered - pages.history_size() as u64
+    }
+
     #[cfg(feature = "compact-history")]
     fn primary_history_rows(&self) -> usize {
         self.core.primary_pages().history_size()

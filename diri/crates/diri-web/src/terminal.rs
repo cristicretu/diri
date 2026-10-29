@@ -818,6 +818,7 @@ mod tests {
                 .map(|(y, text)| ChangedRow::new(*y, row(text, 10)))
                 .collect(),
             cursor_style: Default::default(),
+            history: None,
         }
     }
 

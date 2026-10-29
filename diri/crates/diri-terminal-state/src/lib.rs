@@ -88,6 +88,9 @@ pub struct GridMirror {
     cursor_row: u16,
     cursor_visible: bool,
     cursor_style: CursorStyle,
+    /// The publisher's latest history position, republished with a full
+    /// update so a reseeded client keeps following it.
+    history: Option<diri_proto::grid::GridHistory>,
     sequence: Option<u64>,
     annotations: Vec<RowMetadata>,
     alt_screen: bool,
@@ -234,6 +237,7 @@ impl GridMirror {
         self.cursor_row = grid.cursor_row;
         self.cursor_visible = grid.cursor_visible;
         self.cursor_style = grid.cursor_style;
+        self.history = grid.history;
     }
 
     #[must_use]
@@ -288,6 +292,7 @@ impl GridMirror {
             is_full_snapshot: true,
             changed_rows,
             cursor_style: self.cursor_style,
+            history: self.history,
         })
     }
 }
@@ -1280,6 +1285,15 @@ impl HeadlessScreen {
         self.title.as_deref()
     }
 
+    /// Where the primary screen's history stands, published with each grid
+    /// (`grid-history-v1`). `None` on the alternate screen, which has none.
+    pub fn grid_history(&self) -> Option<diri_proto::grid::GridHistory> {
+        (!self.is_alt_screen()).then(|| diri_proto::grid::GridHistory {
+            origin: self.term.history_origin(),
+            rows: self.term.history_rows() as u64,
+        })
+    }
+
     /// True while the child is on the alternate screen (a full-screen program
     /// like an editor or pager).
     pub fn is_alt_screen(&self) -> bool {
@@ -1534,6 +1548,7 @@ impl HeadlessScreen {
             is_full_snapshot: force_full,
             changed_rows: changed,
             cursor_style: self.wire_cursor_style(),
+            history: self.grid_history(),
         }
     }
 
@@ -1575,6 +1590,7 @@ impl HeadlessScreen {
             is_full_snapshot: true,
             changed_rows: all,
             cursor_style: self.wire_cursor_style(),
+            history: self.grid_history(),
         }
     }
 
@@ -3404,6 +3420,64 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn grids_carry_the_primary_history_position_across_eviction_and_clears() {
+        use diri_proto::grid::GridHistory;
+        let mut screen = HeadlessScreen::new(20, 5);
+        let start = screen.grid_update(true).history.expect("primary screen");
+        assert_eq!(start, GridHistory { origin: 0, rows: 0 });
+        screen.feed("line\r\n".repeat(12).as_bytes());
+        let grown = screen.grid_update(false).history.unwrap();
+        // 12 newlines on a 5-row screen push 8 lines into history.
+        assert_eq!(grown, GridHistory { origin: 0, rows: 8 });
+        assert_eq!(grown.since(start), Some((8, 0)));
+
+        // At the row limit every new line recycles the oldest row: history
+        // stops growing, and the origin counts what left it.
+        let limit = history_line_limit(20) as u64;
+        screen.feed("more\r\n".repeat(limit as usize + 7).as_bytes());
+        let full = screen.grid_update(false).history.unwrap();
+        assert_eq!(full.rows, limit);
+        assert_eq!(full.pushed(), grown.pushed() + limit + 7);
+        let (scrolled, evicted) = full.since(grown).unwrap();
+        assert_eq!(scrolled, limit + 7);
+        assert_eq!(evicted, full.origin);
+
+        // ED 3 empties history from its oldest end: nothing scrolled, every
+        // row left.
+        screen.feed(b"\x1b[3J");
+        let cleared = screen.full_snapshot().history.unwrap();
+        assert_eq!(cleared.rows, 0);
+        assert_eq!(cleared.since(full), Some((0, limit)));
+
+        // The alternate screen has no history to follow; leaving it finds the
+        // primary screen where it was.
+        screen.feed(b"\x1b[?1049h");
+        assert_eq!(screen.grid_update(false).history, None);
+        screen.feed(b"alt\r\n\r\n\r\n\r\n\r\n\r\n");
+        assert_eq!(screen.grid_update(false).history, None);
+        screen.feed(b"\x1b[?1049l");
+        assert_eq!(screen.grid_update(false).history, Some(cleared));
+    }
+
+    #[test]
+    fn a_mirror_republishes_the_latest_history_position() {
+        let mut screen = HeadlessScreen::new(20, 5);
+        screen.feed("line\r\n".repeat(9).as_bytes());
+        let snapshot = screen.grid_update(true);
+        let mut mirror = GridMirror::new();
+        mirror
+            .apply_snapshot(1, &snapshot, false, false, MouseModes::OFF)
+            .unwrap();
+        screen.feed(b"next\r\n");
+        let delta = screen.grid_update(false);
+        mirror
+            .apply_delta(2, &delta, false, false, MouseModes::OFF)
+            .unwrap();
+        assert_eq!(mirror.full_update().unwrap().history, delta.history);
+        assert_eq!(delta.history.unwrap().rows, 6);
+    }
 
     impl HeadlessScreen {
         /// Every kept row fingerprint and fill count equals a fresh walk.
@@ -5701,7 +5775,12 @@ mod qol_tests {
         );
         let mut restored = HeadlessScreen::new(6, 3);
         assert!(restored.restore(&[], &snapshot, false, false, MouseModes::OFF));
-        assert_eq!(restored.full_snapshot(), snapshot);
+        // The screen, not where the publisher's history happened to stand.
+        let screen_only = |grid: GridUpdate| GridUpdate {
+            history: None,
+            ..grid
+        };
+        assert_eq!(screen_only(restored.full_snapshot()), screen_only(snapshot));
     }
     #[test]
     fn named_links_remain_available_in_history_and_after_restore() {

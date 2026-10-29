@@ -1329,6 +1329,28 @@ fn closing_an_exited_parent_with_an_exited_terminal_needs_no_confirmation() {
 }
 
 #[test]
+fn idle_shells_close_without_confirmation() {
+    let mut idle = session("idle-shell", "p", 2.0);
+    idle.kind = AgentKind::SHELL;
+    let mut busy = session("busy-shell", "p", 1.0);
+    busy.kind = AgentKind::SHELL;
+    busy.status = SessionStatus::Working;
+    let (mut store, mut effects) = hydrated(
+        vec![idle, busy],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+
+    store.request_close(vec![id("idle-shell")]);
+    assert!(store.pending_close.is_none());
+    assert!(drain(&mut effects).contains(&StoreEffect::Remove(id("idle-shell"))));
+
+    store.request_close(vec![id("busy-shell")]);
+    assert!(store.pending_close.is_some());
+}
+
+#[test]
 fn a_real_process_exit_immediately_detaches_and_removes_the_agent() {
     let (mut store, mut effects) = hydrated(
         vec![session("one", "p", 1.0)],

@@ -72,6 +72,7 @@ fn editor(alt_screen: bool) -> TerminalElement {
         is_full_snapshot: true,
         changed_rows: rows,
         cursor_style: Default::default(),
+        history: None,
     });
     terminal.set_modes(alt_screen, Default::default());
     terminal

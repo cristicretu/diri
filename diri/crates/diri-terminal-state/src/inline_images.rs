@@ -1284,7 +1284,7 @@ fn next_sequence(input: &[u8], index: Option<C0Index<'_>>) -> Next {
                 from = at + 1;
             }
         }
-        None => alacritty_terminal::vte::scan::find_pair(&input[from..], 0x1b, [b']', b'_'])
+        None => alacritty_terminal::vte::scan::find_pair(&input[from..], 0x1b, *b"]_")
             .map(|at| from + at),
     };
     let mut from = 0;
