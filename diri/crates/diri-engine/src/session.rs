@@ -533,6 +533,9 @@ struct Shared {
     echo_request: Mutex<Option<EchoRequest>>,
     /// Rings the held pump out of an idle park; see [`PumpWake`].
     pump_wake: PumpWake,
+    /// This session's idle history swap, made at its first page-out (see
+    /// [`crate::history_swap`]) and kept so later page-outs add to it.
+    history_swap: Mutex<Option<Arc<crate::history_swap::SwapFile>>>,
     /// Set while a held pump runs or is parked; see [`HeldPumpLatch`].
     held_pump: HeldPumpLatch,
     /// What the last foreground sample of a shell found: 0 unknown, 1 the
@@ -849,6 +852,15 @@ struct PumpWake {
     /// The pump's kqueue while it runs; -1 otherwise. Cleared under the lock
     /// before the kqueue closes, so a ring never reaches a reused descriptor.
     kq: Mutex<i32>,
+}
+
+impl Shared {
+    /// Holds the history swap open for a read of many paged-out blocks (a
+    /// checkpoint export); `None` when nothing was ever paged out.
+    fn history_reading(&self) -> Option<crate::history_swap::Reading> {
+        let swap = self.history_swap.lock().expect("history swap").clone()?;
+        Some(crate::history_swap::Reading::new(swap))
+    }
 }
 
 impl PumpWake {
@@ -1243,6 +1255,7 @@ impl ScrollbackReader {
             })
             .map_err(|error| diri_proto::ControlError::new("find_capture_unavailable", error))?;
             return Ok(diri_proto::CaptureFindResult {
+                history_origin: None,
                 owner: self.shared.find_owner.clone(),
                 capture_revision: self
                     .shared
@@ -1256,7 +1269,7 @@ impl ScrollbackReader {
                 cells,
             });
         }
-        let screen = self.shared.screen.lock().expect("screen");
+        let mut screen = self.shared.screen.lock().expect("screen");
         let (cols, visible_rows) = screen.size();
         if cols.saturating_mul(visible_rows) > diri_proto::FIND_CAPTURE_MAX_CELLS {
             return Err(diri_proto::ControlError::new(
@@ -1264,11 +1277,16 @@ impl ScrollbackReader {
                 "This terminal is too large for a retained search view",
             ));
         }
-        let cells = screen
-            .find_capture_cells()
+        let cells = screen.find_capture_cells();
+        // The capture decoded up to 8,192 history rows; an idle session would
+        // otherwise keep them until its next output.
+        screen.release_history_read_cache();
+        let cells = cells
             .map_err(|error| diri_proto::ControlError::new("find_capture_too_large", error))?;
         let first = cells.first_row;
+        let history_origin = Some(screen.history_origin());
         Ok(diri_proto::CaptureFindResult {
+            history_origin,
             owner: self.shared.find_owner.clone(),
             capture_revision: self
                 .shared
@@ -1279,6 +1297,25 @@ impl ScrollbackReader {
             visible_rows,
             partial: first > 0,
             cells,
+        })
+    }
+
+    /// One page of Find over this terminal's whole history. Remote sessions
+    /// keep searching the capture their Holder serves (`capture_find`): the
+    /// Helper has no history search, and paging every row over SSH would
+    /// cost more than the search.
+    pub(crate) fn find_history(
+        self,
+        params: &diri_proto::find::FindHistoryParams,
+    ) -> Result<diri_proto::find::FindHistoryResult, diri_proto::ControlError> {
+        if self.remote.is_some() {
+            return Err(diri_proto::ControlError::new(
+                "find_history_unsupported",
+                "History search runs on the remote host's capture",
+            ));
+        }
+        crate::find_history::find_history_page(params, || {
+            self.shared.screen.lock().expect("screen")
         })
     }
 
@@ -2742,6 +2779,13 @@ impl Session {
         inspect(&mut self.shared.screen.lock().expect("screen"))
     }
 
+    /// The history a checkpoint exports, read the way the pump's checkpoint
+    /// reads it (paged-out history through one open of the swap).
+    pub fn export_history_payload(&self) -> (usize, Vec<u8>) {
+        let _reading = self.shared.history_reading();
+        self.shared.screen.lock().expect("screen").history_payload()
+    }
+
     pub fn screen_size(&self) -> (usize, usize) {
         if let Some(remote) = self
             .shared
@@ -3928,6 +3972,7 @@ fn new_shared(
         relaunch_requested: AtomicBool::new(false),
         echo_request: Mutex::new(None),
         pump_wake: PumpWake::default(),
+        history_swap: Mutex::new(None),
         held_pump: HeldPumpLatch::default(),
         foreground_job: std::sync::atomic::AtomicU8::new(0),
         foreground: Mutex::new(ForegroundProgram::default()),
@@ -4521,6 +4566,92 @@ fn idle_work_pending(
     screen.in_synchronized_update()
         || (last_scan_at.is_some() && screen.content_seq() != last_scan_seq)
 }
+
+/// The page-out rung of a held pump's idle ladder, run each time the pump
+/// parks while its history is still in memory. Once history has had no
+/// output and no read for [`crate::history_swap::page_out_idle`], its sealed
+/// blocks move to the session's encrypted swap file (see
+/// [`crate::history_swap`]); until then, returns how long the pump may park
+/// before that comes due, so the page-out takes the park's own timer and no
+/// other wakeup. After a page-out, or with too little history to bother,
+/// returns [`IDLE_PARK`] and is not called again until more output.
+fn page_out_idle_history(
+    shared: &Shared,
+    checkpoint_path: &Path,
+    quiet: &mut Option<(Instant, u64)>,
+    paged: &mut bool,
+) -> Duration {
+    let Some(idle) = crate::history_swap::page_out_idle() else {
+        *paged = true;
+        return IDLE_PARK;
+    };
+    let mut screen = shared.screen.lock().expect("screen");
+    if screen.history_storage_bytes() < diri_terminal_state::PAGE_OUT_MIN_BYTES {
+        *paged = true;
+        return IDLE_PARK;
+    }
+    let reads = screen.history_reads();
+    let now = Instant::now();
+    let (since, seen) = quiet.get_or_insert((now, reads));
+    if *seen != reads {
+        // Someone is reading history: start the clock again.
+        *since = now;
+        *seen = reads;
+    }
+    let quiet_for = now.saturating_duration_since(*since);
+    if quiet_for < idle {
+        return idle - quiet_for;
+    }
+    *paged = true;
+    *quiet = None;
+    let mut swap = shared.history_swap.lock().expect("history swap");
+    let store: Arc<dyn diri_terminal_state::ColdStore> = match &*swap {
+        Some(file) => Arc::clone(file) as _,
+        None => {
+            let logs_dir = checkpoint_path.parent().unwrap_or(Path::new("."));
+            match crate::history_swap::SwapFile::new(logs_dir) {
+                Ok(file) => {
+                    *swap = Some(Arc::clone(&file));
+                    file
+                }
+                Err(error) => {
+                    diri_telemetry::warn_event!(
+                        "session.history_page_out_failed",
+                        session = diri_telemetry::id(&shared.id),
+                        io = diri_telemetry::io_error(&error),
+                    );
+                    return IDLE_PARK;
+                }
+            }
+        }
+    };
+    drop(swap);
+    let started = Instant::now();
+    match screen.page_out_history(&store) {
+        Ok(report) => {
+            HISTORY_PAGED_OUT_BYTES.fetch_add(report.bytes as u64, Ordering::Relaxed);
+            diri_telemetry::debug_event!(
+                "session.history_paged_out",
+                session = diri_telemetry::id(&shared.id),
+                payloads = report.payloads,
+                bytes = report.bytes,
+                already_stored = report.already_stored,
+                kept_bytes = report.kept_bytes,
+                micros = started.elapsed().as_micros() as u64,
+            );
+        }
+        Err(error) => diri_telemetry::warn_event!(
+            "session.history_page_out_failed",
+            session = diri_telemetry::id(&shared.id),
+            io = diri_telemetry::io_error(&error),
+        ),
+    }
+    IDLE_PARK
+}
+
+/// Payload bytes every held session in this process has written to its
+/// history swap, framing excluded.
+pub static HISTORY_PAGED_OUT_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// The descriptor an idle held pump may park on (unix only).
 #[cfg(unix)]
@@ -6432,6 +6563,9 @@ fn pump_held(
         live_from,
         drained,
         subscribe_eagerly,
+        history_quiet: None,
+        history_paged: false,
+        park_for: IDLE_PARK,
     };
     run_held(Box::new(state), false);
 }
@@ -6483,6 +6617,15 @@ struct HeldPump {
     live_from: u64,
     drained: bool,
     subscribe_eagerly: bool,
+    /// When history last went quiet (no output, no read) and the history
+    /// read count then; `None` until the pump next parks after output.
+    history_quiet: Option<(Instant, u64)>,
+    /// Set once idle history has been paged out (or there was too little to
+    /// page out), until the next output.
+    history_paged: bool,
+    /// How long the next park may last before the pump looks again: the
+    /// backstop, or sooner when a page-out comes due first.
+    park_for: Duration,
 }
 
 /// How a pump's turn on a thread ended.
@@ -6569,6 +6712,9 @@ fn held_turn(state: Box<HeldPump>, mut resumed: bool, may_park: bool) -> HeldTur
         mut live_from,
         mut drained,
         mut subscribe_eagerly,
+        mut history_quiet,
+        mut history_paged,
+        mut park_for,
     } = *state;
     // Declared after the watcher so it is dropped first: the doorbell is
     // cleared before the kqueue it rings closes. A park forgets it instead,
@@ -6721,6 +6867,9 @@ fn held_turn(state: Box<HeldPump>, mut resumed: bool, may_park: bool) -> HeldTur
                 live_from,
                 drained,
                 subscribe_eagerly,
+                history_quiet,
+                history_paged,
+                park_for,
             }));
         }
         let from_log;
@@ -6751,7 +6900,7 @@ fn held_turn(state: Box<HeldPump>, mut resumed: bool, may_park: bool) -> HeldTur
                             let replaced = if woke {
                                 watcher.drain_events()
                             } else {
-                                watcher.park(descriptor, IDLE_PARK)
+                                watcher.park(descriptor, park_for)
                             };
                             if replaced {
                                 shared.log.lock().expect("log").invalidate_read_handle();
@@ -6872,6 +7021,9 @@ fn held_turn(state: Box<HeldPump>, mut resumed: bool, may_park: bool) -> HeldTur
                 // Output has been quiet for a second (or keeps streaming past
                 // the staleness bound, when the rows are reused at once).
                 shared.screen.lock().expect("screen").release_idle_memory();
+                // The export reads paged-out history back a block at a time:
+                // one open of the swap file for all of them.
+                let _reading = shared.history_reading();
                 persist_checkpoint(
                     &shared,
                     &checkpoint_path,
@@ -6961,11 +7113,21 @@ fn held_turn(state: Box<HeldPump>, mut resumed: bool, may_park: bool) -> HeldTur
                 && checkpoint_dirty_at.is_none()
                 && last_activity.is_none_or(|at| at.elapsed() > FOREGROUND_SETTLE)
                 && !idle_work_pending(&shared, &manifest_id, last_scan_at, last_scan_seq);
+            park_for = IDLE_PARK;
             if parking {
                 // Give back what output, a checkpoint or an artifact scan left
                 // decoded or allocated before sleeping. Cheap when there is
                 // nothing to give back, and parks are rare.
                 shared.screen.lock().expect("screen").compact_idle();
+                if !history_paged {
+                    park_for = page_out_idle_history(
+                        &shared,
+                        &checkpoint_path,
+                        &mut history_quiet,
+                        &mut history_paged,
+                    )
+                    .min(IDLE_PARK);
+                }
                 if !park_next {
                     // Output just went quiet: its buffers are not needed
                     // until the next burst, which reallocates them.
@@ -6979,6 +7141,10 @@ fn held_turn(state: Box<HeldPump>, mut resumed: bool, may_park: bool) -> HeldTur
             continue;
         }
         park_next = false;
+        // New output: history is live again, and the page-out clock restarts
+        // at the next park.
+        history_quiet = None;
+        history_paged = false;
 
         trace_hop!(OutputReceived);
         // A rotation can move the readable floor past us; resynchronize.
@@ -8013,7 +8179,7 @@ mod held_park {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use super::{HeldPump, IDLE_PARK, run_held};
+    use super::{HeldPump, run_held};
     use crate::holder::reactor;
 
     type Slot = Arc<Mutex<Option<Box<HeldPump>>>>;
@@ -8035,9 +8201,10 @@ mod held_park {
         };
         // The slot keeps the state, and with it the kqueue, open while the
         // registration can fire, and hands it back if it cannot.
+        let within = state.park_for;
         let slot: Slot = Arc::new(Mutex::new(Some(state)));
         let waiting = Arc::clone(&slot);
-        match reactor.when_readable_within(kq, IDLE_PARK, move || resume(waiting)) {
+        match reactor.when_readable_within(kq, within, move || resume(waiting)) {
             Ok(_) => Ok(()),
             Err(_) => Err(slot
                 .lock()

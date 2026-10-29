@@ -42,7 +42,7 @@ use crate::switcher::{
 
 pub use prefs::{
     AttentionRoute, AttentionRoutes, CursorBlinkPref, CursorShapePref, DictationShortcut, DockBadge, FileEditor, InspectorTab, InterfaceStyle, NewAgentStart, OptionAsMeta, PaneDensity, Prefs,
-    SavedWindow, SidebarGrouping, SidebarOrdering, TabOrientation, TalkAnswer, UiLanguage,
+    SavedWindow, SidebarGrouping, SidebarOrdering, SidebarUsageIndicator, TabOrientation, TalkAnswer, UiLanguage,
     WindowMaterial, WindowMode, WindowPlacement,
 };
 pub use projection::{SidebarProject, SidebarProjection, SidebarRow};
@@ -3249,6 +3249,29 @@ impl SessionStore {
             }
         }
         None
+    }
+
+    /// The layout of the split tab that shows `session`, if any.
+    pub fn split_layout_of(
+        &self,
+        session: &SessionId,
+    ) -> Option<&diri_proto::workspace::LayoutNode> {
+        use diri_proto::workspace::LayoutNode;
+        fn shows(node: &LayoutNode, session: &SessionId) -> bool {
+            match node {
+                LayoutNode::Pane { session_id, .. } => session_id == session,
+                LayoutNode::Split { first, second, .. } => {
+                    shows(first, session) || shows(second, session)
+                }
+            }
+        }
+        self.workspaces
+            .snapshot()?
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.tabs)
+            .map(|tab| &tab.layout)
+            .find(|layout| matches!(layout, LayoutNode::Split { .. }) && shows(layout, session))
     }
 
     /// The newest running pane shell of `owner` that no tab shows: one

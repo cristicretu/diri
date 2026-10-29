@@ -8,8 +8,10 @@ use diri_proto::methods::ReadScrollbackResult;
 use crate::buffer::GridBuffer;
 use crate::scrollback::ScrollbackViewport;
 
+mod older;
 mod retained;
 mod scheduler;
+pub use older::{OLDER_MATCH_CAP, OlderRequest};
 pub use retained::{FindCapturePermit, FindReservation, RetainedFindSnapshot};
 mod search;
 
@@ -138,6 +140,18 @@ pub struct TerminalFindModel {
     generation: u64,
     search_due: Option<Duration>,
     rescan_due: Option<Duration>,
+    /// Matches older than the capture, searched by the Engine. They come
+    /// before [`Self::matches`] in navigation order.
+    older: Option<older::OlderSearch>,
+    /// Identifies the older search a page reply belongs to.
+    older_id: u64,
+}
+
+/// The selected match, by identity rather than index, so it stays selected
+/// while older matches arrive in front of it.
+enum Selected {
+    Older(FindMatch),
+    Capture(usize),
 }
 
 impl TerminalFindModel {
@@ -147,10 +161,16 @@ impl TerminalFindModel {
             ..Self::default()
         }
     }
+    /// The capture, its matches and the selected one among them
+    /// (`usize::MAX` while an older match is selected).
     pub fn retained_highlights(&self) -> Option<(&Arc<RetainedFindSnapshot>, &[FindMatch], usize)> {
+        let current = self
+            .current_index
+            .checked_sub(self.older_len())
+            .unwrap_or(usize::MAX);
         self.source
             .as_ref()
-            .map(|source| (source, self.matches.as_slice(), self.current_index))
+            .map(|source| (source, self.matches.as_slice(), current))
     }
     pub fn uses_retained_capture(&self) -> bool {
         self.retained_mode
@@ -161,8 +181,164 @@ impl TerminalFindModel {
     pub fn has_newer_output(&self) -> bool {
         self.newer_output
     }
+    /// Some output is not searched (yet): older history while the Engine is
+    /// still paging through it, or history no search here can reach.
     pub fn is_partial(&self) -> bool {
+        if let Some(older) = &self.older {
+            return !older.is_complete();
+        }
         self.source.as_ref().is_some_and(|s| s.partial) || self.matches.len() == MATCH_CAP
+    }
+
+    /// Every match navigation visits: older history and the capture.
+    #[must_use]
+    pub fn match_count(&self) -> usize {
+        self.older_len() + self.matches.len()
+    }
+
+    fn older_len(&self) -> usize {
+        self.older.as_ref().map_or(0, |older| older.matches.len())
+    }
+
+    fn selected(&self) -> Option<Selected> {
+        let older = self.older.as_ref().map_or(&[][..], |older| &older.matches);
+        if let Some(item) = older.get(self.current_index) {
+            return Some(Selected::Older(item.clone()));
+        }
+        let index = self.current_index - older.len();
+        (index < self.matches.len()).then_some(Selected::Capture(index))
+    }
+
+    fn reselect(&mut self, selected: Option<Selected>) {
+        let older = self.older.as_ref().map_or(&[][..], |older| &older.matches);
+        self.current_index = match selected {
+            Some(Selected::Capture(index)) => older.len() + index,
+            Some(Selected::Older(item)) => older
+                .partition_point(|other| {
+                    (other.absolute_row, other.start_col) < (item.absolute_row, item.start_col)
+                })
+                .min(older.len().saturating_sub(1)),
+            None => self.current_index.min(self.match_count().saturating_sub(1)),
+        };
+    }
+
+    /// The next page of the older-history search, when one is due. The
+    /// host sends it with `session.find_history` and hands the reply to
+    /// [`Self::apply_older_page`]. Only one page is outstanding at a time;
+    /// a new query abandons the search, and its reply is then ignored.
+    pub fn take_older_request(&mut self) -> Option<OlderRequest> {
+        let id = self.older_id;
+        if self.query.is_empty() {
+            return None;
+        }
+        self.older.as_mut()?.next_request(id, &self.query)
+    }
+
+    /// Lets a page that was asked for but whose reply was dropped be asked
+    /// for again.
+    pub fn release_older_request(&mut self, request: &OlderRequest) {
+        if request.generation == self.older_id
+            && let Some(older) = self.older.as_mut()
+        {
+            older.release();
+        }
+    }
+
+    /// Takes in one page. `Err` (an Engine without history search, a
+    /// failed request) stops the older search; the capture's matches stay.
+    /// Returns whether anything shown changed.
+    pub fn apply_older_page(
+        &mut self,
+        request: &OlderRequest,
+        page: Result<diri_proto::find::FindHistoryResult, ()>,
+    ) -> bool {
+        if request.generation != self.older_id || request.query != self.query {
+            return false;
+        }
+        let selected = self.selected();
+        let Some(older) = self.older.as_mut() else {
+            return false;
+        };
+        let complete = older.is_complete();
+        let (_, added) = older.apply(request, page);
+        let changed = added > 0 || complete != older.is_complete();
+        self.reselect(selected);
+        changed
+            || self
+                .older
+                .as_ref()
+                .is_some_and(|older| !older.is_complete())
+    }
+
+    /// Starts, continues or drops the older search for a newly applied
+    /// capture.
+    fn follow_capture(&mut self, selected: Option<Selected>) {
+        let below = self.source.as_ref().and_then(|source| {
+            let origin = source.history_origin?;
+            (source.partial && !source.is_alt_screen && self.retained_mode).then(|| {
+                // A capped capture searched only its newest rows: everything
+                // below its oldest kept match is left to the older search,
+                // that match's row included.
+                let first = if self.matches.len() == MATCH_CAP {
+                    self.matches[0].absolute_row
+                } else {
+                    source.first_row
+                };
+                (origin + first, origin, source.cols as i64)
+            })
+        });
+        let Some((top, origin, cols)) = below else {
+            self.older = None;
+            self.reselect(selected);
+            return;
+        };
+        let mut selected = selected;
+        if self.matches.len() == MATCH_CAP {
+            let row = top - origin;
+            let dropped = self
+                .matches
+                .partition_point(|item| item.absolute_row <= row);
+            self.matches.drain(..dropped);
+            if let Some(Selected::Capture(index)) = &mut selected {
+                *index = index.saturating_sub(dropped);
+            }
+        }
+        match self.older.as_mut() {
+            Some(older) if older.cols() == cols => {
+                older.rebase(top, origin);
+            }
+            _ => {
+                self.older_id = self.older_id.wrapping_add(1);
+                self.older = Some(older::OlderSearch::new(top, cols, origin));
+            }
+        }
+        self.reselect(selected);
+    }
+
+    /// Matches placed in the Engine's current rows, for a reading view that
+    /// is not showing the capture (it is showing an older match, or the
+    /// reader scrolled). Ascending, with the selected one's index.
+    #[must_use]
+    pub fn reading_highlights(&self) -> Option<(Vec<FindMatch>, usize)> {
+        let older = self.older.as_ref()?;
+        let shift = self
+            .source
+            .as_ref()
+            .and_then(|source| source.history_origin)
+            .map_or(0, |origin| origin - older.origin);
+        let matches = older
+            .matches
+            .iter()
+            .map(|item| FindMatch {
+                absolute_row: older.absolute(item.absolute_row),
+                ..item.clone()
+            })
+            .chain(self.matches.iter().map(|item| FindMatch {
+                absolute_row: item.absolute_row + shift,
+                ..item.clone()
+            }))
+            .collect();
+        Some((matches, self.current_index))
     }
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
@@ -247,6 +423,8 @@ impl TerminalFindModel {
         self.generation = self.generation.wrapping_add(1);
         self.rescan_due = None;
         self.matches.clear();
+        self.older = None;
+        self.older_id = self.older_id.wrapping_add(1);
         self.current_index = 0;
         if self.query.is_empty() {
             self.search_due = None;
@@ -369,6 +547,7 @@ impl TerminalFindModel {
         if !self.paused {
             self.newer_output = false;
         }
+        let previous = self.selected();
         self.source = result.source;
         self.matches = result.matches;
         self.is_alt_screen = result.is_alt_screen;
@@ -385,18 +564,25 @@ impl TerminalFindModel {
             );
         }
 
-        if result.request.is_rescan && !sequence_changed {
-            self.current_index = self.current_index.min(self.matches.len().saturating_sub(1));
+        let selected = if result.request.is_rescan && !sequence_changed {
+            previous.map(|selected| match selected {
+                Selected::Capture(index) => {
+                    Selected::Capture(index.min(self.matches.len().saturating_sub(1)))
+                }
+                older => older,
+            })
         } else {
             let window_top = result
                 .visible_start_row
                 .saturating_sub(viewport.view_offset());
-            self.current_index = self
-                .matches
-                .iter()
-                .position(|item| item.absolute_row >= window_top)
-                .unwrap_or(0);
-        }
+            Some(Selected::Capture(
+                self.matches
+                    .iter()
+                    .position(|item| item.absolute_row >= window_top)
+                    .unwrap_or(0),
+            ))
+        };
+        self.follow_capture(selected);
         true
     }
 
@@ -444,13 +630,38 @@ impl TerminalFindModel {
                 self.next(viewport)
             };
         };
-        if self.matches.is_empty() {
+        let total = self.match_count();
+        if total == 0 {
             return None;
         }
         let direction = if backwards { -1 } else { 1 };
-        self.current_index = (self.current_index as isize + direction)
-            .rem_euclid(self.matches.len() as isize) as usize;
-        let item = &self.matches[self.current_index];
+        self.current_index =
+            (self.current_index as isize + direction).rem_euclid(total as isize) as usize;
+        let rows = usize::from(live.rows);
+        if let Some(older) = self
+            .older
+            .as_ref()
+            .filter(|older| self.current_index < older.matches.len())
+        {
+            // Older than the capture: read it from the Engine, in its current
+            // rows, like any scrolled history.
+            let absolute_row = older.absolute(older.matches[self.current_index].absolute_row);
+            self.paused = true;
+            self.rescan_due = None;
+            viewport.clear_find_source();
+            viewport.apply_geometry(
+                older.live_start_row,
+                older.total_rows,
+                older.content_seq,
+                rows,
+            );
+            viewport.scroll_to_absolute(absolute_row, HISTORY_ANCHOR, rows);
+            return Some(NavigationTarget::History {
+                absolute_row,
+                anchor: HISTORY_ANCHOR,
+            });
+        }
+        let item = &self.matches[self.current_index - self.older_len()];
         if !self.paused && source.matches_live_row(item.absolute_row, live) {
             viewport.clear_find_source();
             viewport.scroll_to_live(usize::from(live.rows));

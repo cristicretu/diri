@@ -60,6 +60,9 @@ impl Method {
     /// alternate screen shows. Remote sessions: `terminal_clear_unsupported`.
     pub const SESSION_CLEAR_SCROLLBACK: &'static str = "session.clear_scrollback";
     pub const SESSION_CAPTURE_FIND: &'static str = "session.capture_find";
+    /// One bounded page of Find over a local terminal's whole history; see
+    /// [`crate::find::FindHistoryParams`].
+    pub const SESSION_FIND_HISTORY: &'static str = "session.find_history";
     pub const SESSION_READ_SCROLLBACK: &'static str = "session.read_scrollback";
     pub const SESSION_READ_SCROLLBACK_CELLS: &'static str = "session.read_scrollback_cells";
     pub const SESSION_READ_DIFF: &'static str = "session.read_diff";
@@ -201,6 +204,7 @@ impl Method {
         Self::SESSION_CLEAR_SCROLLBACK,
         Self::SESSION_LIST_DIR,
         Self::SESSION_CAPTURE_FIND,
+        Self::SESSION_FIND_HISTORY,
         Self::SESSION_READ_SCROLLBACK,
         Self::SESSION_READ_SCROLLBACK_CELLS,
         Self::SESSION_READ_DIFF,
@@ -1296,6 +1300,11 @@ pub struct CaptureFindResult {
     pub visible_rows: usize,
     pub partial: bool,
     pub cells: ReadScrollbackCellsResult,
+    /// Stable row of the capture's absolute row 0 (see
+    /// [`crate::find::FindHistoryParams`]). Present when the Engine can search
+    /// the history older than the capture with `session.find_history`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_origin: Option<i64>,
 }
 
 pub type SessionReopenLastParams = EmptyParams;

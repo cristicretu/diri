@@ -35,12 +35,28 @@ pub struct Api {
     pub auth: Auth,
     pub host_label: String,
     pub inputs: InputLedger,
+    /// `Some` when callers are admitted by Tailscale identity and pairing
+    /// instead of the bearer token. The token is then never accepted.
+    pub tailnet: Option<Arc<crate::tailnet::Admission>>,
 }
 
 impl Api {
+    /// Whether `request` may reach the API: under tailnet admission the
+    /// connection loop decided already; otherwise it must carry the token.
+    #[must_use]
+    pub fn authorizes(&self, request: &Request) -> bool {
+        match self.tailnet {
+            Some(_) => request.admitted,
+            None => self.auth.authorizes(request),
+        }
+    }
+
     pub async fn route(&self, request: &Request) -> Response {
-        if !self.auth.authorizes(request) {
-            return auth::unauthorized();
+        if !self.authorizes(request) {
+            return match self.tailnet {
+                Some(_) => crate::tailnet::Refusal::NotPaired.response(),
+                None => auth::unauthorized(),
+            };
         }
         // Reads are safe to serve cross-origin; state changes are not.
         let mutating = matches!(request.method.as_str(), "POST" | "PUT" | "DELETE");
@@ -608,6 +624,7 @@ mod tests {
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
             inputs: Default::default(),
+            tailnet: None,
         };
         for (path, method, body, expected) in [
             ("/api/hosts", "GET", "", Method::HOST_LIST),
@@ -716,6 +733,7 @@ mod tests {
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
             inputs: Default::default(),
+            tailnet: None,
         };
 
         let (status, body) = call(&api, "GET", "/api/session/s_a/transcript", "").await;
@@ -829,6 +847,7 @@ mod tests {
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
             inputs: Default::default(),
+            tailnet: None,
         };
         let text = |line: &Value| line["runs"][0]["t"].as_str().unwrap().to_owned();
 
@@ -912,6 +931,7 @@ mod tests {
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
             inputs: Default::default(),
+            tailnet: None,
         };
         // Ctrl-C, Up, Escape and a paste: exactly these bytes, no Enter, no
         // bracketing.
@@ -946,6 +966,7 @@ mod tests {
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
             inputs: Default::default(),
+            tailnet: None,
         };
         let batch = json!({ "data": base64_encode(b"deploy\r"), "id": "b1" }).to_string();
         for _ in 0..2 {
@@ -979,6 +1000,7 @@ mod tests {
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
             inputs: Default::default(),
+            tailnet: None,
         };
         for (method, path, body) in [
             ("GET", "/api/session/s_a/grid", ""),
@@ -1013,6 +1035,7 @@ mod tests {
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
             inputs: Default::default(),
+            tailnet: None,
         });
         let request = tokio::spawn({
             let api = Arc::clone(&api);

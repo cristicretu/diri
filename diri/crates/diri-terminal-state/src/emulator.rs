@@ -154,6 +154,10 @@ pub(crate) trait Emulator: Placement + Sized {
 
     /// Rows above the visible screen on the active screen.
     fn history_rows(&self) -> usize;
+    /// Rows that have left the active screen's history from its oldest end,
+    /// so `history_origin() + row` names a history row stably while output
+    /// evicts older ones.
+    fn history_origin(&self) -> u64;
     /// History rows of the primary screen, also while the alternate one shows.
     #[cfg(feature = "compact-history")]
     fn primary_history_rows(&self) -> usize;
@@ -179,6 +183,17 @@ pub(crate) trait Emulator: Placement + Sized {
     fn prepare_history_read(&mut self);
     #[cfg(feature = "compact-history")]
     fn release_history_read_cache(&mut self);
+    /// Pages idle primary history out to `store`; see
+    /// [`crate::HeadlessScreen::page_out_history`].
+    #[cfg(feature = "compact-history")]
+    fn page_out_history(
+        &mut self,
+        store: &std::sync::Arc<dyn crate::ColdStore>,
+        keep_rows: usize,
+        min_bytes: usize,
+    ) -> std::io::Result<crate::PageOut>;
+    #[cfg(feature = "compact-history")]
+    fn history_residency(&self) -> crate::PayloadResidency;
 
     // Keyboard protocol.
 
@@ -420,6 +435,11 @@ impl Emulator for Term<Collector> {
         self.grid().history_size()
     }
 
+    #[inline]
+    fn history_origin(&self) -> u64 {
+        self.grid().history_origin()
+    }
+
     #[cfg(feature = "compact-history")]
     fn primary_history_rows(&self) -> usize {
         self.primary_history_size()
@@ -474,6 +494,21 @@ impl Emulator for Term<Collector> {
     #[cfg(feature = "compact-history")]
     fn release_history_read_cache(&mut self) {
         self.grid_mut().release_history_read_cache();
+    }
+
+    #[cfg(feature = "compact-history")]
+    fn page_out_history(
+        &mut self,
+        store: &std::sync::Arc<dyn crate::ColdStore>,
+        keep_rows: usize,
+        min_bytes: usize,
+    ) -> std::io::Result<crate::PageOut> {
+        self.page_out_primary_history(store, keep_rows, min_bytes)
+    }
+
+    #[cfg(feature = "compact-history")]
+    fn history_residency(&self) -> crate::PayloadResidency {
+        self.primary_history_residency()
     }
 
     fn kitty_keyboard_enabled(&self) -> bool {
