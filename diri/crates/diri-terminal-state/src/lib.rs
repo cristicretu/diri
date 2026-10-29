@@ -3777,7 +3777,6 @@ mod tests {
     /// fill counts and `content_seq` equal hashing every row after full
     /// damage, which status detection and publication were built on.
     #[test]
-    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
     fn fingerprints_after_scrolling_match_the_cells() {
         let actions: &[&str] = &[
             "\x1b[31;1m",
@@ -3849,7 +3848,8 @@ mod tests {
             reused += screen.geometry.rows - screen.take_fingerprinted_rows();
             reference.feed(bytes.as_bytes());
             assert_same_fingerprints(&screen, &reference, step);
-            if random % 997 == 0 {
+            // Core v2 resizes only to the same size until reflow (step 5).
+            if random % 997 == 0 && cfg!(not(feature = "core-v2-screen")) {
                 let (cols, rows) = (
                     10 + (random >> 24) as usize % 30,
                     1 + (random >> 32) as usize % 8,
@@ -4514,10 +4514,7 @@ mod tests {
     /// could not bring them back. A reference multiplexer keeps every line.
     #[cfg(feature = "compact-history")]
     #[test]
-    // Core v2 keeps fewer rows of these repetitive lines in the 4 MiB
-    // budget (a byte per ASCII cell; the current core LZ-compresses each
-    // row), so the depth asserted here is the current core's.
-    #[cfg(not(feature = "core-v2-screen"))]
+    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
     fn a_resize_at_capacity_keeps_every_retained_line() {
         let lines = HISTORY_ROW_CEILING + 20_000;
         for (width, label) in [(70, "unwrapped"), (120, "wrapped")] {
@@ -4585,10 +4582,7 @@ mod tests {
     /// debug builds tests and development apps run).
     #[cfg(feature = "compact-history")]
     #[test]
-    // Core v2 keeps fewer rows of these repetitive lines in the 4 MiB
-    // budget (a byte per ASCII cell; the current core LZ-compresses each
-    // row), so the depth asserted here is the current core's.
-    #[cfg(not(feature = "core-v2-screen"))]
+    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
     fn lines_after_narrowing_a_full_history_cost_what_they_did_before() {
         fn per_line(screen: &mut HeadlessScreen, next: &mut usize) -> std::time::Duration {
             let mut batches: Vec<_> = (0..5)
@@ -5056,10 +5050,7 @@ mod tests {
 
     #[cfg(feature = "compact-history")]
     #[test]
-    // Core v2 keeps fewer rows of these repetitive lines in the 4 MiB
-    // budget (a byte per ASCII cell; the current core LZ-compresses each
-    // row), so the depth asserted here is the current core's.
-    #[cfg(not(feature = "core-v2-screen"))]
+    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
     fn a_column_change_at_capacity_keeps_hard_line_history() {
         let mut screen = HeadlessScreen::new(80, 24);
         // Past the row ceiling, history recycles its oldest row per line and
@@ -5084,10 +5075,6 @@ mod tests {
 
     #[cfg(feature = "compact-history")]
     #[test]
-    // Core v2 keeps fewer rows of these repetitive lines in the 4 MiB
-    // budget (a byte per ASCII cell; the current core LZ-compresses each
-    // row), so the depth asserted here is the current core's.
-    #[cfg(not(feature = "core-v2-screen"))]
     fn find_and_fetch_work_at_depth() {
         let mut screen = HeadlessScreen::new(80, 24);
         let lines = 100_000;

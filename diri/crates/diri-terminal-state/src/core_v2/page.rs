@@ -14,9 +14,14 @@
 //! sizes. Without a budget, whole pages past the row limit are recycled as
 //! the next tail page.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
+use std::sync::Arc;
+
+use alacritty_terminal::grid::cold::{ColdStore, PageOut};
 use std::collections::{HashMap, VecDeque};
 
+use alacritty_terminal::grid::compact::lz::{compress_into, decompress};
 use alacritty_terminal::term::grapheme::Info;
 
 use super::cell::{
@@ -730,7 +735,9 @@ pub struct Page {
     /// Hyperlinks, for pages that have any (boxed: a page's size counts in
     /// the history budget).
     links: Option<Box<Links>>,
-    packed: Option<Box<[u8]>>,
+    packed: Option<Packed>,
+    /// `packed` is LZ-compressed (see [`Page::finish_pack`]).
+    lz: bool,
 }
 
 const T_LITERAL: u8 = 1;
@@ -1212,6 +1219,100 @@ fn unpack_meta(data: &[u8], metas: &mut [RowMeta]) -> usize {
     at
 }
 
+/// When sealed pages are LZ-compressed (the current core's history codec,
+/// `alacritty_terminal::grid::compact::lz`). Output that repeats, such as
+/// log lines, shrinks to a third or less; text that barely repeats does not
+/// shrink, and compressing it would cost time on every page for nothing.
+/// So while pages compress well, every page is compressed; otherwise every
+/// [`LZ_PROBE_EVERY`]th page compresses a sample of its first
+/// [`LZ_SAMPLE`] bytes and, when that shrinks by [`LZ_PROBE_RATIO`], the
+/// whole page. The decisions depend only on the sequence of sealed pages,
+/// so the history kept is the same however reads split the output.
+#[derive(Default)]
+pub(super) struct LzPolicy {
+    /// The last page compressed by at least [`LZ_KEEP_RATIO`].
+    compressible: bool,
+    /// Pages until the next probe.
+    countdown: u8,
+}
+
+const LZ_PROBE_EVERY: u8 = 8;
+const LZ_SAMPLE: usize = 1024;
+const LZ_PROBE_RATIO: usize = 2;
+/// A page that compresses to two thirds or less keeps compression on.
+const LZ_KEEP_RATIO: (usize, usize) = (2, 3);
+
+impl LzPolicy {
+    /// Compresses `packed` into `lz` when the policy says so and it saves an
+    /// eighth; returns whether `lz` holds the page's bytes.
+    fn compress(&mut self, packed: &[u8], lz: &mut Vec<u8>) -> bool {
+        let whole = if self.compressible {
+            true
+        } else if self.countdown == 0 {
+            self.countdown = LZ_PROBE_EVERY - 1;
+            let sample = &packed[..packed.len().min(LZ_SAMPLE)];
+            compress_into(sample, lz);
+            lz.len() * LZ_PROBE_RATIO <= sample.len()
+        } else {
+            self.countdown -= 1;
+            false
+        };
+        if !whole {
+            return false;
+        }
+        compress_into(packed, lz);
+        let (num, den) = LZ_KEEP_RATIO;
+        self.compressible = lz.len() * den <= packed.len() * num;
+        if !self.compressible {
+            self.countdown = LZ_PROBE_EVERY - 1;
+        }
+        lz.len() + lz.len() / 8 < packed.len()
+    }
+}
+
+/// A packed page's bytes: in memory, or in a cold store (#958). A stored
+/// payload counts its full length against the history budget, exactly as in
+/// memory, so the rows kept never depend on paging.
+pub(super) enum Packed {
+    Resident(Box<[u8]>),
+    Stored(StoredPage),
+}
+
+/// A payload in a [`ColdStore`], released when its page is dropped.
+pub(super) struct StoredPage {
+    store: Arc<dyn ColdStore>,
+    slot: u64,
+    len: usize,
+}
+
+impl Drop for StoredPage {
+    fn drop(&mut self) {
+        self.store.release(self.slot, self.len);
+    }
+}
+
+impl Packed {
+    fn len(&self) -> usize {
+        match self {
+            Packed::Resident(bytes) => bytes.len(),
+            Packed::Stored(stored) => stored.len,
+        }
+    }
+
+    /// The bytes, read back from the store when paged out (nothing of them
+    /// stays in memory after the caller is done); `None` when the store
+    /// cannot give them back.
+    fn bytes(&self) -> Option<Cow<'_, [u8]>> {
+        match self {
+            Packed::Resident(bytes) => Some(Cow::Borrowed(bytes)),
+            Packed::Stored(stored) => match stored.store.load(stored.slot, stored.len) {
+                Ok(bytes) if bytes.len() == stored.len => Some(Cow::Owned(bytes)),
+                _ => None,
+            },
+        }
+    }
+}
+
 /// Dense buffers a packed page leaves behind, reused by the next tail page.
 type DenseBuffers = (Box<[Cell]>, Box<[RowMeta]>, TextLog, Clusters);
 
@@ -1241,6 +1342,7 @@ impl Page {
             text,
             links: None,
             packed: None,
+            lz: false,
         }
     }
 
@@ -1456,7 +1558,10 @@ impl Page {
 
     /// Keeps `packed` as the page and hands back its dense buffers.
     fn finish_pack(&mut self, cols: usize, packed: &[u8]) -> DenseBuffers {
-        self.packed = Some(Box::from(packed));
+        // Tokens only: LZ is applied later, under budget pressure (see
+        // [`Pages::trim`]).
+        self.packed = Some(Packed::Resident(Box::from(packed)));
+        self.lz = false;
         // Debug builds decode the page and compare it with the cells.
         #[cfg(debug_assertions)]
         {
@@ -1502,9 +1607,21 @@ impl Page {
         clusters: &mut Clusters,
         links: &mut HashMap<u32, u32>,
     ) {
-        let data = self.packed.as_deref().expect("packed");
         clusters.clear();
         links.clear();
+        // A payload the cold store cannot give back reads as blank rows, as
+        // the current core's history does (the store reports why).
+        let Some(stored) = self.packed.as_ref().expect("packed").bytes() else {
+            metas[..self.len].fill(RowMeta::default());
+            return;
+        };
+        let decoded;
+        let data: &[u8] = if self.lz {
+            decoded = decompress(&stored);
+            &decoded
+        } else {
+            &stored
+        };
         let mut pending_link: Option<u32> = None;
         let mut at = unpack_meta(data, &mut metas[..self.len]);
         let mut current = 0u64;
@@ -1604,9 +1721,34 @@ impl Page {
         debug_assert_eq!(at, data.len());
     }
 
+    /// LZ-compresses a packed page's bytes in place when `policy` says so;
+    /// returns the bytes it saved.
+    ///
+    /// A page already in the cold store is read back for this and stays in
+    /// memory, so what is compressed never depends on paging. One the store
+    /// cannot give back is left as it is.
+    fn compress(&mut self, policy: &mut LzPolicy, lz: &mut Vec<u8>) -> usize {
+        let Some(packed) = &self.packed else {
+            return 0;
+        };
+        if self.lz {
+            return 0;
+        }
+        let Some(raw) = packed.bytes() else {
+            return 0;
+        };
+        if !policy.compress(&raw, lz) {
+            return 0;
+        }
+        let saved = raw.len() - lz.len();
+        self.packed = Some(Packed::Resident(Box::from(lz.as_slice())));
+        self.lz = true;
+        saved
+    }
+
     /// Live bytes of a packed page.
     fn stored_bytes(&self) -> usize {
-        self.packed.as_ref().map_or(0, |p| p.len())
+        self.packed.as_ref().map_or(0, Packed::len)
             + std::mem::size_of_val(&*self.meta)
             + self.styles.heap_bytes()
             + self.links.as_ref().map_or(0, |links| {
@@ -1650,6 +1792,12 @@ pub struct Pages {
     spare_dense: Vec<DenseBuffers>,
     /// Reused output buffer of `Page::pack`.
     scratch: Vec<u8>,
+    /// Reused LZ output of `Page::pack`.
+    lz_scratch: Vec<u8>,
+    lz_policy: LzPolicy,
+    /// Sealed pages, from the front, that budget pressure has offered to
+    /// [`LzPolicy`] already.
+    lz_considered: usize,
     next_serial: u64,
     cache: RefCell<Option<Unpacked>>,
 }
@@ -1691,6 +1839,9 @@ impl Pages {
             spare: None,
             spare_dense: Vec::new(),
             scratch: Vec::new(),
+            lz_scratch: Vec::new(),
+            lz_policy: LzPolicy::default(),
+            lz_considered: 0,
             next_serial: 1,
             cache: RefCell::new(None),
         };
@@ -1917,6 +2068,7 @@ impl Pages {
         self.base += self.rows_per_page() as u64;
         if page.is_packed() {
             self.sealed -= 1;
+            self.lz_considered = self.lz_considered.saturating_sub(1);
             self.packed_bytes -= page.stored_bytes();
         } else if self.spare.is_none() {
             self.spare = Some(page);
@@ -1933,10 +2085,99 @@ impl Pages {
             self.pop_front_page();
         }
         if let Some(budget) = self.budget {
+            // Over budget, sealed pages are first LZ-compressed, oldest
+            // first and each considered once (see [`LzPolicy`]); only then
+            // is the oldest page dropped. What is compressed, and so what is
+            // kept, depends only on the output: never on the read sizes.
             while self.sealed > 0 && self.history_bytes() > budget {
+                if self.lz_considered < self.sealed {
+                    let page = &mut self.pages[self.lz_considered];
+                    self.packed_bytes -= page.compress(&mut self.lz_policy, &mut self.lz_scratch);
+                    self.lz_considered += 1;
+                    continue;
+                }
                 self.pop_front_page();
             }
         }
+    }
+
+    /// Moves sealed pages older than the newest `keep_rows` history rows
+    /// into `store`, as the current core's `page_out` does: pages already
+    /// there stay, and with fewer than `min_bytes` to move nothing moves.
+    /// Nothing observable changes: a read loads a stored page back (into the
+    /// one-page read cache), and the budget counts it as before. On a store
+    /// error every page stays in memory, unchanged.
+    pub fn page_out(
+        &mut self,
+        store: &Arc<dyn ColdStore>,
+        keep_rows: usize,
+        min_bytes: usize,
+    ) -> std::io::Result<PageOut> {
+        let rows = self.rows_per_page() as u64;
+        let top = self.total.saturating_sub(self.lines as u64);
+        let keep_from = top.saturating_sub(keep_rows as u64);
+        let mut report = PageOut::default();
+        let mut moving = Vec::new();
+        for index in 0..self.sealed {
+            let page = &self.pages[index];
+            let first = self.base + index as u64 * rows;
+            match &page.packed {
+                Some(Packed::Stored(_)) => report.already_stored += 1,
+                Some(Packed::Resident(bytes)) if first + rows <= keep_from => {
+                    moving.push(index);
+                    report.bytes += bytes.len();
+                }
+                Some(Packed::Resident(bytes)) => report.kept_bytes += bytes.len(),
+                None => {}
+            }
+        }
+        if moving.is_empty() || report.bytes < min_bytes {
+            report.bytes = 0;
+            return Ok(report);
+        }
+        let slots = {
+            let payloads: Vec<&[u8]> = moving
+                .iter()
+                .map(|&index| match &self.pages[index].packed {
+                    Some(Packed::Resident(bytes)) => &bytes[..],
+                    _ => unreachable!("only resident pages move"),
+                })
+                .collect();
+            store.store(&payloads)?
+        };
+        assert_eq!(slots.len(), moving.len(), "one slot per stored page");
+        for (&index, slot) in moving.iter().zip(slots) {
+            let page = &mut self.pages[index];
+            let len = page.packed.as_ref().map_or(0, Packed::len);
+            page.packed = Some(Packed::Stored(StoredPage {
+                store: Arc::clone(store),
+                slot,
+                len,
+            }));
+        }
+        report.payloads = moving.len();
+        // The read cache may hold a page that just moved; it is a cache.
+        *self.cache.borrow_mut() = None;
+        Ok(report)
+    }
+
+    /// Sealed pages in memory and in a cold store, and their bytes.
+    pub fn residency(&self) -> (usize, usize, usize, usize) {
+        let (mut resident, mut resident_bytes, mut stored, mut stored_bytes) = (0, 0, 0, 0);
+        for page in self.pages.iter().take(self.sealed) {
+            match &page.packed {
+                Some(Packed::Resident(bytes)) => {
+                    resident += 1;
+                    resident_bytes += bytes.len();
+                }
+                Some(Packed::Stored(page)) => {
+                    stored += 1;
+                    stored_bytes += page.len;
+                }
+                None => {}
+            }
+        }
+        (resident, resident_bytes, stored, stored_bytes)
     }
 
     /// Heap bytes held by pages, for footprint.
@@ -2000,15 +2241,14 @@ impl Pages {
             return;
         }
         let (cols, rows) = (self.cols, self.rows_per_page());
-        let (mut cells, mut meta, _, mut clusters) =
-            self.spare_dense.pop().unwrap_or_else(|| {
-                (
-                    vec![Cell::default(); rows * cols].into_boxed_slice(),
-                    vec![RowMeta::default(); rows].into_boxed_slice(),
-                    TextLog::new(rows, false),
-                    Clusters::default(),
-                )
-            });
+        let (mut cells, mut meta, _, mut clusters) = self.spare_dense.pop().unwrap_or_else(|| {
+            (
+                vec![Cell::default(); rows * cols].into_boxed_slice(),
+                vec![RowMeta::default(); rows].into_boxed_slice(),
+                TextLog::new(rows, false),
+                Clusters::default(),
+            )
+        });
         let mut map = HashMap::new();
         let page = &mut self.pages[p];
         self.packed_bytes -= page.stored_bytes();
@@ -2020,6 +2260,7 @@ impl Pages {
             page.links.get_or_insert_with(Default::default).map = map;
         }
         page.packed = None;
+        page.lz = false;
         page.text = TextLog::new(rows, false);
         page.styles.thaw();
         let serial = page.serial;

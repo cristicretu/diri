@@ -135,6 +135,44 @@ fn paged_out_history_matches_resident_history_through_output_resizes_and_reads()
     );
 }
 
+/// Core v2 (no resize until reflow lands): paged-out pages read, checkpoint,
+/// LZ-compress under budget pressure and evict exactly like resident ones.
+#[test]
+#[cfg(feature = "core-v2-screen")]
+fn paged_out_v2_history_matches_resident_history_through_output_eviction_and_reads() {
+    let store = Arc::new(MemoryStore::default());
+    let cold: Arc<dyn ColdStore> = store.clone();
+    let mut paged = HeadlessScreen::new(120, 40);
+    let mut resident = HeadlessScreen::new(120, 40);
+    let mut moved = 0;
+    // Enough output to pass the 4 MiB budget: older pages are compressed
+    // and evicted while some of them are in the store.
+    for burst in 0..8 {
+        let bytes = styled(burst, 12_000);
+        paged.feed(&bytes);
+        resident.feed(&bytes);
+        let report = paged.page_out_history(&cold).expect("page out");
+        resident.compact_idle();
+        moved += report.payloads;
+        assert!(paged.history_residency().stored > 0, "burst {burst}");
+        assert_same(&mut paged, &mut resident, &format!("burst {burst}"));
+    }
+    assert!(moved > 0);
+    assert!(store.loads.load(Ordering::Relaxed) > 0);
+    assert!(
+        paged.history_rows() < 8 * 12_000,
+        "the budget evicted the oldest rows"
+    );
+    let (count, payload) = paged.history_payload();
+    let (resident_count, resident_payload) = resident.history_payload();
+    assert_eq!((count, &payload), (resident_count, &resident_payload));
+    drop(paged);
+    assert!(
+        store.slots.lock().unwrap().is_empty(),
+        "every stored page is released with its screen"
+    );
+}
+
 #[test]
 fn history_reads_are_counted_and_short_history_stays_in_memory() {
     let store: Arc<dyn ColdStore> = Arc::new(MemoryStore::default());

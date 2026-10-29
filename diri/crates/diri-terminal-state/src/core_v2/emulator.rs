@@ -11,8 +11,9 @@
 //!   fully damaged when rows moved since the last clear (a row was appended,
 //!   history was cleared, the screens were swapped, or the options changed);
 //!   otherwise the dirty rows plus the cursor rows (then and now, as the
-//!   current core adds them) are damaged. Moved rows are not tracked
-//!   ([`Emulator::moved_line_sources`] is `None`).
+//!   current core adds them) are damaged. Rows moved by appends report
+//!   where they were ([`Emulator::moved_line_sources`]), so their
+//!   fingerprints are reused; a dirty or new row reports `CONTENT_CHANGED`.
 //! - **History.** It lives in the primary screen's pages, bounded by rows
 //!   and by the live-byte budget, packed page by page. A packed page that a
 //!   checkpoint annotates is thawed for the edit and packed again before
@@ -27,7 +28,7 @@ use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::{Cell as GridCell, Flags, Hyperlink};
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::keyboard::KeyboardSnapshot;
-use alacritty_terminal::term::{Config, TermMode};
+use alacritty_terminal::term::{CONTENT_CHANGED, Config, TermMode};
 use alacritty_terminal::vte::ansi::{CursorStyle, KeyboardModes};
 use diri_proto::grid::GridCell as WireCell;
 
@@ -72,6 +73,11 @@ pub(crate) struct Screen {
     cursor_line: usize,
     /// Everything is damaged (options changed).
     full_damage: bool,
+    /// Per screen line, where its cells were at the last
+    /// [`Emulator::clear_damage`] (see [`Emulator::moved_line_sources`]);
+    /// valid while `moved_known`.
+    moved: Vec<u32>,
+    moved_known: bool,
 }
 
 /// One row read from a [`Screen`].
@@ -201,6 +207,34 @@ impl Screen {
         if let Some(p) = self.thawed.take() {
             self.core.pages.refreeze(p);
         }
+    }
+
+    /// Where each screen line's cells were at the last clear, so moved rows
+    /// keep their fingerprints (as the current core reports them). Rows only
+    /// move by being appended at the bottom (the screen is the newest rows
+    /// of the page list), so line `y` holds what line `y + appended` held,
+    /// unless a write since marked it dirty or it is new. Unknown across a
+    /// screen swap or an options change.
+    fn track_moved_lines(&mut self) {
+        let now = self.layout();
+        self.moved_known =
+            !self.full_damage && now.swaps == self.layout.swaps && now.total >= self.layout.total;
+        if !self.moved_known {
+            return;
+        }
+        let appended = now.total - self.layout.total;
+        let lines = self.core.lines();
+        let pages = &self.core.pages;
+        self.moved.clear();
+        self.moved.extend((0..lines).map(|y| {
+            let (p, r) = pages.locate(y);
+            let source = y as u64 + appended;
+            if pages.page(p).meta[r].dirty || source >= lines as u64 {
+                CONTENT_CHANGED
+            } else {
+                source as u32
+            }
+        }));
     }
 
     fn layout(&self) -> Layout {
@@ -349,6 +383,8 @@ impl Emulator for Screen {
             layout: Layout::default(),
             cursor_line: 0,
             full_damage: true,
+            moved: Vec::new(),
+            moved_known: false,
         };
         screen.layout = screen.layout();
         screen
@@ -493,6 +529,7 @@ impl Emulator for Screen {
     }
 
     fn collect_damage(&mut self, mut on_line: impl FnMut(usize)) -> bool {
+        self.track_moved_lines();
         if self.full_damage || self.layout() != self.layout {
             return true;
         }
@@ -512,7 +549,7 @@ impl Emulator for Screen {
 
     #[inline]
     fn moved_line_sources(&self) -> Option<&[u32]> {
-        None
+        self.moved_known.then_some(self.moved.as_slice())
     }
 
     fn clear_damage(&mut self) {
@@ -607,30 +644,30 @@ impl Emulator for Screen {
         self.core.release_read_cache();
     }
 
-    /// v2 keeps its packed history in memory; paging it out to the cold
-    /// store is not ported yet, so nothing is written and every byte stays.
+    /// Packed pages older than the newest `keep_rows` history rows move to
+    /// the cold store (#958), as the current core's blocks do.
     #[cfg(feature = "compact-history")]
     fn page_out_history(
         &mut self,
-        _store: &std::sync::Arc<dyn crate::ColdStore>,
-        _keep_rows: usize,
-        _min_bytes: usize,
+        store: &std::sync::Arc<dyn crate::ColdStore>,
+        keep_rows: usize,
+        min_bytes: usize,
     ) -> std::io::Result<crate::PageOut> {
-        Ok(crate::PageOut {
-            payloads: 0,
-            bytes: 0,
-            already_stored: 0,
-            kept_bytes: self.core.history_bytes(),
-        })
+        self.core.release_read_cache();
+        self.core
+            .primary_pages_mut()
+            .page_out(store, keep_rows, min_bytes)
     }
 
     #[cfg(feature = "compact-history")]
     fn history_residency(&self) -> crate::PayloadResidency {
+        let (resident, resident_bytes, stored, stored_bytes) =
+            self.core.primary_pages().residency();
         crate::PayloadResidency {
-            resident: self.core.primary_pages().page_count(),
-            resident_bytes: self.core.history_bytes(),
-            stored: 0,
-            stored_bytes: 0,
+            resident,
+            resident_bytes,
+            stored,
+            stored_bytes,
         }
     }
 

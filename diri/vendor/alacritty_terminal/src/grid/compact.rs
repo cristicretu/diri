@@ -15,7 +15,8 @@ use super::{GridCell, Row};
 use crate::term::cell::ResetDiscriminant;
 
 mod arena;
-mod lz;
+#[doc(hidden)]
+pub mod lz;
 use crate::term::cell::{Cell, CellExtra, Flags, Hyperlink};
 use crate::vte::ansi::{Color, NamedColor, Rgb};
 use arena::{Arena, Slice};

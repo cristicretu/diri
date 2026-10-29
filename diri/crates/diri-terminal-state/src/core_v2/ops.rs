@@ -76,6 +76,7 @@ impl Core {
     }
 
     /// The primary screen's pages, whichever screen is shown.
+    #[cfg_attr(not(feature = "core-v2-screen"), allow(dead_code))]
     pub(super) fn primary_pages_mut(&mut self) -> &mut Pages {
         match &mut self.other {
             Some(other) if self.mode.contains(TermMode::ALT_SCREEN) => &mut other.pages,
@@ -84,6 +85,7 @@ impl Core {
     }
 
     /// How many times the shown screen was swapped with the other one.
+    #[cfg_attr(not(feature = "core-v2-screen"), allow(dead_code))]
     pub(super) fn screen_swaps(&self) -> u64 {
         self.other.as_ref().map_or(0, |other| other.swaps)
     }

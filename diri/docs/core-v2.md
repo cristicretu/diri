@@ -262,11 +262,13 @@ Each PR lands on its own, behind the single `core-v2` cargo feature of `diri-ter
        - Damage is the rows with `RowMeta::dirty` plus the cursor rows; it is full when rows moved (a row appended, history cleared, a screen swap). No content sources: moved rows are hashed again.
        - Checkpoint writes convert back to page cells. A packed history page is thawed for the edit and packed again before rows move or history is bounded.
        - Resize to another size panics ("resize needs reflow, step 5"); the tests that resize are ignored with the switch on.
-       - Rows kept at the budget: on repetitive output (numbered log lines) v2 keeps a third to a half of the current core's rows in 4 MiB, because it stores a byte per ASCII cell where the current core LZ-compresses each row. The four depth tests are gated to the current core; step 6 owns that gap.
+       - Rows kept at the budget: see step 6 (v2 now keeps at least the current core's rows).
 5. **Reflow.** Page rewrap plus deferred cold reflow. Run the resize tests, and the #921 narrowing test on both cores.
-6. **Cold-page packing and the budget.** Prototyped here: it measures 4.7× and 3.7× the Engine (ASCII and Unicode) at budget, and is deterministic under the split tests.
-   - Remaining: close the 1.5% gap in rows kept against today's Engine.
-   - Then wire packing through the `HeadlessScreen` adapter, and pass the regenerated full-history golden (#921).
+6. **History parity** (`core/v2-history`). The rule: v2 keeps at least as many history rows as the current core in the same 4 MiB of live bytes.
+   - **LZ under budget pressure.** Sealed pages are packed as tokens. When history passes its budget, the oldest pages not yet considered are compressed with the current core's LZ codec (`grid::compact::lz`), before any page is dropped. An `LzPolicy` compresses every page while pages shrink by a third, and otherwise probes a 1 KiB sample of every 8th page. Text that barely repeats (the kitten ASCII and Unicode captures) therefore costs about 1% more instructions, not a full LZ pass. What is compressed depends only on the sequence of sealed pages, so the history kept is the same for any read split, and with or without paging.
+   - **Cold paging (#958).** Packed pages older than the newest `keep_rows` history rows move to the `ColdStore` (`Pages::page_out`, through `Emulator::page_out_history`). A stored page counts its full length against the budget, reads load it into the one-page cache, a store failure reads as blank rows, and a page is released with its screen.
+   - **Moved-row fingerprints.** `Emulator::moved_line_sources` reports, for each screen line, the line its cells came from when rows only moved by appends. Dirty and new rows report `CONTENT_CHANGED`. `fingerprints_after_scrolling_match_the_cells` now runs on v2 and checks this is exact.
+   - **Golden on v2.** `vt_workloads` with `core-v2-screen` requires at least the golden's rows and compares the newest of them exactly. `core_v2_bench` compares every row v2 keeps, cell for cell.
 7. **Inline images and checkpoints** on v2, with the existing image and checkpoint tests.
 8. **Switch.** Enable `core-v2` for the Engine and the Remote Helper after a soak on the nightly channel. Holder→Engine vtbench before/after; `PERF.md` gates unchanged or better.
 9. **Remove** the old grid, compact history and the unused vendored selection/search/vi-mode code.

@@ -448,10 +448,19 @@ fn digest(
         put("history_rows_reference", kept.to_string());
     }
     // A run keeps exactly the rows checked: newest-row hashes alone would
-    // pass a run that kept extra, older rows.
+    // pass a run that kept extra, older rows. Core v2 (`core-v2-screen`)
+    // must keep at least as many rows as the current core (the owner's
+    // rule for its history), so it passes with more, and its newest
+    // `checked` rows must match; `core_v2_bench` compares every row it
+    // keeps, cell for cell, with a byte-at-a-time parse.
+    let enough = if cfg!(feature = "core-v2-screen") {
+        kept >= checked
+    } else {
+        kept == checked
+    };
     put(
         "history_rows_checked",
-        if checked_rows.is_none() || kept == checked {
+        if checked_rows.is_none() || enough {
             checked.to_string()
         } else {
             format!("{checked} but {kept} kept")
