@@ -2231,7 +2231,7 @@ impl HeadlessScreen {
     pub fn text_lines(&mut self, options: TextOptions) -> Vec<String> {
         let rows = self.geometry.rows;
         let history = if options.scrollback {
-            self.term.grid().history_size()
+            self.term.history_rows()
         } else {
             0
         };
@@ -2259,26 +2259,28 @@ impl HeadlessScreen {
     fn row_wraps(&self, line: Line) -> bool {
         let cols = self.geometry.cols;
         cols > 0
-            && self.term.grid()[line][Column(cols - 1)]
-                .flags
+            && self
+                .term
+                .cell(line, Column(cols - 1))
+                .cell_flags()
                 .contains(Flags::WRAPLINE)
     }
 
     /// Appends one row's text to `out`; trailing blanks are kept only when
     /// the line continues onto the next row.
     fn push_row_text(&self, line: Line, ansi: bool, keep_trailing: bool, out: &mut String) {
-        let source = &self.term.grid()[line];
+        let row = self.term.row(line);
+        let source = row.cells();
         let cols = self.geometry.cols;
         let spacer = Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
         if !ansi {
             let start = out.len();
-            for column in 0..cols {
-                let cell = &source[Column(column)];
-                if cell.flags.intersects(spacer) {
+            for cell in &source[..cols] {
+                if cell.cell_flags().intersects(spacer) {
                     continue;
                 }
-                out.push(cell.c);
-                if let Some(combining) = cell.zerowidth() {
+                out.push(cell.ch());
+                if let Some(combining) = cell.combining() {
                     out.extend(combining.iter().copied());
                 }
             }
@@ -2294,10 +2296,10 @@ impl HeadlessScreen {
             (0..cols)
                 .rev()
                 .find(|&column| {
-                    let cell = &source[Column(column)];
-                    !cell.flags.intersects(spacer)
-                        && (!(cell.c.is_whitespace() || cell.c == '\0')
-                            || cell.zerowidth().is_some())
+                    let cell = &source[column];
+                    !cell.cell_flags().intersects(spacer)
+                        && (!(cell.ch().is_whitespace() || cell.ch() == '\0')
+                            || cell.combining().is_some())
                 })
                 .map_or(0, |column| column + 1)
         };
@@ -2310,19 +2312,18 @@ impl HeadlessScreen {
         };
         let plain = visual(&GridCell::BLANK);
         let mut current = plain;
-        for column in 0..end {
-            let cell = &source[Column(column)];
-            if cell.flags.intersects(spacer) {
+        for cell in &source[..end] {
+            if cell.cell_flags().intersects(spacer) {
                 continue;
             }
             let mut wire = wire_cell(cell);
             // The wire folds BOLD and DIM together (`DIM_BOLD` holds both
             // bits); a reader gets the attributes the program set.
             let mut bits = wire.style.bits() & !(TermStyle::BOLD.bits() | TermStyle::DIM.bits());
-            if cell.flags.contains(Flags::BOLD) {
+            if cell.cell_flags().contains(Flags::BOLD) {
                 bits |= TermStyle::BOLD.bits();
             }
-            if cell.flags.contains(Flags::DIM) {
+            if cell.cell_flags().contains(Flags::DIM) {
                 bits |= TermStyle::DIM.bits();
             }
             wire.style = TermStyle::from_bits_retain(bits);
@@ -2331,8 +2332,8 @@ impl HeadlessScreen {
                 out.push_str(&sgr(&wire, None));
                 current = style;
             }
-            out.push(if cell.c == '\0' { ' ' } else { cell.c });
-            if let Some(combining) = cell.zerowidth() {
+            out.push(if cell.ch() == '\0' { ' ' } else { cell.ch() });
+            if let Some(combining) = cell.combining() {
                 out.extend(combining.iter().copied());
             }
         }

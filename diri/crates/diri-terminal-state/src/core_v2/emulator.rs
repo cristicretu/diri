@@ -607,6 +607,33 @@ impl Emulator for Screen {
         self.core.release_read_cache();
     }
 
+    /// v2 keeps its packed history in memory; paging it out to the cold
+    /// store is not ported yet, so nothing is written and every byte stays.
+    #[cfg(feature = "compact-history")]
+    fn page_out_history(
+        &mut self,
+        _store: &std::sync::Arc<dyn crate::ColdStore>,
+        _keep_rows: usize,
+        _min_bytes: usize,
+    ) -> std::io::Result<crate::PageOut> {
+        Ok(crate::PageOut {
+            payloads: 0,
+            bytes: 0,
+            already_stored: 0,
+            kept_bytes: self.core.history_bytes(),
+        })
+    }
+
+    #[cfg(feature = "compact-history")]
+    fn history_residency(&self) -> crate::PayloadResidency {
+        crate::PayloadResidency {
+            resident: self.core.primary_pages().page_count(),
+            resident_bytes: self.core.history_bytes(),
+            stored: 0,
+            stored_bytes: 0,
+        }
+    }
+
     fn kitty_keyboard_enabled(&self) -> bool {
         self.core.events.config.kitty_keyboard
     }
