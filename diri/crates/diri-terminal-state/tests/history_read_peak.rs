@@ -37,6 +37,7 @@ fn full_history_screen() -> HeadlessScreen {
 }
 
 #[test]
+#[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
 fn full_history_reads_after_resizes_stay_small() {
     let mut screen = full_history_screen();
     for (step, cols) in [97usize, 171, 128, 80, 145].into_iter().enumerate() {

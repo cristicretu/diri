@@ -17,6 +17,10 @@ bench-verify = ["alacritty_terminal/observe"]
 # Prototype of the page-based terminal core (docs/core-v2.md). Off by
 # default and not used by the Engine or the Remote Helper.
 core-v2 = []
+# Migration step 4c (docs/core-v2.md): `HeadlessScreen` runs on core v2
+# instead of the current core. Off by default and enabled by nothing; resize
+# refuses until reflow lands (step 5).
+core-v2-screen = ["core-v2"]
 
 [dependencies]
 alacritty_terminal.workspace = true
