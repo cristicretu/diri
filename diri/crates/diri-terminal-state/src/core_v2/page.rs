@@ -152,7 +152,7 @@ impl Clusters {
     /// Empties the arena for the next page, keeping a small one's
     /// capacity (a page of marks takes a few KiB) and freeing a large one.
     fn reuse(&mut self) {
-        const KEEP: usize = 16 << 10;
+        const KEEP: usize = 256 << 10;
         if self.spans.capacity() * 8 + self.chars.capacity() * 4 > KEEP {
             *self = Clusters::default();
         } else {
@@ -629,11 +629,9 @@ unsafe fn mixed_codes16(cps: &[u32; 16], n: usize, utf8: *const u8, out: *mut u8
             vqtbl4q_u8(first, high),
             vqtbl3q_u8(second, vsubq_u8(high, vdupq_n_u8(64))),
         );
-        let mut lanes = [0u8; 64];
-        vst3q_u8(
-            lanes.as_mut_ptr(),
-            uint8x16x3_t(vbslq_u8(cjk, lead, src.0), vbslq_u8(cjk, low, src.1), src.2),
-        );
+        // The lanes' three bytes stay planar in registers; the shuffles
+        // index the 48-byte table they form (no store and reload).
+        let planes = uint8x16x3_t(vbslq_u8(cjk, lead, src.0), vbslq_u8(cjk, low, src.1), src.2);
         // One bit per lane: CJK.
         let bits = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(
             cjk,
@@ -644,10 +642,9 @@ unsafe fn mixed_codes16(cps: &[u32; 16], n: usize, utf8: *const u8, out: *mut u8
             let mask = (0..4).fold(0usize, |m, j| {
                 m | (((bits >> (16 * g + 4 * j)) & 1) as usize) << j
             });
-            let (shuffle, kept) = &COMPACT4[mask];
+            let (shuffle, kept) = &COMPACT4[g][mask];
             let taken = (n - 4 * g).min(4);
-            let group = vld1q_u8(lanes.as_ptr().add(12 * g));
-            vst1q_u8(out.add(w), vqtbl1q_u8(group, vld1q_u8(shuffle.as_ptr())));
+            vst1q_u8(out.add(w), vqtbl3q_u8(planes, vld1q_u8(shuffle.as_ptr())));
             // Only the lanes below `n` count.
             w += if taken == 4 {
                 *kept as usize
@@ -661,28 +658,34 @@ unsafe fn mixed_codes16(cps: &[u32; 16], n: usize, utf8: *const u8, out: *mut u8
     }
 }
 
-/// For each 4-bit mask of CJK lanes among four three-byte lane groups:
-/// the shuffle that keeps bytes 0 and 1 of every lane and byte 2 of the
-/// others, in order, and how many bytes it keeps.
+/// For each group `g` of four lanes and each 4-bit mask of its CJK lanes:
+/// the shuffle over the three 16-lane byte planes (plane `c` of lane `l`
+/// at `16 * c + l`) that keeps bytes 0 and 1 of every lane and byte 2 of
+/// the others, in lane order, and how many bytes it keeps.
 #[cfg(target_arch = "aarch64")]
-const COMPACT4: [([u8; 16], u8); 16] = {
-    let mut t = [([0xFFu8; 16], 0u8); 16];
-    let mut mask = 0;
-    while mask < 16 {
-        let mut k = 0;
-        let mut j = 0;
-        while j < 4 {
-            t[mask].0[k] = 3 * j as u8;
-            t[mask].0[k + 1] = 3 * j as u8 + 1;
-            k += 2;
-            if mask & (1 << j) == 0 {
-                t[mask].0[k] = 3 * j as u8 + 2;
-                k += 1;
+const COMPACT4: [[([u8; 16], u8); 16]; 4] = {
+    let mut t = [[([0xFFu8; 16], 0u8); 16]; 4];
+    let mut g = 0;
+    while g < 4 {
+        let mut mask = 0;
+        while mask < 16 {
+            let mut k = 0;
+            let mut j = 0;
+            while j < 4 {
+                let lane = (4 * g + j) as u8;
+                t[g][mask].0[k] = lane;
+                t[g][mask].0[k + 1] = 16 + lane;
+                k += 2;
+                if mask & (1 << j) == 0 {
+                    t[g][mask].0[k] = 32 + lane;
+                    k += 1;
+                }
+                j += 1;
             }
-            j += 1;
+            t[g][mask].1 = k as u8;
+            mask += 1;
         }
-        t[mask].1 = k as u8;
-        mask += 1;
+        g += 1;
     }
     t
 };
@@ -803,6 +806,38 @@ fn push_utf8(out: &mut Vec<u8>, cp: u64) {
     let c = char::from_u32(cp as u32).expect("cells hold scalars");
     let mut buf = [0u8; 4];
     out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+}
+
+/// One extra codepoint of a cluster in general tokens: the combining
+/// diacritics U+0300..U+036F (the common marks) as one byte 0x10..0x7F,
+/// anything else as UTF-8 (whose first byte is never below 0x80 for the
+/// non-ASCII characters clusters hold), and an ASCII character, which no
+/// cluster should hold, as 0x01 and its byte so packing stays lossless.
+#[inline]
+fn push_cluster_char(out: &mut Vec<u8>, c: char) {
+    let cp = c as u32;
+    if (0x300..0x370).contains(&cp) {
+        out.push((cp - 0x300 + 0x10) as u8);
+    } else if cp < 0x80 {
+        out.extend_from_slice(&[0x01, cp as u8]);
+    } else {
+        push_utf8(out, cp as u64);
+    }
+}
+
+/// Reads one [`push_cluster_char`] codepoint.
+#[inline]
+fn read_cluster_char(data: &[u8], at: &mut usize) -> char {
+    let byte = data[*at];
+    if (0x10..0x80).contains(&byte) {
+        *at += 1;
+        return char::from_u32(0x300 + (byte - 0x10) as u32).expect("a mark");
+    }
+    if byte == 0x01 {
+        *at += 2;
+        return data[*at - 1] as char;
+    }
+    char::from_u32(read_utf8(data, at) as u32).expect("char")
 }
 
 fn read_utf8(data: &[u8], at: &mut usize) -> u64 {
@@ -1626,7 +1661,7 @@ impl Page {
                     out.push(T_CLUSTER);
                     out.push(extra.len() as u8);
                     for &c in extra {
-                        push_utf8(out, c as u64);
+                        push_cluster_char(out, c);
                     }
                 }
                 let cp = cell & CP;
@@ -1844,9 +1879,7 @@ impl Page {
                         at += 1;
                         chars.clear();
                         for _ in 0..n {
-                            chars.push(
-                                char::from_u32(read_utf8(data, &mut at) as u32).expect("char"),
-                            );
+                            chars.push(read_cluster_char(data, &mut at));
                         }
                         pending = Some(clusters.add(&chars));
                         continue;

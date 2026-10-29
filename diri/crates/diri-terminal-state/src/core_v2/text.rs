@@ -12,11 +12,12 @@
 //!
 //! On aarch64, runs of three-byte characters (CJK, kana, Hangul) are
 //! classified sixteen at a time with NEON: a structure load splits lead and
-//! continuation bytes, and two 2048-bit maps over 32-codepoint blocks say
-//! which codepoints are two-column, non-joining characters: one for all but
-//! the block's first codepoint, one for that first codepoint. So CJK
+//! continuation bytes, and a 2048-bit map over 32-codepoint blocks says
+//! which blocks hold only two-column, non-joining characters, the block's
+//! first codepoint aside; the few blocks whose first codepoint alone is
+//! not such a character (U+3040, U+FF00) are listed and compared. So CJK
 //! punctuation (U+3001.., U+FF01..) stays in the vector runs while the
-//! marks and holes next to it do not. Other targets use the same maps one
+//! marks and holes next to it do not. Other targets use the same map one
 //! character at a time.
 
 use std::sync::OnceLock;
@@ -27,11 +28,16 @@ pub struct Tables {
     /// Two bits per BMP codepoint.
     cp2: Box<[u8; 0x4000]>,
     /// One bit per 32-codepoint BMP block: codepoints 1..32 of the block
-    /// are all class 2.
-    wide_rest: [u8; 256],
-    /// One bit per 32-codepoint BMP block: its first codepoint is class 2.
-    wide_first: [u8; 256],
+    /// are all class 2, and so is its first unless it is in `holes`.
+    wide: [u8; 256],
+    /// UTF-8 of the first codepoints of `wide` blocks that are not class 2
+    /// (unused entries are zero, which no three-byte character matches).
+    holes: [[u8; 3]; HOLES],
 }
+
+/// Blocks a `wide` block's first codepoint may be a hole in; any further
+/// such block is left out of `wide` (its characters take the scalar path).
+const HOLES: usize = 2;
 
 pub fn tables() -> &'static Tables {
     static TABLES: OnceLock<Tables> = OnceLock::new();
@@ -58,8 +64,9 @@ fn class_of(cp: u32) -> u8 {
 
 fn build() -> Tables {
     let mut cp2 = Box::new([0u8; 0x4000]);
-    let mut wide_rest = [0u8; 256];
-    let mut wide_first = [0u8; 256];
+    let mut wide = [0u8; 256];
+    let mut holes = [[0u8; 3]; HOLES];
+    let mut hole_count = 0;
     for block in 0..2048u32 {
         let mut rest = true;
         for cp in block * 32..block * 32 + 32 {
@@ -74,18 +81,22 @@ fn build() -> Tables {
         // pass the vector path's check (which does not look for them).
         let invalid = block * 32 < 0x800 || (0xD800..0xE000).contains(&(block * 32));
         let bit = 1 << (block & 7);
-        if rest && !invalid {
-            wide_rest[(block >> 3) as usize] |= bit;
+        if !rest || invalid {
+            continue;
         }
-        if first && !invalid {
-            wide_first[(block >> 3) as usize] |= bit;
+        if !first {
+            if hole_count == HOLES {
+                continue;
+            }
+            let c = char::from_u32(block * 32).expect("a scalar");
+            let mut utf8 = [0u8; 4];
+            c.encode_utf8(&mut utf8);
+            holes[hole_count].copy_from_slice(&utf8[..3]);
+            hole_count += 1;
         }
+        wide[(block >> 3) as usize] |= bit;
     }
-    Tables {
-        cp2,
-        wide_rest,
-        wide_first,
-    }
+    Tables { cp2, wide, holes }
 }
 
 impl Tables {
@@ -124,12 +135,13 @@ impl Tables {
     #[inline(always)]
     pub fn vector_accepts(&self, cp: u32) -> bool {
         let block = (cp >> 5) as usize;
-        let map = if cp & 31 == 0 {
-            &self.wide_first
-        } else {
-            &self.wide_rest
-        };
-        (0x800..0x1_0000).contains(&cp) && map[block >> 3] & (1 << (block & 7)) != 0
+        if !(0x800..0x1_0000).contains(&cp) || self.wide[block >> 3] & (1 << (block & 7)) == 0 {
+            return false;
+        }
+        let c = char::from_u32(cp).expect("not a surrogate: their blocks are never wide");
+        let mut utf8 = [0u8; 4];
+        c.encode_utf8(&mut utf8);
+        !self.holes.iter().any(|hole| hole[..] == utf8[..3])
     }
 
     #[inline(always)]
@@ -159,7 +171,7 @@ impl Tables {
                     vceqq_u8(vandq_u8(b2, vdupq_n_u8(0xC0)), vdupq_n_u8(0x80)),
                 ),
             );
-            // Block = cp >> 5; its byte in a map is cp >> 8 =
+            // Block = cp >> 5; its byte in the map is cp >> 8 =
             // (b0 & 0xF) << 4 | (b1 & 0x3F) >> 2 (0..256, four 64-byte
             // lookups, an index past a table reading as zero), its bit
             // (cp >> 5) & 7 = (b1 & 3) << 1 | (b2 >> 5) & 1.
@@ -167,31 +179,39 @@ impl Tables {
                 vshlq_n_u8::<4>(vandq_u8(b0, vdupq_n_u8(0x0F))),
                 vshrq_n_u8::<2>(vandq_u8(b1, vdupq_n_u8(0x3F))),
             );
-            let lookup = |map: &[u8; 256]| {
-                let t = map.as_ptr();
-                let part = |at: usize| {
-                    uint8x16x4_t(
-                        vld1q_u8(t.add(at)),
-                        vld1q_u8(t.add(at + 16)),
-                        vld1q_u8(t.add(at + 32)),
-                        vld1q_u8(t.add(at + 48)),
-                    )
-                };
-                vorrq_u8(
-                    vorrq_u8(
-                        vqtbl4q_u8(part(0), index),
-                        vqtbl4q_u8(part(64), vsubq_u8(index, vdupq_n_u8(64))),
-                    ),
-                    vorrq_u8(
-                        vqtbl4q_u8(part(128), vsubq_u8(index, vdupq_n_u8(128))),
-                        vqtbl4q_u8(part(192), vsubq_u8(index, vdupq_n_u8(192))),
-                    ),
+            let t = self.wide.as_ptr();
+            let part = |at: usize| {
+                uint8x16x4_t(
+                    vld1q_u8(t.add(at)),
+                    vld1q_u8(t.add(at + 16)),
+                    vld1q_u8(t.add(at + 32)),
+                    vld1q_u8(t.add(at + 48)),
                 )
             };
-            // The first codepoint of a block (b2 & 0x1F == 0) reads the
-            // other map.
-            let first = vceqq_u8(vandq_u8(b2, vdupq_n_u8(0x1F)), vdupq_n_u8(0));
-            let map = vbslq_u8(first, lookup(&self.wide_first), lookup(&self.wide_rest));
+            let map = vorrq_u8(
+                vorrq_u8(
+                    vqtbl4q_u8(part(0), index),
+                    vqtbl4q_u8(part(64), vsubq_u8(index, vdupq_n_u8(64))),
+                ),
+                vorrq_u8(
+                    vqtbl4q_u8(part(128), vsubq_u8(index, vdupq_n_u8(128))),
+                    vqtbl4q_u8(part(192), vsubq_u8(index, vdupq_n_u8(192))),
+                ),
+            );
+            // Lanes that are a listed hole.
+            let mut hole = vdupq_n_u8(0);
+            for h in &self.holes {
+                hole = vorrq_u8(
+                    hole,
+                    vandq_u8(
+                        vceqq_u8(b0, vdupq_n_u8(h[0])),
+                        vandq_u8(
+                            vceqq_u8(b1, vdupq_n_u8(h[1])),
+                            vceqq_u8(b2, vdupq_n_u8(h[2])),
+                        ),
+                    ),
+                );
+            }
             let bit = vshlq_u8(
                 vdupq_n_u8(1),
                 vreinterpretq_s8_u8(vorrq_u8(
@@ -199,7 +219,7 @@ impl Tables {
                     vandq_u8(vshrq_n_u8::<5>(b2), vdupq_n_u8(1)),
                 )),
             );
-            let ok = vandq_u8(lead, vtstq_u8(map, bit));
+            let ok = vbicq_u8(vandq_u8(lead, vtstq_u8(map, bit)), hole);
             // Four mask bits per lane; count the leading accepted lanes.
             let mask = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(
                 vreinterpretq_u16_u8(ok),
