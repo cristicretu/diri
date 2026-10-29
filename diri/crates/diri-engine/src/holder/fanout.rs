@@ -67,6 +67,7 @@ pub(super) enum Pushed {
 }
 
 /// What a writer waiting with a deadline got.
+#[cfg(any(unix, test))]
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Popped {
     Frame(Frame),
@@ -220,6 +221,7 @@ impl FrameQueue {
     }
 
     /// Takes the next frame, waiting at most `idle` for one to arrive.
+    #[cfg(any(unix, test))]
     pub(super) fn pop_within(&self, idle: Duration) -> Popped {
         let mut state = self.state.lock().expect("frame queue");
         let deadline = Instant::now() + idle;
@@ -280,6 +282,7 @@ impl FrameQueue {
     /// Ends the writer's turn if nothing is waiting: returns true, and the
     /// next push asks for a new writer. Returns false if a frame or a close
     /// arrived meanwhile, so the writer must carry on.
+    #[cfg(any(unix, test))]
     pub(super) fn park_writer(&self) -> bool {
         let mut state = self.state.lock().expect("frame queue");
         if state.frames.is_empty() && !state.closed {
@@ -292,6 +295,7 @@ impl FrameQueue {
 
     /// Records that a writer was started for this queue other than by a push,
     /// so the next push does not ask for another.
+    #[cfg(any(unix, test))]
     pub(super) fn claim_writer(&self) {
         self.state.lock().expect("frame queue").writer_parked = false;
     }
