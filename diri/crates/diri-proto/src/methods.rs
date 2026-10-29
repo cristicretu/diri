@@ -204,6 +204,7 @@ impl Method {
         Self::SESSION_CLEAR_SCROLLBACK,
         Self::SESSION_LIST_DIR,
         Self::SESSION_CAPTURE_FIND,
+        Self::SESSION_FIND_HISTORY,
         Self::SESSION_READ_SCROLLBACK,
         Self::SESSION_READ_SCROLLBACK_CELLS,
         Self::SESSION_READ_DIFF,

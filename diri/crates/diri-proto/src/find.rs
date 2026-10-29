@@ -99,6 +99,7 @@ fn chars_equal(haystack: &[char], needle: &[char], case_sensitive: bool) -> bool
 /// resume a search, or jump to a match, after the terminal has moved on.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FindHistoryParams {
     #[serde(rename = "sessionID")]
     pub session_id: SessionId,
@@ -123,6 +124,7 @@ pub type FindHistoryMatch = [i64; 3];
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FindHistoryResult {
     /// Stable row of absolute row 0 when the page ended.
     pub history_origin: i64,
