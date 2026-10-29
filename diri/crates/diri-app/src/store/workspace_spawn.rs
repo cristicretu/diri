@@ -95,24 +95,6 @@ pub(super) struct WorkspaceSpawns {
 }
 
 impl SessionStore {
-    #[cfg(test)]
-    pub(crate) fn seed_workspace_spawn_for_test(
-        &mut self,
-        target: WorkspaceSpawnTarget,
-        state: WorkspaceSpawnState,
-    ) -> u64 {
-        self.workspace_spawns.next += 1;
-        let id = self.workspace_spawns.next;
-        self.workspace_spawns
-            .receipts
-            .push_back(WorkspaceSpawnReceipt {
-                id,
-                target: target.into(),
-                state,
-            });
-        id
-    }
-
     pub fn workspace_spawn_source(&self, target: &WorkspaceSpawnTarget) -> Option<&SessionRecord> {
         let workspace = self
             .workspace_catalog()

@@ -36,9 +36,12 @@ use core::str;
 use arrayvec::ArrayVec;
 
 mod params;
+pub mod scan;
 
 #[cfg(feature = "ansi")]
 pub mod ansi;
+#[cfg(feature = "observe")]
+pub mod observe;
 pub use params::{Params, ParamsIter};
 
 const MAX_INTERMEDIATES: usize = 2;
@@ -73,11 +76,17 @@ pub struct Parser<const OSC_RAW_BUF_SIZE: usize = MAX_OSC_RAW> {
     /// a truncated title, hyperlink or clipboard payload is worse than none.
     #[cfg(feature = "std")]
     osc_overflowed: bool,
+    /// Once the current OSC nears `MAX_OSC_RAW_STD`: how many body bytes
+    /// (`;` excluded) and separators `osc_raw` holds. See `osc_raw_put`.
+    #[cfg(feature = "std")]
+    osc_counts: Option<(usize, usize)>,
     osc_params: [(usize, usize); MAX_OSC_PARAMS],
     osc_num_params: usize,
     ignoring: bool,
     partial_utf8: [u8; 4],
     partial_utf8_len: usize,
+    /// Print ground-state text one character at a time (reference mode).
+    per_character: bool,
 }
 
 impl Parser {
@@ -88,6 +97,15 @@ impl Parser {
 }
 
 impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
+    /// DIRI PATCH: hands ground-state text to [`Perform::print`] one
+    /// character at a time instead of as runs. Parsing is otherwise
+    /// identical; a reference for checking the run paths against the
+    /// per-character path.
+    #[doc(hidden)]
+    pub fn set_per_character_print(&mut self, per_character: bool) {
+        self.per_character = per_character;
+    }
+
     /// Create a new Parser with a custom size for the Operating System Command
     /// buffer.
     ///
@@ -128,7 +146,11 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         while i != bytes.len() {
             match self.state {
                 State::Ground => i += self.advance_ground(performer, &bytes[i..]),
-                State::CsiParam => i += self.advance_csi_params(performer, &bytes[i..]),
+                State::OscString
+                | State::SosPmApcString
+                | State::DcsIgnore
+                | State::DcsPassthrough => i += self.advance_string(performer, &bytes[i..], None),
+                State::CsiEntry | State::CsiParam => i += self.advance_csi(performer, &bytes[i..]),
                 _ => {
                     // Inlining it results in worse codegen.
                     let byte = bytes[i];
@@ -154,6 +176,20 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         performer: &mut P,
         bytes: &[u8],
     ) -> usize {
+        self.advance_until_terminated_indexed(performer, bytes, None)
+    }
+
+    /// Diri patch: [`Self::advance_until_terminated`] with the read's
+    /// [`scan::C0Index`], so string bodies end where the index says instead
+    /// of being scanned again. The index must describe `bytes` exactly.
+    #[inline]
+    #[must_use = "Returned value should be used to processs the remaining bytes"]
+    pub fn advance_until_terminated_indexed<P: Perform>(
+        &mut self,
+        performer: &mut P,
+        bytes: &[u8],
+        index: Option<scan::C0Index<'_>>,
+    ) -> usize {
         let mut i = 0;
 
         // Handle partial codepoints from previous calls to `advance`.
@@ -164,7 +200,14 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         while i != bytes.len() && !performer.terminated() {
             match self.state {
                 State::Ground => i += self.advance_ground(performer, &bytes[i..]),
-                State::CsiParam => i += self.advance_csi_params(performer, &bytes[i..]),
+                State::OscString
+                | State::SosPmApcString
+                | State::DcsIgnore
+                | State::DcsPassthrough => {
+                    let index = index.map(|index| index.offset(i));
+                    i += self.advance_string(performer, &bytes[i..], index)
+                },
+                State::CsiEntry | State::CsiParam => i += self.advance_csi(performer, &bytes[i..]),
                 _ => {
                     // Inlining it results in worse codegen.
                     let byte = bytes[i];
@@ -177,29 +220,99 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         i
     }
 
-    /// DIRI PATCH: the parameter bytes of a CSI sequence (digits, `;` and
-    /// `:`) in one loop, then the byte after them as `change_state` would.
-    /// Each byte takes the action `advance_csi_param` takes for it; none of
-    /// them dispatches, so nothing between them can end the parse early.
+    /// Diri patch: advance through a string body (OSC, SOS/PM/APC, DCS) a
+    /// run at a time.
     ///
-    /// Returns the number of bytes consumed (at least one).
-    #[inline(always)]
-    fn advance_csi_params<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
-        let mut consumed = 0;
-        for &byte in bytes {
+    /// The bytes a string state treats alike (stored, passed to `put` or
+    /// ignored) are found in bulk and handled as one slice; the first byte
+    /// that does anything else goes through the per-byte state machine as
+    /// before. The result is identical to feeding every byte to
+    /// `change_state`. Always consumes at least one byte.
+    #[inline]
+    fn advance_string<P: Perform>(
+        &mut self,
+        performer: &mut P,
+        bytes: &[u8],
+        index: Option<scan::C0Index<'_>>,
+    ) -> usize {
+        let run = match self.state {
+            // Everything but CAN, SUB and ESC is ignored (`anywhere`).
+            State::SosPmApcString | State::DcsIgnore => match index {
+                Some(index) => index.next(bytes, 0, &[0x18, 0x1A, 0x1B]),
+                None => memchr::memchr3(0x18, 0x1A, 0x1B, bytes).unwrap_or(bytes.len()),
+            },
+            // C0 controls are ignored and `;` splits parameters; every other
+            // byte, 0x7F and 0x80..=0xFF included, is stored.
+            State::OscString => {
+                // The body up to the first C0 byte (a terminator, an abort or
+                // an ignored control) is stored as one run.
+                let run = match index {
+                    Some(index) => index.next(bytes, 0, &[]),
+                    None => {
+                        scan::run(bytes, scan::Stops { below: 0x20, above: 0xFF, bytes: [0; 4] })
+                    },
+                };
+                // A whole OSC in this read, nothing stored before it: it is
+                // dispatched from the read itself, with no copy.
+                #[cfg(feature = "std")]
+                {
+                    let end = bytes.get(run).copied().unwrap_or(0x20);
+                    if scan::STRING_ENDS.contains(&end)
+                        && self.osc_raw.is_empty()
+                        && !self.osc_overflowed
+                        && run <= MAX_OSC_RAW_STD
+                    {
+                        self.osc_finish_in_place(performer, &bytes[..run], end);
+                        return run + 1;
+                    }
+                }
+                if run != 0 {
+                    self.action_osc_put_slice(&bytes[..run]);
+                }
+                run
+            },
+            // `put` takes C0 controls (but CAN, SUB and ESC) and 0x20..=0x7E.
+            State::DcsPassthrough => {
+                let stops = scan::Stops { below: 0, above: 0x7E, bytes: [0x18, 0x1A, 0x1B, 0x1B] };
+                let run = scan::run(bytes, stops);
+                if run != 0 {
+                    performer.put_slice(&bytes[..run]);
+                }
+                run
+            },
+            _ => 0,
+        };
+        if run != 0 {
+            return run;
+        }
+        self.change_state(performer, bytes[0]);
+        1
+    }
+
+    /// Diri patch: CSI parameters in a tight loop.
+    ///
+    /// Digits, `;` and `:` only update the parameter list, so they are taken
+    /// here without a round trip through the state dispatch. The first other
+    /// byte goes through `change_state` as before, and the loop returns after
+    /// it: only such a byte can reach the performer, and
+    /// `advance_until_terminated` checks for termination after each one.
+    /// Always consumes at least one byte.
+    #[inline]
+    fn advance_csi<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
+        for (index, &byte) in bytes.iter().enumerate() {
             match byte {
                 0x30..=0x39 => self.action_paramnext(byte),
                 0x3A => self.action_subparam(),
                 0x3B => self.action_param(),
-                _ => break,
+                _ => {
+                    self.change_state(performer, byte);
+                    return index + 1;
+                },
             }
-            consumed += 1;
+            // From CSI entry each of these leads to CSI param, as there.
+            self.state = State::CsiParam;
         }
-        if consumed == 0 {
-            self.change_state(performer, bytes[0]);
-            consumed = 1;
-        }
-        consumed
+        bytes.len()
     }
 
     #[inline(always)]
@@ -413,6 +526,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 #[cfg(feature = "std")]
                 {
                     self.osc_overflowed = false;
+                    self.osc_counts = None;
                 }
                 self.state = State::OscString
             },
@@ -469,14 +583,11 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                     if self.osc_raw.is_full() {
                         return;
                     }
+                    self.action_osc_put_param()
                 }
+                // With `std` the separator is stored and split at the end.
                 #[cfg(feature = "std")]
-                {
-                    if self.osc_overflowed {
-                        return;
-                    }
-                }
-                self.action_osc_put_param()
+                self.action_osc_put_slice(b";");
             },
             _ => self.action_osc_put(byte),
         }
@@ -565,6 +676,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     }
 
     /// Add OSC param separator.
+    #[cfg(not(feature = "std"))]
     #[inline]
     fn action_osc_put_param(&mut self) {
         let idx = self.osc_raw.len();
@@ -595,33 +707,143 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             if self.osc_raw.is_full() {
                 return;
             }
+            self.osc_raw.push(byte);
+        }
+        #[cfg(feature = "std")]
+        self.action_osc_put_slice(&[byte]);
+    }
+
+    /// Diri patch: `action_osc_put` for a run of bytes.
+    ///
+    /// With `std`, `osc_raw` keeps the body as it arrived, separators
+    /// included, so a run is one copy; `osc_end` splits it. The result is the
+    /// same as upstream's per-byte storage, which leaves `;` out:
+    ///
+    /// - The limit counts body bytes without separators. The byte that
+    ///   arrives with `MAX_OSC_RAW_STD` of them stored overflows the OSC.
+    /// - Only the first `MAX_OSC_PARAMS` separators can end a parameter;
+    ///   later ones are dropped, so a body of separators cannot grow the
+    ///   buffer past the limit plus `MAX_OSC_PARAMS`.
+    #[inline]
+    fn action_osc_put_slice(&mut self, run: &[u8]) {
+        #[cfg(not(feature = "std"))]
+        {
+            for &byte in run {
+                if byte == b';' {
+                    if !self.osc_raw.is_full() {
+                        self.action_osc_put_param();
+                    }
+                } else {
+                    self.action_osc_put(byte);
+                }
+            }
         }
         #[cfg(feature = "std")]
         {
             if self.osc_overflowed {
                 return;
             }
-            if self.osc_raw.len() >= MAX_OSC_RAW_STD {
-                // An unterminated `ESC ]` would otherwise buffer everything
-                // the program prints until a terminator happens to arrive.
-                self.osc_overflowed = true;
-                self.osc_raw = Vec::new();
-                self.osc_num_params = 0;
+            // Below the limit even counting separators: nothing to decide.
+            if self.osc_counts.is_none() && self.osc_raw.len() + run.len() <= MAX_OSC_RAW_STD {
+                self.osc_raw.extend_from_slice(run);
                 return;
             }
+            let (mut stored, mut separators) = self.osc_counts.unwrap_or_else(|| {
+                let separators = memchr::memchr_iter(b';', &self.osc_raw).count();
+                (self.osc_raw.len() - separators, separators)
+            });
+            for &byte in run {
+                if byte == b';' {
+                    if separators < MAX_OSC_PARAMS {
+                        self.osc_raw.push(byte);
+                        separators += 1;
+                    }
+                    continue;
+                }
+                if stored >= MAX_OSC_RAW_STD {
+                    // An unterminated `ESC ]` would otherwise buffer
+                    // everything the program prints until a terminator
+                    // happens to arrive.
+                    self.osc_overflowed = true;
+                    self.osc_raw = Vec::new();
+                    self.osc_counts = None;
+                    self.osc_num_params = 0;
+                    return;
+                }
+                self.osc_raw.push(byte);
+                stored += 1;
+            }
+            self.osc_counts = Some((stored, separators));
         }
-        self.osc_raw.push(byte);
+    }
+
+    /// Diri patch: `osc_end` and the terminator's transition for an OSC whose
+    /// whole body is `body`, in the caller's buffer, with nothing in
+    /// `osc_raw`. Dispatches what `osc_end` would after storing `body`.
+    #[cfg(feature = "std")]
+    fn osc_finish_in_place<P: Perform>(&mut self, performer: &mut P, body: &[u8], byte: u8) {
+        self.osc_counts = None;
+        let mut params: [&[u8]; MAX_OSC_PARAMS] = [&[]; MAX_OSC_PARAMS];
+        let mut count = 0;
+        let mut start = 0;
+        for separator in memchr::memchr_iter(b';', body) {
+            if count == MAX_OSC_PARAMS {
+                break;
+            }
+            params[count] = &body[start..separator];
+            count += 1;
+            start = separator + 1;
+        }
+        if count < MAX_OSC_PARAMS {
+            params[count] = &body[start..];
+            count += 1;
+        }
+        #[cfg(feature = "observe")]
+        observe::record(&params[..count], byte == 0x07);
+        performer.osc_dispatch(&params[..count], byte == 0x07);
+        self.osc_num_params = 0;
+        // As `advance_osc_string` continues after `osc_end`.
+        match byte {
+            0x07 => self.state = State::Ground,
+            0x18 | 0x1A => {
+                performer.execute(byte);
+                self.state = State::Ground
+            },
+            _ => {
+                self.reset_params();
+                self.state = State::Escape
+            },
+        }
     }
 
     fn osc_end<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         #[cfg(feature = "std")]
         {
+            self.osc_counts = None;
             if self.osc_overflowed {
                 self.osc_overflowed = false;
                 self.osc_num_params = 0;
                 return;
             }
+            // Parameters end at the first `MAX_OSC_PARAMS` separators; with
+            // fewer, the last runs to the end of the body.
+            let mut start = 0;
+            let mut count = 0;
+            for separator in memchr::memchr_iter(b';', &self.osc_raw) {
+                if count == MAX_OSC_PARAMS {
+                    break;
+                }
+                self.osc_params[count] = (start, separator);
+                count += 1;
+                start = separator + 1;
+            }
+            if count < MAX_OSC_PARAMS {
+                self.osc_params[count] = (start, self.osc_raw.len());
+                count += 1;
+            }
+            self.osc_num_params = count;
         }
+        #[cfg(not(feature = "std"))]
         self.action_osc_put_param();
         self.osc_dispatch(performer, byte);
         self.osc_raw.clear();
@@ -660,6 +882,8 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         unsafe {
             let num_params = self.osc_num_params;
             let params = &slices[..num_params] as *const [MaybeUninit<&[u8]>] as *const [&[u8]];
+            #[cfg(feature = "observe")]
+            observe::record(&*params, byte == 0x07);
             performer.osc_dispatch(&*params, byte == 0x07);
         }
     }
@@ -703,7 +927,12 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             if is_printable_ascii(byte) {
                 let end = printable_ascii_end(text, index + 1);
                 // SAFETY: printable ASCII is UTF-8.
-                performer.print_ascii(unsafe { str::from_utf8_unchecked(&text[index..end]) });
+                let run = unsafe { str::from_utf8_unchecked(&text[index..end]) };
+                if self.per_character {
+                    run.chars().for_each(|c| performer.print(c));
+                } else {
+                    performer.print_ascii(run);
+                }
                 index = end;
                 continue;
             }
@@ -718,7 +947,29 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 continue;
             }
 
-            // A stretch of non-ASCII bytes, up to the next ASCII byte.
+            // Characters beyond ASCII, validated in the same pass that finds
+            // where their run ends (the next ASCII byte, C1 control or
+            // invalid or incomplete sequence).
+            let end = non_ascii_run_end(text, index);
+            if end > index {
+                // SAFETY: `non_ascii_run_end` validated these bytes as UTF-8.
+                let run = unsafe { str::from_utf8_unchecked(&text[index..end]) };
+                if self.per_character {
+                    run.chars().for_each(|c| performer.print(c));
+                } else {
+                    performer.print_text(run);
+                }
+                index = end;
+                continue;
+            }
+            if byte == 0xC2 && matches!(text.get(index + 1), Some(0x80..=0x9F)) {
+                performer.execute(text[index + 1]);
+                index += 2;
+                continue;
+            }
+
+            // Invalid or incomplete UTF-8 starts here: the error handling of
+            // a stretch of non-ASCII bytes up to the next ASCII byte.
             let stretch_end = text[index..]
                 .iter()
                 .position(|&byte| byte < 0x80)
@@ -795,7 +1046,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             // If the entire buffer is valid, use the first character and continue parsing.
             Ok(parsed) => {
                 let c = unsafe { parsed.chars().next().unwrap_unchecked() };
-                performer.print(c);
+                Self::partial_dispatch(performer, c);
 
                 self.partial_utf8_len = 0;
                 c.len_utf8() - old_bytes
@@ -811,7 +1062,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                         parsed.chars().next().unwrap_unchecked()
                     };
 
-                    performer.print(c);
+                    Self::partial_dispatch(performer, c);
 
                     self.partial_utf8_len = 0;
                     // Only the first character's bytes are consumed. The
@@ -836,8 +1087,22 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         }
     }
 
-    /// The parser before the DIRI PATCH single scans (`advance_ground` and
-    /// `advance_csi_params`), kept to check them against: every byte outside
+    /// DIRI PATCH: a character completed across reads is dispatched as the
+    /// whole-text path dispatches it: a C1 control encoded in UTF-8
+    /// (`C2 80` to `C2 9F`) executes instead of printing. Upstream printed
+    /// it, so `ESC [ b` (REP) after a split `C2 9C` repeated the C1 instead
+    /// of the character before it, only when a read ended between its bytes.
+    #[inline]
+    fn partial_dispatch<P: Perform>(performer: &mut P, c: char) {
+        match c {
+            '\u{80}'..='\u{9f}' => performer.execute(c as u8),
+            _ => performer.print(c),
+        }
+    }
+
+    /// The parser before the DIRI PATCH single scans (`advance_ground`,
+    /// `advance_csi` and `advance_string`), kept to check them against: every
+    /// byte outside
     /// ground through `change_state`, and ground text validated whole.
     #[cfg(test)]
     fn advance_reference<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) {
@@ -991,6 +1256,49 @@ fn printable_ascii_end(text: &[u8], mut from: usize) -> usize {
     from
 }
 
+/// DIRI PATCH: the end of the run of characters beyond ASCII in `text` that
+/// starts at `from`: valid UTF-8, with exactly `str::from_utf8`'s acceptance
+/// (overlongs, surrogates and code points past U+10FFFF rejected), up to the
+/// next ASCII byte, C1 control (`C2 80..=C2 9F`) or invalid or incomplete
+/// sequence. Three-byte characters (CJK, kana, Hangul) take a short path.
+#[inline]
+fn non_ascii_run_end(text: &[u8], mut from: usize) -> usize {
+    #[inline(always)]
+    fn continuation(byte: Option<&u8>) -> bool {
+        byte.is_some_and(|&byte| byte & 0xC0 == 0x80)
+    }
+    while let Some(&byte) = text.get(from) {
+        if matches!(byte, 0xE1..=0xEC | 0xEE..=0xEF) {
+            match text.get(from + 1..from + 3) {
+                Some(&[second, third]) if second & 0xC0 == 0x80 && third & 0xC0 == 0x80 => {
+                    from += 3;
+                    continue;
+                },
+                _ => break,
+            }
+        }
+        let second = text.get(from + 1).copied().unwrap_or(0);
+        let len = match byte {
+            0xC2 if second < 0xA0 => break,
+            0xC2..=0xDF if continuation(Some(&second)) => 2,
+            0xE0 if (0xA0..=0xBF).contains(&second) => 3,
+            0xED if (0x80..=0x9F).contains(&second) => 3,
+            0xF0 if (0x90..=0xBF).contains(&second) => 4,
+            0xF1..=0xF3 if continuation(Some(&second)) => 4,
+            0xF4 if (0x80..=0x8F).contains(&second) => 4,
+            _ => break,
+        };
+        if len >= 3 && !continuation(text.get(from + 2)) {
+            break;
+        }
+        if len == 4 && !continuation(text.get(from + 3)) {
+            break;
+        }
+        from += len;
+    }
+    from
+}
+
 #[derive(PartialEq, Eq, Debug, Default, Copy, Clone)]
 enum State {
     CsiEntry,
@@ -1075,6 +1383,15 @@ pub trait Perform {
     /// Pass bytes as part of a device control string to the handle chosen in
     /// `hook`. C0 controls will also be passed to the handler.
     fn put(&mut self, _byte: u8) {}
+
+    /// Diri patch: a run of device control string bytes, each of which
+    /// would have gone to [`Self::put`]. The default does exactly that.
+    #[inline]
+    fn put_slice(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.put(byte);
+        }
+    }
 
     /// Called when a device control string is terminated.
     ///
@@ -1198,15 +1515,53 @@ mod tests {
     /// valid, truncated and invalid UTF-8, and escapes of every kind.
     fn soup(seed: u64, len: usize) -> Vec<u8> {
         let pieces: &[&[u8]] = &[
-            b"plain text ", b" ", b"~", b"\x7f", b"\x00", b"\r\n", b"\t", b"\x07", b"\x1b",
-            b"\x1b[", b"\x1b[1;38;2;10;20;30m", b"\x1b[4:3m", b"\x1b[38:2::1:2:3m", b"\x1b[?25h",
-            b"\x1b[>0q", b"\x1b[ q", b"\x1b[1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;17;18;19;20m",
-            b"\x1b[99999999999m", b"\x1b[;;;m", b"\x1b[1:2:3:4:5:6:7:8;9m", b"\x1b[1\x08m",
-            b"\x1b[12\x1b[m", b"\x1b]0;title\x07", b"\x1b]8;;http://x\x1b\\", b"\x1bP+q54\x1b\\",
-            b"\x1b_Gq=1\x1b\\", b"\x1b(0", b"\x1b(B", b"\x1bc", b"\xc2\x85", b"\xc2\x9b", b"\x85",
-            b"\x9b", b"\xa0", b"\xe6\x97", b"\xe6\x97\xa5", b"\xf0\x9f", b"\xf0\x9f\x91\x8d", b"\xff",
-            b"\xc3", b"\xed\xa0\x80", "日本語".as_bytes(), "é✓—".as_bytes(), b"abcdefghijklmnop",
-            b"0123456789", b"\x1b[?2026h", b"\x1b[?2026l",
+            b"plain text ",
+            b" ",
+            b"~",
+            b"\x7f",
+            b"\x00",
+            b"\r\n",
+            b"\t",
+            b"\x07",
+            b"\x1b",
+            b"\x1b[",
+            b"\x1b[1;38;2;10;20;30m",
+            b"\x1b[4:3m",
+            b"\x1b[38:2::1:2:3m",
+            b"\x1b[?25h",
+            b"\x1b[>0q",
+            b"\x1b[ q",
+            b"\x1b[1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;17;18;19;20m",
+            b"\x1b[99999999999m",
+            b"\x1b[;;;m",
+            b"\x1b[1:2:3:4:5:6:7:8;9m",
+            b"\x1b[1\x08m",
+            b"\x1b[12\x1b[m",
+            b"\x1b]0;title\x07",
+            b"\x1b]8;;http://x\x1b\\",
+            b"\x1bP+q54\x1b\\",
+            b"\x1b_Gq=1\x1b\\",
+            b"\x1b(0",
+            b"\x1b(B",
+            b"\x1bc",
+            b"\xc2\x85",
+            b"\xc2\x9b",
+            b"\x85",
+            b"\x9b",
+            b"\xa0",
+            b"\xe6\x97",
+            b"\xe6\x97\xa5",
+            b"\xf0\x9f",
+            b"\xf0\x9f\x91\x8d",
+            b"\xff",
+            b"\xc3",
+            b"\xed\xa0\x80",
+            "日本語".as_bytes(),
+            "é✓—".as_bytes(),
+            b"abcdefghijklmnop",
+            b"0123456789",
+            b"\x1b[?2026h",
+            b"\x1b[?2026l",
         ];
         let mut state = seed | 1;
         let mut next = move || {
@@ -1239,6 +1594,67 @@ mod tests {
                     "seed {seed}, pieces of {piece}: {bytes:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn non_ascii_runs_end_where_from_utf8_and_c1_end_them() {
+        // Arbitrary bytes, weighted towards UTF-8 edges: the run ends at the
+        // first ASCII byte, C1 control, or byte `from_utf8` does not accept.
+        let edges = [
+            0x00, 0x20, 0x41, 0x7F, 0x80, 0x8F, 0x90, 0x9F, 0xA0, 0xBF, 0xC0, 0xC1, 0xC2, 0xC3,
+            0xDF, 0xE0, 0xE1, 0xE6, 0xEC, 0xED, 0xEE, 0xEF, 0xF0, 0xF1, 0xF3, 0xF4, 0xF5, 0xFF,
+        ];
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..300_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let len = (seed % 13) as usize;
+            let bytes: Vec<u8> =
+                (0..len).map(|i| edges[(seed >> (5 * i + 4)) as usize % edges.len()]).collect();
+            let valid = match str::from_utf8(&bytes) {
+                Ok(text) => text,
+                Err(err) => str::from_utf8(&bytes[..err.valid_up_to()]).unwrap(),
+            };
+            let end = valid
+                .char_indices()
+                .find(|&(_, c)| c.is_ascii() || ('\u{80}'..='\u{9F}').contains(&c))
+                .map_or(valid.len(), |(at, _)| at);
+            assert_eq!(non_ascii_run_end(&bytes, 0), end, "{bytes:x?}");
+        }
+    }
+
+    #[test]
+    fn per_character_print_dispatches_the_same_characters() {
+        for seed in 1..200u64 {
+            let bytes = soup(seed, 400);
+            for piece in [1, 3, bytes.len()] {
+                let (mut runs, mut single) = (Dispatcher::default(), Dispatcher::default());
+                let (mut runs_parser, mut single_parser) = (Parser::new(), Parser::new());
+                single_parser.set_per_character_print(true);
+                for chunk in bytes.chunks(piece) {
+                    runs_parser.advance(&mut runs, chunk);
+                    single_parser.advance(&mut single, chunk);
+                }
+                assert_eq!(runs.dispatched, single.dispatched, "seed {seed}, pieces of {piece}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_c1_control_split_across_reads_is_executed() {
+        for split in 0..=2 {
+            let bytes = b"\xc2\x85x";
+            let mut dispatcher = Dispatcher::default();
+            let mut parser = Parser::new();
+            parser.advance(&mut dispatcher, &bytes[..split]);
+            parser.advance(&mut dispatcher, &bytes[split..]);
+            assert_eq!(
+                dispatcher.dispatched,
+                [Sequence::Execute(0x85), Sequence::Print('x')],
+                "split at {split}"
+            );
         }
     }
 
@@ -1367,6 +1783,183 @@ mod tests {
                 assert_eq!(params[1], &INPUT[4..(INPUT.len() - 2)]);
             },
             _ => panic!("expected osc sequence"),
+        }
+    }
+
+    /// What upstream's per-byte OSC storage dispatches for one body: C0
+    /// controls dropped, at most `MAX_OSC_PARAMS` parameters, nothing once
+    /// the body (separators excluded) passes `MAX_OSC_RAW_STD`.
+    #[cfg(feature = "std")]
+    fn expected_osc(body: &[u8]) -> Option<Vec<Vec<u8>>> {
+        let kept: Vec<u8> = body.iter().copied().filter(|&byte| byte >= 0x20).collect();
+        if kept.iter().filter(|&&byte| byte != b';').count() > MAX_OSC_RAW_STD {
+            return None;
+        }
+        Some(kept.split(|&byte| byte == b';').take(MAX_OSC_PARAMS).map(<[u8]>::to_vec).collect())
+    }
+
+    /// Every dispatch for `stream` fed in reads of `chunks` sizes, with each
+    /// read's C0 index when `indexed`.
+    #[cfg(feature = "std")]
+    fn dispatches(stream: &[u8], chunks: &[usize], indexed: bool) -> (Vec<Sequence>, Parser) {
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+        let mut at = 0;
+        let mut sizes = chunks.iter().cycle();
+        let mut positions = Vec::new();
+        while at < stream.len() {
+            let take = (*sizes.next().unwrap()).min(stream.len() - at);
+            let read = &stream[at..at + take];
+            if indexed && scan::c0_positions(read, &mut positions, usize::MAX) {
+                let index = scan::C0Index::new(&positions);
+                let mut done = 0;
+                while done < read.len() {
+                    done += parser.advance_until_terminated_indexed(
+                        &mut dispatcher,
+                        &read[done..],
+                        Some(index.offset(done)),
+                    );
+                }
+            } else {
+                parser.advance(&mut dispatcher, read);
+            }
+            at += take;
+        }
+        (dispatcher.dispatched, parser)
+    }
+
+    #[cfg(feature = "std")]
+    fn osc_dispatches(stream: &[u8], chunks: &[usize]) -> Vec<Sequence> {
+        let (dispatched, parser) = dispatches(stream, chunks, false);
+        let (indexed, _) = dispatches(stream, chunks, true);
+        assert_eq!(indexed, dispatched, "with the C0 index");
+        let dispatcher = Dispatcher { dispatched };
+        assert!(parser.osc_raw.len() <= MAX_OSC_RAW_STD + MAX_OSC_PARAMS);
+        dispatcher.dispatched.into_iter().filter(|seq| matches!(seq, Sequence::Osc(..))).collect()
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn osc_bodies_in_runs_dispatch_what_per_byte_storage_did() {
+        const BODY: &[u8] = b"xy1;;;;\x01\n\x7f\x9c\xc3\xff ";
+        const ENDS: [(&[u8], bool); 5] = [
+            (b"\x07", true),
+            (b"\x1b\\", false),
+            (b"\x18", false),
+            (b"\x1a", false),
+            (b"\x1b[m", false),
+        ];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        for case in 0..400 {
+            let mut stream = Vec::new();
+            let mut expected = Vec::new();
+            for _ in 0..1 + next(6) {
+                stream.extend_from_slice(b"text");
+                let body: Vec<u8> = (0..next(if case % 5 == 0 { 3000 } else { 60 }))
+                    .map(|_| BODY[next(BODY.len())])
+                    .collect();
+                let (end, bell) = ENDS[next(ENDS.len())];
+                stream.extend_from_slice(b"\x1b]");
+                stream.extend_from_slice(&body);
+                stream.extend_from_slice(end);
+                if let Some(params) = expected_osc(&body) {
+                    expected.push(Sequence::Osc(params, bell));
+                }
+            }
+            let chunks: Vec<usize> =
+                (0..8).map(|_| 1 + next(if case % 2 == 0 { 5 } else { 400 })).collect();
+            assert_eq!(osc_dispatches(&stream, &chunks), expected, "case {case}");
+            assert_eq!(osc_dispatches(&stream, &[stream.len()]), expected, "case {case} whole");
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn indexed_parsing_dispatches_what_scanning_does() {
+        // Escapes of every kind, string bodies, controls, C1 and UTF-8, so
+        // every string state meets every terminator at every read boundary.
+        const PIECES: [&[u8]; 22] = [
+            b"\x1b]",
+            b"\x1b]0;title",
+            b"\x1b]8;;http://a\x1b\\",
+            b"\x1b_Gq=2;AAAA",
+            b"\x1bP+q",
+            b"\x1bP1$r",
+            b"\x1b^pm",
+            b"\x1bXsos",
+            b"\x1b[31m",
+            b"\x1b[?2026h",
+            b"\x1b[?2026l",
+            b"\x07",
+            b"\x18",
+            b"\x1a",
+            b"\x1b\\",
+            b"\x1b",
+            b"text;",
+            b"\n\r\t",
+            b"\x9c",
+            b"\xc3\xa9",
+            b"\x7f",
+            b"12;:",
+        ];
+        let mut state = 0x853c_49e6_748f_ea9bu64;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        for case in 0..2_000 {
+            let stream: Vec<u8> =
+                (0..next(60)).flat_map(|_| PIECES[next(PIECES.len())].iter().copied()).collect();
+            let chunks: Vec<usize> =
+                (0..6).map(|_| 1 + next(if case % 2 == 0 { 9 } else { 300 })).collect();
+            for chunks in [&chunks[..], &[stream.len().max(1)]] {
+                assert_eq!(
+                    dispatches(&stream, chunks, true).0,
+                    dispatches(&stream, chunks, false).0,
+                    "case {case} reads {chunks:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn the_osc_limit_counts_body_bytes_not_separators() {
+        for body_bytes in [MAX_OSC_RAW_STD - 1, MAX_OSC_RAW_STD, MAX_OSC_RAW_STD + 1] {
+            for separators in [3, 40, 300_000] {
+                // Separators spread through the body, a burst at its end.
+                let mut body = Vec::with_capacity(body_bytes + separators);
+                let spread = separators.min(20);
+                for index in 0..body_bytes {
+                    if index % (body_bytes / spread) == 7 {
+                        body.push(b';');
+                    }
+                    body.push(b'a' + (index % 26) as u8);
+                }
+                body.extend(std::iter::repeat_n(b';', separators - spread.min(separators)));
+                let mut stream = b"\x1b]".to_vec();
+                stream.extend_from_slice(&body);
+                stream.push(0x07);
+                let expected: Vec<Sequence> = expected_osc(&body)
+                    .map(|params| Sequence::Osc(params, true))
+                    .into_iter()
+                    .collect();
+                for chunks in [&[65_536][..], &[1_000_003], &[stream.len()]] {
+                    assert_eq!(
+                        osc_dispatches(&stream, chunks),
+                        expected,
+                        "{body_bytes} bytes, {separators} separators, reads of {chunks:?}"
+                    );
+                }
+            }
         }
     }
 
@@ -1876,6 +2469,25 @@ mod tests {
                 ['e', '\u{301}', 'a', '\u{308}', 'b'].map(Sequence::Print),
                 "split at {split}"
             );
+        }
+    }
+
+    #[test]
+    fn split_utf8_c1_control_executes_as_whole() {
+        // `C2 9C` is the C1 control ST in UTF-8. Whole, it executes; split
+        // between its bytes it must too, not print.
+        const INPUT: &[u8] = b"a\xC2\x9Cb\xC2\x85c";
+
+        let mut whole = Dispatcher::default();
+        Parser::new().advance(&mut whole, INPUT);
+        assert!(whole.dispatched.contains(&Sequence::Execute(0x9C)), "{:?}", whole.dispatched);
+
+        for split in 1..INPUT.len() {
+            let mut dispatcher = Dispatcher::default();
+            let mut parser = Parser::new();
+            parser.advance(&mut dispatcher, &INPUT[..split]);
+            parser.advance(&mut dispatcher, &INPUT[split..]);
+            assert_eq!(dispatcher.dispatched, whole.dispatched, "split at {split}");
         }
     }
 

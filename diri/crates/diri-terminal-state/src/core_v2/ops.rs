@@ -617,17 +617,21 @@ impl Core {
                 }
                 self.mode.set(bit, on);
             }
-            NamedPrivateMode::SgrMouse => {
+            // Mouse encodings are mutually exclusive.
+            NamedPrivateMode::SgrMouse
+            | NamedPrivateMode::Utf8Mouse
+            | NamedPrivateMode::SgrPixelMouse => {
+                let bit = match mode {
+                    NamedPrivateMode::SgrMouse => TermMode::SGR_MOUSE,
+                    NamedPrivateMode::Utf8Mouse => TermMode::UTF8_MOUSE,
+                    _ => TermMode::SGR_PIXEL_MOUSE,
+                };
                 if on {
-                    self.mode.remove(TermMode::UTF8_MOUSE);
+                    self.mode.remove(
+                        TermMode::SGR_MOUSE | TermMode::UTF8_MOUSE | TermMode::SGR_PIXEL_MOUSE,
+                    );
                 }
-                self.mode.set(TermMode::SGR_MOUSE, on);
-            }
-            NamedPrivateMode::Utf8Mouse => {
-                if on {
-                    self.mode.remove(TermMode::SGR_MOUSE);
-                }
-                self.mode.set(TermMode::UTF8_MOUSE, on);
+                self.mode.set(bit, on);
             }
             NamedPrivateMode::CursorKeys => self.mode.set(TermMode::APP_CURSOR, on),
             NamedPrivateMode::LineWrap => self.mode.set(TermMode::LINE_WRAP, on),
@@ -645,10 +649,10 @@ impl Core {
             NamedPrivateMode::InBandResize => self.mode.set(TermMode::IN_BAND_RESIZE, on),
             NamedPrivateMode::BlinkingCursor
             | NamedPrivateMode::SyncUpdate
-            | NamedPrivateMode::LeftRightMargins
-            | NamedPrivateMode::SgrPixelMouse => {}
+            | NamedPrivateMode::LeftRightMargins => {}
         }
         self.sync_mode();
+        self.private_mode_events(mode, on);
     }
 
     /// Swaps the shown screen with the other one: pages, cursor and saved
@@ -688,6 +692,7 @@ impl Core {
                 self.reset_row(y);
             }
         }
+        self.swap_keyboard_stacks();
         let clear_entered = entering && kind == AltScreen::SaveCursorAndClear;
         if clear_entered {
             // The alternate screen starts with this cursor, and this is
@@ -724,6 +729,7 @@ impl Core {
             self.swap_screens();
         }
         self.active_charset = 0;
+        self.events.cursor_style = None;
         self.reset_grid();
         if self.other.is_some() {
             self.swap_screens();
@@ -732,9 +738,11 @@ impl Core {
         }
         self.region = (0, self.lines);
         self.tabs = (0..self.cols).map(|c| c % 8 == 0).collect();
+        self.reset_events();
         self.mode = TermMode::default();
         self.sync_mode();
         self.update_slow_text();
+        self.send(alacritty_terminal::event::Event::CursorBlinkingChange);
     }
 
     /// `Term::soft_reset` (DECSTR).
@@ -757,5 +765,8 @@ impl Core {
         self.saved = saved;
         self.sync_mode();
         self.update_slow_text();
+        if self.events.cursor_style.take().is_some() {
+            self.send(alacritty_terminal::event::Event::CursorBlinkingChange);
+        }
     }
 }

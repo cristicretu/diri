@@ -964,7 +964,7 @@
       "name": "remove_worktree"
     },
     {
-      "description": "Terminate an authorized agent session. Delegated agents may release direct children; root agents may release sessions in their project. The caller and its ancestors are protected.",
+      "description": "Terminate an authorized agent session. Delegated agents may release direct children; root agents may release sessions in their project and their direct children anywhere. The caller and its ancestors are protected.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {

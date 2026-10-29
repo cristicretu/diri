@@ -672,6 +672,9 @@ impl Error for GridCodecError {}
 /// RLE codec shared by grid frames and `session.read_scrollback_cells`.
 pub struct GridRowCodec;
 
+/// One encoded run: repeat (u16), scalar, fg and bg (u32 each), style (u16).
+const RUN_BYTES: usize = 2 + 4 + 4 + 4 + 2;
+
 impl GridRowCodec {
     /// Appends `[runCount u16]` and the row's RLE runs, without a `y` prefix.
     pub fn append_row(cells: &[GridCell], encoded: &mut Vec<u8>) -> Result<(), GridCodecError> {
@@ -704,6 +707,12 @@ impl GridRowCodec {
         }
         encoded[count_offset..count_offset + 2].copy_from_slice(&run_count.to_be_bytes());
         Ok(())
+    }
+
+    /// The most bytes [`Self::append_row`] appends for a row of `cells`
+    /// cells: its run count and one run per cell.
+    pub const fn max_row_len(cells: usize) -> usize {
+        2 + cells * RUN_BYTES
     }
 
     pub fn encode_row(cells: &[GridCell]) -> Result<Vec<u8>, GridCodecError> {
