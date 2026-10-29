@@ -3483,3 +3483,84 @@ wakeup.
 DIRI_ERASE_PROBE_CLAUDE=/path/to/isolated-claude.sh \
   cargo test -p diri-engine --release --test erase_hold_probe -- --ignored --nocapture --test-threads=1
 ```
+
+## Idle history on disk (2026-10-29)
+
+**Question.** An idle session keeps its whole compact history (up to 4 MiB of
+live bytes, about 3.7 MB per 100,000 styled lines) in the Engine. At 100
+sessions × 100,000 styled lines the Engine measured 4.95 MB per session,
+against 1.4 MB for a reference multiplexer that suspends idle terminals to an
+encrypted file.
+
+**What changed.** After 60 s with no output and no history read, a held
+session's pump pages its sealed history blocks out to an AES-256-GCM sealed,
+owner-only swap file, on the idle park's own timer (no new timer, thread or
+periodic wakeup). Reads load one block at a time and keep nothing. Payloads
+now live in per-history 128 KiB mappings, so the freed memory leaves the
+process. Design, file format and lifetime: `docs/idle-history-swap.md`.
+
+**Numbers.** `idlebench <n> <lines> 75` with `IDLE_FILE` set to a styled log
+(dim line numbers, 4 SGR colors, a 256-color module path, bold numbers;
+11.4 MB per 100,000 lines), 120×40, real `diri-holder --manager`; Engine
+`phys_footprint` 80 s after the fleet went quiet (the page-out runs at about
+62 s).
+
+| sessions × lines | history in RAM, base → branch | Engine per session, base → branch | swap on disk | written at the idle transition |
+| --- | ---: | ---: | ---: | ---: |
+| 10 × 10k | 5.9 → 0.2 MB | 11.1–13.4 → 5.1–11.8 MB | 5.7 MB | 0.57 MB/session |
+| 10 × 100k | 37.0 → 0.2 MB | 7.9–15.9 → 2.0–11.3 MB | 37.3 MB | 3.68 MB/session |
+| 100 × 10k | 58.1 → 1.5 MB | 1.91 → 1.25 MB | 57.3 MB | 0.57 MB/session |
+| 100 × 100k | 369.8 → 1.5 MB | 4.95 → 1.53 MB (1.13–1.53 in 3 runs) | 372.8 MB | 3.68 MB/session |
+
+- At 10 sessions the per-session figure is dominated by 50–130 MB that the
+  macOS allocator keeps cached after the replay and checkpoint transients, in
+  both builds and different from run to run (three runs each shown as a
+  range); the history column is the deterministic part. At 100 sessions that
+  cache is amortized.
+- Before payloads had their own mappings, paging 368 MB out of the 100 ×
+  100k fleet lowered the footprint by only 190 MB (3.3–3.5 MB per session):
+  the allocator's small regions stayed pinned by about 6,500 live rows
+  interleaved with the freed payloads (`vmmap`: 223 MB free but dirty, 71%
+  fragmentation). With the mappings the footprint falls by the history
+  moved, at the page-out (483 → 118 MB in one trace).
+- A second idle period after a wake phase (keys and `echo` in every session)
+  wrote 0 bytes: less than 64 KiB of new history stays in memory.
+
+**Reading paged-out history** (100 × 100k, after the page-out; resident is
+the same build with `DIRI_HISTORY_SWAP=0`):
+
+| read | resident p50 / p95 | paged out p50 / p95 |
+| --- | ---: | ---: |
+| oldest screen (40 rows, `read_scrollback_cells`) | 0.05 / 0.07 ms | 0.09–0.18 / 0.12–0.40 ms |
+| newest history screen | 0.05 / 0.06 ms | 0.06–0.11 / 0.08–0.22 ms |
+| checkpoint export (newest 10,000 rows) | 9.8 / 10.1 ms | 9.8–10.0 / 12.7–13.5 ms |
+| Find capture | 1.5 / 1.9 ms | 1.8 / 2.1–2.5 ms |
+
+The first fetched screen of paged-out history is under 0.5 ms at p95 in
+every 100-session run. With ten sessions (ten samples, so p95 is the
+slowest) it was 0.2–1.6 ms, and once 7.6 ms for a single read. One record
+costs about 11 µs opened per read, 1.3 µs through a held descriptor
+(`history_swap::tests::record_load_cost`). `aes-gcm` 0.11 (`aes` 0.9,
+`polyval` 0.7) detects the ARMv8 AES and PMULL instructions at run time with
+no build flag; on 0.10 the portable code took 24 / 13.5 µs. A page-out seals
+about 1.6 ms of CPU per MB (6.6 ms on the portable code) on the pump thread,
+once per idle period.
+
+**Wake.** After 90 s idle with history paged out: keystroke echo p95
+0.28 ms, command output p95 0.80 ms (10 × 100k), as before.
+
+**Footprint of the change.** Per paged session: a 48-byte record per stored
+64-row block (about 75 KB at 100,000 rows) and the block index, which was
+already resident; no descriptor while idle; one extra pump wakeup per idle
+period for sessions with at least 64 KiB of history. Disk: the compact
+history size plus 24 bytes per block (0.6%), removed with the session. Every
+history with sealed blocks maps one 128 KiB chunk, of which only written
+pages are resident.
+
+```sh
+cargo build --release -p diri-engine --bin diri-holder --example idlebench
+IDLE_FILE=styled-100k.txt DIRI_HOLDER_BIN=$CARGO_TARGET_DIR/release/diri-holder \
+  $CARGO_TARGET_DIR/release/examples/idlebench 100 100000 75
+# with IDLE_TRACE=1 for the footprint every 10 s, DIRI_HISTORY_SWAP=0 for resident reads
+cargo test --release -p diri-engine --lib record_load_cost -- --ignored --nocapture
+```

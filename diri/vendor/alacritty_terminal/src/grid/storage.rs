@@ -142,6 +142,27 @@ impl<T> Storage<T> {
     }
 
     #[cfg(feature = "compact-history")]
+    pub fn page_out(
+        &mut self,
+        store: &std::sync::Arc<dyn super::cold::ColdStore>,
+        keep_rows: usize,
+        min_bytes: usize,
+    ) -> std::io::Result<super::cold::PageOut> {
+        match &mut self.compact {
+            Some(compact) => compact.page_out(store, keep_rows, min_bytes),
+            None => Ok(super::cold::PageOut::default()),
+        }
+    }
+
+    #[cfg(feature = "compact-history")]
+    pub fn payload_residency(&self) -> super::compact::PayloadResidency {
+        self.compact
+            .as_ref()
+            .map(CompactRows::payload_residency)
+            .unwrap_or_default()
+    }
+
+    #[cfg(feature = "compact-history")]
     pub fn release_idle(&mut self) {
         if let Some(compact) = &mut self.compact {
             compact.release_idle();

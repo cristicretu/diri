@@ -175,3 +175,70 @@ fn the_cli_runs_app_actions_and_describes_the_api() {
     assert!(llms.contains("- app.perform(action, "), "{llms}");
     assert!(llms.contains("- select-tab(index)"), "{llms}");
 }
+
+fn text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[test]
+fn a_lua_script_calls_engine_methods_and_window_actions() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = Server::start(temp.path());
+    let (asked, _worker) = fake_app(&server.socket);
+
+    let listed = server.command(
+        &["script", "-e", "print(#diri.session.list().sessions)"],
+        None,
+    );
+    assert!(listed.status.success(), "{}", text(&listed.stderr));
+    assert_eq!(text(&listed.stdout).trim(), "0");
+
+    let action = server.command(
+        &[
+            "script",
+            "-e",
+            "print(diri.actions.select_tab{index = 3}.ran)",
+        ],
+        None,
+    );
+    assert!(action.status.success(), "{}", text(&action.stderr));
+    assert_eq!(text(&action.stdout).trim(), "select-tab");
+    assert_eq!(asked.lock().unwrap()[0]["args"], json!({"index": 3}));
+
+    // A bad parameter fails before anything is sent, naming the method.
+    let bad = server.command(&["script", "-e", "diri.session.spawn{cwd = 1}"], None);
+    assert!(!bad.status.success());
+    assert!(
+        text(&bad.stderr).contains("session.spawn"),
+        "{}",
+        text(&bad.stderr)
+    );
+
+    let file = temp.path().join("listen.lua");
+    std::fs::write(
+        &file,
+        r#"
+diri.on("workspace.updated", function(snapshot)
+  print("updated", type(snapshot))
+  diri.stop()
+end)
+-- The event stream starts after the file loads; poke until it is heard.
+diri.every(0.5, function()
+  local snapshot = diri.workspace.snapshot()
+  diri.workspace.mutate{
+    expectedRevision = snapshot.revision,
+    mutation = {type = "createWorkspace", name = "from lua"},
+  }
+end)
+"#,
+    )
+    .unwrap();
+    let listened = server.command(&["script", file.to_str().unwrap(), "--for", "20"], None);
+    assert!(listened.status.success(), "{}", text(&listened.stderr));
+    assert!(
+        text(&listened.stdout).starts_with("updated"),
+        "stdout: {}\nstderr: {}",
+        text(&listened.stdout),
+        text(&listened.stderr)
+    );
+}

@@ -854,6 +854,9 @@ impl WindowWrite<'_> {
             let _ = self.persist_preferences();
         }
         if self.canonical.focused_window == Some(self.owner) {
+            if self.canonical.focused_window_session.as_ref() != Some(&id) {
+                crate::scripting::emit_focus(&id);
+            }
             self.canonical.focused_window_session = Some(id.clone());
             if self.navigation.notification_surface_visible {
                 self.mark_notifications_read(&id);

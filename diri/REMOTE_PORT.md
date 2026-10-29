@@ -1050,6 +1050,20 @@ retained on the remote host. A Helper that cannot serve the rows makes the
 capture fail, and the client falls back to searching the mirrored screen, which
 is what every remote session did before.
 
+Find over a local session's whole history (October 2026) adds the local control
+method `session.find_history`: one bounded page of matches per request, walking
+from a stable row toward older output, with the Engine holding the screen lock
+for one run of 128 rows at a time and keeping no search state between pages.
+Stable rows count from a per-grid `history_origin` (rows that have left history
+from its oldest end) added to the vendored parser; local `session.capture_find`
+replies carry it as an optional `historyOrigin`. Remote sessions deliberately
+stay on the capture path above: the Helper gets no search request or
+capability, and remote captures omit `historyOrigin`, so the client never asks
+for older pages. A remote search would either page every history row over SSH
+to the Engine or add a Helper search protocol; neither is part of this baseline.
+The parser change alters the Helper Build ID only; live Holders keep their
+binary and no frame or on-disk format changes.
+
 The shared terminal parser additionally retains OSC 8 targets, soft-wrap facts,
 wide-cell continuation facts, combining characters, and OSC 133 A prompt-start
 marks. These are terminal screen facts; the Holder does not infer commands,
@@ -1636,6 +1650,18 @@ locally (`qrcode`, with default features disabled); no pairing secret goes to
 an image service, log, or preferences file. The iPhone stores its credential
 in Keychain and refuses HTTP redirects. Anyone with this credential and
 tailnet reachability can control all sessions exposed by that Engine.
+
+Tailnet admission (October 2026, off by default, Settings → Phone access →
+*Identify devices with Tailscale*; `diri-web --admit tailnet` standalone)
+replaces the shared credential with per-connection identity. The gateway asks
+the host's own `tailscaled` LocalAPI (Unix socket, the standalone macOS app's
+loopback port, or the `tailscale` CLI) who the peer is, and admits only the
+owner's untagged devices that were paired with a single-use, ten-minute code
+and are still in the owner-only device list. Each device is revoked on its
+own; revocation closes its live streams. An unreachable LocalAPI fails closed
+with `tailnet_identity_unavailable` and never falls back to the token. No
+`tsnet` is bundled and Tailscale is never configured. Design, threat model
+and later phases: `docs/remote-access.md`.
 
 Turning access off aborts the listener and all accepted HTTP/SSE connections.
 Re-enabling rotates the credential. The gateway lives only as long as the Mac

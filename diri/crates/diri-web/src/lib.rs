@@ -20,14 +20,18 @@ mod api;
 mod auth;
 #[cfg(test)]
 mod bench;
+mod devices;
 mod http;
 mod input_ledger;
+mod tailnet;
 mod terminal;
 #[cfg(test)]
 mod testing;
 mod turns;
 mod ui;
 
+pub use devices::{CODE_LIFETIME as PAIRING_CODE_LIFETIME, Device, Devices};
+pub use tailnet::{LocalApi, Owner};
 pub use terminal::{TerminalPalette, set_terminal_palette};
 
 use std::net::SocketAddr;
@@ -66,6 +70,19 @@ struct Config {
     socket_path: PathBuf,
     token_path: PathBuf,
     host_label: String,
+    /// `Some` admits callers by Tailscale identity and pairing.
+    tailnet_owner: Option<Owner>,
+    devices_path: PathBuf,
+}
+
+/// What a standalone invocation does besides serving.
+#[derive(Debug, PartialEq, Eq)]
+enum Command {
+    Serve,
+    Url,
+    Pair,
+    Devices,
+    Revoke(String),
 }
 
 fn usage() -> &'static str {
@@ -74,7 +91,11 @@ diri-web — serve a Dirijor daemon to a phone browser over a private network
 
 USAGE:
     diri-web [--listen ADDR:PORT] [--socket PATH] [--token-file PATH] [--label NAME]
+             [--admit token|tailnet] [--tailnet-owner LOGIN] [--devices-file PATH]
     diri-web url                       print the enrolment URL and exit
+    diri-web pair                      mint a one-time pairing link (tailnet admission)
+    diri-web devices                   list paired devices
+    diri-web revoke NODE_ID            unpair one device; its connections close
 
 OPTIONS:
     --listen ADDR:PORT   default 127.0.0.1:7380; must be loopback or Tailscale
@@ -82,9 +103,19 @@ OPTIONS:
                          standard Dirijor application-support path)
     --token-file PATH    default ~/.config/dirijor/web.token, created if absent
     --label NAME         name shown in the frontend header (default: the hostname)
+    --admit MODE         `token` (default): a shared bearer token. `tailnet`: each
+                         connection is identified by this host's tailscaled (WhoIs);
+                         only the owner's untagged, paired devices get in
+    --tailnet-owner LOGIN
+                         the Tailscale login admitted on a tagged host (implies
+                         --admit tailnet; default: the user this node is logged in as)
+    --devices-file PATH  default ~/.config/dirijor/web-devices.json
 
 The token is minted on first run. Open the printed URL once on the phone; it is
-exchanged for a cookie and the secret leaves the address bar.
+exchanged for a cookie and the secret leaves the address bar. Under tailnet
+admission there is no standing secret: `diri-web pair` prints a link holding a
+single-use code valid for ten minutes, and the device is remembered by its
+Tailscale node id.
 "
 }
 
@@ -106,6 +137,52 @@ pub fn run() -> ExitCode {
         }
     };
 
+    let command = match command(&arguments) {
+        Ok(command) => command,
+        Err(message) => {
+            eprintln!("diri-web: {message}\n\n{}", usage());
+            return ExitCode::from(2);
+        }
+    };
+    match command {
+        Command::Serve | Command::Url => {}
+        Command::Pair => {
+            let devices = Devices::open(config.devices_path.clone());
+            return match devices.mint_code() {
+                Ok(code) => {
+                    println!("{}", enrolment_url(&config.listen, &code));
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("diri-web: cannot write a pairing code: {error}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Command::Devices => {
+            for device in Devices::open(config.devices_path.clone()).list() {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    device.id, device.name, device.os, device.login
+                );
+            }
+            return ExitCode::SUCCESS;
+        }
+        Command::Revoke(id) => {
+            return match Devices::open(config.devices_path.clone()).revoke(&id) {
+                Ok(true) => ExitCode::SUCCESS,
+                Ok(false) => {
+                    eprintln!("diri-web: no paired device {id:?}");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("diri-web: cannot revoke {id:?}: {error}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+    }
+
     let (auth, minted) = match Auth::load_or_create(&config.token_path) {
         Ok(pair) => pair,
         Err(error) => {
@@ -117,7 +194,7 @@ pub fn run() -> ExitCode {
         }
     };
 
-    if arguments.first().is_some_and(|argument| argument == "url") {
+    if command == Command::Url {
         println!("{}", enrolment_url(&config.listen, auth.token()));
         return ExitCode::SUCCESS;
     }
@@ -144,13 +221,20 @@ fn parse(arguments: &[String]) -> Result<Config, String> {
     let mut socket_path = None;
     let mut token_path = None;
     let mut host_label = None;
+    let mut admit = None;
+    let mut tailnet_owner = None;
+    let mut devices_path = None;
 
     let mut index = 0;
     while index < arguments.len() {
         let argument = arguments[index].as_str();
-        // `url` is a bare subcommand, handled by the caller.
-        if argument == "url" {
+        // Subcommands are handled by the caller.
+        if matches!(argument, "url" | "pair" | "devices") {
             index += 1;
+            continue;
+        }
+        if argument == "revoke" {
+            index += 2;
             continue;
         }
         let value = || {
@@ -176,6 +260,18 @@ fn parse(arguments: &[String]) -> Result<Config, String> {
                 host_label = Some(value()?);
                 index += 2;
             }
+            "--admit" => {
+                admit = Some(value()?);
+                index += 2;
+            }
+            "--tailnet-owner" => {
+                tailnet_owner = Some(Owner::Login(value()?));
+                index += 2;
+            }
+            "--devices-file" => {
+                devices_path = Some(PathBuf::from(value()?));
+                index += 2;
+            }
             other => return Err(format!("unrecognised argument {other:?}")),
         }
     }
@@ -188,12 +284,64 @@ fn parse(arguments: &[String]) -> Result<Config, String> {
         ));
     }
 
+    let tailnet_owner = match (admit.as_deref(), tailnet_owner) {
+        (None | Some("tailnet"), Some(owner)) => Some(owner),
+        (Some("tailnet"), None) => Some(Owner::ThisNode),
+        (None | Some("token"), None) => None,
+        (Some("token"), Some(_)) => {
+            return Err("--tailnet-owner needs --admit tailnet".into());
+        }
+        (Some(other), _) => return Err(format!("unknown --admit mode {other:?}")),
+    };
+
     Ok(Config {
         listen,
         socket_path: socket_path.unwrap_or_else(default_socket_path),
         token_path: token_path.unwrap_or_else(auth::default_token_path),
         host_label: host_label.unwrap_or_else(default_host_label),
+        tailnet_owner,
+        devices_path: devices_path.unwrap_or_else(default_devices_path),
     })
+}
+
+fn command(arguments: &[String]) -> Result<Command, String> {
+    let mut found = Command::Serve;
+    let mut index = 0;
+    while index < arguments.len() {
+        let next = match arguments[index].as_str() {
+            "url" => Command::Url,
+            "pair" => Command::Pair,
+            "devices" => Command::Devices,
+            "revoke" => Command::Revoke(
+                arguments
+                    .get(index + 1)
+                    .cloned()
+                    .ok_or("revoke needs a device id")?,
+            ),
+            argument if argument.starts_with("--") => {
+                index += 2;
+                continue;
+            }
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+        if found != Command::Serve {
+            return Err("give at most one subcommand".into());
+        }
+        index += if matches!(next, Command::Revoke(_)) {
+            2
+        } else {
+            1
+        };
+        found = next;
+    }
+    Ok(found)
+}
+
+fn default_devices_path() -> PathBuf {
+    auth::default_token_path().with_file_name("web-devices.json")
 }
 
 /// Accepts either a literal `ADDR:PORT` or a `HOST:PORT` to resolve.
@@ -268,15 +416,32 @@ async fn serve(config: Config, auth: Auth, minted: bool) -> Result<(), String> {
         .await
         .map_err(|error| format!("cannot bind {}: {error}", config.listen))?;
 
+    let tailnet = match config.tailnet_owner {
+        None => None,
+        Some(owner) => {
+            let local = LocalApi::discover().ok_or(
+                "--admit tailnet needs Tailscale on this host, and found no tailscaled \
+                 LocalAPI or tailscale CLI",
+            )?;
+            let devices = Arc::new(Devices::open(config.devices_path));
+            Some(Arc::new(tailnet::Admission::new(local, owner, devices)))
+        }
+    };
+
     eprintln!("diri-web: listening on http://{}", config.listen);
     let _ = minted;
-    eprintln!("diri-web: use `diri-web url` to show the private pairing link");
+    if tailnet.is_some() {
+        eprintln!("diri-web: admitting paired tailnet devices; `diri-web pair` pairs one");
+    } else {
+        eprintln!("diri-web: use `diri-web url` to show the private pairing link");
+    }
 
     let api = Arc::new(Api {
         client: Arc::clone(&client),
         auth,
         host_label: config.host_label,
         inputs: Default::default(),
+        tailnet,
     });
 
     serve_connections(listener, api).await
@@ -302,14 +467,41 @@ pub fn reset_phone_pairing(token_path: &std::path::Path) -> Result<(), String> {
         .map_err(|error| format!("Cannot create a new pairing code: {error}"))
 }
 
-/// App-owned gateway. Its credential persists at `token_path` (created
-/// owner-only on first enable), so turning access off and on again, or
-/// restarting Diri, keeps existing phone pairings.
+/// Where the Mac app keeps the devices paired under tailnet admission.
+#[must_use]
+pub fn phone_devices_path() -> PathBuf {
+    phone_token_path().with_file_name(PHONE_DEVICES_FILE)
+}
+
+const PHONE_DEVICES_FILE: &str = "phone-devices.json";
+
+/// The link a phone opens (or scans) to present `secret` to the gateway on
+/// `address`: the bearer token, or a one-time pairing code.
+#[must_use]
+pub fn phone_link(address: std::net::Ipv4Addr, secret: &str) -> String {
+    enrolment_url(&SocketAddr::from((address, DEFAULT_PORT)), secret)
+}
+
+/// How the app's gateway decides who may connect.
+pub enum PhoneAdmission {
+    /// The persistent bearer token at this path.
+    Token(PathBuf),
+    /// Tailscale WhoIs through this LocalAPI, then pairing against `devices`.
+    Tailnet {
+        local: LocalApi,
+        devices: Arc<Devices>,
+    },
+}
+
+/// App-owned gateway. Under token admission its credential persists at the
+/// token path (created owner-only on first enable), so turning access off
+/// and on again, or restarting Diri, keeps existing phone pairings. Under
+/// tailnet admission the returned link holds a fresh one-time pairing code.
 pub async fn start_phone_access(
     address: std::net::Ipv4Addr,
     client: Arc<DaemonClient>,
     label: String,
-    token_path: &std::path::Path,
+    admission: PhoneAdmission,
 ) -> Result<(String, tokio::task::JoinHandle<Result<(), String>>), String> {
     let [a, b, _, _] = address.octets();
     if a != 100 || !(64..=127).contains(&b) {
@@ -322,14 +514,30 @@ pub async fn start_phone_access(
     let listener = TcpListener::bind((address, DEFAULT_PORT))
         .await
         .map_err(|error| format!("Cannot enable phone access: {error}"))?;
-    let (auth, _) = Auth::load_or_create(token_path)
-        .map_err(|error| format!("Cannot read the phone pairing code: {error}"))?;
-    let url = enrolment_url(&SocketAddr::from((address, DEFAULT_PORT)), auth.token());
+    let (auth, url, tailnet) = match admission {
+        PhoneAdmission::Token(token_path) => {
+            let (auth, _) = Auth::load_or_create(&token_path)
+                .map_err(|error| format!("Cannot read the phone pairing code: {error}"))?;
+            let url = phone_link(address, auth.token());
+            (auth, url, None)
+        }
+        PhoneAdmission::Tailnet { local, devices } => {
+            let code = devices
+                .mint_code()
+                .map_err(|error| format!("Cannot create a pairing code: {error}"))?;
+            // Never presented: tailnet admission ignores the bearer token.
+            let auth =
+                Auth::ephemeral().map_err(|error| format!("Cannot start phone access: {error}"))?;
+            let gate = tailnet::Admission::new(local, Owner::ThisNode, devices);
+            (auth, phone_link(address, &code), Some(Arc::new(gate)))
+        }
+    };
     let api = Arc::new(Api {
         client,
         auth,
         host_label: label,
         inputs: Default::default(),
+        tailnet,
     });
     Ok((url, tokio::spawn(serve_connections(listener, api))))
 }
@@ -351,7 +559,7 @@ async fn serve_connections(listener: TcpListener, api: Arc<Api>) -> Result<(), S
         };
         let api = Arc::clone(&api);
         connections.spawn(async move {
-            if let Err(error) = handle(stream, api).await {
+            if let Err(error) = handle(stream, peer, api).await {
                 // One phone falling off a cell tower is normal; log at a
                 // volume that does not drown the journal.
                 let _ = (peer, error);
@@ -360,11 +568,16 @@ async fn serve_connections(listener: TcpListener, api: Arc<Api>) -> Result<(), S
     }
 }
 
-async fn handle(stream: TcpStream, api: Arc<Api>) -> std::io::Result<()> {
+async fn handle(stream: TcpStream, peer: SocketAddr, api: Arc<Api>) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let mut authenticated = false;
+    // A connection's peer cannot change, so it is identified once.
+    let identity = match &api.tailnet {
+        Some(gate) => Some(gate.identify(peer.ip()).await),
+        None => None,
+    };
 
     loop {
         let timeout = if authenticated {
@@ -383,25 +596,56 @@ async fn handle(stream: TcpStream, api: Arc<Api>) -> std::io::Result<()> {
                 return Ok(());
             }
         };
-        authenticated |= api.auth.authorizes(&request);
+        let mut request = request;
+        let mut guard = None;
+        match (&api.tailnet, &identity) {
+            (Some(gate), Some(Ok(identity))) => match gate.admits(identity, &request) {
+                Ok(()) => {
+                    request.admitted = true;
+                    guard = Some((Arc::clone(&gate.devices), identity.node.clone()));
+                }
+                // Unpaired falls through to the page and the 401 below, so
+                // the browser can show where to enter a pairing code.
+                Err(tailnet::Refusal::NotPaired) => {}
+                Err(refusal) => {
+                    let _ = http::write_response(&mut write_half, None, refusal.response()).await;
+                    return Ok(());
+                }
+            },
+            // Refused by identity: say why, once, and hang up.
+            (Some(_), Some(Err(refusal))) => {
+                let _ = http::write_response(&mut write_half, None, refusal.response()).await;
+                return Ok(());
+            }
+            _ => {}
+        }
+        authenticated |= api.authorizes(&request);
+        let refusal = || match api.tailnet {
+            Some(_) => tailnet::Refusal::NotPaired.response(),
+            None => auth::unauthorized(),
+        };
 
         // The event stream owns the connection for its lifetime.
         if request.method == "GET" && request.path == "/api/events" {
-            if !api.auth.authorizes(&request) {
-                let _ = http::write_response(&mut write_half, None, auth::unauthorized()).await;
+            if !api.authorizes(&request) {
+                let _ = http::write_response(&mut write_half, None, refusal()).await;
                 return Ok(());
             }
-            return stream_events(&mut write_half, &api).await;
+            return until_revoked(guard, stream_events(&mut write_half, &api)).await;
         }
         if request.method == "GET"
             && let ["api", "session", id, "stream"] = request.segments().as_slice()
         {
-            if !api.auth.authorizes(&request) {
-                let _ = http::write_response(&mut write_half, None, auth::unauthorized()).await;
+            if !api.authorizes(&request) {
+                let _ = http::write_response(&mut write_half, None, refusal()).await;
                 return Ok(());
             }
             let id = diri_proto::SessionId((*id).to_owned());
-            return stream_terminal(&mut reader, &mut write_half, &api, id).await;
+            return until_revoked(
+                guard,
+                stream_terminal(&mut reader, &mut write_half, &api, id),
+            )
+            .await;
         }
 
         let response = respond(&request, &api).await;
@@ -418,6 +662,12 @@ async fn respond(request: &Request, api: &Api) -> Response {
         // authenticated API call succeeds, and shipping it unauthenticated is
         // what lets the login screen exist at all.
         ("GET" | "HEAD", "/") => {
+            if api.tailnet.is_some() && request.query.contains_key("token") {
+                // The pairing code was spent (or refused) on arrival; take it
+                // out of the address bar either way. No cookie: identity
+                // comes from the tailnet.
+                return Response::redirect("/");
+            }
             if api.auth.arrived_in_url(request) {
                 // Trade the URL token for a cookie so the secret is not left
                 // in history, or in the referrer of anything the page loads.
@@ -495,6 +745,21 @@ where
                 writer.flush().await?;
             }
         }
+    }
+}
+
+/// Runs a stream until it ends or, under tailnet admission, its device is
+/// revoked; dropping the stream closes its Engine preview.
+async fn until_revoked(
+    guard: Option<(Arc<Devices>, String)>,
+    stream: impl std::future::Future<Output = std::io::Result<()>>,
+) -> std::io::Result<()> {
+    let Some((devices, node)) = guard else {
+        return stream.await;
+    };
+    tokio::select! {
+        result = stream => result,
+        () = tailnet::revoked(&devices, &node) => Ok(()),
     }
 }
 
@@ -596,7 +861,7 @@ mod tests {
                     address.parse().unwrap(),
                     client,
                     "test".into(),
-                    &token.path().join("phone.token"),
+                    PhoneAdmission::Token(token.path().join("phone.token")),
                 )
                 .await
                 .is_err()
@@ -621,6 +886,7 @@ mod tests {
             auth,
             host_label: "test".into(),
             inputs: Default::default(),
+            tailnet: None,
         });
         let server = tokio::spawn(serve_connections(listener, api));
         let mut stream = TcpStream::connect(address).await.unwrap();
@@ -665,6 +931,7 @@ mod tests {
             auth,
             host_label: "test".into(),
             inputs: Default::default(),
+            tailnet: None,
         });
         let server = tokio::spawn(serve_connections(listener, api));
         let stream = TcpStream::connect(address).await.unwrap();
@@ -777,6 +1044,7 @@ mod tests {
             auth,
             host_label: "test".into(),
             inputs: Default::default(),
+            tailnet: None,
         });
         (
             address,
@@ -1047,5 +1315,241 @@ mod tests {
     fn the_enrolment_url_carries_the_token_once() {
         let url = enrolment_url(&"100.66.149.100:7380".parse().unwrap(), "deadbeef");
         assert_eq!(url, "http://100.66.149.100:7380/?token=deadbeef");
+    }
+
+    #[cfg(unix)]
+    mod tailnet_admission {
+        use super::*;
+        use crate::tailnet::fake::{self, OWNER};
+        use tokio::io::AsyncReadExt as _;
+
+        const PHONE: &str = "100.64.0.2";
+
+        struct Gateway {
+            address: SocketAddr,
+            devices: Arc<Devices>,
+            gate: Arc<tailnet::Admission>,
+            token: String,
+            local: fake::FakeLocalApi,
+            server: tokio::task::JoinHandle<Result<(), String>>,
+            _dir: tempfile::TempDir,
+        }
+
+        impl Drop for Gateway {
+            fn drop(&mut self) {
+                self.server.abort();
+            }
+        }
+
+        async fn gateway(client: Arc<DaemonClient>) -> Gateway {
+            let local = fake::start().await;
+            {
+                let mut whois = local.whois.lock().unwrap();
+                whois.insert(PHONE.into(), fake::device("nPhone", "phone", OWNER, &[]));
+                whois.insert("100.64.0.3".into(), fake::device("nThem", "them", 99, &[]));
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let devices = Arc::new(Devices::open(dir.path().join("devices.json")));
+            let gate = Arc::new(tailnet::Admission::new(
+                local.api(),
+                Owner::ThisNode,
+                Arc::clone(&devices),
+            ));
+            *gate.test_peer.lock().unwrap() = Some(PHONE.parse().unwrap());
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let auth = Auth::temporary().unwrap();
+            let token = auth.token().to_owned();
+            let api = Arc::new(Api {
+                client,
+                auth,
+                host_label: "test".into(),
+                inputs: Default::default(),
+                tailnet: Some(Arc::clone(&gate)),
+            });
+            Gateway {
+                address,
+                devices,
+                gate,
+                token,
+                local,
+                server: tokio::spawn(serve_connections(listener, api)),
+                _dir: dir,
+            }
+        }
+
+        fn offline_client() -> Arc<DaemonClient> {
+            Arc::new(DaemonClient::with_socket_path(
+                "/nonexistent/diri-tailnet-test.sock",
+            ))
+        }
+
+        async fn get(address: SocketAddr, target: &str, headers: &str) -> String {
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "GET {target} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n{headers}\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut response = String::new();
+            tokio::time::timeout(Duration::from_secs(5), stream.read_to_string(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            response
+        }
+
+        #[tokio::test]
+        async fn an_owner_device_gets_in_only_after_pairing_and_needs_no_secret_after() {
+            let gateway = gateway(offline_client()).await;
+            let refused = get(gateway.address, "/api/health", "").await;
+            assert!(refused.starts_with("HTTP/1.1 401"), "{refused}");
+            assert!(refused.contains("\"code\":\"device_not_paired\""));
+
+            let code = gateway.devices.mint_code().unwrap();
+            let paired = get(
+                gateway.address,
+                "/api/health",
+                &format!("X-Diri-Token: {code}\r\n"),
+            )
+            .await;
+            assert!(paired.starts_with("HTTP/1.1 200"), "{paired}");
+            assert_eq!(gateway.devices.list()[0].id, "nPhone");
+
+            // Identity, not a secret, admits it from now on.
+            let later = get(gateway.address, "/api/health", "").await;
+            assert!(later.starts_with("HTTP/1.1 200"), "{later}");
+        }
+
+        #[tokio::test]
+        async fn the_bearer_token_is_not_a_way_in() {
+            let gateway = gateway(offline_client()).await;
+            for header in [
+                "Authorization: Bearer",
+                "X-Diri-Token:",
+                "Cookie: diri_web_token=",
+            ] {
+                let response = get(
+                    gateway.address,
+                    "/api/health",
+                    &format!("{header} {}\r\n", gateway.token),
+                )
+                .await;
+                assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_pairing_link_leaves_the_address_bar_without_a_cookie() {
+            let gateway = gateway(offline_client()).await;
+            let code = gateway.devices.mint_code().unwrap();
+            let landing = get(gateway.address, &format!("/?token={code}"), "").await;
+            assert!(landing.starts_with("HTTP/1.1 303"), "{landing}");
+            assert!(!landing.to_ascii_lowercase().contains("set-cookie"));
+            assert!(gateway.devices.is_paired("nPhone"));
+        }
+
+        #[tokio::test]
+        async fn other_users_tagged_nodes_and_outages_are_refused_with_reasons() {
+            let gateway = gateway(offline_client()).await;
+            *gateway.gate.test_peer.lock().unwrap() = Some("100.64.0.3".parse().unwrap());
+            let code = gateway.devices.mint_code().unwrap();
+            let them = get(
+                gateway.address,
+                "/api/health",
+                &format!("X-Diri-Token: {code}\r\n"),
+            )
+            .await;
+            assert!(them.starts_with("HTTP/1.1 403"), "{them}");
+            assert!(them.contains("\"code\":\"not_the_owner\""));
+            // A refused caller cannot spend the code.
+            assert!(gateway.devices.list().is_empty());
+
+            *gateway.gate.test_peer.lock().unwrap() = Some("100.64.0.9".parse().unwrap());
+            let stranger = get(gateway.address, "/", "").await;
+            assert!(
+                stranger.contains("\"code\":\"not_a_tailnet_peer\""),
+                "{stranger}"
+            );
+
+            *gateway.local.status.lock().unwrap() = serde_json::json!({"nope": true});
+            *gateway.gate.test_peer.lock().unwrap() = Some("100.64.0.8".parse().unwrap());
+            let outage = get(gateway.address, "/api/health", "").await;
+            assert!(outage.starts_with("HTTP/1.1 503"), "{outage}");
+            assert!(outage.contains("\"code\":\"tailnet_identity_unavailable\""));
+        }
+
+        #[tokio::test]
+        async fn revoking_a_device_closes_its_live_event_stream() {
+            use diri_proto::Method;
+            use tokio::io::{AsyncBufReadExt as _, BufReader as TokioBufReader};
+            let engine = crate::testing::fake_engine(|method, _| match method {
+                Method::EVENTS_SUBSCRIBE => json!({"subscribed": true}),
+                _ => json!({}),
+            })
+            .await;
+            let gateway = gateway(Arc::clone(&engine.client)).await;
+            let code = gateway.devices.mint_code().unwrap();
+            let stream = TcpStream::connect(gateway.address).await.unwrap();
+            let (read_half, mut write_half) = stream.into_split();
+            write_half
+                .write_all(
+                    format!(
+                        "GET /api/events HTTP/1.1\r\nHost: {}\r\nX-Diri-Token: {code}\r\n\r\n",
+                        gateway.address
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut lines = TokioBufReader::new(read_half).lines();
+            loop {
+                let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .expect("stream open");
+                if line == "event: ready" {
+                    break;
+                }
+            }
+            assert!(gateway.devices.revoke("nPhone").unwrap());
+            // The server hangs up: EOF well before any heartbeat would fire.
+            let closed = tokio::time::timeout(Duration::from_secs(2), async {
+                while let Ok(Some(_)) = lines.next_line().await {}
+            })
+            .await;
+            assert!(closed.is_ok(), "revoked stream stayed open");
+            let after = get(gateway.address, "/api/health", "").await;
+            assert!(after.contains("\"code\":\"device_not_paired\""), "{after}");
+        }
+
+        #[test]
+        fn standalone_flags_choose_the_admission_mode() {
+            let args = |list: &[&str]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
+            let token = parse(&args(&[])).unwrap();
+            assert_eq!(token.tailnet_owner, None);
+            let tailnet = parse(&args(&["--admit", "tailnet"])).unwrap();
+            assert_eq!(tailnet.tailnet_owner, Some(Owner::ThisNode));
+            let tagged = parse(&args(&["--tailnet-owner", "me@example.com"])).unwrap();
+            assert_eq!(
+                tagged.tailnet_owner,
+                Some(Owner::Login("me@example.com".into()))
+            );
+            assert!(parse(&args(&["--admit", "token", "--tailnet-owner", "x"])).is_err());
+            assert!(parse(&args(&["--admit", "open"])).is_err());
+            assert_eq!(
+                command(&args(&["--admit", "tailnet", "revoke", "nPhone"])).unwrap(),
+                Command::Revoke("nPhone".into())
+            );
+            assert_eq!(command(&args(&["pair"])).unwrap(), Command::Pair);
+            assert!(command(&args(&["pair", "devices"])).is_err());
+            let revoke = parse(&args(&["revoke", "nPhone", "--label", "x"])).unwrap();
+            assert_eq!(revoke.host_label, "x");
+        }
     }
 }

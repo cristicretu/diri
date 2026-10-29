@@ -1848,6 +1848,11 @@ impl RootView {
         self.show_toast(toast, cx);
     }
 
+    /// A notice from the person's `init.lua` (see `crate::scripting`).
+    pub(crate) fn show_script_toast(&mut self, toast: Toast, cx: &mut Context<Self>) {
+        self.show_feedback("script", toast, cx);
+    }
+
     fn show_toast(&mut self, toast: Toast, cx: &mut Context<Self>) {
         let timer = self.toast.show(toast);
         self.arm_toast_timer(timer, cx);

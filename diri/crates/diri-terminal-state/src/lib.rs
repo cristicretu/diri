@@ -16,13 +16,20 @@
 #[cfg(feature = "core-v2")]
 pub mod core_v2;
 mod emulator;
+mod find_history;
 mod inline_images;
 mod notifications;
 mod program_status;
+/// The seam idle history leaves memory through, and what one page-out moved.
+#[cfg(feature = "compact-history")]
+pub use alacritty_terminal::grid::cold::{ColdStore, PageOut};
+#[cfg(feature = "compact-history")]
+pub use alacritty_terminal::grid::compact::PayloadResidency;
 /// Per-thread totals of the OSCs the parser dispatched (benchmark
 /// verification only).
 #[cfg(feature = "bench-verify")]
 pub use alacritty_terminal::vte::observe as osc_observe;
+pub use find_history::HistorySearch;
 pub use inline_images::{
     DEFAULT_CELL_PIXELS, STORE_BUDGET_BYTES as INLINE_IMAGE_BUDGET_BYTES, StoredImage,
 };
@@ -607,7 +614,20 @@ pub struct HeadlessScreen {
     last_annotations: Vec<RowMetadata>,
     last_grid_cols: usize,
     last_grid_rows: usize,
+    /// History reads so far (scrollback, find, links, checkpoints); see
+    /// [`HeadlessScreen::history_reads`].
+    history_reads: std::sync::atomic::AtomicU64,
 }
+
+/// History rows a page-out keeps in memory at least: what a short scroll
+/// back reads without touching the disk.
+#[cfg(feature = "compact-history")]
+pub const PAGE_OUT_KEEP_ROWS: usize = 256;
+
+/// Least history worth a page-out. Below it, an idle session's history stays
+/// in memory and nothing is written: a quiet shell has a few KiB of it.
+#[cfg(feature = "compact-history")]
+pub const PAGE_OUT_MIN_BYTES: usize = 64 << 10;
 
 impl HeadlessScreen {
     pub fn new(cols: usize, rows: usize) -> Self {
@@ -677,6 +697,7 @@ impl HeadlessScreen {
             last_annotations: Vec::new(),
             last_grid_cols: 0,
             last_grid_rows: 0,
+            history_reads: std::sync::atomic::AtomicU64::new(0),
         };
         screen.rebuild_content_cache();
         screen
@@ -1681,8 +1702,50 @@ impl HeadlessScreen {
     /// stored a block at a time now, rather than rebuilt whole (every row at
     /// the new width, tens of MB) by the first read.
     fn prepare_history_read(&mut self) {
+        self.count_history_read();
         #[cfg(feature = "compact-history")]
         self.term.prepare_history_read();
+    }
+
+    fn count_history_read(&self) {
+        self.history_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many times history has been read: by scrollback, Find, link
+    /// detection or a checkpoint. An owner that pages idle history out
+    /// waits until this stops moving, so a person scrolling back is not
+    /// sent to the disk.
+    pub fn history_reads(&self) -> u64 {
+        self.history_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Moves idle history out of memory into `store`, after giving back
+    /// what [`Self::compact_idle`] gives back. The visible screen and the
+    /// newest [`PAGE_OUT_KEEP_ROWS`] history rows (at least two screens)
+    /// stay in memory; with less than [`PAGE_OUT_MIN_BYTES`] to move, nothing
+    /// moves. Nothing observable changes: reads bring stored history back a
+    /// block at a time and keep none of it, and the history budget counts it
+    /// as before, so the rows kept never depend on paging.
+    #[cfg(feature = "compact-history")]
+    pub fn page_out_history(&mut self, store: &Arc<dyn ColdStore>) -> std::io::Result<PageOut> {
+        self.compact_idle();
+        let keep = PAGE_OUT_KEEP_ROWS.max(2 * self.geometry.rows);
+        self.term.page_out_history(store, keep, PAGE_OUT_MIN_BYTES)
+    }
+
+    /// Releases the history rows a `&self` read ([`Self::find_capture_cells`])
+    /// left decoded. Readers that take `&mut self` release them as they go.
+    pub fn release_history_read_cache(&mut self) {
+        #[cfg(feature = "compact-history")]
+        self.term.release_history_read_cache();
+    }
+
+    /// Where the history's payloads live: in memory or in a cold store.
+    #[cfg(feature = "compact-history")]
+    pub fn history_residency(&self) -> PayloadResidency {
+        self.term.history_residency()
     }
 
     fn finish_history_read_batch(&mut self, completed: usize, finished: bool) {
@@ -2061,6 +2124,7 @@ impl HeadlessScreen {
     pub fn find_capture_cells(
         &self,
     ) -> Result<diri_proto::ReadScrollbackCellsResult, &'static str> {
+        self.count_history_read();
         let (cols, visible) = self.size();
         let history = self.term.history_rows();
         let total = history + visible;
