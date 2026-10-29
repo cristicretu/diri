@@ -576,6 +576,12 @@ impl Core {
             let cluster = self.get(line, col);
             let cluster_style = self.style_of(line as i32, cluster);
             let zerowidth = self.zerowidth_hot(line, col).to_vec();
+            // Read before the leading spacer overwrites the cell and the
+            // wrap scrolls `line` away.
+            let link = cluster
+                .has(super::cell::HYPERLINK)
+                .then(|| self.link_at(line as i32, col))
+                .flatten();
             self.wrap_pending = false;
             self.col = col;
             self.write_at_cursor(' ', LEADING);
@@ -588,10 +594,6 @@ impl Core {
             let style =
                 (self.pages.page_mut(p).styles.intern(&cluster_style) as u64) << STYLE_SHIFT;
             let keep = cluster.0 & (super::cell::CP | super::cell::HYPERLINK);
-            let link = cluster
-                .has(super::cell::HYPERLINK)
-                .then(|| self.link_at(line as i32, col))
-                .flatten();
             self.set(l, c, |_| Cell(keep | style | WIDE | marks));
             if let Some(link) = link {
                 let (p, r) = self.pages.locate(l);
