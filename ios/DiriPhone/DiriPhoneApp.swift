@@ -2,6 +2,7 @@ import SwiftUI
 
 @main
 struct DiriPhoneApp: App {
+    @UIApplicationDelegateAdaptor(PushDelegate.self) private var push
     @State private var model = AppModel()
     @Environment(\.scenePhase) private var scenePhase
 
@@ -18,6 +19,10 @@ struct DiriPhoneApp: App {
             .preferredColorScheme(.dark)
             .tint(Tokens.Ink.clay)
             .onChange(of: scenePhase) { _, phase in model.setActive(phase != .background) }
+            .task(id: model.hasGateways) {
+                push.model = model
+                if model.hasGateways { push.requestAuthorization() }
+            }
         }
     }
 }

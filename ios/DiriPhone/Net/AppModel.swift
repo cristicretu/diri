@@ -44,6 +44,11 @@ final class AppModel {
     var collapsedSessions: Set<String> = []
     var collapsedProjects: Set<String> = []
     var banner: String?
+    /// This phone's APNs token, once iOS hands it over.
+    var pushToken: String? { didSet { if pushToken != oldValue { registeredPush = [] ; registerPushEverywhere() } } }
+    /// Gateways that took this phone's token (or said push is off).
+    private(set) var pushEnabled: [String: Bool] = [:]
+    private var registeredPush: Set<String> = []
 
     private let store: SecretStore
     /// False for a `-endpoint` launch: a seeded gateway is not written back.
@@ -137,6 +142,7 @@ final class AppModel {
         pollTask?.cancel()
         pollTask = nil
         clients = [:]
+        registeredPush = []
         probeClients = [:]
         payloads = [:]
         outcomes = [:]
@@ -216,8 +222,46 @@ final class AppModel {
         } while probeQueued
     }
 
+    /// Registers the push token with every reachable gateway, once each.
+    func registerPushEverywhere() {
+        guard let token = pushToken else { return }
+        #if DEBUG
+        let environment = "sandbox"
+        #else
+        let environment = "production"
+        #endif
+        for gateway in gateways where outcomes[gateway.id]?.isReachable == true && !registeredPush.contains(gateway.id) {
+            guard let client = clients[gateway.id] else { continue }
+            registeredPush.insert(gateway.id)
+            let base = gateway.endpoint.baseURL
+            Task {
+                let enabled = (try? await client.registerPush(token: token, environment: environment, base: base))
+                if let enabled { pushEnabled[gateway.id] = enabled } else { registeredPush.remove(gateway.id) }
+            }
+        }
+    }
+
+    /// Answers from a notification action: the gateway named in the push.
+    func answer(fromPushTo base: URL, session: String, approve: Bool, occurredAt: Double, answerID: String) async throws {
+        guard let gateway = gateways.first(where: { $0.endpoint.baseURL.absoluteString == base.absoluteString }),
+              let client = clients[gateway.id] ?? Optional(DiriClient(endpoint: gateway.endpoint))
+        else { throw DiriClient.Failure.daemonUnreachable("That computer is not paired with this iPhone.") }
+        var attempt = 0
+        while true {
+            do {
+                try await client.answer(sessionID: session, approve: approve, occurredAt: occurredAt, answerID: answerID)
+                return
+            } catch {
+                guard attempt < TerminalSession.inputRetryDelays.count, TerminalSession.isTransient(error) else { throw error }
+                try? await Task.sleep(for: TerminalSession.inputRetryDelays[attempt])
+                attempt += 1
+            }
+        }
+    }
+
     private func apply(_ results: [String: GatewayProbe.Outcome]) {
         outcomes = results
+        defer { registerPushEverywhere() }
         // A migrated or pasted gateway is named after its address until it
         // introduces itself.
         var renamed = gateways

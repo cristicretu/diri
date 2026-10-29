@@ -116,6 +116,7 @@ async fn bench_history_page_and_diff_delivery() {
         auth: Auth::temporary().unwrap(),
         host_label: "bench".into(),
         inputs: Default::default(),
+        push: None,
         tailnet: None,
     });
     let token = api.auth.token().to_owned();

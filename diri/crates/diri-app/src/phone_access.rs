@@ -25,6 +25,13 @@ pub struct PhoneAccess {
 
 /// The store of devices paired under tailnet admission. One per app, shared
 /// by Settings and the gateway so a revocation closes live connections.
+/// Pushes to paired phones follow the Notify column of Settings › General ›
+/// Alerts: Needs you, Failed, Finished.
+pub fn apply_push_routes(prefs: &crate::store::Prefs) {
+    let routes = &prefs.attention_routes;
+    diri_web::set_push_routes(routes.blocked.notify, routes.error.notify, routes.done.notify);
+}
+
 pub fn paired_devices() -> Arc<diri_web::Devices> {
     Arc::new(diri_web::Devices::open(diri_web::phone_devices_path()))
 }

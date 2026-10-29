@@ -38,6 +38,8 @@ pub struct Request {
     /// Set by the connection loop when tailnet admission let this request
     /// in. Never parsed from the wire.
     pub admitted: bool,
+    /// The admitted device's tailnet node id. Never parsed from the wire.
+    pub node: Option<String>,
 }
 
 impl Request {
@@ -182,6 +184,7 @@ where
         body,
         keep_alive,
         admitted: false,
+        node: None,
     }))
 }
 

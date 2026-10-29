@@ -448,6 +448,7 @@ fn main() {
             .expect("session store lock poisoned");
         perf_overlay::apply_prefs(store.preferences());
         i18n::apply_prefs(store.preferences());
+        phone_access::apply_push_routes(store.preferences());
     }
     let updates = if preview {
         updates::inert()

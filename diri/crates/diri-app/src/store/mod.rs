@@ -1590,6 +1590,7 @@ impl SessionStore {
             next.save(path)?;
         }
         self.prefs = next;
+        crate::phone_access::apply_push_routes(&self.prefs);
         self.invalidate_projection();
         if matches!(self.daemon_state, DaemonState::Connected) {
             self.emit(StoreEffect::ConfigureGovernor(self.governor_settings()));

@@ -121,6 +121,22 @@ Sessions are grouped by computer. On a narrow screen the list is a drawer
 and logs `DIRI_FRAME_PROBE` with frame intervals, dropped frames, main-thread
 layout+draw time per frame and how many lines showed blank.
 
+## Notifications
+
+When the Mac has an APNs key (`phone-push.json`, see
+`diri/docs/remote-access.md` § Push), an agent that needs you, fails or
+finishes reaches the phone as a push, following the Mac's Alerts › Notify
+switches. The push carries no session content: the
+`DiriNotificationService` extension fetches the title and question from the
+gateway over the tailnet. A permission prompt gets Approve and Deny (through
+the guarded `/answer`, destructive ones only with the phone unlocked);
+tapping opens the session.
+
+`xcrun simctl push` delivers payloads without launching service
+extensions, so DEBUG builds take `-deliverPush <payload>` to run the same
+composition in-app and post it; `TerminalFixtureTests` uses that against the
+tailnet fixture.
+
 ## Several computers
 
 Pair more than one gateway (your Mac, `forge`) with **connection menu → Add a
@@ -224,10 +240,6 @@ The glyphs, colours and ordering are unchanged.
 
 ## Not built yet
 
-- **Push notifications when a session needs input.** The highest-value missing
-  piece: today you have to open the app to discover that something is waiting.
-- **Mouse reporting and text selection in the terminal.** Taps focus the
-  keyboard; they are not sent to programs that asked for the mouse.
 - **Archived bucket, rename, drag-to-reorder.** The projection already computes
   the archived list and honours a manual order; no UI reaches them.
 
