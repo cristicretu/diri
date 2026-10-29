@@ -2007,9 +2007,16 @@ impl<T: EventListener> Handler for Term<T> {
                     cell.fg = fg;
                     cell.bg = bg;
                     cell.flags = flags | (cell.flags & Flags::SHELL_MARKS);
-                    // Most cells and templates have no extra storage; skip
-                    // the reference count when both are empty.
-                    if extra.is_some() || cell.extra.is_some() {
+                    // Most cells and templates have no extra storage, and a
+                    // rewritten cell (a repeated character, a redrawn row)
+                    // often already shares the template's: skip the atomic
+                    // reference-count round trip in both cases.
+                    let same_extra = match (&cell.extra, &extra) {
+                        (None, None) => true,
+                        (Some(cell), Some(extra)) => Arc::ptr_eq(cell, extra),
+                        _ => false,
+                    };
+                    if !same_extra {
                         cell.extra = extra.clone();
                     }
                     written += 1;

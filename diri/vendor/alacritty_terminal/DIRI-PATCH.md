@@ -439,6 +439,14 @@ change and never republished the screen. `reset_state` (RIS, `ESC c`) also
 clears every color a program set, as xterm and libghostty do; upstream kept
 them across `reset`. No wire, checkpoint or protocol change.
 
+## Shared cell extras are not re-cloned
+
+`input_ascii` writes the cursor template's `extra` (underline color,
+hyperlink, zero-width characters) into each cell. A cell that already shares
+the template's `Arc` (a repeated character, a redrawn row) now keeps it
+instead of an atomic increment and decrement per cell. The cell ends the
+same. No wire, checkpoint or protocol change.
+
 ## Faster skipping through text that does not repeat
 
 The history LZ codec steps one byte further per 32 consecutive missed
