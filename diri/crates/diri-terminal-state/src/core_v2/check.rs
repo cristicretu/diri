@@ -14,14 +14,18 @@ use super::cell::{Cell, LEADING, MARKS, MARKS_SHIFT, SPACER, Style, WIDE, WRAP};
 /// The current core's `Flags` of a v2 cell: its style flags, width bits,
 /// soft wrap and shell marks.
 pub fn flags_of(core: &Core, line: i32, col: usize, cell: Cell, style: &Style) -> Flags {
+    flags_with(cell, style, col + 1 == core.cols() && core.wrapped(line))
+}
+
+/// [`flags_of`] for a cell whose row's soft-wrap mark (on the last column)
+/// is `row_wrap`.
+#[inline]
+pub fn flags_with(cell: Cell, style: &Style, row_wrap: bool) -> Flags {
     let mut flags = Flags::from_bits_retain(style.flags);
     flags.set(Flags::WIDE_CHAR, cell.has(WIDE));
     flags.set(Flags::WIDE_CHAR_SPACER, cell.has(SPACER));
     flags.set(Flags::LEADING_WIDE_CHAR_SPACER, cell.has(LEADING));
-    flags.set(
-        Flags::WRAPLINE,
-        cell.has(WRAP) || (col + 1 == core.cols() && core.wrapped(line)),
-    );
+    flags.set(Flags::WRAPLINE, cell.has(WRAP) || row_wrap);
     let marks = (cell.0 & MARKS) >> MARKS_SHIFT;
     for (bit, flag) in [
         Flags::PROMPT_START,

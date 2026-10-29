@@ -9,6 +9,8 @@ pub mod check;
 mod events;
 mod ops;
 pub mod page;
+#[cfg(feature = "core-v2-screen")]
+pub(crate) mod screen;
 pub mod term;
 pub mod text;
 

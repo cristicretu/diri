@@ -3,12 +3,19 @@
 //! cells, modes, colors, damage, history management, keyboard stacks and the
 //! cell writes a checkpoint restore makes.
 //!
-//! The emulator in use is chosen once, by [`Emu`]. Everything is static
-//! dispatch: cell reads return the emulator's own cells by reference, and the
+//! The emulator in use is chosen once, by [`Emu`]: the current core, or with
+//! the `core-v2-screen` feature the page-based core of `docs/core-v2.md`.
+//! Everything is static dispatch. Row and cell reads return a view type of
+//! the emulator's choosing ([`Emulator::RowRef`], [`Emulator::CellRef`]);
+//! for the current core they are plain references to its own cells, and the
 //! helpers that read them are generic over [`CellView`] and [`RowView`], so
-//! they monomorphize to the same code as reading the cells directly.
+//! they monomorphize to the same code as reading the cells directly. Cell
+//! writes go through [`Emulator::edit_row`], a closure over the row, which
+//! for the current core is the same indexing as before.
 //!
 //! [`HeadlessScreen`]: crate::HeadlessScreen
+
+use std::ops::Deref;
 
 use alacritty_terminal::grid::{Dimensions, Row};
 use alacritty_terminal::index::{Column, Line, Point};
@@ -22,7 +29,11 @@ use diri_proto::grid::GridCell;
 use crate::{Collector, Geometry};
 
 /// The emulator behind every [`crate::HeadlessScreen`].
+#[cfg(not(feature = "core-v2-screen"))]
 pub(crate) type Emu = Term<Collector>;
+/// The emulator behind every [`crate::HeadlessScreen`]: core v2.
+#[cfg(feature = "core-v2-screen")]
+pub(crate) type Emu = crate::core_v2::screen::Screen;
 
 /// An OSC 8 hyperlink as a cell holds it. Two links are equal when they are
 /// the same link (target and id), as consecutive cells of one link are.
@@ -74,14 +85,50 @@ pub(crate) trait RowView {
     fn content_width(&self) -> usize;
 }
 
-pub(crate) trait Emulator: Handler + Sized {
+impl<R: RowView> RowView for &R {
+    type Cell = R::Cell;
+
+    #[inline(always)]
+    fn cells(&self) -> &[R::Cell] {
+        (**self).cells()
+    }
+
+    #[inline(always)]
+    fn content_width(&self) -> usize {
+        (**self).content_width()
+    }
+}
+
+/// Write access to one row, for [`Emulator::edit_row`].
+pub(crate) trait RowWrite {
     type Cell: CellWrite;
-    type Row: RowView<Cell = Self::Cell>;
+
+    fn cell(&self, column: Column) -> &Self::Cell;
+    fn cell_mut(&mut self, column: Column) -> &mut Self::Cell;
+}
+
+pub(crate) trait Emulator: Sized {
+    /// What the parser drives: the emulator itself, or the core it wraps.
+    type Handler: Handler;
+    type Cell: CellWrite;
+    /// One row as [`Self::row`] reads it.
+    type RowRef<'a>: RowView<Cell = Self::Cell>
+    where
+        Self: 'a;
+    /// One cell as [`Self::cell`] reads it.
+    type CellRef<'a>: Deref<Target = Self::Cell>
+    where
+        Self: 'a;
+    /// One row as [`Self::edit_row`] writes it.
+    type RowMut: RowWrite<Cell = Self::Cell>;
     /// The attributes new characters are written with, saved and restored
     /// around writes that must not change them.
     type Pen;
 
     fn create(config: Config, geometry: &Geometry, events: Collector) -> Self;
+
+    /// The parser's target.
+    fn handler(&mut self) -> &mut Self::Handler;
 
     // Geometry.
 
@@ -111,13 +158,11 @@ pub(crate) trait Emulator: Handler + Sized {
 
     // Cells. Lines below zero are history, oldest at `-history_rows()`.
 
-    fn row(&self, line: Line) -> &Self::Row;
-    fn cell(&self, line: Line, column: Column) -> &Self::Cell {
-        &self.row(line).cells()[column.0]
-    }
-    fn cell_mut(&mut self, line: Line, column: Column) -> &mut Self::Cell;
-    /// Replaces a cell with the emulator form of a wire cell.
-    fn write_cell(&mut self, line: Line, column: Column, cell: GridCell);
+    fn row(&self, line: Line) -> Self::RowRef<'_>;
+    fn cell(&self, line: Line, column: Column) -> Self::CellRef<'_>;
+    /// Runs `edit` over the cells of `line`; what it changes is written
+    /// back to the emulator.
+    fn edit_row<R>(&mut self, line: Line, edit: impl FnOnce(&mut Self::RowMut) -> R) -> R;
 
     // Modes, colors and the cursor style.
 
@@ -150,8 +195,11 @@ pub(crate) trait Emulator: Handler + Sized {
     /// The primary history's row limit; a lower one drops the oldest rows.
     #[cfg(feature = "compact-history")]
     fn set_history_limit(&mut self, limit: usize);
-    /// Scrolls the whole screen up by `rows`, pushing them into history.
-    fn push_screen_into_history(&mut self, rows: usize);
+    /// Scrolls the whole screen up by one row per row of `history`, pushing
+    /// them into history, and replaces those history rows with the emulator
+    /// form of `history`'s wire cells, oldest first. False, with history
+    /// partly written, when the emulator kept fewer rows than given.
+    fn restore_history(&mut self, history: &[Vec<GridCell>]) -> bool;
     /// Memory held per history row of `cols` cells while it is decoded.
     #[cfg(feature = "compact-history")]
     fn decoded_row_bytes(cols: usize) -> usize;
@@ -271,9 +319,26 @@ impl RowView for Row<Cell> {
     }
 }
 
-impl Emulator for Term<Collector> {
+impl RowWrite for Row<Cell> {
     type Cell = Cell;
-    type Row = Row<Cell>;
+
+    #[inline(always)]
+    fn cell(&self, column: Column) -> &Cell {
+        &self[column]
+    }
+
+    #[inline(always)]
+    fn cell_mut(&mut self, column: Column) -> &mut Cell {
+        &mut self[column]
+    }
+}
+
+impl Emulator for Term<Collector> {
+    type Handler = Self;
+    type Cell = Cell;
+    type RowRef<'a> = &'a Row<Cell>;
+    type CellRef<'a> = &'a Cell;
+    type RowMut = Row<Cell>;
     type Pen = Cell;
 
     fn create(config: Config, geometry: &Geometry, events: Collector) -> Self {
@@ -285,6 +350,11 @@ impl Emulator for Term<Collector> {
             term
         };
         term
+    }
+
+    #[inline(always)]
+    fn handler(&mut self) -> &mut Self {
+        self
     }
 
     #[inline]
@@ -348,13 +418,14 @@ impl Emulator for Term<Collector> {
         &self.grid()[line]
     }
 
-    #[inline]
-    fn cell_mut(&mut self, line: Line, column: Column) -> &mut Cell {
-        &mut self.grid_mut()[line][column]
+    #[inline(always)]
+    fn cell(&self, line: Line, column: Column) -> &Cell {
+        &self.grid()[line][column]
     }
 
-    fn write_cell(&mut self, line: Line, column: Column, cell: GridCell) {
-        self.grid_mut()[line][column] = crate::emulator_cell(cell);
+    #[inline]
+    fn edit_row<R>(&mut self, line: Line, edit: impl FnOnce(&mut Row<Cell>) -> R) -> R {
+        edit(&mut self.grid_mut()[line])
     }
 
     #[inline]
@@ -413,9 +484,21 @@ impl Emulator for Term<Collector> {
         self.set_scrolling_history(limit);
     }
 
-    fn push_screen_into_history(&mut self, rows: usize) {
+    fn restore_history(&mut self, history: &[Vec<GridCell>]) -> bool {
         let lines = self.grid().screen_lines() as i32;
-        self.grid_mut().scroll_up(&(Line(0)..Line(lines)), rows);
+        self.grid_mut()
+            .scroll_up(&(Line(0)..Line(lines)), history.len());
+        let restored = self.grid().history_size();
+        if restored != history.len() {
+            return false;
+        }
+        for (index, row) in history.iter().enumerate() {
+            let line = Line(index as i32 - restored as i32);
+            for (x, cell) in row.iter().enumerate() {
+                self.grid_mut()[line][Column(x)] = crate::emulator_cell(*cell);
+            }
+        }
+        true
     }
 
     #[cfg(feature = "compact-history")]

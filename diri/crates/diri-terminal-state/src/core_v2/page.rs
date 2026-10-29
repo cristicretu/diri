@@ -103,6 +103,16 @@ impl StyleTable {
         self.table.shrink_to_fit();
     }
 
+    /// Rebuilds the index of a frozen table, so a thawed page interns
+    /// without duplicating its styles.
+    fn thaw(&mut self) {
+        let index = self.index.get_or_insert_with(Default::default);
+        index.clear();
+        for (id, style) in self.table.iter().enumerate().skip(1) {
+            index.entry(*style).or_insert(id as u16);
+        }
+    }
+
     fn heap_bytes(&self) -> usize {
         self.table.capacity() * std::mem::size_of::<Style>()
     }
@@ -1498,5 +1508,94 @@ impl Pages {
 
     pub fn page_count(&self) -> usize {
         self.pages.len()
+    }
+}
+
+/// Writes outside the print path: the `HeadlessScreen` adapter
+/// (`super::screen`) restoring checkpoints, and its history settings. None
+/// of this runs while output is parsed.
+impl Pages {
+    /// Absolute index one past the newest row: grows by one per row
+    /// appended, so a change means rows moved up.
+    pub fn total_rows(&self) -> u64 {
+        self.total
+    }
+
+    /// Sets the row limit. A lower one drops the oldest rows at once: they
+    /// stay dropped if the limit is raised again.
+    pub fn set_history_limit(&mut self, limit: usize) {
+        if limit < self.history_size() {
+            let keep_from = self.total - (self.lines + limit) as u64;
+            self.floor = self.floor.max(keep_from);
+        }
+        self.history_limit = limit;
+        let rows = self.rows_per_page() as u64;
+        while self.pages.len() > 1 && self.base + rows <= self.floor {
+            self.pop_front_page();
+        }
+        self.trim();
+    }
+
+    /// The live-byte bound on history, if any.
+    pub fn budget(&self) -> Option<usize> {
+        self.budget
+    }
+
+    /// Sets the live-byte bound on history and drops the oldest packed
+    /// pages that exceed it. Pages are packed from the next page boundary
+    /// on (text logs start with new pages).
+    pub fn set_budget(&mut self, budget: Option<usize>) {
+        self.budget = budget;
+        self.seal();
+        self.trim();
+    }
+
+    /// Makes packed page `p` dense again so its cells can be written; the
+    /// caller packs it back with [`Pages::refreeze`] before rows are
+    /// appended or history is measured.
+    pub fn thaw(&mut self, p: usize) {
+        if !self.pages[p].is_packed() {
+            return;
+        }
+        let (cols, rows) = (self.cols, self.rows_per_page());
+        let mut cells = self
+            .spare_dense
+            .pop()
+            .map(|(cells, _)| cells)
+            .unwrap_or_else(|| vec![Cell::default(); rows * cols].into_boxed_slice());
+        let mut clusters = Clusters::default();
+        let mut map = HashMap::new();
+        let page = &mut self.pages[p];
+        self.packed_bytes -= page.stored_bytes();
+        page.unpack(cols, &mut cells, &mut clusters, &mut map);
+        page.cells = cells;
+        page.clusters = clusters;
+        if !map.is_empty() {
+            page.links.get_or_insert_with(Default::default).map = map;
+        }
+        page.packed = None;
+        page.text = TextLog::new(rows, false);
+        page.styles.thaw();
+        let serial = page.serial;
+        let mut cache = self.cache.borrow_mut();
+        if cache.as_ref().is_some_and(|c| c.serial == serial) {
+            *cache = None;
+        }
+    }
+
+    /// Packs page `p` again after [`Pages::thaw`].
+    pub fn refreeze(&mut self, p: usize) {
+        let cols = self.cols;
+        let page = &mut self.pages[p];
+        if page.is_packed() {
+            return;
+        }
+        let (cells, _) = page.pack(cols, &mut self.scratch);
+        self.packed_bytes += page.stored_bytes();
+        if self.spare_dense.len() < 2 {
+            let logging = self.budget.is_some();
+            self.spare_dense
+                .push((cells, TextLog::new(self.rows_per_page(), logging)));
+        }
     }
 }

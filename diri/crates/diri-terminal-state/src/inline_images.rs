@@ -375,8 +375,10 @@ impl HeadlessScreen {
     /// C0 index when there is one.
     fn advance_parser(&mut self, bytes: &[u8], index: Option<C0Index<'_>>) {
         match index {
-            Some(index) => self.parser.advance_indexed(&mut self.term, bytes, index),
-            None => self.parser.advance(&mut self.term, bytes),
+            Some(index) => self
+                .parser
+                .advance_indexed(self.term.handler(), bytes, index),
+            None => self.parser.advance(self.term.handler(), bytes),
         }
     }
 
@@ -407,7 +409,7 @@ impl HeadlessScreen {
         // Bytes a synchronized update holds back were written before this
         // image; they must land first.
         if self.parser.sync_timeout().sync_timeout().is_some() {
-            self.parser.stop_sync(&mut self.term);
+            self.parser.stop_sync(self.term.handler());
         }
         match collecting.kind {
             SequenceKind::Kitty => self.kitty(&collecting.body, collecting.overflow, historical),
@@ -767,7 +769,7 @@ impl HeadlessScreen {
         for row in 0..rows {
             if row > 0 {
                 if move_cursor {
-                    Handler::linefeed(&mut self.term);
+                    Handler::linefeed(self.term.handler());
                     line = self.term.cursor_point().line;
                 } else {
                     line = Line(line.0 + 1);
@@ -787,7 +789,7 @@ impl HeadlessScreen {
             self.term
                 .place_cursor(Point::new(line, Column(col0)), false);
             for _ in 0..written {
-                Handler::input(&mut self.term, ' ');
+                Handler::input(self.term.handler(), ' ');
             }
         }
         self.term.restore_pen(saved_template);
@@ -813,8 +815,8 @@ impl HeadlessScreen {
         let mut positions = Vec::new();
         for line in 0..self.term.screen_rows() {
             let line = Line(line as i32);
-            let row = self.term.row(line).cells();
-            for (column, cell) in row[..self.term.cols()].iter().enumerate() {
+            let row = self.term.row(line);
+            for (column, cell) in row.cells()[..self.term.cols()].iter().enumerate() {
                 let Some(link) = cell.link() else {
                     continue;
                 };
@@ -841,7 +843,7 @@ impl HeadlessScreen {
         self.term.set_link_pen(None);
         for &(line, column) in positions {
             self.term.place_cursor(Point::new(line, column), false);
-            Handler::input(&mut self.term, ' ');
+            Handler::input(self.term.handler(), ' ');
         }
         self.term.restore_pen(saved_template);
         self.term.place_cursor(saved_point, saved_wrap);

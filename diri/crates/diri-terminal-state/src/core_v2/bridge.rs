@@ -4,13 +4,30 @@
 //! step 4) encodes the wire types from pages directly; this copy is for
 //! verification and is not on any hot path.
 
+#[cfg(not(feature = "core-v2-screen"))]
 use alacritty_terminal::grid::Dimensions;
+#[cfg(not(feature = "core-v2-screen"))]
 use alacritty_terminal::index::{Column, Line, Point};
+#[cfg(not(feature = "core-v2-screen"))]
 use alacritty_terminal::term::cell::{Cell as GridCell, Hyperlink};
 
 use super::Core;
 use crate::HeadlessScreen;
 
+#[cfg(feature = "core-v2-screen")]
+impl HeadlessScreen {
+    /// A screen holding `core`'s grid, history and cursor, cell for cell.
+    pub fn from_core_v2(core: &Core) -> HeadlessScreen {
+        let mut screen = HeadlessScreen::new(core.cols(), core.lines());
+        screen.term.copy_from(core);
+        screen.fingerprints_track_cells = false;
+        screen.last_grid_cols = 0;
+        screen.last_grid_rows = 0;
+        screen
+    }
+}
+
+#[cfg(not(feature = "core-v2-screen"))]
 impl HeadlessScreen {
     /// A screen holding `core`'s grid, history and cursor, cell for cell.
     pub fn from_core_v2(core: &Core) -> HeadlessScreen {
