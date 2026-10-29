@@ -298,7 +298,7 @@ Each PR lands on its own, behind the single `core-v2` cargo feature of `diri-ter
    - **Moved-row fingerprints.** `Emulator::moved_line_sources` reports, for each screen line, the line its cells came from when rows only moved by appends. Dirty and new rows report `CONTENT_CHANGED`. `fingerprints_after_scrolling_match_the_cells` now runs on v2 and checks this is exact.
    - **Golden on v2.** `vt_workloads` with `core-v2-screen` requires at least the golden's rows and compares the newest of them exactly. `core_v2_bench` compares every row v2 keeps, cell for cell.
 7. **Inline images and checkpoints** on v2, with the existing image and checkpoint tests.
-   - Engine-path parity with the current core (#978, `core/v2-images`). These read paths had cost v2 more than the current core:
+   - Engine-path parity with the current core (#978 and #982). These read paths had cost v2 more than the current core:
      - Settling a read that changed nothing no longer hashes the cursor rows. Every v2 write marks its row dirty; the cursor rows are reported only after a recolor.
      - With nothing moved, the dirty scan walks the screen pages' metadata slices, and the moved-line sources are a kept identity.
      - Image deletes read link targets through `Emulator::each_link_target` instead of converting every screen row.
