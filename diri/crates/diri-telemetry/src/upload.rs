@@ -162,13 +162,16 @@ impl Uploader {
         self.run_cycle_with(false)
     }
 
-    /// One pass over the spool; `forced` (an explicit user request) sends
-    /// even when sharing is turned off.
+    /// One pass over the spool; `forced` (an explicit user request: Send now
+    /// or Report a Problem) sends even when sharing is turned off. Routine
+    /// passes send nothing while sharing is off, and after an opt-in only
+    /// what was recorded since.
     pub fn run_cycle_with(&mut self, forced: bool) -> CycleReport {
         let dir = spool::spool_dir(&self.state_dir);
         let mut report = CycleReport::default();
         let config = Config::load(&self.state_dir);
-        if !config.upload && !forced {
+        let since = if forced { None } else { config.chosen_ms };
+        if !config.sharing_allowed() && !forced {
             spool::prune(&dir, spool::SPOOL_CAP_BYTES);
             return report;
         }
@@ -195,6 +198,7 @@ impl Uploader {
                 && !self.send(
                     &identity,
                     &config,
+                    since,
                     &mut body,
                     &mut lines,
                     &mut pending,
@@ -212,6 +216,7 @@ impl Uploader {
             self.send(
                 &identity,
                 &config,
+                since,
                 &mut body,
                 &mut lines,
                 &mut pending,
@@ -242,6 +247,7 @@ impl Uploader {
         &mut self,
         identity: &Identity,
         config: &Config,
+        since: Option<u64>,
         body: &mut Vec<u8>,
         lines: &mut usize,
         pending: &mut Vec<(String, u64)>,
@@ -250,8 +256,17 @@ impl Uploader {
     ) -> bool {
         // Old app/Holder processes may still write the former error fields.
         // Project every queued record before it can leave this machine.
-        let safe_body = upload_records(body);
+        let safe_body = upload_records(body, since);
         *lines = safe_body.iter().filter(|byte| **byte == b'\n').count();
+        if *lines == 0 {
+            // Everything here predates consent: mark it handled, send nothing.
+            for (name, offset) in pending.drain(..) {
+                offsets.insert(name, offset);
+            }
+            let _ = save_offsets(&spool::spool_dir(&self.state_dir), offsets);
+            body.clear();
+            return true;
+        }
         let header = Header {
             v: 1,
             kind: "batch",
@@ -300,8 +315,9 @@ impl Uploader {
 }
 
 /// Removes retired content-bearing fields, including records written by old
-/// processes before an upgrade. Preserve the scanner's canonical key order.
-fn upload_records(body: &[u8]) -> Vec<u8> {
+/// processes before an upgrade, and with `since`, records made before the
+/// person opted in. Preserve the scanner's canonical key order.
+fn upload_records(body: &[u8], since: Option<u64>) -> Vec<u8> {
     let mut output = Vec::with_capacity(body.len());
     for line in body
         .split(|byte| *byte == b'\n')
@@ -310,6 +326,15 @@ fn upload_records(body: &[u8]) -> Vec<u8> {
         let Ok(serde_json::Value::Object(mut record)) = serde_json::from_slice(line) else {
             continue;
         };
+        if let Some(since) = since
+            && record
+                .get("t")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                < since
+        {
+            continue;
+        }
         let hello = record.get("k").and_then(serde_json::Value::as_str) == Some("client.hello");
         let panic = record.get("k").and_then(serde_json::Value::as_str) == Some("panic");
         if let Some(serde_json::Value::Object(fields)) = record.get_mut("f") {
@@ -555,7 +580,7 @@ mod tests {
             .join("config.json")
             .exists()
         {
-            Config::default().save(state).unwrap();
+            Config::default().choose(true, 0).save(state).unwrap();
         }
         Uploader::new(
             state.to_path_buf(),
@@ -590,7 +615,7 @@ mod tests {
                 .starts_with(r#"{"t":1,"seq":1,"p":"engine""#)
         );
         let legacy_panic = br#"{"k":"panic","f":{"thread":"PRIVATE_THREAD","message":"PRIVATE_PANIC","signature":"known_symbol"}}"#;
-        let projected = String::from_utf8(upload_records(legacy_panic)).unwrap();
+        let projected = String::from_utf8(upload_records(legacy_panic, None)).unwrap();
         assert!(!projected.contains("PRIVATE_"));
         assert!(projected.contains("known_symbol"));
     }
@@ -657,17 +682,59 @@ mod tests {
     }
 
     #[test]
+    fn new_installs_send_nothing_until_opt_in_and_only_from_then() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = spool::spool_dir(state.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("app-1-0-0000.jsonl"),
+            "{\"t\":10,\"k\":\"before\"}\n{\"t\":30,\"k\":\"after\"}\n",
+        )
+        .unwrap();
+        // A new install that has not answered yet.
+        Config::default().save(state.path()).unwrap();
+        let (transport, bodies) = capture(202);
+        assert_eq!(
+            uploader(state.path(), transport).run_cycle(),
+            CycleReport::default()
+        );
+        assert!(bodies.lock().unwrap().is_empty());
+
+        Config::default()
+            .choose(true, 20)
+            .save(state.path())
+            .unwrap();
+        let (transport, bodies) = capture(202);
+        assert_eq!(uploader(state.path(), transport).run_cycle().lines, 1);
+        let bodies = bodies.lock().unwrap();
+        assert!(bodies[0].contains("after"));
+        assert!(!bodies[0].contains("before"), "recorded before opting in");
+        assert!(bodies[0].lines().next().unwrap().contains(r#""name":null"#));
+    }
+
+    #[test]
+    fn settings_from_before_opt_in_keep_uploading() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = spool::spool_dir(state.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("app-1-0-0000.jsonl"), "{\"t\":10,\"k\":\"a\"}\n").unwrap();
+        let path = crate::identity::telemetry_dir(state.path()).join("config.json");
+        std::fs::write(&path, r#"{"upload": true, "name": null}"#).unwrap();
+        let (transport, bodies) = capture(202);
+        assert_eq!(uploader(state.path(), transport).run_cycle().lines, 1);
+        assert_eq!(bodies.lock().unwrap().len(), 1);
+    }
+
+    #[test]
     fn disabled_upload_sends_nothing() {
         let state = tempfile::tempdir().unwrap();
         let dir = spool::spool_dir(state.path());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("app-1-0-0000.jsonl"), "{}\n").unwrap();
-        Config {
-            upload: false,
-            name: None,
-        }
-        .save(state.path())
-        .unwrap();
+        Config::default()
+            .choose(false, 0)
+            .save(state.path())
+            .unwrap();
         let (transport, bodies) = capture(200);
         assert_eq!(
             uploader(state.path(), transport).run_cycle(),
@@ -682,12 +749,10 @@ mod tests {
         let dir = spool::spool_dir(state.path());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("app-1-0-0000.jsonl"), "{}\n").unwrap();
-        Config {
-            upload: false,
-            name: None,
-        }
-        .save(state.path())
-        .unwrap();
+        Config::default()
+            .choose(false, 0)
+            .save(state.path())
+            .unwrap();
         let (transport, bodies) = capture(202);
         let handle = uploader(state.path(), transport).spawn().unwrap();
         match handle.upload_now(Duration::from_secs(10)) {

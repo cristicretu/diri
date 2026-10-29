@@ -2547,7 +2547,7 @@ Saved Claude and Codex logins are stored in owner-only files beside the Engine's
 On macOS the updater downloads a versioned ZIP from GitHub Releases, checks its SHA-256 against the release feed, verifies the code signature, Team ID, bundle identifier and notarization, and refuses downgrades. Linux packages do not update in place. Each Linux release file has a Sigstore signature you can check with `cosign verify-blob`, as described in [diri/LINUX.md](https://github.com/cristicretu/diri/blob/main/diri/LINUX.md).
 
 ## Diagnostics and privacy
-diri has no account system and no advertising. It records diagnostics so bugs can be fixed from a report, and shares them with the project unless you turn sharing off.
+diri has no account system and no advertising. It records diagnostics locally so bugs can be fixed from a report. Sharing them with the project is opt-in: a new install asks once and uploads nothing until you choose **Share**. Installs from before opt-in keep the setting they had.
 
 Every diri process keeps a local log in `~/Library/Application Support/Dirijor/telemetry/spool`, capped at 64 MiB.
 
@@ -2562,14 +2562,14 @@ Every diri process keeps a local log in `~/Library/Application Support/Dirijor/t
 | Command names, session ids, agent names, conversation ids | Passwords or keys |
 | Folders, only as a one-way hash | Free-form error messages and stderr |
 
-Unless you turn sharing off, the Engine uploads the log about once an hour, or within a minute after a crash, to a Cloudflare Worker run by the project. Uploads carry a random install id, your short Support ID and a name, which defaults to your macOS login name. They are kept for 30 days and readable only by the maintainers.
+If you share, the Engine uploads the log about once an hour, or within a minute after a crash, to a Cloudflare Worker run by the project, starting from the moment you opted in. Uploads carry a random install id, your short Support ID and the name you set: empty on a new install, your macOS login name on installs from before opt-in. They are kept for 30 days and readable only by the maintainers.
 
 ### Your controls
-Open **Settings → General → Privacy**:
+Open **Settings → Privacy**:
 
 | Control | What it does |
 | --- | --- |
-| **Share diagnostics to help fix bugs** | Turns uploads on or off. Off stops uploads at the next cycle. Recording stays local. |
+| **Share diagnostics to help fix bugs** | Turns uploads on or off. Off on a new install until you opt in. Off stops uploads at the next cycle. Recording stays local. |
 | Name | Change or clear the name sent with uploads. |
 | Support ID | The id to quote in a bug report. |
 | **Send now** | Uploads what has been recorded so far, once, even with sharing off. |
@@ -2577,7 +2577,7 @@ Open **Settings → General → Privacy**:
 
 To turn recording off entirely, set `DIRI_TELEMETRY=off` in diri's environment. Missing or unreadable privacy settings turn uploads off.
 
-diri also connects to GitHub Releases for updates, and makes network connections when you use remote hosts, pull request monitoring, browser automation, or an agent that uses the network. diri does not proxy that traffic. The full policy is in [PRIVACY.md](https://github.com/cristicretu/diri/blob/main/PRIVACY.md).
+Every other network connection diri makes, what it sends and how to turn it off, is listed in [Privacy and network connections](/docs/privacy/). diri does not proxy agent traffic. The full policy is in [PRIVACY.md](https://github.com/cristicretu/diri/blob/main/PRIVACY.md).
 
 ## Report a vulnerability
 Use [GitHub private vulnerability reporting](https://github.com/cristicretu/diri/security/advisories/new). Do not put exploits, private terminal output, tokens or personal paths in a public issue.
@@ -2585,6 +2585,50 @@ Use [GitHub private vulnerability reporting](https://github.com/cristicretu/diri
 Include the diri and OS versions, a minimal reproduction, the impact you believe is possible, and any suggested fix. You should get an acknowledgement within seven days. Fixes go into the latest release.
 
 In scope: permission-boundary bypasses, unsafe update or IPC behaviour, credential disclosure, session isolation failures and unintended remote execution. A tool doing something you explicitly allowed is not a diri vulnerability.
+
+
+---
+
+Source: https://diri.sh/docs/privacy/
+
+# Privacy and network connections
+
+> What diri sends over the network, when, and how to turn each connection off. Diagnostics sharing is opt-in for new installs; update checks carry no identifiers.
+
+diri has no account system, no advertising and no hosted relay. Your agents talk to their own services with their own sign-ins; diri does not proxy that traffic.
+
+## Diagnostics are opt-in
+On a new install diri asks once, in a small notice at the bottom of the window, whether to share anonymous diagnostics. Nothing is uploaded unless you choose **Share**. Ignoring the notice or choosing **Not now** keeps sharing off, and diri does not ask again. Change your answer any time in **Settings › Privacy › Share diagnostics**.
+
+Installs from before this change keep the setting they already had.
+
+Every diri process still keeps a local diagnostics log in `~/Library/Application Support/Dirijor/telemetry/spool`, capped at 64 MiB, so a bug you report can be investigated. It stays on your machine unless you share it. Crash reports follow the same rule. When you opt in, routine uploads include only what was recorded after you said yes. [Security model](/docs/security/#diagnostics-and-privacy) lists exactly what is and is not recorded.
+
+## Every connection
+
+| Connection | Goes to | What is sent | When | Optional | How to turn it off |
+| --- | --- | --- | --- | --- | --- |
+| **Diagnostics** | telemetry.diri.sh (Cloudflare Worker run by the project) | Recorded diagnostics (crashes, hangs, errors, timings, counts), a random install id, your Support ID, app/OS/CPU versions and the name you set. Never terminal contents, prompts, files or environment variables. | About once an hour, and within a minute after a crash, by the Engine. | Opt-in. New installs send nothing until you choose Share. Existing installs keep the setting they already had. | Settings › Privacy › Share diagnostics. `DIRI_TELEMETRY=off` also stops recording. |
+| **Send now and Report a Problem** | telemetry.diri.sh | The same diagnostics as above, once. | Only when you click Send now or Help › Report a Problem. | Yes. The click is the consent, even with sharing off. | Don't click them. |
+| **Update checks** | GitHub Releases (appcast.json and the release ZIP), with updates.diri.sh as a mirror when GitHub is slow | Plain downloads. No install id, cookies or account; only a fixed `diri-updater` User-Agent and your IP address. | 20 seconds after launch, then every 6 hours, and when you click Check for Updates. | Yes. | Turn off automatic updates in Settings. `DIRI_UPDATE_MIRROR=off` uses GitHub only. |
+| **Release notes** | api.github.com (the latest diri release) | A plain request, no identifiers. The What's New clips ship inside the app and are never downloaded. | When you open Settings › What's New. | Yes. | Don't open that tab. |
+| **Claude and Codex usage limits** | api.anthropic.com and chatgpt.com | The agent's own sign-in token, read from Claude Code's keychain item or Codex's auth file, to read your remaining quota and account profile. Tokens are never refreshed or sent anywhere else. | When you open the account menu or Accounts settings, on account switching, and every 3 minutes if the sidebar shows remaining quota. | Yes. | Keep the sidebar indicator on its default and don't open the account menu. |
+| **Cursor usage** | cursor.com and api2.cursor.sh | Cursor's own session token and machine id, to read your Cursor usage events. Refreshes the Cursor token when it has expired. | At launch and every minute, only if Cursor is signed in on this machine. | Only runs with a Cursor sign-in. | Sign out of Cursor. There is no separate switch yet. |
+| **Pull request status** | GitHub, through your own `gh` CLI | Pull request links that appeared in your sessions, with your `gh` sign-in. | Every minute while diri is in front, every 5 minutes or less often in the background, and when you open Worktrees. | Only runs when `gh` is installed. | Uninstall or sign out of `gh`. |
+| **Your SSH hosts** | The hosts you add, through your own `ssh` and `scp` | Session input and output, the diri-remote helper binary (copied from the app, never downloaded), pasted images, and usage queries. | Only for remote sessions and hosts you configure. | Yes. | Remove the host. |
+| **Git remotes** | Your repository's `origin`, through your own `git` | Your git credentials and the session branch. | A fetch before starting an agent in a new worktree from the default branch, and push/fetch when you move a session to another machine. | Yes. Offline it uses the last fetched branch. | Start agents without a new worktree, and don't move sessions. |
+| **Agent installers** | The agent vendor's installer (claude.ai, chatgpt.com, npm, opencode.ai and others) | Whatever the vendor's installer sends. diri types the command into a terminal you can see. | Only when you click Install for an agent and confirm. | Yes. | Install agents yourself. |
+| **Computer use driver** | github.com (a pinned cua-driver release, checked by SHA-256 and signing team) | A plain download. | Only when you click Set up in Settings › Agents › Computer use. | Yes. | Don't set it up. |
+| **Kokoro voice** | huggingface.co, github.com and raw.githubusercontent.com | Plain downloads of the voice model, checked by SHA-256. Speech recognition and system voices stay on device. | When you pick a Kokoro voice and its files are missing. | Yes. | Use a system voice (the default). |
+| **API tab** | Any URL you or an agent enter | The request as written. | When you click Send. An agent may send a GET it opened for you. | Yes. | Don't use the API tab. |
+| **Browser** | Any site you or an agent open | Normal web traffic from the in-app browser or the agent browser tool (your own Node and Playwright). | Only while you or an agent browse. | Yes. | Don't use the browser. |
+| **Phone access** | Local: listens on your Tailscale address only, and asks the local Tailscale service who is connecting | Nothing to the internet. No relay or cloud pairing service. | Only while Phone access is turned on in Settings. | Yes, off by default. | Turn off Phone access. |
+| **Engine and MCP** | Local: a Unix socket and a loopback-only MCP port | Nothing leaves the machine. | Always, between diri's own processes and the agents it starts. | Required. | Not needed: it never leaves the machine. |
+
+## Not fetched
+diri does not download fonts, images, avatars or web assets. What's New clips, agent definitions and model prices ship inside the app. Links you click open in your browser; diri never requests them itself.
+
+The full policy is in [PRIVACY.md](https://github.com/cristicretu/diri/blob/main/PRIVACY.md).
 
 
 ---

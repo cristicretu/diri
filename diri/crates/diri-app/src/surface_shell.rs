@@ -5009,6 +5009,7 @@ impl UtilitySurfaces {
                 .flex_col()
                 .gap(px(SETTINGS_SECTION_GAP))
                 .child(self.privacy_settings(cx))
+                .child(self.network_connections_settings(cx))
                 .child(self.developer_settings(cx)),
             colors,
         )
@@ -11026,6 +11027,7 @@ mod tests {
                         config: diri_telemetry::Config {
                             upload: privacy != "off",
                             name: Some("alex".into()),
+                            chosen_ms: Some(1),
                         },
                         support_id: Some("D-7K3MQ9XA".into()),
                         login_name: Some("alex".into()),

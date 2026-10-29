@@ -34,6 +34,7 @@ Each page is available as Markdown at the URL below. The docs are concatenated i
 ## Reference
 
 - [Security model](https://diri.sh/docs/security.md): What diri protects and what it does not. Agent privileges, MCP and CLI authority, lineage rules, remote trust, diagnostics and privacy, and how to report a vulnerability.
+- [Privacy and network connections](https://diri.sh/docs/privacy.md): What diri sends over the network, when, and how to turn each connection off. Diagnostics sharing is opt-in for new installs; update checks carry no identifiers.
 - [Troubleshooting](https://diri.sh/docs/troubleshooting.md): Diagnose diri problems with dirijor doctor, find logs and state on macOS and Linux, fix common agent and remote issues, and file a useful bug report.
 
 ## Agents

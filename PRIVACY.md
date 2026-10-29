@@ -2,7 +2,7 @@
 
 Diri has no account system or advertising. It records diagnostics (crashes,
 hangs, errors and timings) so bugs can be fixed from a report instead of a
-reproduction, and shares them with the project unless you turn that off. The
+reproduction. Sharing them with the project is opt-in for new installs. The
 project does not run a service that receives your terminal contents or session
 history.
 
@@ -30,11 +30,16 @@ locations remain available for diagnosing crashes.
 text, file contents, environment variables, command lines, URLs you open,
 passwords or keys.
 
-**Where it goes:** unless you turn sharing off, the Engine uploads the log
-about once an hour (within a minute after a crash or other incident) to a
-Cloudflare Worker operated by the project. Uploads carry a random install id,
-the short Support ID derived from it, and the name you chose (your macOS login
-name unless you change or clear it). They are kept for 30 days and then
+**Where it goes:** only if you share. A new install asks once, in a
+non-blocking notice, and uploads nothing until you choose *Share*; ignoring
+the notice keeps sharing off and it is not shown again. Installs from before
+opt-in keep the setting they already had. When sharing is on, the Engine
+uploads the log about once an hour (within a minute after a crash or other
+incident) to a Cloudflare Worker operated by the project; after an opt-in,
+only what was recorded from that moment on. Crash reports follow the same
+rule. Uploads carry a random install id, the short Support ID derived from
+it, and the name you chose (empty on a new install; your macOS login name on
+installs from before opt-in, unless you changed or cleared it). They are kept for 30 days and then
 deleted; only the maintainers can read them.
 
 **Your controls:** Settings › General › Privacy has the switch (*Share
@@ -67,12 +72,15 @@ after Diri and its daemon are stopped.
 
 ## Network activity
 
-Diri connects to GitHub Releases to check for and download updates, and to the
-project's diagnostics service unless you turn sharing off (see above). It may also
-make network connections when you explicitly use remote hosts, PR monitoring,
-browser automation, or a tool/agent that uses the network. Those tools and
-services have their own privacy practices. Diri does not proxy their traffic
-through a Diri-operated server.
+Every outbound connection, with what it sends, when, and how to turn it off,
+is listed at [diri.sh/docs/privacy](https://diri.sh/docs/privacy/) and in
+Settings › Privacy (source: `website/docs-src/connections.json`). In short:
+update checks (GitHub Releases, no identifiers), diagnostics (opt-in, see
+above), and connections for features you use: agent usage limits, Cursor
+usage, pull request status through `gh`, your SSH hosts and git remotes, agent
+and computer-use installers, voice model downloads, the API tab and the
+browser. Those tools and services have their own privacy practices. Diri does
+not proxy their traffic through a Diri-operated server.
 
 Remote-node credentials remain in the mechanisms you configure (for example,
 SSH configuration and your keychain); they are not sent to the Diri project.

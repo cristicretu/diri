@@ -82,19 +82,27 @@ pub fn support_id(install_id: &str) -> String {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
-    /// Upload recorded diagnostics. Recording itself is always local.
+    /// Upload recorded diagnostics. Recording itself is always local. Off
+    /// for a new install until the person opts in; settings written before
+    /// sharing became opt-in keep whatever they say.
     pub upload: bool,
     /// The name shown next to this install when investigating a report.
-    /// `None` means "never set": the login name is used. `Some("")` means
-    /// the user cleared it.
+    /// `None` means "never set": the login name is used (installs from
+    /// before opt-in). `Some("")` means anonymous, a new install's default.
     pub name: Option<String>,
+    /// When the person last chose, in the first-run prompt or in Settings.
+    /// Absent in files written before sharing became opt-in. A routine
+    /// upload sends only what was recorded after this moment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chosen_ms: Option<u64>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            upload: true,
-            name: None,
+            upload: false,
+            name: Some(String::new()),
+            chosen_ms: None,
         }
     }
 }
@@ -105,10 +113,30 @@ impl Config {
         std::fs::read(telemetry_dir(state_dir).join(CONFIG_FILE))
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_else(|| Self {
-                upload: false,
-                name: Some(String::new()),
-            })
+            .unwrap_or_default()
+    }
+
+    /// Whether settings were ever written (by the prompt, Settings, or a
+    /// build from when sharing was on by default).
+    #[must_use]
+    pub fn exists(state_dir: &Path) -> bool {
+        telemetry_dir(state_dir).join(CONFIG_FILE).is_file()
+    }
+
+    /// Whether routine uploads may run.
+    #[must_use]
+    pub fn sharing_allowed(&self) -> bool {
+        self.upload
+    }
+
+    /// Records the person's answer, keeping the name as it is.
+    #[must_use]
+    pub fn choose(&self, upload: bool, now_ms: u64) -> Self {
+        Self {
+            upload,
+            name: self.name.clone(),
+            chosen_ms: Some(now_ms),
+        }
     }
 
     pub fn save(&self, state_dir: &Path) -> std::io::Result<()> {
@@ -221,11 +249,11 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         for data in ["{", "{}", r#"{"name":"someone"}"#, r#"{"upload":"false"}"#] {
             std::fs::write(&path, data).unwrap();
-            assert!(!Config::load(state.path()).upload, "{data}");
+            assert!(!Config::load(state.path()).sharing_allowed(), "{data}");
         }
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
-        assert!(!Config::load(state.path()).upload);
+        assert!(!Config::load(state.path()).sharing_allowed());
     }
 
     #[test]
@@ -267,21 +295,43 @@ mod tests {
     }
 
     #[test]
-    fn config_defaults_to_upload_with_login_name() {
+    fn sharing_is_off_until_chosen() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!Config::load(dir.path()).upload);
-        Config::default().save(dir.path()).unwrap();
-        let config = Config::load(dir.path());
-        assert!(config.upload);
-        assert_eq!(config.effective_name(), login_name());
+        assert!(!Config::exists(dir.path()));
+        let fresh = Config::load(dir.path());
+        assert!(!fresh.sharing_allowed());
+        assert_eq!(fresh.effective_name(), None, "anonymous by default");
 
-        let cleared = Config {
-            upload: false,
-            name: Some("  ".into()),
-        };
-        cleared.save(dir.path()).unwrap();
+        Config::default().save(dir.path()).unwrap();
+        assert!(Config::exists(dir.path()));
+        assert!(!Config::load(dir.path()).sharing_allowed());
+
+        let granted = Config::default().choose(true, 42);
+        granted.save(dir.path()).unwrap();
         let loaded = Config::load(dir.path());
-        assert_eq!(loaded, cleared);
+        assert_eq!(loaded, granted);
+        assert!(loaded.sharing_allowed());
         assert_eq!(loaded.effective_name(), None);
+        assert!(!loaded.choose(false, 43).sharing_allowed());
+    }
+
+    #[test]
+    fn settings_from_before_opt_in_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = telemetry_dir(dir.path()).join(CONFIG_FILE);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // What builds before opt-in wrote on first run: still sharing, still
+        // named after the login.
+        std::fs::write(&path, r#"{"upload": true, "name": null}"#).unwrap();
+        let existing = Config::load(dir.path());
+        assert!(existing.sharing_allowed());
+        assert_eq!(existing.chosen_ms, None);
+        assert_eq!(existing.effective_name(), login_name());
+        std::fs::write(&path, r#"{"upload": false, "name": "alex"}"#).unwrap();
+        assert!(!Config::load(dir.path()).sharing_allowed());
+        assert_eq!(
+            Config::load(dir.path()).choose(true, 1).name.as_deref(),
+            Some("alex")
+        );
     }
 }

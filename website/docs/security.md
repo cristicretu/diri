@@ -58,7 +58,7 @@ Saved Claude and Codex logins are stored in owner-only files beside the Engine's
 On macOS the updater downloads a versioned ZIP from GitHub Releases, checks its SHA-256 against the release feed, verifies the code signature, Team ID, bundle identifier and notarization, and refuses downgrades. Linux packages do not update in place. Each Linux release file has a Sigstore signature you can check with `cosign verify-blob`, as described in [diri/LINUX.md](https://github.com/cristicretu/diri/blob/main/diri/LINUX.md).
 
 ## Diagnostics and privacy
-diri has no account system and no advertising. It records diagnostics so bugs can be fixed from a report, and shares them with the project unless you turn sharing off.
+diri has no account system and no advertising. It records diagnostics locally so bugs can be fixed from a report. Sharing them with the project is opt-in: a new install asks once and uploads nothing until you choose **Share**. Installs from before opt-in keep the setting they had.
 
 Every diri process keeps a local log in `~/Library/Application Support/Dirijor/telemetry/spool`, capped at 64 MiB.
 
@@ -73,14 +73,14 @@ Every diri process keeps a local log in `~/Library/Application Support/Dirijor/t
 | Command names, session ids, agent names, conversation ids | Passwords or keys |
 | Folders, only as a one-way hash | Free-form error messages and stderr |
 
-Unless you turn sharing off, the Engine uploads the log about once an hour, or within a minute after a crash, to a Cloudflare Worker run by the project. Uploads carry a random install id, your short Support ID and a name, which defaults to your macOS login name. They are kept for 30 days and readable only by the maintainers.
+If you share, the Engine uploads the log about once an hour, or within a minute after a crash, to a Cloudflare Worker run by the project, starting from the moment you opted in. Uploads carry a random install id, your short Support ID and the name you set: empty on a new install, your macOS login name on installs from before opt-in. They are kept for 30 days and readable only by the maintainers.
 
 ### Your controls
-Open **Settings → General → Privacy**:
+Open **Settings → Privacy**:
 
 | Control | What it does |
 | --- | --- |
-| **Share diagnostics to help fix bugs** | Turns uploads on or off. Off stops uploads at the next cycle. Recording stays local. |
+| **Share diagnostics to help fix bugs** | Turns uploads on or off. Off on a new install until you opt in. Off stops uploads at the next cycle. Recording stays local. |
 | Name | Change or clear the name sent with uploads. |
 | Support ID | The id to quote in a bug report. |
 | **Send now** | Uploads what has been recorded so far, once, even with sharing off. |
@@ -88,7 +88,7 @@ Open **Settings → General → Privacy**:
 
 To turn recording off entirely, set `DIRI_TELEMETRY=off` in diri's environment. Missing or unreadable privacy settings turn uploads off.
 
-diri also connects to GitHub Releases for updates, and makes network connections when you use remote hosts, pull request monitoring, browser automation, or an agent that uses the network. diri does not proxy that traffic. The full policy is in [PRIVACY.md](https://github.com/cristicretu/diri/blob/main/PRIVACY.md).
+Every other network connection diri makes, what it sends and how to turn it off, is listed in [Privacy and network connections](/docs/privacy/). diri does not proxy agent traffic. The full policy is in [PRIVACY.md](https://github.com/cristicretu/diri/blob/main/PRIVACY.md).
 
 ## Report a vulnerability
 Use [GitHub private vulnerability reporting](https://github.com/cristicretu/diri/security/advisories/new). Do not put exploits, private terminal output, tokens or personal paths in a public issue.

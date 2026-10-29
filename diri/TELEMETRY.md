@@ -34,7 +34,7 @@ Under the platform state dir (`~/Library/Application Support/Dirijor`):
 | Path | Owner | Content |
 |---|---|---|
 | `telemetry/install.json` | recorder | random install UUID, created time |
-| `telemetry/config.json` | app Settings | `{ "upload": bool, "name": string\|null }` |
+| `telemetry/config.json` | app Settings, first-run prompt | `{ "upload": bool, "name": string\|null, "chosen_ms"?: number }` |
 | `telemetry/spool/<proc>-<pid>-<start_ms>-<n>.open` | each process | JSONL being written |
 | `telemetry/spool/*.jsonl` | each process | rolled at 2 MiB |
 | `telemetry/spool/offsets.json` | uploader | bytes acknowledged per file |
@@ -46,7 +46,17 @@ The spool is capped at 64 MiB; oldest sealed files go first.
 
 The **Support ID** (`D-XXXXXXXX`, Crockford base32 of the first 40 bits of
 the install UUID) is shown in Settings > General > Privacy. The **name**
-defaults to the macOS login name; the user can edit or clear it.
+is empty (anonymous) on a new install; installs from before opt-in keep
+`null`, which means the macOS login name. The user can edit or clear it.
+
+**Consent.** Uploading is opt-in for new installs. With no `config.json`,
+the app's first run saves `{upload: false, name: ""}` and shows one
+non-blocking toast (*Share anonymous diagnostics?* with *Share* / *Not now*);
+ignoring it leaves sharing off and it is not shown again. An answer, or the
+Settings toggle, stamps `chosen_ms`, and routine uploads then send only
+records made after that moment. A `config.json` written before opt-in (no
+`chosen_ms`) is kept exactly as it is, so those installs keep their current
+setting and see no prompt. A missing or unreadable file never uploads.
 
 ## Record format
 
@@ -248,9 +258,9 @@ Support ID, *Send now*, *Show in Finder*) and Help › Report a Problem…. *Sen
 and Report a Problem call the Engine's `telemetry.upload_now` RPC, which runs
 one upload immediately (flushing the Engine's own recorder first) and ignores
 the sharing toggle: the click is the consent. There is no About
-surface, so the Support ID is shown only in Settings. The first run of a
-recording build shows one 20 s toast (*diri shares diagnostics*) and writes
-the default `telemetry/config.json`; the file's existence is the "seen" mark.
+surface, so the Support ID is shown only in Settings. A new install's first
+run asks once (see Consent) and writes `telemetry/config.json`; the file's
+existence is the "asked" mark.
 
 **Health gauges:** `windows_main`, `windows_floating` (menus, palette,
 popovers: each is a window), `windows_opened` (lifetime), `terminal_panes`,
@@ -306,7 +316,7 @@ hang that ends in Force Quit still leaves a record. Durations are lower bounds
 | `ui.stall` | warn (1–3 s), incident (≥ 3 s) | `ms, ongoing, active, was_active` (frontmost when it began), `cpu_ms` (main-thread CPU during it), `faults`, `action` (static action name that finished inside it), `surface` (what the last main-window frame showed, as on `ui.slow_frame`), `stack` (macOS: the main thread's call stack sampled 2 s into the stall, innermost first, each frame `image symbol` or `image +0xoffset`: image file names and function names only, never paths or stack data) | beachballs, hangs; `ongoing=true` is written at 5 s while still stuck. `cpu_ms` ≈ `ms`: busy on the main thread; ≈ 0: blocked (lock, synchronous call, AppKit) or not scheduled; `stack` names the code either way |
 | `ui.action` | debug | `action` (GPUI action name), `source` (`shortcut`\|`palette`) | what the user did just before a failure |
 | `ui.toast` | info | `title` (static toast title) | errors the user was shown ("Terminal", "Target unavailable", …) |
-| `privacy.notice_shown` / `privacy.upload_changed` | info | `upload` | consent history |
+| `privacy.prompt_shown` / `privacy.upload_changed` | info | `upload` | consent history (`privacy.notice_shown` in builds before opt-in) |
 | `settings.privacy_save_failed` | error | `io` (io kind) | failed save; the UI keeps the confirmed value and shows an error |
 | `user.report` | incident | `version, support_id` | Help › Report a Problem…: the moment to look around (uploaded immediately) |
 | `telemetry.upload_now` | info | `status, batches` | Engine: a user-requested upload and its outcome (`sent`, `up_to_date`, `failed`, `timeout`, `unavailable`) |
