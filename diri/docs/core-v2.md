@@ -286,6 +286,10 @@ Each PR lands on its own, behind the single `core-v2` cargo feature of `diri-ter
    - Remaining: close the 1.5% gap in rows kept against today's Engine.
    - Then wire packing through the `HeadlessScreen` adapter, and pass the regenerated full-history golden (#921).
 7. **Inline images and checkpoints** on v2, with the existing image and checkpoint tests.
+7b. **The Engine and the Remote Helper on v2.** Status: done on `core/v2-helper`.
+   - With `diri-terminal-state/core-v2-screen` on, the Remote Helper's whole suite passes (`diri-remote`), and so does the Engine's: attach, mirrors, checkpoints and sessions.
+   - The one exception is paging idle history out to the cold store (#958), which is step 6.
+   - CI's Linux x86_64 job runs both suites with the switch on.
 8. **Switch.** Enable `core-v2` for the Engine and the Remote Helper after a soak on the nightly channel. Holder→Engine vtbench before/after; `PERF.md` gates unchanged or better.
 9. **Remove** the old grid, compact history and the unused vendored selection/search/vi-mode code.
 
