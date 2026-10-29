@@ -21,6 +21,11 @@ diri-terminal-state.workspace = true
 # The Engine serves the `dirijor` MCP tools over loopback HTTP with the same
 # message handling as the stdio frontend (see src/mcp_http.rs).
 dirijor-mcp = { path = "../dirijor-mcp" }
+# Seals idle terminal history paged out to the owner-only swap file
+# (src/history_swap.rs) with a per-Engine key held only in memory. RustCrypto's
+# AES and cipher crates are already in the graph; this adds the GCM mode and
+# GHASH. Authenticated encryption, not a hand-rolled MAC, is the reason.
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
 getrandom.workspace = true
 # Already in the graph through diri-terminal-state and the vendored parser;
 # the Engine pump scans every output byte for the Holder exit marker with it.

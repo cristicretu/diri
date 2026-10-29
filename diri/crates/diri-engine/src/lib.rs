@@ -48,6 +48,7 @@ pub mod events;
 pub mod git;
 pub mod governor;
 pub mod history;
+pub mod history_swap;
 pub mod holder;
 pub mod hooks;
 pub mod hosts;

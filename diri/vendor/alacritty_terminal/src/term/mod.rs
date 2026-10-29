@@ -595,6 +595,33 @@ impl<T> Term<T> {
         self.primary_grid_mut().release_history_spare_rows();
     }
 
+    /// DIRI PATCH: page the primary grid's idle history out to `store`
+    /// (see [`Grid::page_out_history`]), also while the alternate screen is
+    /// shown.
+    #[cfg(feature = "compact-history")]
+    pub fn page_out_primary_history(
+        &mut self,
+        store: &std::sync::Arc<dyn crate::grid::cold::ColdStore>,
+        keep_rows: usize,
+        min_bytes: usize,
+    ) -> std::io::Result<crate::grid::cold::PageOut> {
+        self.primary_grid_mut()
+            .page_out_history(store, keep_rows, min_bytes)
+    }
+
+    /// Where the primary history's payloads live.
+    #[cfg(feature = "compact-history")]
+    pub fn primary_history_residency(&self) -> crate::grid::compact::PayloadResidency {
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            self.inactive_grid
+                .as_ref()
+                .expect("primary grid")
+                .history_residency()
+        } else {
+            self.grid.history_residency()
+        }
+    }
+
     #[cfg(feature = "compact-history")]
     fn primary_grid_mut(&mut self) -> &mut Grid<Cell> {
         if self.mode.contains(TermMode::ALT_SCREEN) {

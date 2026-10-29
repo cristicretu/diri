@@ -169,6 +169,17 @@ pub(crate) trait Emulator: Handler + Sized {
     fn prepare_history_read(&mut self);
     #[cfg(feature = "compact-history")]
     fn release_history_read_cache(&mut self);
+    /// Pages idle primary history out to `store`; see
+    /// [`crate::HeadlessScreen::page_out_history`].
+    #[cfg(feature = "compact-history")]
+    fn page_out_history(
+        &mut self,
+        store: &std::sync::Arc<dyn crate::ColdStore>,
+        keep_rows: usize,
+        min_bytes: usize,
+    ) -> std::io::Result<crate::PageOut>;
+    #[cfg(feature = "compact-history")]
+    fn history_residency(&self) -> crate::PayloadResidency;
 
     // Keyboard protocol.
 
@@ -457,6 +468,21 @@ impl Emulator for Term<Collector> {
     #[cfg(feature = "compact-history")]
     fn release_history_read_cache(&mut self) {
         self.grid_mut().release_history_read_cache();
+    }
+
+    #[cfg(feature = "compact-history")]
+    fn page_out_history(
+        &mut self,
+        store: &std::sync::Arc<dyn crate::ColdStore>,
+        keep_rows: usize,
+        min_bytes: usize,
+    ) -> std::io::Result<crate::PageOut> {
+        self.page_out_primary_history(store, keep_rows, min_bytes)
+    }
+
+    #[cfg(feature = "compact-history")]
+    fn history_residency(&self) -> crate::PayloadResidency {
+        self.primary_history_residency()
     }
 
     fn kitty_keyboard_enabled(&self) -> bool {
