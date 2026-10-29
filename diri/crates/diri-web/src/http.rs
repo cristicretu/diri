@@ -35,6 +35,9 @@ pub struct Request {
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
     keep_alive: bool,
+    /// Set by the connection loop when tailnet admission let this request
+    /// in. Never parsed from the wire.
+    pub admitted: bool,
 }
 
 impl Request {
@@ -178,6 +181,7 @@ where
         headers,
         body,
         keep_alive,
+        admitted: false,
     }))
 }
 
@@ -235,6 +239,18 @@ impl Response {
             status,
             content_type,
             body: body.into(),
+            extra_headers: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    /// An error with a stable machine-readable `code` beside the message.
+    pub fn coded_error(status: u16, code: &str, message: &str) -> Self {
+        Self {
+            status,
+            content_type: "application/json; charset=utf-8",
+            body: serde_json::to_vec(&serde_json::json!({ "error": message, "code": code }))
+                .unwrap_or_else(|_| b"{}".to_vec()),
             extra_headers: Vec::new(),
         }
     }

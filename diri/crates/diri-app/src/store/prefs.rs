@@ -673,6 +673,9 @@ pub struct Prefs {
     /// Turn Diri's animations off even when macOS animates. Reduce Motion
     /// in System Settings turns them off as well; see `crate::motion`.
     pub reduce_motion: bool,
+    /// Phone access admits callers by Tailscale identity and per-device
+    /// pairing instead of a shared code. Off by default.
+    pub phone_tailnet_identity: bool,
     pub status_sounds: bool,
     pub status_notifications: bool,
     /// Which channels blocked, failed and finished sessions reach.
@@ -942,6 +945,7 @@ impl Default for Prefs {
             ui_language: UiLanguage::System,
             confirm_before_closing_session: true,
             reduce_motion: false,
+            phone_tailnet_identity: false,
             status_sounds: true,
             status_notifications: true,
             attention_routes: AttentionRoutes::default(),

@@ -1637,6 +1637,18 @@ an image service, log, or preferences file. The iPhone stores its credential
 in Keychain and refuses HTTP redirects. Anyone with this credential and
 tailnet reachability can control all sessions exposed by that Engine.
 
+Tailnet admission (October 2026, off by default, Settings → Phone access →
+*Identify devices with Tailscale*; `diri-web --admit tailnet` standalone)
+replaces the shared credential with per-connection identity. The gateway asks
+the host's own `tailscaled` LocalAPI (Unix socket, the standalone macOS app's
+loopback port, or the `tailscale` CLI) who the peer is, and admits only the
+owner's untagged devices that were paired with a single-use, ten-minute code
+and are still in the owner-only device list. Each device is revoked on its
+own; revocation closes its live streams. An unreachable LocalAPI fails closed
+with `tailnet_identity_unavailable` and never falls back to the token. No
+`tsnet` is bundled and Tailscale is never configured. Design, threat model
+and later phases: `docs/remote-access.md`.
+
 Turning access off aborts the listener and all accepted HTTP/SSE connections.
 Re-enabling rotates the credential. The gateway lives only as long as the Mac
 app; disabling it does not kill sessions. On macOS an app-lifetime `caffeinate`

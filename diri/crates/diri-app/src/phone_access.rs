@@ -1,6 +1,11 @@
-//! App-lifetime phone gateway; no service install or public bind. Its pairing
-//! token persists owner-only in the app's support directory so phones stay
-//! paired across restarts; [`PhoneAccess::reset_pairing`] rotates it.
+//! App-lifetime phone gateway; no service install or public bind.
+//!
+//! Two admission modes. By default a pairing token persists owner-only in
+//! the app's support directory so phones stay paired across restarts;
+//! [`PhoneAccess::reset_pairing`] rotates it. With "Identify devices with
+//! Tailscale" on, there is no standing secret: each connection is identified
+//! by the Mac's own tailscaled (WhoIs), only the owner's untagged devices
+//! paired with a one-time code get in, and each can be revoked on its own.
 use std::{
     net::Ipv4Addr,
     process::{Child, Command, Stdio},
@@ -11,20 +16,35 @@ use std::{
 pub struct PhoneAccess {
     pub url: String,
     pub qr: qrcode::QrCode,
+    address: Ipv4Addr,
+    /// `Some` under tailnet admission.
+    devices: Option<Arc<diri_web::Devices>>,
     server: tokio::task::JoinHandle<Result<(), String>>,
     awake: Option<Child>,
 }
 
+/// The store of devices paired under tailnet admission. One per app, shared
+/// by Settings and the gateway so a revocation closes live connections.
+pub fn paired_devices() -> Arc<diri_web::Devices> {
+    Arc::new(diri_web::Devices::open(diri_web::phone_devices_path()))
+}
+
 impl PhoneAccess {
-    pub async fn start(client: Arc<diri_client::DaemonClient>) -> Result<Self, String> {
+    pub async fn start(
+        client: Arc<diri_client::DaemonClient>,
+        tailnet: Option<Arc<diri_web::Devices>>,
+    ) -> Result<Self, String> {
         let address = tailscale_address().await?;
-        let (url, server) = diri_web::start_phone_access(
-            address,
-            client,
-            "Your Mac".into(),
-            &diri_web::phone_token_path(),
-        )
-        .await?;
+        let admission = match &tailnet {
+            None => diri_web::PhoneAdmission::Token(diri_web::phone_token_path()),
+            Some(devices) => diri_web::PhoneAdmission::Tailnet {
+                local: diri_web::LocalApi::discover()
+                    .ok_or_else(|| TailscaleSetup::NotInstalled.message().to_owned())?,
+                devices: Arc::clone(devices),
+            },
+        };
+        let (url, server) =
+            diri_web::start_phone_access(address, client, "Your Mac".into(), admission).await?;
         let qr = match qrcode::QrCode::new(url.as_bytes()) {
             Ok(qr) => qr,
             Err(error) => {
@@ -57,9 +77,29 @@ impl PhoneAccess {
         Ok(Self {
             url,
             qr,
+            address,
+            devices: tailnet,
             server,
             awake,
         })
+    }
+
+    /// Whether this gateway admits by Tailscale identity and pairing.
+    pub fn identifies_devices(&self) -> bool {
+        self.devices.is_some()
+    }
+
+    /// Replaces the one-time pairing code shown in the QR (tailnet admission
+    /// only). Paired devices are unaffected.
+    pub fn new_pairing_code(&mut self) -> Result<(), String> {
+        let Some(devices) = &self.devices else {
+            return Ok(());
+        };
+        let code = devices.mint_code().map_err(|error| error.to_string())?;
+        let url = diri_web::phone_link(self.address, &code);
+        self.qr = qrcode::QrCode::new(url.as_bytes()).map_err(|error| error.to_string())?;
+        self.url = url;
+        Ok(())
     }
 
     /// Replaces the pairing code: every paired phone must scan the new one.

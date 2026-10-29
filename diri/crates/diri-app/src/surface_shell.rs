@@ -566,6 +566,9 @@ pub struct UtilitySurfaces {
     phone_loading: bool,
     phone_error: Option<String>,
     phone_setup: Option<crate::phone_access::TailscaleSetup>,
+    /// Devices paired under Tailscale identity admission; shared with the
+    /// gateway so removing one closes its connections at once.
+    phone_devices: Arc<diri_web::Devices>,
     focus: FocusHandle,
     surface: Surface,
     worktrees: WorktreesSheet,
@@ -825,6 +828,7 @@ impl UtilitySurfaces {
             phone_loading: false,
             phone_error: None,
             phone_setup: None,
+            phone_devices: crate::phone_access::paired_devices(),
             surface: if diagnostics_preview {
                 Surface::Diagnostics
             } else if settings_preview.is_some() {
@@ -3712,9 +3716,13 @@ impl UtilitySurfaces {
                                     this.phone_loading = true;
                                     this.phone_error = None;
                                     let client = Arc::clone(this.store_runtime.client());
-                                    let task = this
-                                        .runtime
-                                        .spawn(crate::phone_access::PhoneAccess::start(client));
+                                    let tailnet = this
+                                        .prefs
+                                        .phone_tailnet_identity
+                                        .then(|| Arc::clone(&this.phone_devices));
+                                    let task = this.runtime.spawn(
+                                        crate::phone_access::PhoneAccess::start(client, tailnet),
+                                    );
                                     cx.spawn(async move |this, cx| {
                                         let result = task
                                             .await
@@ -3788,8 +3796,16 @@ impl UtilitySurfaces {
                                 .flex()
                                 .flex_col()
                                 .gap(px(10.0))
-                                .child(copy(t("settings.phone.scan_hint")))
-                                .child(copy(t("settings.phone.code_warning")))
+                                .child(copy(if access.identifies_devices() {
+                                    t("settings.phone.pair_hint")
+                                } else {
+                                    t("settings.phone.scan_hint")
+                                }))
+                                .child(copy(if access.identifies_devices() {
+                                    t("settings.phone.pair_warning")
+                                } else {
+                                    t("settings.phone.code_warning")
+                                }))
                                 .child(
                                     div()
                                         .flex()
@@ -3815,6 +3831,19 @@ impl UtilitySurfaces {
                                             colors,
                                             cx,
                                             |this, cx| {
+                                                // A one-time code is replaced
+                                                // in place; paired devices
+                                                // stay connected.
+                                                if let Some(access) = this
+                                                    .phone_access
+                                                    .as_mut()
+                                                    .filter(|access| access.identifies_devices())
+                                                {
+                                                    this.phone_error =
+                                                        access.new_pairing_code().err();
+                                                    cx.notify();
+                                                    return;
+                                                }
                                                 // Stop serving the old code
                                                 // before it is replaced.
                                                 this.phone_access = None;
@@ -3824,8 +3853,10 @@ impl UtilitySurfaces {
                                                     Arc::clone(this.store_runtime.client());
                                                 let task = this.runtime.spawn(async move {
                                                     crate::phone_access::PhoneAccess::reset_pairing()?;
-                                                    crate::phone_access::PhoneAccess::start(client)
-                                                        .await
+                                                    crate::phone_access::PhoneAccess::start(
+                                                        client, None,
+                                                    )
+                                                    .await
                                                 });
                                                 cx.spawn(async move |this, cx| {
                                                     let result = task
@@ -3863,7 +3894,76 @@ impl UtilitySurfaces {
                     colors,
                 ))
             });
+        let content = content.child(self.phone_identity_settings(cx));
         settings_page(t("settings.phone.title"), content, colors)
+    }
+
+    /// Who may connect: the identity toggle and, when it is on, the paired
+    /// devices with a per-device Remove.
+    fn phone_identity_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let enabled = self.prefs.phone_tailnet_identity;
+        let devices = if enabled {
+            self.phone_devices.list()
+        } else {
+            Vec::new()
+        };
+        let mut section = div().flex().flex_col().child(toggle_row(
+            t("settings.phone.identity"),
+            t("settings.phone.identity_detail"),
+            enabled,
+            "phone-identity",
+            colors,
+            cx,
+            |this, cx| {
+                let enabled = !this.prefs.phone_tailnet_identity;
+                if this.update_prefs(move |prefs| prefs.phone_tailnet_identity = enabled) {
+                    // The running gateway admits the old way; stop it so the
+                    // next Enable uses the new rule.
+                    this.phone_access = None;
+                }
+                cx.notify();
+            },
+        ));
+        if enabled {
+            section = section.child(setting_divider(colors));
+            if devices.is_empty() {
+                section = section.child(setting_row(
+                    t("settings.phone.devices"),
+                    t("settings.phone.no_devices"),
+                    div(),
+                    colors,
+                ));
+            }
+            for device in devices {
+                let id = device.id.clone();
+                let detail = [device.os.as_str(), device.login.as_str()]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                section = section.child(setting_row(
+                    device.name,
+                    detail,
+                    surface_button(
+                        t("settings.phone.remove_device"),
+                        SharedString::from(format!("phone-device-{}", device.id)),
+                        colors,
+                        cx,
+                        move |this, cx| {
+                            this.phone_error = this
+                                .phone_devices
+                                .revoke(&id)
+                                .err()
+                                .map(|error| error.to_string());
+                            cx.notify();
+                        },
+                    ),
+                    colors,
+                ));
+            }
+        }
+        setting_section(t("settings.phone.who_can_connect"), section, colors)
     }
 
     /// Decodes the thumbnails' stills once per appearance, off the main thread.
