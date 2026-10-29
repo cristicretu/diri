@@ -98,8 +98,18 @@ sticks. **Resize session to this phone** is the only path that calls
 as plain text.
 
 Tapping the terminal (or the keyboard button) types straight into the PTY via
-`/input`. The row above the keyboard has esc, tab, a sticky ctrl, arrows, `/`
-and `|`. A hardware keyboard sends ctrl and option combos, arrows, esc and
+`/input`. The row above the keyboard is the browser terminal's: esc, a sticky
+ctrl, ⇥, arrows (repeating while held), ⏎, ⇧⇥, ^C, `|`, `/`, `~`, `-`. It
+scrolls sideways and a key acts on release.
+
+A dropped stream reconnects with `?resume=COLSxROWS.<row digests>` and the
+gateway answers with only the rows that changed. It reconnects at once on a
+network change (the old socket is often open but dead) and on returning to the
+foreground, otherwise backs off with jitter up to 4 s; 45 s of silence (two
+missed heartbeats) counts as a drop. After 2 s without a frame the screen dims
+and says so, but keeps what it showed, even while the computer is unreachable.
+`DiriPhoneUITests/TerminalFixtureTests` drives this against `diri-web`'s
+`phone_fixture` (a fake Engine behind a real gateway). A hardware keyboard sends ctrl and option combos, arrows, esc and
 tab; ⌘V pastes (bracketed when the program asked for it), ⌘K switches
 session, ⌘[ / ⌘] go to the previous / next one, ⌘N starts one. The message
 field below the terminal still sends whole prompts through `/send`.

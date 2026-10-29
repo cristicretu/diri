@@ -103,8 +103,35 @@ struct TerminalBuffer {
             change.cursor = true
         }
         if let newModes = diff.modes { modes = newModes }
+        if let newPalette = diff.palette, newPalette != palette {
+            palette = newPalette
+            change.everything = true
+        }
         seq = diff.seq
         return .applied(change)
+    }
+
+    /// `?resume=` for a reconnect: this screen's width, height and one digest
+    /// per visible row. Nil before the first snapshot.
+    var resumeToken: String? {
+        guard hasSnapshot, !screen.isEmpty, screen.count <= 300 else { return nil }
+        var token = "\(cols)x\(screen.count)"
+        for line in screen {
+            token += "."
+            token += String(line.wireDigest, radix: 16)
+        }
+        return token
+    }
+
+    /// A `resume` frame: the rows that changed while the stream was down,
+    /// with cursor, modes, palette and history size. It restarts the frame
+    /// sequence, since a gateway that restarted counts from one again. Nil
+    /// when it does not fit this screen; the caller then asks for a snapshot.
+    mutating func resume(_ frame: GridDiff) -> Change? {
+        guard hasSnapshot, (frame.cols ?? cols) == cols, (frame.rows ?? rows) == rows, frame.seq > 0 else { return nil }
+        seq = 0
+        guard case let .applied(change) = apply(frame) else { return nil }
+        return change
     }
 
     /// Stores a history page.

@@ -519,7 +519,7 @@ final class TerminalView: UIScrollView, UIKeyInput, UITextInputTraits {
         get {
             let top = max(0, Int((contentOffset.y + adjustedContentInset.top) / lineHeight))
             let coloured = session.buffer.screen.filter(\.isColoured).count
-            return "top \(top) of \(totalLines); coloured \(coloured); cols \(session.buffer.cols)"
+            return "top \(top) of \(totalLines); coloured \(coloured); cols \(session.buffer.cols); snapshots \(session.snapshots); resumes \(session.resumes); resumed rows \(session.resumedRows); stale \(session.stale)"
         }
         set {}
     }
