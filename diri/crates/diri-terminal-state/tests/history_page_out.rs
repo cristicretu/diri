@@ -89,10 +89,6 @@ fn assert_same(paged: &mut HeadlessScreen, resident: &mut HeadlessScreen, step: 
 }
 
 #[test]
-#[cfg_attr(
-    feature = "core-v2-screen",
-    ignore = "core v2 keeps history in memory: cold paging is a later step (#958)"
-)]
 fn paged_out_history_matches_resident_history_through_output_resizes_and_reads() {
     let store = Arc::new(MemoryStore::default());
     let cold: Arc<dyn ColdStore> = store.clone();
@@ -135,7 +131,7 @@ fn paged_out_history_matches_resident_history_through_output_resizes_and_reads()
     );
 }
 
-/// Core v2 (no resize until reflow lands): paged-out pages read, checkpoint,
+/// Core v2: paged-out pages read, checkpoint,
 /// LZ-compress under budget pressure and evict exactly like resident ones.
 #[test]
 #[cfg(feature = "core-v2-screen")]

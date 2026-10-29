@@ -2452,12 +2452,14 @@ impl Pages {
     }
 
     /// Sets the row limit. A lower one drops the oldest rows at once: they
-    /// stay dropped if the limit is raised again.
+    /// stay dropped if the limit is raised again. So do the rows the old
+    /// limit already hid (whole pages are trimmed, so the oldest page can
+    /// hold rows past the limit): a raised limit, as a resize at capacity
+    /// sets, only makes room for new rows, as the current core's does.
     pub fn set_history_limit(&mut self, limit: usize) {
-        if limit < self.history_size() {
-            let keep_from = self.total - (self.lines + limit) as u64;
-            self.floor = self.floor.max(keep_from);
-        }
+        let keep = limit.min(self.history_size());
+        let keep_from = self.total - (self.lines + keep) as u64;
+        self.floor = self.floor.max(keep_from);
         self.history_limit = limit;
         let rows = self.rows_per_page() as u64;
         while self.pages.len() > 1 && self.base + rows <= self.floor {

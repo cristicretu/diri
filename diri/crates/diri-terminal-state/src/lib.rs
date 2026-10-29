@@ -4534,9 +4534,6 @@ mod tests {
     /// could not bring them back. A reference multiplexer keeps every line.
     #[cfg(feature = "compact-history")]
     #[test]
-    // Core v2 re-wraps history at once (step 5) and holds no raised row
-    // limit for it, so a narrowing at capacity drops rows past the limit.
-    #[cfg(not(feature = "core-v2-screen"))]
     fn a_resize_at_capacity_keeps_every_retained_line() {
         let lines = HISTORY_ROW_CEILING + 20_000;
         for (width, label) in [(70, "unwrapped"), (120, "wrapped")] {
@@ -5065,9 +5062,6 @@ mod tests {
 
     #[cfg(feature = "compact-history")]
     #[test]
-    // Core v2 re-wraps history at once (step 5) and holds no raised row
-    // limit for it, so a narrowing at capacity drops rows past the limit.
-    #[cfg(not(feature = "core-v2-screen"))]
     fn a_column_change_at_capacity_keeps_hard_line_history() {
         let mut screen = HeadlessScreen::new(80, 24);
         // Past the row ceiling, history recycles its oldest row per line and

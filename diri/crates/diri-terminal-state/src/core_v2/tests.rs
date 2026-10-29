@@ -940,3 +940,83 @@ fn random_resizes(mut seed: u32, runs: usize, min_cols: usize, tokens: &[&[&str]
         check_resizes(lines, cols, history, &steps, run);
     }
 }
+
+/// `HeadlessScreen::resize` at capacity (#902) on both cores: the row limit
+/// is raised to `RESIZE_ROW_ALLOWANCE` (4) times `base` for the re-wrap,
+/// then held at the rows it produced (at least `base`), and output then
+/// lowers it as `settle` does when history shrinks below it. Neither core
+/// may drop a retained row, and v2 must not bring back one the limit hid.
+#[test]
+fn a_resize_at_capacity_keeps_history_like_the_current_core() {
+    fn set_limit(got: &mut Core, want: &mut Term<VoidListener>, limit: usize) {
+        want.set_scrolling_history(limit);
+        got.primary_pages_mut().set_history_limit(limit);
+    }
+    fn settle(got: &mut Core, want: &mut Term<VoidListener>, base: usize) {
+        let limit = want.config().scrolling_history;
+        let history = want.primary_history_size();
+        if limit > base && history < limit {
+            set_limit(got, want, history.max(base));
+        }
+    }
+    fn same(got: &Core, want: &Term<VoidListener>, what: &str) {
+        if let Err(error) = compare(got, want).and_then(|()| compare_origin(got, want)) {
+            panic!("{what}: {error}");
+        }
+        assert_eq!(got.history_size(), want.primary_history_size(), "{what}");
+    }
+    let base = 20;
+    let line = |n: usize, width: usize| {
+        let text = format!("L{n:03}{}", "abcdefghij".repeat(4));
+        format!("{}\r\n", &text[..width])
+    };
+    for variant in 0..4 {
+        let (lines, cols) = (5, 12);
+        let config = Config {
+            scrolling_history: base,
+            ..Config::default()
+        };
+        let mut want = Term::new(config, &TermSize::new(cols, lines), VoidListener);
+        let mut got = match variant % 2 {
+            // Packed four-row pages under a budget that evicts nothing.
+            0 => Core::with_layout(lines, cols, base, Some(1 << 24), Some(4)),
+            _ => Core::new(lines, cols, base),
+        };
+        got.raw_text = variant >= 2;
+        let mut parsers = (
+            Processor::<StdSyncHandler>::new(),
+            Processor::<StdSyncHandler>::new(),
+        );
+        let mut feed = |got: &mut Core, want: &mut Term<VoidListener>, bytes: &[u8]| {
+            parsers.0.advance(got, bytes);
+            for byte in bytes.chunks(1) {
+                parsers.1.advance(want, byte);
+            }
+            settle(got, want, base);
+        };
+        // Past capacity, unwrapped lines and lines wrapping at 12 columns.
+        let fill: String = (0..60).map(|n| line(n, [10, 18][n % 2])).collect();
+        feed(&mut got, &mut want, fill.as_bytes());
+        same(&got, &want, "filled");
+        assert_eq!(got.history_size(), base);
+        for (step, (lines, cols)) in [(5, 6), (5, 20), (5, 4), (7, 9), (3, 12), (5, 12)]
+            .into_iter()
+            .enumerate()
+        {
+            set_limit(&mut got, &mut want, base * 4);
+            want.resize(TermSize::new(cols, lines));
+            got.resize(lines, cols);
+            let kept = want.primary_history_size().clamp(base, base * 4);
+            set_limit(&mut got, &mut want, kept);
+            settle(&mut got, &mut want, base);
+            let what = format!("variant {variant} step {step}: {lines}x{cols}");
+            same(&got, &want, &what);
+            // Output after the resize recycles the oldest rows alike.
+            let more: String = (100 + step * 3..103 + step * 3)
+                .map(|n| line(n, 7))
+                .collect();
+            feed(&mut got, &mut want, more.as_bytes());
+            same(&got, &want, &format!("{what}, then output"));
+        }
+    }
+}
