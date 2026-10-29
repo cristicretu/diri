@@ -59,7 +59,9 @@ to identify its agent, account, and quota window.
 
 Quota mode shows **—** if any current login has missing data, a fetch error, a
 window whose reset has passed, or data more than six minutes old. Open the account
-menu to refresh; selecting this setting adds no credential reads at startup.
+menu to refresh. While **Remaining quota** is selected, Diri also refreshes the
+current logins' limits every few minutes so the percentage stays current; the
+other modes only refresh when you open the account menu.
 
 ## Working from the keyboard
 
