@@ -13,6 +13,9 @@ The design and the core functions are in [scripting.md](scripting.md). This page
 | `session.exited` | A session's process ended: {session, kind, code, signal, reason}. |
 | `session.title` | A session's title changed: {session, kind, from, to}. |
 | `session.removed` | A session was closed: {id, reason}. |
+| `session.cwd` | A shell's live working directory changed: {session, kind, from, to}. |
+| `session.program` | A shell's foreground program changed (to is nil back at the prompt): {session, kind, from, to}. |
+| `session.bell` | A program rang the terminal bell: {session_id}. |
 | `session.notification` | A program posted a notification: {session_id, title, body}. |
 | `workspace.updated` | Workspaces, tabs or splits changed: the new snapshot. |
 | `schedule.updated` | A schedule changed or ran: {id}. |
@@ -251,3 +254,4 @@ Run one with `diri.action("split-pane-right")` or `diri.actions.split_pane_right
 | `select-tab` | `index` |  | Show the tab at this position in the sidebar: 1 is the first, -1 the last. |
 | `show-session` | `session_id` |  | Select a session's tab in the window, without bringing Diri to the front. |
 | `set-theme` | `theme` |  | Use this terminal color theme and stop following the system appearance. |
+| `list-keys` |  |  | Answer every key binding: its keys, what it runs, and where it came from (default, recorded in Settings, or the script's file:line), with the script's key modes. |

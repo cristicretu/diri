@@ -1497,6 +1497,14 @@ pub fn rebind_active_keys(cx: &mut App) {
     rebind_keys(cx, &overrides);
 }
 
+/// The shortcuts the person recorded, as the live keymap uses them.
+pub fn active_overrides() -> ShortcutOverrides {
+    active_shortcut_overrides()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
 fn active_shortcut_overrides() -> &'static RwLock<ShortcutOverrides> {
     ACTIVE_SHORTCUT_OVERRIDES.get_or_init(|| RwLock::new(ShortcutOverrides::new()))
 }

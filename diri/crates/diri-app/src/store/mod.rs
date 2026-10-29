@@ -285,6 +285,8 @@ pub enum StoreEffect {
     StatusTransition(StatusTransition),
     /// Answer one `app.perform_requested` from the Engine.
     AppReply(diri_proto::app_actions::AppReplyParams),
+    /// Publish the window's actions again (a script's commands changed).
+    PublishAppActions,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3019,6 +3021,11 @@ impl SessionStore {
         self.emit(StoreEffect::PublishSnapshot);
     }
 
+    /// Publishes the app's actions again on the performer connection.
+    pub fn request_app_actions_publish(&mut self) {
+        self.emit(StoreEffect::PublishAppActions);
+    }
+
     /// Sends a window's answer to the Engine.
     pub fn reply_app_perform(
         &mut self,
@@ -4549,6 +4556,15 @@ async fn run_effects(
                 });
                 Ok(())
             }
+            StoreEffect::PublishAppActions => {
+                let client = Arc::clone(&client);
+                tokio::spawn(async move {
+                    let _ = client
+                        .publish_app_actions(&crate::app_actions::publish_params())
+                        .await;
+                });
+                Ok(())
+            }
             StoreEffect::RetryConnection => {
                 client.retry_now();
                 Ok(())
@@ -4937,6 +4953,7 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         StoreEffect::ReopenLast => ("Reopen session failed", None),
         StoreEffect::UiChanged
         | StoreEffect::AppReply(_)
+        | StoreEffect::PublishAppActions
         | StoreEffect::WorkspaceSpawn { .. }
         | StoreEffect::RefreshWorkspaces { .. }
         | StoreEffect::MutateWorkspace { .. }
