@@ -10,7 +10,7 @@ mod events;
 mod ops;
 pub mod page;
 #[cfg(feature = "core-v2-screen")]
-pub(crate) mod screen;
+pub(crate) mod emulator;
 pub mod term;
 pub mod text;
 

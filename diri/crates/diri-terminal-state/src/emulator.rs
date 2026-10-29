@@ -33,7 +33,7 @@ use crate::{Collector, Geometry};
 pub(crate) type Emu = Term<Collector>;
 /// The emulator behind every [`crate::HeadlessScreen`]: core v2.
 #[cfg(feature = "core-v2-screen")]
-pub(crate) type Emu = crate::core_v2::screen::Screen;
+pub(crate) type Emu = crate::core_v2::emulator::Screen;
 
 /// An OSC 8 hyperlink as a cell holds it. Two links are equal when they are
 /// the same link (target and id), as consecutive cells of one link are.
