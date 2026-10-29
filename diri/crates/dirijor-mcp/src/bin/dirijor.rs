@@ -2,6 +2,8 @@
 mod api;
 #[path = "dirijor/completion.rs"]
 mod completion;
+#[path = "dirijor/lua.rs"]
+mod lua;
 #[path = "dirijor/notes.rs"]
 mod notes;
 #[path = "dirijor/organization.rs"]
@@ -119,6 +121,7 @@ fn run(arguments: &[String]) -> Result<(), CliError> {
         "actions" => api::actions(arguments.get(1..).unwrap_or_default()),
         "do" => api::perform(arguments.get(1..).unwrap_or_default()),
         "api" => api::api(arguments.get(1..).unwrap_or_default()),
+        "script" => lua::run(arguments.get(1..).unwrap_or_default()),
         "forward" => Err(CliError::failure(
             "companion TCP forwarding is not part of the Rust Engine",
         )),
@@ -148,9 +151,11 @@ fn print_help() {
          Deferred on Linux: companion forwarding (dirijor forward).\n\n\
          {}\n\n\
          {}\n\n\
+         {}\n\n\
          Notes (Markdown files; new notes appear in the sidebar when Diri is running):\n  {}",
         script::HELP,
         api::HELP,
+        lua::HELP,
         notes::HELP
     );
 }

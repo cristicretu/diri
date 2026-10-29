@@ -579,3 +579,26 @@ keeping a second copy. `Term`'s own code paths are unchanged.
 `observe = ["vte/observe"]` only forwards the vendored VTE's test-only OSC
 totals (see its DIRI-PATCH.md) so `diri-terminal-state`'s `bench-verify`
 feature can reach them. No source change.
+
+## Cold history store
+
+`grid::cold::ColdStore` is a store of opaque, immutable byte payloads
+(`store`, `load`, `release`) that knows nothing about rows or codecs.
+`CompactRows::page_out` (`Grid::page_out_history`,
+`Term::page_out_primary_history`) moves sealed block payloads outside the
+newest `keep_rows` rows into one; a block's payload is now a `Payload` that is
+either the `Arc<[u8]>` it was or a stored slot, released when the last range
+sharing it is dropped. A stored block decodes by loading its payload for the
+one decode (its read cache is released as before); an unreadable payload
+decodes as blank rows (`RowCodec::blank_row`). `Payload` has the size of
+`Arc<[u8]>` and keeps the length and sharing identity, so `Block` and
+`history_storage_bytes` are unchanged and retention never depends on paging.
+No new dependency; nothing pages out unless the owner calls `page_out`. The
+Engine's store and policy are in `diri-engine` (`docs/idle-history-swap.md`).
+
+Resident payloads now live in per-history chunks (`grid/compact/arena.rs`,
+128 KiB anonymous mappings on Unix, page-aligned heap blocks elsewhere)
+instead of one `Arc<[u8]>` each, so freeing them (oldest first, by eviction
+or page-out) unmaps whole chunks instead of leaving allocator pages pinned by
+neighbouring rows. The encoder's output buffer is handed back to its scratch
+after the copy. A cloned history starts its own chunk.

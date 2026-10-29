@@ -140,6 +140,7 @@ actions!(
         ReadAllTabs,
         TogglePerfOverlay,
         ToggleRenderCounters,
+        ReloadScripts,
         SelectPreviousSession,
         SelectNextSession,
         MoveSelectedSessionUp,
@@ -268,6 +269,7 @@ pub enum CommandId {
     ReadAllTabs,
     TogglePerfOverlay,
     ToggleRenderCounters,
+    ReloadScripts,
     SelectPreviousSession,
     SelectNextSession,
     MoveSelectedSessionUp,
@@ -1166,6 +1168,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         "square.stack.3d.up",
         "developer renders render count redraw views perf performance debug"
     ),
+    spec!(
+        ReloadScripts,
+        "reload-scripts",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.reload_scripts.palette_title",
+        "chevron.left.forwardslash.chevron.right",
+        "lua init.lua config script scripting reload refresh keymap plugins"
+    ),
     // ⌥⌘arrows and ⌘[ / ⌘] are pane keys now; in a one-pane tab they still
     // move between sessions (`PaneCommand::session_fallback`).
     spec!(
@@ -1470,6 +1482,19 @@ fn bind_active_keys(cx: &mut App, overrides: &ShortcutOverrides) {
     cx.bind_keys(crate::notes::key_bindings());
     // The Files surface's editor keys, likewise scoped to its contexts.
     cx.bind_keys(crate::code_viewer::key_bindings());
+    // init.lua's keys: over every default above, under the keys the person
+    // recorded (those are skipped). Empty unless a script is loaded.
+    crate::scripting::bind_keys(cx, overrides);
+}
+
+/// Rebuilds the keymap with the overrides already in force, after a script
+/// changed its keys.
+pub fn rebind_active_keys(cx: &mut App) {
+    let overrides = active_shortcut_overrides()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    rebind_keys(cx, &overrides);
 }
 
 fn active_shortcut_overrides() -> &'static RwLock<ShortcutOverrides> {
@@ -1702,6 +1727,7 @@ impl CommandSpec {
             CommandId::ReadAllTabs => KeyBinding::new(key, ReadAllTabs, context),
             CommandId::TogglePerfOverlay => KeyBinding::new(key, TogglePerfOverlay, context),
             CommandId::ToggleRenderCounters => KeyBinding::new(key, ToggleRenderCounters, context),
+            CommandId::ReloadScripts => KeyBinding::new(key, ReloadScripts, context),
             CommandId::SelectPreviousSession => {
                 KeyBinding::new(key, SelectPreviousSession, context)
             }
@@ -2677,6 +2703,11 @@ impl CommandId {
                 description: t("command.toggle_render_counters.description"),
                 category: Application,
             },
+            Self::ReloadScripts => ShortcutMetadata {
+                title: t("command.reload_scripts.title"),
+                description: t("command.reload_scripts.description"),
+                category: Application,
+            },
             Self::NewWindow => ShortcutMetadata {
                 title: t("command.new_window.title"),
                 description: t("command.new_window.description"),
@@ -2799,6 +2830,7 @@ impl CommandId {
             Self::ReadAllTabs => Box::new(ReadAllTabs),
             Self::TogglePerfOverlay => Box::new(TogglePerfOverlay),
             Self::ToggleRenderCounters => Box::new(ToggleRenderCounters),
+            Self::ReloadScripts => Box::new(ReloadScripts),
             Self::SelectPreviousSession => Box::new(SelectPreviousSession),
             Self::SelectNextSession => Box::new(SelectNextSession),
             Self::MoveSelectedSessionUp => Box::new(MoveSelectedSessionUp),

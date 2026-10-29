@@ -60,8 +60,11 @@ pub(in crate::sidebar) struct StripTabProps {
     pub(super) location: Option<String>,
     /// The question the tab waits on. The strip has no room for a second
     /// line, so the tab keeps its title and its status mark, and the
-    /// question shows when the pointer rests on it.
+    /// question shows when the pointer rests on it. In a split tab it is
+    /// the question of the pane that asks.
     pub(super) question: Option<String>,
+    /// The tab's layout with each pane's state, when it is split.
+    pub(super) split: Option<super::split_mark::SplitMark>,
     /// The fraction of the hover fill a tab the pointer just left still
     /// wears; it changes each frame of the fade (see `hover_linger`).
     pub(super) hover_linger: f32,
@@ -81,6 +84,13 @@ pub(in crate::sidebar) struct StripTabView {
     props: StripTabProps,
     #[cfg(test)]
     pub(super) renders: usize,
+}
+
+#[cfg(test)]
+impl StripTabView {
+    pub(super) fn props_for_test(&self) -> &StripTabProps {
+        &self.props
+    }
 }
 
 impl Render for StripTabView {
@@ -111,13 +121,20 @@ impl Sidebar {
         index: usize,
         count: usize,
         active: bool,
-        state: StatusState,
+        marks: super::tabs::TabMarks,
         colors: SemanticColors,
         custom_ordering: bool,
         reduce_motion: bool,
         pill_drawn: bool,
     ) -> StripTabProps {
         let id = &session.id;
+        let super::tabs::TabMarks {
+            state,
+            asking,
+            split,
+        } = marks;
+        // The pane that asks names the question in the tooltip.
+        let asking = asking.as_deref().unwrap_or(session);
         // The same rule the sidebar rows follow: ⌘1–⌘8, then ⌘9 = last.
         let rank = if index < 8 {
             Some(index + 1)
@@ -158,7 +175,8 @@ impl Sidebar {
             shift,
             settling: self.settling_title(id, 0.0).is_some(),
             location: crate::switcher::terminal_location(session),
-            question: crate::session_presentation::blocker_line(session),
+            question: crate::session_presentation::blocker_line(asking),
+            split,
             hover_linger: if active {
                 0.0
             } else {

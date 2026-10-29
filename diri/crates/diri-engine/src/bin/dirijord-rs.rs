@@ -338,6 +338,15 @@ fn main() {
         let _ = std::thread::Builder::new()
             .name("diri-orphan-sweep".into())
             .spawn(move || {
+                // Idle history swapped out by an Engine that is gone: its
+                // key died with it, so nothing in it can be read again.
+                let swap = diri_engine::history_swap::sweep_stale(&logs_dir);
+                if swap.removed_dirs > 0 {
+                    eprintln!(
+                        "dirijord-rs: removed {} stale history swap dir(s), {} file(s), {} bytes",
+                        swap.removed_dirs, swap.removed_files, swap.removed_bytes,
+                    );
+                }
                 let report = diri_engine::session_files::startup_sweep(
                     &registry,
                     state_loaded,

@@ -21,6 +21,12 @@ diri-terminal-state.workspace = true
 # The Engine serves the `dirijor` MCP tools over loopback HTTP with the same
 # message handling as the stdio frontend (see src/mcp_http.rs).
 dirijor-mcp = { path = "../dirijor-mcp" }
+# Seals idle terminal history paged out to the owner-only swap file
+# (src/history_swap.rs) with a per-Engine key held only in memory.
+# Authenticated encryption from a maintained crate, not a hand-rolled MAC.
+# 0.11 (aes 0.9, polyval 0.7) uses ARMv8 AES/PMULL and x86 AES-NI/CLMUL,
+# detected at run time, with no build flag (0.10 needed `--cfg aes_armv8`).
+aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc"] }
 getrandom.workspace = true
 # Already in the graph through diri-terminal-state and the vendored parser;
 # the Engine pump scans every output byte for the Holder exit marker with it.

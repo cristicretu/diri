@@ -1251,6 +1251,10 @@ impl NavigationOverlay {
                 self.close_overlay(window, cx);
                 cx.emit(crate::sidebar::AccountRequest::Switch(profile_id));
             }
+            PaletteCommand::Script { id } => {
+                self.close_overlay(window, cx);
+                crate::scripting::run_command(id);
+            }
         }
     }
 
@@ -1294,6 +1298,7 @@ impl NavigationOverlay {
                 &self.account_limits,
                 crate::usage::Clock::read(&crate::usage::SystemClock).unix_seconds,
             ));
+            actions.extend(crate::scripting::palette_actions());
             let orientation = store.preferences().tab_orientation;
             let density = store.preferences().pane_density;
             let style = store.preferences().interface_style();
