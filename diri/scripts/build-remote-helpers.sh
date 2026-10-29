@@ -16,6 +16,12 @@ build_id="${DIRI_REMOTE_BUILD_ID:-${git_revision}}"
 if [[ -n "$(git -C "${workspace_dir}" status --porcelain --untracked-files=normal 2>/dev/null || true)" && -z "${DIRI_REMOTE_BUILD_ID:-}" ]]; then
     build_id="${build_id}-dirty-$(date -u +%Y%m%d%H%M%S)"
 fi
+# A Helper built on terminal core v2 is a different binary from the same
+# source tree on the current core, so it gets its own Build ID: the two never
+# share an install path on a remote host.
+if [[ "${DIRI_TERMINAL_CORE:-v1}" == "v2" ]]; then
+    build_id="${build_id}-core-v2"
+fi
 if [[ ! "${build_id}" =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
     echo "error: DIRI_REMOTE_BUILD_ID must be 1..128 ASCII letters, digits, '.', '_' or '-'" >&2
     exit 1
@@ -37,14 +43,23 @@ file_length() {
     fi
 }
 
+# DIRI_TERMINAL_CORE=v2 builds the Helper on terminal core v2
+# (docs/core-v2.md); the default, v1, is the current core.
+core_features=()
+case "${DIRI_TERMINAL_CORE:-v1}" in
+    v1) ;;
+    v2) core_features=(--features diri-terminal-state/core-v2-screen) ;;
+    *) echo "error: DIRI_TERMINAL_CORE must be v1 or v2" >&2; exit 1 ;;
+esac
+
 build_target() {
     local target="$1"
     case "${target}" in
         x86_64-unknown-linux-musl|aarch64-unknown-linux-musl)
             if [[ "$(uname -s)" == "Linux" ]]; then
-                cargo build --locked --release --package diri-remote --target "${target}"
+                cargo build --locked --release --package diri-remote ${core_features[@]+"${core_features[@]}"} --target "${target}"
             elif command -v cargo-zigbuild >/dev/null 2>&1; then
-                cargo zigbuild --locked --release --package diri-remote --target "${target}"
+                cargo zigbuild --locked --release --package diri-remote ${core_features[@]+"${core_features[@]}"} --target "${target}"
             else
                 echo "error: cross-building ${target} requires cargo-zigbuild on this host" >&2
                 exit 1
@@ -55,7 +70,7 @@ build_target() {
                 echo "error: Apple Helper target ${target} requires a macOS release builder" >&2
                 exit 1
             fi
-            cargo build --locked --release --package diri-remote --target "${target}"
+            cargo build --locked --release --package diri-remote ${core_features[@]+"${core_features[@]}"} --target "${target}"
             ;;
         *)
             echo "error: unsupported Helper target ${target}" >&2

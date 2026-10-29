@@ -71,6 +71,42 @@ jobs:
       - name: Release build
         run: cargo build --workspace --release
 
+  # The nightly channel ships terminal core v2 (docs/core-v2.md, step 8):
+  # its golden, the screenshots against the current core, and the
+  # Holder->Engine vtbench A/B (checked runs; numbers reported, not gated).
+  core-v2:
+    name: Terminal core v2 gates (macOS)
+    if: github.event_name != 'push'
+    runs-on: macos-15
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: diri
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            diri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('diri/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Golden, screenshots and vtbench, current core vs v2
+        env:
+          DIRI_CORE_V2_GATE_DIR: ${{ runner.temp }}/core-v2
+        run: scripts/core-v2-gate.sh
+      - name: Release build of the app and Engine on v2
+        run: |
+          cargo build --locked --release -p diri-app --features diri-terminal-state/core-v2-screen
+          cargo build --locked --release -p diri-engine --features diri-terminal-state/core-v2-screen
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: core-v2-gates
+          path: ${{ runner.temp }}/core-v2/*.txt
+
   app-linux:
     name: Full test suite, release build and GUI smokes (Linux x86_64)
     if: github.event_name != 'push'
@@ -177,6 +213,25 @@ jobs:
         run: |
           helper="target/${EXPECTED_TARGET}/release/diri-remote"
           test -x "${helper}"
+          probe="$("${helper}" probe --format=json)"
+          jq -e \
+            --arg target "${EXPECTED_TARGET}" \
+            --arg build "${EXPECTED_BUILD}" \
+            '.target == $target and .buildId == $build and .protocol.major == 1 and .supported and .holderAvailable' \
+            <<<"${probe}"
+      # The nightly channel's Helper runs on terminal core v2.
+      - name: Build exact release Helper on core v2
+        env:
+          DIRI_REMOTE_BUILD_ID: ci-${{ matrix.target }}-core-v2
+        run: >-
+          cargo build --locked --release --package diri-remote
+          --features diri-terminal-state/core-v2-screen --target "${{ matrix.target }}"
+      - name: Execute core v2 probe and verify identity
+        env:
+          EXPECTED_TARGET: ${{ matrix.target }}
+          EXPECTED_BUILD: ci-${{ matrix.target }}-core-v2
+        run: |
+          helper="target/${EXPECTED_TARGET}/release/diri-remote"
           probe="$("${helper}" probe --format=json)"
           jq -e \
             --arg target "${EXPECTED_TARGET}" \
@@ -330,6 +385,8 @@ jobs:
           # diri-voice needs the macOS 26 SDK (Foundation Models); macos-15
           # still defaults to Xcode 16.4.
           DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+          # As the nightly channel ships it (scripts/nightly-macos.sh).
+          DIRI_TERMINAL_CORE: v2
         run: diri/scripts/package.sh
       - name: Verify bundle structure and signature
         run: |
@@ -353,6 +410,7 @@ jobs:
           test ! -e "${app}/Contents/Resources/bin/libonnxruntime.1.dylib"
           test -f "${app}/Contents/Resources/bin/remote-helpers/manifest.json"
           test "$(find "${app}/Contents/Resources/bin/remote-helpers/artifacts" -name diri-remote -type f | wc -l | tr -d ' ')" = 3
+          grep -q -- '-core-v2' "${app}/Contents/Resources/bin/remote-helpers/manifest.json"
           codesign --verify --deep --strict "${app}"
 
   # Linux packages are built natively per architecture (package-linux.sh

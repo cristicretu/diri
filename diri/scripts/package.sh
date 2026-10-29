@@ -84,8 +84,17 @@ trap 'kill "${remote_helpers_pid}" 2>/dev/null || true' EXIT
 # features across them, which would change the shipped Engine and CLI (serde_json
 # preserve_order, for one) relative to building each alone.
 mac_targets=(--target aarch64-apple-darwin --target x86_64-apple-darwin)
+# DIRI_TERMINAL_CORE=v2 builds the app and Engine on terminal core v2
+# (docs/core-v2.md); the default, v1, is the current core. Only the packages
+# that depend on diri-terminal-state take the feature.
+core_features=()
+case "${DIRI_TERMINAL_CORE:-v1}" in
+    v1) ;;
+    v2) core_features=(--features diri-terminal-state/core-v2-screen) ;;
+    *) echo "error: DIRI_TERMINAL_CORE must be v1 or v2" >&2; exit 1 ;;
+esac
 echo "==> Building diri (Apple silicon + Intel)"
-cargo build --release --package diri-app --bin diri "${mac_targets[@]}"
+cargo build --release --package diri-app --bin diri ${core_features[@]+"${core_features[@]}"} "${mac_targets[@]}"
 cargo build --release --package dirijor-mcp --bin dirijor --bin dirijor-mcp "${mac_targets[@]}"
 
 echo "==> Creating universal executable"
@@ -143,7 +152,7 @@ cp "${universal_mcp_binary}" "${app_bin_dir}/dirijor-mcp"
 # Helper catalog below is consumed by this executable directly.
 echo "==> Building the authoritative Rust Engine (universal)"
 cargo build --release --package diri-engine --bin dirijord-rs --bin diri-holder \
-    --bin diri-ssh-askpass --bin diri-wake-helper "${mac_targets[@]}"
+    --bin diri-ssh-askpass --bin diri-wake-helper ${core_features[@]+"${core_features[@]}"} "${mac_targets[@]}"
 lipo -create \
     "${target_dir}/aarch64-apple-darwin/release/dirijord-rs" \
     "${target_dir}/x86_64-apple-darwin/release/dirijord-rs" \

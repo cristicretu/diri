@@ -334,6 +334,10 @@ Each PR lands on its own, behind the single `core-v2` cargo feature of `diri-ter
    - The one exception is paging idle history out to the cold store (#958), which is step 6.
    - CI's Linux x86_64 job runs both suites with the switch on.
 8. **Switch.** Enable `core-v2` for the Engine and the Remote Helper after a soak on the nightly channel. Holder→Engine vtbench before/after; `PERF.md` gates unchanged or better.
+   - **Nightly, on.** `DIRI_TERMINAL_CORE=v2` makes `scripts/package.sh` and `scripts/build-remote-helpers.sh` build the app, the Engine and the Helper with `diri-terminal-state/core-v2-screen`; the default, `v1`, is the current core. `scripts/nightly-macos.sh` sets `v2`.
+   - A v2 Helper gets the Build ID `<source>-core-v2`, so it never shares an install path on a remote host with a current-core Helper of the same tree.
+   - `nightly.yml`: the unsigned package job builds with `v2` and checks the Helper catalog's Build ID; the Remote Helper matrix also builds and probes a v2 Helper on every target; the `core-v2` job runs `scripts/core-v2-gate.sh`: the golden on both cores, diri-term's screenshots on both (every PNG byte-identical), and the Holder→Engine vtbench with rounds interleaved. vtbench runs are checked against a reference parse; their numbers are reported, not asserted.
+   - **No runtime kill switch.** The core is chosen at compile time (`type Emu`, static dispatch, no per-call branch). Choosing it at run time (`DIRI_CORE=v1`) needs an enum emulator over both cores that implements the `Emulator` trait by `match`, with enum row and cell views. The runtime cost is small (one predictable branch per row or run, no memory), but the binary carries both cores and every suite has to run under both selections; that is about a day of work and doubles CI time for the terminal crates. Until stable default-on, falling back is a rebuild with `DIRI_TERMINAL_CORE=v1` or the previous nightly.
 9. **Remove** the old grid, compact history and the unused vendored selection/search/vi-mode code.
 
 ## Risks
