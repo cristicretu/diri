@@ -641,9 +641,13 @@ async fn handle(stream: TcpStream, peer: SocketAddr, api: Arc<Api>) -> std::io::
                 return Ok(());
             }
             let id = diri_proto::SessionId((*id).to_owned());
+            let resume = request
+                .query
+                .get("resume")
+                .and_then(|raw| terminal::Resume::parse(raw));
             return until_revoked(
                 guard,
-                stream_terminal(&mut reader, &mut write_half, &api, id),
+                stream_terminal(&mut reader, &mut write_half, &api, id, resume),
             )
             .await;
         }
@@ -680,6 +684,11 @@ async fn respond(request: &Request, api: &Api) -> Response {
             "application/manifest+json; charset=utf-8",
             ui::MANIFEST,
         ),
+        ("GET" | "HEAD", "/term.js") => Response::text(
+            200,
+            "text/javascript; charset=utf-8",
+            ui::TERMINAL_JS,
+        ),
         ("GET" | "HEAD", "/icon.svg") => {
             Response::text(200, "image/svg+xml; charset=utf-8", ui::ICON_SVG)
         }
@@ -697,6 +706,7 @@ async fn stream_terminal<R, W>(
     writer: &mut W,
     api: &Api,
     session: diri_proto::SessionId,
+    resume: Option<terminal::Resume>,
 ) -> std::io::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -724,6 +734,7 @@ where
         session,
         events,
         out,
+        resume,
     ));
     let _abort = AbortOnDrop(task);
     let mut scratch = [0_u8; 512];
@@ -1550,6 +1561,231 @@ mod tests {
             assert!(command(&args(&["pair", "devices"])).is_err());
             let revoke = parse(&args(&["revoke", "nPhone", "--label", "x"])).unwrap();
             assert_eq!(revoke.host_label, "x");
+        }
+    }
+
+    /// The browser terminal end to end in real headless browsers (Chromium
+    /// with touch and phone metrics, then WebKit): render, key row and
+    /// typing, a diff, touch scrolling into paged history, a dropped stream
+    /// that resumes with only the changed row, and exit.
+    ///
+    /// Opt-in: needs `node` and an installed `playwright-core` whose
+    /// browsers are installed, named by `DIRI_WEB_PLAYWRIGHT`:
+    ///
+    /// ```sh
+    /// npm install --prefix /tmp/pw playwright-core && npx --prefix /tmp/pw playwright-core install chromium-headless-shell webkit
+    /// DIRI_WEB_PLAYWRIGHT=/tmp/pw/node_modules/playwright-core \
+    ///   cargo test -p diri-web browser_terminal -- --ignored
+    /// ```
+    ///
+    /// Headless only; nothing opens on screen. Everything it starts (fake
+    /// Engine, gateway, node, browsers) ends with the test.
+    #[cfg(unix)]
+    mod browser_terminal {
+        use super::*;
+        use diri_proto::Method;
+        use diri_proto::grid::{
+            ChangedRow, GridCell, GridRowCodec, GridUpdate, TermColor, TermStyle,
+        };
+        use tokio::io::{AsyncBufReadExt as _, BufReader as TokioBufReader};
+
+        const COLS: u16 = 40;
+        const ROWS: u16 = 10;
+        const HISTORY: i64 = 500;
+
+        fn cells(text: &str, fg: TermColor, style: TermStyle) -> Vec<GridCell> {
+            let mut cells: Vec<GridCell> = text
+                .chars()
+                .map(|ch| GridCell::new(ch as u32, fg, TermColor::DefaultInverted, style))
+                .collect();
+            cells.resize(usize::from(COLS), GridCell::BLANK);
+            cells
+        }
+
+        fn grid(full: bool, rows: &[(u16, &str)]) -> GridUpdate {
+            GridUpdate {
+                cols: COLS,
+                rows: ROWS,
+                cursor_col: 3,
+                cursor_row: 1,
+                cursor_visible: true,
+                is_full_snapshot: full,
+                changed_rows: rows
+                    .iter()
+                    .map(|(y, text)| {
+                        let (fg, style) = if *y == 0 {
+                            (TermColor::Ansi(1), TermStyle::BOLD)
+                        } else {
+                            (TermColor::Default, TermStyle::empty())
+                        };
+                        ChangedRow::new(*y, cells(text, fg, style))
+                    })
+                    .collect(),
+                cursor_style: Default::default(),
+                history: None,
+            }
+        }
+
+        fn scrollback(params: Option<&serde_json::Value>) -> serde_json::Value {
+            let params = params.cloned().unwrap_or_default();
+            let total = HISTORY + i64::from(ROWS);
+            let first = params["firstRow"].as_i64().unwrap_or(0).clamp(0, total);
+            let end = (first + params["maxRows"].as_i64().unwrap_or(0)).min(total);
+            let rows: Vec<Vec<GridCell>> = (first..end)
+                .map(|n| cells(&format!("row {n}"), TermColor::Default, TermStyle::empty()))
+                .collect();
+            serde_json::to_value(diri_proto::ReadScrollbackCellsResult {
+                metadata: Vec::new(),
+                payload: GridRowCodec::encode_rows(&rows).unwrap(),
+                first_row: first,
+                row_count: end - first,
+                total_rows: total,
+                live_start_row: HISTORY,
+                cols: i64::from(COLS),
+                content_seq: 1,
+            })
+            .unwrap()
+        }
+
+        async fn seed(preview: &mut UnixStream, rows: &[(u16, &str)]) {
+            preview.write_all(&grid_frame(&grid(true, rows))).await.unwrap();
+            let modes = diri_proto::frames::Frame::modes_with_bracketed_paste(
+                false,
+                true,
+                diri_proto::terminal::MouseModes::OFF,
+            );
+            preview
+                .write_all(&diri_proto::frames::FrameCodec::encode(&modes).unwrap())
+                .await
+                .unwrap();
+        }
+
+        use diri_platform::ipc::asynchronous::UnixStream;
+
+        async fn next_preview(engine: &mut crate::testing::FakeEngine) -> UnixStream {
+            tokio::time::timeout(Duration::from_secs(15), engine.previews.recv())
+                .await
+                .expect("the page opened a stream")
+                .expect("engine alive")
+                .1
+        }
+
+        async fn typed(engine: &mut crate::testing::FakeEngine, expected: &str) -> String {
+            let mut text = String::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while text.len() < expected.len() {
+                let Ok(Some((method, params))) =
+                    tokio::time::timeout_at(deadline, engine.calls.recv()).await
+                else {
+                    break;
+                };
+                if method == Method::SESSION_SEND_TEXT {
+                    text.push_str(params.unwrap()["text"].as_str().unwrap());
+                }
+            }
+            text
+        }
+
+        async fn drive(browser: &str, playwright: &str) {
+            let mut engine = crate::testing::fake_engine(|method, params| match method {
+                Method::EVENTS_SUBSCRIBE => json!({"subscribed": true}),
+                Method::SESSION_LIST => json!({"sessions": [], "projects": []}),
+                Method::SESSION_READ_SCROLLBACK_CELLS => scrollback(params),
+                _ => json!({}),
+            })
+            .await;
+            let (address, token, server) = serve_engine(&engine).await;
+            let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/browser/terminal.mjs");
+            let mut node = tokio::process::Command::new("node")
+                .arg(script)
+                .args([format!("http://{address}"), token, browser.to_owned()])
+                .env("DIRI_WEB_PLAYWRIGHT", playwright)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("node runs");
+            let mut replies = node.stdin.take().unwrap();
+            let mut lines = TokioBufReader::new(node.stdout.take().unwrap()).lines();
+            let mut preview = None;
+            loop {
+                let line = tokio::time::timeout(Duration::from_secs(90), lines.next_line())
+                    .await
+                    .unwrap_or_else(|_| panic!("{browser}: the browser script stalled"))
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{browser}: the browser script exited early"));
+                let reply = match line.as_str() {
+                    "pass" => break,
+                    "need seed" => {
+                        let mut stream = next_preview(&mut engine).await;
+                        seed(&mut stream, &[(0, "hello browser"), (1, "line one")]).await;
+                        preview = Some(stream);
+                        "ok".to_owned()
+                    }
+                    "need input" => {
+                        let expected = "\x1b\x03\x1b[Als\r";
+                        let got = typed(&mut engine, expected).await;
+                        if got == expected {
+                            "ok".to_owned()
+                        } else {
+                            format!("fail typed {got:?}, expected {expected:?}")
+                        }
+                    }
+                    "need diff" => {
+                        let stream = preview.as_mut().unwrap();
+                        stream
+                            .write_all(&grid_frame(&grid(false, &[(1, "after diff")])))
+                            .await
+                            .unwrap();
+                        "ok".to_owned()
+                    }
+                    "need drop" => {
+                        // The Engine side of the stream goes away, as on a
+                        // gateway restart or a dropped connection.
+                        drop(preview.take());
+                        let mut stream = next_preview(&mut engine).await;
+                        seed(
+                            &mut stream,
+                            &[(0, "hello browser"), (1, "after diff"), (2, "after resume")],
+                        )
+                        .await;
+                        preview = Some(stream);
+                        "ok".to_owned()
+                    }
+                    "need exit" => {
+                        let exited: diri_proto::ExitInfo =
+                            serde_json::from_value(json!({"reason": "exited", "code": 0}))
+                                .unwrap();
+                        engine
+                            .events
+                            .send((
+                                diri_proto::EventName::SESSION_UPDATED.into(),
+                                json!({"id": "s_a", "status": diri_proto::SessionStatus::Exited(exited)}),
+                            ))
+                            .await
+                            .unwrap();
+                        "ok".to_owned()
+                    }
+                    other => panic!("{browser}: {other}"),
+                };
+                replies
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            drop(replies);
+            assert!(node.wait().await.unwrap().success());
+            server.abort();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "needs node and playwright-core with browsers: DIRI_WEB_PLAYWRIGHT"]
+        async fn the_browser_terminal_renders_types_scrolls_and_resumes() {
+            let playwright = std::env::var("DIRI_WEB_PLAYWRIGHT")
+                .expect("DIRI_WEB_PLAYWRIGHT names an installed playwright-core");
+            for browser in ["chromium", "webkit"] {
+                drive(browser, &playwright).await;
+            }
         }
     }
 }

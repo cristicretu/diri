@@ -376,6 +376,37 @@ impl Mirror {
         })
     }
 
+    /// The `resume` event for a client that reconnected still showing a grid
+    /// of the same size: only the rows whose digest differs from the one it
+    /// sent, plus cursor, modes and palette. `None` means it needs a
+    /// snapshot. Clears every pending change, like [`Self::snapshot`].
+    pub fn resume(&mut self, from: &Resume) -> Option<Value> {
+        if from.cols != self.cols || from.digests.len() != self.rows.len() {
+            return None;
+        }
+        let palette = current_palette();
+        let mut lines = Map::new();
+        for (y, ((cells, metadata), digest)) in self.rows.iter().zip(&from.digests).enumerate() {
+            let line = line_json(cells, metadata, &palette);
+            if line_digest(&line) != *digest {
+                lines.insert(y.to_string(), line);
+            }
+        }
+        self.dirty.clear();
+        self.meta_dirty = false;
+        self.snapshot_due = false;
+        Some(json!({
+            "cols": self.cols,
+            "rows": self.rows.len(),
+            "seq": next_seq(),
+            "historySize": self.history_size,
+            "cursor": self.cursor_json(),
+            "modes": self.modes_json(),
+            "palette": palette_json(&palette),
+            "lines": lines,
+        }))
+    }
+
     /// The `diff` event for everything changed since the last frame.
     fn diff(&mut self) -> Value {
         let palette = current_palette();
@@ -415,6 +446,53 @@ impl Mirror {
         }
         true
     }
+}
+
+// ---------------------------------------------------------------------------
+// Resume
+// ---------------------------------------------------------------------------
+
+/// Rows a client is limited to describing on reconnect; matches `/resize`.
+const MAX_RESUME_ROWS: usize = 300;
+
+/// What a reconnecting client still shows: its width and one digest per
+/// visible row, sent as `?resume=COLSxROWS.HEX.HEX…`. The gateway keeps no
+/// state between connections; a mismatch only costs the rows it covers.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Resume {
+    cols: u16,
+    digests: Vec<u32>,
+}
+
+impl Resume {
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        let mut parts = raw.split('.');
+        let (cols, rows) = parts.next()?.split_once('x')?;
+        let cols: u16 = cols.parse().ok()?;
+        let rows: usize = rows.parse().ok()?;
+        if rows > MAX_RESUME_ROWS {
+            return None;
+        }
+        let digests = parts
+            .map(|hex| u32::from_str_radix(hex, 16).ok())
+            .collect::<Option<Vec<_>>>()?;
+        (digests.len() == rows).then_some(Self { cols, digests })
+    }
+}
+
+/// FNV-1a over a line's JSON exactly as the stream serialises it. The page
+/// computes the same over `JSON.stringify` of the parsed line, which
+/// reproduces these bytes for every value a line can hold (strings, small
+/// integers, booleans, null, keys in the order received).
+#[must_use]
+pub fn line_digest(line: &Value) -> u32 {
+    serde_json::to_string(line)
+        .unwrap_or_default()
+        .bytes()
+        .fold(0x811c_9dc5_u32, |hash, byte| {
+            (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -600,12 +678,13 @@ pub async fn pump<S: ChunkSource>(
     session: SessionId,
     mut events: broadcast::Receiver<EventEnvelope>,
     out: mpsc::Sender<String>,
+    resume: Option<Resume>,
 ) {
-    if out
-        .send(frame("snapshot", &mirror.snapshot()))
-        .await
-        .is_err()
-    {
+    let opening = match resume.as_ref().and_then(|from| mirror.resume(from)) {
+        Some(delta) => frame("resume", &delta),
+        None => frame("snapshot", &mirror.snapshot()),
+    };
+    if out.send(opening).await.is_err() {
         return;
     }
     let mut deadline: Option<Instant> = None;
@@ -842,6 +921,66 @@ mod tests {
         assert!(!mirror.has_changes());
     }
 
+    fn digests_of(mirror: &mut Mirror) -> Vec<u32> {
+        mirror.snapshot()["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(line_digest)
+            .collect()
+    }
+
+    #[test]
+    fn a_resume_names_only_the_rows_that_changed_and_never_trusts_a_bad_token() {
+        let mut mirror = Mirror::default();
+        mirror.apply(update(true, &[(0, "one"), (1, "two"), (2, "three")]));
+        mirror.set_modes(Modes::default());
+        let digests = digests_of(&mut mirror);
+        let token = format!(
+            "10x4{}",
+            digests.iter().map(|d| format!(".{d:x}")).collect::<String>()
+        );
+        let resume = Resume::parse(&token).unwrap();
+
+        // Unchanged since the client last saw it: no rows at all.
+        let quiet = mirror.resume(&resume).unwrap();
+        assert_eq!(quiet["lines"], json!({}));
+        assert_eq!(quiet["cols"], 10);
+        assert!(quiet["palette"].is_object());
+
+        mirror.apply(update(false, &[(1, "TWO")]));
+        let delta = mirror.resume(&resume).unwrap();
+        assert_eq!(delta["lines"].as_object().unwrap().len(), 1);
+        assert_eq!(delta["lines"]["1"]["runs"][0]["t"], "TWO");
+        assert!(!mirror.has_changes(), "the resume frame covers pending rows");
+
+        // Another width or height means a snapshot.
+        let narrower = Resume::parse(&token.replacen("10x", "9x", 1)).unwrap();
+        assert!(mirror.resume(&narrower).is_none());
+        let shorter = Resume::parse("10x3.0.0.0").unwrap();
+        assert!(mirror.resume(&shorter).is_none());
+
+        for bad in ["", "10", "10x2.zz.0", "10x3.0.0", "x1.0", "10x301"] {
+            assert_eq!(Resume::parse(bad), None, "{bad:?}");
+        }
+    }
+
+    /// The page computes FNV-1a over `JSON.stringify` of the parsed line;
+    /// these are the values its implementation gives for the same lines.
+    #[test]
+    fn line_digests_match_the_pages_algorithm() {
+        assert_eq!(line_digest(&json!({"runs": [], "wrapped": false})), {
+            "{\"runs\":[],\"wrapped\":false}"
+                .bytes()
+                .fold(0x811c_9dc5_u32, |h, b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193))
+        });
+        // Serialised key order and escapes are what JSON.stringify writes.
+        assert_eq!(
+            serde_json::to_string(&json!({"runs": [{"t": "a\u{1}\"é", "fg": null, "bg": 3, "a": 1}], "wrapped": true})).unwrap(),
+            r#"{"runs":[{"a":1,"bg":3,"fg":null,"t":"a\u0001\"é"}],"wrapped":true}"#
+        );
+    }
+
     fn event_of(frame: &str) -> (&str, Value) {
         let (head, data) = frame.split_once('\n').unwrap();
         let data = data.strip_prefix("data: ").unwrap().trim_end();
@@ -878,6 +1017,7 @@ mod tests {
             SessionId("s_a".into()),
             events,
             out,
+            None,
         ));
         // Far more frames than the queue holds, each in its own window, and
         // nobody reading.
@@ -930,6 +1070,7 @@ mod tests {
             SessionId("s_a".into()),
             events,
             out,
+            None,
         ));
         assert_eq!(event_of(&frames.recv().await.unwrap()).0, "snapshot");
         // Spend the leading edge, then send a burst inside the next window.
