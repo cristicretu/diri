@@ -118,11 +118,141 @@ impl std::hash::Hash for Style {
 }
 
 impl Style {
+    /// `*self == Style::default()`, without comparing whole colors.
+    #[inline(always)]
+    pub fn is_default(&self) -> bool {
+        matches!(self.fg, Color::Named(NamedColor::Foreground))
+            && matches!(self.bg, Color::Named(NamedColor::Background))
+            && self.underline.is_none()
+            && self.flags == 0
+    }
+
     /// The style of a cell erased under this pen: background only.
     pub fn erased(&self) -> Style {
         Style {
             bg: self.bg,
             ..Style::default()
+        }
+    }
+}
+
+/// Writes `cells[k] = src[k] | high` for every `k` (printable ASCII into
+/// fresh cells; `high` carries the style). `cells` and `src` have the same
+/// length.
+#[inline(always)]
+pub fn fill_bytes(cells: &mut [Cell], src: &[u8], high: u64) {
+    debug_assert_eq!(cells.len(), src.len());
+    let n = src.len().min(cells.len());
+    // Whole sixteens with the vectorised loop; a remainder after at least
+    // sixteen as one overlapping NEON window (the overlap is written twice
+    // with the same values) instead of a scalar tail.
+    let body = if cfg!(target_arch = "aarch64") && n > 16 {
+        n & !15
+    } else {
+        n
+    };
+    for (cell, &byte) in cells[..body].iter_mut().zip(&src[..body]) {
+        cell.0 = byte as u64 | high;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if body < n {
+        // SAFETY: `n > 16`, so the window `n - 16..n` is in bounds.
+        unsafe {
+            neon::fill16(
+                cells.as_mut_ptr().add(n - 16),
+                src.as_ptr().add(n - 16),
+                high,
+            )
+        };
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use super::Cell;
+    use std::arch::aarch64::*;
+
+    /// Sixteen cells from sixteen bytes.
+    ///
+    /// # Safety
+    /// `dst` has room for sixteen cells and `src` holds sixteen bytes.
+    #[inline(always)]
+    pub unsafe fn fill16(dst: *mut Cell, src: *const u8, high: u64) {
+        // SAFETY: NEON is baseline on aarch64; the caller bounds the
+        // pointers.
+        unsafe {
+            let v = vld1q_u8(src);
+            let fill = vdupq_n_u64(high);
+            let dst = dst as *mut u64;
+            // Widen u8 -> u16 -> u32 -> u64 by zipping with zero.
+            let z8 = vdupq_n_u8(0);
+            let (h0, h1) = (
+                vreinterpretq_u16_u8(vzip1q_u8(v, z8)),
+                vreinterpretq_u16_u8(vzip2q_u8(v, z8)),
+            );
+            let z16 = vdupq_n_u16(0);
+            let words = [
+                vreinterpretq_u32_u16(vzip1q_u16(h0, z16)),
+                vreinterpretq_u32_u16(vzip2q_u16(h0, z16)),
+                vreinterpretq_u32_u16(vzip1q_u16(h1, z16)),
+                vreinterpretq_u32_u16(vzip2q_u16(h1, z16)),
+            ];
+            let z32 = vdupq_n_u32(0);
+            for (j, w) in words.into_iter().enumerate() {
+                let lo = vorrq_u64(vreinterpretq_u64_u32(vzip1q_u32(w, z32)), fill);
+                let hi = vorrq_u64(vreinterpretq_u64_u32(vzip2q_u32(w, z32)), fill);
+                vst1q_u64(dst.add(4 * j), lo);
+                vst1q_u64(dst.add(4 * j + 2), hi);
+            }
+        }
+    }
+}
+
+/// `cells.fill(cell)`, sixteen bytes per store.
+#[inline(always)]
+pub fn fill_cells(cells: &mut [Cell], cell: Cell) {
+    let (pairs, rest) = cells.as_chunks_mut::<2>();
+    for pair in pairs {
+        // SAFETY: two cells are sixteen bytes in bounds; `Cell` is a
+        // transparent u64 with no invalid bit patterns.
+        unsafe { (pair.as_mut_ptr() as *mut [u64; 2]).write_unaligned([cell.0, cell.0]) };
+    }
+    for c in rest {
+        *c = cell;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fill_bytes_writes_every_length() {
+        let src: Vec<u8> = (0..64u8).map(|b| b' ' + b).collect();
+        for n in 0..=40 {
+            for start in 0..3 {
+                let mut cells = vec![Cell(0xDEAD); n + 6];
+                fill_bytes(&mut cells[start..start + n], &src[..n], 7 << STYLE_SHIFT);
+                for (k, cell) in cells.iter().enumerate() {
+                    let want = if (start..start + n).contains(&k) {
+                        src[k - start] as u64 | 7 << STYLE_SHIFT
+                    } else {
+                        0xDEAD
+                    };
+                    assert_eq!(cell.0, want, "n {n} start {start} cell {k}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fill_cells_writes_every_length() {
+        for n in 0..20 {
+            let mut cells = vec![Cell(1); n + 2];
+            fill_cells(&mut cells[1..1 + n], Cell(9));
+            assert_eq!(cells[0], Cell(1));
+            assert!(cells[1..1 + n].iter().all(|c| *c == Cell(9)));
+            assert_eq!(cells[n + 1], Cell(1));
         }
     }
 }

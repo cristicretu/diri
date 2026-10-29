@@ -220,6 +220,21 @@ fn text_rows_with_orphaned_halves_and_indents() {
 }
 
 #[test]
+fn marks_emoji_and_astral_on_the_text_path() {
+    // Marks on narrow, wide and blank cells, at the row's end and at its
+    // start (after a wrap), stacked, and after a spacer; emoji and Indic
+    // consonants after plain cells and after clusters; astral characters
+    // that never join; all through packed history.
+    let input = "abcdefghi\u{301}\u{302}漢\u{301}x 👍😀\u{301}a\u{301}👍🏽\r\n\
+                 \u{301}q ©\u{300}® ‼ क\u{94D}क e\u{301}😀 𠀀𠀁\u{301}𝐀 \u{200B}z\u{200B}\r\n\
+                 1234567890\u{301}\u{302}\u{303}\r\n🇷\u{301}x 🏽\u{301}y \u{20E3}\u{301}w 🇷\u{FE0F}\u{301}\r\n\x1b[5C\u{301}\x1b[3C漢\u{302}\r\n"
+        .repeat(5);
+    for cols in [7, 10, 11, 16] {
+        check(4, cols, 12, input.as_bytes());
+    }
+}
+
+#[test]
 fn scroll_regions_insert_and_delete_lines() {
     let mut input = Vec::new();
     for i in 0..12 {
@@ -393,6 +408,70 @@ fn random_sequences_match_the_current_core() {
         }
         let (lines, cols) = [(5, 9), (3, 4), (7, 16)][run % 3];
         check(lines, cols, 12, input.as_bytes());
+    }
+}
+
+/// A cluster that widens at the right margin moves to the next row with
+/// its hyperlink (it was read after the leading spacer overwrote it).
+#[test]
+fn a_cluster_widening_at_the_margin_keeps_its_link() {
+    for cols in [3, 4, 5] {
+        check(3, cols, 6, "ab\x1b]8;;u://x\x07🇴\x1b]8;;\x07🇴".as_bytes());
+        check(
+            3,
+            cols,
+            6,
+            "a\x1b]8;id=7;u://y\x07b❤\x1b]8;;\x07\u{FE0F}x\x1b]8;;u://z\x07🇷🇴\x1b]8;;\x07"
+                .as_bytes(),
+        );
+    }
+}
+
+/// Hyperlinks (explicit ids and none) over clusters that widen and narrow
+/// at the margins, wide characters, wraps and scrolls, at narrow widths.
+#[test]
+fn random_links_over_clusters_and_margins() {
+    const TOKENS: &[&str] = &[
+        "a",
+        "bc",
+        "漢",
+        "🇴",
+        "🇷",
+        "❤",
+        "\u{FE0F}",
+        "\u{FE0E}",
+        "\u{200D}",
+        "👍",
+        "\u{1F3FD}",
+        "e\u{301}",
+        "\r\n",
+        "\n",
+        "\x1b]8;;u://x\x07",
+        "\x1b]8;id=1;u://y\x07",
+        "\x1b]8;id=2;u://y\x07",
+        "\x1b]8;;\x07",
+        "\x1b[?2027h",
+        "\x1b[?2027l",
+        "\x1b[?7l",
+        "\x1b[?7h",
+        "\x1b[2D",
+        "\x1b[K",
+    ];
+    let mut seed = 0x9E37_79B9_u32;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    let runs = std::env::var("CORE_V2_FUZZ").map_or(48, |n| n.parse().expect("count"));
+    for run in 0..runs {
+        let mut input = String::new();
+        for _ in 0..50 {
+            input.push_str(TOKENS[next() as usize % TOKENS.len()]);
+        }
+        let (lines, cols) = [(3, 3), (4, 4), (3, 5), (5, 7)][run % 4];
+        check(lines, cols, 8, input.as_bytes());
     }
 }
 

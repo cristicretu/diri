@@ -101,6 +101,16 @@ fn read_golden(path: &str) -> BTreeMap<String, BTreeMap<String, String>> {
     golden
 }
 
+/// `vt_workloads::without_history_position`: a snapshot's history position
+/// (how many rows are kept) is compared through the history keys, so the
+/// grid digest leaves it out.
+fn without_history_position(mut text: String) -> String {
+    if let Some(at) = text.rfind(", history: ") {
+        text.replace_range(at..text.len() - " }".len(), "");
+    }
+    text
+}
+
 /// The golden digest's grid, history, cursor and link keys, computed the
 /// way `vt_workloads` computes them, over the v2 state seen through
 /// `HeadlessScreen`. History is compared over the newest `checked` rows.
@@ -119,7 +129,7 @@ fn screen_digest(
     d.insert("bytes_fed".into(), bytes_fed.to_string());
     d.insert(
         "grid_sha256".into(),
-        sha256(format!("{:?}", screen.full_snapshot()).as_bytes()),
+        sha256(without_history_position(format!("{:?}", screen.full_snapshot())).as_bytes()),
     );
     let kept = screen.history_rows();
     d.insert(
@@ -165,6 +175,27 @@ fn screen_digest(
     );
     d.insert("cursor".into(), format!("{:?}", screen.cursor()));
     d
+}
+
+/// This process's (cycles, instructions) so far: macOS's per-process
+/// counters, which count only while it runs, so a loaded machine changes
+/// them far less than wall time. `None` elsewhere.
+fn cpu_counters() -> Option<(u64, u64)> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+        // SAFETY: the buffer is a `rusage_info_v4`, the flavor asked for.
+        let ok = unsafe {
+            libc::proc_pid_rusage(
+                std::process::id() as i32,
+                libc::RUSAGE_INFO_V4,
+                &mut info as *mut _ as *mut libc::rusage_info_t,
+            )
+        } == 0;
+        ok.then_some((info.ri_cycles, info.ri_instructions))
+    }
+    #[cfg(not(target_os = "macos"))]
+    None
 }
 
 fn summary(mut values: Vec<f64>) -> String {
@@ -352,14 +383,23 @@ fn main() {
         let mut golden_checked = 0;
 
         let (mut v2, mut engine) = (Vec::new(), Vec::new());
+        // Cycles and instructions per byte of the runs that passed.
+        let (mut cycles, mut instructions) = (Vec::new(), Vec::new());
         let mut failure = None;
         let mut stored = 0;
         for _ in 0..rounds {
             let mut core = Core::with_budget(LINES, COLS, history, budget);
             core.raw_text = std::env::var_os("CORE_V2_NO_RAW").is_none();
+            let counters = cpu_counters();
             let start = Instant::now();
             let fed = feed(&mut core, &payload, reps);
             let secs = start.elapsed().as_secs_f64();
+            let counted = counters.zip(cpu_counters()).map(|((c0, i0), (c1, i1))| {
+                (
+                    (c1 - c0) as f64 / bytes as f64,
+                    (i1 - i0) as f64 / bytes as f64,
+                )
+            });
             assert_eq!(fed, bytes, "every byte is fed");
             stored = core.history_bytes();
             if let Some(want) = &want {
@@ -378,7 +418,13 @@ fn main() {
                 golden_checked += 1;
             }
             match compare(&core, &reference) {
-                Ok(()) => v2.push(bytes as f64 / secs / 1e6),
+                Ok(()) => {
+                    v2.push(bytes as f64 / secs / 1e6);
+                    if let Some((c, i)) = counted {
+                        cycles.push(c);
+                        instructions.push(i);
+                    }
+                }
                 Err(error) => {
                     failure = Some(error);
                     break;
@@ -401,7 +447,7 @@ fn main() {
         match failure {
             Some(error) => println!("{name:<10} v2 FAILED THE STATE CHECK: {error}"),
             None => println!(
-                "{name:<10} {:>20} {:>20} {kept:>12} {:>14.2}{}",
+                "{name:<10} {:>20} {:>20} {kept:>12} {:>14.2}{}{}",
                 summary(v2),
                 summary(engine),
                 stored as f64 / (1 << 20) as f64,
@@ -409,6 +455,19 @@ fn main() {
                     format!("  golden ok x{golden_checked}")
                 } else {
                     String::new()
+                },
+                if cycles.is_empty() {
+                    String::new()
+                } else {
+                    let fmt = |mut v: Vec<f64>| {
+                        v.sort_by(f64::total_cmp);
+                        format!("{:.3} ({:.3}..{:.3})", v[v.len() / 2], v[0], v[v.len() - 1])
+                    };
+                    format!(
+                        "  cycles/B {}  instructions/B {}",
+                        fmt(cycles),
+                        fmt(instructions)
+                    )
                 }
             ),
         }
