@@ -56,6 +56,8 @@ pub(in crate::sidebar) struct StripTabProps {
     pub(super) settling: bool,
     /// A terminal's directory, shown when the pointer rests on its tab.
     pub(super) location: Option<String>,
+    /// The tab's layout with each pane's state, when it is split.
+    pub(super) split: Option<super::split_mark::SplitMark>,
     /// The fraction of the hover fill a tab the pointer just left still
     /// wears; it changes each frame of the fade (see `hover_linger`).
     pub(super) hover_linger: f32,
@@ -105,13 +107,20 @@ impl Sidebar {
         index: usize,
         count: usize,
         active: bool,
-        state: StatusState,
+        marks: super::tabs::TabMarks,
         colors: SemanticColors,
         custom_ordering: bool,
         reduce_motion: bool,
         pill_drawn: bool,
     ) -> StripTabProps {
         let id = &session.id;
+        let super::tabs::TabMarks {
+            state,
+            asking,
+            split,
+        } = marks;
+        // The pane that asks names the question.
+        let asking = asking.as_deref().unwrap_or(session);
         // The same rule the sidebar rows follow: ⌘1–⌘8, then ⌘9 = last.
         let rank = if index < 8 {
             Some(index + 1)
@@ -132,7 +141,7 @@ impl Sidebar {
         StripTabProps {
             id: id.clone(),
             // A tab waiting on a named question shows the question.
-            title: crate::session_presentation::blocker_line(session)
+            title: crate::session_presentation::blocker_line(asking)
                 .unwrap_or_else(|| display_title(session)),
             kind: session.effective_kind().clone(),
             active,
@@ -153,6 +162,7 @@ impl Sidebar {
             shift,
             settling: self.settling_title(id, 0.0).is_some(),
             location: crate::switcher::terminal_location(session),
+            split,
             hover_linger: if active {
                 0.0
             } else {

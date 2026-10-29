@@ -259,36 +259,21 @@ impl HoverStatus {
 
 /// The tab's layout at glyph size with tile `filled` in `ink`.
 pub(super) fn layout_glyph(tiles: &[Tile], filled: usize, ink: Rgba, colors: SemanticColors) -> AnyElement {
-    let mut glyph = div()
-        .flex_none()
-        .relative()
-        .w(px(GLYPH_WIDTH))
-        .h(px(GLYPH_HEIGHT));
-    for (index, tile) in tiles.iter().enumerate() {
-        let half = GLYPH_GAP / 2.0;
-        // Inset only the edges a tile shares with a neighbour, so the
-        // glyph's outline stays one clean rectangle.
-        let left = if tile.x > 0.001 { half } else { 0.0 };
-        let top = if tile.y > 0.001 { half } else { 0.0 };
-        let right = if tile.x + tile.width < 0.999 { half } else { 0.0 };
-        let bottom = if tile.y + tile.height < 0.999 { half } else { 0.0 };
-        let fill = if index == filled {
-            ink
-        } else {
-            colors.primary.alpha(0.14)
-        };
-        glyph = glyph.child(
-            div()
-                .absolute()
-                .left(px(tile.x * GLYPH_WIDTH + left))
-                .top(px(tile.y * GLYPH_HEIGHT + top))
-                .w(px((tile.width * GLYPH_WIDTH - left - right).max(1.0)))
-                .h(px((tile.height * GLYPH_HEIGHT - top - bottom).max(1.0)))
-                .rounded(px(2.0))
-                .bg(fill),
-        );
-    }
-    glyph.into_any_element()
+    super::split_mark::draw(
+        tiles.iter().enumerate().map(|(index, tile)| {
+            let fill = if index == filled {
+                ink
+            } else {
+                colors.primary.alpha(0.14)
+            };
+            (*tile, fill)
+        }),
+        GLYPH_WIDTH,
+        GLYPH_HEIGHT,
+        GLYPH_GAP,
+        2.0,
+    )
+    .into_any_element()
 }
 
 impl HoverStatus {

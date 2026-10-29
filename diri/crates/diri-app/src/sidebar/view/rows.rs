@@ -56,6 +56,8 @@ pub(in crate::sidebar) struct SessionRowProps {
     pub(super) panes: usize,
     /// Terminal progress, when the session reports any.
     pub(super) progress: Option<crate::progress_mark::ProgressFace>,
+    /// The tab's layout with each pane's state, when it is split.
+    pub(super) split: Option<super::split_mark::SplitMark>,
     pub(super) marked: bool,
     pub(super) hovered: bool,
     pub(super) focused: bool,
@@ -131,7 +133,7 @@ impl Sidebar {
     ) -> SessionRowProps {
         let session = &row.session;
         let id = &session.id;
-        let (selected, multi, drag_selection, migrating, activity_state, pane_group, unseen) = {
+        let (selected, multi, drag_selection, migrating, activity_state, pane_group, unseen, split) = {
             let mut store = self.store.write().expect("session store lock poisoned");
             (
                 // While the To-dos page covers the workbench, no row is the
@@ -146,6 +148,7 @@ impl Sidebar {
                 self.activity_filter
                     .then(|| store.notifications().latest_unread(id).cloned())
                     .flatten(),
+                super::split_mark::SplitMark::of(&store, id, colors),
             )
         };
         let (panes, shells) = pane_group.unwrap_or_default();
@@ -184,6 +187,7 @@ impl Sidebar {
             activity,
             panes,
             progress: crate::progress_mark::face(session, self.activity_frame, reduce_motion),
+            split,
             marked: self.ui.delegation_mark.as_ref() == Some(id),
             hovered: self.ui.hovered_session.as_ref() == Some(id),
             focused: self.focus_handle.is_focused(window)
