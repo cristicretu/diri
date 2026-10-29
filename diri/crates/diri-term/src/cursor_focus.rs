@@ -343,6 +343,7 @@ mod tests {
                     .map(|y| ChangedRow::new(y, vec![GridCell::BLANK; 20]))
                     .collect(),
                 cursor_style: Default::default(),
+                history: None,
             });
             element
         }
@@ -391,6 +392,7 @@ mod tests {
                 is_full_snapshot: false,
                 changed_rows: vec![ChangedRow::new(1, vec![GridCell::BLANK; 20])],
                 cursor_style: Default::default(),
+                history: None,
             });
             assert_eq!(next_frame(cx), 0);
             assert_eq!(element.cursor_schedule(), Some(CursorSchedule::Rest));

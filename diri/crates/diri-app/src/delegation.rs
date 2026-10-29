@@ -78,7 +78,7 @@ pub fn handoff_proposal(
         target_id: target.id.clone(),
         source_title: display_title(source),
         target_title: display_title(target),
-        summary: assemble_handoff_summary(source),
+        summary: assemble_handoff_summary(source, target),
     })
 }
 
@@ -207,7 +207,7 @@ fn is_descendant(
     false
 }
 
-pub fn assemble_handoff_summary(source: &SessionRecord) -> String {
+pub fn assemble_handoff_summary(source: &SessionRecord, target: &SessionRecord) -> String {
     let title = display_title(source);
     let location = source
         .worktree_path
@@ -216,16 +216,49 @@ pub fn assemble_handoff_summary(source: &SessionRecord) -> String {
         .trim();
     let result = last_transcript_result(source)
         .unwrap_or_else(|| "No transcript result is available yet.".to_owned());
+    let (transcript, read_hint) = transcript_reference(source, target);
+    let agent_session = source.agent_session_id.as_deref().unwrap_or("not available");
     format!(
         "Please continue the work delegated from the Diri session \"{title}\".\n\n\
          BEGIN DELEGATED SESSION CONTEXT\n\
          Session: {title}\n\
+         Diri session ID: {}\n\
+         Agent session ID: {agent_session}\n\
+         Transcript: {transcript}\n\
          Worktree: {location}\n\
          Diff stat: {}\n\
          Last transcript result:\n{result}\n\
          END DELEGATED SESSION CONTEXT\n\n\
+         {read_hint}\
          Verify the current workspace state, preserve completed work, and continue from here.",
+        source.id,
         diff_stat(source)
+    )
+}
+
+/// The source transcript stays on disk; the handoff only points at it so the
+/// receiving agent reads it on demand instead of starting with it in context.
+/// A path on another machine is named but not offered as readable.
+fn transcript_reference(source: &SessionRecord, target: &SessionRecord) -> (String, &'static str) {
+    let Some(path) = source.transcript_path.as_deref().and_then(nonempty) else {
+        return ("not available".to_owned(), "");
+    };
+    let kind = source.kind.id();
+    if source.host == target.host {
+        return (
+            format!("{path} ({kind} transcript)"),
+            "The full source transcript is referenced above. Read it when you need earlier \
+             decisions, approaches that were tried and rejected, or details this summary \
+             leaves out; skip tool output unless it matters.\n\n",
+        );
+    }
+    let machine = source
+        .host
+        .as_deref()
+        .map_or_else(|| "the local machine".to_owned(), |host| format!("host {host}"));
+    (
+        format!("{path} ({kind} transcript on {machine}, not reachable from this session)"),
+        "",
     )
 }
 
@@ -426,6 +459,7 @@ mod tests {
             pull_requests: None,
             listening_ports: None,
             foreground_agent: None,
+            foreground_program: None,
             terminal_cwd: None,
             agent_workspace: None,
             note_id: None,
@@ -570,10 +604,46 @@ mod tests {
             originating_prompt(&source).as_deref(),
             Some("original task")
         );
-        let summary = assemble_handoff_summary(&source);
+        let target = session("target", None);
+        let summary = assemble_handoff_summary(&source, &target);
         assert!(summary.contains("Session: Source session"));
+        assert!(summary.contains("Diri session ID: Source  session"));
+        assert!(summary.contains("Agent session ID: agent-Source  session"));
+        assert!(summary.contains(&format!(
+            "Transcript: {} (codex transcript)",
+            temp.path().display()
+        )));
+        assert!(summary.contains("Read it when you need earlier decisions"));
         assert!(summary.contains("Worktree: /repo/worktrees/Source  session"));
         assert!(summary.contains("Diff stat: +12 −3 across 2 files"));
         assert!(summary.contains("Implemented the parser and all tests pass."));
+    }
+
+    #[test]
+    fn transcript_on_another_machine_is_named_but_not_offered() {
+        let mut source = session("source", None);
+        source.transcript_path = Some("/home/me/.codex/sessions/rollout.jsonl".to_owned());
+        source.host = Some("forge".to_owned());
+        let target = session("target", None);
+        let summary = assemble_handoff_summary(&source, &target);
+        assert!(summary.contains(
+            "Transcript: /home/me/.codex/sessions/rollout.jsonl (codex transcript on host \
+             forge, not reachable from this session)"
+        ));
+        assert!(!summary.contains("Read it when you need"));
+
+        let mut local_source = session("source", None);
+        local_source.transcript_path = Some("/Users/me/t.jsonl".to_owned());
+        let mut remote_target = session("target", None);
+        remote_target.host = Some("forge".to_owned());
+        let summary = assemble_handoff_summary(&local_source, &remote_target);
+        assert!(summary.contains("on the local machine, not reachable"));
+    }
+
+    #[test]
+    fn missing_transcript_is_reported_without_a_read_hint() {
+        let summary = assemble_handoff_summary(&session("source", None), &session("target", None));
+        assert!(summary.contains("Transcript: not available"));
+        assert!(!summary.contains("Read it when you need"));
     }
 }

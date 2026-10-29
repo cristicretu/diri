@@ -312,6 +312,7 @@ fn snapshot() -> GridUpdate {
         is_full_snapshot: true,
         changed_rows,
         cursor_style: Default::default(),
+        history: None,
     }
 }
 

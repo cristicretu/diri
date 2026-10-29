@@ -118,7 +118,7 @@ Wait for a session status without model polling. Already matching states return 
 
 ### `read_output`
 
-Read what a session produced. last_message (best for results) returns the Agent's final answer from its transcript; transcript returns the last N turns; since returns only terminal lines added after cursor (pass back the returned cursor next time); screen/tail return the rendered screen. Transcript modes fall back to the screen tail when a session has no readable transcript (remote, shells, other agents).
+Read what a session produced. last_message (best for results) returns the Agent's final answer from its transcript; transcript returns the last N turns; since returns only terminal lines added after cursor (pass back the returned cursor next time); screen/tail return the rendered screen, with rows the terminal soft-wrapped rejoined into the line the program wrote so URLs, paths and JSON arrive whole (unwrap:false for one line per screen row). Transcript modes fall back to the screen tail when a session has no readable transcript (remote, shells, other agents).
 
 | Argument | Type | Notes |
 | --- | --- | --- |
@@ -127,6 +127,7 @@ Read what a session produced. last_message (best for results) returns the Agent'
 | `lines` | number | Default `50`. |
 | `mode` | `screen`, `tail`, `last_message`, `transcript`, `since` |  |
 | `turns` | number | Default `6`. |
+| `unwrap` | boolean | Default `true`. |
 
 
 ## Tracked tasks
@@ -561,6 +562,23 @@ Name your own Diri session (its tab and sidebar row) after the task: 2-4 lowerca
 | --- | --- | --- |
 | `name` | string | **Required.** |
 | `user_requested` | boolean |  |
+
+### `list_actions`
+
+List the Diri app's window actions: what its menus, keys and command palette do (split, focus, zoom or equalize panes, select tabs, toggle the sidebar, find, font size, theme). query filters by name or title. Run one with perform_action.
+
+| Argument | Type | Notes |
+| --- | --- | --- |
+| `query` | string |  |
+
+### `perform_action`
+
+Run one Diri app action from list_actions in the person's window; args must match its schema. The window names you while it changes, so change it only when the user asked. Destructive actions need args.session_id of a session you may manage, or are the person's to run.
+
+| Argument | Type | Notes |
+| --- | --- | --- |
+| `action` | string | **Required.** |
+| `args` | object |  |
 
 ### `note_links`
 

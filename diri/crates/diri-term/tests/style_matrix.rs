@@ -410,6 +410,7 @@ fn render_style_matrix() {
         is_full_snapshot: true,
         changed_rows: rows,
         cursor_style: Default::default(),
+        history: None,
     };
     capture(
         &mut cx,

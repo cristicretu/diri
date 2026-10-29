@@ -24,8 +24,8 @@ use crate::find::{
 use crate::inline_images::{DrawGrid, ImageDraw, InlineImageCache, append_row_draws};
 use crate::metrics::CellMetrics;
 use crate::scrollback::{
-    ScrollRouter, ScrollbackApplyError, ScrollbackRequest, ScrollbackViewport, ScrolledState,
-    TerminalModes, WheelDelta, WheelEvent, WheelRoute,
+    HistoryFollow, HistoryStep, ScrollRouter, ScrollbackApplyError, ScrollbackRequest,
+    ScrollbackViewport, ScrolledState, TerminalModes, WheelDelta, WheelEvent, WheelRoute,
 };
 use crate::selection::{SelectionPoint, TerminalSelection};
 use crate::selection_shimmer::SelectionShimmer;
@@ -379,16 +379,29 @@ impl TerminalDamageObserver {
             viewport.note_width_change(&buffer, update.cols);
         }
         let reading_held = viewport.is_reading();
-        drop(viewport);
+        let follow = viewport.follow_history(update, &buffer);
         let replaces_grid =
             update.is_full_snapshot || buffer.cols != update.cols || buffer.rows != update.rows;
         note_cursor_damage(&self.shared.cursor, &buffer, update, replaces_grid);
+        let mut selection = mutex_lock(&self.shared.selection);
+        if let HistoryFollow::Moved(step) = follow {
+            // `grid-history-v1`: the publisher said how far the rows moved.
+            carry_selection(
+                &mut selection,
+                &mut viewport,
+                &buffer,
+                update,
+                live_start_row,
+                step,
+            );
+            return;
+        }
+        drop(viewport);
         let damaged_cols = usize::from(if replaces_grid {
             buffer.cols.max(update.cols)
         } else {
             update.cols
         });
-        let mut selection = mutex_lock(&self.shared.selection);
         let selection_overlaps_damage = if reading_held || selection.range().is_none() {
             false
         } else if replaces_grid {
@@ -404,9 +417,74 @@ impl TerminalDamageObserver {
                     )
             })
         };
-        if selection_overlaps_damage {
+        // A new origin renumbers every row: whatever the selection named,
+        // it no longer names it.
+        if selection_overlaps_damage || follow == HistoryFollow::Rebased {
             selection.clear();
         }
+    }
+}
+
+/// Keeps a live selection on its text across one grid whose rows moved up
+/// by `step`. Rows of it that scroll into history are kept by the viewport,
+/// so it still paints when scrolled to and copies the same text; the
+/// selection is dropped once a selected cell shows different text (the
+/// program rewrote or cleared it in place) or its text leaves history.
+fn carry_selection(
+    selection: &mut TerminalSelection,
+    viewport: &mut ScrollbackViewport,
+    buffer: &GridBuffer,
+    update: &GridUpdate,
+    old_live_start: i64,
+    step: HistoryStep,
+) {
+    if selection.range().is_none() {
+        return;
+    }
+    let cols = usize::from(buffer.cols);
+    let rows = usize::from(buffer.rows);
+    let new_live_start = viewport.live_start_row();
+    for y in 0..step.scrolled.min(rows) {
+        let old_row = old_live_start.saturating_add(y as i64);
+        if selection.overlaps_row(old_row, cols)
+            && let Some(cells) = buffer.row(y)
+        {
+            let metadata = buffer.annotations.get(y).cloned().unwrap_or_default();
+            viewport.pin_row(old_row.saturating_add(step.renumber), cells, metadata);
+        }
+    }
+    selection.shift_rows(step.renumber);
+    // Rows evicted from the oldest end of history take their text with them.
+    if selection.first_row().is_some_and(|row| row < 0) {
+        selection.clear();
+        return;
+    }
+    // Each live row the selection now covers must show the text it covered
+    // at its old position `y + scrolled`. A row the diff leaves alone still
+    // shows what row `y` showed; a full snapshot sends every row.
+    let changed = update
+        .changed_rows
+        .iter()
+        .map(|changed| (usize::from(changed.y), changed.cells.as_slice()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let dropped = (0..rows).any(|y| {
+        let row = new_live_start.saturating_add(y as i64);
+        if !selection.overlaps_row(row, cols) {
+            return false;
+        }
+        let after = match changed.get(&y) {
+            Some(cells) => *cells,
+            None if update.is_full_snapshot => &[],
+            None => buffer.row(y).unwrap_or_default(),
+        };
+        match buffer.row(y + step.scrolled) {
+            Some(before) => !selection.keeps_text(row, cols, before, after),
+            // A new row under the selection: nothing it selected was there.
+            None => true,
+        }
+    });
+    if dropped {
+        selection.clear();
     }
 }
 
@@ -5434,6 +5512,7 @@ mod link_tests {
                 .map(|y| diri_proto::grid::ChangedRow::new(*y, vec![super::GridCell::BLANK; 8]))
                 .collect(),
             cursor_style: Default::default(),
+            history: None,
         }
     }
 
@@ -5947,6 +6026,7 @@ mod selection_repaint_tests {
                 .map(|(y, text)| ChangedRow::new(*y, row(text)))
                 .collect(),
             cursor_style: Default::default(),
+            history: None,
         }
     }
 

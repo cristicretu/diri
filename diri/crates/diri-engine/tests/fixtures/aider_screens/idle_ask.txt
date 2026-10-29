@@ -1,0 +1,21 @@
+
+notes.txt
+Add file to the chat? (Y)es/(N)o/(D)on't ask again [Yes]: y
+Here is the fix:
+
+Done.
+
+
+Tokens: 2.4k sent, 7 received.
+────────────────────────────────────────────────────────────────────────────────
+notes.txt
+diff> /chat-mode ask
+
+Aider v0.86.2
+Model: openai/fake with ask edit format
+Git repo: .git with 1 files
+Repo-map: disabled
+Added notes.txt to the chat.
+────────────────────────────────────────────────────────────────────────────────
+notes.txt
+ask>

@@ -94,6 +94,7 @@ fn glyph_columns(cx: &mut gpui::HeadlessAppContext, cell_width: f32) -> Vec<u32>
         is_full_snapshot: true,
         changed_rows: vec![ChangedRow::new(0, cells)],
         cursor_style: Default::default(),
+        history: None,
     });
     let window = cx
         .open_window(gpui::size(px(240.0), px(30.0)), move |_, cx| {

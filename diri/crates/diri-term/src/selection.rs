@@ -287,6 +287,60 @@ impl TerminalSelection {
         start < end
     }
 
+    /// Moves every endpoint by `delta` rows, keeping the selection on its
+    /// text when the terminal renumbers absolute rows under it.
+    pub(crate) fn shift_rows(&mut self, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        let shift = |point: &mut Option<SelectionPoint>| {
+            if let Some(point) = point {
+                point.row = point.row.saturating_add(delta);
+            }
+        };
+        shift(&mut self.anchor);
+        shift(&mut self.head);
+        shift(&mut self.anchor_cell);
+        if let Some(initial) = &mut self.initial {
+            initial.start.row = initial.start.row.saturating_add(delta);
+            initial.end.row = initial.end.row.saturating_add(delta);
+        }
+    }
+
+    /// The first absolute row the selection covers.
+    #[must_use]
+    pub(crate) fn first_row(&self) -> Option<i64> {
+        self.range().map(|range| range.start.row)
+    }
+
+    /// Whether `after` shows the same text as `before` in every cell the
+    /// selection covers on `absolute_row`: a repaint that only restyles or
+    /// rewrites what it already showed leaves the selection on its text.
+    #[must_use]
+    pub(crate) fn keeps_text(
+        &self,
+        absolute_row: i64,
+        cols: usize,
+        before: &[GridCell],
+        after: &[GridCell],
+    ) -> bool {
+        let Some(range) = self.range() else {
+            return true;
+        };
+        let (start, end) = self.columns(range, absolute_row, cols);
+        let text = |cells: &[GridCell], col: usize| {
+            let cell = cells.get(col).copied().unwrap_or(GridCell::BLANK);
+            // An erased cell and a written space read the same.
+            let scalar = if cell.scalar == 0 {
+                u32::from(' ')
+            } else {
+                cell.scalar
+            };
+            (scalar, cell.style.contains(TermStyle::WIDE_SPACER))
+        };
+        (start..end).all(|col| text(before, col) == text(after, col))
+    }
+
     #[must_use]
     pub fn visible_spans(
         &self,

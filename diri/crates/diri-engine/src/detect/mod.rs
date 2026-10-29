@@ -988,6 +988,136 @@ mod tests {
         }
     }
 
+    /// Visible grids captured from aider 0.86.2 in an 80- or 40-column PTY
+    /// against a scripted local OpenAI-compatible API; `working_ascii` forces
+    /// only aider's unicode probe off. Before these rules an answered confirm
+    /// read as pending again once a later row ended in ':' (the follow-up
+    /// request streams "Here is the fix:"), a confirm wrapped inside `(Y)es`
+    /// never read as blocked, the hyphenated edit-format and `multi` prompts
+    /// never read as idle, and the ASCII spinner rule matched a palette aider
+    /// does not draw.
+    #[test]
+    fn aider_rules_match_the_screens_aider_draws() {
+        let engine = engine();
+        let cases = [
+            (
+                include_str!("../../tests/fixtures/aider_screens/confirm_docs.txt"),
+                Some((ManifestState::BlockedPermission, "confirm-prompt")),
+            ),
+            (
+                include_str!("../../tests/fixtures/aider_screens/confirm_docs_wrapped.txt"),
+                Some((ManifestState::BlockedPermission, "confirm-prompt")),
+            ),
+            (
+                include_str!("../../tests/fixtures/aider_screens/confirm_gitignore_wrapped.txt"),
+                Some((ManifestState::BlockedPermission, "confirm-prompt")),
+            ),
+            (
+                include_str!("../../tests/fixtures/aider_screens/confirm_add_file.txt"),
+                Some((ManifestState::BlockedPermission, "confirm-prompt")),
+            ),
+            (
+                include_str!("../../tests/fixtures/aider_screens/working_request.txt"),
+                Some((ManifestState::Working, "working-spinner")),
+            ),
+            (
+                include_str!("../../tests/fixtures/aider_screens/answered_spinner.txt"),
+                Some((ManifestState::Working, "working-spinner")),
+            ),
+            (
+                include_str!("../../tests/fixtures/aider_screens/working_ascii.txt"),
+                Some((ManifestState::Working, "working-spinner-ascii")),
+            ),
+            // Streaming matches nothing, so the reducer keeps Working.
+            (
+                include_str!("../../tests/fixtures/aider_screens/answered_then_colon.txt"),
+                None,
+            ),
+            (
+                include_str!("../../tests/fixtures/aider_screens/denied_then_idle.txt"),
+                Some((ManifestState::Idle, "idle-prompt")),
+            ),
+            (
+                include_str!("../../tests/fixtures/aider_screens/idle_after_reply.txt"),
+                Some((ManifestState::Idle, "idle-prompt")),
+            ),
+            (
+                include_str!("../../tests/fixtures/aider_screens/idle_ask.txt"),
+                Some((ManifestState::Idle, "idle-prompt")),
+            ),
+            (
+                include_str!("../../tests/fixtures/aider_screens/idle_diff_fenced.txt"),
+                Some((ManifestState::Idle, "idle-prompt")),
+            ),
+            (
+                include_str!("../../tests/fixtures/aider_screens/idle_multi.txt"),
+                Some((ManifestState::Idle, "idle-prompt")),
+            ),
+        ];
+        for (text, expected) in cases {
+            let actual = engine.evaluate(
+                &ScreenSnapshot::from_lines(text.lines().map(str::to_owned)),
+                "aider",
+            );
+            assert_eq!(
+                actual
+                    .as_ref()
+                    .map(|actual| (actual.state, actual.matched_rule_id.as_str())),
+                expected,
+                "{text}"
+            );
+            if let Some(actual) =
+                actual.filter(|actual| actual.state == ManifestState::BlockedPermission)
+            {
+                let excerpt = actual.prompt_excerpt.expect("confirm excerpt");
+                let prompt = text.trim_end().lines().last().unwrap();
+                assert!(excerpt.ends_with(prompt), "{excerpt}");
+            }
+        }
+
+        // The subject aider prints above a confirm is part of the question.
+        let excerpt = engine
+            .evaluate(
+                &ScreenSnapshot::from_lines(
+                    include_str!("../../tests/fixtures/aider_screens/confirm_add_file.txt")
+                        .lines()
+                        .map(str::to_owned),
+                ),
+                "aider",
+            )
+            .and_then(|observation| observation.prompt_excerpt)
+            .unwrap();
+        assert!(
+            excerpt
+                .ends_with("notes.txt\nAdd file to the chat? (Y)es/(N)o/(D)on't ask again [Yes]:"),
+            "{excerpt}"
+        );
+
+        // Rows a reply can stream onto the bottom of the screen. Synthetic:
+        // none of them may read as a pending confirm, the prompt or the
+        // spinner. A lone '>' row stays indistinguishable from the prompt.
+        let answered = "Add file to the chat? (Y)es/(N)o/(D)on't ask again [Yes]: y";
+        for lines in [
+            vec![answered],
+            vec!["Create new file? (Y)es/(N)o [Yes]: n"],
+            vec![answered, "items[0]:"],
+            vec![answered, "Applying edit to src/main.rs:"],
+            vec!["->"],
+            vec!["-->"],
+            vec!["    string>"],
+            vec!["html>"],
+            vec![">", "Response continues here."],
+            vec!["- Waiting for review on the PR"],
+            vec!["| Generating commit message with care |"],
+        ] {
+            assert_eq!(
+                engine.evaluate(&ScreenSnapshot::from_lines(lines.clone()), "aider"),
+                None,
+                "{lines:#?}"
+            );
+        }
+    }
+
     /// Visible grids captured from Kimi Code 2.1.1 via `tests/kimi_real.rs`.
     /// Only temporary paths/session IDs are normalized in the fixture screens.
     #[test]

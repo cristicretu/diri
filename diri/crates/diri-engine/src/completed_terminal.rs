@@ -343,9 +343,11 @@ impl CompletedTerminalStore {
         }
         check_capture_size(checkpoint)?;
         let mut payload = LimitedBytes(Vec::new());
+        // The stored form predates `grid-history-v1`; a history position
+        // describes a live terminal, not a retained one.
         let grid = checkpoint
             .grid
-            .encode()
+            .encode_without_history()
             .map_err(|_| StorageError::Corrupt)?;
         preflight_grid(&grid, checkpoint.history.len())?;
         append_section(&mut payload, &grid)?;
@@ -784,6 +786,7 @@ mod tests {
             pull_requests: None,
             listening_ports: None,
             foreground_agent: None,
+            foreground_program: None,
             terminal_cwd: None,
             agent_workspace: None,
             note_id: None,
@@ -964,7 +967,10 @@ mod tests {
         assert_eq!(loaded.coverage, CompletedCoverage::RetainedGridAndHistory);
         assert_eq!(loaded.exit, exited(0));
         let restored = loaded.checkpoint;
-        assert_eq!(restored.grid, checkpoint.grid);
+        // A retained run keeps its screen, not a live history position.
+        let mut grid = checkpoint.grid.clone();
+        grid.history = None;
+        assert_eq!(restored.grid, grid);
         assert_eq!(restored.history, checkpoint.history);
         assert_eq!(restored.history_metadata, checkpoint.history_metadata);
         assert!(
