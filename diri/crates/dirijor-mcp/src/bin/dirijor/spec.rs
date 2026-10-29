@@ -911,6 +911,23 @@ pub(super) const ROOT: Command = Command {
             Complete::Nothing,
             &[option("--tool", "NAME", "Tool")],
         ),
+        cmd(
+            "script",
+            "[FILE]",
+            "Run a Lua script against Diri, a line of Lua, or a prompt",
+            Complete::Path,
+            &[
+                short(
+                    option("--eval", "CODE", "Run this Lua instead of a file"),
+                    'e',
+                ),
+                option(
+                    "--for",
+                    "SECONDS",
+                    "Stop a script that listens after this long",
+                ),
+            ],
+        ),
         cmd("help", "[COMMAND]", "Print usage", Complete::Nothing, &[]),
         internal(cmd("hook", "EVENT", "Agent hook", Complete::Nothing, &[])),
         internal(cmd("mcp-stdio", "", "MCP server", Complete::Nothing, &[])),

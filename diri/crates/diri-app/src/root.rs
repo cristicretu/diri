@@ -30,6 +30,7 @@ mod terminal_import_tests;
 mod whats_new_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod window_navigation_tests;
+mod app_actions;
 mod workspace_launches;
 mod move_to_window;
 #[cfg(all(test, target_os = "macos"))]
@@ -1320,6 +1321,9 @@ impl RootView {
                             if let Some(id) = launched {
                                 this.open_workspace_launch_session(id, window, cx);
                             }
+                            // Before the window's own requests: they may bring
+                            // the window forward, and an Agent's must not.
+                            this.perform_app_actions(window, cx);
                             let actions = this
                                 .window_store
                                 .write()
@@ -1842,6 +1846,11 @@ impl RootView {
     fn show_feedback(&mut self, kind: &'static str, toast: Toast, cx: &mut Context<Self>) {
         diri_telemetry::event!("ui.toast", kind = kind);
         self.show_toast(toast, cx);
+    }
+
+    /// A notice from the person's `init.lua` (see `crate::scripting`).
+    pub(crate) fn show_script_toast(&mut self, toast: Toast, cx: &mut Context<Self>) {
+        self.show_feedback("script", toast, cx);
     }
 
     fn show_toast(&mut self, toast: Toast, cx: &mut Context<Self>) {

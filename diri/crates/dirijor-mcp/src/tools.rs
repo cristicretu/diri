@@ -219,7 +219,7 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
         ),
         ToolDefinition::new(
             "read_output",
-            "Read what a session produced. last_message (best for results) returns the Agent's final answer from its transcript; transcript returns the last N turns; since returns only terminal lines added after cursor (pass back the returned cursor next time); screen/tail return the rendered screen. Transcript modes fall back to the screen tail when a session has no readable transcript (remote, shells, other agents).",
+            "Read what a session produced. last_message (best for results) returns the Agent's final answer from its transcript; transcript returns the last N turns; since returns only terminal lines added after cursor (pass back the returned cursor next time); screen/tail return the rendered screen, with rows the terminal soft-wrapped rejoined into the line the program wrote so URLs, paths and JSON arrive whole (unwrap:false for one line per screen row). Transcript modes fall back to the screen tail when a session has no readable transcript (remote, shells, other agents).",
             json!({
                 "type": "object",
                 "properties": {
@@ -227,7 +227,8 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
                     "mode": {"type": "string", "enum": ["screen", "tail", "last_message", "transcript", "since"]},
                     "lines": {"type": "number", "default": 50},
                     "turns": {"type": "number", "default": 6, "minimum": 1, "maximum": 100},
-                    "cursor": {"type": "number", "minimum": 0}
+                    "cursor": {"type": "number", "minimum": 0},
+                    "unwrap": {"type": "boolean", "default": true}
                 },
                 "required": ["session_id"]
             }),
@@ -401,6 +402,16 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
             }),
         ),
         ToolDefinition::new(
+            "list_actions",
+            "List the Diri app's window actions: what its menus, keys and command palette do (split, focus, zoom or equalize panes, select tabs, toggle the sidebar, find, font size, theme). query filters by name or title. Run one with perform_action.",
+            json!({"type": "object", "properties": {"query": {"type": "string", "minLength": 1}}}),
+        ),
+        ToolDefinition::new(
+            "perform_action",
+            "Run one Diri app action from list_actions in the person's window; args must match its schema. The window names you while it changes, so change it only when the user asked. Destructive actions need args.session_id of a session you may manage, or are the person's to run.",
+            json!({"type": "object", "properties": {"action": {"type": "string", "minLength": 1}, "args": {"type": "object"}}, "required": ["action"]}),
+        ),
+        ToolDefinition::new(
             "list_notes",
             "Find the person's Diri Notes (briefs, plans, to-do lists). Notes are kept by Diri, not in the project folder, so use this rather than searching files. Defaults to notes for your project; project:\"all\" lists every note, or pass a project folder. mentions:\"me\" returns notes that @-mention you or an ancestor that started you (mentioned_via says which). query filters title and body. links_to (a note's id or title) returns the notes that link to that note. session_id is the note's sidebar Session.",
             json!({"type":"object","properties":{"project":{"type":"string","minLength":1},"mentions":{"type":"string","minLength":1},"query":{"type":"string","minLength":1},"links_to":{"type":"string","minLength":1},"include_archived":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":200}}}),
@@ -564,61 +575,7 @@ pub(crate) fn validate_arguments(tool: &str, arguments: &Value) -> Result<(), St
 }
 
 pub(crate) fn validate_value(value: &Value, schema: &Value, path: &str) -> Result<(), String> {
-    let expected = schema["type"].as_str().unwrap_or("any");
-    let valid = match expected {
-        "object" => value.is_object(),
-        "array" => value.is_array(),
-        "string" => value.is_string(),
-        "boolean" => value.is_boolean(),
-        "number" => value.as_f64().is_some_and(f64::is_finite),
-        "integer" => value.is_i64() || value.is_u64(),
-        "null" => value.is_null(),
-        _ => true,
-    };
-    if !valid {
-        return Err(format!("{path} must be {expected}"));
-    }
-    if let Some(allowed) = schema["enum"].as_array()
-        && !allowed.contains(value)
-    {
-        return Err(format!("{path} is not a supported value"));
-    }
-    if let Some(object) = value.as_object() {
-        if let Some(required) = schema["required"].as_array() {
-            for key in required.iter().filter_map(Value::as_str) {
-                if !object.contains_key(key) {
-                    return Err(format!("missing required argument: {key}"));
-                }
-            }
-        }
-        for (key, field) in object {
-            if let Some(field_schema) = schema["properties"].get(key) {
-                validate_value(field, field_schema, &format!("{path}.{key}"))?;
-            } else if schema["additionalProperties"] == false {
-                return Err(format!("unsupported argument: {key}"));
-            }
-        }
-    }
-    if let Some(entries) = value.as_array() {
-        for (index, entry) in entries.iter().enumerate() {
-            validate_value(entry, &schema["items"], &format!("{path}[{index}]"))?;
-        }
-    }
-    if let Some(text) = value.as_str() {
-        let length = text.chars().count() as u64;
-        if schema["minLength"].as_u64().is_some_and(|min| length < min)
-            || schema["maxLength"].as_u64().is_some_and(|max| length > max)
-        {
-            return Err(format!("{path} has an invalid length"));
-        }
-    }
-    if let Some(number) = value.as_f64()
-        && (schema["minimum"].as_f64().is_some_and(|min| number < min)
-            || schema["maximum"].as_f64().is_some_and(|max| number > max))
-    {
-        return Err(format!("{path} is outside the supported range"));
-    }
-    Ok(())
+    diri_proto::json_schema::validate(value, schema, path)
 }
 
 fn session_id_schema() -> Value {

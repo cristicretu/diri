@@ -8,6 +8,7 @@ macro_rules! identity {
     ($name:ident) => {
         #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
         #[serde(transparent)]
+        #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
         pub struct $name(pub String);
         impl $name {
             pub fn new(value: impl Into<String>) -> Self {
@@ -36,6 +37,7 @@ pub enum LayoutAxis {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum DockEdge {
     Left,
     Right,
@@ -131,6 +133,7 @@ impl LayoutNode {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "id", rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum LayoutNodeId {
     Pane(PaneId),
     Split(SplitId),
@@ -208,6 +211,7 @@ impl Default for WorkspaceSnapshot {
     rename_all = "camelCase",
     rename_all_fields = "camelCase"
 )]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum WorkspaceMutation {
     /// Open an existing agent in its project layout without launching a process.
     OpenProjectAgent {
@@ -337,6 +341,7 @@ pub const SPAWN_PANE_FIELD: &str = "pane";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WorkspaceMutationParams {
     pub expected_revision: u64,
     pub mutation: WorkspaceMutation,

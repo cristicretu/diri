@@ -16,13 +16,20 @@
 #[cfg(feature = "core-v2")]
 pub mod core_v2;
 mod emulator;
+mod find_history;
 mod inline_images;
 mod notifications;
 mod program_status;
+/// The seam idle history leaves memory through, and what one page-out moved.
+#[cfg(feature = "compact-history")]
+pub use alacritty_terminal::grid::cold::{ColdStore, PageOut};
+#[cfg(feature = "compact-history")]
+pub use alacritty_terminal::grid::compact::PayloadResidency;
 /// Per-thread totals of the OSCs the parser dispatched (benchmark
 /// verification only).
 #[cfg(feature = "bench-verify")]
 pub use alacritty_terminal::vte::observe as osc_observe;
+pub use find_history::HistorySearch;
 pub use inline_images::{
     DEFAULT_CELL_PIXELS, STORE_BUDGET_BYTES as INLINE_IMAGE_BUDGET_BYTES, StoredImage,
 };
@@ -343,6 +350,18 @@ fn validate_grid(grid: &GridUpdate) -> Result<(), MirrorError> {
     Ok(())
 }
 
+/// How [`HeadlessScreen::text_lines`] reads; all off reads like
+/// [`HeadlessScreen::lines`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TextOptions {
+    /// Join soft-wrapped rows into the line the program wrote.
+    pub unwrap: bool,
+    /// Keep colours and attributes as SGR escape sequences.
+    pub ansi: bool,
+    /// Include retained history above the screen, oldest first.
+    pub scrollback: bool,
+}
+
 /// Screen text and hyperlink targets for the artifact scanner; see
 /// [`HeadlessScreen::link_source`].
 #[derive(Clone, Debug, Default)]
@@ -595,7 +614,20 @@ pub struct HeadlessScreen {
     last_annotations: Vec<RowMetadata>,
     last_grid_cols: usize,
     last_grid_rows: usize,
+    /// History reads so far (scrollback, find, links, checkpoints); see
+    /// [`HeadlessScreen::history_reads`].
+    history_reads: std::sync::atomic::AtomicU64,
 }
+
+/// History rows a page-out keeps in memory at least: what a short scroll
+/// back reads without touching the disk.
+#[cfg(feature = "compact-history")]
+pub const PAGE_OUT_KEEP_ROWS: usize = 256;
+
+/// Least history worth a page-out. Below it, an idle session's history stays
+/// in memory and nothing is written: a quiet shell has a few KiB of it.
+#[cfg(feature = "compact-history")]
+pub const PAGE_OUT_MIN_BYTES: usize = 64 << 10;
 
 impl HeadlessScreen {
     pub fn new(cols: usize, rows: usize) -> Self {
@@ -665,6 +697,7 @@ impl HeadlessScreen {
             last_annotations: Vec::new(),
             last_grid_cols: 0,
             last_grid_rows: 0,
+            history_reads: std::sync::atomic::AtomicU64::new(0),
         };
         screen.rebuild_content_cache();
         screen
@@ -1669,8 +1702,50 @@ impl HeadlessScreen {
     /// stored a block at a time now, rather than rebuilt whole (every row at
     /// the new width, tens of MB) by the first read.
     fn prepare_history_read(&mut self) {
+        self.count_history_read();
         #[cfg(feature = "compact-history")]
         self.term.prepare_history_read();
+    }
+
+    fn count_history_read(&self) {
+        self.history_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many times history has been read: by scrollback, Find, link
+    /// detection or a checkpoint. An owner that pages idle history out
+    /// waits until this stops moving, so a person scrolling back is not
+    /// sent to the disk.
+    pub fn history_reads(&self) -> u64 {
+        self.history_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Moves idle history out of memory into `store`, after giving back
+    /// what [`Self::compact_idle`] gives back. The visible screen and the
+    /// newest [`PAGE_OUT_KEEP_ROWS`] history rows (at least two screens)
+    /// stay in memory; with less than [`PAGE_OUT_MIN_BYTES`] to move, nothing
+    /// moves. Nothing observable changes: reads bring stored history back a
+    /// block at a time and keep none of it, and the history budget counts it
+    /// as before, so the rows kept never depend on paging.
+    #[cfg(feature = "compact-history")]
+    pub fn page_out_history(&mut self, store: &Arc<dyn ColdStore>) -> std::io::Result<PageOut> {
+        self.compact_idle();
+        let keep = PAGE_OUT_KEEP_ROWS.max(2 * self.geometry.rows);
+        self.term.page_out_history(store, keep, PAGE_OUT_MIN_BYTES)
+    }
+
+    /// Releases the history rows a `&self` read ([`Self::find_capture_cells`])
+    /// left decoded. Readers that take `&mut self` release them as they go.
+    pub fn release_history_read_cache(&mut self) {
+        #[cfg(feature = "compact-history")]
+        self.term.release_history_read_cache();
+    }
+
+    /// Where the history's payloads live: in memory or in a cold store.
+    #[cfg(feature = "compact-history")]
+    pub fn history_residency(&self) -> PayloadResidency {
+        self.term.history_residency()
     }
 
     fn finish_history_read_batch(&mut self, completed: usize, finished: bool) {
@@ -2049,6 +2124,7 @@ impl HeadlessScreen {
     pub fn find_capture_cells(
         &self,
     ) -> Result<diri_proto::ReadScrollbackCellsResult, &'static str> {
+        self.count_history_read();
         let (cols, visible) = self.size();
         let history = self.term.history_rows();
         let total = history + visible;
@@ -2138,6 +2214,132 @@ impl HeadlessScreen {
             return String::new();
         }
         row_text(self.term.row(Line(row as i32)), self.geometry.cols)
+    }
+
+    /// The screen, and with [`TextOptions::scrollback`] the retained history
+    /// above it, as text for a reader rather than a renderer: an agent or a
+    /// script reading another session's output. With every option off this
+    /// is exactly [`Self::lines`].
+    ///
+    /// [`TextOptions::unwrap`] rejoins rows the terminal soft-wrapped at its
+    /// width, so a URL, path, JSON value or stack frame longer than the pane
+    /// arrives as the one line the program wrote. A hard newline still ends
+    /// a line, and trailing blanks are trimmed only where a line really ends.
+    ///
+    /// [`TextOptions::ansi`] keeps colours and attributes as SGR sequences,
+    /// emitted only where the style changes and reset at each line's end so
+    /// any line can be printed on its own.
+    pub fn text_lines(&mut self, options: TextOptions) -> Vec<String> {
+        let rows = self.geometry.rows;
+        let history = if options.scrollback {
+            self.term.grid().history_size()
+        } else {
+            0
+        };
+        let total = history + rows;
+        let mut lines = Vec::with_capacity(total);
+        let mut logical = String::new();
+        for index in 0..total {
+            let line = Line(index as i32 - history as i32);
+            let continues = options.unwrap && index + 1 < total && self.row_wraps(line);
+            self.push_row_text(line, options.ansi, continues, &mut logical);
+            if !continues {
+                lines.push(std::mem::take(&mut logical));
+            }
+            if options.scrollback {
+                self.finish_history_read_batch(index + 1, index + 1 == total);
+            }
+        }
+        while lines.last().is_some_and(|line| line.trim().is_empty()) {
+            lines.pop();
+        }
+        lines
+    }
+
+    /// Whether the program's line runs on past the end of `line`.
+    fn row_wraps(&self, line: Line) -> bool {
+        let cols = self.geometry.cols;
+        cols > 0
+            && self.term.grid()[line][Column(cols - 1)]
+                .flags
+                .contains(Flags::WRAPLINE)
+    }
+
+    /// Appends one row's text to `out`; trailing blanks are kept only when
+    /// the line continues onto the next row.
+    fn push_row_text(&self, line: Line, ansi: bool, keep_trailing: bool, out: &mut String) {
+        let source = &self.term.grid()[line];
+        let cols = self.geometry.cols;
+        let spacer = Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
+        if !ansi {
+            let start = out.len();
+            for column in 0..cols {
+                let cell = &source[Column(column)];
+                if cell.flags.intersects(spacer) {
+                    continue;
+                }
+                out.push(cell.c);
+                if let Some(combining) = cell.zerowidth() {
+                    out.extend(combining.iter().copied());
+                }
+            }
+            if !keep_trailing {
+                let kept = start + out[start..].trim_end().len();
+                out.truncate(kept);
+            }
+            return;
+        }
+        let end = if keep_trailing {
+            cols
+        } else {
+            (0..cols)
+                .rev()
+                .find(|&column| {
+                    let cell = &source[Column(column)];
+                    !cell.flags.intersects(spacer)
+                        && (!(cell.c.is_whitespace() || cell.c == '\0')
+                            || cell.zerowidth().is_some())
+                })
+                .map_or(0, |column| column + 1)
+        };
+        let visual = |cell: &GridCell| {
+            (
+                cell.fg,
+                cell.bg,
+                TermStyle::from_bits_retain(cell.style.bits() & 0xff),
+            )
+        };
+        let plain = visual(&GridCell::BLANK);
+        let mut current = plain;
+        for column in 0..end {
+            let cell = &source[Column(column)];
+            if cell.flags.intersects(spacer) {
+                continue;
+            }
+            let mut wire = wire_cell(cell);
+            // The wire folds BOLD and DIM together (`DIM_BOLD` holds both
+            // bits); a reader gets the attributes the program set.
+            let mut bits = wire.style.bits() & !(TermStyle::BOLD.bits() | TermStyle::DIM.bits());
+            if cell.flags.contains(Flags::BOLD) {
+                bits |= TermStyle::BOLD.bits();
+            }
+            if cell.flags.contains(Flags::DIM) {
+                bits |= TermStyle::DIM.bits();
+            }
+            wire.style = TermStyle::from_bits_retain(bits);
+            let style = visual(&wire);
+            if style != current {
+                out.push_str(&sgr(&wire, None));
+                current = style;
+            }
+            out.push(if cell.c == '\0' { ' ' } else { cell.c });
+            if let Some(combining) = cell.zerowidth() {
+                out.extend(combining.iter().copied());
+            }
+        }
+        if current != plain {
+            out.push_str("\x1b[0m");
+        }
     }
 
     /// What a link scanner needs from the screen and the newest `history_rows`
@@ -3873,6 +4075,69 @@ mod tests {
         let (at, uri) = &source.hyperlinks[0];
         assert_eq!(uri, "https://github.com/o/r/pull/9");
         assert!(source.text[*at..].starts_with("PR #9"));
+    }
+
+    #[test]
+    fn text_lines_with_no_options_reads_like_lines() {
+        let mut screen = HeadlessScreen::new(10, 4);
+        screen.feed(b"abcdefghijKLM  \r\n\x1b[31mred\x1b[0m \xe4\xb8\xad\r\n");
+        assert_eq!(screen.text_lines(TextOptions::default()), screen.lines());
+        assert_eq!(screen.lines(), ["abcdefghij", "KLM", "red \u{4e2d}"]);
+    }
+
+    #[test]
+    fn text_lines_unwrap_rejoins_soft_wraps_but_not_hard_newlines() {
+        let mut screen = HeadlessScreen::new(10, 6);
+        // 24 columns of path wrap twice; the space at a wrap boundary is
+        // part of the line, the blanks after a hard newline are not.
+        screen.feed(b"/a/b/c/d/e f/h/i/j/k/l/m\r\nshort   \r\n0123456789\r\nnext");
+        let unwrap = TextOptions {
+            unwrap: true,
+            ..TextOptions::default()
+        };
+        assert_eq!(
+            screen.text_lines(unwrap),
+            ["/a/b/c/d/e f/h/i/j/k/l/m", "short", "0123456789", "next"]
+        );
+    }
+
+    #[test]
+    fn text_lines_unwrap_reaches_into_history_and_across_the_screen_edge() {
+        let mut screen = HeadlessScreen::new(8, 3);
+        screen.feed(b"https://example.com/long/path\r\nx\r\ny\r\nz");
+        let visible = TextOptions {
+            unwrap: true,
+            ..TextOptions::default()
+        };
+        // Only the URL's tail is on screen.
+        assert_eq!(screen.text_lines(visible), ["x", "y", "z"]);
+        let all = TextOptions {
+            scrollback: true,
+            ..visible
+        };
+        assert_eq!(
+            screen.text_lines(all),
+            ["https://example.com/long/path", "x", "y", "z"]
+        );
+    }
+
+    #[test]
+    fn text_lines_ansi_keeps_style_changes_and_resets_each_line() {
+        let mut screen = HeadlessScreen::new(20, 3);
+        screen.feed(b"ok \x1b[1;31mFAIL\x1b[0m done\r\n\x1b[32mgreen\r\nplain");
+        let ansi = TextOptions {
+            ansi: true,
+            ..TextOptions::default()
+        };
+        assert_eq!(
+            screen.text_lines(ansi),
+            [
+                "ok \x1b[0;1;38;5;1;49mFAIL\x1b[0;39;49m done",
+                "\x1b[0;38;5;2;49mgreen\x1b[0m",
+                // SGR 32 is still in force: the program never reset it.
+                "\x1b[0;38;5;2;49mplain\x1b[0m",
+            ]
+        );
     }
 
     #[test]

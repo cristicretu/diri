@@ -16,6 +16,14 @@
 //! With `IDLE_FILE` set, each session prints that file instead of
 //! `scrollback-lines` numbers (styled, realistic history).
 //!
+//! After the window it reports where history lives (memory or the idle
+//! history swap, see `diri_engine::history_swap`), the swap's disk use, and
+//! the latency of reading the oldest screen of history (paged out once the
+//! fleet has idled `DIRI_HISTORY_SWAP_IDLE_MS`, default 60 s) and the newest.
+//! With `wake-after-secs` and `IDLE_SECOND` (seconds), it then idles again
+//! after the wake phase's output and reports what the second idle transition
+//! wrote.
+//!
 //! Set `DIRI_HOLDER_BIN` to a built `diri-holder`. Everything lives in a
 //! private temporary directory; nothing touches an installed Diri.
 
@@ -255,7 +263,21 @@ fn main() {
         first.0,
         first.1,
     );
-    std::thread::sleep(Duration::from_secs(window));
+    // With IDLE_TRACE, the Engine's footprint every 10 s of the window: the
+    // allocator gives freed pages back to the system over time, not at once.
+    if std::env::var_os("IDLE_TRACE").is_some() {
+        let until = Instant::now() + Duration::from_secs(window);
+        while let Some(rest) = until.checked_duration_since(Instant::now()) {
+            std::thread::sleep(rest.min(Duration::from_secs(10)));
+            println!(
+                "trace {:>4.0}s   engine {:>7.1} MB",
+                idle_from.elapsed().as_secs_f64(),
+                mb(sample(engine_pid).footprint)
+            );
+        }
+    } else {
+        std::thread::sleep(Duration::from_secs(window));
+    }
     let second = (sample(engine_pid), sample(manager_pid));
     print_point(
         &format!("idle {:.0}s", idle_from.elapsed().as_secs_f64()),
@@ -289,6 +311,8 @@ fn main() {
         f64::from(second.0.threads - baseline.threads) / count as f64,
         f64::from(second.1.threads) / count as f64,
     );
+
+    let paged_before_reads = report_history(&fleet, root, engine_pid, baseline, count);
 
     if let Some(wake_after) = wake_after {
         let target = Duration::from_secs(wake_after);
@@ -372,7 +396,120 @@ fn main() {
         );
         let after = (sample(engine_pid), sample(manager_pid));
         print_point("after typing", after.0, after.1);
+        if let Some(second) = std::env::var("IDLE_SECOND")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            std::thread::sleep(Duration::from_secs(second));
+            let written = diri_engine::session::HISTORY_PAGED_OUT_BYTES
+                .load(std::sync::atomic::Ordering::Relaxed)
+                - paged_before_reads;
+            println!(
+                "second idle transition after {second}s: wrote {:.1} KB in all, {:.2} KB per session",
+                written as f64 / 1024.0,
+                written as f64 / 1024.0 / count as f64,
+            );
+            report_history(&fleet, root, engine_pid, baseline, count);
+        }
     }
+}
+
+/// Where the fleet's history lives, the swap's disk use, the latency of a
+/// screen read from paged-out and from in-memory history, and the Engine's
+/// footprint after those reads. Returns the bytes paged out so far.
+fn report_history(
+    fleet: &Fleet,
+    root: &Path,
+    engine_pid: i32,
+    baseline: Sample,
+    count: usize,
+) -> u64 {
+    use std::sync::atomic::Ordering;
+    let written = diri_engine::session::HISTORY_PAGED_OUT_BYTES.load(Ordering::Relaxed);
+    let (mut resident, mut stored, mut rows) = (0usize, 0usize, Vec::new());
+    for session in &fleet.0 {
+        let (residency, history) =
+            session.inspect_screen(|screen| (screen.history_residency(), screen.history_rows()));
+        resident += residency.resident_bytes;
+        stored += residency.stored_bytes;
+        rows.push(history);
+    }
+    let swap = root.join("logs").join(diri_engine::history_swap::DIR_NAME);
+    let (mut files, mut disk) = (0usize, 0u64);
+    for directory in std::fs::read_dir(&swap).into_iter().flatten().flatten() {
+        for file in std::fs::read_dir(directory.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if let Ok(metadata) = file.metadata() {
+                files += 1;
+                disk += metadata.len();
+            }
+        }
+    }
+    println!(
+        "history        {:.1} MB in memory, {:.1} MB paged out | swap {files} files, {:.1} MB on disk, {:.1} MB written so far",
+        mb(resident as u64),
+        mb(stored as u64),
+        mb(disk),
+        mb(written),
+    );
+    let (_, screen_rows) = fleet.0[0].screen_size();
+    let mut oldest = Vec::with_capacity(fleet.0.len());
+    let mut newest = Vec::with_capacity(fleet.0.len());
+    for (session, &history) in fleet.0.iter().zip(&rows) {
+        let started = Instant::now();
+        let read = session.read_scrollback_cells(0, screen_rows as i64);
+        oldest.push(started.elapsed().as_secs_f64() * 1e3);
+        assert_eq!(
+            read.row_count as usize,
+            screen_rows.min(history + screen_rows)
+        );
+        let started = Instant::now();
+        let first = history.saturating_sub(screen_rows) as i64;
+        let _ = session.read_scrollback_cells(first, screen_rows as i64);
+        newest.push(started.elapsed().as_secs_f64() * 1e3);
+    }
+    println!(
+        "screen read    oldest history p50 {:.2} ms p95 {:.2} ms max {:.2} ms | newest history p50 {:.2} ms p95 {:.2} ms",
+        percentile(&mut oldest.clone(), 0.5),
+        percentile(&mut oldest.clone(), 0.95),
+        percentile(&mut oldest, 1.0),
+        percentile(&mut newest.clone(), 0.5),
+        percentile(&mut newest, 0.95),
+    );
+    // Whole-history reads: what a checkpoint and Find read (the newest
+    // 10,000 rows, and Find's capture), for up to 20 sessions.
+    let mut checkpoints = Vec::new();
+    let mut finds = Vec::new();
+    for session in fleet.0.iter().take(20) {
+        let started = Instant::now();
+        let (rows, payload) = session.export_history_payload();
+        checkpoints.push(started.elapsed().as_secs_f64() * 1e3);
+        assert!(rows == 0 || !payload.is_empty());
+        let started = Instant::now();
+        // As the Engine's capture does: release what the capture decoded.
+        session.inspect_screen(|screen| {
+            let _ = screen.find_capture_cells();
+            screen.release_history_read_cache();
+        });
+        finds.push(started.elapsed().as_secs_f64() * 1e3);
+    }
+    println!(
+        "history read   checkpoint export p50 {:.2} ms p95 {:.2} ms | find capture p50 {:.2} ms p95 {:.2} ms",
+        percentile(&mut checkpoints.clone(), 0.5),
+        percentile(&mut checkpoints, 0.95),
+        percentile(&mut finds.clone(), 0.5),
+        percentile(&mut finds, 0.95),
+    );
+    let after = sample(engine_pid);
+    println!(
+        "after reads    engine {:>7.1} MB, {:.2} MB per session",
+        mb(after.footprint),
+        mb(after.footprint.saturating_sub(baseline.footprint)) / count as f64,
+    );
+    written
 }
 
 /// Keystrokes typed into each session in the active phase.

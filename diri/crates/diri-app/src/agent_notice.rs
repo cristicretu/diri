@@ -12,10 +12,21 @@ use crate::toast::Toast;
 
 /// The notice for `actor` doing `action`.
 pub fn notice(actor: &SessionRecord, action: AgentAction) -> Toast {
+    message(actor, label(action))
+}
+
+/// The notice for `actor` running one of the app's exported actions: the
+/// action's own title, as the menu and palette show it ("fix-auth: Toggle
+/// Sidebar").
+pub fn app_action_notice(actor: &SessionRecord, title: &str) -> Toast {
+    message(actor, title)
+}
+
+fn message(actor: &SessionRecord, action: &str) -> Toast {
     let agent = crate::switcher::display_title_str(actor);
     Toast::ambient(tf(
         "agent_notice.message",
-        &[("agent", &agent), ("action", &label(action))],
+        &[("agent", &agent), ("action", &action)],
     ))
 }
 
@@ -42,5 +53,6 @@ fn label(action: AgentAction) -> &'static str {
         AgentAction::SleepAgent => "agent_notice.sleep_agent",
         AgentAction::WakeAgent => "agent_notice.wake_agent",
         AgentAction::ResumeAgent => "agent_notice.resume_agent",
+        AgentAction::AppAction => "agent_notice.app_action",
     })
 }

@@ -11,6 +11,7 @@ members = [
     "crates/diri-platform",
     "crates/diri-pty",
     "crates/diri-remote",
+    "crates/diri-script",
     "crates/diri-terminal-state",
     "crates/diri-telemetry",
     "crates/diri-term",
@@ -38,6 +39,7 @@ diri-notes = { path = "crates/diri-notes" }
 diri-proto = { path = "crates/diri-proto" }
 diri-platform = { path = "crates/diri-platform" }
 diri-pty = { path = "crates/diri-pty" }
+diri-script = { path = "crates/diri-script" }
 diri-telemetry = { path = "crates/diri-telemetry" }
 diri-terminal-state = { path = "crates/diri-terminal-state" }
 diri-term = { path = "crates/diri-term" }
@@ -49,6 +51,11 @@ gpui_macos = { git = "https://github.com/zed-industries/zed.git", rev = "dc2a339
 gpui_platform = { git = "https://github.com/zed-industries/zed.git", rev = "dc2a339d5d043da448a3f7ddc7c0a85c63864aad", features = ["font-kit", "wayland", "x11"] }
 image = { version = "0.25.1", default-features = false }
 nucleo-matcher = "0.3"
+# User scripting (`init.lua`, `dirijor script`). Lua 5.4 compiled from the
+# vendored C sources, so no system Lua is linked and every build runs the
+# same interpreter. Only diri-script uses it; the Engine and the remote Helper
+# never link it.
+mlua = { version = "0.12", features = ["lua54", "vendored", "serialize"] }
 notify = "8.2"
 plist = "1"
 smallvec = { version = "1.6", features = ["union", "const_new"] }
@@ -56,6 +63,7 @@ futures-core = "0.3"
 getrandom = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+schemars = "1.2"
 regex = "1"
 raw-window-handle = "0.6.2"
 rusqlite = { version = "0.41.0", features = ["bundled"] }

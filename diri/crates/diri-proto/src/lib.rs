@@ -3,7 +3,9 @@
 pub mod accounts;
 pub mod agent_action;
 pub mod agent_names;
+pub mod api;
 pub mod api_request;
+pub mod app_actions;
 pub mod attention;
 pub mod computer;
 pub use accounts::*;
@@ -16,11 +18,13 @@ pub use computer::{
     ComputerStatus, ComputerStatusParams,
 };
 pub mod control;
+pub mod find;
 pub mod frames;
 pub mod grid;
 pub mod hosts;
 pub mod include;
 pub mod inline_image;
+pub mod json_schema;
 pub mod methods;
 pub mod model;
 pub mod net;

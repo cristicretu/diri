@@ -386,6 +386,29 @@ impl CursorBlinkPref {
     }
 }
 
+/// The optional metric beside the local account name in the sidebar.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SidebarUsageIndicator {
+    Hidden,
+    RemainingQuota,
+    #[default]
+    #[serde(other)]
+    EstimatedCost,
+}
+
+impl SidebarUsageIndicator {
+    pub const ALL: [Self; 3] = [Self::Hidden, Self::EstimatedCost, Self::RemainingQuota];
+
+    pub fn title(self) -> &'static str {
+        crate::i18n::t(match self {
+            Self::Hidden => "sidebar.usage.hidden",
+            Self::EstimatedCost => "sidebar.usage.estimated_cost",
+            Self::RemainingQuota => "sidebar.usage.remaining_quota",
+        })
+    }
+}
+
 /// Where a new Agent opened from a project (⌘T, New Agent) starts. Stored
 /// per project; a missing entry, or a name this build does not know, is the
 /// current checkout, which is what every project did before the choice.
@@ -843,6 +866,8 @@ pub struct Prefs {
     /// Islands (comfortable) or flush panes (compact).
     #[serde(default)]
     pub pane_density: PaneDensity,
+    #[serde(default)]
+    pub sidebar_usage_indicator: SidebarUsageIndicator,
     /// Last size, position, and presentation mode of the key window.
     pub window_placement: Option<WindowPlacement>,
     /// The other windows open at the last quit, in no particular order. They
@@ -998,6 +1023,7 @@ impl Default for Prefs {
             window_transparency: window_transparency_default(),
             interface_style: None,
             pane_density: PaneDensity::Comfortable,
+            sidebar_usage_indicator: SidebarUsageIndicator::EstimatedCost,
             window_placement: None,
             additional_windows: Vec::new(),
             sidebar_visible: false,
@@ -1360,6 +1386,28 @@ mod tests {
         prefs.set_interface_style(InterfaceStyle::Modern);
         prefs.window_material = WindowMaterial::Opaque;
         assert_eq!(prefs.interface_style(), InterfaceStyle::Themed);
+    }
+
+    #[test]
+    fn footer_usage_defaults_and_round_trips_without_changing_other_preferences() {
+        for json in ["{}", r#"{"sidebarUsageIndicator":"future"}"#] {
+            let prefs: Prefs = serde_json::from_str(json).unwrap();
+            assert_eq!(
+                prefs.sidebar_usage_indicator,
+                SidebarUsageIndicator::EstimatedCost
+            );
+        }
+        for choice in SidebarUsageIndicator::ALL {
+            let prefs = Prefs {
+                sidebar_usage_indicator: choice,
+                pane_density: PaneDensity::Compact,
+                ..Prefs::default()
+            };
+            let read: Prefs =
+                serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+            assert_eq!(read.sidebar_usage_indicator, choice);
+            assert_eq!(read.pane_density, PaneDensity::Compact);
+        }
     }
 
     #[test]

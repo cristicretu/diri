@@ -11,6 +11,15 @@ const TAB_GAP: f32 = 4.0;
 /// slot, close button and the two gaps between them.
 const TAB_TITLE_WIDTH: f32 = TAB_WIDTH - 2.0 - 20.0 - 18.0 - 7.0 - 18.0 - 7.0;
 
+/// What the strip marks on one tab, read under the store lock.
+pub(super) struct TabMarks {
+    /// The tab's most urgent state, as its sidebar row shows it.
+    pub(super) state: StatusState,
+    /// A split pane waiting on you while the tab's own session is not.
+    pub(super) asking: Option<Arc<SessionRecord>>,
+    pub(super) split: Option<super::split_mark::SplitMark>,
+}
+
 /// A session tab picked up in the horizontal strip. It carries no ghost:
 /// the tab itself is lifted by the strip, locked to the strip's axis.
 #[derive(Clone)]
@@ -251,11 +260,12 @@ impl Sidebar {
     }
 
     pub(super) fn agent_tab_icon(kind: &ProtoAgentKind, colors: SemanticColors) -> AnyElement {
-        Self::agent_tab_icon_sized(kind, colors, 16.0)
+        Self::agent_tab_icon_sized(kind, None, colors, 16.0)
     }
 
     fn agent_tab_icon_sized(
         kind: &ProtoAgentKind,
+        glyph: Option<diri_ui::IconName>,
         colors: SemanticColors,
         size: f32,
     ) -> AnyElement {
@@ -265,8 +275,12 @@ impl Sidebar {
                 .into_any_element(),
             // Exactly `size`: `sf_symbol` rounds up to its 12 pt tier, which
             // would crowd a progress ring.
-            None => diri_ui::Icon::new(diri_ui::IconName::Terminal, size, colors.secondary)
-                .into_any_element(),
+            None => diri_ui::Icon::new(
+                glyph.unwrap_or(diri_ui::IconName::Terminal),
+                size,
+                colors.secondary,
+            )
+            .into_any_element(),
         };
         div()
             .size(px(size))
@@ -406,15 +420,24 @@ impl Sidebar {
             let custom = store.preferences().sidebar_ordering == SidebarOrdering::Custom;
             let tabs = selected_project_tabs(&mut store);
             // The same reduction the sidebar rows use, so a tab and its row
-            // never disagree about what a session is doing.
-            let marks: Vec<StatusState> = tabs
+            // never disagree about what a session is doing: a split tab
+            // shows its most urgent pane, names the question of the pane
+            // that asks, and draws its layout with each pane's state.
+            let marks: Vec<TabMarks> = tabs
                 .sessions
                 .iter()
                 .map(|session| {
-                    sidebar_activity_state(
-                        status_state(session, store.migrating().contains(&session.id)),
-                        store.notifications().session_unread(&session.id),
-                    )
+                    let asks =
+                        |pane: &SessionRecord| matches!(status_state(pane, false), StatusState::NeedsInput { .. });
+                    let (_, shells) = store.pane_group(&session.id).unwrap_or_default();
+                    TabMarks {
+                        state: super::activity::row_state(&store, session),
+                        // The row's rule: its own question first.
+                        asking: (!asks(session))
+                            .then(|| shells.into_iter().find(|pane| asks(pane)))
+                            .flatten(),
+                        split: super::split_mark::SplitMark::of(&store, &session.id, colors),
+                    }
                 })
                 .collect();
             (tabs, selected, custom, marks)
@@ -522,7 +545,7 @@ impl Sidebar {
         }
         let tab_count = tabs.sessions.len();
         let mut mounted = HashSet::with_capacity(tab_count);
-        for (index, (session, state)) in tabs.sessions.into_iter().zip(marks).enumerate() {
+        for (index, (session, marks)) in tabs.sessions.into_iter().zip(marks).enumerate() {
             mounted.insert(session.id.clone());
             let active = selected.as_ref() == Some(&session.id);
             let props = self.strip_tab_props(
@@ -530,7 +553,7 @@ impl Sidebar {
                 index,
                 tab_count,
                 active,
-                state,
+                marks,
                 colors,
                 custom_ordering,
                 reduce_motion,
@@ -559,6 +582,7 @@ impl Sidebar {
             ref id,
             ref title,
             ref kind,
+            glyph,
             active,
             rank,
             state,
@@ -582,7 +606,7 @@ impl Sidebar {
             )
         });
         let progress_mark = progress.map(|face| {
-            let logo = Self::agent_tab_icon_sized(kind, colors, 10.0);
+            let logo = Self::agent_tab_icon_sized(kind, glyph, colors, 10.0);
             crate::progress_mark::progress_mark(face, colors, Some(logo))
         });
         let mark = match state {
@@ -601,7 +625,7 @@ impl Sidebar {
                     let id = id.0.clone();
                     move || format!("horizontal-tab-logo-{id}")
                 })
-                .child(Self::agent_tab_icon(kind, colors))
+                .child(Self::agent_tab_icon_sized(kind, glyph, colors, 16.0))
                 .into_any_element(),
             state => div()
                 .id(SharedString::from(format!(
@@ -634,10 +658,20 @@ impl Sidebar {
             Some(settling) => settling.into_any_element(),
             None => title_fade(title.clone()).into_any_element(),
         };
-        let location = props.location.clone();
+        // A waiting tab names its question first, then where it runs.
+        let tooltip = match (&props.question, &props.location) {
+            (Some(question), Some(place)) => Some(format!("{question}\n{place}")),
+            (question, place) => question.clone().or_else(|| place.clone()),
+        };
+        let label = match &props.question {
+            Some(question) => format!("{title}, {question}"),
+            None => title.clone(),
+        };
+        let group = SharedString::from(format!("horizontal-tab-group-{}", id.0));
         let tab = session_tab_face(mark, face, active, colors)
             .id(SharedString::from(format!("horizontal-tab-{}", id.0)))
-            .when_some(location, |tab, place| {
+            .group(group.clone())
+            .when_some(tooltip, |tab, place| {
                 tab.warm_tooltip(move |_, cx| {
                     cx.new(|_| crate::palette_chrome::PaletteTooltip(place.clone(), colors))
                         .into()
@@ -645,7 +679,7 @@ impl Sidebar {
             })
             .debug_selector(move || format!("horizontal-tab-{}", debug_id))
             .role(Role::Tab)
-            .aria_label(title.clone())
+            .aria_label(label)
             .aria_selected(active)
             .relative()
             .child(self.fade_probe(probe_key.clone()))
@@ -744,7 +778,30 @@ impl Sidebar {
                     .justify_center()
                     .rounded(px(5.0))
                     .hover(move |button| button.bg(colors.primary.alpha(0.10)))
-                    .child(sf_symbol("xmark", 8.0, colors.tertiary))
+                    .map(|button| match props.split.as_ref() {
+                        None => button.child(sf_symbol("xmark", 8.0, colors.tertiary)),
+                        // A split tab's slot shows its layout at rest and
+                        // the ✕ while the pointer is on the tab, so the
+                        // mark costs the title no width.
+                        Some(split) => button
+                            .relative()
+                            .child(
+                                div()
+                                    .absolute()
+                                    .inset_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .group_hover(group.clone(), |slot| slot.opacity(0.0))
+                                    .child(split.render(format!("horizontal-tab-panes-{}", id.0))),
+                            )
+                            .child(
+                                div()
+                                    .opacity(0.0)
+                                    .group_hover(group.clone(), |slot| slot.opacity(1.0))
+                                    .child(sf_symbol("xmark", 8.0, colors.tertiary)),
+                            ),
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.close_sessions(vec![close_id.clone()], cx);
                         cx.stop_propagation();

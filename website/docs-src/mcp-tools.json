@@ -772,7 +772,7 @@
       "name": "wait_for_agent"
     },
     {
-      "description": "Read what a session produced. last_message (best for results) returns the Agent's final answer from its transcript; transcript returns the last N turns; since returns only terminal lines added after cursor (pass back the returned cursor next time); screen/tail return the rendered screen. Transcript modes fall back to the screen tail when a session has no readable transcript (remote, shells, other agents).",
+      "description": "Read what a session produced. last_message (best for results) returns the Agent's final answer from its transcript; transcript returns the last N turns; since returns only terminal lines added after cursor (pass back the returned cursor next time); screen/tail return the rendered screen, with rows the terminal soft-wrapped rejoined into the line the program wrote so URLs, paths and JSON arrive whole (unwrap:false for one line per screen row). Transcript modes fall back to the screen tail when a session has no readable transcript (remote, shells, other agents).",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -803,6 +803,10 @@
             "maximum": 100,
             "minimum": 1,
             "type": "number"
+          },
+          "unwrap": {
+            "default": true,
+            "type": "boolean"
           }
         },
         "required": [
@@ -1304,6 +1308,40 @@
         "type": "object"
       },
       "name": "manage_layout"
+    },
+    {
+      "description": "List the Diri app's window actions: what its menus, keys and command palette do (split, focus, zoom or equalize panes, select tabs, toggle the sidebar, find, font size, theme). query filters by name or title. Run one with perform_action.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "query": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "list_actions"
+    },
+    {
+      "description": "Run one Diri app action from list_actions in the person's window; args must match its schema. The window names you while it changes, so change it only when the user asked. Destructive actions need args.session_id of a session you may manage, or are the person's to run.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "args": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      },
+      "name": "perform_action"
     },
     {
       "description": "Find the person's Diri Notes (briefs, plans, to-do lists). Notes are kept by Diri, not in the project folder, so use this rather than searching files. Defaults to notes for your project; project:\"all\" lists every note, or pass a project folder. mentions:\"me\" returns notes that @-mention you or an ancestor that started you (mentioned_via says which). query filters title and body. links_to (a note's id or title) returns the notes that link to that note. session_id is the note's sidebar Session.",

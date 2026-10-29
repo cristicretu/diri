@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use crate::control::{ControlClient, ControlFailure, default_socket_path};
 use crate::tools::{ToolDefinition, tool_definitions_for};
 
+mod actions;
 mod api;
 #[cfg(test)]
 mod audit_tests;
@@ -150,6 +151,8 @@ impl Bridge {
             "browser" => self.browser(arguments),
             "computer" => self.computer(arguments),
             "open_api_request" => self.open_api_request(arguments),
+            "list_actions" => self.list_actions(arguments),
+            "perform_action" => self.perform_action(arguments),
             "quick_open_include" => self.quick_open_include(arguments),
             "whoami" => self.whoami(),
             crate::tools::NAME_SESSION_TOOL => self.name_session(arguments),
@@ -1268,7 +1271,8 @@ fn compact(record: &SessionRecord) -> Value {
 
 /// Who chose a session's current name, so an Agent knows whether it may
 /// replace it: `user` and `diri` names are kept, an `agent` name may be
-/// refined, an `automatic` one (prompt, terminal, provider summary) replaced.
+/// refined, an `automatic` one (prompt, terminal, provider summary, or the
+/// "Fork of …" title a fork starts with) replaced.
 fn name_set_by(source: diri_proto::TitleSource) -> &'static str {
     use diri_proto::TitleSource;
     match source {
@@ -1279,6 +1283,7 @@ fn name_set_by(source: diri_proto::TitleSource) -> &'static str {
         | TitleSource::FirstPrompt
         | TitleSource::AgentProvided
         | TitleSource::TerminalTitle
+        | TitleSource::Forked
         | TitleSource::Unknown => "automatic",
     }
 }
@@ -1566,6 +1571,7 @@ mod tests {
             pull_requests: None,
             listening_ports: None,
             foreground_agent: None,
+            foreground_program: None,
             terminal_cwd: None,
             agent_workspace: None,
             note_id: None,

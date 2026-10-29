@@ -1,0 +1,21 @@
+Git repo: .git with 1 files
+Repo-map: disabled
+────────────────────────────────────────────────────────────────────────────────
+diff> MENTION notes please
+
+Please add notes.txt to the chat so I can edit it.
+
+
+Tokens: 2.3k sent, 13 received.
+
+notes.txt
+Add file to the chat? (Y)es/(N)o/(D)on't ask again [Yes]: y
+Here is the fix:
+
+Done.
+
+
+Tokens: 2.4k sent, 7 received.
+────────────────────────────────────────────────────────────────────────────────
+notes.txt
+diff>

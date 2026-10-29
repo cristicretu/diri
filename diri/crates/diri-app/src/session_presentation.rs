@@ -218,6 +218,50 @@ pub(crate) fn is_loading(session: &SessionRecord, migrating: bool) -> bool {
         && matches!(session.status, diri_proto::SessionStatus::Starting)
 }
 
+/// The glyph a terminal's mark takes from what it is running: a dev server
+/// (it listens on a port) is a globe, a known program its kind of glyph, and
+/// anything else keeps the shell's own mark. Generic glyphs, never a
+/// project's logo, so the set stays small, monochrome and unlicensed.
+pub(crate) fn program_glyph(session: &SessionRecord) -> Option<IconName> {
+    if session.effective_kind() != &ProtoAgentKind::SHELL {
+        return None;
+    }
+    if session.foreground_ports.as_ref().is_some_and(|ports| !ports.is_empty()) {
+        return Some(IconName::Globe);
+    }
+    program_glyph_for(session.foreground_program.as_deref()?)
+}
+
+fn program_glyph_for(program: &str) -> Option<IconName> {
+    // Linux reports `python3.12`, macOS `Python`; versions and case don't
+    // change what a program is.
+    let name = program.trim().to_ascii_lowercase();
+    let name = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.' || c == '-');
+    Some(match name {
+        "vim" | "nvim" | "vi" | "hx" | "helix" | "nano" | "emacs" | "micro" | "kak" | "ed"
+        | "zed" | "code" => IconName::Code,
+        "git" | "lazygit" | "tig" | "gitui" | "gh" | "jj" | "glab" => IconName::Branch,
+        "psql" | "pgcli" | "mysql" | "mariadb" | "mycli" | "sqlite" | "litecli" | "redis-cli"
+        | "valkey-cli" | "mongosh" | "mongo" | "duckdb" | "clickhouse" | "usql" => {
+            IconName::Database
+        }
+        "docker" | "podman" | "kubectl" | "k9s" | "helm" | "nerdctl" | "lazydocker"
+        | "docker-compose" | "kind" | "minikube" => IconName::Cube,
+        "cargo" | "rustc" | "make" | "gmake" | "cmake" | "ninja" | "go" | "swift"
+        | "xcodebuild" | "gradle" | "mvn" | "bazel" | "just" | "zig" | "tsc" | "gcc"
+        | "clang" | "dotnet" => IconName::Hammer,
+        "node" | "bun" | "deno" | "npm" | "npx" | "pnpm" | "yarn" | "python" | "ipython"
+        | "uv" | "pip" | "ruby" | "irb" | "rails" | "php" | "elixir" | "iex" | "julia" | "r"
+        | "lua" | "ghci" => IconName::Stack,
+        "ssh" | "mosh" | "autossh" | "et" | "telnet" => IconName::Server,
+        "htop" | "top" | "btop" | "btm" | "atop" | "glances" | "nvtop" | "iotop" => {
+            IconName::Activity
+        }
+        "less" | "more" | "man" | "bat" | "tail" | "most" => IconName::Text,
+        _ => return None,
+    })
+}
+
 pub(crate) fn ui_agent_kind(kind: &ProtoAgentKind) -> AgentKind {
     // Brand vocabulary, not a protocol type: any other Agent takes its mark
     // from the catalog, and one without a mark the generic terminal treatment.
@@ -324,6 +368,47 @@ mod tests {
         assert_eq!(age_label(0, 7 * 60_000 + 5), ("7m".to_owned(), 8 * 60_000));
         assert_eq!(age_label(0, 3_600_000), ("1h".to_owned(), 7_200_000));
         assert_eq!(age_label(10, 0), ("now".to_owned(), 60_010));
+    }
+
+    #[test]
+    fn terminals_take_a_glyph_from_their_program() {
+        use crate::sidebar::{PreviewScenario, SidebarPreviewFixture};
+        let mut shell = SidebarPreviewFixture::make(PreviewScenario::Typical)
+            .list
+            .sessions
+            .into_iter()
+            .find(|session| session.kind == ProtoAgentKind::SHELL)
+            .expect("shell fixture");
+        shell.foreground_agent = None;
+        shell.foreground_ports = None;
+        assert_eq!(program_glyph(&shell), None, "a prompt keeps the shell mark");
+        for (program, glyph) in [
+            ("nvim", Some(IconName::Code)),
+            ("psql", Some(IconName::Database)),
+            ("python3.12", Some(IconName::Stack)),
+            ("Python", Some(IconName::Stack)),
+            ("k9s", Some(IconName::Cube)),
+            ("cargo", Some(IconName::Hammer)),
+            ("lazygit", Some(IconName::Branch)),
+            ("ssh", Some(IconName::Server)),
+            ("htop", Some(IconName::Activity)),
+            ("less", Some(IconName::Text)),
+            ("my-script", None),
+        ] {
+            shell.foreground_program = Some(program.into());
+            assert_eq!(program_glyph(&shell), glyph, "{program}");
+        }
+        // A program that serves a port reads as the server it is.
+        shell.foreground_program = Some("node".into());
+        shell.foreground_ports = Some(vec![diri_proto::PortInfo {
+            port: 3000,
+            process_name: "node".into(),
+        }]);
+        assert_eq!(program_glyph(&shell), Some(IconName::Globe));
+        // An Agent typed at the prompt shows its own mark.
+        shell.foreground_ports = None;
+        shell.foreground_agent = Some(ProtoAgentKind::CLAUDE_CODE);
+        assert_eq!(program_glyph(&shell), None);
     }
 
     #[test]
