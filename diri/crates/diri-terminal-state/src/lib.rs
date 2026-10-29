@@ -3591,7 +3591,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
     fn a_repaint_between_erase_and_redraw_is_not_a_line_edit() {
         let mut screen = super::HeadlessScreen::new(40, 6);
         let page = b"\x1b[Hrow one\r\nrow two\r\nrow three\r\n$ prompt";
@@ -3777,7 +3776,6 @@ mod tests {
     /// fill counts and `content_seq` equal hashing every row after full
     /// damage, which status detection and publication were built on.
     #[test]
-    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
     fn fingerprints_after_scrolling_match_the_cells() {
         let actions: &[&str] = &[
             "\x1b[31;1m",
@@ -4477,7 +4475,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
     fn a_resize_reflows_to_the_new_width() {
         let mut screen = HeadlessScreen::new(80, 24);
         screen.feed(b"hello\r\n");
@@ -4498,7 +4495,7 @@ mod tests {
     }
 
     /// Line numbers still held anywhere in history or on the screen.
-    #[cfg(feature = "compact-history")]
+    #[cfg(all(feature = "compact-history", not(feature = "core-v2-screen")))]
     fn retained_ids(screen: &mut HeadlessScreen) -> Vec<usize> {
         screen
             .link_source(usize::MAX)
@@ -4545,7 +4542,11 @@ mod tests {
     /// widening returns the limit to its base.
     #[cfg(feature = "compact-history")]
     #[test]
-    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
+    // Core v2 keeps fewer rows of these repetitive lines in the 4 MiB
+    // budget (a byte per ASCII cell; the current core LZ-compresses each
+    // row), so narrowing never re-wraps them past the base limit, which
+    // this asserts first.
+    #[cfg(not(feature = "core-v2-screen"))]
     fn a_raised_history_limit_follows_history_back_down() {
         let burst = HISTORY_ROW_CEILING;
         let mut screen = HeadlessScreen::new(80, 24);
@@ -4625,7 +4626,6 @@ mod tests {
     /// checkpoint carries the newest of them and still restores.
     #[cfg(feature = "compact-history")]
     #[test]
-    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
     fn a_checkpoint_of_re_wrapped_history_stays_restorable() {
         let mut screen = HeadlessScreen::new(80, 24);
         screen.feed(&numbered_lines(0, 20_000, 120));
@@ -4659,7 +4659,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
     fn resize_keeps_history_within_the_cell_budget() {
         for alternate in [false, true] {
             let mut screen = HeadlessScreen::new(80, 24);
@@ -4708,7 +4707,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
     fn first_alternate_screen_matches_a_previously_initialized_screen() {
         for mode in [47, 1047, 1049] {
             let mut fresh = HeadlessScreen::new(80, 24);
@@ -4741,7 +4739,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
     fn incremental_grid_matches_fresh_snapshots_through_damage_and_resize() {
         let mut screen = HeadlessScreen::new(24, 8);
         let mut mirror = Vec::new();
@@ -4890,7 +4887,6 @@ mod tests {
     /// (about 150 at 100,001 rows of 40-column CJK prose).
     #[cfg(feature = "compact-history")]
     #[test]
-    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
     fn narrowing_deep_wide_character_history_keeps_it() {
         const WIDE: &[char] = &['漢', '字', '行', '日', '本', '語', '中', '文', '書', '道'];
         let line = |n: usize| {
@@ -5790,7 +5786,6 @@ mod qol_tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
     fn command_marks_survive_reflow_and_restore() {
         let mut screen = HeadlessScreen::new(12, 4);
         screen.feed(
@@ -6173,7 +6168,6 @@ mod style_tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
     fn decscusr_reaches_the_wire_and_advances_content_seq() {
         let mut screen = screen(b"hello");
         assert_eq!(screen.full_snapshot().cursor_style, CursorStyle::default());

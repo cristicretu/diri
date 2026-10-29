@@ -40,9 +40,9 @@ pub struct Saved {
 
 /// The screen not shown: its pages, cursor and saved cursor.
 pub struct Inactive {
-    pages: Pages,
-    cursor: Saved,
-    saved: Saved,
+    pub(super) pages: Pages,
+    pub(super) cursor: Saved,
+    pub(super) saved: Saved,
     /// Screen swaps so far, for damage tracking.
     swaps: u64,
 }
@@ -356,6 +356,7 @@ impl Core {
         }
         if origin == 0 {
             let fill = self.pen.erased();
+            self.uncount_passed_rows(n);
             for _ in 0..n {
                 self.pages.push_row(&fill);
             }
@@ -423,6 +424,16 @@ impl Core {
             && style.flags & blocking.bits() == 0
     }
 
+    /// One scroll of `n` rows into history: the current core's history origin
+    /// counts only the history rows it recycles, never the rows of a scroll
+    /// larger than the row limit that pass through without staying.
+    fn uncount_passed_rows(&mut self, n: usize) {
+        let limit = self.pages.history_limit;
+        if limit != 0 && n > limit {
+            self.pages.origin_bias -= (n - limit) as i64;
+        }
+    }
+
     /// `Grid::clear_viewport` (ED 2 on the primary screen): the lines up to
     /// the last non-empty one scroll into history, the screen is blank.
     fn clear_viewport(&mut self) {
@@ -439,6 +450,7 @@ impl Core {
             }
         }
         let fill = self.pen.erased();
+        self.uncount_passed_rows(positions);
         for _ in 0..positions {
             self.pages.push_row(&fill);
         }
