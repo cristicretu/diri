@@ -309,9 +309,8 @@ impl TextLog {
     /// A character's token: its two-byte CJK code, or `utf8` (its UTF-8).
     #[inline(always)]
     pub fn char(&mut self, row: usize, cp: u64, utf8: &[u8]) {
-        if (CJK_BASE..CJK_END).contains(&cp) {
-            let index = cp - CJK_BASE;
-            self.extend(row, &[CJK_LEADS[(index >> 8) as usize], index as u8]);
+        if let Some(code) = cjk_code(cp) {
+            self.extend(row, &code);
         } else {
             self.small(row, utf8);
         }
@@ -490,15 +489,15 @@ impl TextLog {
     }
 }
 
-/// A character's token as a little-endian word and its length: the
-/// two-byte CJK code from U+4E00 on, otherwise `utf` (its UTF-8, `len`
+/// A character's token as a little-endian word and its length: its
+/// two-byte code (see [`CJK_PAGES`]), otherwise `utf` (its UTF-8, `len`
 /// bytes), chosen without a branch.
 #[inline(always)]
 fn select_cjk(cp: u64, utf: u32, len: usize) -> (u32, usize) {
-    let index = cp.wrapping_sub(CJK_BASE);
-    let cjk = index < CJK_END - CJK_BASE;
-    let lead = CJK_LEADS[((index >> 8) as usize).min(CJK_LEADS.len() - 1)] as u32;
-    let code = lead | (index as u32 & 0xFF) << 8;
+    let page = cp >> 8;
+    let lead = PAGE_LEAD[(page & 0xFF) as usize] as u32;
+    let cjk = page < 0x100 && lead != 0;
+    let code = lead | (cp as u32 & 0xFF) << 8;
     if cjk { (code, 2) } else { (utf, len) }
 }
 
@@ -508,9 +507,10 @@ fn len_of(b0: u8) -> usize {
     1 + (b0 >= 0xC0) as usize + (b0 >= 0xE0) as usize + (b0 >= 0xF0) as usize
 }
 
-/// Writes the two-byte codes of sixteen characters as 32 bytes at `out`
-/// when the first `n` are all from U+4E00 on (see [`CJK_LEADS`]); `None`
-/// (writing nothing) otherwise. Only the first `2 * n` bytes are tokens.
+/// Writes the two-byte codes of sixteen characters (all below U+10000)
+/// as 32 bytes at `out` when the first `n` are all coded (see
+/// [`CJK_PAGES`]); `None` (writing nothing) otherwise. Only the first
+/// `2 * n` bytes are tokens.
 ///
 /// # Safety
 /// `out` has room for 32 bytes.
@@ -521,63 +521,48 @@ unsafe fn cjk_codes16(cps: &[u32; 16], n: usize, out: *mut u8) -> Option<()> {
     // SAFETY: NEON is baseline on aarch64; the loads read `cps` and the
     // lead table, the store writes the caller's 32 bytes.
     unsafe {
-        let base = vdupq_n_u32(CJK_BASE as u32);
-        let span = vdupq_n_u32((CJK_END - CJK_BASE) as u32);
-        let p = cps.as_ptr();
-        let (a, b, c, d) = (
-            vsubq_u32(vld1q_u32(p), base),
-            vsubq_u32(vld1q_u32(p.add(4)), base),
-            vsubq_u32(vld1q_u32(p.add(8)), base),
-            vsubq_u32(vld1q_u32(p.add(12)), base),
-        );
+        let (low, high) = low_high(cps);
+        let lead = page_leads(high);
         // Lanes from `n` on hold whatever the run stopped at: they pass.
-        let lane = |at: u32| {
-            let ids: [u32; 4] = [at, at + 1, at + 2, at + 3];
-            vcgeq_u32(vld1q_u32(ids.as_ptr()), vdupq_n_u32(n as u32))
-        };
-        let inside = vandq_u32(
-            vandq_u32(
-                vorrq_u32(vcltq_u32(a, span), lane(0)),
-                vorrq_u32(vcltq_u32(b, span), lane(4)),
-            ),
-            vandq_u32(
-                vorrq_u32(vcltq_u32(c, span), lane(8)),
-                vorrq_u32(vcltq_u32(d, span), lane(12)),
-            ),
-        );
-        if vminvq_u32(inside) == 0 {
+        let ids: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let past = vcgeq_u8(vld1q_u8(ids.as_ptr()), vdupq_n_u8(n as u8));
+        if vminvq_u8(vorrq_u8(vtstq_u8(lead, lead), past)) == 0 {
             return None;
         }
-        let narrow = |x: uint32x4_t, y: uint32x4_t| vcombine_u16(vmovn_u32(x), vmovn_u32(y));
-        let (lo16, hi16) = (narrow(a, b), narrow(c, d));
-        let low = vcombine_u8(vmovn_u16(lo16), vmovn_u16(hi16));
-        let high = vcombine_u8(vshrn_n_u16::<8>(lo16), vshrn_n_u16::<8>(hi16));
-        let t = CJK_LEADS_PADDED.as_ptr();
-        let first = uint8x16x4_t(
-            vld1q_u8(t),
-            vld1q_u8(t.add(16)),
-            vld1q_u8(t.add(32)),
-            vld1q_u8(t.add(48)),
-        );
-        let second = uint8x16x3_t(
-            vld1q_u8(t.add(64)),
-            vld1q_u8(t.add(80)),
-            vld1q_u8(t.add(96)),
-        );
-        // Indices 0..64 read the first table, 64..100 the second (an
-        // index past a table reads as zero).
-        let lead = vorrq_u8(
-            vqtbl4q_u8(first, high),
-            vqtbl3q_u8(second, vsubq_u8(high, vdupq_n_u8(64))),
-        );
         vst2q_u8(out, uint8x16x2_t(lead, low));
         Some(())
     }
 }
 
+/// The low and high bytes of sixteen codepoints below U+10000.
+///
+/// # Safety
+/// NEON (baseline on aarch64).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn low_high(
+    cps: &[u32; 16],
+) -> (
+    std::arch::aarch64::uint8x16_t,
+    std::arch::aarch64::uint8x16_t,
+) {
+    use std::arch::aarch64::*;
+    // SAFETY: the loads read `cps`.
+    unsafe {
+        let p = cps.as_ptr();
+        let narrow =
+            |x: *const u32| vcombine_u16(vmovn_u32(vld1q_u32(x)), vmovn_u32(vld1q_u32(x.add(4))));
+        let (lo16, hi16) = (narrow(p), narrow(p.add(8)));
+        (
+            vcombine_u8(vmovn_u16(lo16), vmovn_u16(hi16)),
+            vcombine_u8(vshrn_n_u16::<8>(lo16), vshrn_n_u16::<8>(hi16)),
+        )
+    }
+}
+
 /// Tokens of the first `n` of sixteen two-column three-byte characters
-/// (`cps`, whose UTF-8 is the 48 bytes at `utf8`): the two-byte code from
-/// U+4E00 on, the UTF-8 otherwise. Returns the bytes written at `out`
+/// (`cps`, whose UTF-8 is the 48 bytes at `utf8`): the two-byte code of
+/// a coded page (see [`CJK_PAGES`]), the UTF-8 otherwise. Returns the bytes written at `out`
 /// (beyond them, up to 16 more bytes are scratch).
 ///
 /// Each lane makes three bytes (code and a byte to drop, or UTF-8); four
@@ -595,40 +580,9 @@ unsafe fn mixed_codes16(cps: &[u32; 16], n: usize, utf8: *const u8, out: *mut u8
     // the tables, stores in `lanes` and the caller's room.
     unsafe {
         let src = vld3q_u8(utf8);
-        let base = vdupq_n_u32(CJK_BASE as u32);
-        let span = vdupq_n_u32((CJK_END - CJK_BASE) as u32);
-        let p = cps.as_ptr();
-        let (a, b, c, d) = (
-            vsubq_u32(vld1q_u32(p), base),
-            vsubq_u32(vld1q_u32(p.add(4)), base),
-            vsubq_u32(vld1q_u32(p.add(8)), base),
-            vsubq_u32(vld1q_u32(p.add(12)), base),
-        );
-        let in16 = |x: uint32x4_t, y: uint32x4_t| {
-            vcombine_u16(vmovn_u32(vcltq_u32(x, span)), vmovn_u32(vcltq_u32(y, span)))
-        };
-        let cjk = vcombine_u8(vmovn_u16(in16(a, b)), vmovn_u16(in16(c, d)));
-        let narrow = |x: uint32x4_t, y: uint32x4_t| vcombine_u16(vmovn_u32(x), vmovn_u32(y));
-        let (lo16, hi16) = (narrow(a, b), narrow(c, d));
-        let low = vcombine_u8(vmovn_u16(lo16), vmovn_u16(hi16));
-        // Out-of-range lanes index past the tables (zero); `cjk` drops them.
-        let high = vcombine_u8(vshrn_n_u16::<8>(lo16), vshrn_n_u16::<8>(hi16));
-        let t = CJK_LEADS_PADDED.as_ptr();
-        let first = uint8x16x4_t(
-            vld1q_u8(t),
-            vld1q_u8(t.add(16)),
-            vld1q_u8(t.add(32)),
-            vld1q_u8(t.add(48)),
-        );
-        let second = uint8x16x3_t(
-            vld1q_u8(t.add(64)),
-            vld1q_u8(t.add(80)),
-            vld1q_u8(t.add(96)),
-        );
-        let lead = vorrq_u8(
-            vqtbl4q_u8(first, high),
-            vqtbl3q_u8(second, vsubq_u8(high, vdupq_n_u8(64))),
-        );
+        let (low, high) = low_high(cps);
+        let lead = page_leads(high);
+        let cjk = vtstq_u8(lead, lead);
         // The lanes' three bytes stay planar in registers; the shuffles
         // index the 48-byte table they form (no store and reload).
         let planes = uint8x16x3_t(vbslq_u8(cjk, lead, src.0), vbslq_u8(cjk, low, src.1), src.2);
@@ -690,17 +644,39 @@ const COMPACT4: [[([u8; 16], u8); 16]; 4] = {
     t
 };
 
-/// [`CJK_LEADS`] padded to 112 bytes for table lookups.
+/// The lead byte of sixteen codepoints' pages (their high bytes, all
+/// below U+10000), zero where a page is not coded: four 64-byte lookups
+/// in [`PAGE_LEAD`].
+///
+/// # Safety
+/// NEON (baseline on aarch64).
 #[cfg(target_arch = "aarch64")]
-const CJK_LEADS_PADDED: [u8; 112] = {
-    let mut t = [0u8; 112];
-    let mut i = 0;
-    while i < 100 {
-        t[i] = CJK_LEADS[i];
-        i += 1;
+#[inline(always)]
+unsafe fn page_leads(high: std::arch::aarch64::uint8x16_t) -> std::arch::aarch64::uint8x16_t {
+    use std::arch::aarch64::*;
+    // SAFETY: the loads read the 256 bytes of `PAGE_LEAD`.
+    unsafe {
+        let t = PAGE_LEAD.as_ptr();
+        let part = |at: usize| {
+            uint8x16x4_t(
+                vld1q_u8(t.add(at)),
+                vld1q_u8(t.add(at + 16)),
+                vld1q_u8(t.add(at + 32)),
+                vld1q_u8(t.add(at + 48)),
+            )
+        };
+        vorrq_u8(
+            vorrq_u8(
+                vqtbl4q_u8(part(0), high),
+                vqtbl4q_u8(part(64), vsubq_u8(high, vdupq_n_u8(64))),
+            ),
+            vorrq_u8(
+                vqtbl4q_u8(part(128), vsubq_u8(high, vdupq_n_u8(128))),
+                vqtbl4q_u8(part(192), vsubq_u8(high, vdupq_n_u8(192))),
+            ),
+        )
     }
-    t
-};
+}
 
 /// An OSC 8 hyperlink: an explicit id, if the program gave one, and the URI.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -756,11 +732,37 @@ const T_TEXT_ROW: u8 = 0x7F;
 const FLAGS: u64 = 0x7FF << 21;
 const STYLE_BITS: u64 = 0xFFFF << STYLE_SHIFT;
 
-/// Two-byte codes for U+4E00.. (CJK ideographs, Yi, most Hangul
-/// syllables): a first byte that cannot start any other token (UTF-8
-/// continuation bytes, bytes past 0xF4, unused controls) gives the high
-/// byte of `cp - CJK_BASE`, the second byte the low byte.
-const CJK_BASE: u64 = 0x4E00;
+/// Two-byte codes for the characters of 100 BMP pages (256 codepoints
+/// each, [`CJK_PAGES`]): CJK symbols and punctuation, kana, the unified
+/// ideographs, most Hangul syllables and the fullwidth forms. A first byte
+/// that cannot start any other token (UTF-8 continuation bytes, bytes past
+/// 0xF4, unused controls) names the page, the second byte is the low byte
+/// of the codepoint. Prose mixes ideographs with fullwidth and CJK
+/// punctuation, so a run of it codes whole.
+const CJK_PAGES: [u8; 100] = {
+    let mut pages = [0u8; 100];
+    let mut n = 0;
+    let mut page = 0x30;
+    while page <= 0x33 {
+        pages[n] = page;
+        n += 1;
+        page += 1;
+    }
+    page = 0x4E;
+    while page <= 0x9F {
+        pages[n] = page;
+        n += 1;
+        page += 1;
+    }
+    page = 0xAC;
+    while page <= 0xB8 {
+        pages[n] = page;
+        n += 1;
+        page += 1;
+    }
+    pages[n] = 0xFF;
+    pages
+};
 const CJK_LEADS: [u8; 100] = {
     let mut leads = [0u8; 100];
     let mut n = 0;
@@ -775,16 +777,42 @@ const CJK_LEADS: [u8; 100] = {
     }
     leads
 };
-const CJK_HIGH: [u8; 256] = {
-    let mut high = [0xFFu8; 256];
+/// The lead byte of each coded page's characters (0: not coded).
+const PAGE_LEAD: [u8; 256] = {
+    let mut lead = [0u8; 256];
     let mut i = 0;
     while i < 100 {
-        high[CJK_LEADS[i] as usize] = i as u8;
+        lead[CJK_PAGES[i] as usize] = CJK_LEADS[i];
         i += 1;
     }
-    high
+    lead
 };
-const CJK_END: u64 = CJK_BASE + 100 * 256;
+/// The page a lead byte codes (0: not a lead; page 0 is not coded).
+const LEAD_PAGE: [u8; 256] = {
+    let mut page = [0u8; 256];
+    let mut i = 0;
+    while i < 100 {
+        page[CJK_LEADS[i] as usize] = CJK_PAGES[i];
+        i += 1;
+    }
+    page
+};
+
+/// The two-byte code of `cp`, if its page is coded.
+#[inline(always)]
+fn cjk_code(cp: u64) -> Option<[u8; 2]> {
+    if cp > 0xFFFF {
+        return None;
+    }
+    let lead = PAGE_LEAD[(cp >> 8) as usize];
+    (lead != 0).then_some([lead, cp as u8])
+}
+
+/// The character of the two-byte code for `page` with low byte `low`.
+#[inline(always)]
+fn cjk_char(page: u8, low: u8) -> u64 {
+    (page as u64) << 8 | low as u64
+}
 
 #[inline]
 fn wide(cp: u64) -> bool {
@@ -793,10 +821,8 @@ fn wide(cp: u64) -> bool {
 
 #[inline]
 fn push_char(out: &mut Vec<u8>, cp: u64) {
-    if (CJK_BASE..CJK_END).contains(&cp) {
-        let index = cp - CJK_BASE;
-        out.push(CJK_LEADS[(index >> 8) as usize]);
-        out.push(index as u8);
+    if let Some(code) = cjk_code(cp) {
+        out.extend_from_slice(&code);
         return;
     }
     push_utf8(out, cp);
@@ -1008,15 +1034,17 @@ fn pack_text_row(cells: &[Cell], meta: &RowMeta, out: &mut Vec<u8>) -> bool {
             let mut y = x;
             while y + 1 < occ {
                 let (c, next) = (cells[y].0, cells[y + 1].0);
-                let index = (c & CP).wrapping_sub(CJK_BASE);
-                if c & !CP != glyph || next != spacer || index >= CJK_END - CJK_BASE {
+                if c & !CP != glyph || next != spacer {
                     break;
                 }
+                let Some([lead, low]) = cjk_code(c & CP) else {
+                    break;
+                };
                 if y == x {
                     w.flush();
                 }
-                w.put(CJK_LEADS[(index >> 8) as usize]);
-                w.put(index as u8);
+                w.put(lead);
+                w.put(low);
                 y += 2;
             }
             if y > x {
@@ -1083,7 +1111,7 @@ fn decode_text_row(
     while x < occ || data.get(*at) == Some(&T_MARK) {
         let byte = data[*at];
         *at += 1;
-        let cp = match CJK_HIGH[byte as usize] {
+        let cp = match LEAD_PAGE[byte as usize] {
             _ if byte == T_LEADING => {
                 cells[x] = Cell(0x20 | LEADING | fill);
                 x += 1;
@@ -1104,13 +1132,13 @@ fn decode_text_row(
                 push_mark(cells, clusters, base, c);
                 continue;
             }
-            0xFF if byte < 0x80 => byte as u64,
-            0xFF => {
+            0 if byte < 0x80 => byte as u64,
+            0 => {
                 *at -= 1;
                 read_utf8(data, at)
             }
-            high => {
-                let cp = CJK_BASE + ((high as u64) << 8 | data[*at] as u64);
+            page => {
+                let cp = cjk_char(page, data[*at]);
                 *at += 1;
                 cp
             }
@@ -1180,10 +1208,9 @@ impl Writer {
 
     #[inline]
     fn put_char(&mut self, cp: u64) {
-        if (CJK_BASE..CJK_END).contains(&cp) {
-            let index = cp - CJK_BASE;
-            self.put(CJK_LEADS[(index >> 8) as usize]);
-            self.put(index as u8);
+        if let Some([lead, low]) = cjk_code(cp) {
+            self.put(lead);
+            self.put(low);
             return;
         }
         let c = char::from_u32(cp as u32).expect("cells hold scalars");
@@ -1585,7 +1612,7 @@ impl Page {
     /// cluster with those extra codepoints; `0x04 n` is n blanks; `0x01` and
     /// eight bytes is a literal cell; `0x05` is a leading spacer; a blank,
     /// tab or printable ASCII cell is its byte; a character is its UTF-8
-    /// sequence, or two bytes from U+4E00 on (see [`CJK_LEADS`]), and is
+    /// sequence, or two bytes for a coded page (see [`CJK_PAGES`]), and is
     /// two columns (with its spacer) when its width is two. Everything else about a cell (marks,
     /// spacers that do not follow their character, leading spacers) is a
     /// literal, so packing is lossless.
@@ -1895,14 +1922,14 @@ impl Page {
                         x += 1;
                     }
                     _ => {
-                        let cp = match CJK_HIGH[byte as usize] {
-                            0xFF if byte < 0x80 => byte as u64,
-                            0xFF => {
+                        let cp = match LEAD_PAGE[byte as usize] {
+                            0 if byte < 0x80 => byte as u64,
+                            0 => {
                                 at -= 1;
                                 read_utf8(data, &mut at)
                             }
-                            high => {
-                                let cp = CJK_BASE + ((high as u64) << 8 | data[at] as u64);
+                            page => {
+                                let cp = cjk_char(page, data[at]);
                                 at += 1;
                                 cp
                             }
