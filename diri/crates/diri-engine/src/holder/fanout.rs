@@ -295,7 +295,7 @@ impl FrameQueue {
 
     /// Records that a writer was started for this queue other than by a push,
     /// so the next push does not ask for another.
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     pub(super) fn claim_writer(&self) {
         self.state.lock().expect("frame queue").writer_parked = false;
     }
