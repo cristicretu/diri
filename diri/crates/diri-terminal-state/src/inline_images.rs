@@ -30,13 +30,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::cell::{Cell, Hyperlink};
+use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::vte::ansi::Handler;
 use alacritty_terminal::vte::scan::{C0Index, STRING_ENDS};
 use diri_proto::inline_image::{ImageAnchor, InlineImageFormat, MAX_IMAGE_BYTES};
 
 use crate::HeadlessScreen;
+use crate::emulator::{Emu, Placement};
 
 /// Hard budget for one terminal's stored images. Placing a new image evicts
 /// the oldest until it fits; evicted placements stay as blank cells.
@@ -266,14 +266,19 @@ impl HeadlessScreen {
     }
 }
 
-/// What the image layer needs from the terminal it feeds: the parser for
-/// the bytes around image sequences, replies, the cursor, and the cells
-/// anchors live in. [`HeadlessScreen`] implements it over the current core
-/// and `core_v2::Screen` over core v2 (feature `core-v2`), so both cut out,
-/// store and place images with this same code.
+/// What the image layer needs from the terminal it feeds: its image state,
+/// the parser for the bytes around image sequences, replies, and an
+/// emulator to place anchors in through [`Placement`] (the image-placement
+/// part of 4b's [`crate::emulator::Emulator`]). [`HeadlessScreen`]
+/// implements it over its emulator, and `core_v2::Screen` over core v2, so
+/// both cut out, store and place images with this one copy of the code.
 pub(crate) trait ImageHost {
+    type Term: Placement;
+
     fn images_ref(&self) -> Option<&InlineImages>;
     fn images_mut(&mut self) -> Option<&mut InlineImages>;
+    fn term(&self) -> &Self::Term;
+    fn term_mut(&mut self) -> &mut Self::Term;
     /// Hands bytes to the emulator's parser, with their part of the read's
     /// C0 index when there is one.
     fn advance_parser(&mut self, bytes: &[u8], index: Option<C0Index<'_>>);
@@ -283,30 +288,6 @@ pub(crate) trait ImageHost {
     /// Applies bytes a synchronized update holds back (they were written
     /// before the image sequence being dispatched).
     fn release_held_update(&mut self);
-    /// Columns and screen lines.
-    fn screen_size(&self) -> (usize, usize);
-    /// The cursor's line and column.
-    fn image_cursor(&self) -> (Line, Column);
-    /// Writes `written` default-style blanks carrying the anchor of image
-    /// `key` (whose box is `size` cells), from column `col0` on each row of
-    /// the box, starting on the cursor's line. With `move_cursor` each
-    /// further row is a linefeed (so it scrolls) and the cursor is left
-    /// after the last row's blanks; otherwise rows below the screen are
-    /// dropped and the cursor and its wrap state are restored. The pen is
-    /// restored either way.
-    fn write_anchor_rows(
-        &mut self,
-        key: &str,
-        col0: usize,
-        size: (u16, u16),
-        written: usize,
-        move_cursor: bool,
-    );
-    /// The hyperlink URI of a visible cell.
-    fn link_uri_at(&self, line: Line, column: Column) -> Option<String>;
-    /// Rewrites cells as plain blanks through the emulator, so the change is
-    /// tracked like output. The cursor is left exactly as it was.
-    fn blank_cells(&mut self, positions: &[(Line, Column)]);
 
     /// Parses `bytes`, cutting image sequences out of the stream. Replies to
     /// sequences that end inside the first `historical_bytes` are dropped.
@@ -594,8 +575,8 @@ pub(crate) trait ImageHost {
                 Some(found.1)
             }
             b'c' => {
-                let (line, column) = self.image_cursor();
-                let Some(internal) = self.anchor_at(line, column) else {
+                let point = self.term().cursor_point();
+                let Some(internal) = self.anchor_at(point.line, point.column) else {
                     return;
                 };
                 Some(internal)
@@ -708,8 +689,8 @@ pub(crate) trait ImageHost {
             return;
         }
         let (cell_width, cell_height) = self.images_ref().expect("images").cell_pixels;
-        let (cols, rows) = self.screen_size();
-        let (cols, rows) = (cols as u32, rows as u32);
+        let cols = self.term().cols() as u32;
+        let rows = self.term().screen_rows() as u32;
         let resolve = |size: ItermSize, cell: u16, screen: u32| match size {
             ItermSize::Auto => None,
             ItermSize::Cells(count) => Some(count),
@@ -756,8 +737,10 @@ pub(crate) trait ImageHost {
         let images = self.images_ref().expect("images");
         let key = images.store.key(internal);
         let cell = images.cell_pixels;
-        let (columns, screen_lines) = self.screen_size();
-        let col0 = self.image_cursor().1.0.min(columns - 1);
+        let columns = self.term().cols();
+        let screen_lines = self.term().screen_rows();
+        let cursor = self.term().cursor_point();
+        let col0 = cursor.column.0.min(columns - 1);
         let available = (columns - col0) as u32;
         let (cols, rows) = cell_box(
             pixels,
@@ -766,18 +749,52 @@ pub(crate) trait ImageHost {
             available,
             fit_height.then_some(screen_lines as u32),
         );
+        let saved_template = self.term().pen();
+        let saved_wrap = self.term().cursor_pending_wrap();
         let written = usize::from(cols).min(columns - col0);
-        self.write_anchor_rows(&key, col0, (cols, rows), written, move_cursor);
+        let mut line = cursor.line;
+        for row in 0..rows {
+            if row > 0 {
+                if move_cursor {
+                    Handler::linefeed(self.term_mut());
+                    line = self.term().cursor_point().line;
+                } else {
+                    line = Line(line.0 + 1);
+                    if line.0 >= screen_lines as i32 {
+                        break;
+                    }
+                }
+            }
+            let anchor = ImageAnchor {
+                key: key.clone(),
+                row,
+                col: col0 as u16,
+                cols,
+                rows,
+            };
+            self.term_mut().set_link_pen(Some(anchor.to_uri()));
+            self.term_mut()
+                .place_cursor(Point::new(line, Column(col0)), false);
+            for _ in 0..written {
+                Handler::input(self.term_mut(), ' ');
+            }
+        }
+        self.term_mut().restore_pen(saved_template);
+        if !move_cursor {
+            self.term_mut().place_cursor(cursor, saved_wrap);
+        }
     }
 
     /// The image whose anchor covers a visible cell.
     fn anchor_at(&self, line: Line, column: Column) -> Option<u32> {
-        let (columns, screen_lines) = self.screen_size();
-        if line.0 < 0 || line.0 >= screen_lines as i32 || column.0 >= columns {
+        if line.0 < 0
+            || line.0 >= self.term().screen_rows() as i32
+            || column.0 >= self.term().cols()
+        {
             return None;
         }
-        let uri = self.link_uri_at(line, column)?;
-        let anchor = ImageAnchor::parse(&uri)?;
+        let target = self.term().link_target(line, column)?;
+        let anchor = ImageAnchor::parse(&target)?;
         self.images_ref()?.store.internal(&anchor.key)
     }
 
@@ -785,16 +802,16 @@ pub(crate) trait ImageHost {
         let Some(images) = self.images_ref() else {
             return Vec::new();
         };
-        let (columns, screen_lines) = self.screen_size();
+        let term = self.term();
         let mut positions = Vec::new();
-        for line in 0..screen_lines {
+        for line in 0..term.screen_rows() {
             let line = Line(line as i32);
-            for column in 0..columns {
+            for column in 0..term.cols() {
                 let column = Column(column);
-                let Some(uri) = self.link_uri_at(line, column) else {
+                let Some(target) = term.link_target(line, column) else {
                     continue;
                 };
-                if let Some(anchor) = ImageAnchor::parse(&uri)
+                if let Some(anchor) = ImageAnchor::parse(&target)
                     && images.store.internal(&anchor.key).is_some_and(matches)
                 {
                     positions.push((line, column));
@@ -803,15 +820,44 @@ pub(crate) trait ImageHost {
         }
         positions
     }
+
+    /// Rewrites cells as plain blanks through the emulator, so the change is
+    /// damage-tracked like output. The cursor is left exactly as it was.
+    fn blank_cells(&mut self, positions: &[(Line, Column)]) {
+        if positions.is_empty() {
+            return;
+        }
+        let saved_point = self.term().cursor_point();
+        let saved_wrap = self.term().cursor_pending_wrap();
+        let saved_template = self.term().pen();
+        self.term_mut().set_link_pen(None);
+        for &(line, column) in positions {
+            self.term_mut()
+                .place_cursor(Point::new(line, column), false);
+            Handler::input(self.term_mut(), ' ');
+        }
+        self.term_mut().restore_pen(saved_template);
+        self.term_mut().place_cursor(saved_point, saved_wrap);
+    }
 }
 
 impl ImageHost for HeadlessScreen {
+    type Term = Emu;
+
     fn images_ref(&self) -> Option<&InlineImages> {
         self.images.as_deref()
     }
 
     fn images_mut(&mut self) -> Option<&mut InlineImages> {
         self.images.as_deref_mut()
+    }
+
+    fn term(&self) -> &Emu {
+        &self.term
+    }
+
+    fn term_mut(&mut self) -> &mut Emu {
+        &mut self.term
     }
 
     /// Hands bytes to the emulator's parser, with their part of the read's
@@ -837,95 +883,6 @@ impl ImageHost for HeadlessScreen {
         if self.parser.sync_timeout().sync_timeout().is_some() {
             self.parser.stop_sync(&mut self.term);
         }
-    }
-
-    fn screen_size(&self) -> (usize, usize) {
-        (self.geometry.cols, self.geometry.rows)
-    }
-
-    fn image_cursor(&self) -> (Line, Column) {
-        let point = self.term.grid().cursor.point;
-        (point.line, point.column)
-    }
-
-    fn write_anchor_rows(
-        &mut self,
-        key: &str,
-        col0: usize,
-        (cols, rows): (u16, u16),
-        written: usize,
-        move_cursor: bool,
-    ) {
-        let screen_lines = self.geometry.rows;
-        let cursor = self.term.grid().cursor.point;
-        let saved_template = self.term.grid().cursor.template.clone();
-        let saved_wrap = self.term.grid().cursor.input_needs_wrap;
-        let mut line = cursor.line;
-        for row in 0..rows {
-            if row > 0 {
-                if move_cursor {
-                    Handler::linefeed(&mut self.term);
-                    line = self.term.grid().cursor.point.line;
-                } else {
-                    line = Line(line.0 + 1);
-                    if line.0 >= screen_lines as i32 {
-                        break;
-                    }
-                }
-            }
-            let anchor = ImageAnchor {
-                key: key.to_owned(),
-                row,
-                col: col0 as u16,
-                cols,
-                rows,
-            };
-            let mut template = Cell::default();
-            template.set_hyperlink(Some(Hyperlink::new(None::<&str>, anchor.to_uri())));
-            let grid = self.term.grid_mut();
-            grid.cursor.template = template;
-            grid.cursor.point.line = line;
-            grid.cursor.point.column = Column(col0);
-            grid.cursor.input_needs_wrap = false;
-            for _ in 0..written {
-                Handler::input(&mut self.term, ' ');
-            }
-        }
-        let grid = self.term.grid_mut();
-        grid.cursor.template = saved_template;
-        if !move_cursor {
-            grid.cursor.point = cursor;
-            grid.cursor.input_needs_wrap = saved_wrap;
-        }
-    }
-
-    fn link_uri_at(&self, line: Line, column: Column) -> Option<String> {
-        let grid = self.term.grid();
-        Some(grid[line][column].hyperlink()?.uri().to_owned())
-    }
-
-    /// Rewrites cells as plain blanks through the emulator, so the change is
-    /// damage-tracked like output. The cursor is left exactly as it was.
-    fn blank_cells(&mut self, positions: &[(Line, Column)]) {
-        if positions.is_empty() {
-            return;
-        }
-        let grid = self.term.grid();
-        let saved_point = grid.cursor.point;
-        let saved_wrap = grid.cursor.input_needs_wrap;
-        let saved_template = grid.cursor.template.clone();
-        self.term.grid_mut().cursor.template = Cell::default();
-        for &(line, column) in positions {
-            let grid = self.term.grid_mut();
-            grid.cursor.point.line = line;
-            grid.cursor.point.column = column;
-            grid.cursor.input_needs_wrap = false;
-            Handler::input(&mut self.term, ' ');
-        }
-        let grid = self.term.grid_mut();
-        grid.cursor.template = saved_template;
-        grid.cursor.point = saved_point;
-        grid.cursor.input_needs_wrap = saved_wrap;
     }
 }
 

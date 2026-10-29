@@ -9,9 +9,9 @@
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::Event;
-use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::{Config, TermMode};
-use alacritty_terminal::vte::ansi::{Handler, Processor};
+use alacritty_terminal::vte::ansi::Processor;
 use alacritty_terminal::vte::scan::{C0Index, c0_positions};
 use diri_proto::grid::CursorStyle;
 use diri_proto::terminal::MouseModes;
@@ -20,6 +20,7 @@ use diri_proto::terminal_input::KeyboardState;
 use super::Core;
 use super::cell::Style;
 use super::page::Link;
+use crate::emulator::Placement;
 use crate::inline_images::{ImageHost, InlineImages, StoredImage};
 use crate::notifications::NotificationParser;
 use crate::{
@@ -274,31 +275,25 @@ impl Screen {
     pub fn inline_image(&self, key: &str) -> Option<StoredImage> {
         self.images.as_ref()?.get(key)
     }
-
-    /// Runs `f` with the pen set to a default-style blank carrying `link`,
-    /// then restores the pen, its link and the character-set gate.
-    fn with_pen(&mut self, link: Option<Link>, f: impl FnOnce(&mut Core)) {
-        let core = &mut self.core;
-        let (pen, saved_link) = (core.pen, core.link.take());
-        core.pen = Style::default();
-        core.pen_cache.0 = 0;
-        core.link = link;
-        core.update_slow_text();
-        f(core);
-        core.pen = pen;
-        core.pen_cache.0 = 0;
-        core.link = saved_link;
-        core.update_slow_text();
-    }
 }
 
 impl ImageHost for Screen {
+    type Term = Core;
+
     fn images_ref(&self) -> Option<&InlineImages> {
         self.images.as_deref()
     }
 
     fn images_mut(&mut self) -> Option<&mut InlineImages> {
         self.images.as_deref_mut()
+    }
+
+    fn term(&self) -> &Core {
+        &self.core
+    }
+
+    fn term_mut(&mut self) -> &mut Core {
+        &mut self.core
     }
 
     fn advance_parser(&mut self, bytes: &[u8], index: Option<C0Index<'_>>) {
@@ -321,89 +316,63 @@ impl ImageHost for Screen {
             self.parser.stop_sync(&mut self.core);
         }
     }
+}
 
-    fn screen_size(&self) -> (usize, usize) {
-        (self.core.cols(), self.core.lines())
+/// The pen v2 writes with: the style and the OSC 8 link of the cursor.
+pub struct Pen {
+    style: Style,
+    link: Option<Link>,
+}
+
+/// Image placement on v2, as `Term` provides it (4b's `Placement`).
+impl Placement for Core {
+    type Pen = Pen;
+
+    fn cols(&self) -> usize {
+        Core::cols(self)
     }
 
-    fn image_cursor(&self) -> (Line, Column) {
-        (Line(self.core.line as i32), Column(self.core.col))
+    fn screen_rows(&self) -> usize {
+        self.lines()
     }
 
-    fn write_anchor_rows(
-        &mut self,
-        key: &str,
-        col0: usize,
-        (cols, rows): (u16, u16),
-        written: usize,
-        move_cursor: bool,
-    ) {
-        let screen_lines = self.core.lines();
-        let (line0, col, wrap) = (self.core.line, self.core.col, self.core.wrap_pending);
-        // The whole box is written under the anchor pen, linefeeds included:
-        // a row a linefeed scrolls in is erased in that (default) style, as
-        // the current core's cursor template has it.
-        self.with_pen(None, |core| {
-            let mut line = line0;
-            for row in 0..rows {
-                if row > 0 {
-                    if move_cursor {
-                        Handler::linefeed(core);
-                        line = core.line;
-                    } else {
-                        line += 1;
-                        if line >= screen_lines {
-                            break;
-                        }
-                    }
-                }
-                let anchor = diri_proto::inline_image::ImageAnchor {
-                    key: key.to_owned(),
-                    row,
-                    col: col0 as u16,
-                    cols,
-                    rows,
-                };
-                core.link = Some(Link {
-                    id: None,
-                    uri: anchor.to_uri(),
-                });
-                core.update_slow_text();
-                core.line = line;
-                core.col = col0;
-                core.wrap_pending = false;
-                for _ in 0..written {
-                    Handler::input(core, ' ');
-                }
-            }
-        });
-        if !move_cursor {
-            self.core.line = line0;
-            self.core.col = col;
-            self.core.wrap_pending = wrap;
+    fn cursor_point(&self) -> Point {
+        Point::new(Line(self.line as i32), Column(self.col))
+    }
+
+    fn cursor_pending_wrap(&self) -> bool {
+        self.wrap_pending
+    }
+
+    fn place_cursor(&mut self, point: Point, pending_wrap: bool) {
+        self.line = point.line.0.max(0) as usize;
+        self.col = point.column.0;
+        self.wrap_pending = pending_wrap;
+    }
+
+    fn pen(&self) -> Pen {
+        Pen {
+            style: self.pen,
+            link: self.link.clone(),
         }
     }
 
-    fn link_uri_at(&self, line: Line, column: Column) -> Option<String> {
-        Some(self.core.link_at(line.0, column.0)?.uri)
+    fn restore_pen(&mut self, pen: Pen) {
+        self.pen = pen.style;
+        self.pen_cache.0 = 0;
+        self.link = pen.link;
+        self.update_slow_text();
     }
 
-    fn blank_cells(&mut self, positions: &[(Line, Column)]) {
-        if positions.is_empty() {
-            return;
-        }
-        let (line, col, wrap) = (self.core.line, self.core.col, self.core.wrap_pending);
-        self.with_pen(None, |core| {
-            for &(line, column) in positions {
-                core.line = line.0 as usize;
-                core.col = column.0;
-                core.wrap_pending = false;
-                Handler::input(core, ' ');
-            }
+    fn set_link_pen(&mut self, uri: Option<String>) {
+        self.restore_pen(Pen {
+            style: Style::default(),
+            link: uri.map(|uri| Link { id: None, uri }),
         });
-        self.core.line = line;
-        self.core.col = col;
-        self.core.wrap_pending = wrap;
+    }
+
+    fn link_target(&self, line: Line, column: Column) -> Option<String> {
+        Some(self.link_at(line.0, column.0)?.uri)
     }
 }
 
@@ -512,7 +481,10 @@ mod tests {
     }
 
     fn run_v2(input: &[u8], reads: &[usize]) -> (Screen, Vec<String>) {
-        let mut screen = Screen::new(LINES, COLS, 0, None, true, None)
+        // History bounded as the current screen bounds it, so both keep
+        // the same rows (these inputs stay far below the byte budget).
+        let history = crate::history_line_limit(COLS);
+        let mut screen = Screen::new(LINES, COLS, history, Some(4 << 20), true, None)
             .with_notifications()
             .with_inline_images();
         let (mut replies, mut notes, mut clips) = (Vec::new(), Vec::new(), Vec::new());

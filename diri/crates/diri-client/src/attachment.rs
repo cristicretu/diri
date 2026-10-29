@@ -358,6 +358,8 @@ impl SessionAttachment {
             enhanced_keyboard: options.enhanced_keyboard,
             // This client decodes cursor shapes and decoration spans.
             terminal_styles: true,
+            // ... and the history position each primary-screen grid carries.
+            grid_history: true,
             attach: session_id.clone(),
             from_offset: None,
             token: None,
@@ -827,6 +829,7 @@ mod tests {
                     is_full_snapshot: index == 0,
                     changed_rows: Vec::new(),
                     cursor_style: Default::default(),
+                    history: None,
                 };
                 super::write_frame(server.get_mut(), &Frame::grid(&grid).unwrap())
                     .await
@@ -1021,6 +1024,7 @@ mod tests {
                             ..GridCell::BLANK
                         }],
                     )],
+                    history: None,
                 };
                 super::write_frame(server.get_mut(), &Frame::grid(&update).unwrap())
                     .await
