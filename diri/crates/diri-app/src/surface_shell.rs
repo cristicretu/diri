@@ -10595,6 +10595,14 @@ mod tests {
                             cx.notify();
                         });
                     }
+                    // `DIRI_VISUAL_USAGE_MENU=1` opens Appearance's sidebar
+                    // usage indicator menu.
+                    if std::env::var_os("DIRI_VISUAL_USAGE_MENU").is_some() {
+                        harness.surfaces.update(cx, |surfaces, cx| {
+                            surfaces.settings_menu = Some(SettingsMenu::SidebarUsageIndicator);
+                            cx.notify();
+                        });
+                    }
                     // `DIRI_VISUAL_TRUSTED_LINKS=ssh,vscode` lists trusted
                     // app-link schemes in Settings › Terminal.
                     if let Ok(schemes) = std::env::var("DIRI_VISUAL_TRUSTED_LINKS") {

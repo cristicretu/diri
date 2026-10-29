@@ -13093,6 +13093,25 @@ mod tests {
                             units..units,
                         );
                     }
+                    // `DIRI_VISUAL_USAGE_INDICATOR=hidden|cost|quota` picks the
+                    // footer metric; `DIRI_VISUAL_QUOTA_UNKNOWN=1` leaves quota
+                    // mode without limits so the footer shows its `—`.
+                    if let Ok(mode) = std::env::var("DIRI_VISUAL_USAGE_INDICATOR") {
+                        let choice = match mode.as_str() {
+                            "hidden" => crate::store::SidebarUsageIndicator::Hidden,
+                            "quota" => crate::store::SidebarUsageIndicator::RemainingQuota,
+                            _ => crate::store::SidebarUsageIndicator::EstimatedCost,
+                        };
+                        sidebar
+                            .store
+                            .write()
+                            .expect("preview session store")
+                            .update_preferences(|prefs| prefs.sidebar_usage_indicator = choice)
+                            .expect("preview preferences");
+                    }
+                    if std::env::var_os("DIRI_VISUAL_QUOTA_UNKNOWN").is_some() {
+                        sidebar.preview = false;
+                    }
                     let now = wall_clock_millis();
                     let mut store = sidebar.store.write().expect("preview session store");
                     let mut sessions: Vec<_> = store
