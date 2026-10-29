@@ -246,6 +246,18 @@ Each PR lands on its own, behind the single `core-v2` cargo feature of `diri-ter
      - a random mix of 90 sequence families, run 3,000 times in local runs and 24 times in CI;
      - the adversarial corpus of #927 when present, fed the same reads to both cores.
 3. **Link table and the Unicode gap.** The grapheme arena has landed in the prototype. Add the link table, and close the Unicode gap: history-on Unicode is 0.46× the reference.
+   - Status: closed (#980). Core-only, checked against the golden and cell for cell, history at 4 MiB, cycles per byte, v2 vs the reference:
+
+     | workload | v2 | reference |
+     |---|---:|---:|
+     | Unicode | 4.02 | 4.21 |
+     | ASCII | 6.09 | 6.40 |
+     | CSI | 14.1 | 19.5 |
+
+     - v2 runs are 7 interleaved rounds. Reference runs are 9 runs of `+terminal-stream`, cycles minus the median of the warm empty-file runs, at load 9–13.
+     - The last 1.5% on Unicode came from CJK prose: punctuation every few ideographs sent most 16-character runs to the mixed token path.
+     - History tokens now give two-byte codes to 100 pages through a page table: U+3000..U+33FF, U+4E00..U+9FFF, U+AC00..U+B8FF and U+FF00..U+FFFF, where they had covered U+4E00..U+B1FF.
+     - That gave 6% fewer Unicode instructions, and kitten Unicode keeps 61,872 rows (the current core keeps 53,648).
 4. **Boundary adapter.** Split into three PRs.
    - **4a, the event layer.** Status: done on `core/v2-step4`.
      - Ported: titles and the title stack, OSC 4/10/11/12 colors and their resets, OSC 52 store and load, every reply (DA1, DA2, DSR, DECRQM, XTWINOPS, XTVERSION, XTGETTCAP, DECRQSS), the kitty keyboard stack (swapped with the screens), the cursor style, the bell, and the events modes send.
@@ -287,6 +299,18 @@ Each PR lands on its own, behind the single `core-v2` cargo feature of `diri-ter
    - **Moved-row fingerprints.** `Emulator::moved_line_sources` reports, for each screen line, the line its cells came from when rows only moved by appends. Dirty and new rows report `CONTENT_CHANGED`. `fingerprints_after_scrolling_match_the_cells` now runs on v2 and checks this is exact.
    - **Golden on v2.** `vt_workloads` with `core-v2-screen` requires at least the golden's rows and compares the newest of them exactly. `core_v2_bench` compares every row v2 keeps, cell for cell.
 7. **Inline images and checkpoints** on v2, with the existing image and checkpoint tests.
+   - Engine-path parity with the current core (#978 and #982). These read paths had cost v2 more than the current core:
+     - Settling a read that changed nothing no longer hashes the cursor rows. Every v2 write marks its row dirty; the cursor rows are reported only after a recolor.
+     - With nothing moved, the dirty scan walks the screen pages' metadata slices, and the moved-line sources are a kept identity.
+     - Image deletes read link targets through `Emulator::each_link_target` instead of converting every screen row.
+   - Result, `vt_workloads` golden-checked, 5 interleaved rounds at load about 9, median MB/s:
+
+     | workload | v2 | current core |
+     |---|---:|---:|
+     | images | 6,181 | 6,089 |
+     | long escape codes | 26,123 | 25,706 |
+
+     Instructions per 100 feeds: images 1.343G vs 1.351G, long escapes 0.522G vs 0.528G.
 7b. **The Engine and the Remote Helper on v2.** Status: done on `core/v2-helper`.
    - With `diri-terminal-state/core-v2-screen` on, the Remote Helper's whole suite passes (`diri-remote`), and so does the Engine's: attach, mirrors, checkpoints and sessions.
    - The one exception is paging idle history out to the cold store (#958), which is step 6.

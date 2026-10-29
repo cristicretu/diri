@@ -36,7 +36,7 @@ use alacritty_terminal::vte::scan::{C0Index, STRING_ENDS};
 use diri_proto::inline_image::{ImageAnchor, InlineImageFormat, MAX_IMAGE_BYTES};
 
 use crate::HeadlessScreen;
-use crate::emulator::{CellView, Emulator, LinkView, RowView};
+use crate::emulator::{CellView, Emulator, LinkView};
 
 /// Hard budget for one terminal's stored images. Placing a new image evicts
 /// the oldest until it fits; evicted placements stay as blank cells.
@@ -815,18 +815,13 @@ impl HeadlessScreen {
         let mut positions = Vec::new();
         for line in 0..self.term.screen_rows() {
             let line = Line(line as i32);
-            let row = self.term.row(line);
-            for (column, cell) in row.cells()[..self.term.cols()].iter().enumerate() {
-                let Some(link) = cell.link() else {
-                    continue;
-                };
-                let column = Column(column);
-                if let Some(anchor) = ImageAnchor::parse(link.target())
+            self.term.each_link_target(line, &mut |column, target| {
+                if let Some(anchor) = ImageAnchor::parse(target)
                     && images.store.internal(&anchor.key).is_some_and(matches)
                 {
-                    positions.push((line, column));
+                    positions.push((line, Column(column)));
                 }
-            }
+            });
         }
         positions
     }
