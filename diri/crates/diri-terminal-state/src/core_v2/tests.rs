@@ -398,6 +398,70 @@ fn random_sequences_match_the_current_core() {
     }
 }
 
+/// A cluster that widens at the right margin moves to the next row with
+/// its hyperlink (it was read after the leading spacer overwrote it).
+#[test]
+fn a_cluster_widening_at_the_margin_keeps_its_link() {
+    for cols in [3, 4, 5] {
+        check(3, cols, 6, "ab\x1b]8;;u://x\x07🇴\x1b]8;;\x07🇴".as_bytes());
+        check(
+            3,
+            cols,
+            6,
+            "a\x1b]8;id=7;u://y\x07b❤\x1b]8;;\x07\u{FE0F}x\x1b]8;;u://z\x07🇷🇴\x1b]8;;\x07"
+                .as_bytes(),
+        );
+    }
+}
+
+/// Hyperlinks (explicit ids and none) over clusters that widen and narrow
+/// at the margins, wide characters, wraps and scrolls, at narrow widths.
+#[test]
+fn random_links_over_clusters_and_margins() {
+    const TOKENS: &[&str] = &[
+        "a",
+        "bc",
+        "漢",
+        "🇴",
+        "🇷",
+        "❤",
+        "\u{FE0F}",
+        "\u{FE0E}",
+        "\u{200D}",
+        "👍",
+        "\u{1F3FD}",
+        "e\u{301}",
+        "\r\n",
+        "\n",
+        "\x1b]8;;u://x\x07",
+        "\x1b]8;id=1;u://y\x07",
+        "\x1b]8;id=2;u://y\x07",
+        "\x1b]8;;\x07",
+        "\x1b[?2027h",
+        "\x1b[?2027l",
+        "\x1b[?7l",
+        "\x1b[?7h",
+        "\x1b[2D",
+        "\x1b[K",
+    ];
+    let mut seed = 0x9E37_79B9_u32;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    let runs = std::env::var("CORE_V2_FUZZ").map_or(48, |n| n.parse().expect("count"));
+    for run in 0..runs {
+        let mut input = String::new();
+        for _ in 0..50 {
+            input.push_str(TOKENS[next() as usize % TOKENS.len()]);
+        }
+        let (lines, cols) = [(3, 3), (4, 4), (3, 5), (5, 7)][run % 4];
+        check(lines, cols, 8, input.as_bytes());
+    }
+}
+
 /// `CORE_V2_BISECT=<file> CORE_V2_SIZE=lines,cols,history`: the shortest
 /// prefix of the file's bytes on which v2 and the current core differ.
 #[test]
