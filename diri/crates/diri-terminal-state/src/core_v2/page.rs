@@ -732,8 +732,6 @@ pub struct Page {
     /// the history budget).
     links: Option<Box<Links>>,
     packed: Option<Packed>,
-    /// `packed` is LZ-compressed (see [`Page::finish_pack`]).
-    lz: bool,
 }
 
 const T_LITERAL: u8 = 1;
@@ -1269,9 +1267,14 @@ impl LzPolicy {
 /// A packed page's bytes: in memory, or in a cold store (#958). A stored
 /// payload counts its full length against the history budget, exactly as in
 /// memory, so the rows kept never depend on paging.
+/// Whether the bytes are LZ-compressed is the variant, so a page spends
+/// no field on it.
 pub(super) enum Packed {
     Resident(Box<[u8]>),
-    Stored(StoredPage),
+    /// Resident and LZ-compressed (see [`Pages::trim`]).
+    ResidentLz(Box<[u8]>),
+    /// Boxed: a resident page, the common case, stays three words.
+    Stored(Box<StoredPage>),
 }
 
 /// A payload in a [`ColdStore`], released when its page is dropped.
@@ -1279,6 +1282,7 @@ pub(super) struct StoredPage {
     store: Arc<dyn ColdStore>,
     slot: u64,
     len: usize,
+    lz: bool,
 }
 
 impl Drop for StoredPage {
@@ -1290,8 +1294,24 @@ impl Drop for StoredPage {
 impl Packed {
     fn len(&self) -> usize {
         match self {
-            Packed::Resident(bytes) => bytes.len(),
+            Packed::Resident(bytes) | Packed::ResidentLz(bytes) => bytes.len(),
             Packed::Stored(stored) => stored.len,
+        }
+    }
+
+    fn lz(&self) -> bool {
+        match self {
+            Packed::Resident(_) => false,
+            Packed::ResidentLz(_) => true,
+            Packed::Stored(stored) => stored.lz,
+        }
+    }
+
+    /// The bytes when in memory.
+    fn resident(&self) -> Option<&[u8]> {
+        match self {
+            Packed::Resident(bytes) | Packed::ResidentLz(bytes) => Some(bytes),
+            Packed::Stored(_) => None,
         }
     }
 
@@ -1300,7 +1320,7 @@ impl Packed {
     /// cannot give them back.
     fn bytes(&self) -> Option<Cow<'_, [u8]>> {
         match self {
-            Packed::Resident(bytes) => Some(Cow::Borrowed(bytes)),
+            Packed::Resident(bytes) | Packed::ResidentLz(bytes) => Some(Cow::Borrowed(bytes)),
             Packed::Stored(stored) => match stored.store.load(stored.slot, stored.len) {
                 Ok(bytes) if bytes.len() == stored.len => Some(Cow::Owned(bytes)),
                 _ => None,
@@ -1456,7 +1476,6 @@ impl Page {
             text,
             links: None,
             packed: None,
-            lz: false,
         }
     }
 
@@ -1702,7 +1721,6 @@ impl Page {
         packed.extend_from_slice(&tokens[meta_len..]);
         packed.extend_from_slice(&styles);
         self.packed = Some(Packed::Resident(packed.into_boxed_slice()));
-        self.lz = false;
         // Debug builds decode the page and compare it with the cells.
         #[cfg(debug_assertions)]
         {
@@ -1763,12 +1781,13 @@ impl Page {
         // A payload the cold store cannot give back reads as blank rows, as
         // the current core's history does (the store reports why).
         styles.clear();
-        let Some(stored) = self.packed.as_ref().expect("packed").bytes() else {
+        let packed = self.packed.as_ref().expect("packed");
+        let Some(stored) = packed.bytes() else {
             metas[..self.len].fill(RowMeta::default());
             return;
         };
         let decoded;
-        let data: &[u8] = if self.lz {
+        let data: &[u8] = if packed.lz() {
             decoded = decompress(&stored);
             &decoded
         } else {
@@ -1888,7 +1907,7 @@ impl Page {
         let Some(packed) = &self.packed else {
             return 0;
         };
-        if self.lz {
+        if packed.lz() {
             return 0;
         }
         let Some(raw) = packed.bytes() else {
@@ -1898,8 +1917,7 @@ impl Page {
             return 0;
         }
         let saved = raw.len() - lz.len();
-        self.packed = Some(Packed::Resident(Box::from(lz.as_slice())));
-        self.lz = true;
+        self.packed = Some(Packed::ResidentLz(Box::from(lz.as_slice())));
         saved
     }
 
@@ -2305,13 +2323,13 @@ impl Pages {
         for index in 0..self.sealed {
             let page = &self.pages[index];
             let first = self.base + index as u64 * rows;
-            match &page.packed {
-                Some(Packed::Stored(_)) => report.already_stored += 1,
-                Some(Packed::Resident(bytes)) if first + rows <= keep_from => {
+            match page.packed.as_ref().map(|packed| packed.resident()) {
+                Some(None) => report.already_stored += 1,
+                Some(Some(bytes)) if first + rows <= keep_from => {
                     moving.push(index);
                     report.bytes += bytes.len();
                 }
-                Some(Packed::Resident(bytes)) => report.kept_bytes += bytes.len(),
+                Some(Some(bytes)) => report.kept_bytes += bytes.len(),
                 None => {}
             }
         }
@@ -2322,9 +2340,12 @@ impl Pages {
         let slots = {
             let payloads: Vec<&[u8]> = moving
                 .iter()
-                .map(|&index| match &self.pages[index].packed {
-                    Some(Packed::Resident(bytes)) => &bytes[..],
-                    _ => unreachable!("only resident pages move"),
+                .map(|&index| {
+                    self.pages[index]
+                        .packed
+                        .as_ref()
+                        .and_then(Packed::resident)
+                        .expect("only resident pages move")
                 })
                 .collect();
             store.store(&payloads)?
@@ -2332,12 +2353,14 @@ impl Pages {
         assert_eq!(slots.len(), moving.len(), "one slot per stored page");
         for (&index, slot) in moving.iter().zip(slots) {
             let page = &mut self.pages[index];
-            let len = page.packed.as_ref().map_or(0, Packed::len);
-            page.packed = Some(Packed::Stored(StoredPage {
+            let packed = page.packed.as_ref().expect("a moving page is packed");
+            let (len, lz) = (packed.len(), packed.lz());
+            page.packed = Some(Packed::Stored(Box::new(StoredPage {
                 store: Arc::clone(store),
                 slot,
                 len,
-            }));
+                lz,
+            })));
         }
         report.payloads = moving.len();
         // The read cache may hold a page that just moved; it is a cache.
@@ -2350,7 +2373,7 @@ impl Pages {
         let (mut resident, mut resident_bytes, mut stored, mut stored_bytes) = (0, 0, 0, 0);
         for page in self.pages.iter().take(self.sealed) {
             match &page.packed {
-                Some(Packed::Resident(bytes)) => {
+                Some(Packed::Resident(bytes) | Packed::ResidentLz(bytes)) => {
                     resident += 1;
                     resident_bytes += bytes.len();
                 }
@@ -2456,7 +2479,6 @@ impl Pages {
             page.links.get_or_insert_with(Default::default).map = map;
         }
         page.packed = None;
-        page.lz = false;
         page.text = TextLog::new(rows, false);
         page.styles.thaw();
         let serial = page.serial;
