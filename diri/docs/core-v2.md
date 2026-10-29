@@ -311,6 +311,24 @@ Each PR lands on its own, behind the single `core-v2` cargo feature of `diri-ter
      | long escape codes | 26,123 | 25,706 |
 
      Instructions per 100 feeds: images 1.343G vs 1.351G, long escapes 0.522G vs 0.528G.
+   - **Row reads without conversion** (`core/v2-perf`). Settling fingerprinted each damaged row through `Emulator::row`, which on v2 built a `Vec` of current-core cells (24 bytes each, plus an `Arc` for every cluster, link or underline color). On ASCII, fingerprinting took about a third of a 64 KiB feed, and the conversion most of that (`sample`).
+     - Two hooks on `Emulator`, `fingerprint_row` and `wire_row`, have default bodies that read `row()` as before. The current core uses the defaults, so its code is unchanged: the fold moved into `RowHasher`, which `fingerprint_cells` drives over the same slice.
+     - v2 overrides both and reads the page in place. The style word, or the wire cell minus its character, is derived once per run of equal style ids and flag bits. Cells with a link, a cluster or an underline color go through `PageCell`, a borrowed view that reads like the converted cell, into the same fold.
+     - Both results equal the default reading. `page_views_read_as_converted_rows` checks this at every row width, for wire cells and the annotation report, packed history included.
+     - `wire_row` serves `grid_update`, `full_snapshot`, the history exports and scrollback cells. Text, find and link exports still convert rows; they are off the hot path.
+     - `vt_workloads`, golden-checked, 5 interleaved rounds at load 2.5–7, median of per-run medians in MB/s, kitten captures:
+
+       | workload | v2 before | v2 after | current core |
+       |---|---:|---:|---:|
+       | ASCII | 474 | 590 | 167 |
+       | Unicode | 594 | 740 | 195 |
+       | unique Unicode | 74 | 133 | 54 |
+       | CSI | 278 | 288 | 219 |
+       | images | 5,609 | 5,655 | 5,531 |
+       | long escape codes | 26,482 | 27,221 | 26,561 |
+
+       The current core before and after is within noise everywhere (ASCII 169 vs 167, images 5,529 vs 5,531).
+     - Holder→Engine `vtbench`, kitten captures, interleaved runs at load 2–5, median of the runs' medians in MB/s, v2 vs the current core: ASCII 232 vs 162, Unicode 231 vs 195, unique Unicode 137 vs 56, CSI 218 vs 202. Images (226 vs 231) and long escape codes (217 vs 219) are bound by the PTY (drain 216–258), and their ranges overlap across 6 runs each. The Engine process is over 95% idle in both, and `vt_workloads` at 1 KiB reads runs v2 1.3× (images) and 1.6× (long escapes) faster, so what remains is not the parse or the read path.
 7b. **The Engine and the Remote Helper on v2.** Status: done on `core/v2-helper`.
    - With `diri-terminal-state/core-v2-screen` on, the Remote Helper's whole suite passes (`diri-remote`), and so does the Engine's: attach, mirrors, checkpoints and sessions.
    - The one exception is paging idle history out to the cold store (#958), which is step 6.
