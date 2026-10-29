@@ -270,7 +270,9 @@ impl Core {
         }
         let (p, r) = self.pages.locate(self.line);
         if self.col + 1 == self.cols {
-            self.pages.page_mut(p).meta[r].wrapped = true;
+            let meta = &mut self.pages.page_mut(p).meta[r];
+            meta.wrapped = true;
+            meta.dirty = true;
         } else {
             // A restored cursor can wait to wrap before the last column;
             // the mark goes on the cursor cell, as in the current core.

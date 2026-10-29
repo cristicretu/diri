@@ -43,6 +43,8 @@ pub struct Inactive {
     pages: Pages,
     cursor: Saved,
     saved: Saved,
+    /// Screen swaps so far, for damage tracking.
+    swaps: u64,
 }
 
 /// `AltScreen` of the current core: what entering or leaving does to the
@@ -71,6 +73,19 @@ impl Core {
             Some(other) if self.mode.contains(TermMode::ALT_SCREEN) => &other.pages,
             _ => &self.pages,
         }
+    }
+
+    /// The primary screen's pages, whichever screen is shown.
+    pub(super) fn primary_pages_mut(&mut self) -> &mut Pages {
+        match &mut self.other {
+            Some(other) if self.mode.contains(TermMode::ALT_SCREEN) => &mut other.pages,
+            _ => &mut self.pages,
+        }
+    }
+
+    /// How many times the shown screen was swapped with the other one.
+    pub(super) fn screen_swaps(&self) -> u64 {
+        self.other.as_ref().map_or(0, |other| other.swaps)
     }
 
     /// Keeps the print path's copies of mode bits and its slow-text gate
@@ -665,6 +680,7 @@ impl Core {
                 pages: Pages::new(lines, cols, 0, None, None),
                 cursor: Saved::default(),
                 saved: Saved::default(),
+                swaps: 0,
             })
         });
         let mut other = std::mem::replace(
@@ -673,8 +689,10 @@ impl Core {
                 pages: Pages::new(1, 1, 0, None, None),
                 cursor: Saved::default(),
                 saved: Saved::default(),
+                swaps: 0,
             }),
         );
+        other.swaps += 1;
         std::mem::swap(&mut self.pages, &mut other.pages);
         std::mem::swap(&mut self.saved, &mut other.saved);
         let shown = std::mem::replace(&mut other.cursor, self.cursor_state());

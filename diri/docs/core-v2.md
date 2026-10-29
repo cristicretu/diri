@@ -256,6 +256,13 @@ Each PR lands on its own, behind the single `core-v2` cargo feature of `diri-ter
      - The whole `diri-terminal-state` suite runs both ways in CI.
      - The wire output must be byte-identical on the vt workloads and the golden digests, and the diri-term screenshots must be pixel-identical.
      - Resize is the one gap until step 5: with the switch on it must refuse rather than guess.
+     - Status: implemented on `core/v2-step4c` behind its own switch, `core-v2-screen` (it implies `core-v2`; nothing enables it). `core_v2/screen.rs` is the adapter:
+       - The interface reads rows and cells through views (`Emulator::RowRef`, `CellRef`) and writes through `edit_row`. For the current core they are its own references and indexing, so that build is unchanged.
+       - Rows and cells are read as current-core cells, converted from pages, so every encoder runs unchanged.
+       - Damage is the rows with `RowMeta::dirty` plus the cursor rows; it is full when rows moved (a row appended, history cleared, a screen swap). No content sources: moved rows are hashed again.
+       - Checkpoint writes convert back to page cells. A packed history page is thawed for the edit and packed again before rows move or history is bounded.
+       - Resize to another size panics ("resize needs reflow, step 5"); the tests that resize are ignored with the switch on.
+       - Rows kept at the budget: on repetitive output (numbered log lines) v2 keeps a third to a half of the current core's rows in 4 MiB, because it stores a byte per ASCII cell where the current core LZ-compresses each row. The four depth tests are gated to the current core; step 6 owns that gap.
 5. **Reflow.** Page rewrap plus deferred cold reflow. Run the resize tests, and the #921 narrowing test on both cores.
 6. **Cold-page packing and the budget.** Prototyped here: it measures 4.7× and 3.7× the Engine (ASCII and Unicode) at budget, and is deterministic under the split tests.
    - Remaining: close the 1.5% gap in rows kept against today's Engine.

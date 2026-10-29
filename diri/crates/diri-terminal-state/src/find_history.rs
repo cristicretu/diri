@@ -89,7 +89,8 @@ impl HeadlessScreen {
     ) {
         let cols = self.geometry.cols;
         let line = Line(index as i32 - history as i32);
-        let cells = self.term.row(line).cells();
+        let row = self.term.row(line);
+        let cells = row.cells();
         let HistorySearch {
             needle,
             text,

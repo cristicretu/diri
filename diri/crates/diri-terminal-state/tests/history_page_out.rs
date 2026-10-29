@@ -89,6 +89,10 @@ fn assert_same(paged: &mut HeadlessScreen, resident: &mut HeadlessScreen, step: 
 }
 
 #[test]
+#[cfg_attr(
+    feature = "core-v2-screen",
+    ignore = "core v2 keeps history in memory: cold paging, and resize, are later steps"
+)]
 fn paged_out_history_matches_resident_history_through_output_resizes_and_reads() {
     let store = Arc::new(MemoryStore::default());
     let cold: Arc<dyn ColdStore> = store.clone();
