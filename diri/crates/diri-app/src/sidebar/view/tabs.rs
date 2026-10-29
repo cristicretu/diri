@@ -251,11 +251,12 @@ impl Sidebar {
     }
 
     pub(super) fn agent_tab_icon(kind: &ProtoAgentKind, colors: SemanticColors) -> AnyElement {
-        Self::agent_tab_icon_sized(kind, colors, 16.0)
+        Self::agent_tab_icon_sized(kind, None, colors, 16.0)
     }
 
     fn agent_tab_icon_sized(
         kind: &ProtoAgentKind,
+        glyph: Option<diri_ui::IconName>,
         colors: SemanticColors,
         size: f32,
     ) -> AnyElement {
@@ -265,8 +266,12 @@ impl Sidebar {
                 .into_any_element(),
             // Exactly `size`: `sf_symbol` rounds up to its 12 pt tier, which
             // would crowd a progress ring.
-            None => diri_ui::Icon::new(diri_ui::IconName::Terminal, size, colors.secondary)
-                .into_any_element(),
+            None => diri_ui::Icon::new(
+                glyph.unwrap_or(diri_ui::IconName::Terminal),
+                size,
+                colors.secondary,
+            )
+            .into_any_element(),
         };
         div()
             .size(px(size))
@@ -559,6 +564,7 @@ impl Sidebar {
             ref id,
             ref title,
             ref kind,
+            glyph,
             active,
             rank,
             state,
@@ -582,7 +588,7 @@ impl Sidebar {
             )
         });
         let progress_mark = progress.map(|face| {
-            let logo = Self::agent_tab_icon_sized(kind, colors, 10.0);
+            let logo = Self::agent_tab_icon_sized(kind, glyph, colors, 10.0);
             crate::progress_mark::progress_mark(face, colors, Some(logo))
         });
         let mark = match state {
@@ -601,7 +607,7 @@ impl Sidebar {
                     let id = id.0.clone();
                     move || format!("horizontal-tab-logo-{id}")
                 })
-                .child(Self::agent_tab_icon(kind, colors))
+                .child(Self::agent_tab_icon_sized(kind, glyph, colors, 16.0))
                 .into_any_element(),
             state => div()
                 .id(SharedString::from(format!(

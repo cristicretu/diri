@@ -7023,8 +7023,10 @@ impl Sidebar {
             .entry(session.id.clone())
             .or_insert_with(|| cx.new(|_| StatusGlyph::new(kind, state, 16.0, colors)))
             .clone();
+        let program = crate::session_presentation::program_glyph(session);
         entity.update(cx, |glyph, cx| {
             glyph.set_kind(kind, cx);
+            glyph.set_glyph(program, cx);
             glyph.set_state(state, window, cx);
             glyph.set_colors(colors, cx);
         });
@@ -12832,10 +12834,26 @@ mod tests {
                                 diri_proto::SessionStatus::Working,
                                 Some(ProtoAgentKind::CLAUDE_CODE),
                             ),
-                        ] {
+                        ]
+                        .into_iter()
+                        // `DIRI_VISUAL_TERMINALS=programs` adds a few more
+                        // programs, to show each terminal's program glyph.
+                        .chain(
+                            (std::env::var("DIRI_VISUAL_TERMINALS").as_deref() == Ok("programs"))
+                                .then_some([
+                                    ("preview-term-psql", "psql", "web", diri_proto::SessionStatus::Idle, None),
+                                    ("preview-term-cargo", "cargo", "diri", diri_proto::SessionStatus::Working, None),
+                                    ("preview-term-k9s", "k9s", "infra", diri_proto::SessionStatus::Idle, None),
+                                    ("preview-term-htop", "htop", "web", diri_proto::SessionStatus::Idle, None),
+                                ])
+                                .into_iter()
+                                .flatten(),
+                        ) {
                             let mut terminal = base.clone();
                             terminal.id = SessionId::new(id);
                             terminal.title = title.into();
+                            terminal.foreground_program = (agent.is_none() && id != "preview-term-web")
+                                .then(|| title.to_owned());
                             terminal.title_source = diri_proto::TitleSource::TerminalTitle;
                             terminal.terminal_cwd = Some(format!("{root}/{folder}"));
                             terminal.status = status;
