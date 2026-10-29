@@ -1978,6 +1978,11 @@ pub struct Pages {
     lz_considered: usize,
     next_serial: u64,
     cache: RefCell<Option<Unpacked>>,
+    /// The rows per page a test asked for, kept for a resize's new pages.
+    page_rows: Option<usize>,
+    /// What a resize that rebuilt these pages adds to their history origin
+    /// (see `super::resize`).
+    pub origin_bias: i64,
 }
 
 /// Rows per page: a power of two near 64 KiB of cells, at least 16.
@@ -2023,6 +2028,8 @@ impl Pages {
             lz_considered: 0,
             next_serial: 1,
             cache: RefCell::new(None),
+            page_rows,
+            origin_bias: 0,
         };
         for _ in 0..lines {
             pages.push_row(&Style::default());
@@ -2424,6 +2431,21 @@ impl Pages {
             self.pop_front_page();
         }
         self.trim();
+    }
+
+    /// Empty pages of `lines` × `cols` with this one's row limit, budget and
+    /// page size, for a resize to fill.
+    pub fn resized(&self, lines: usize, cols: usize) -> Pages {
+        Pages::new(lines, cols, self.history_limit, self.budget, self.page_rows)
+    }
+
+    /// Rows that have left history from its oldest end (evicted, trimmed,
+    /// hidden by the row limit or cleared), as the current core's
+    /// `Grid::history_origin` counts them.
+    pub fn history_origin(&self) -> u64 {
+        let entered = self.total - self.lines as u64;
+        let left = entered - self.history_size() as u64;
+        (left as i64 + self.origin_bias) as u64
     }
 
     /// The live-byte bound on history, if any.
