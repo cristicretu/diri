@@ -37,7 +37,7 @@ use super::cell::{
     CP, Cell, HYPERLINK, LEADING, MARKS_SHIFT, SPACER, STYLE_FLAGS, STYLE_SHIFT, Style, WIDE, WRAP,
 };
 use super::check::flags_with;
-use super::page::Link;
+use super::page::{Link, style_in};
 use crate::emulator::{Emulator, RowView, RowWrite};
 use crate::{Collector, Geometry};
 
@@ -139,12 +139,11 @@ fn read_row(core: &Core, line: i32, out: &mut Vec<GridCell>) {
     let cols = core.cols();
     let pages = &core.pages;
     let (p, r) = pages.locate_line(line);
-    let page = pages.page(p);
     let meta = pages.meta(p, r);
     let occ = meta.occ as usize;
     let mut linked = Vec::new();
     out.clear();
-    pages.read(p, |_, cells, clusters| {
+    pages.read_styled(p, |_, cells, clusters, styles| {
         for x in 0..cols {
             let cell = if x < occ {
                 cells[r * cols + x]
@@ -156,7 +155,7 @@ fn read_row(core: &Core, line: i32, out: &mut Vec<GridCell>) {
             }
             out.push(grid_cell(
                 cell,
-                &page.styles.get(cell.style()),
+                &style_in(styles, cell.style()),
                 clusters.of(cell),
                 x + 1 == cols && meta.wrapped,
             ));

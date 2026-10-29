@@ -24,6 +24,8 @@ use std::collections::{HashMap, VecDeque};
 use alacritty_terminal::grid::compact::lz::{compress_into, decompress};
 use alacritty_terminal::term::grapheme::Info;
 
+use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
+
 use super::cell::{
     CLUSTER, CLUSTER_SHIFT, CP, Cell, GRAPHEME, HYPERLINK, LEADING, SPACER, STYLE_SHIFT, Style,
     WIDE,
@@ -106,12 +108,6 @@ impl StyleTable {
         if let Some(index) = &mut self.index {
             index.clear();
         }
-    }
-
-    /// A packed page never interns again: keep only the table.
-    fn freeze(&mut self) {
-        self.index = None;
-        self.table.shrink_to_fit();
     }
 
     /// Rebuilds the index of a frozen table, so a thawed page interns
@@ -1313,6 +1309,124 @@ impl Packed {
     }
 }
 
+/// Style `id` of a page's style table (the default for 0, and for a page
+/// whose payload could not be read back).
+#[inline]
+pub fn style_in(styles: &[Style], id: u16) -> Style {
+    if id == 0 {
+        return Style::default();
+    }
+    styles.get(id as usize).copied().unwrap_or_default()
+}
+
+/// Every named color, to decode [`put_color`]'s index.
+const NAMED_COLORS: [NamedColor; 29] = {
+    use NamedColor::*;
+    [
+        Black,
+        Red,
+        Green,
+        Yellow,
+        Blue,
+        Magenta,
+        Cyan,
+        White,
+        BrightBlack,
+        BrightRed,
+        BrightGreen,
+        BrightYellow,
+        BrightBlue,
+        BrightMagenta,
+        BrightCyan,
+        BrightWhite,
+        Foreground,
+        Background,
+        Cursor,
+        DimBlack,
+        DimRed,
+        DimGreen,
+        DimYellow,
+        DimBlue,
+        DimMagenta,
+        DimCyan,
+        DimWhite,
+        BrightForeground,
+        DimForeground,
+    ]
+};
+
+fn put_color(out: &mut Vec<u8>, color: Color) {
+    match color {
+        Color::Named(named) => {
+            let index = NAMED_COLORS
+                .iter()
+                .position(|&n| n == named)
+                .expect("every named color is listed");
+            out.extend_from_slice(&[0, index as u8]);
+        }
+        Color::Spec(rgb) => out.extend_from_slice(&[1, rgb.r, rgb.g, rgb.b]),
+        Color::Indexed(index) => out.extend_from_slice(&[2, index]),
+    }
+}
+
+fn read_color(data: &[u8], at: &mut usize) -> Option<Color> {
+    let kind = data[*at];
+    *at += 1;
+    let color = match kind {
+        0 => Color::Named(NAMED_COLORS[data[*at] as usize]),
+        1 => {
+            let rgb = Rgb {
+                r: data[*at],
+                g: data[*at + 1],
+                b: data[*at + 2],
+            };
+            *at += 2;
+            Color::Spec(rgb)
+        }
+        2 => Color::Indexed(data[*at]),
+        _ => return None,
+    };
+    *at += 1;
+    Some(color)
+}
+
+/// A packed page's style table, after its row tokens: the count, then each
+/// style but the default at index 0: foreground, background, underline
+/// color (3 for none) and flags. Ids are positions, so cells keep theirs.
+fn pack_styles(table: &[Style], out: &mut Vec<u8>) {
+    push_varint(out, table.len());
+    for style in table.iter().skip(1) {
+        put_color(out, style.fg);
+        put_color(out, style.bg);
+        match style.underline {
+            Some(color) => put_color(out, color),
+            None => out.push(3),
+        }
+        push_varint(out, style.flags as usize);
+    }
+}
+
+fn unpack_styles(data: &[u8], at: &mut usize, styles: &mut Vec<Style>) {
+    let len = read_varint(data, at);
+    styles.clear();
+    if len == 0 {
+        return;
+    }
+    styles.push(Style::default());
+    for _ in 1..len {
+        let fg = read_color(data, at).expect("a color");
+        let bg = read_color(data, at).expect("a color");
+        let underline = read_color(data, at);
+        let flags = read_varint(data, at) as u32;
+        styles.push(Style {
+            fg,
+            bg,
+            underline,
+            flags,
+        });
+    }
+}
+
 /// Dense buffers a packed page leaves behind, reused by the next tail page.
 type DenseBuffers = (Box<[Cell]>, Box<[RowMeta]>, TextLog, Clusters);
 
@@ -1421,14 +1535,16 @@ impl Page {
     /// two columns (with its spacer) when its width is two. Everything else about a cell (marks,
     /// spacers that do not follow their character, leading spacers) is a
     /// literal, so packing is lossless.
-    fn pack(&mut self, cols: usize, out: &mut Vec<u8>) -> DenseBuffers {
+    fn pack(&mut self, cols: usize, out: &mut Vec<u8>, ids: &mut Vec<u8>) -> DenseBuffers {
         out.clear();
         pack_meta(&self.meta[..self.len], out);
+        let meta_len = out.len();
+        ids.clear();
         // Every written row logged, in order, with nothing between them:
         // the log is the row tokens.
         if self.text.on && self.text.contiguous(&self.meta[..self.len]) {
             out.extend_from_slice(&self.text.bytes);
-            return self.finish_pack(cols, out);
+            return self.finish_pack(cols, out, meta_len, ids);
         }
         let mut current = 0u64;
         for row in 0..self.len {
@@ -1496,10 +1612,11 @@ impl Page {
                 }
                 let cp = cell & CP;
                 let flags = cell & FLAGS;
-                let token = |out: &mut Vec<u8>, current: &mut u64| {
+                // The id goes to its own stream (see [`Page::finish_pack`]).
+                let mut token = |out: &mut Vec<u8>, current: &mut u64| {
                     if style != *current {
                         out.push(T_STYLE);
-                        out.extend_from_slice(&((style >> STYLE_SHIFT) as u16).to_le_bytes());
+                        ids.extend_from_slice(&((style >> STYLE_SHIFT) as u16).to_le_bytes());
                         *current = style;
                     }
                 };
@@ -1553,14 +1670,38 @@ impl Page {
             }
             flush_blanks(out, &mut blanks);
         }
-        self.finish_pack(cols, out)
+        self.finish_pack(cols, out, meta_len, ids)
     }
 
     /// Keeps `packed` as the page and hands back its dense buffers.
-    fn finish_pack(&mut self, cols: usize, packed: &[u8]) -> DenseBuffers {
-        // Tokens only: LZ is applied later, under budget pressure (see
-        // [`Pages::trim`]).
-        self.packed = Some(Packed::Resident(Box::from(packed)));
+    ///
+    /// The packed bytes are: the rows' metadata, the style ids of the
+    /// general rows' style changes as their own stream (its length, then
+    /// u16s), the row tokens, then the style table. Ids and characters
+    /// change at different rates (a colour per cell, text shifted between
+    /// rows), so apart they repeat, and LZ finds them. The table after the
+    /// tokens is compressed with them, so a packed page keeps no table of
+    /// its own. LZ is applied later, under budget pressure (see
+    /// [`Pages::trim`]).
+    fn finish_pack(
+        &mut self,
+        cols: usize,
+        tokens: &[u8],
+        meta_len: usize,
+        ids: &[u8],
+    ) -> DenseBuffers {
+        let mut styles = Vec::new();
+        pack_styles(&self.styles.table, &mut styles);
+        let mut ids_len = Vec::new();
+        push_varint(&mut ids_len, ids.len());
+        let mut packed =
+            Vec::with_capacity(tokens.len() + ids_len.len() + ids.len() + styles.len());
+        packed.extend_from_slice(&tokens[..meta_len]);
+        packed.extend_from_slice(&ids_len);
+        packed.extend_from_slice(ids);
+        packed.extend_from_slice(&tokens[meta_len..]);
+        packed.extend_from_slice(&styles);
+        self.packed = Some(Packed::Resident(packed.into_boxed_slice()));
         self.lz = false;
         // Debug builds decode the page and compare it with the cells.
         #[cfg(debug_assertions)]
@@ -1569,7 +1710,16 @@ impl Page {
             let mut metas = vec![RowMeta::default(); self.len];
             let mut clusters = Clusters::default();
             let mut links = HashMap::new();
-            self.unpack(cols, &mut metas, &mut check, &mut clusters, &mut links);
+            let mut styles = Vec::new();
+            self.unpack(
+                cols,
+                &mut metas,
+                &mut check,
+                &mut clusters,
+                &mut links,
+                &mut styles,
+            );
+            assert_eq!(styles, self.styles.table, "packed styles");
             for (row, (&got, &want)) in metas.iter().zip(&self.meta[..self.len]).enumerate() {
                 assert_eq!(
                     (got.occ, got.fill, got.wrapped),
@@ -1585,7 +1735,7 @@ impl Page {
         }
         #[cfg(not(debug_assertions))]
         let _ = cols;
-        self.styles.freeze();
+        self.styles = StyleTable::default();
         if let Some(links) = &mut self.links {
             links.map = HashMap::new();
         }
@@ -1606,11 +1756,13 @@ impl Page {
         cells: &mut [Cell],
         clusters: &mut Clusters,
         links: &mut HashMap<u32, u32>,
+        styles: &mut Vec<Style>,
     ) {
         clusters.clear();
         links.clear();
         // A payload the cold store cannot give back reads as blank rows, as
         // the current core's history does (the store reports why).
+        styles.clear();
         let Some(stored) = self.packed.as_ref().expect("packed").bytes() else {
             metas[..self.len].fill(RowMeta::default());
             return;
@@ -1624,6 +1776,10 @@ impl Page {
         };
         let mut pending_link: Option<u32> = None;
         let mut at = unpack_meta(data, &mut metas[..self.len]);
+        let ids_len = read_varint(data, &mut at);
+        let ids = &data[at..at + ids_len];
+        at += ids_len;
+        let mut next_id = 0;
         let mut current = 0u64;
         let mut pending: Option<u64> = None;
         let mut chars = Vec::new();
@@ -1654,9 +1810,9 @@ impl Page {
                         x += 1;
                     }
                     T_STYLE => {
-                        current =
-                            (u16::from_le_bytes([data[at], data[at + 1]]) as u64) << STYLE_SHIFT;
-                        at += 2;
+                        current = (u16::from_le_bytes([ids[next_id], ids[next_id + 1]]) as u64)
+                            << STYLE_SHIFT;
+                        next_id += 2;
                         continue;
                     }
                     T_LINK => {
@@ -1718,6 +1874,7 @@ impl Page {
                 }
             }
         }
+        unpack_styles(data, &mut at, styles);
         debug_assert_eq!(at, data.len());
     }
 
@@ -1769,6 +1926,7 @@ struct Unpacked {
     cells: Box<[Cell]>,
     clusters: Clusters,
     links: HashMap<u32, u32>,
+    styles: Vec<Style>,
 }
 
 pub struct Pages {
@@ -1794,6 +1952,8 @@ pub struct Pages {
     scratch: Vec<u8>,
     /// Reused LZ output of `Page::pack`.
     lz_scratch: Vec<u8>,
+    /// Reused style-id stream of `Page::pack`.
+    ids_scratch: Vec<u8>,
     lz_policy: LzPolicy,
     /// Sealed pages, from the front, that budget pressure has offered to
     /// [`LzPolicy`] already.
@@ -1840,6 +2000,7 @@ impl Pages {
             spare_dense: Vec::new(),
             scratch: Vec::new(),
             lz_scratch: Vec::new(),
+            ids_scratch: Vec::new(),
             lz_policy: LzPolicy::default(),
             lz_considered: 0,
             next_serial: 1,
@@ -1909,9 +2070,19 @@ impl Pages {
     /// Runs `f` over page `p`'s cells and clusters, unpacking it first
     /// (into a one-page cache) when it is packed.
     pub fn read<R>(&self, p: usize, f: impl FnOnce(&[RowMeta], &[Cell], &Clusters) -> R) -> R {
+        self.read_styled(p, |meta, cells, clusters, _| f(meta, cells, clusters))
+    }
+
+    /// [`Pages::read`], with the page's style table (index 0, the default,
+    /// may be absent: read styles with [`style_in`]).
+    pub fn read_styled<R>(
+        &self,
+        p: usize,
+        f: impl FnOnce(&[RowMeta], &[Cell], &Clusters, &[Style]) -> R,
+    ) -> R {
         let page = &self.pages[p];
         if !page.is_packed() {
-            return f(&page.meta, &page.cells, &page.clusters);
+            return f(&page.meta, &page.cells, &page.clusters, &page.styles.table);
         }
         let mut cache = self.cache.borrow_mut();
         if cache.as_ref().is_none_or(|c| c.serial != page.serial) {
@@ -1921,6 +2092,7 @@ impl Pages {
                 cells: vec![Cell::default(); self.rows_per_page() * self.cols].into_boxed_slice(),
                 clusters: Clusters::default(),
                 links: HashMap::new(),
+                styles: Vec::new(),
             });
             page.unpack(
                 self.cols,
@@ -1928,12 +2100,23 @@ impl Pages {
                 &mut unpacked.cells,
                 &mut unpacked.clusters,
                 &mut unpacked.links,
+                &mut unpacked.styles,
             );
             unpacked.serial = page.serial;
             *cache = Some(unpacked);
         }
         let unpacked = cache.as_ref().expect("filled");
-        f(&unpacked.meta, &unpacked.cells, &unpacked.clusters)
+        f(
+            &unpacked.meta,
+            &unpacked.cells,
+            &unpacked.clusters,
+            &unpacked.styles,
+        )
+    }
+
+    /// Style `id` of page `p`, packed or not.
+    pub fn style(&self, p: usize, id: u16) -> Style {
+        self.read_styled(p, |_, _, _, styles| style_in(styles, id))
     }
 
     /// The metadata of row `r` of page `p`, packed or not.
@@ -2036,7 +2219,8 @@ impl Pages {
             }
             let cols = self.cols;
             let page = &mut self.pages[self.sealed];
-            let (cells, meta, mut text, clusters) = page.pack(cols, &mut self.scratch);
+            let (cells, meta, mut text, clusters) =
+                page.pack(cols, &mut self.scratch, &mut self.ids_scratch);
             self.packed_bytes += page.stored_bytes();
             if self.spare_dense.len() < 2 {
                 text.clear();
@@ -2252,7 +2436,19 @@ impl Pages {
         let mut map = HashMap::new();
         let page = &mut self.pages[p];
         self.packed_bytes -= page.stored_bytes();
-        page.unpack(cols, &mut meta, &mut cells, &mut clusters, &mut map);
+        let mut styles = Vec::new();
+        page.unpack(
+            cols,
+            &mut meta,
+            &mut cells,
+            &mut clusters,
+            &mut map,
+            &mut styles,
+        );
+        page.styles = StyleTable {
+            table: styles,
+            index: None,
+        };
         page.cells = cells;
         page.meta = meta;
         page.clusters = clusters;
@@ -2277,7 +2473,7 @@ impl Pages {
         if page.is_packed() {
             return;
         }
-        let (cells, meta, _, clusters) = page.pack(cols, &mut self.scratch);
+        let (cells, meta, _, clusters) = page.pack(cols, &mut self.scratch, &mut self.ids_scratch);
         self.packed_bytes += page.stored_bytes();
         if self.spare_dense.len() < 2 {
             let logging = self.budget.is_some();

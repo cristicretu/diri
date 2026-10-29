@@ -171,7 +171,7 @@ impl Core {
 
     pub fn style_of(&self, line: i32, cell: Cell) -> Style {
         let (p, _) = self.pages.locate_line(line);
-        self.pages.page(p).styles.get(cell.style())
+        self.pages.style(p, cell.style())
     }
 
     pub fn wrapped(&self, line: i32) -> bool {
