@@ -27,14 +27,20 @@ final class TerminalView: UIScrollView, UIKeyInput, UITextInputTraits {
     private var lineLayers: [Int: LineLayer] = [:]
     private var pool: [LineLayer] = []
     private let cursorLayer = CALayer()
-    private let canvas = UIView()
+    let canvas = UIView()
     private var following = true
     private var lastOffset: CGFloat = 0
     private var lastOffsetTime: CFTimeInterval = 0
     private var velocity: CGFloat = 0
-    private let padding: CGFloat = 10
+    let padding: CGFloat = 10
     private let overscan = 6
     private lazy var accessory = KeyAccessoryView(terminal: self)
+
+    // Selection state (see TerminalSelection.swift).
+    var selection: TerminalSelection?
+    var selectionAnchor: TerminalSelection.Point?
+    let selectionLayer = CAShapeLayer()
+    var editMenu: UIEditMenuInteraction?
     private lazy var wheelPan = UIPanGestureRecognizer(target: self, action: #selector(wheeled(_:)))
     private var wheelCarry: CGFloat = 0
 
@@ -59,6 +65,7 @@ final class TerminalView: UIScrollView, UIKeyInput, UITextInputTraits {
         canvas.layer.addSublayer(cursorLayer)
 
         addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped)))
+        installSelection()
         addGestureRecognizer(UIPinchGestureRecognizer(target: self, action: #selector(pinched(_:))))
         wheelPan.maximumNumberOfTouches = 1
         wheelPan.isEnabled = false
@@ -77,7 +84,7 @@ final class TerminalView: UIScrollView, UIKeyInput, UITextInputTraits {
 
     // MARK: - Geometry
 
-    private var lineHeight: CGFloat { font.lineHeight }
+    var lineHeight: CGFloat { font.lineHeight }
     /// A line layer's width, whole device pixels: an opaque layer with a
     /// fractional edge leaves an undrawn hairline down the screen.
     private var lineWidth: CGFloat {
@@ -172,6 +179,7 @@ final class TerminalView: UIScrollView, UIKeyInput, UITextInputTraits {
             }
         }
         placeCursor()
+        drawSelection()
         CATransaction.commit()
 
         // Lines-per-second, negative towards history, drives how far ahead
@@ -488,6 +496,11 @@ final class TerminalView: UIScrollView, UIKeyInput, UITextInputTraits {
     var inlinePredictionType: UITextInlinePredictionType { get { .no } set {} }
 
     @objc private func tapped() {
+        // A tap first dismisses a selection, as in any iOS text view.
+        if selection != nil {
+            clearSelection()
+            return
+        }
         if isFirstResponder { return }
         becomeFirstResponder()
     }
@@ -500,6 +513,7 @@ final class TerminalView: UIScrollView, UIKeyInput, UITextInputTraits {
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
         if action == #selector(paste(_:)) { return UIPasteboard.general.hasStrings }
+        if action == #selector(copy(_:)) { return selection != nil }
         return super.canPerformAction(action, withSender: sender)
     }
 
@@ -511,6 +525,7 @@ final class TerminalView: UIScrollView, UIKeyInput, UITextInputTraits {
             UIKeyCommand(title: "Previous Session", action: #selector(commandPrevious), input: "[", modifierFlags: .command),
             UIKeyCommand(title: "Next Session", action: #selector(commandNext), input: "]", modifierFlags: .command),
             UIKeyCommand(title: "Paste", action: #selector(paste(_:)), input: "v", modifierFlags: .command),
+            UIKeyCommand(title: "Copy", action: #selector(copy(_:)), input: "c", modifierFlags: .command),
         ]
         commands.forEach { $0.wantsPriorityOverSystemBehavior = true }
         return commands
@@ -585,7 +600,7 @@ final class TerminalView: UIScrollView, UIKeyInput, UITextInputTraits {
         get {
             let top = max(0, Int((contentOffset.y + adjustedContentInset.top) / lineHeight))
             let coloured = session.buffer.screen.filter(\.isColoured).count
-            return "top \(top) of \(totalLines); coloured \(coloured); cols \(session.buffer.cols); snapshots \(session.snapshots); resumes \(session.resumes); resumed rows \(session.resumedRows); stale \(session.stale)"
+            return "top \(top) of \(totalLines); coloured \(coloured); cols \(session.buffer.cols); snapshots \(session.snapshots); resumes \(session.resumes); resumed rows \(session.resumedRows); stale \(session.stale); selection \(selectedText.map { "[\($0)]" } ?? "none")"
         }
         set {}
     }

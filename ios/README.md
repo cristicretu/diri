@@ -108,6 +108,11 @@ network change (the old socket is often open but dead) and on returning to the
 foreground, otherwise backs off with jitter up to 4 s; 45 s of silence (two
 missed heartbeats) counts as a drop. After 2 s without a frame the screen dims
 and says so, but keeps what it showed, even while the computer is unreachable.
+Long-press selects the word under your finger; keep holding and drag to
+extend it, then Copy, Paste (into the program, bracketed when it asked) or
+Select Screen. A tap clears it; ⌘C copies with a hardware keyboard. In a
+full-screen program that asked for the mouse, a drag sends wheel reports.
+
 `DiriPhoneUITests/TerminalFixtureTests` drives this against `diri-web`'s
 `phone_fixture` (a fake Engine behind a real gateway). A hardware keyboard sends ctrl and option combos, arrows, esc and
 tab; ⌘V pastes (bracketed when the program asked for it), ⌘K switches
@@ -226,8 +231,6 @@ The glyphs, colours and ordering are unchanged.
 
 - **Push notifications when a session needs input.** The highest-value missing
   piece: today you have to open the app to discover that something is waiting.
-- **Mouse reporting and text selection in the terminal.** Taps focus the
-  keyboard; they are not sent to programs that asked for the mouse.
 - **Archived bucket, rename, drag-to-reorder.** The projection already computes
   the archived list and honours a manual order; no UI reaches them.
 
