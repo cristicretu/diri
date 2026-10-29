@@ -46,9 +46,10 @@ impl Sidebar {
         &self,
         row: AnyElement,
         presence: Presence,
+        natural: f32,
         ghost: bool,
     ) -> AnyElement {
-        row_motion::slot(row, presence, self.session_row_height(), ghost)
+        row_motion::slot(row, presence, natural, ghost)
     }
 }
 

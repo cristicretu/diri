@@ -101,6 +101,16 @@ fn read_golden(path: &str) -> BTreeMap<String, BTreeMap<String, String>> {
     golden
 }
 
+/// `vt_workloads::without_history_position`: a snapshot's history position
+/// (how many rows are kept) is compared through the history keys, so the
+/// grid digest leaves it out.
+fn without_history_position(mut text: String) -> String {
+    if let Some(at) = text.rfind(", history: ") {
+        text.replace_range(at..text.len() - " }".len(), "");
+    }
+    text
+}
+
 /// The golden digest's grid, history, cursor and link keys, computed the
 /// way `vt_workloads` computes them, over the v2 state seen through
 /// `HeadlessScreen`. History is compared over the newest `checked` rows.
@@ -119,7 +129,7 @@ fn screen_digest(
     d.insert("bytes_fed".into(), bytes_fed.to_string());
     d.insert(
         "grid_sha256".into(),
-        sha256(format!("{:?}", screen.full_snapshot()).as_bytes()),
+        sha256(without_history_position(format!("{:?}", screen.full_snapshot())).as_bytes()),
     );
     let kept = screen.history_rows();
     d.insert(

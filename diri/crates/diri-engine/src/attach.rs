@@ -50,7 +50,7 @@ impl From<Arc<Mutex<SinkOutput>>> for PublicationOutput {
 }
 impl PublicationOutput {
     /// Whether this sink decodes `terminal-styles-v1`. Preview muxes never do.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn terminal_styles(&self) -> bool {
         self.grid_form() != GridForm::Legacy
     }
@@ -1723,6 +1723,7 @@ mod tests {
             pull_requests: None,
             listening_ports: None,
             foreground_agent: None,
+            foreground_program: None,
             terminal_cwd: None,
             agent_workspace: None,
             note_id: None,

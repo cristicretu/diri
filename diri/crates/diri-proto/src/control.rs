@@ -32,6 +32,7 @@ pub const CWD_MISSING: &str = "cwd_missing";
 pub type JsonValue = Value;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ControlError {
     pub code: String,
     pub message: String,

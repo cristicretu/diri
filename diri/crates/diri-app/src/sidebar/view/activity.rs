@@ -36,15 +36,6 @@ impl Sidebar {
         cx.notify();
     }
 
-    /// How tall a session row is: two lines under the Activity filter.
-    pub(super) fn session_row_height(&self) -> f32 {
-        if self.activity_filter {
-            ACTIVITY_ROW_HEIGHT
-        } else {
-            SIDEBAR_NAV_ROW_HEIGHT
-        }
-    }
-
     /// The sessions the sidebar lists: the store's projection, narrowed by
     /// the typed filter and then by Activity.
     pub(super) fn visible_projection(
