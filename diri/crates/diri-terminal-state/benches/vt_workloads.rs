@@ -53,6 +53,14 @@
 //! commit in the file's header. Captured payloads are matched by SHA-256, so
 //! a different capture has no golden digest and is refused.
 //!
+//! Any PR that changes history retention (how many rows the budget keeps,
+//! or what they hold) must regenerate the golden in the same PR, generated
+//! and kitten sections both, and declare the row delta per workload.
+//! The delta is declared in `DECLARED_HISTORY_ROWS` and the golden is
+//! regenerated at the reference with that declaration: the content of the
+//! rows kept is still checked against the reference, and their number
+//! against the declaration.
+//!
 //! `DIRI_VT_BENCH_WRITE=<dir>` writes the payloads it uses there and exits,
 //! for `diri-engine`'s `vtbench` (the same workloads through Holder and
 //! Engine).
@@ -252,6 +260,19 @@ fn sha256(bytes: &[u8]) -> String {
     hex
 }
 
+/// The visible grid without where history stands (#905's `grid-history-v1`
+/// position, the snapshot's last field). Its origin counts evicted rows, so
+/// it follows retention, which `history_rows_checked` already compares
+/// against the reference or the declared count; a declared retention change
+/// would otherwise change the grid digest too. Snapshots from before #905
+/// have no such field and hash as they always did.
+fn without_history_position(mut text: String) -> String {
+    if let Some(at) = text.rfind(", history: ") {
+        text.replace_range(at..text.len() - " }".len(), "");
+    }
+    text
+}
+
 /// Image anchors name a per-screen store nonce; only the rest must match.
 fn without_store_nonce(text: String) -> String {
     const ANCHOR: &str = "diri-image:";
@@ -268,10 +289,56 @@ fn without_store_nonce(text: String) -> String {
     out
 }
 
-/// History rows compared: all the reference kept. Retention depends only
-/// on the output, not on where reads end, so every row must match.
-fn history_checked(kept: usize) -> usize {
-    kept
+/// History rows the code under test is declared to keep, by golden key
+/// (`"workload payload-sha256"`), where that differs from what the
+/// reference kept.
+///
+/// Retention depends only on the output, not on where reads end, but it does
+/// depend on how well history compresses: a codec change that compresses a
+/// little worse fits fewer rows in the 4 MiB budget. Such a change declares
+/// its count here, as a reviewed behavior change, and the golden is
+/// regenerated at the reference with these declarations: the reference then
+/// hashes only its newest `declared` rows, and every run must keep exactly
+/// `declared` rows whose content matches them. Undeclared payloads keep
+/// exactly what the reference kept. A declaration above what the reference
+/// kept cannot be checked and stops regeneration.
+const DECLARED_HISTORY_ROWS: &[(&str, usize)] = &[
+    // History sealing at the parser's pace (#928): faster LZ skipping.
+    (
+        "ascii 5b1de281ecd8d0f0db1696ae1dbf745069c6ff3815c809f02e31791d50cb131d",
+        62_961,
+    ),
+    (
+        "unicode 33d19ab233c8bb6434f594a1afa41aec58f12bc44005b87e0c059b11ced0033b",
+        53_648,
+    ),
+    // The kitten 0.48 captures.
+    (
+        "ascii af0751e04c0301ae668fb64fee70eb53a45637e32ec2d5999c6367df6d10d515",
+        63_217,
+    ),
+    (
+        "unicode d5c85baa3324d1f35a7ac69f020494d7ec82fd281ceaf72bafa17ae871679c4a",
+        53_648,
+    ),
+];
+
+/// History rows compared: all the reference kept, or the declared count
+/// (see [`DECLARED_HISTORY_ROWS`]).
+fn history_checked(key: &str, kept: usize) -> usize {
+    match DECLARED_HISTORY_ROWS
+        .iter()
+        .find(|(declared, _)| *declared == key)
+    {
+        Some(&(_, rows)) => {
+            assert!(
+                rows <= kept,
+                "{key}: {rows} history rows declared, but the reference kept only {kept}"
+            );
+            rows
+        }
+        None => kept,
+    }
 }
 
 /// Digest key of the per-byte OSC checksum, which timed runs leave off.
@@ -369,19 +436,25 @@ fn digest(
     let screen = &mut run.screen;
     put(
         "grid_sha256",
-        sha256(without_store_nonce(format!("{:?}", screen.full_snapshot())).as_bytes()),
+        sha256(
+            without_history_position(without_store_nonce(format!("{:?}", screen.full_snapshot())))
+                .as_bytes(),
+        ),
     );
     let kept = screen.history_rows();
-    let checked = checked_rows.unwrap_or_else(|| history_checked(kept));
+    let checked =
+        checked_rows.unwrap_or_else(|| history_checked(&format!("{name} {}", sha256(data)), kept));
     if checked_rows.is_none() {
         put("history_rows_reference", kept.to_string());
     }
+    // A run keeps exactly the rows checked: newest-row hashes alone would
+    // pass a run that kept extra, older rows.
     put(
         "history_rows_checked",
-        if kept >= checked {
+        if checked_rows.is_none() || kept == checked {
             checked.to_string()
         } else {
-            format!("{checked} but only {kept} kept")
+            format!("{checked} but {kept} kept")
         },
     );
     // The newest `checked` history rows and the screen, as text with cell

@@ -1692,6 +1692,7 @@ name = "diri-proto"
 version = "0.1.0"
 dependencies = [
  "diri-platform",
+ "schemars",
  "serde",
  "serde_json",
  "sha2 0.11.1",

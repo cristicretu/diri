@@ -50,10 +50,18 @@ impl From<Arc<Mutex<SinkOutput>>> for PublicationOutput {
 }
 impl PublicationOutput {
     /// Whether this sink decodes `terminal-styles-v1`. Preview muxes never do.
+    #[cfg(all(test, unix))]
     fn terminal_styles(&self) -> bool {
+        self.grid_form() != GridForm::Legacy
+    }
+
+    /// The grid encoding this sink decodes. Preview muxes take the legacy one.
+    fn grid_form(&self) -> GridForm {
         match self {
-            Self::Socket(output) => output.lock().is_ok_and(|output| output.terminal_styles),
-            Self::Mux(_) => false,
+            Self::Socket(output) => output
+                .lock()
+                .map_or(GridForm::Legacy, |output| output.grid_form()),
+            Self::Mux(_) => GridForm::Legacy,
         }
     }
 
@@ -100,23 +108,39 @@ pub struct AttachCapabilities {
     /// `terminal-styles-v1`: cursor shape bits and decoration spans. A sink
     /// without it gets the exact pre-styles grid bytes.
     pub terminal_styles: bool,
+    /// `grid-history-v1`: the primary screen's history position on every
+    /// grid. Only with `terminal_styles`; a sink without it gets the exact
+    /// styled bytes from before.
+    pub grid_history: bool,
 }
 
-/// A grid frame for a sink that does or does not decode `terminal-styles-v1`.
+/// The grid encodings a sink may decode, each a superset of the one before.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GridForm {
+    /// Before `terminal-styles-v1`.
+    Legacy,
+    /// `terminal-styles-v1` without `grid-history-v1`.
+    Styled,
+    /// Everything this Engine publishes.
+    Full,
+}
+
+/// A grid frame for a sink that decodes `form`.
 fn grid_frame(
     update: &diri_proto::grid::GridUpdate,
-    styles: bool,
+    form: GridForm,
 ) -> Result<Frame, diri_proto::grid::GridCodecError> {
-    if styles {
-        Frame::grid(update)
-    } else {
-        Frame::grid_without_styles(update)
+    match form {
+        GridForm::Full => Frame::grid(update),
+        GridForm::Styled => Frame::grid_without_history(update),
+        GridForm::Legacy => Frame::grid_without_styles(update),
     }
 }
 
 struct SinkOutput {
     enhanced_keyboard: bool,
     terminal_styles: bool,
+    grid_history: bool,
     preview: bool,
     stream: UnixStream,
     frames: VecDeque<Arc<[u8]>>,
@@ -142,6 +166,7 @@ impl SinkOutput {
         Ok(Self {
             enhanced_keyboard: false,
             terminal_styles: false,
+            grid_history: false,
             preview: false,
             stream,
             frames: VecDeque::new(),
@@ -153,6 +178,14 @@ impl SinkOutput {
             reseedable: false,
             lagging: None,
         })
+    }
+
+    const fn grid_form(&self) -> GridForm {
+        match (self.terminal_styles, self.grid_history) {
+            (false, _) => GridForm::Legacy,
+            (true, false) => GridForm::Styled,
+            (true, true) => GridForm::Full,
+        }
     }
 
     fn enqueue(&mut self, bytes: Arc<[u8]>) -> bool {
@@ -490,6 +523,7 @@ impl AttachHub {
             AttachCapabilities {
                 enhanced_keyboard,
                 terminal_styles: false,
+                grid_history: false,
             },
             reader,
             buffered,
@@ -575,6 +609,7 @@ impl AttachHub {
         };
         output.enhanced_keyboard = enhanced_keyboard;
         output.terminal_styles = capabilities.terminal_styles && !preview;
+        output.grid_history = output.terminal_styles && capabilities.grid_history;
         output.preview = preview;
         // A completed local session whose Engine has since been replaced has
         // no live Session to attach to, but its final terminal may have been
@@ -657,7 +692,7 @@ impl AttachHub {
             if let Some(hook) = self.registration_hook.lock().unwrap().clone() {
                 hook();
             }
-            let Some(grid) = grid_frame(&seed.grid, output.terminal_styles)
+            let Some(grid) = grid_frame(&seed.grid, output.grid_form())
                 .ok()
                 .and_then(|frame| FrameCodec::encode(&frame).ok())
             else {
@@ -802,7 +837,7 @@ impl AttachHub {
         let Some(mut screen) = terminal.screen() else {
             return false;
         };
-        let Ok(grid) = grid_frame(&screen.grid_update(true), output.terminal_styles)
+        let Ok(grid) = grid_frame(&screen.grid_update(true), output.grid_form())
             .ok()
             .and_then(|frame| FrameCodec::encode(&frame).ok())
             .ok_or(())
@@ -1083,19 +1118,24 @@ impl AttachHub {
             session_id,
             sinks,
             frames,
-            (enhanced_modes, None),
+            (enhanced_modes, None, None),
             requires_enhanced,
         );
     }
 
     /// `legacy_grid`, when present, replaces the first frame (the grid) for
-    /// every sink that did not negotiate `terminal-styles-v1`.
+    /// every sink that did not negotiate `terminal-styles-v1`, and
+    /// `styled_grid` for every styled sink without `grid-history-v1`.
     fn enqueue_publication_frames(
         &self,
         session_id: &str,
         sinks: Vec<(u64, PublicationOutput)>,
         frames: &[Arc<[u8]>],
-        (enhanced_modes, legacy_grid): (Option<&EncodedFrame>, Option<&EncodedFrame>),
+        (enhanced_modes, legacy_grid, styled_grid): (
+            Option<&EncodedFrame>,
+            Option<&EncodedFrame>,
+            Option<&EncodedFrame>,
+        ),
         requires_enhanced: bool,
     ) {
         let mut legacy_frames = None;
@@ -1107,12 +1147,14 @@ impl AttachHub {
                         return false;
                     }
                     let enhanced = output.enhanced_keyboard;
-                    let styles = output.terminal_styles;
+                    let form = output.grid_form();
                     frames.iter().enumerate().all(|(index, frame)| {
                         let frame = if enhanced && index + 1 == frames.len() {
                             enhanced_modes.unwrap_or(frame)
-                        } else if index == 0 && !styles {
+                        } else if index == 0 && form == GridForm::Legacy {
                             legacy_grid.unwrap_or(frame)
+                        } else if index == 0 && form == GridForm::Styled {
+                            styled_grid.unwrap_or(frame)
                         } else {
                             frame
                         };
@@ -1197,25 +1239,35 @@ impl AttachHub {
         else {
             return;
         };
-        // Encoded only when some sink cannot read the styled form.
+        // Encoded only when some sink cannot read the full form.
         let mut legacy_grid: Option<Arc<[u8]>> = None;
+        let mut styled_grid: Option<Arc<[u8]>> = None;
         for output in sinks {
             let Ok(mut output) = output.lock() else {
                 continue;
             };
-            let grid = if output.terminal_styles || !seed.grid.has_style_extensions() {
+            let form = output.grid_form();
+            let (needed, variant) = match form {
+                GridForm::Full => (false, &mut legacy_grid),
+                GridForm::Styled => (seed.grid.history.is_some(), &mut styled_grid),
+                GridForm::Legacy => (
+                    seed.grid.has_style_extensions() || seed.grid.history.is_some(),
+                    &mut legacy_grid,
+                ),
+            };
+            let grid = if !needed {
                 Arc::clone(&grid)
-            } else if let Some(legacy) = &legacy_grid {
-                Arc::clone(legacy)
+            } else if let Some(variant) = variant {
+                Arc::clone(variant)
             } else {
-                let Ok(legacy) = Frame::grid_without_styles(&seed.grid)
+                let Ok(bytes) = grid_frame(&seed.grid, form)
                     .map_err(std::io::Error::other)
                     .and_then(|frame| encoded(&frame))
                 else {
                     continue;
                 };
-                legacy_grid = Some(Arc::clone(&legacy));
-                legacy
+                *variant = Some(Arc::clone(&bytes));
+                bytes
             };
             let Ok(modes) = encoded(
                 &Frame::modes_with_keyboard_capability(
@@ -1385,8 +1437,11 @@ impl AttachHub {
             let mut frames: Vec<Frame> = Vec::with_capacity(2);
             let mut enhanced_modes = None;
             // The pre-styles form of `frames[0]`, for sinks that cannot read
-            // the styled one. Built only when the grid carries styles.
+            // the styled one, and the styled form without the history
+            // position. Each is built only when the grid carries what it drops
+            // and some sink needs it.
             let mut legacy_grid = None;
+            let mut styled_grid = None;
             let mut requires_enhanced = false;
             let mut eligible_sinks = Vec::new();
             if let Some((publication, sinks, requires_capability)) = observed {
@@ -1401,14 +1456,24 @@ impl AttachHub {
                     && let Ok(frame) = Frame::grid(&update)
                 {
                     frames.push(frame);
-                    if update.has_style_extensions()
-                        && eligible_sinks
-                            .iter()
-                            .any(|(_, output)| !output.terminal_styles())
-                    {
+                    let forms = || eligible_sinks.iter().map(|(_, output)| output.grid_form());
+                    let styled = update.has_style_extensions();
+                    // Without styles the legacy and styled forms are the same
+                    // bytes, so one extra encoding serves both.
+                    let stripped_for = |form: GridForm| {
+                        form == GridForm::Styled || (form == GridForm::Legacy && !styled)
+                    };
+                    if update.history.is_some() && forms().any(stripped_for) {
+                        styled_grid = Frame::grid_without_history(&update)
+                            .ok()
+                            .and_then(|frame| encoded(&frame).ok());
+                    }
+                    if styled && forms().any(|form| form == GridForm::Legacy) {
                         legacy_grid = Frame::grid_without_styles(&update)
                             .ok()
                             .and_then(|frame| encoded(&frame).ok());
+                    } else if !styled {
+                        legacy_grid.clone_from(&styled_grid);
                     }
                 }
                 // Fresh sinks get their initial modes at seed time; the pump
@@ -1457,7 +1522,11 @@ impl AttachHub {
                     session_id,
                     eligible_sinks,
                     &encoded_frames,
-                    (enhanced_modes.as_ref(), legacy_grid.as_ref()),
+                    (
+                        enhanced_modes.as_ref(),
+                        legacy_grid.as_ref(),
+                        styled_grid.as_ref(),
+                    ),
                     requires_enhanced,
                 );
                 trace_hop!(FrameEnqueued);
@@ -1654,6 +1723,7 @@ mod tests {
             pull_requests: None,
             listening_ports: None,
             foreground_agent: None,
+            foreground_program: None,
             terminal_cwd: None,
             agent_workspace: None,
             note_id: None,
@@ -1922,7 +1992,7 @@ mod tests {
             "fixture",
             sinks,
             std::slice::from_ref(&styled),
-            (None, Some(&plain)),
+            (None, Some(&plain), None),
             false,
         );
         assert!(Arc::ptr_eq(
@@ -1939,6 +2009,64 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!decoded.has_style_extensions());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_positions_reach_only_sinks_that_negotiated_them() {
+        let hub = AttachHub::new();
+        let (legacy, _legacy_reader) = constrained_output();
+        let (mut styled, _styled_reader) = constrained_output();
+        let (mut full, _full_reader) = constrained_output();
+        styled.terminal_styles = true;
+        full.terminal_styles = true;
+        full.grid_history = true;
+        assert_eq!(legacy.grid_form(), GridForm::Legacy);
+        assert_eq!(styled.grid_form(), GridForm::Styled);
+        assert_eq!(full.grid_form(), GridForm::Full);
+        let outputs = [legacy, styled, full].map(|output| Arc::new(Mutex::new(output)));
+        let mut screen = diri_terminal_state::HeadlessScreen::new(8, 2);
+        screen.feed(b"one\r\ntwo\r\nthree");
+        let update = screen.grid_update(true);
+        assert_eq!(update.history.map(|history| history.rows), Some(1));
+        let frames = [
+            Frame::grid_without_styles(&update),
+            Frame::grid_without_history(&update),
+            Frame::grid(&update),
+        ]
+        .map(|frame| encoded(&frame.unwrap()).unwrap());
+        let sinks = outputs
+            .iter()
+            .enumerate()
+            .map(|(id, output)| (id as u64, PublicationOutput::from(Arc::clone(output))))
+            .collect();
+        hub.enqueue_publication_frames(
+            "fixture",
+            sinks,
+            std::slice::from_ref(&frames[2]),
+            (None, Some(&frames[0]), Some(&frames[1])),
+            false,
+        );
+        for (output, frame) in outputs.iter().zip(&frames) {
+            assert!(Arc::ptr_eq(
+                output.lock().unwrap().frames.front().unwrap(),
+                frame
+            ));
+        }
+        let decoded = |bytes: &Arc<[u8]>| {
+            FrameCodec::new().feed(bytes).unwrap()[0]
+                .grid_payload()
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(decoded(&frames[0]).history, None);
+        assert_eq!(decoded(&frames[1]).history, None);
+        assert_eq!(decoded(&frames[2]).history, update.history);
+        // A preview mux reads the legacy form, positions and all stripped.
+        assert_eq!(
+            PublicationOutput::from(Arc::clone(&outputs[0])).grid_form(),
+            GridForm::Legacy
+        );
     }
 
     #[cfg(unix)]

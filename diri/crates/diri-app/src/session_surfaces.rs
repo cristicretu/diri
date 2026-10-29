@@ -1705,6 +1705,7 @@ impl SessionSurfaces {
                                 })
                                 .collect(),
                             cursor_style: Default::default(),
+                            history: None,
                         });
                         Some(element)
                     });
@@ -1990,6 +1991,7 @@ mod tests {
             pull_requests: None,
             listening_ports: None,
             foreground_agent: None,
+            foreground_program: None,
             terminal_cwd: None,
             agent_workspace: None,
             note_id: None,
@@ -2397,6 +2399,7 @@ mod tests {
                         is_full_snapshot: true,
                         changed_rows: vec![],
                         cursor_style: Default::default(),
+                        history: None,
                     };
                     stream
                         .get_mut()

@@ -58,6 +58,8 @@ pub(super) enum WriteAction<'a> {
     Computer,
     /// Open a request in the caller's own API tab (nothing is sent for it).
     ApiRequest,
+    /// Run a non-destructive app window action (split, focus, sidebar...).
+    AppAction,
     TestRun,
     ReportToParent {
         target: &'a str,
@@ -175,6 +177,7 @@ impl<'a> McpPolicy<'a> {
             | WriteAction::Browser
             | WriteAction::Computer
             | WriteAction::ApiRequest
+            | WriteAction::AppAction
             | WriteAction::TestRun => Relation::Unrelated,
             WriteAction::Worktree { repo } => {
                 let project = self
@@ -451,6 +454,7 @@ mod tests {
             pull_requests: None,
             listening_ports: None,
             foreground_agent: None,
+            foreground_program: None,
             terminal_cwd: None,
             agent_workspace: None,
             note_id: None,

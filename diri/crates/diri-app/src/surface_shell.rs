@@ -373,8 +373,20 @@ enum ThemeFileStatus {
     Failed(String),
 }
 
+/// What the recorder's next key does to the command's keys.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ShortcutTarget {
+    /// Becomes the command's only key (the pencil).
+    All,
+    /// Takes the place of this one key (a click on its chip).
+    Key(String),
+    /// Joins the keys the command already has (the plus).
+    Add,
+}
+
 struct ShortcutEditor {
     command: CommandId,
+    target: ShortcutTarget,
     error: Option<String>,
     /// The key just recorded belongs to another command: ↩ replaces, ⇥ swaps.
     clash: Option<crate::commands::ShortcutClash>,
@@ -2325,6 +2337,7 @@ impl UtilitySurfaces {
     fn begin_shortcut_edit(
         &mut self,
         command: CommandId,
+        target: ShortcutTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2347,6 +2360,7 @@ impl UtilitySurfaces {
         });
         self.shortcut_editor = Some(ShortcutEditor {
             command,
+            target,
             error: None,
             clash: None,
             #[cfg(target_os = "macos")]
@@ -2456,7 +2470,26 @@ impl UtilitySurfaces {
         cx: &mut Context<Self>,
     ) {
         let current = self.live_shortcut_overrides();
-        let next = match crate::commands::assign_shortcut(&current, command, &binding, resolution) {
+        let target = self
+            .shortcut_editor
+            .as_ref()
+            .map_or(ShortcutTarget::All, |editor| editor.target.clone());
+        let next = match &target {
+            ShortcutTarget::All => {
+                crate::commands::assign_shortcut(&current, command, &binding, resolution)
+            }
+            ShortcutTarget::Key(old) => crate::commands::add_shortcut(
+                &current,
+                command,
+                &binding,
+                Some(old),
+                resolution,
+            ),
+            ShortcutTarget::Add => {
+                crate::commands::add_shortcut(&current, command, &binding, None, resolution)
+            }
+        };
+        let next = match next {
             Ok(next) => next,
             Err(clash) => {
                 if let Some(editor) = &mut self.shortcut_editor {
@@ -2479,6 +2512,15 @@ impl UtilitySurfaces {
 
     fn unassign_shortcut(&mut self, command: CommandId, cx: &mut Context<Self>) {
         let next = crate::commands::unassign_shortcut(&self.live_shortcut_overrides(), command);
+        if self.save_shortcut_override(command, next, cx) {
+            self.shortcut_editor = None;
+        }
+        cx.notify();
+    }
+
+    fn remove_shortcut_key(&mut self, command: CommandId, key: &str, cx: &mut Context<Self>) {
+        let next =
+            crate::commands::remove_shortcut_key(&self.live_shortcut_overrides(), command, key);
         if self.save_shortcut_override(command, next, cx) {
             self.shortcut_editor = None;
         }
@@ -2528,7 +2570,19 @@ impl UtilitySurfaces {
                 self.shortcut_editor = None;
                 cx.notify();
             }
-            RecorderKey::Remove => self.unassign_shortcut(command, cx),
+            RecorderKey::Remove => match self
+                .shortcut_editor
+                .as_ref()
+                .map(|editor| editor.target.clone())
+            {
+                Some(ShortcutTarget::Key(key)) => self.remove_shortcut_key(command, &key, cx),
+                // Nothing recorded yet to take back: just stop adding.
+                Some(ShortcutTarget::Add) => {
+                    self.shortcut_editor = None;
+                    cx.notify();
+                }
+                _ => self.unassign_shortcut(command, cx),
+            },
             RecorderKey::Reset => self.restore_shortcut(command, cx),
             RecorderKey::Resolve(resolution) => {
                 if let Some(clash) = clash {
@@ -9153,61 +9207,138 @@ fn shortcut_row(
     let assignment = command.shortcut_label_for(overrides);
     let modified = command.is_overridden(overrides);
     let command_id = command.id;
-    let binding_label: SharedString = if editing {
-        t("settings.shortcuts.press_keys").into()
-    } else {
-        assignment
+    let keys = command.effective_keystrokes(overrides);
+    let target = editor
+        .filter(|editor| editor.command == command.id)
+        .map(|editor| editor.target.clone());
+    let several = keys.len() > 1;
+    let detail: SharedString = match (error, &target) {
+        (Some(error), _) => error.to_owned(),
+        (None, Some(ShortcutTarget::Key(_))) if several => {
+            t("settings.shortcuts.key_hint").to_owned()
+        }
+        (None, Some(ShortcutTarget::Add)) => t("settings.shortcuts.add_hint").to_owned(),
+        _ => metadata.description.to_owned(),
+    }
+    .into();
+
+    // One chip per key. A single key reads exactly as before; with several,
+    // each chip edits only its own key.
+    let chip = |slot: usize,
+                label: SharedString,
+                recording: bool,
+                empty: bool,
+                on_click: ShortcutTarget,
+                cx: &mut Context<UtilitySurfaces>| {
+        div()
+            .id(SharedString::from(format!(
+                "shortcut-binding-{}-{slot}",
+                command.stable_id
+            )))
+            .debug_selector({
+                let stable_id = command.stable_id;
+                move || {
+                    if slot == 0 {
+                        format!("SHORTCUT_BINDING_{stable_id}")
+                    } else {
+                        format!("SHORTCUT_BINDING_{stable_id}_{slot}")
+                    }
+                }
+            })
+            .h(px(31.0))
+            .min_w(px(if recording { 96.0 } else { 48.0 }))
+            .px(px(11.0))
+            .rounded(px(Radius::BADGE))
+            .border_1()
+            .border_color(if recording && error.is_some() {
+                Ink::DANGER.alpha(0.60)
+            } else if recording {
+                Palette::CLAY.alpha(0.72)
+            } else {
+                colors.primary.alpha(0.09)
+            })
+            .bg(if recording {
+                Palette::CLAY.alpha(0.10)
+            } else {
+                colors.primary.alpha(0.045)
+            })
+            .flex()
+            .items_center()
+            .justify_center()
+            .font_family(crate::fonts::mono_family())
+            .text_size(px(Typo::ROW.size))
+            .text_color(if empty && !recording {
+                colors.tertiary
+            } else {
+                colors.primary
+            })
+            .cursor_pointer()
+            .hover(move |style| style.bg(colors.primary.alpha(0.08)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.begin_shortcut_edit(command_id, on_click.clone(), window, cx)
+            }))
+            .child(label)
+    };
+    let press_keys = || SharedString::from(t("settings.shortcuts.press_keys").to_owned());
+    let mut chips = div().flex().items_center().gap(px(4.0));
+    if target == Some(ShortcutTarget::All) || (target.is_some() && !several && target != Some(ShortcutTarget::Add)) {
+        chips = chips.child(chip(
+            0,
+            press_keys(),
+            true,
+            false,
+            ShortcutTarget::All,
+            cx,
+        ));
+    } else if keys.is_empty() || !several {
+        let label: SharedString = assignment
             .as_deref()
             .map_or_else(
                 || t("settings.shortcuts.unassigned").to_owned(),
                 spaced_shortcut_label,
             )
-            .into()
-    };
-    let detail: SharedString = error.unwrap_or(metadata.description).to_owned().into();
-
-    let binding = div()
-        .id(SharedString::from(format!(
-            "shortcut-binding-{}",
-            command.stable_id
-        )))
-        .debug_selector({
-            let stable_id = command.stable_id;
-            move || format!("SHORTCUT_BINDING_{stable_id}")
-        })
-        .h(px(31.0))
-        .min_w(px(if editing { 96.0 } else { 48.0 }))
-        .px(px(11.0))
-        .rounded(px(Radius::BADGE))
-        .border_1()
-        .border_color(if error.is_some() {
-            Ink::DANGER.alpha(0.60)
-        } else if editing {
-            Palette::CLAY.alpha(0.72)
-        } else {
-            colors.primary.alpha(0.09)
-        })
-        .bg(if editing {
-            Palette::CLAY.alpha(0.10)
-        } else {
-            colors.primary.alpha(0.045)
-        })
-        .flex()
-        .items_center()
-        .justify_center()
-        .font_family(crate::fonts::mono_family())
-        .text_size(px(Typo::ROW.size))
-        .text_color(if assignment.is_none() && !editing {
-            colors.tertiary
-        } else {
-            colors.primary
-        })
-        .cursor_pointer()
-        .hover(move |style| style.bg(colors.primary.alpha(0.08)))
-        .on_click(cx.listener(move |this, _, window, cx| {
-            this.begin_shortcut_edit(command_id, window, cx);
-        }))
-        .child(binding_label);
+            .into();
+        chips = chips.child(chip(
+            0,
+            label,
+            false,
+            assignment.is_none(),
+            ShortcutTarget::All,
+            cx,
+        ));
+    } else {
+        for (slot, key) in keys.iter().enumerate() {
+            let recording = target.as_ref() == Some(&ShortcutTarget::Key(key.clone()));
+            let label: SharedString = if recording {
+                press_keys()
+            } else {
+                spaced_shortcut_label(&crate::commands::keystroke_label(key)).into()
+            };
+            let key = key.clone();
+            chips = chips.child(chip(
+                slot,
+                label,
+                recording,
+                false,
+                ShortcutTarget::Key(key),
+                cx,
+            ));
+        }
+    }
+    if target == Some(ShortcutTarget::Add) {
+        chips = chips.child(chip(
+            keys.len(),
+            press_keys(),
+            true,
+            false,
+            ShortcutTarget::Add,
+            cx,
+        ));
+    }
+    let binding = chips;
+    // A command with a key can take another; the global hotkey is one key.
+    let can_add = !keys.is_empty() && command.id != CommandId::ShowApp && !editing;
+    let row_group = SharedString::from(format!("shortcut-row-group-{}", command.stable_id));
 
     let mut actions = div()
         .flex_none()
@@ -9215,6 +9346,32 @@ fn shortcut_row(
         .items_center()
         .gap(px(4.0))
         .child(binding)
+        .when(can_add, |actions| {
+            actions.child(
+                div()
+                    .id(SharedString::from(format!("add-shortcut-{}", command.stable_id)))
+                    .debug_selector({
+                        let stable_id = command.stable_id;
+                        move || format!("ADD_SHORTCUT_{stable_id}")
+                    })
+                    .size(px(26.0))
+                    .rounded(px(Radius::BADGE))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(colors.primary.alpha(0.07)))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.begin_shortcut_edit(command_id, ShortcutTarget::Add, window, cx);
+                    }))
+                    // Shown on the row's hover, so the page keeps one
+                    // column of controls at rest.
+                    .opacity(0.0)
+                    .group_hover(row_group.clone(), |style| style.opacity(1.0))
+                    .child(sf_symbol("plus", 10.0, colors.tertiary)),
+            )
+        })
         .child(
             div()
                 .id(SharedString::from(format!(
@@ -9233,7 +9390,7 @@ fn shortcut_row(
                         this.shortcut_editor = None;
                         cx.notify();
                     } else {
-                        this.begin_shortcut_edit(command_id, window, cx);
+                        this.begin_shortcut_edit(command_id, ShortcutTarget::All, window, cx);
                     }
                 }))
                 .child(sf_symbol(
@@ -9307,6 +9464,7 @@ fn shortcut_row(
             let stable_id = command.stable_id;
             move || format!("SHORTCUT_ROW_{stable_id}")
         })
+        .group(row_group)
         .min_h(px(58.0))
         .px(px(12.0))
         .py(px(8.0))
@@ -10652,6 +10810,44 @@ mod tests {
                 });
             })
             .expect("seed computer use");
+            cx.run_until_parked();
+        }
+        // `DIRI_VISUAL_SHORTCUT_KEYS=1` gives New Session and Toggle Sidebar a
+        // second key; `=add` also opens the add-a-key recorder on the first.
+        if let Ok(mode) = std::env::var("DIRI_VISUAL_SHORTCUT_KEYS") {
+            cx.update_window(window.into(), |root, window, cx| {
+                let harness = root
+                    .downcast::<SettingsWorkbenchHarness>()
+                    .expect("harness");
+                let surfaces = harness.read(cx).surfaces.clone();
+                surfaces.update(cx, |surfaces, cx| {
+                    let mut overrides = crate::commands::ShortcutOverrides::new();
+                    for (id, key) in [
+                        (CommandId::OpenLauncher, "cmd-shift-y"),
+                        (CommandId::ToggleSidebar, "cmd-alt-y"),
+                    ] {
+                        overrides = crate::commands::add_shortcut(
+                            &overrides,
+                            id,
+                            &crate::commands::test_chords(key),
+                            None,
+                            None,
+                        )
+                        .expect("free key");
+                    }
+                    surfaces.update_prefs(move |prefs| prefs.shortcut_overrides = overrides);
+                    if mode == "add" {
+                        surfaces.begin_shortcut_edit(
+                            CommandId::OpenLauncher,
+                            ShortcutTarget::Add,
+                            window,
+                            cx,
+                        );
+                    }
+                    cx.notify();
+                });
+            })
+            .expect("seed shortcut keys");
             cx.run_until_parked();
         }
         // `DIRI_VISUAL_PRIVACY=on|off` seeds Settings > Privacy
@@ -13348,6 +13544,65 @@ mod tests {
         cx.update(|_, cx| crate::motion::set_system(true, cx));
         assert!(cx.update(|_, cx| cx.reduce_motion()));
         cx.update(|_, cx| crate::motion::set_system(false, cx));
+    }
+
+    #[gpui::test]
+    fn shortcut_page_adds_a_second_key_and_edits_each_key_alone(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::Shortcuts, cx);
+        });
+        let keys = |cx: &mut gpui::VisualTestContext| {
+            surfaces.read_with(cx, |surfaces, _| {
+                crate::commands::command(CommandId::OpenLauncher)
+                    .effective_keystrokes(&surfaces.prefs.shortcut_overrides)
+            })
+        };
+        let default = keys(cx);
+        assert_eq!(default.len(), 1);
+
+        let add = cx
+            .debug_bounds("ADD_SHORTCUT_open-launcher")
+            .expect("a bound command offers another key");
+        cx.simulate_click(add.center(), Modifiers::default());
+        let second = crate::commands::test_chords("cmd-shift-y");
+        cx.simulate_keystrokes(&second);
+        assert_eq!(keys(cx), vec![default[0].clone(), second.clone()]);
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(surfaces.shortcut_editor.is_none());
+            assert!(!surfaces.prefs.shortcut_overrides.contains_key("open-launcher"));
+        });
+        // Each key is its own chip now.
+        assert!(cx.debug_bounds("SHORTCUT_BINDING_open-launcher_1").is_some());
+
+        // Editing the second chip replaces only that key.
+        let chip = cx
+            .debug_bounds("SHORTCUT_BINDING_open-launcher_1")
+            .expect("second key chip");
+        cx.simulate_click(chip.center(), Modifiers::default());
+        let third = crate::commands::test_chords("cmd-shift-u");
+        cx.simulate_keystrokes(&third);
+        assert_eq!(keys(cx), vec![default[0].clone(), third.clone()]);
+
+        // ⌫ on the first chip removes just that one.
+        let chip = cx
+            .debug_bounds("SHORTCUT_BINDING_open-launcher")
+            .expect("first key chip");
+        cx.simulate_click(chip.center(), Modifiers::default());
+        cx.simulate_keystrokes("backspace");
+        assert_eq!(keys(cx), vec![third]);
+        assert!(cx.debug_bounds("SHORTCUT_BINDING_open-launcher_1").is_none());
+
+        // Restore brings back the default alone.
+        let restore = cx
+            .debug_bounds("RESTORE_SHORTCUT_open-launcher")
+            .expect("modified shortcut should offer restore");
+        cx.simulate_click(restore.center(), Modifiers::default());
+        assert_eq!(keys(cx), default);
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(surfaces.prefs.shortcut_overrides.is_empty());
+        });
     }
 
     #[gpui::test]

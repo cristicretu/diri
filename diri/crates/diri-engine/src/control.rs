@@ -29,6 +29,7 @@ mod account_overview;
 mod account_switch;
 mod agent_relaunch;
 mod agent_sign_in;
+mod app_actions;
 mod claude_accounts;
 mod codex_accounts;
 mod hook_queue;
@@ -233,6 +234,8 @@ pub struct ControlServer {
     /// notes directory (tests pin a temporary one).
     notes_dir: Option<PathBuf>,
     scheduler: Arc<schedules::Scheduler>,
+    /// The connected app's exported actions and the requests waiting on it.
+    app_actions: Arc<app_actions::AppActionHub>,
 }
 
 /// Where injection files live and which CLI they point at. Present, spawns
@@ -361,6 +364,7 @@ impl ControlServer {
             phone_reads_aloud: std::sync::atomic::AtomicBool::new(false),
             notes_dir: None,
             scheduler: Arc::new(schedules::Scheduler::default()),
+            app_actions: Arc::default(),
         }
     }
 
@@ -850,6 +854,9 @@ impl ControlServer {
         diri_telemetry::count("engine.connections", 1);
         let mut reader = BufReader::new(stream.try_clone()?);
         let writer = Arc::new(Mutex::new(stream));
+        // Whatever ends this connection, an app that published actions on it
+        // stops being the performer.
+        let _performer = self.app_actions.guard(&writer);
         let mut subscription: Option<SubscriptionHandle> = None;
 
         let mut first = true;
@@ -942,6 +949,7 @@ impl ControlServer {
                         crate::attach::AttachCapabilities {
                             enhanced_keyboard: attach.enhanced_keyboard,
                             terminal_styles: attach.terminal_styles,
+                            grid_history: attach.grid_history,
                         },
                         reader.into_inner(),
                         buffered,
@@ -987,6 +995,18 @@ impl ControlServer {
                 })
             }
             ControlMessage::Request { id, method, params }
+                if method == Method::APP_ACTIONS_PUBLISH || method == Method::APP_REPLY =>
+            {
+                // Both are about this connection: it becomes the performer,
+                // and only the performer may answer.
+                let result = if method == Method::APP_ACTIONS_PUBLISH {
+                    self.app_actions.publish(params, writer)
+                } else {
+                    self.app_actions.reply(params, writer)
+                };
+                Some(ControlMessage::Response { id, result })
+            }
+            ControlMessage::Request { id, method, params }
                 if matches!(
                     method.as_str(),
                     Method::SESSION_SPAWN
@@ -1022,6 +1042,7 @@ impl ControlServer {
                         | Method::TELEMETRY_UPLOAD_NOW
                         | Method::COMPUTER_STATUS
                         | Method::COMPUTER_SETUP
+                        | Method::APP_PERFORM
                 ) || ((method == Method::AGENT_READINESS
                     || method == Method::AGENT_CONFIGURE)
                     && params
@@ -1348,7 +1369,7 @@ impl ControlServer {
             Method::WORKTREE_SCAN => encode(&self.worktree_scan_page(decode(params)?)?),
             Method::WORKTREE_OVERVIEW => self.worktree_overview(),
             Method::TEST_RUN => self.browser_call("run", params),
-            "browser.act" => self.browser_call("browser", params),
+            Method::BROWSER_ACT => self.browser_call("browser", params),
             Method::COMPUTER_ACT => self.computer_act(params),
             Method::COMPUTER_STATUS => {
                 let p: diri_proto::ComputerStatusParams = decode(params)?;
@@ -1403,6 +1424,16 @@ impl ControlServer {
             Method::GOVERNOR_CONFIGURE => self.governor_configure(params),
             Method::TERMINAL_CONFIGURE => self.terminal_configure(params),
             Method::CLIENT_SET_ACTIVE => self.client_set_active(params),
+            Method::APP_ACTIONS_LIST => encode(&self.app_actions.list()),
+            Method::APP_PERFORM => self.app_actions.perform(params),
+            Method::API_LIST => encode(&self.app_actions.api_list()),
+            Method::API_DESCRIBE => self.app_actions.api_describe(params),
+            Method::API_LLMS => encode(&self.app_actions.api_llms()),
+            Method::APP_ACTIONS_PUBLISH | Method::APP_REPLY | Method::EVENTS_SUBSCRIBE => {
+                Err(ControlError::bad_request(format!(
+                    "{method} is answered per connection, not dispatched"
+                )))
+            }
             other => Err(ControlError::not_found(format!(
                 "method {other:?} is not implemented by this engine yet"
             ))),
@@ -3109,24 +3140,29 @@ impl ControlServer {
     }
 
     fn session_read_screen(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
-        let p: diri_proto::SessionIdParams = decode(params)?;
+        let p: diri_proto::ReadScreenParams = decode(params)?;
+        let options = diri_terminal_state::TextOptions {
+            unwrap: p.unwrap,
+            ansi: p.ansi,
+            scrollback: p.scrollback,
+        };
         {
             let registry = self.registry.lock().map_err(poisoned)?;
             if let Some(session) = registry.get(&p.session_id.0) {
                 let (cols, rows) = session.screen_size();
                 return encode(&diri_proto::ReadScreenResult {
-                    text: session.screen_lines().join("\n"),
+                    text: session.screen_text(options).join("\n"),
                     cols: cols as i64,
                     rows: rows as i64,
                 });
             }
         }
-        let screen = self
+        let mut screen = self
             .completed_terminal_screen(&p.session_id.0)?
             .ok_or_else(|| self.no_retained_terminal(&p.session_id.0))?;
         let (cols, rows) = screen.size();
         encode(&diri_proto::ReadScreenResult {
-            text: screen.lines().join("\n"),
+            text: screen.text_lines(options).join("\n"),
             cols: cols as i64,
             rows: rows as i64,
         })
@@ -4266,8 +4302,7 @@ impl ControlServer {
         record.parent = Some(p.parent.clone().unwrap_or_else(|| source.id.clone()));
         record.host = source.host.clone();
         record.remote_persistence = remote_persistence;
-        record.title = format!("Fork of {}", source.title);
-        record.title_source = diri_proto::TitleSource::DirijorAssigned;
+        crate::registry::name_fork(&mut record, &source.title);
 
         if spec.remote.is_some() {
             self.spawn_session_unlocked(spec, Some(record))?;
@@ -5796,6 +5831,7 @@ pub(crate) fn new_record(id: &str, kind: &str, cwd: &str) -> diri_proto::Session
         pull_requests: None,
         listening_ports: None,
         foreground_agent: None,
+        foreground_program: None,
         terminal_cwd: None,
         agent_workspace: None,
         note_id: None,
@@ -8191,6 +8227,7 @@ mod tests {
             pull_requests: None,
             listening_ports: None,
             foreground_agent: None,
+            foreground_program: None,
             terminal_cwd: None,
             agent_workspace: None,
             note_id: None,
@@ -8809,6 +8846,7 @@ mod tests {
         let key = crate::completed_terminal::CompletedRunKey::bind(&record, child, 10).unwrap();
         let mut screen = diri_terminal_state::HeadlessScreen::new(40, 4);
         screen.feed(b"line one\r\nline two\r\nline three\r\nline four\r\nline five");
+        screen.feed(b"\r\nhttps://example.com/a/very/long/path/that/wraps.json");
         let checkpoint = crate::checkpoint::ScreenCheckpoint {
             keyboard_snapshot: screen.keyboard_snapshot(),
             keyboard: Some(screen.keyboard_state()),
@@ -8854,6 +8892,26 @@ mod tests {
         assert!(
             result["text"].as_str().unwrap().contains("line five"),
             "{result}"
+        );
+        // The wrap survives the retained checkpoint: an unwrapped read hands
+        // the URL over whole, and scrollback reaches the rows above.
+        assert!(
+            !result["text"]
+                .as_str()
+                .unwrap()
+                .contains("https://example.com/a/very/long/path/that/wraps.json"),
+            "{result}"
+        );
+        let unwrapped = ok_of(call(
+            &server,
+            "session.read_screen",
+            Some(json!({ "sessionID": "finished", "unwrap": true, "scrollback": true })),
+        ));
+        assert_eq!(
+            unwrapped["text"],
+            "line one\nline two\nline three\nline four\nline five\n\
+             https://example.com/a/very/long/path/that/wraps.json",
+            "{unwrapped}"
         );
         let scrollback = ok_of(call(
             &server,
@@ -9491,6 +9549,7 @@ mod tests {
                     diri_proto::grid::ChangedRow::new(1, row),
                 ],
                 cursor_style: Default::default(),
+                history: None,
             },
             marker_buffer: Vec::new(),
             alt_screen: false,

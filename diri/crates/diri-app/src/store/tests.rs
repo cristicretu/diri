@@ -65,6 +65,7 @@ pub(super) fn session(value: &str, project: &str, created: f64) -> SessionRecord
         pull_requests: None,
         listening_ports: None,
         foreground_agent: None,
+        foreground_program: None,
         terminal_cwd: None,
         agent_workspace: None,
         note_id: None,
@@ -1233,9 +1234,13 @@ fn exited_parent_with_terminal(terminal_running: bool) -> Vec<SessionRecord> {
     let mut terminal = session("terminal", "p", 1.0);
     terminal.kind = AgentKind::SHELL;
     terminal.parent = Some(id("parent"));
-    if !terminal_running {
-        terminal.status = exit;
-    }
+    // A shell at its prompt closes without asking (#940); "running" means a
+    // program is executing in it, which is what the confirmation guards.
+    terminal.status = if terminal_running {
+        SessionStatus::Working
+    } else {
+        exit
+    };
     vec![parent, terminal]
 }
 
@@ -4969,4 +4974,122 @@ fn recorded_shortcuts_persist_across_a_restart() {
             .shortcut_overrides
             .contains_key(command(CommandId::ToggleInspector).stable_id)
     );
+}
+
+#[test]
+fn an_agents_app_action_is_named_by_the_actions_own_title() {
+    let mut agent = session("fix-auth", "p", 1.0);
+    agent.title_source = TitleSource::UserRename;
+    let (mut store, mut effects) = hydrated(
+        vec![agent.clone()],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+    let ran = |command: &str, seq: u64| EventEnvelope {
+        name: diri_proto::EventName::AGENT_ACTION.into(),
+        params: serde_json::json!({ "sessionID": agent.id.0, "action": "app_action", "command": command }),
+        seq,
+    };
+    store.handle_event(ran("toggle-sidebar", 2));
+    // An action this build does not export, or one with no name, is silent.
+    store.handle_event(ran("terminal-paste", 3));
+    store.handle_event(EventEnvelope {
+        name: diri_proto::EventName::AGENT_ACTION.into(),
+        params: serde_json::json!({ "sessionID": agent.id.0, "action": "app_action" }),
+        seq: 4,
+    });
+    let shown: Vec<String> = drain(&mut effects)
+        .into_iter()
+        .filter_map(|effect| match effect {
+            StoreEffect::StatusTransition(transition) => transition.in_app_banner,
+            _ => None,
+        })
+        .map(|toast| toast.message.to_string())
+        .collect();
+    assert_eq!(shown, vec!["fix-auth: Toggle Navigation Bar".to_owned()]);
+}
+
+#[test]
+fn an_app_action_runs_in_the_window_showing_its_agent_else_the_focused_one() {
+    let agent = session("agent", "p", 1.0);
+    let other = session("other", "p", 2.0);
+    let (store, mut effects) = hydrated(
+        vec![agent.clone(), other.clone()],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    let canonical = Arc::new(std::sync::RwLock::new(store));
+    let showing_agent = super::WindowStore::new(canonical.clone(), Some(agent.id.clone()));
+    let focused = super::WindowStore::new(canonical.clone(), Some(other.id.clone()));
+    focused.write().unwrap().set_active(true);
+    drain(&mut effects);
+    let request = |id: u64, actor: Option<&SessionId>| EventEnvelope {
+        name: diri_proto::EventName::APP_PERFORM_REQUESTED.into(),
+        params: serde_json::json!({
+            "requestId": id,
+            "action": "toggle-sidebar",
+            "args": {},
+            "actor": actor.map(|actor| actor.0.clone()),
+        }),
+        seq: 0,
+    };
+    {
+        let mut store = canonical.write().unwrap();
+        // Queued only: an event never changes what the sidebar shows.
+        assert!(!store.handle_event(request(1, Some(&agent.id))));
+        store.handle_event(request(2, None));
+        store.handle_event(request(3, Some(&SessionId::new("s_unknown"))));
+        assert!(store.has_pending_ui_request());
+    }
+    let ids = |window: &super::WindowStore| -> Vec<u64> {
+        window
+            .take_app_performs()
+            .into_iter()
+            .map(|request| request.request_id)
+            .collect()
+    };
+    assert_eq!(ids(&showing_agent), vec![1]);
+    assert_eq!(ids(&focused), vec![2, 3]);
+    // Each request runs once.
+    assert!(ids(&showing_agent).is_empty());
+    assert!(ids(&focused).is_empty());
+
+    // The window's answer goes back to the Engine.
+    canonical
+        .write()
+        .unwrap()
+        .reply_app_perform(1, Ok(serde_json::json!({"dispatched": "toggle-sidebar"})));
+    let replies: Vec<_> = drain(&mut effects)
+        .into_iter()
+        .filter_map(|effect| match effect {
+            StoreEffect::AppReply(reply) => Some(reply),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].request_id, 1);
+    assert!(replies[0].error.is_none());
+}
+
+#[test]
+fn a_flood_of_app_actions_is_bounded_and_the_dropped_ones_are_answered() {
+    let (mut store, mut effects) = hydrated(vec![], vec![], Prefs::default());
+    drain(&mut effects);
+    for id in 1..=20 {
+        store.handle_event(EventEnvelope {
+            name: diri_proto::EventName::APP_PERFORM_REQUESTED.into(),
+            params: serde_json::json!({"requestId": id, "action": "toggle-sidebar"}),
+            seq: 0,
+        });
+    }
+    assert_eq!(store.pending_app_performs.len(), 16);
+    let refused: Vec<u64> = drain(&mut effects)
+        .into_iter()
+        .filter_map(|effect| match effect {
+            StoreEffect::AppReply(reply) if reply.error.is_some() => Some(reply.request_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(refused, vec![1, 2, 3, 4]);
 }

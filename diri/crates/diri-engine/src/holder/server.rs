@@ -2626,6 +2626,7 @@ mod tests {
     }
 
     /// Reads every byte a subscriber is sent until `until` appears.
+    #[cfg(target_os = "macos")]
     fn read_stream_until(stream: &mut crate::holder::HolderOutputStream, until: &[u8]) -> Vec<u8> {
         let mut received = Vec::new();
         let mut run = Vec::new();

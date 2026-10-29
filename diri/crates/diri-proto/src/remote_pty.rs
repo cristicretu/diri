@@ -18,7 +18,7 @@ use crate::grid::{GridCodecError, GridUpdate};
 use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 22;
+pub const PROTOCOL_MINOR: u16 = 23;
 /// `list-dir-v1`: the Helper lists one directory level resolved against the
 /// session child's live working directory. Minors 19 and 20 belong to
 /// `query-replies-v1` and `kitty-keyboard-v1`.
@@ -26,6 +26,8 @@ pub const LIST_DIR_PROTOCOL_MINOR: u16 = 21;
 /// Minors 19-21 belong to `query-replies-v1`, `kitty-keyboard-v1` and
 /// `list-dir-v1`; clearing is negotiated by name like every capability.
 pub const TERMINAL_CLEAR_PROTOCOL_MINOR: u16 = 22;
+/// `grid-history-v1`: grids carry the primary screen's history position.
+pub const GRID_HISTORY_PROTOCOL_MINOR: u16 = 23;
 pub const GRID_RESUME_PROTOCOL_MINOR: u16 = 17;
 /// Minor 17 belongs to `grid-resume-v1`; styles are negotiated by name.
 pub const TERMINAL_STYLES_PROTOCOL_MINOR: u16 = 18;
@@ -167,6 +169,11 @@ pub enum RemoteCapability {
     /// `InputModes` as before.
     #[serde(rename = "kitty-keyboard-v1")]
     KittyKeyboard,
+    /// Every primary-screen grid carries the history position
+    /// ([`crate::grid::GridHistory`]), so a client can keep a selection on
+    /// text that scrolls into history. Only with `terminal-styles-v1`.
+    #[serde(rename = "grid-history-v1")]
+    GridHistory,
     IncrementalGrid,
     ProcessExit,
     Signal,
@@ -220,6 +227,7 @@ impl RemoteCapability {
             Self::TerminalStyles => "terminal-styles-v1",
             Self::QueryReplies => "query-replies-v1",
             Self::KittyKeyboard => "kitty-keyboard-v1",
+            Self::GridHistory => "grid-history-v1",
             Self::FullSnapshot => "full-snapshot",
             Self::IncrementalGrid => "incremental-grid",
             Self::ProcessExit => "process-exit",
@@ -293,6 +301,7 @@ pub const ANNOTATED_HOLDER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::GridResume,
     RemoteCapability::TerminalStyles,
     RemoteCapability::QueryReplies,
+    RemoteCapability::GridHistory,
 ];
 pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::ProcessFacts,
@@ -320,6 +329,7 @@ pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::GridResume,
     RemoteCapability::TerminalStyles,
     RemoteCapability::ListDir,
+    RemoteCapability::GridHistory,
 ];
 
 /// Authentication bearer shared only by the local Engine and one Holder.
@@ -780,6 +790,7 @@ impl DirectoryListRequest {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum DirectoryListMode {
     #[default]
     Directories,
@@ -2288,6 +2299,7 @@ mod tests {
                 is_full_snapshot: true,
                 changed_rows: vec![ChangedRow::new(0, vec![GridCell::BLANK; 2])],
                 cursor_style: Default::default(),
+                history: None,
             },
         }
     }
@@ -3092,6 +3104,26 @@ mod usage_tests {
             }],
         };
         assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn grid_history_is_an_optional_minor_23_capability() {
+        const {
+            assert!(GRID_HISTORY_PROTOCOL_MINOR == PROTOCOL_MINOR);
+            assert!(GRID_HISTORY_PROTOCOL_MINOR > TERMINAL_STYLES_PROTOCOL_MINOR);
+        }
+        assert_eq!(
+            serde_json::to_string(&RemoteCapability::GridHistory).unwrap(),
+            "\"grid-history-v1\""
+        );
+        assert_eq!(RemoteCapability::GridHistory.wire_name(), "grid-history-v1");
+        assert!(!PHASE_ONE_HOLDER_CAPABILITIES.contains(&RemoteCapability::GridHistory));
+        assert!(ANNOTATED_HOLDER_CAPABILITIES.contains(&RemoteCapability::GridHistory));
+        // An older peer reads the name as a capability it does not know.
+        assert_eq!(
+            serde_json::from_str::<RemoteCapability>("\"grid-history-v2\"").unwrap(),
+            RemoteCapability::Unknown
+        );
     }
 
     #[test]

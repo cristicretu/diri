@@ -35,6 +35,8 @@ pub(in crate::sidebar) struct StripTabProps {
     pub(super) id: SessionId,
     pub(super) title: String,
     pub(super) kind: ProtoAgentKind,
+    /// A terminal's program glyph; see `session_presentation::program_glyph`.
+    pub(super) glyph: Option<diri_ui::IconName>,
     pub(super) active: bool,
     /// ⌘1–⌘8, then ⌘9 for the last tab.
     pub(super) rank: Option<usize>,
@@ -56,6 +58,10 @@ pub(in crate::sidebar) struct StripTabProps {
     pub(super) settling: bool,
     /// A terminal's directory, shown when the pointer rests on its tab.
     pub(super) location: Option<String>,
+    /// The question the tab waits on. The strip has no room for a second
+    /// line, so the tab keeps its title and its status mark, and the
+    /// question shows when the pointer rests on it.
+    pub(super) question: Option<String>,
     /// The fraction of the hover fill a tab the pointer just left still
     /// wears; it changes each frame of the fade (see `hover_linger`).
     pub(super) hover_linger: f32,
@@ -131,10 +137,9 @@ impl Sidebar {
         };
         StripTabProps {
             id: id.clone(),
-            // A tab waiting on a named question shows the question.
-            title: crate::session_presentation::blocker_line(session)
-                .unwrap_or_else(|| display_title(session)),
+            title: display_title(session),
             kind: session.effective_kind().clone(),
+            glyph: crate::session_presentation::program_glyph(session),
             active,
             rank,
             state,
@@ -153,6 +158,7 @@ impl Sidebar {
             shift,
             settling: self.settling_title(id, 0.0).is_some(),
             location: crate::switcher::terminal_location(session),
+            question: crate::session_presentation::blocker_line(session),
             hover_linger: if active {
                 0.0
             } else {
