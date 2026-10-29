@@ -219,7 +219,7 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
         ),
         ToolDefinition::new(
             "read_output",
-            "Read what a session produced. last_message (best for results) returns the Agent's final answer from its transcript; transcript returns the last N turns; since returns only terminal lines added after cursor (pass back the returned cursor next time); screen/tail return the rendered screen. Transcript modes fall back to the screen tail when a session has no readable transcript (remote, shells, other agents).",
+            "Read what a session produced. last_message (best for results) returns the Agent's final answer from its transcript; transcript returns the last N turns; since returns only terminal lines added after cursor (pass back the returned cursor next time); screen/tail return the rendered screen, with rows the terminal soft-wrapped rejoined into the line the program wrote so URLs, paths and JSON arrive whole (unwrap:false for one line per screen row). Transcript modes fall back to the screen tail when a session has no readable transcript (remote, shells, other agents).",
             json!({
                 "type": "object",
                 "properties": {
@@ -227,7 +227,8 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
                     "mode": {"type": "string", "enum": ["screen", "tail", "last_message", "transcript", "since"]},
                     "lines": {"type": "number", "default": 50},
                     "turns": {"type": "number", "default": 6, "minimum": 1, "maximum": 100},
-                    "cursor": {"type": "number", "minimum": 0}
+                    "cursor": {"type": "number", "minimum": 0},
+                    "unwrap": {"type": "boolean", "default": true}
                 },
                 "required": ["session_id"]
             }),

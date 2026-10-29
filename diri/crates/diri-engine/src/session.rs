@@ -2671,6 +2671,16 @@ impl Session {
         self.shared.screen.lock().expect("screen").lines()
     }
 
+    /// The screen as text for a reader (`session.read_screen`); see
+    /// [`diri_terminal_state::HeadlessScreen::text_lines`].
+    pub fn screen_text(&self, options: diri_terminal_state::TextOptions) -> Vec<String> {
+        self.shared
+            .screen
+            .lock()
+            .expect("screen")
+            .text_lines(options)
+    }
+
     /// The verified child birth and Holder epoch this Session was bound to
     /// at launch or adoption, if the Holder provided them. Local held
     /// sessions only; never refreshed from a later inspection.

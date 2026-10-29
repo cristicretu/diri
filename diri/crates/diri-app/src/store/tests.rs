@@ -65,6 +65,7 @@ pub(super) fn session(value: &str, project: &str, created: f64) -> SessionRecord
         pull_requests: None,
         listening_ports: None,
         foreground_agent: None,
+        foreground_program: None,
         terminal_cwd: None,
         agent_workspace: None,
         note_id: None,
@@ -1233,9 +1234,13 @@ fn exited_parent_with_terminal(terminal_running: bool) -> Vec<SessionRecord> {
     let mut terminal = session("terminal", "p", 1.0);
     terminal.kind = AgentKind::SHELL;
     terminal.parent = Some(id("parent"));
-    if !terminal_running {
-        terminal.status = exit;
-    }
+    // A shell at its prompt closes without asking (#940); "running" means a
+    // program is executing in it, which is what the confirmation guards.
+    terminal.status = if terminal_running {
+        SessionStatus::Working
+    } else {
+        exit
+    };
     vec![parent, terminal]
 }
 
