@@ -26,6 +26,10 @@
 //!   History survives an Engine restart through the screen checkpoint, as
 //!   before; the swap is a memory extension, never a recovery source.
 
+// Paging out is Unix-only; on other platforms the swap stays a no-op stub
+// and the sealing, staging and file helpers are compiled but unused.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports, unused_variables))]
+
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
