@@ -6102,7 +6102,7 @@ impl Sidebar {
         } else {
             (self.update.summary(), None)
         };
-        let mut row = account_menu_item("account-version", label, false, trailing, colors)
+        let mut row = account_menu_item("account-version", label, None, trailing, colors)
             .when(unsupported, |row| row.text_color(colors.tertiary));
         if let Some(command) = command {
             row = row
@@ -6153,17 +6153,8 @@ impl Sidebar {
                     .h(px(ACCOUNT_MENU_ACTION_ROW_HEIGHT + 4.0))
                     .flex()
                     .items_center()
-                    .gap(px(6.0))
-                    // Centred on the check column, so the name lines up with
-                    // the items below even though the avatar is a little wider.
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(ACCOUNT_MENU_CHECK_COLUMN))
-                            .flex()
-                            .justify_center()
-                            .child(account_avatar(&account_label, 18.0, colors)),
-                    )
+                    .gap(px(8.0))
+                    .child(account_avatar(&account_label, 20.0, colors))
                     .child(
                         div()
                             .min_w(px(0.0))
@@ -6172,7 +6163,6 @@ impl Sidebar {
                             .overflow_hidden()
                             .text_ellipsis()
                             .text_size(px(Typo::ROW.size))
-                            .font_weight(FontWeight::MEDIUM)
                             .text_color(colors.primary)
                             .child(account_label),
                     ),
@@ -6190,7 +6180,7 @@ impl Sidebar {
                 account_menu_item(
                     "account-settings",
                     t("sidebar.account.settings"),
-                    false,
+                    None,
                     crate::commands::command(CommandId::OpenSettings)
                         .shortcut_label()
                         .map(SharedString::from),
@@ -9287,13 +9277,8 @@ const PROJECT_MENU_WIDTH: f32 = 252.0;
 /// Height of the clickable rows in the account menu.
 const ACCOUNT_MENU_ACTION_ROW_HEIGHT: f32 = 28.0;
 
-/// Leading column of the account menu: the avatar in the header, a
-/// checkmark beside the login in use, empty otherwise. Every label starts
-/// after it, as in an AppKit menu.
-const ACCOUNT_MENU_CHECK_COLUMN: f32 = 16.0;
-
-/// Where account menu text starts: row margin, padding, check column, gap.
-const ACCOUNT_MENU_TEXT_INSET: f32 = 6.0 + 8.0 + ACCOUNT_MENU_CHECK_COLUMN + 6.0;
+/// Where account menu text starts: row margin plus padding.
+const ACCOUNT_MENU_TEXT_INSET: f32 = 6.0 + 8.0;
 
 /// Height of the single-line stat rows in the account menu.
 const ACCOUNT_MENU_STAT_ROW_HEIGHT: f32 = 22.0;
@@ -9470,12 +9455,12 @@ fn account_meter_row(
         .into_any_element()
 }
 
-/// One account menu item: the check column, the label, and a shortcut or
-/// hint on the right. Callers add the hover pill and click when it acts.
+/// One account menu item: the label, then a shortcut or hint and, for
+/// choices, a checkmark slot on the right. Callers add the hover pill and click when it acts.
 fn account_menu_item(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
-    checked: bool,
+    check: Option<bool>,
     trailing: Option<SharedString>,
     colors: SemanticColors,
 ) -> gpui::Stateful<gpui::Div> {
@@ -9493,21 +9478,6 @@ fn account_menu_item(
         .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
         .text_size(px(Typo::ROW.size))
         .text_color(colors.primary)
-        .child(
-            div()
-                .flex_none()
-                .w(px(ACCOUNT_MENU_CHECK_COLUMN))
-                .flex()
-                .justify_center()
-                .when(checked, |slot| {
-                    slot.child(sf_symbol_weighted(
-                        "checkmark",
-                        9.0,
-                        SymbolWeight::Bold,
-                        colors.primary,
-                    ))
-                }),
-        )
         .child(
             div()
                 .min_w(px(0.0))
@@ -9530,20 +9500,19 @@ fn account_menu_item(
                     .child(trailing),
             )
         })
-}
-
-/// A disabled-looking heading over a group of account menu items.
-fn account_menu_section(label: impl Into<SharedString>, colors: SemanticColors) -> AnyElement {
-    div()
-        .pl(px(ACCOUNT_MENU_TEXT_INSET))
-        .pr(px(14.0))
-        .pt(px(4.0))
-        .pb(px(1.0))
-        .text_size(px(Typo::SECTION_HEADER.size))
-        .font_weight(Typo::SECTION_HEADER.weight)
-        .text_color(colors.tertiary)
-        .child(label.into())
-        .into_any_element()
+        // Rows that can be checked keep the slot so their hints line up.
+        .when_some(check, |row, checked| {
+            row.child(
+                div()
+                    .flex_none()
+                    .w(px(12.0))
+                    .flex()
+                    .justify_center()
+                    .when(checked, |slot| {
+                        slot.child(sf_symbol("checkmark", 9.0, colors.secondary))
+                    }),
+            )
+        })
 }
 
 fn hover_detail(icon: &str, text: &str, mono: bool, colors: SemanticColors) -> AnyElement {

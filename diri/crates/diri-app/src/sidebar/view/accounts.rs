@@ -229,8 +229,8 @@ impl Sidebar {
         self.accounts.loaded
     }
 
-    /// The saved local accounts under their Agent, the login in use checked,
-    /// then managing them.
+    /// One line per saved local account, the login in use checked, then
+    /// managing them.
     pub(super) fn account_switch_menu(
         &self,
         colors: SemanticColors,
@@ -244,51 +244,49 @@ impl Sidebar {
             .flex()
             .flex_col()
             .py(px(3.0));
-        for (agent, heading) in [
-            (AgentKind::CLAUDE_CODE_ID, "Claude"),
-            (AgentKind::CODEX_ID, "Codex"),
-        ] {
-            let mut profiles = overview
-                .catalog
-                .profiles
-                .iter()
-                .filter(|p| switchable(p) && p.agent == agent)
-                .peekable();
-            if profiles.peek().is_none() {
-                continue;
-            }
-            section = section.child(account_menu_section(heading, colors));
-            for profile in profiles {
-                let live = overview.is_live(profile);
-                // A click switches to the account, or signs in one with no login.
-                let action = (!live).then(|| {
-                    if overview.login(&profile.id).is_some_and(|l| l.signed_in) {
-                        AccountRequest::Switch(profile.id.clone())
-                    } else {
-                        AccountRequest::SignIn(profile.id.clone())
-                    }
-                });
-                section = section.child(
-                    account_menu_item(
-                        format!("switch-account-{}", profile.id),
-                        profile.label.clone(),
-                        live,
-                        None,
-                        colors,
-                    )
-                    .when(busy, |row| row.text_color(colors.tertiary))
-                    .when(!busy && action.is_some(), |row| {
-                        row.cursor_pointer().glass_menu_row(colors, false)
-                    })
-                    .when_some(action.filter(|_| !busy), |row, action| {
-                        row.on_click(cx.listener(move |this, _, _, cx| {
-                            if !this.accounts.busy {
-                                cx.emit(SidebarEvent::AccountAction(action.clone()));
-                            }
-                        }))
-                    }),
-                );
-            }
+        // Claude logins first, then Codex, in saved order within each.
+        let mut profiles: Vec<_> = overview
+            .catalog
+            .profiles
+            .iter()
+            .filter(|p| switchable(p))
+            .collect();
+        profiles.sort_by_key(|p| p.agent != AgentKind::CLAUDE_CODE_ID);
+        for profile in profiles {
+            let agent = if profile.agent == AgentKind::CODEX_ID {
+                "Codex"
+            } else {
+                "Claude"
+            };
+            let live = overview.is_live(profile);
+            // A click switches to the account, or signs in one with no login.
+            let action = (!live).then(|| {
+                if overview.login(&profile.id).is_some_and(|l| l.signed_in) {
+                    AccountRequest::Switch(profile.id.clone())
+                } else {
+                    AccountRequest::SignIn(profile.id.clone())
+                }
+            });
+            section = section.child(
+                account_menu_item(
+                    format!("switch-account-{}", profile.id),
+                    profile.label.clone(),
+                    Some(live),
+                    Some(agent.into()),
+                    colors,
+                )
+                .when(busy, |row| row.text_color(colors.tertiary))
+                .when(!busy && action.is_some(), |row| {
+                    row.cursor_pointer().glass_menu_row(colors, false)
+                })
+                .when_some(action.filter(|_| !busy), |row, action| {
+                    row.on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.accounts.busy {
+                            cx.emit(SidebarEvent::AccountAction(action.clone()));
+                        }
+                    }))
+                }),
+            );
         }
         if !self.accounts.loaded && !self.accounts.failed {
             section = section.child(menu_note(t("sidebar.account.loading"), colors));
@@ -314,7 +312,7 @@ impl Sidebar {
                 account_menu_item(
                     "manage-accounts",
                     t("sidebar.account.manage"),
-                    false,
+                    None,
                     None,
                     colors,
                 )
