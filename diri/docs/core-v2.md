@@ -264,6 +264,24 @@ Each PR lands on its own, behind the single `core-v2` cargo feature of `diri-ter
        - Resize to another size panics ("resize needs reflow, step 5"); the tests that resize are ignored with the switch on.
        - Rows kept at the budget: on repetitive output (numbered log lines) v2 keeps a third to a half of the current core's rows in 4 MiB, because it stores a byte per ASCII cell where the current core LZ-compresses each row. The four depth tests are gated to the current core; step 6 owns that gap.
 5. **Reflow.** Page rewrap plus deferred cold reflow. Run the resize tests, and the #921 narrowing test on both cores.
+   - Status: rewrap done on `core/v2-step5`; deferred cold reflow is not.
+     - `core_v2/resize.rs` is a port of `Term::resize` and `Grid::resize`. Each screen's rows stream oldest first through the current core's algorithm, as current-core rows, so `Row::shrink`, `is_clear` and `Cell::is_empty` are the vendored functions. The rows are written into new pages of the new size.
+     - Packed history is unpacked a page at a time by the read cache, and the new pages pack as they fill. A resize keeps only the screen and a few rows decoded, but it costs O(history): every resize rewrites all of it.
+     - What it covers:
+       - lines first: growing pulls rows back from history, shrinking pushes rows into history under the row limit;
+       - then columns: reflow on the primary screen and none on the alternate screen, as the current core does;
+       - wide characters, leading spacers, clusters, links, marks and styled blanks;
+       - the cursor, pending wrap and saved cursor of both screens; tab stops and the scroll region;
+       - the history origin (`Pages::history_origin`). Like the current core's, it does not count rows that a narrowing re-wraps past the row limit, or rows of a single scroll larger than the limit. The second rule also fixes 4c's origin outside resize.
+     - Gates:
+       - `core_v2::tests`: a deterministic resize suite, plus 48 + 24 random runs (3,000 each locally with `CORE_V2_FUZZ`). Each run interleaves random output with eight random resizes. v2 is fed whole, byte by byte, in random reads, and on packed four-row pages; the current core gets the same bytes.
+       - The comparison covers cells, cursor, history and origin after every step, and the saved cursors, the other screen, tab stops and the scroll region through probes at the end.
+       - Every `HeadlessScreen` resize test runs with `core-v2-screen` on, and so does diri-term's suite.
+     - **One deliberate difference.** At one column, the current core never finishes narrowing a wide character: each round pushes another row. v2 leaves the character in the column and wraps its spacer to the next row. The differential tests use at least two columns whenever wide characters are present.
+     - Still gated with the switch on:
+       - `a_raised_history_limit_follows_history_back_down`, with the four depth tests: v2 keeps fewer rows at the budget (step 6).
+       - The cold-paging test (#958).
+       - Moved-row fingerprints (no content sources).
 6. **Cold-page packing and the budget.** Prototyped here: it measures 4.7× and 3.7× the Engine (ASCII and Unicode) at budget, and is deterministic under the split tests.
    - Remaining: close the 1.5% gap in rows kept against today's Engine.
    - Then wire packing through the `HeadlessScreen` adapter, and pass the regenerated full-history golden (#921).

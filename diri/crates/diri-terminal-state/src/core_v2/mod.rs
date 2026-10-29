@@ -11,6 +11,7 @@ pub(crate) mod emulator;
 mod events;
 mod ops;
 pub mod page;
+mod resize;
 pub mod term;
 pub mod text;
 

@@ -17,14 +17,14 @@
 //!   and by the live-byte budget, packed page by page. A packed page that a
 //!   checkpoint annotates is thawed for the edit and packed again before
 //!   rows move or history is bounded.
-//! - **Resize** needs reflow (step 5). Until then a resize that changes the
-//!   geometry panics instead of guessing.
+//! - **Resize** reflows both screens as the current core does (step 5,
+//!   `super::resize`), and damages everything.
 
 use std::ops::Deref;
 
 use alacritty_terminal::event::Event;
 use alacritty_terminal::index::{Column, Line, Point};
-use alacritty_terminal::term::cell::{Cell as GridCell, Flags, Hyperlink};
+use alacritty_terminal::term::cell::{Cell as GridCell, Hyperlink};
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::keyboard::KeyboardSnapshot;
 use alacritty_terminal::term::{Config, TermMode};
@@ -32,27 +32,11 @@ use alacritty_terminal::vte::ansi::{CursorStyle, KeyboardModes};
 use diri_proto::grid::GridCell as WireCell;
 
 use super::Core;
-use super::cell::{
-    CP, Cell, HYPERLINK, LEADING, MARKS_SHIFT, SPACER, STYLE_FLAGS, STYLE_SHIFT, Style, WIDE, WRAP,
-};
-use super::check::flags_with;
+use super::cell::Style;
 use super::page::Link;
+use super::resize::{self, ANONYMOUS_LINK, grid_cell};
 use crate::emulator::{Emulator, RowView, RowWrite};
 use crate::{Collector, Geometry};
-
-/// The OSC 133 marks, in the order of the cell's MARKS bits.
-const MARK_FLAGS: [Flags; 5] = [
-    Flags::PROMPT_START,
-    Flags::INPUT_START,
-    Flags::OUTPUT_START,
-    Flags::COMMAND_SUCCEEDED,
-    Flags::COMMAND_FAILED,
-];
-
-/// The id a link read from a page gets when the program gave it none. A
-/// link's cells in one row read as one link, as they do in the current core.
-/// A parsed OSC 8 id never holds a NUL.
-const ANONYMOUS_LINK: &str = "\0core-v2";
 
 /// What rows look like at the last [`Emulator::clear_damage`]: when any of
 /// it changes, rows moved and the whole screen is damaged.
@@ -130,69 +114,7 @@ impl RowWrite for RowEdit {
 /// Reads row `line` (negative: history) of `core`'s shown screen into `out`
 /// as current-core cells.
 fn read_row(core: &Core, line: i32, out: &mut Vec<GridCell>) {
-    let cols = core.cols();
-    let pages = &core.pages;
-    let (p, r) = pages.locate_line(line);
-    let page = pages.page(p);
-    let meta = page.meta[r];
-    let occ = meta.occ as usize;
-    let mut linked = Vec::new();
-    out.clear();
-    pages.read(p, |cells, clusters| {
-        for x in 0..cols {
-            let cell = if x < occ {
-                cells[r * cols + x]
-            } else {
-                Cell::blank(meta.fill)
-            };
-            if cell.has(HYPERLINK) {
-                linked.push(x);
-            }
-            out.push(grid_cell(
-                cell,
-                &page.styles.get(cell.style()),
-                clusters.of(cell),
-                x + 1 == cols && meta.wrapped,
-            ));
-        }
-    });
-    let mut previous: Option<(Link, Hyperlink)> = None;
-    for x in linked {
-        let Some(link) = pages.read_link(p, r * cols + x) else {
-            continue;
-        };
-        let hyperlink = match &previous {
-            Some((last, hyperlink)) if *last == link => hyperlink.clone(),
-            _ => {
-                let hyperlink = Hyperlink::new(
-                    Some(link.id.as_deref().unwrap_or(ANONYMOUS_LINK)),
-                    link.uri.clone(),
-                );
-                previous = Some((link, hyperlink.clone()));
-                hyperlink
-            }
-        };
-        out[x].set_hyperlink(Some(hyperlink));
-    }
-}
-
-/// The current core's cell for a v2 cell in `style`.
-#[inline]
-fn grid_cell(cell: Cell, style: &Style, zerowidth: &[char], row_wrap: bool) -> GridCell {
-    let mut out = GridCell {
-        c: cell.ch(),
-        fg: style.fg,
-        bg: style.bg,
-        flags: flags_with(cell, style, row_wrap),
-        extra: None,
-    };
-    if style.underline.is_some() {
-        out.set_underline_color(style.underline);
-    }
-    for &c in zerowidth {
-        out.push_zerowidth(c);
-    }
-    out
+    resize::read_row(&core.pages, line, out);
 }
 
 impl Screen {
@@ -223,65 +145,9 @@ impl Screen {
     }
 
     /// Writes `cell` (a current-core cell) at column `x` of row `r` of page
-    /// `p`, which is writable: its character, style, width and wrap bits,
-    /// marks, combining characters and hyperlink.
+    /// `p`, which is writable.
     fn store(&mut self, p: usize, r: usize, x: usize, cell: &GridCell) {
-        let cols = self.core.cols();
-        let page = self.core.pages.page_mut(p);
-        let index = r * cols + x;
-        let meta = &mut page.meta[r];
-        let occ = meta.occ as usize;
-        if occ <= x {
-            let blank = Cell::blank(meta.fill);
-            page.cells[r * cols + occ..index].fill(blank);
-            meta.occ = x as u16 + 1;
-        }
-        meta.dirty = true;
-        meta.simple = false;
-        meta.lead = meta.lead.min(x as u16);
-        let flags = cell.flags;
-        if x + 1 == cols {
-            meta.wrapped = flags.contains(Flags::WRAPLINE);
-        }
-        page.text.invalidate(r);
-        let style = Style {
-            fg: cell.fg,
-            bg: cell.bg,
-            underline: cell.underline_color(),
-            flags: flags.bits() & STYLE_FLAGS,
-        };
-        let id = page.styles.intern(&style);
-        let mut bits = (cell.c as u64 & CP) | (id as u64) << STYLE_SHIFT;
-        for (flag, bit) in [
-            (Flags::WIDE_CHAR, WIDE),
-            (Flags::WIDE_CHAR_SPACER, SPACER),
-            (Flags::LEADING_WIDE_CHAR_SPACER, LEADING),
-        ] {
-            if flags.contains(flag) {
-                bits |= bit;
-            }
-        }
-        if x + 1 != cols && flags.contains(Flags::WRAPLINE) {
-            bits |= WRAP;
-        }
-        for (i, flag) in MARK_FLAGS.into_iter().enumerate() {
-            if flags.contains(flag) {
-                bits |= 1 << (MARKS_SHIFT + i as u32);
-            }
-        }
-        page.cells[index] = Cell(bits);
-        for &c in cell.zerowidth().unwrap_or(&[]) {
-            page.push_zerowidth(index, c);
-        }
-        if let Some(hyperlink) = cell.hyperlink() {
-            let link = Link {
-                id: (hyperlink.id() != ANONYMOUS_LINK).then(|| hyperlink.id().to_owned()),
-                uri: hyperlink.uri().to_owned(),
-            };
-            let id = page.link_id(&link);
-            page.set_link(index, id);
-            page.cells[index].0 |= HYPERLINK;
-        }
+        resize::store(&mut self.core.pages, p, r, x, cell);
     }
 
     /// Replaces screen line 0 with `cells`, then appends a row so that line
@@ -370,11 +236,14 @@ impl Emulator for Screen {
         self.core.lines()
     }
 
+    /// `Term::resize`, with reflow (`core_v2::resize`).
     fn resize_screen(&mut self, geometry: Geometry) {
         if geometry.cols == self.core.cols() && geometry.rows == self.core.lines() {
             return;
         }
-        panic!("core-v2: resize needs reflow, step 5");
+        self.refreeze();
+        self.core.resize(geometry.rows, geometry.cols);
+        self.full_damage = true;
     }
 
     #[inline]
@@ -538,8 +407,7 @@ impl Emulator for Screen {
         if pages.history_limit == 0 {
             return 0;
         }
-        let entered = pages.total_rows() - self.core.lines() as u64;
-        entered - pages.history_size() as u64
+        pages.history_origin()
     }
 
     #[cfg(feature = "compact-history")]
