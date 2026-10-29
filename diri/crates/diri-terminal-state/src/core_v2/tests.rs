@@ -109,6 +109,48 @@ fn check(lines: usize, cols: usize, history: usize, input: &[u8]) {
     }
 }
 
+/// The current core and v2 fed the same reads (one-shot, byte by byte,
+/// pseudo-random) must agree. Unlike [`check`], this does not also demand
+/// that the parser treat every split alike: on some corpus files it does
+/// not (a parser matter for #927, not a grid one).
+fn check_same_reads(lines: usize, cols: usize, history: usize, input: &[u8]) {
+    let mut splits: Vec<Vec<&[u8]>> = vec![vec![input], input.chunks(1).collect()];
+    let mut seed = 0x9E37_79B9_u32;
+    for _ in 0..8 {
+        let mut reads = Vec::new();
+        let mut rest = input;
+        while !rest.is_empty() {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let n = (seed as usize % 97 + 1).min(rest.len());
+            reads.push(&rest[..n]);
+            rest = &rest[n..];
+        }
+        splits.push(reads);
+    }
+    for reads in &splits {
+        let config = Config {
+            scrolling_history: history,
+            ..Config::default()
+        };
+        let mut want = Term::new(config, &TermSize::new(cols, lines), VoidListener);
+        let mut parser = Processor::<StdSyncHandler>::new();
+        for read in reads {
+            parser.advance(&mut want, read);
+        }
+        for raw in [true, false] {
+            let got = core(lines, cols, history, reads, raw, None);
+            if let Err(error) = compare(&got, &want) {
+                panic!(
+                    "raw={raw} reads={:?}: {error}",
+                    reads.iter().map(|r| r.len()).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn ascii_wrap_linefeed_and_history() {
     let mut input = Vec::new();
@@ -175,4 +217,358 @@ fn text_rows_with_orphaned_halves_and_indents() {
                  漢字漢字漢字\x1b[3Dw\x1b[1Gz\n"
         .repeat(6);
     check(4, 12, 40, input.as_bytes());
+}
+
+#[test]
+fn scroll_regions_insert_and_delete_lines() {
+    let mut input = Vec::new();
+    for i in 0..12 {
+        input.extend_from_slice(format!("row{i}\r\n").as_bytes());
+    }
+    input.extend_from_slice(
+        b"\x1b[2;4r\x1b[4;1Hx\ny\nz\x1b[2;1H\x1bMup\x1bM\x1b[2L\x1b[1M\x1b[3S\x1b[2T\
+          \x1b[r\x1b[1;3r\x1b[3;1Hq\n\n\nw\x1b[5S\x1b[r\x1b[?6h\x1b[2;3r\x1b[1;1Ho\x1b[5;9Hp\
+          \x1b[?6l\x1b[H\x1b[3M\x1b[4L\x1b[r\x1b[6;1H\x1b[9L\x1b[9M",
+    );
+    check(6, 10, 20, &input);
+    check(6, 10, 0, &input);
+}
+
+#[test]
+fn character_insert_delete_and_erase() {
+    let input = "\x1b[44mabcdefghijkl漢字mnop\r\x1b[3C\x1b[2@\x1b[1P\x1b[3X\x1b[m\
+                 \r\n0123456789abcdefghij\x1b[1A\x1b[5G\x1b[2P\x1b[20P\r\n\x1b[7G漢\x1b[6G\x1b[@\
+                 \x1b[2K漢字かなカナ漢字\x1b[3G\x1b[P\x1b[1;1H\x1b[3@z\x1b[99X\n";
+    for cols in [8, 10, 13] {
+        check(5, cols, 10, input.as_bytes());
+    }
+}
+
+#[test]
+fn erase_in_display_and_history() {
+    let mut input = Vec::new();
+    for i in 0..15 {
+        input.extend_from_slice(format!("line {i}\r\n").as_bytes());
+    }
+    input.extend_from_slice(
+        b"\x1b[3;4H\x1b[0J\x1b[2;2H\x1b[1Jtop\x1b[2J\x1b[Hafter\x1b[44m\x1b[2J\x1b[m",
+    );
+    input.extend_from_slice(b"\r\nmore\r\n\x1b[3J\x1b[1;1H\x1b[1J\x1b[2;1H\x1b[1J\x1b[J");
+    check(5, 12, 30, &input);
+    check(5, 12, 3, &input);
+    // A blank screen clears without scrolling anything.
+    check(4, 8, 10, b"\x1b[2J\x1b[2J ab\x1b[H\x1b[2J");
+}
+
+#[test]
+fn alternate_screens_and_saved_cursors() {
+    let input = b"primary\r\nsecond\x1b7\x1b[31m\x1b[?1049hALT\x1b[2;3Hx\x1b[?1049lback\x1b8!\
+                  \x1b[?47hlegacy\x1b[?47l\x1b[?1047hclear\x1b[3;1Hme\x1b[?1047l\x1b[?1047h\
+                  \x1b[?1049h\x1b[?1049l\x1b[?1047lend\x1b[?1049h\r\n\r\n\r\n\r\n\r\nscroll\x1b[?1049l\
+                  \x1b[5;5H\x1b7\x1b[H\x1b8z";
+    check(4, 10, 10, input);
+}
+
+#[test]
+fn charsets_links_and_marks() {
+    let input = b"\x1b(0lqqk\x1b(Bx\x0e\x1b)0lqk\x0fq\r\n\
+                  \x1b]8;;https://a.example\x07link\x1b]8;id=7;https://b.example\x1b\\two\x1b]8;;\x07plain\
+                  \x1b]8;;https://c.example\x07wrapping across the row end\x1b]8;;\x07\r\n\
+                  \x1b]133;A\x07$ \x1b]133;B\x07ls\x1b]133;C\x07\r\nout\r\n\x1b]133;D;0\x07\x1b]133;D;3\x07\
+                  \x1b]133;D\x07\x1b]133;A\x07\r\n\r\n\r\n\r\n\r\n";
+    check(4, 12, 20, input);
+}
+
+#[test]
+fn insert_mode_tabs_and_resets() {
+    let input = "abcdefgh\r\x1b[4hXY漢\x1b[2Gz\x1b[4l\r\n\x1b[3G\x1bH\x1b[7G\x1bH\r\t.\t.\x1b[g\t,\x1b[3g\
+                 \r\t;\x1b[2I:\x1b[2Z!\r\n\x1b[20h\x1bElnm\x1b[20l\x1b#8\x1b[?3h\x1b[?3l\x1b[!pafter\
+                 \x1b[?25l\x1b[?1000h\x1b[?1006h\x1b[?2004h\x1b[?1h\x1b=\x1bcreset\x1b[?7lnowrap and long text";
+    check(4, 10, 10, input.as_bytes());
+}
+
+/// Random mixes of every family above, against the current core.
+#[test]
+fn random_sequences_match_the_current_core() {
+    const TOKENS: &[&str] = &[
+        "abc",
+        "hello world ",
+        "漢字",
+        "e\u{301}",
+        "❤\u{FE0F}",
+        "👍🏽",
+        "\t",
+        "\r",
+        "\n",
+        "\x08",
+        "\x1b[2;4r",
+        "\x1b[r",
+        "\x1bM",
+        "\x1b[2L",
+        "\x1b[M",
+        "\x1b[2S",
+        "\x1b[T",
+        "\x1b[3@",
+        "\x1b[2P",
+        "\x1b[4X",
+        "\x1b[J",
+        "\x1b[1J",
+        "\x1b[2J",
+        "\x1b[3J",
+        "\x1b[K",
+        "\x1b[1K",
+        "\x1b[?1049h",
+        "\x1b[?1049l",
+        "\x1b[?47h",
+        "\x1b[?47l",
+        "\x1b[?1047h",
+        "\x1b[?1047l",
+        "\x1b7",
+        "\x1b8",
+        "\x1b(0",
+        "\x1b(B",
+        "\x1b]8;;u://x\x07",
+        "\x1b]8;;\x07",
+        "\x1b]133;A\x07",
+        "\x1b]133;D;1\x07",
+        "\x1b[4h",
+        "\x1b[4l",
+        "\x1b[?6h",
+        "\x1b[?6l",
+        "\x1b[?7l",
+        "\x1b[?7h",
+        "\x1b[H",
+        "\x1b[3;5H",
+        "\x1b[2A",
+        "\x1b[3C",
+        "\x1bH",
+        "\x1b[g",
+        "\x1b[31;44m",
+        "\x1b[m",
+        "\x1b[5b",
+        "\x1b#8",
+        "\x1b[!p",
+        "\x1bE",
+        "\x1b]8;id=1;u://y\x07",
+        "\x1b[?3h",
+        "\x1bc",
+        "\x0e",
+        "\x0f",
+        "\x1b)0",
+        "\x1b[2I",
+        "\x1b[Z",
+        "\x1b[20h",
+        "\x1b[20l",
+        "\x1b[?2027h",
+        "\x1b[?2027l",
+        "\x1b[@",
+        "\x1b[2;9r",
+        "\x1b]133;B\x07",
+        "\x1b]133;C\x07",
+        "\x1b]133;D\x07",
+        "\x1b[?1000h",
+        "\x1b[?1006h",
+        "\x1b[3g",
+        "\x1b[?1016h",
+        "\x1b[?1005h",
+        "\x1b[?1016l",
+        "🇷🇴",
+        "\u{1F3FB}",
+        "\x1b[1;1H\x1b[2J",
+        "lqqk",
+    ];
+    let mut seed = 0x2545_F491_u32;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    // `CORE_V2_FUZZ=<n>` runs n inputs instead of 24.
+    let runs = std::env::var("CORE_V2_FUZZ").map_or(24, |n| n.parse().expect("count"));
+    for run in 0..runs {
+        let mut input = String::new();
+        for _ in 0..60 {
+            input.push_str(TOKENS[next() as usize % TOKENS.len()]);
+        }
+        let (lines, cols) = [(5, 9), (3, 4), (7, 16)][run % 3];
+        check(lines, cols, 12, input.as_bytes());
+    }
+}
+
+/// `CORE_V2_BISECT=<file> CORE_V2_SIZE=lines,cols,history`: the shortest
+/// prefix of the file's bytes on which v2 and the current core differ.
+#[test]
+#[ignore]
+fn bisect_first_difference() {
+    let input = std::fs::read(std::env::var("CORE_V2_BISECT").expect("file")).expect("read");
+    let size: Vec<usize> = std::env::var("CORE_V2_SIZE")
+        .expect("size")
+        .split(',')
+        .map(|n| n.parse().expect("number"))
+        .collect();
+    for end in 1..=input.len() {
+        let prefix = &input[..end];
+        let want = reference(size[0], size[1], size[2], prefix);
+        let got = core(size[0], size[1], size[2], &[prefix], true, None);
+        if let Err(error) = compare(&got, &want) {
+            let before = &input[..end - 1];
+            let dump = |label: &str, bytes: &[u8]| {
+                let want = reference(size[0], size[1], size[2], bytes);
+                let got = core(size[0], size[1], size[2], &[bytes], true, None);
+                let grid = want.grid();
+                eprintln!(
+                    "{label}: cursor got {:?} want {:?}",
+                    (got.line, got.col, got.wrap_pending),
+                    (grid.cursor.point, grid.cursor.input_needs_wrap)
+                );
+                for line in 0..size[0] as i32 {
+                    let row: String = (0..size[1])
+                        .map(|c| {
+                            let w = &grid[alacritty_terminal::index::Line(line)]
+                                [alacritty_terminal::index::Column(c)];
+                            let cell = got.cell(line, c);
+                            let style = got.style_of(line, cell);
+                            let f = super::check::flags_of(&got, line, c, cell, &style);
+                            format!(
+                                "[{}{:x}|{}{:x}]",
+                                w.c,
+                                w.flags.bits() & 0xFFFF,
+                                cell.ch(),
+                                f.bits() & 0xFFFF
+                            )
+                        })
+                        .collect();
+                    eprintln!("  {line}: {row}");
+                }
+            };
+            if std::env::var_os("CORE_V2_BISECT_RAW").is_some() {
+                let got = core(size[0], size[1], size[2], &[prefix], true, None);
+                for c in 0..4 {
+                    eprintln!(
+                        "raw line {} col {c}: {:#x}",
+                        got.line,
+                        got.cell(got.line as i32, c).0
+                    );
+                }
+            } else {
+                dump("before", before);
+                dump("after", prefix);
+            }
+            panic!(
+                "first difference after {end} bytes: {:?}\n{error}",
+                String::from_utf8_lossy(prefix)
+            );
+        }
+    }
+}
+
+/// Every file of the adversarial corpus (`tests/fixtures/adversarial`, or
+/// `CORE_V2_CORPUS`), when present: v2 must match the current core on each
+/// at every split.
+#[test]
+fn adversarial_corpus_matches_the_current_core() {
+    let dir = std::env::var("CORE_V2_CORPUS").unwrap_or_else(|_| {
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/adversarial").to_owned()
+    });
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let mut files: Vec<_> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "bin"))
+        .collect();
+    files.sort();
+    for path in files {
+        let input = std::fs::read(&path).expect("fixture");
+        let input = &input[..input.len().min(4096)];
+        eprintln!("{}", path.display());
+        check_same_reads(24, 80, 100, input);
+    }
+}
+
+/// Events as comparable text: closures are applied to fixed inputs.
+fn event_text(event: &alacritty_terminal::event::Event) -> String {
+    use alacritty_terminal::event::{Event, WindowSize};
+    use alacritty_terminal::vte::ansi::Rgb;
+    let size = WindowSize {
+        num_lines: 24,
+        num_cols: 80,
+        cell_width: 9,
+        cell_height: 18,
+    };
+    match event {
+        Event::ClipboardLoad(kind, reply) => format!("load {kind:?} {}", reply("pasted")),
+        Event::ColorRequest(index, reply) => {
+            format!("color {index} {}", reply(Rgb { r: 1, g: 2, b: 3 }))
+        }
+        Event::TextAreaSizeRequest(reply) => format!("area {}", reply(size)),
+        Event::CellSizeRequest(reply) => format!("cell {}", reply(size)),
+        other => format!("{other:?}"),
+    }
+}
+
+#[derive(Clone, Default)]
+struct Recorder(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl alacritty_terminal::event::EventListener for Recorder {
+    fn send_event(&self, event: alacritty_terminal::event::Event) {
+        self.0.lock().unwrap().push(event_text(&event));
+    }
+}
+
+#[test]
+fn events_titles_colors_replies_keyboard_and_cursor_style() {
+    use alacritty_terminal::term::Osc52;
+    let input = b"\x1b]0;first\x07\x1b[22;0t\x1b]2;second\x1b\\\x1b[23;0t\x1b]0;\x07\
+                  \x1b]4;1;rgb:10/20/30\x07\x1b]10;?\x07\x1b]11;rgb:ff/00/00\x07\x1b]104;1\x07\x1b]110\x07\
+                  \x1b]52;c;aGVsbG8=\x07\x1b]52;p;?\x07\x1b]52;x;Zg==\x07\
+                  \x1b[c\x1b[>c\x1b[5n\x1b[3;4H\x1b[6n\x1b[?6n\x1b[?996n\x1b[14t\x1b[16t\x1b[18t\x1b[19t\x1b[>q\
+                  \x1bP+q544E;436F;626164\x1b\\\x1b[1;31;48;5;20;58:2::1:2:3m\x1bP$qm\x1b\\\x1b[2;5r\x1bP$qr\x1b\\\
+                  \x1b[5 q\x1bP$q q\x1b\\\x1b[?12l\x1b[?12$p\x1b[?1016h\x1b[?1016$p\x1b[?1006h\x1b[?1016$p\x1b[?1049$p\x1b[4$p\x1b[99$p\x1b[?7$p\x1b[?69$p\
+                  \x1b[>1u\x1b[>5u\x1b[?u\x1b[=3;2u\x1b[?u\x1b[<u\x1b[?u\x1b[?1049h\x1b[>2u\x1b[?u\x1b[?1049l\x1b[?u\
+                  \x07\x1b[?1000h\x1b[?1000l\x1b[?2048h\x1b[?12h\x1b[!p\x1b]0;again\x07\x1b]4;2;rgb:01/02/03\x07\x1bc";
+    let config = Config {
+        scrolling_history: 10,
+        kitty_keyboard: true,
+        osc52: Osc52::CopyPaste,
+        terminal_version: Some("diri 1.0".into()),
+        ..Config::default()
+    };
+    for reads in [
+        vec![&input[..]],
+        input.chunks(1).collect::<Vec<_>>(),
+        input.chunks(7).collect(),
+    ] {
+        let want_events = Recorder::default();
+        let mut want = Term::new(config.clone(), &TermSize::new(20, 6), want_events.clone());
+        let mut parser = Processor::<StdSyncHandler>::new();
+        for read in &reads {
+            parser.advance(&mut want, read);
+        }
+        let got_events = Recorder::default();
+        let mut got = Core::new(6, 20, 10);
+        got.set_events(config.clone(), Box::new(got_events.clone()));
+        let mut parser = Processor::<StdSyncHandler>::new();
+        for read in &reads {
+            parser.advance(&mut got, read);
+        }
+        assert_eq!(
+            *got_events.0.lock().unwrap(),
+            *want_events.0.lock().unwrap()
+        );
+        assert!(
+            want_events.0.lock().unwrap().len() > 30,
+            "the input exercises events"
+        );
+        compare(&got, &want).unwrap();
+        assert_eq!(got.colors_generation(), want.colors_generation());
+        for index in 0..alacritty_terminal::term::color::COUNT {
+            assert_eq!(got.colors()[index], want.colors()[index], "color {index}");
+        }
+        assert_eq!(
+            format!("{:?}", got.cursor_style()),
+            format!("{:?}", want.cursor_style())
+        );
+    }
 }

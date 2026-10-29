@@ -17,7 +17,9 @@
 //! same stream with one span missing (as a terminal that overwrites a read
 //! ring would) must not compare equal.
 
-use diri_terminal_state::HeadlessScreen;
+#[path = "support/observed.rs"]
+mod observed;
+use observed::{Feeder, Observed, assert_same, screen};
 
 const COLS: usize = 48;
 const ROWS: usize = 12;
@@ -263,132 +265,8 @@ fn lasting_stream(lines: usize) -> Vec<u8> {
     out
 }
 
-fn screen() -> HeadlessScreen {
-    // The local Engine's configuration.
-    HeadlessScreen::new_with_keyboard_enhancements(COLS, ROWS)
-        .with_notifications()
-        .with_inline_images()
-        .with_host_replies("diri-test")
-}
-
-/// Everything observable that does not count reads.
-#[derive(Debug, PartialEq)]
-struct Observed {
-    replies: Vec<u8>,
-    notifications: Vec<String>,
-    clipboard: Vec<String>,
-    scrollback_lines: Vec<String>,
-    scrollback_text_cells: String,
-    visible_start_row: i64,
-    cells_payload: Vec<u8>,
-    cells_metadata: String,
-    full_snapshot: String,
-    link_text: String,
-    links: Vec<(usize, String)>,
-    title: Option<String>,
-    modes: String,
-    cursor: (u16, u16, bool),
-    keyboard: String,
-    progress: Option<(i64, i64)>,
-    /// Whether any synchronized update was closed, and whether one is open.
-    /// How many closed is not compared: the parser counts at most one per
-    /// read, which is all the Engine asks of it (did a frame complete).
-    synchronized: (bool, bool),
-    image_bytes: usize,
-    program_status: String,
-}
-
-struct Feeder {
-    screen: HeadlessScreen,
-    replies: Vec<u8>,
-    notifications: Vec<String>,
-    clipboard: Vec<String>,
-}
-
-impl Feeder {
-    fn new() -> Self {
-        Self {
-            screen: screen(),
-            replies: Vec::new(),
-            notifications: Vec::new(),
-            clipboard: Vec::new(),
-        }
-    }
-
-    /// One read, handled the way the Engine pump handles it.
-    fn feed(&mut self, bytes: &[u8]) {
-        self.screen.feed(bytes);
-        self.replies.extend(self.screen.take_replies());
-        self.notifications.extend(
-            self.screen
-                .take_notifications()
-                .into_iter()
-                .map(|n| format!("{n:?}")),
-        );
-        self.clipboard.extend(self.screen.take_clipboard());
-    }
-
-    fn observe(mut self) -> Observed {
-        let screen = &mut self.screen;
-        let scrollback = screen.scrollback();
-        let cells = screen.scrollback_cells(0, i64::MAX);
-        let links = screen.link_source(usize::MAX);
-        Observed {
-            replies: self.replies,
-            notifications: self.notifications,
-            clipboard: self.clipboard,
-            scrollback_lines: scrollback.lines,
-            scrollback_text_cells: format!("{:?}", scrollback.text_cells),
-            visible_start_row: scrollback.visible_start_row,
-            cells_payload: cells.payload,
-            cells_metadata: without_store_nonce(format!("{:?}", cells.metadata)),
-            full_snapshot: without_store_nonce(format!("{:?}", screen.full_snapshot())),
-            link_text: links.text,
-            links: links
-                .hyperlinks
-                .into_iter()
-                .map(|(at, uri)| (at, without_store_nonce(uri)))
-                .collect(),
-            title: screen.title().map(str::to_owned),
-            modes: format!(
-                "alt={} paste={} focus={} mouse={:?} cursor={:?}",
-                screen.is_alt_screen(),
-                screen.bracketed_paste(),
-                screen.focus_reporting(),
-                screen.mouse_modes(),
-                screen.cursor_style(),
-            ),
-            cursor: screen.cursor(),
-            keyboard: format!("{:?}", screen.keyboard_state()),
-            progress: screen.progress(),
-            synchronized: (
-                screen.synchronized_updates_completed() > 0,
-                screen.in_synchronized_update(),
-            ),
-            image_bytes: screen.inline_image_bytes(),
-            program_status: format!("{:?}", screen.program_status()),
-        }
-    }
-}
-
-/// Image anchors name a per-screen store; only the rest must match.
-fn without_store_nonce(text: String) -> String {
-    const ANCHOR: &str = "diri-image:";
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text.as_str();
-    while let Some(at) = rest.find(ANCHOR) {
-        out.push_str(&rest[..at + ANCHOR.len()]);
-        rest = &rest[at + ANCHOR.len()..];
-        let nonce = rest.find('.').unwrap_or(0);
-        out.push('#');
-        rest = &rest[nonce..];
-    }
-    out.push_str(rest);
-    out
-}
-
 fn observe_chunks<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> Observed {
-    let mut feeder = Feeder::new();
+    let mut feeder = Feeder::new(COLS, ROWS);
     for chunk in chunks {
         feeder.feed(chunk);
     }
@@ -413,54 +291,6 @@ fn random_chunks<'a>(bytes: &'a [u8], rng: &mut Rng, max: usize) -> Vec<&'a [u8]
 }
 
 /// Names the first field that differs, so a failure says what was lost.
-fn assert_same(expected: &Observed, actual: &Observed, how: &str) {
-    if expected == actual {
-        return;
-    }
-    let e = format!("{expected:#?}");
-    let a = format!("{actual:#?}");
-    let field = e
-        .lines()
-        .zip(a.lines())
-        .take_while(|(x, y)| x == y)
-        .filter(|(x, _)| x.starts_with("    ") && !x.starts_with("     "))
-        .last()
-        .map_or("", |(x, _)| x);
-    let line = e
-        .lines()
-        .zip(a.lines())
-        .position(|(x, y)| x != y)
-        .unwrap_or(0);
-    let (x, y) = e.lines().zip(a.lines()).nth(line).unwrap_or(("", ""));
-    let column = x
-        .char_indices()
-        .zip(y.chars())
-        .find(|((_, p), q)| p != q)
-        .map_or(0, |((i, _), _)| i);
-    let window = |s: &str| {
-        let start = s.floor_char_boundary(column.saturating_sub(120));
-        let end = s.ceil_char_boundary((column + 120).min(s.len()));
-        s[start..end].to_owned()
-    };
-    eprintln!(
-        "first difference:\n  one shot: {}\n  {how}: {}",
-        window(x),
-        window(y)
-    );
-    let context = |s: &str| {
-        s.lines()
-            .skip(line.saturating_sub(3))
-            .take(6)
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    panic!(
-        "{how}: state differs from a one-shot parse (after {field})\n--- one shot\n{}\n--- {how}\n{}",
-        context(&e),
-        context(&a)
-    );
-}
-
 #[test]
 fn the_dense_stream_parses_the_same_split_at_every_offset() {
     let stream = dense_stream(0x5eed);
@@ -635,7 +465,7 @@ fn a_cut_inside_an_escape_never_prints_its_parameters() {
 fn state_after_hundreds_of_events_in_one_read_survives() {
     // One read with more events than a small bounded queue holds: the title
     // set after them, and every query's answer, must still arrive.
-    let mut screen = screen();
+    let mut screen = screen(COLS, ROWS);
     screen.feed(
         &[
             &b"\x07".repeat(500)[..],
@@ -647,4 +477,158 @@ fn state_after_hundreds_of_events_in_one_read_survives() {
     );
     assert_eq!(screen.title(), Some("kept"));
     assert_eq!(screen.take_replies(), b"\x1b[0n".repeat(300));
+}
+
+/// Hand-made and random escape soups from an independent review
+/// (`fixtures/adversarial-gen.py`, seed 922; the inputs over 64 KiB are left
+/// out): C1 controls, CAN/SUB inside every string type, OSC 8 and titles
+/// with odd terminators, DCS queries, notifications, Kitty uploads chunked,
+/// padded, URL-safe, whitespace-wrapped, invalid and interleaved with text,
+/// iTerm2 images, REP and CSI edge cases. Each must end in the same state in
+/// one read, a byte at a time, split in two anywhere, and in random reads.
+#[test]
+fn adversarial_inputs_parse_the_same_however_they_are_read() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/adversarial");
+    let mut paths: Vec<_> = std::fs::read_dir(&dir)
+        .expect("fixtures")
+        .map(|entry| entry.expect("entry").path())
+        .collect();
+    paths.sort();
+    assert!(paths.len() >= 40, "fixtures missing: {}", paths.len());
+    // The pump hands over only the newest clipboard write of a read (two in
+    // one read set the clipboard once, to the second), so how many arrive
+    // depends on reads; the clipboard's final contents must not.
+    let observe_chunks = |chunks: Vec<&[u8]>| {
+        let mut observed = observe_chunks(chunks);
+        observed.clipboard = observed.clipboard.pop().into_iter().collect();
+        observed
+    };
+    for path in paths {
+        let name = path
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .into_owned();
+        let stream = std::fs::read(&path).expect("fixture");
+        let expected = observe_chunks(vec![&stream[..]]);
+        assert_same(
+            &expected,
+            &observe_chunks(stream.chunks(1).collect()),
+            &format!("{name} a byte at a time"),
+        );
+        // Every split for small inputs; for larger ones every split in the
+        // first 256 bytes and 256 spread through the rest.
+        let splits: Vec<usize> = if stream.len() <= 6_000 {
+            (1..stream.len()).collect()
+        } else {
+            (1..256)
+                .chain((0..256).map(|i| 256 + i * (stream.len() - 256) / 256))
+                .collect()
+        };
+        for split in splits {
+            assert_same(
+                &expected,
+                &observe_chunks(vec![&stream[..split], &stream[split..]]),
+                &format!("{name} split at {split} of {}", stream.len()),
+            );
+        }
+        let mut rng = Rng(stream.len() as u64 | 1);
+        for round in 0..4 {
+            assert_same(
+                &expected,
+                &observe_chunks(random_chunks(&stream, &mut rng, 4096)),
+                &format!("{name} random reads, round {round}"),
+            );
+        }
+    }
+}
+
+/// `soup06` from the review: strings of every kind cut short by ESC, CAN,
+/// SUB and 8-bit C1 controls (an SOS ended by a raw ST among them), REP and
+/// synchronized updates. On the base its cursor, text and replies depended on
+/// where reads split (one read and a byte at a time ended on different
+/// cursors). Checked alone so a regression names it.
+#[test]
+fn soup06_ends_in_one_state_however_it_is_read() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/adversarial/soup06.bin");
+    let stream = std::fs::read(path).expect("fixture");
+    let observe = |chunks: Vec<&[u8]>| {
+        let mut observed = observe_chunks(chunks);
+        observed.clipboard = observed.clipboard.pop().into_iter().collect();
+        observed
+    };
+    let expected = observe(vec![&stream[..]]);
+    assert_same(
+        &expected,
+        &observe(stream.chunks(1).collect()),
+        "a byte at a time",
+    );
+    for split in 1..stream.len() {
+        assert_same(
+            &expected,
+            &observe(vec![&stream[..split], &stream[split..]]),
+            &format!("split at {split} of {}", stream.len()),
+        );
+    }
+}
+
+#[test]
+fn can_or_sub_cancels_an_image_command_like_any_other_string() {
+    // The parser drops an APC at CAN or SUB, executes the byte and goes on
+    // with what follows. With images on, the Kitty command is cut out before
+    // the parser sees it; the text after it must still print, and the DCS
+    // query after that must be cancelled by its own SUB, not answered.
+    let stream = b"\x1b_Gf=32,s=1,v=1;AAAA\x18tail\x1bP+q54\x1a!\x1b_Gi=3;AA\x1amore";
+    let mut parser_only =
+        diri_terminal_state::HeadlessScreen::new_with_keyboard_enhancements(COLS, ROWS)
+            .with_host_replies("diri-test");
+    parser_only.feed(stream);
+    let with_images = observe_chunks([&stream[..]]);
+    assert!(
+        with_images.link_text.starts_with("tail!more"),
+        "{:?}",
+        with_images.link_text
+    );
+    assert!(
+        parser_only.row_text(0).starts_with("tail!more"),
+        "{:?}",
+        parser_only.row_text(0)
+    );
+    let mut screen = screen(COLS, ROWS);
+    screen.feed(stream);
+    assert_eq!(screen.row_text(0), parser_only.row_text(0));
+    assert_eq!(screen.take_replies(), parser_only.take_replies());
+    assert_eq!(screen.inline_image_bytes(), 0);
+    for split in 1..stream.len() {
+        assert_same(
+            &with_images,
+            &observe_chunks([&stream[..split], &stream[split..]]),
+            &format!("split at {split}"),
+        );
+    }
+}
+
+#[test]
+fn can_or_sub_ends_an_inline_image_osc_like_any_other_osc() {
+    // The parser dispatches an OSC at CAN or SUB, then executes the byte. An
+    // iTerm2 image ended that way is shown, and the text after it prints.
+    let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0\x1f\x15\xc4\x89\0\0\0\rIDATx\x9cc\xf8\x0f\0\0\x01\x01\0\x05\x18\xd8N\0\0\0\0IEND\xaeB`\x82";
+    let mut stream = b"\x1b]1337;File=inline=1:".to_vec();
+    stream.extend_from_slice(base64(png).as_bytes());
+    stream.extend_from_slice(b"\x18after");
+    let expected = observe_chunks([&stream[..]]);
+    assert!(expected.image_bytes > 0, "the image was stored");
+    assert!(
+        expected.link_text.contains("after"),
+        "{:?}",
+        expected.link_text
+    );
+    for split in 1..stream.len() {
+        assert_same(
+            &expected,
+            &observe_chunks([&stream[..split], &stream[split..]]),
+            &format!("split at {split}"),
+        );
+    }
 }

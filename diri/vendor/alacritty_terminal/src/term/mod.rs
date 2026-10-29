@@ -1793,9 +1793,16 @@ impl<T: EventListener> Handler for Term<T> {
                     cell.fg = fg;
                     cell.bg = bg;
                     cell.flags = flags | (cell.flags & Flags::SHELL_MARKS);
-                    // Most cells and templates have no extra storage; skip
-                    // the reference count when both are empty.
-                    if extra.is_some() || cell.extra.is_some() {
+                    // Most cells and templates have no extra storage, and a
+                    // rewritten cell (a repeated character, a redrawn row)
+                    // often already shares the template's: skip the atomic
+                    // reference-count round trip in both cases.
+                    let same_extra = match (&cell.extra, &extra) {
+                        (None, None) => true,
+                        (Some(cell), Some(extra)) => Arc::ptr_eq(cell, extra),
+                        _ => false,
+                    };
+                    if !same_extra {
                         cell.extra = extra.clone();
                     }
                     written += 1;
@@ -3351,6 +3358,46 @@ impl<T: EventListener> Handler for Term<T> {
         };
         self.event_proxy.send_event(Event::PtyWrite(text));
     }
+}
+
+/// DIRI PATCH (core v2): the XTGETTCAP reply for one hex-encoded name, as
+/// `request_termcap` writes it, so the core v2 prototype answers alike.
+#[doc(hidden)]
+pub fn xtgettcap_reply(hex: &[u8]) -> String {
+    let name = decode_hex(hex);
+    match name.as_deref().and_then(termcap) {
+        Some(Some(value)) => format!(
+            "\x1bP1+r{}={}\x1b\\",
+            hex_name(hex),
+            encode_hex(value.as_bytes())
+        ),
+        Some(None) => format!("\x1bP1+r{}\x1b\\", hex_name(hex)),
+        None => format!("\x1bP0+r{}\x1b\\", hex_name(hex)),
+    }
+}
+
+/// DIRI PATCH (core v2): the text of an OSC 52 store, as `clipboard_store`
+/// decodes it.
+#[doc(hidden)]
+pub fn osc52_store_text(base64: &[u8]) -> Option<String> {
+    String::from_utf8(Base64.decode(base64).ok()?).ok()
+}
+
+/// DIRI PATCH (core v2): the OSC 52 load reply `clipboard_load` builds.
+#[doc(hidden)]
+pub fn osc52_load_reply(clipboard: u8, text: &str, terminator: &str) -> String {
+    format!(
+        "\x1b]52;{};{}{}",
+        clipboard as char,
+        Base64.encode(text),
+        terminator
+    )
+}
+
+/// DIRI PATCH (core v2): the version DA2 (`CSI > c`) reports.
+#[doc(hidden)]
+pub fn da2_version() -> usize {
+    version_number(env!("CARGO_PKG_VERSION"))
 }
 
 /// DIRI PATCH: XTGETTCAP answers. `Some(None)` is a boolean capability; the

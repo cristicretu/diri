@@ -34,6 +34,8 @@ resolver = "2"
 [features]
 default = ["serde"]
 compact-history = ["serde"]
+# DIRI PATCH: test-only OSC dispatch totals (`vte::observe`); see DIRI-PATCH.md.
+observe = ["vte/observe"]
 serde = [
     "dep:serde",
     "bitflags/serde",

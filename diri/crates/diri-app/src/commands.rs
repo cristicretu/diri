@@ -47,7 +47,6 @@ actions!(
         ToggleActivity,
         ToggleOverview,
         ToggleTabPeek,
-        ReviewLaunches,
         FocusPaneLeft,
         FocusPaneRight,
         FocusPaneUp,
@@ -77,6 +76,8 @@ actions!(
         MovePaneToNewTab,
         MovePaneToNextTab,
         MovePaneToPreviousTab,
+        MoveTabToNewWindow,
+        MoveTabToNextWindow,
         OpenWorktrees,
         NewNote,
         ShowTodos,
@@ -179,7 +180,6 @@ pub enum CommandId {
     ToggleActivity,
     ToggleOverview,
     ToggleTabPeek,
-    ReviewLaunches,
     FocusPaneLeft,
     FocusPaneRight,
     FocusPaneUp,
@@ -209,6 +209,8 @@ pub enum CommandId {
     MovePaneToNewTab,
     MovePaneToNextTab,
     MovePaneToPreviousTab,
+    MoveTabToNewWindow,
+    MoveTabToNextWindow,
     OpenWorktrees,
     NewNote,
     ShowTodos,
@@ -505,16 +507,6 @@ pub const COMMANDS: &[CommandSpec] = &[
         "preview strip tabs glance"
     ),
     spec!(
-        ReviewLaunches,
-        "review-launches",
-        None,
-        None,
-        Some(APP_CONTEXT),
-        "command.review_launches.palette_title",
-        "tray",
-        "workspace create pending retry placement receipts"
-    ),
-    spec!(
         FocusPaneLeft,
         "focus-pane-left",
         Some("cmd-alt-left"),
@@ -803,6 +795,26 @@ pub const COMMANDS: &[CommandSpec] = &[
         "command.move_pane_to_previous_tab.palette_title",
         "rectangle.split.2x1",
         "workspace move pane previous tab join"
+    ),
+    spec!(
+        MoveTabToNewWindow,
+        "move-tab-to-new-window",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.move_tab_to_new_window.palette_title",
+        "macwindow.badge.plus",
+        "window move tab session new detach tear off"
+    ),
+    spec!(
+        MoveTabToNextWindow,
+        "move-tab-to-next-window",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.move_tab_to_next_window.palette_title",
+        "macwindow",
+        "window move tab session next other"
     ),
     spec!(
         NewNote,
@@ -1561,7 +1573,6 @@ impl CommandSpec {
             CommandId::ToggleNotifications => KeyBinding::new(key, ToggleNotifications, context),
             CommandId::ToggleActivity => KeyBinding::new(key, ToggleActivity, context),
             CommandId::ToggleOverview => KeyBinding::new(key, ToggleOverview, context),
-            CommandId::ReviewLaunches => KeyBinding::new(key, ReviewLaunches, context),
             CommandId::ToggleTabPeek => KeyBinding::new(key, ToggleTabPeek, context),
             CommandId::FocusPaneLeft => KeyBinding::new(key, FocusPaneLeft, context),
             CommandId::FocusPaneRight => KeyBinding::new(key, FocusPaneRight, context),
@@ -1592,6 +1603,8 @@ impl CommandSpec {
             CommandId::MovePaneToNewTab => KeyBinding::new(key, MovePaneToNewTab, context),
             CommandId::MovePaneToNextTab => KeyBinding::new(key, MovePaneToNextTab, context),
             CommandId::MovePaneToPreviousTab => KeyBinding::new(key, MovePaneToPreviousTab, context),
+            CommandId::MoveTabToNewWindow => KeyBinding::new(key, MoveTabToNewWindow, context),
+            CommandId::MoveTabToNextWindow => KeyBinding::new(key, MoveTabToNextWindow, context),
 
             CommandId::OpenWorktrees => KeyBinding::new(key, OpenWorktrees, context),
             CommandId::NewNote => KeyBinding::new(key, NewNote, context),
@@ -2095,11 +2108,6 @@ impl CommandId {
                 description: t("command.toggle_overview.description"),
                 category: Navigation,
             },
-            Self::ReviewLaunches => ShortcutMetadata {
-                title: t("command.review_launches.title"),
-                description: t("command.review_launches.description"),
-                category: Workspace,
-            },
             Self::FocusPaneLeft => ShortcutMetadata {
                 title: t("command.focus_pane_left.title"),
                 description: t("command.focus_pane_left.description"),
@@ -2243,6 +2251,16 @@ impl CommandId {
             Self::MovePaneToPreviousTab => ShortcutMetadata {
                 title: t("command.move_pane_to_previous_tab.title"),
                 description: t("command.move_pane_to_previous_tab.description"),
+                category: Workspace,
+            },
+            Self::MoveTabToNewWindow => ShortcutMetadata {
+                title: t("command.move_tab_to_new_window.title"),
+                description: t("command.move_tab_to_new_window.description"),
+                category: Workspace,
+            },
+            Self::MoveTabToNextWindow => ShortcutMetadata {
+                title: t("command.move_tab_to_next_window.title"),
+                description: t("command.move_tab_to_next_window.description"),
                 category: Workspace,
             },
             Self::ToggleTabPeek => ShortcutMetadata {
@@ -2569,7 +2587,6 @@ impl CommandId {
             Self::ToggleActivity => Box::new(ToggleActivity),
             Self::ToggleOverview => Box::new(ToggleOverview),
             Self::ToggleTabPeek => Box::new(ToggleTabPeek),
-            Self::ReviewLaunches => Box::new(ReviewLaunches),
             Self::FocusPaneLeft => Box::new(FocusPaneLeft),
             Self::FocusPaneRight => Box::new(FocusPaneRight),
             Self::FocusPaneUp => Box::new(FocusPaneUp),
@@ -2599,6 +2616,8 @@ impl CommandId {
             Self::MovePaneToNewTab => Box::new(MovePaneToNewTab),
             Self::MovePaneToNextTab => Box::new(MovePaneToNextTab),
             Self::MovePaneToPreviousTab => Box::new(MovePaneToPreviousTab),
+            Self::MoveTabToNewWindow => Box::new(MoveTabToNewWindow),
+            Self::MoveTabToNextWindow => Box::new(MoveTabToNextWindow),
 
             Self::OpenWorktrees => Box::new(OpenWorktrees),
             Self::NewNote => Box::new(NewNote),

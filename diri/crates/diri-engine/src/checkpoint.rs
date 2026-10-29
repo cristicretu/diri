@@ -170,7 +170,7 @@ impl ScreenCheckpoint {
     /// Writes atomically (temp file + rename) as a binary plist.
     pub fn write_atomically(&self, path: &Path) -> std::io::Result<()> {
         let payload = GridRowCodec::encode_rows(&self.history).map_err(std::io::Error::other)?;
-        self.write_with_history(path, self.history.len(), &payload)
+        self.write_with_history(path, self.history.len(), payload)
     }
 
     /// [`Self::write_atomically`] with the history already encoded by
@@ -181,7 +181,7 @@ impl ScreenCheckpoint {
         &self,
         path: &Path,
         history_rows: usize,
-        history_payload: &[u8],
+        history_payload: Vec<u8>,
     ) -> std::io::Result<()> {
         let mut dict = plist::Dictionary::new();
         let enhancements = self.keyboard.and_then(|keyboard| keyboard.enhancements);
@@ -251,10 +251,7 @@ impl ScreenCheckpoint {
                     .into(),
             ),
         );
-        dict.insert(
-            "historyPayload".into(),
-            plist::Value::Data(history_payload.to_vec()),
-        );
+        dict.insert("historyPayload".into(), plist::Value::Data(history_payload));
         dict.insert(
             "markerBuffer".into(),
             plist::Value::Data(self.marker_buffer.clone()),
@@ -287,11 +284,13 @@ impl ScreenCheckpoint {
         }
 
         // Terminal content: owner-only from creation, never via the umask.
-        let mut bytes = Vec::new();
-        plist::Value::Dictionary(dict)
-            .to_writer_binary(&mut bytes)
-            .map_err(std::io::Error::other)?;
-        diri_platform::private::replace_via(&path.with_extension("plist.tmp"), path, bytes)
+        // Streamed to the file: the history payload alone is megabytes, and
+        // a growing in-memory copy of the plist stayed resident in the
+        // allocator after every checkpoint.
+        let value = plist::Value::Dictionary(dict);
+        diri_platform::private::replace_streamed(&path.with_extension("plist.tmp"), path, |file| {
+            value.to_writer_binary(file).map_err(std::io::Error::other)
+        })
     }
 }
 

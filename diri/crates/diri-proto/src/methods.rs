@@ -1428,7 +1428,7 @@ pub type GovernorConfigureResult = EmptyResult;
 /// Engine-side terminal settings the app owns. The Engine keeps the last
 /// value it was sent, so terminals it restarts before the app connects follow
 /// it too.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalConfigureParams {
     /// Whether new zsh and bash terminals get Diri's OSC 133 prompt and
@@ -1439,6 +1439,12 @@ pub struct TerminalConfigureParams {
     /// older Apps: queries stay unanswered, as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub palette: Option<TerminalPalette>,
+    /// What a new local terminal runs instead of the login shell, as argv
+    /// executed without a shell (`["zsh", "-l"]`, `["nix", "develop"]`).
+    /// Absent, or from older Apps: the user's login shell. Remote terminals
+    /// always use the host's own shell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_command: Option<Vec<String>>,
 }
 
 pub type TerminalConfigureResult = EmptyResult;
