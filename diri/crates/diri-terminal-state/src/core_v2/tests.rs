@@ -302,96 +302,98 @@ fn insert_mode_tabs_and_resets() {
     check(4, 10, 10, input.as_bytes());
 }
 
+/// Tokens of every family above, for the random tests.
+const TOKENS: &[&str] = &[
+    "abc",
+    "hello world ",
+    "漢字",
+    "e\u{301}",
+    "❤\u{FE0F}",
+    "👍🏽",
+    "\t",
+    "\r",
+    "\n",
+    "\x08",
+    "\x1b[2;4r",
+    "\x1b[r",
+    "\x1bM",
+    "\x1b[2L",
+    "\x1b[M",
+    "\x1b[2S",
+    "\x1b[T",
+    "\x1b[3@",
+    "\x1b[2P",
+    "\x1b[4X",
+    "\x1b[J",
+    "\x1b[1J",
+    "\x1b[2J",
+    "\x1b[3J",
+    "\x1b[K",
+    "\x1b[1K",
+    "\x1b[?1049h",
+    "\x1b[?1049l",
+    "\x1b[?47h",
+    "\x1b[?47l",
+    "\x1b[?1047h",
+    "\x1b[?1047l",
+    "\x1b7",
+    "\x1b8",
+    "\x1b(0",
+    "\x1b(B",
+    "\x1b]8;;u://x\x07",
+    "\x1b]8;;\x07",
+    "\x1b]133;A\x07",
+    "\x1b]133;D;1\x07",
+    "\x1b[4h",
+    "\x1b[4l",
+    "\x1b[?6h",
+    "\x1b[?6l",
+    "\x1b[?7l",
+    "\x1b[?7h",
+    "\x1b[H",
+    "\x1b[3;5H",
+    "\x1b[2A",
+    "\x1b[3C",
+    "\x1bH",
+    "\x1b[g",
+    "\x1b[31;44m",
+    "\x1b[m",
+    "\x1b[5b",
+    "\x1b#8",
+    "\x1b[!p",
+    "\x1bE",
+    "\x1b]8;id=1;u://y\x07",
+    "\x1b[?3h",
+    "\x1bc",
+    "\x0e",
+    "\x0f",
+    "\x1b)0",
+    "\x1b[2I",
+    "\x1b[Z",
+    "\x1b[20h",
+    "\x1b[20l",
+    "\x1b[?2027h",
+    "\x1b[?2027l",
+    "\x1b[@",
+    "\x1b[2;9r",
+    "\x1b]133;B\x07",
+    "\x1b]133;C\x07",
+    "\x1b]133;D\x07",
+    "\x1b[?1000h",
+    "\x1b[?1006h",
+    "\x1b[3g",
+    "\x1b[?1016h",
+    "\x1b[?1005h",
+    "\x1b[?1016l",
+    "🇷🇴",
+    "\u{1F3FB}",
+    "\x1b[1;1H\x1b[2J",
+    "lqqk",
+];
+
 /// Random mixes of every family above, against the current core.
 #[test]
 fn random_sequences_match_the_current_core() {
-    const TOKENS: &[&str] = &[
-        "abc",
-        "hello world ",
-        "漢字",
-        "e\u{301}",
-        "❤\u{FE0F}",
-        "👍🏽",
-        "\t",
-        "\r",
-        "\n",
-        "\x08",
-        "\x1b[2;4r",
-        "\x1b[r",
-        "\x1bM",
-        "\x1b[2L",
-        "\x1b[M",
-        "\x1b[2S",
-        "\x1b[T",
-        "\x1b[3@",
-        "\x1b[2P",
-        "\x1b[4X",
-        "\x1b[J",
-        "\x1b[1J",
-        "\x1b[2J",
-        "\x1b[3J",
-        "\x1b[K",
-        "\x1b[1K",
-        "\x1b[?1049h",
-        "\x1b[?1049l",
-        "\x1b[?47h",
-        "\x1b[?47l",
-        "\x1b[?1047h",
-        "\x1b[?1047l",
-        "\x1b7",
-        "\x1b8",
-        "\x1b(0",
-        "\x1b(B",
-        "\x1b]8;;u://x\x07",
-        "\x1b]8;;\x07",
-        "\x1b]133;A\x07",
-        "\x1b]133;D;1\x07",
-        "\x1b[4h",
-        "\x1b[4l",
-        "\x1b[?6h",
-        "\x1b[?6l",
-        "\x1b[?7l",
-        "\x1b[?7h",
-        "\x1b[H",
-        "\x1b[3;5H",
-        "\x1b[2A",
-        "\x1b[3C",
-        "\x1bH",
-        "\x1b[g",
-        "\x1b[31;44m",
-        "\x1b[m",
-        "\x1b[5b",
-        "\x1b#8",
-        "\x1b[!p",
-        "\x1bE",
-        "\x1b]8;id=1;u://y\x07",
-        "\x1b[?3h",
-        "\x1bc",
-        "\x0e",
-        "\x0f",
-        "\x1b)0",
-        "\x1b[2I",
-        "\x1b[Z",
-        "\x1b[20h",
-        "\x1b[20l",
-        "\x1b[?2027h",
-        "\x1b[?2027l",
-        "\x1b[@",
-        "\x1b[2;9r",
-        "\x1b]133;B\x07",
-        "\x1b]133;C\x07",
-        "\x1b]133;D\x07",
-        "\x1b[?1000h",
-        "\x1b[?1006h",
-        "\x1b[3g",
-        "\x1b[?1016h",
-        "\x1b[?1005h",
-        "\x1b[?1016l",
-        "🇷🇴",
-        "\u{1F3FB}",
-        "\x1b[1;1H\x1b[2J",
-        "lqqk",
-    ];
     let mut seed = 0x2545_F491_u32;
     let mut next = || {
         seed ^= seed << 13;
@@ -649,5 +651,292 @@ fn events_titles_colors_replies_keyboard_and_cursor_style() {
             format!("{:?}", got.cursor_style()),
             format!("{:?}", want.cursor_style())
         );
+    }
+}
+
+/// Tokens that reflow has to get right: long soft-wrapped runs, wide
+/// characters landing on row ends, clusters, links and marks across wraps,
+/// styled blanks, explicit spaces before the cursor, and the alternate screen.
+const RESIZE_TOKENS: &[&str] = &[
+    "abcdefghijklmnopqrstuvwxyz0123456789",
+    "漢字漢字漢字漢字漢字漢字漢",
+    "a漢b字c漢d字e",
+    "x漢",
+    "e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}",
+    "👨\u{200D}👩\u{200D}👧👍🏽❤\u{FE0F}🇷🇴",
+    "\x1b]8;;u://wrap\x07link text that wraps around\x1b]8;;\x07",
+    "\x1b]133;A\x07$ \x1b]133;B\x07command\x1b]133;C\x07\r\n",
+    "\x1b[44m      \x1b[m",
+    "\x1b[4;58:5:3mund\x1b[m",
+    "        ",
+    "\r\n",
+    "\r\n\r\n\r\n",
+    "\x1b[K",
+    "\x1b[?1049h",
+    "\x1b[?1049l",
+    "\x1b[?47h",
+    "\x1b[?47l",
+    "\x1b7",
+    "\x1b8",
+    "\x1b[2;3r",
+    "\x1b[5;9H",
+    "\x1b[1;1H",
+    "\x1bH",
+    "\x1b[3g",
+    "\x1b[?7l",
+    "\x1b[?7h",
+    "\x1b[3P",
+    "\x1b[2@",
+];
+
+/// Applies `step` to the current core and to v2 alike.
+enum Step<'a> {
+    Feed(&'a [u8]),
+    Resize(usize, usize),
+}
+
+/// The primary screen's history origin, while it is shown (the alternate
+/// screen keeps no history) and keeps any.
+fn compare_origin(got: &Core, want: &Term<VoidListener>) -> Result<(), String> {
+    let alt = got
+        .mode
+        .contains(alacritty_terminal::term::TermMode::ALT_SCREEN);
+    if !alt && got.pages.history_limit != 0 {
+        let origin = want.grid().history_origin();
+        if got.pages.history_origin() != origin {
+            return Err(format!(
+                "history origin {}, reference {origin}",
+                got.pages.history_origin()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Everything a resize touches beyond what [`compare`] reads: the saved
+/// cursor, the history origin, and (through probes fed to both cores
+/// afterwards) the other screen, its cursors, tab stops and the scroll
+/// region.
+fn compare_resized(
+    got: &mut Core,
+    want: &mut Term<VoidListener>,
+    parsers: &mut (Processor<StdSyncHandler>, Processor<StdSyncHandler>),
+) -> Result<(), String> {
+    compare(got, want)?;
+    let saved = want.grid().saved_cursor.point;
+    if (got.saved.line, got.saved.col) != (saved.line.0 as usize, saved.column.0) {
+        return Err(format!(
+            "saved cursor {:?}, reference {saved:?}",
+            (got.saved.line, got.saved.col)
+        ));
+    }
+    compare_origin(got, want)?;
+    let alt = got
+        .mode
+        .contains(alacritty_terminal::term::TermMode::ALT_SCREEN);
+    let (lines, cols) = (got.lines(), got.cols());
+    let swap: &[u8] = if alt { b"\x1b[?1049l" } else { b"\x1b[?47h" };
+    let tabs = format!("\r{}", "\t*".repeat(cols));
+    let region = format!("\x1b[1;1H{}z", "\n".repeat(lines + 1));
+    for probe in [
+        b"\x1b8" as &[u8],
+        swap,
+        b"\x1b8",
+        tabs.as_bytes(),
+        region.as_bytes(),
+    ] {
+        parsers.0.advance(got, probe);
+        parsers.1.advance(want, probe);
+        compare(got, want).map_err(|e| format!("after probe {probe:?}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Runs `steps` on the current core (byte at a time) and on v2 (in `reads`
+/// of each feed: whole, byte by byte or pseudo-random), comparing after
+/// every resize and, with probes, at the end.
+fn check_resizes(lines: usize, cols: usize, history: usize, steps: &[Step], variant: usize) {
+    let config = Config {
+        scrolling_history: history,
+        ..Config::default()
+    };
+    let mut want = Term::new(config, &TermSize::new(cols, lines), VoidListener);
+    let mut got = match variant % 3 {
+        // Packed pages of four rows, with a budget that evicts nothing.
+        2 => Core::with_layout(lines, cols, history, Some(1 << 24), Some(4)),
+        _ => Core::new(lines, cols, history),
+    };
+    got.raw_text = variant.is_multiple_of(2);
+    let mut parsers = (Processor::<StdSyncHandler>::new(), Processor::new());
+    let mut seed = 0x1234_5679_u32 ^ variant as u32;
+    let mut log = String::new();
+    for (index, step) in steps.iter().enumerate() {
+        match step {
+            Step::Feed(bytes) => {
+                log.push_str(&String::from_utf8_lossy(bytes));
+                for byte in bytes.chunks(1) {
+                    parsers.1.advance(&mut want, byte);
+                }
+                let mut rest = *bytes;
+                while !rest.is_empty() {
+                    let n = match variant % 4 {
+                        0 => rest.len(),
+                        1 => 1,
+                        _ => {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 17;
+                            seed ^= seed << 5;
+                            (seed as usize % 13 + 1).min(rest.len())
+                        }
+                    };
+                    parsers.0.advance(&mut got, &rest[..n]);
+                    rest = &rest[n..];
+                }
+            }
+            &Step::Resize(lines, cols) => {
+                log.push_str(&format!("<resize {lines}x{cols}>"));
+                want.resize(TermSize::new(cols, lines));
+                got.resize(lines, cols);
+                if let Err(error) = compare(&got, &want) {
+                    panic!("variant {variant} step {index}: {error}\nsteps {log:?}");
+                }
+            }
+        }
+        if let Err(error) = compare_origin(&got, &want) {
+            panic!("variant {variant} step {index}: {error}\nsteps {log:?}");
+        }
+    }
+    if let Err(error) = compare_resized(&mut got, &mut want, &mut parsers) {
+        panic!("variant {variant} at the end: {error}\nsteps {log:?}");
+    }
+}
+
+#[test]
+fn resizes_reflow_like_the_current_core() {
+    let text = "first line that is long enough to wrap\r\n漢字漢字漢字かな\r\n\
+                e\u{301}\u{301}x 👍🏽 tail\x1b]8;;u://l\x07linked words\x1b]8;;\x07 end";
+    for variant in 0..6 {
+        let steps = [
+            Step::Feed(text.as_bytes()),
+            Step::Resize(4, 7),
+            Step::Resize(4, 3),
+            Step::Resize(6, 2),
+            Step::Resize(3, 2),
+            Step::Resize(5, 9),
+            Step::Feed(text.as_bytes()),
+            Step::Resize(2, 31),
+            Step::Resize(7, 5),
+            Step::Feed(b"\x1b[?1049hALT screen text\x1b[2;2H"),
+            Step::Resize(3, 4),
+            Step::Resize(6, 12),
+            Step::Feed(b"\x1b[?1049l"),
+            Step::Resize(5, 11),
+        ];
+        check_resizes(5, 10, 20, &steps, variant);
+        // The cursor on a continuation row that widening pulls up while
+        // content stays after it: rows below it are dropped to keep it.
+        let steps = [
+            Step::Feed(b"h1\r\nh2\r\nh3\r\n0123456789abcdef\r\nnext\r\nmore\r\nlast\x1b[2;3H"),
+            Step::Resize(5, 14),
+            Step::Feed(b"\x1b[3;2H"),
+            Step::Resize(5, 6),
+            Step::Resize(4, 20),
+        ];
+        check_resizes(5, 10, 20, &steps, variant);
+    }
+}
+
+/// Random output interleaved with random resizes (rows and columns growing
+/// and shrinking, down to two columns), against the current core. One
+/// column is [`random_narrow_resizes_match_the_current_core`]: with a wide
+/// character on the screen or in history the current core never finishes
+/// narrowing to one column.
+#[test]
+fn random_resizes_match_the_current_core() {
+    random_resizes(0x6C07_8965, 48, 2, &[RESIZE_TOKENS, TOKENS]);
+}
+
+/// [`random_resizes_match_the_current_core`] down to one column, with only
+/// narrow characters (clusters included).
+#[test]
+fn random_narrow_resizes_match_the_current_core() {
+    let narrow = |tokens: &[&'static str]| -> Vec<&'static str> {
+        tokens
+            .iter()
+            .copied()
+            .filter(|token| token.chars().all(|c| (c as u32) < 0x1100))
+            .collect()
+    };
+    let (resize_tokens, tokens) = (narrow(RESIZE_TOKENS), narrow(TOKENS));
+    random_resizes(0x0BAD_5EED, 24, 1, &[&resize_tokens, &tokens]);
+}
+
+/// A wide character narrowed to one column stays there, its spacer on the
+/// next row (the current core does not finish this resize), and widening
+/// again keeps every character with a spacer after it.
+#[test]
+fn a_wide_character_narrowed_to_one_column_stays() {
+    let mut core = Core::new(3, 4, 10);
+    let mut parser = Processor::<StdSyncHandler>::new();
+    parser.advance(&mut core, "a漢\r\n漢字".as_bytes());
+    let text = |core: &Core| -> String {
+        (-(core.history_size() as i32)..core.lines() as i32)
+            .flat_map(|line| (0..core.cols()).map(move |col| (line, col)))
+            .map(|(line, col)| core.cell(line, col))
+            .filter(|cell| !cell.has(super::cell::SPACER | super::cell::LEADING))
+            .map(|cell| cell.ch())
+            .filter(|c| *c != ' ')
+            .collect()
+    };
+    core.resize(3, 1);
+    assert_eq!(text(&core), "a漢漢字");
+    core.resize(3, 4);
+    assert_eq!(text(&core), "a漢漢字");
+    for line in -(core.history_size() as i32)..3 {
+        for col in 0..4 {
+            if core.cell(line, col).has(super::cell::WIDE) {
+                assert!(col + 1 < 4 && core.cell(line, col + 1).has(super::cell::SPACER));
+            }
+        }
+    }
+}
+
+/// `runs` random mixes of `tokens` (each feed draws from one of the sets)
+/// with eight resizes each, to at least `min_cols` columns.
+fn random_resizes(mut seed: u32, runs: usize, min_cols: usize, tokens: &[&[&str]]) {
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed as usize
+    };
+    // `CORE_V2_FUZZ=<n>` runs n inputs instead.
+    let runs = std::env::var("CORE_V2_FUZZ").map_or(runs, |n| n.parse().expect("count"));
+    for run in 0..runs {
+        let mut feeds = Vec::new();
+        let mut sizes = Vec::new();
+        for _ in 0..8 {
+            let mut feed = String::new();
+            for _ in 0..next() % 12 {
+                let set = tokens[next() % tokens.len()];
+                feed.push_str(set[next() % set.len()]);
+            }
+            feeds.push(feed);
+            let cols = if next() % 3 == 0 {
+                min_cols + next() % 4
+            } else {
+                min_cols + next() % 24
+            };
+            sizes.push((1 + next() % 9, cols));
+        }
+        let mut steps = Vec::new();
+        for (feed, &(lines, cols)) in feeds.iter().zip(&sizes) {
+            steps.push(Step::Feed(feed.as_bytes()));
+            steps.push(Step::Resize(lines, cols));
+        }
+        steps.push(Step::Feed(b"tail text after the last resize"));
+        let history = [0, 3, 40][run % 3];
+        let (lines, cols) = [(5, 9), (3, 4), (7, 16)][run / 3 % 3];
+        check_resizes(lines, cols, history, &steps, run);
     }
 }
