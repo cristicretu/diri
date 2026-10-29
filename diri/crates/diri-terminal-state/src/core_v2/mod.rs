@@ -6,6 +6,7 @@
 mod bridge;
 pub mod cell;
 pub mod check;
+mod events;
 mod ops;
 pub mod page;
 pub mod term;

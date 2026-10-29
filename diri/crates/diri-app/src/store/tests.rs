@@ -1329,6 +1329,28 @@ fn closing_an_exited_parent_with_an_exited_terminal_needs_no_confirmation() {
 }
 
 #[test]
+fn idle_shells_close_without_confirmation() {
+    let mut idle = session("idle-shell", "p", 2.0);
+    idle.kind = AgentKind::SHELL;
+    let mut busy = session("busy-shell", "p", 1.0);
+    busy.kind = AgentKind::SHELL;
+    busy.status = SessionStatus::Working;
+    let (mut store, mut effects) = hydrated(
+        vec![idle, busy],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+
+    store.request_close(vec![id("idle-shell")]);
+    assert!(store.pending_close.is_none());
+    assert!(drain(&mut effects).contains(&StoreEffect::Remove(id("idle-shell"))));
+
+    store.request_close(vec![id("busy-shell")]);
+    assert!(store.pending_close.is_some());
+}
+
+#[test]
 fn a_real_process_exit_immediately_detaches_and_removes_the_agent() {
     let (mut store, mut effects) = hydrated(
         vec![session("one", "p", 1.0)],
@@ -4447,6 +4469,77 @@ fn read_aloud_can_pick_one_tab_or_all_but_one() {
     assert!(store.tab_reads_aloud(&SessionId("later".into())));
     store.set_read_aloud(a.id.clone(), ReadAloudChoice::All);
     assert!(store.reads_aloud(&a.id) && store.reads_aloud(&b.id));
+}
+
+/// `dirijor note open` and `start_from_note` ask the app to show a Session
+/// with `session.reveal`. The Engine filters events by the kinds the client
+/// subscribed to, so the store's reveal handler only runs when the client
+/// asks for that kind. Real Engine, real client, real store runtime.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_engine_session_reveal_selects_the_session_in_the_app() {
+    let root = tempdir().unwrap();
+    let (manifests, _) =
+        diri_engine::ManifestEngine::load_dir(&diri_engine::detect::bundled_manifest_dir())
+            .unwrap();
+    let mut registry =
+        diri_engine::Registry::new(Arc::new(manifests), root.path().join("state.json"));
+    for (name, created) in [("one", 2.0), ("two", 1.0)] {
+        let mut record = session(name, "p", created);
+        record.status = SessionStatus::Exited(ExitInfo {
+            reason: ExitReason::Exited,
+            code: Some(0),
+            signal: None,
+            system_restart: false,
+            interrupted: false,
+        });
+        registry.insert_record(record);
+    }
+    let server = Arc::new(diri_engine::ControlServer::new(
+        Arc::new(std::sync::Mutex::new(registry)),
+        root.path().join("daemon.sock"),
+    ));
+    let listener = server.bind().unwrap();
+    {
+        let server = Arc::clone(&server);
+        std::thread::spawn(move || {
+            while let Ok((stream, _)) = listener.accept() {
+                let server = Arc::clone(&server);
+                std::thread::spawn(move || {
+                    let _ = server.serve(stream);
+                });
+            }
+        });
+    }
+
+    let client = Arc::new(DaemonClient::with_socket_path(server.socket_path()));
+    let (store, effects) = SessionStore::headless(Prefs::default());
+    let runtime = StoreRuntime::start_with_store(client, store, effects, ClientStartup::Immediate);
+    runtime.client.connect();
+    let store = Arc::clone(&runtime.store);
+    eventually("the Engine's sessions hydrate", {
+        let store = Arc::clone(&store);
+        move || store.read().unwrap().has_hydrated_sessions()
+    })
+    .await;
+    store.write().unwrap().select(id("one"));
+
+    runtime
+        .client
+        .request(
+            diri_proto::Method::SESSION_REVEAL,
+            Some(&serde_json::json!({ "sessionID": "two" })),
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .expect("the Engine accepts the reveal");
+    eventually("the reveal reaches the store and selects the session", {
+        let store = Arc::clone(&store);
+        move || store.read().unwrap().selected_session_id() == Some(&id("two"))
+    })
+    .await;
+
+    runtime.shutdown().await;
 }
 
 /// A session holding one unresolved attention event of `kind`.

@@ -320,10 +320,12 @@ fn decrqm_reports_the_newly_recognized_modes() {
         ("\x1b[?1047$p", "\x1b[?1047;2$y"),
         ("\x1b[?2031$p", "\x1b[?2031;2$y"),
         ("\x1b[?2048$p", "\x1b[?2048;2$y"),
+        ("\x1b[?1016$p", "\x1b[?1016;2$y"),
+        ("\x1b[?1016h\x1b[?1016$p", "\x1b[?1016;1$y"),
+        ("\x1b[?1016l\x1b[?1016$p", "\x1b[?1016;2$y"),
         // Recognized but not implemented: permanently reset, so a program
         // falls back instead of enabling something that will not happen.
         ("\x1b[?69$p", "\x1b[?69;4$y"),
-        ("\x1b[?1016$p", "\x1b[?1016;4$y"),
         ("\x1b[?69h\x1b[?69$p", "\x1b[?69;4$y"),
         ("\x1b[?47h\x1b[?47$p", "\x1b[?47;1$y"),
         ("\x1b[?47l\x1b[?1047h\x1b[?1047$p", "\x1b[?1047;1$y"),

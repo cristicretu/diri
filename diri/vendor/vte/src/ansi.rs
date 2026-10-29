@@ -326,6 +326,13 @@ impl<T: Timeout> Processor<T> {
         Self::default()
     }
 
+    /// DIRI PATCH: prints ground-state text one character at a time
+    /// instead of as runs; see [`crate::Parser::set_per_character_print`].
+    #[doc(hidden)]
+    pub fn set_per_character_print(&mut self, per_character: bool) {
+        self.parser.set_per_character_print(per_character);
+    }
+
     /// Synchronized update timeout.
     pub fn sync_timeout(&self) -> &T {
         &self.state.sync_state.timeout
@@ -352,6 +359,32 @@ impl<T: Timeout> Processor<T> {
                 let mut performer = Performer::new(&mut self.state, handler);
                 processed +=
                     self.parser.advance_until_terminated(&mut performer, &bytes[processed..]);
+            }
+        }
+    }
+
+    /// Diri patch: [`Self::advance`] with the read's [`crate::scan::C0Index`],
+    /// which must describe `bytes` exactly. String bodies end where the index
+    /// says; bytes held for a synchronized update are parsed without it.
+    pub fn advance_indexed<H>(
+        &mut self,
+        handler: &mut H,
+        bytes: &[u8],
+        index: crate::scan::C0Index<'_>,
+    ) where
+        H: Handler,
+    {
+        let mut processed = 0;
+        while processed != bytes.len() {
+            if self.state.sync_state.timeout.pending_timeout() {
+                processed += self.advance_sync(handler, &bytes[processed..]);
+            } else {
+                let mut performer = Performer::new(&mut self.state, handler);
+                processed += self.parser.advance_until_terminated_indexed(
+                    &mut performer,
+                    &bytes[processed..],
+                    Some(index.offset(processed)),
+                );
             }
         }
     }
@@ -595,10 +628,23 @@ pub trait Handler {
     }
 
     /// DIRI PATCH: REP, `c` printed `count` times. Must be equivalent to
-    /// calling [`Handler::input`] `count` times, which the default does.
+    /// calling [`Handler::input`] `count` times. The default writes a
+    /// repeated printable ASCII character as a run, a row segment at a time
+    /// like any other (`input_ascii` equals `input` per character).
     fn input_repeat(&mut self, c: char, count: usize) {
-        for _ in 0..count {
-            self.input(c);
+        if (' '..='~').contains(&c) {
+            let run = [c as u8; 256];
+            let mut left = count;
+            while left != 0 {
+                let take = left.min(run.len());
+                let text = str::from_utf8(&run[..take]).expect("ASCII");
+                self.input_ascii(text);
+                left -= take;
+            }
+        } else {
+            for _ in 0..count {
+                self.input(c);
+            }
         }
     }
 
@@ -1106,8 +1152,8 @@ pub enum NamedPrivateMode {
     /// DIRI PATCH: left and right margins (DECLRMM). Recognized so DECRQM can
     /// report it as permanently reset; margins are not implemented.
     LeftRightMargins = 69,
-    /// DIRI PATCH: SGR mouse reports in pixels. Recognized so DECRQM can
-    /// report it as permanently reset; pixel reports are not implemented.
+    /// DIRI PATCH: SGR mouse reports with pixel coordinates (xterm
+    /// SGR-Pixels), exclusive with the other mouse encodings.
     SgrPixelMouse = 1016,
     /// DIRI PATCH: alternate screen that is cleared on exit; the cursor is
     /// shared.
@@ -1520,6 +1566,18 @@ where
     }
 
     #[inline]
+    fn put_slice(&mut self, bytes: &[u8]) {
+        if let Some(request) = &mut self.state.dcs {
+            // `put` stores bytes until the limit and flags any past it.
+            let room = DCS_REQUEST_MAX.saturating_sub(request.payload.len());
+            request.payload.extend_from_slice(&bytes[..bytes.len().min(room)]);
+            if bytes.len() > room {
+                request.overflowed = true;
+            }
+        }
+    }
+
+    #[inline]
     fn unhook(&mut self) {
         let Some(request) = self.state.dcs.take() else {
             return;
@@ -1538,6 +1596,11 @@ where
         let terminator = if bell_terminated { "\x07" } else { "\x1b\\" };
 
         fn unhandled(params: &[&[u8]]) {
+            // Diri patch: formatting every byte of a long OSC nobody logs
+            // cost more than parsing it.
+            if !log::log_enabled!(log::Level::Debug) {
+                return;
+            }
             let mut buf = String::new();
             for items in params {
                 buf.push('[');
@@ -2275,6 +2338,41 @@ mod tests {
         identity_reported: bool,
         color: Option<Rgb>,
         reset_colors: Vec<usize>,
+    }
+
+    #[derive(Default)]
+    struct Termcaps(Vec<Vec<u8>>);
+
+    impl Handler for Termcaps {
+        fn request_termcap(&mut self, names: &[u8]) {
+            self.0.push(names.to_vec());
+        }
+    }
+
+    #[test]
+    fn dcs_requests_in_runs_keep_the_per_byte_cap_and_filtering() {
+        for len in [0, 1, 1023, 1024, 1025, 5000] {
+            // DEL and bytes from 0x80 are not passed through; C0 bytes are.
+            let mut body = Vec::new();
+            for index in 0..len {
+                body.push(b'a' + (index % 26) as u8);
+                if index % 97 == 5 {
+                    body.extend_from_slice(b"\x7f\xc3\x01");
+                }
+            }
+            let kept: Vec<u8> = body.iter().copied().filter(|&byte| byte < 0x7f).collect();
+            let expected: Vec<Vec<u8>> =
+                if kept.len() <= DCS_REQUEST_MAX { vec![kept] } else { vec![] };
+            let stream = [b"\x1bP+q".as_slice(), &body, b"\x1b\\"].concat();
+            for read in [1, 7, stream.len()] {
+                let mut handler = Termcaps::default();
+                let mut parser = Processor::<StdSyncHandler>::new();
+                for chunk in stream.chunks(read) {
+                    parser.advance(&mut handler, chunk);
+                }
+                assert_eq!(handler.0, expected, "{len} bytes in reads of {read}");
+            }
+        }
     }
 
     impl Handler for MockHandler {

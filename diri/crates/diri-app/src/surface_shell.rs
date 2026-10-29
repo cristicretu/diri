@@ -130,6 +130,10 @@ enum SettingsMenu {
     Language,
     DefaultAgent,
     TerminalTheme,
+    /// The theme System appearance uses while the OS is light.
+    TerminalThemeLight,
+    /// The theme System appearance uses while the OS is dark.
+    TerminalThemeDark,
     TerminalFont,
     RegularFace,
     BoldFace,
@@ -319,6 +323,12 @@ struct AgentPathEditor {
     configured_path: Option<String>,
     path: QueryEditor,
     show_in_quick_create: bool,
+    error: Option<String>,
+}
+
+/// The new-terminal command field and why it cannot be saved, if it cannot.
+struct ShellCommandEditor {
+    text: QueryEditor,
     error: Option<String>,
 }
 
@@ -606,6 +616,9 @@ pub struct UtilitySurfaces {
     shortcut_editor: Option<ShortcutEditor>,
     /// The open theme menu's search; typing goes here while it is open.
     theme_search: QueryEditor,
+    /// The OS appearance at the last render, for theme choices made from a
+    /// key press, which has no window to ask.
+    system_is_dark: bool,
     theme_scroll: UniformListScrollHandle,
     /// The last theme import or export, shown beside its buttons.
     theme_file_status: Option<ThemeFileStatus>,
@@ -625,6 +638,8 @@ pub struct UtilitySurfaces {
     settings_menu: Option<SettingsMenu>,
     agents_host: Option<String>,
     agent_path_editor: Option<AgentPathEditor>,
+    /// Settings › Terminal: the new-terminal command being edited.
+    shell_command_editor: Option<ShellCommandEditor>,
     hosts_path: PathBuf,
     hosts: Vec<HostEntry>,
     host_editor: Option<HostEditor>,
@@ -850,6 +865,7 @@ impl UtilitySurfaces {
             shortcut_search_active: false,
             shortcut_editor: None,
             theme_search: QueryEditor::default(),
+            system_is_dark: true,
             theme_scroll: UniformListScrollHandle::new(),
             theme_file_status: None,
             include_path,
@@ -868,6 +884,7 @@ impl UtilitySurfaces {
             settings_menu: None,
             agents_host,
             agent_path_editor: None,
+            shell_command_editor: None,
             hosts_path,
             hosts,
             host_editor: None,
@@ -1845,6 +1862,141 @@ impl UtilitySurfaces {
         true
     }
 
+    fn handle_shell_command_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings
+            || self.settings_tab != SettingsTab::Terminal
+            || self.shell_command_editor.is_none()
+        {
+            return false;
+        }
+        let key = &event.keystroke;
+        match key.key.as_str() {
+            "escape" => self.shell_command_editor = None,
+            "enter" => self.save_shell_command(),
+            _ => {
+                let Some(edit) = query_editor::edit_for(key) else {
+                    return false;
+                };
+                let Some(editor) = &mut self.shell_command_editor else {
+                    return false;
+                };
+                match edit {
+                    Edit::Local(local) => {
+                        editor.text.apply(local);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Copy) => {
+                        query_editor::copy_selection(&editor.text, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Cut) => {
+                        query_editor::cut_selection(&mut editor.text, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Paste) => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                            editor.text.insert(&text);
+                        }
+                    }
+                }
+                editor.error = None;
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    fn open_shell_command_editor(&mut self) {
+        let mut text = QueryEditor::default();
+        text.insert(&self.prefs.terminal_shell_command);
+        self.shell_command_editor = Some(ShellCommandEditor { text, error: None });
+    }
+
+    /// Saves the new-terminal command, or keeps the editor open saying why
+    /// it cannot be read as words. Empty is the login shell.
+    fn save_shell_command(&mut self) {
+        let Some(editor) = &mut self.shell_command_editor else {
+            return;
+        };
+        let text = editor.text.text().trim().to_owned();
+        if crate::agent_catalog::split_launch_args(&text).is_none() {
+            editor.error = Some(t("settings.agents.args_unbalanced").into());
+            return;
+        }
+        self.shell_command_editor = None;
+        self.update_prefs(move |prefs| prefs.terminal_shell_command = text);
+    }
+
+    fn shell_command_editor_row(
+        &self,
+        editor: &ShellCommandEditor,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut row = div()
+            .px(px(12.0))
+            .py(px(10.0))
+            .flex()
+            .flex_col()
+            .gap(px(7.0))
+            .child(
+                div()
+                    .debug_selector(|| "shell-command-field".into())
+                    .h(px(30.0))
+                    .px(px(8.0))
+                    .rounded(px(Radius::CHIP))
+                    .border_1()
+                    .border_color(colors.primary.alpha(0.14))
+                    .flex()
+                    .items_center()
+                    .text_size(px(11.0))
+                    .text_color(colors.primary)
+                    .font_family(crate::fonts::terminal_family(
+                        &self.prefs.terminal_font_family,
+                    ))
+                    .child(if editor.text.is_empty() {
+                        div()
+                            .text_color(colors.tertiary)
+                            .child(t("settings.terminal.shell_command_placeholder"))
+                            .into_any_element()
+                    } else {
+                        query_label(&editor.text)
+                    }),
+            );
+        if let Some(error) = &editor.error {
+            row = row.child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(Ink::DANGER)
+                    .child(error.clone()),
+            );
+        }
+        row.child(
+            div()
+                .flex()
+                .justify_end()
+                .gap(px(7.0))
+                .child(surface_button(
+                    t("settings.agents.cancel"),
+                    "cancel-shell-command",
+                    colors,
+                    cx,
+                    |this, cx| {
+                        this.shell_command_editor = None;
+                        cx.notify();
+                    },
+                ))
+                .child(surface_button(
+                    t("settings.terminal.shell_command_save"),
+                    "save-shell-command",
+                    colors,
+                    cx,
+                    |this, cx| {
+                        this.save_shell_command();
+                        cx.notify();
+                    },
+                )),
+        )
+        .into_any_element()
+    }
+
     fn handle_include_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
         if self.surface != Surface::Settings
             || self.settings_tab != SettingsTab::General
@@ -2411,7 +2563,7 @@ impl UtilitySurfaces {
     /// first match and Escape closes the menu.
     fn handle_theme_search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
         if self.surface != Surface::Settings
-            || self.settings_menu != Some(SettingsMenu::TerminalTheme)
+            || self.theme_menu_side().is_none()
         {
             return false;
         }
@@ -2461,18 +2613,39 @@ impl UtilitySurfaces {
         true
     }
 
+    /// Which theme the open theme menu picks: `Some(None)` the one theme
+    /// for every appearance, `Some(Some(dark))` one side of System.
+    fn theme_menu_side(&self) -> Option<Option<bool>> {
+        match self.settings_menu? {
+            SettingsMenu::TerminalTheme => Some(None),
+            SettingsMenu::TerminalThemeLight => Some(Some(false)),
+            SettingsMenu::TerminalThemeDark => Some(Some(true)),
+            _ => None,
+        }
+    }
+
+    /// The theme the open theme menu marks as chosen.
+    fn theme_menu_selection(&self) -> String {
+        match self.theme_menu_side().flatten() {
+            Some(dark) => self.prefs.system_theme(dark).to_owned(),
+            None => self.prefs.terminal_theme.clone(),
+        }
+    }
+
     fn choose_terminal_theme(&mut self, id: &'static str) {
+        let side = self.theme_menu_side().flatten();
+        let system_is_dark = self.system_is_dark;
         self.settings_menu = None;
-        self.update_prefs(move |prefs| {
-            prefs.follow_system_theme = false;
-            prefs.terminal_theme = id.to_owned();
+        self.update_prefs(move |prefs| match side {
+            Some(dark) => prefs.set_system_theme(dark, id, system_is_dark),
+            None => prefs.set_fixed_theme(id, theme(id).appearance == ThemeAppearance::Dark),
         });
     }
 
     /// Opens the theme menu at the selected theme with an empty search.
     fn open_terminal_theme_menu(&mut self) {
         self.theme_search.clear();
-        let selected = self.prefs.terminal_theme.clone();
+        let selected = self.theme_menu_selection();
         if let Some(index) = theme_picker_rows("")
             .iter()
             .position(|row| matches!(row, ThemePickerRow::Theme(theme) if theme.id == selected))
@@ -2767,6 +2940,7 @@ impl UtilitySurfaces {
             || self.handle_include_key(event, cx)
             || self.handle_roots_key(event, cx)
             || self.handle_agent_path_key(event, cx)
+            || self.handle_shell_command_key(event, cx)
             || self.handle_host_editor_key(event, cx)
         {
             return;
@@ -5559,7 +5733,9 @@ impl UtilitySurfaces {
         Some(match self.settings_menu.as_ref()? {
             SettingsMenu::Language => (self.language_options(colors, cx), 204.0),
             SettingsMenu::DefaultAgent => (self.default_agent_options(colors, cx), 204.0),
-            SettingsMenu::TerminalTheme => (self.terminal_theme_options(colors, cx), 252.0),
+            SettingsMenu::TerminalTheme
+            | SettingsMenu::TerminalThemeLight
+            | SettingsMenu::TerminalThemeDark => (self.terminal_theme_options(colors, cx), 252.0),
             SettingsMenu::TerminalFont => (self.terminal_font_options(colors, cx), 252.0),
             SettingsMenu::RegularFace | SettingsMenu::BoldFace | SettingsMenu::ItalicFace => {
                 let menu = self.settings_menu.unwrap_or(SettingsMenu::RegularFace);
@@ -5675,7 +5851,7 @@ impl UtilitySurfaces {
     /// virtual: only visible rows are built, so hundreds of themes cost what
     /// a dozen did.
     fn terminal_theme_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
-        let selected = theme(&self.prefs.terminal_theme).id;
+        let selected = theme(&self.theme_menu_selection()).id;
         let rows = Rc::new(theme_picker_rows(self.theme_search.text()));
         let search_content = if self.theme_search.is_empty() {
             div()
@@ -6521,10 +6697,31 @@ impl UtilitySurfaces {
                     div()
                         .flex()
                         .flex_col()
-                        .child(row(
-                            t("settings.appearance.color_theme"),
-                            self.terminal_theme_dropdown(cx).into_any_element(),
-                        ))
+                        .children(if self.prefs.follow_system_theme {
+                            // System appearance: a theme for each side.
+                            vec![
+                                row(
+                                    t("settings.appearance.light_theme"),
+                                    self.terminal_theme_dropdown(
+                                        SettingsMenu::TerminalThemeLight,
+                                        cx,
+                                    ),
+                                ),
+                                setting_divider(colors).into_any_element(),
+                                row(
+                                    t("settings.appearance.dark_theme"),
+                                    self.terminal_theme_dropdown(
+                                        SettingsMenu::TerminalThemeDark,
+                                        cx,
+                                    ),
+                                ),
+                            ]
+                        } else {
+                            vec![row(
+                                t("settings.appearance.color_theme"),
+                                self.terminal_theme_dropdown(SettingsMenu::TerminalTheme, cx),
+                            )]
+                        })
                         .child(setting_divider(colors))
                         .child(row(
                             t("settings.appearance.theme_files"),
@@ -6566,6 +6763,22 @@ impl UtilitySurfaces {
                                 cx,
                             )
                             .into_any_element(),
+                        ))
+                        .child(setting_divider(colors))
+                        .child(toggle_row(
+                            t("settings.appearance.reduce_motion"),
+                            t("settings.appearance.reduce_motion_detail"),
+                            self.prefs.reduce_motion,
+                            "reduce_motion",
+                            colors,
+                            cx,
+                            |this, cx| {
+                                let enabled = !this.prefs.reduce_motion;
+                                if this.update_prefs(move |prefs| prefs.reduce_motion = enabled) {
+                                    crate::motion::set_preference(enabled, cx);
+                                }
+                                cx.notify();
+                            },
                         )),
                     colors,
                 ))
@@ -6818,6 +7031,51 @@ impl UtilitySurfaces {
                     div()
                         .flex()
                         .flex_col()
+                        .child(setting_row(
+                            t("settings.terminal.shell_command"),
+                            if self.prefs.terminal_shell_command.trim().is_empty() {
+                                SharedString::from(t("settings.terminal.shell_command_login"))
+                            } else {
+                                tf(
+                                    "settings.terminal.shell_command_custom",
+                                    &[("command", &self.prefs.terminal_shell_command.trim())],
+                                )
+                                .into()
+                            },
+                            div()
+                                .flex()
+                                .gap(px(7.0))
+                                .when(!self.prefs.terminal_shell_command.trim().is_empty(), |row| {
+                                    row.child(surface_button(
+                                        t("settings.terminal.shell_command_reset"),
+                                        "reset-shell-command",
+                                        colors,
+                                        cx,
+                                        |this, cx| {
+                                            this.shell_command_editor = None;
+                                            this.update_prefs(|prefs| {
+                                                prefs.terminal_shell_command.clear()
+                                            });
+                                            cx.notify();
+                                        },
+                                    ))
+                                })
+                                .child(surface_button(
+                                    t("settings.terminal.shell_command_edit"),
+                                    "edit-shell-command",
+                                    colors,
+                                    cx,
+                                    |this, cx| {
+                                        this.open_shell_command_editor();
+                                        cx.notify();
+                                    },
+                                )),
+                            colors,
+                        ))
+                        .children(self.shell_command_editor.as_ref().map(|editor| {
+                            self.shell_command_editor_row(editor, colors, cx)
+                        }))
+                        .child(setting_divider(colors))
                         .child(toggle_row(
                             t("settings.appearance.paste_protection"),
                             t("settings.appearance.paste_protection_detail"),
@@ -7909,18 +8167,34 @@ impl UtilitySurfaces {
         options.into_any_element()
     }
 
-    fn terminal_theme_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
-        let selected = theme(&self.prefs.terminal_theme);
+    /// The theme select for `menu`: the one theme, or one side of System.
+    fn terminal_theme_dropdown(&self, menu: SettingsMenu, cx: &mut Context<Self>) -> AnyElement {
+        let (id, element_id) = match menu {
+            SettingsMenu::TerminalThemeLight => (
+                self.prefs.system_theme(false),
+                "terminal-theme-light-dropdown",
+            ),
+            SettingsMenu::TerminalThemeDark => (
+                self.prefs.system_theme(true),
+                "terminal-theme-dark-dropdown",
+            ),
+            _ => (
+                self.prefs.terminal_theme.as_str(),
+                "terminal-theme-dropdown",
+            ),
+        };
+        let selected = theme(id);
         let colors = self.settings_colors();
-        let open = self.settings_menu == Some(SettingsMenu::TerminalTheme);
+        let open = self.settings_menu == Some(menu);
         let mut control = div()
             .relative()
+            .debug_selector(move || element_id.into())
             .min_w(px(158.0))
             .child(settings_select_button(
                 selected.name,
-                "terminal-theme-dropdown",
+                element_id,
                 open,
-                SettingsMenu::TerminalTheme,
+                menu,
                 colors,
                 cx,
             ));
@@ -8150,6 +8424,10 @@ impl Focusable for UtilitySurfaces {
 impl Render for UtilitySurfaces {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::perf_overlay::rendered("settings");
+        self.system_is_dark = matches!(
+            window.appearance(),
+            gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+        );
         self.sync_computer_setup(cx);
         self.hosts = self
             .store
@@ -9563,7 +9841,7 @@ fn settings_select_button(
             } else {
                 Some(menu)
             };
-            if this.settings_menu == Some(SettingsMenu::TerminalTheme) {
+            if this.theme_menu_side().is_some() {
                 this.open_terminal_theme_menu();
             }
             if this.settings_menu == Some(SettingsMenu::TerminalFont) {
@@ -9738,12 +10016,9 @@ fn appearance_mode_card(
                 } else if (theme(&prefs.terminal_theme).appearance == ThemeAppearance::Light)
                     != light
                 {
-                    prefs.terminal_theme = if light {
-                        "dirijor-light"
-                    } else {
-                        "dirijor-dark"
-                    }
-                    .into();
+                    // The side's remembered theme, which is Diri's own
+                    // light or dark until one is chosen.
+                    prefs.terminal_theme = prefs.system_theme(!light).to_owned();
                 }
             });
             cx.notify();
@@ -10255,6 +10530,17 @@ mod tests {
                     harness
                         .sidebar
                         .update(cx, |sidebar, cx| sidebar.set_width(320.0, cx));
+                    // `DIRI_VISUAL_SHELL_COMMAND=<text>`: a saved new-terminal
+                    // command; `DIRI_VISUAL_SHELL_EDITOR` opens its editor.
+                    if let Ok(command) = std::env::var("DIRI_VISUAL_SHELL_COMMAND") {
+                        harness.surfaces.update(cx, |surfaces, cx| {
+                            surfaces.prefs.terminal_shell_command = command;
+                            if std::env::var_os("DIRI_VISUAL_SHELL_EDITOR").is_some() {
+                                surfaces.open_shell_command_editor();
+                            }
+                            cx.notify();
+                        });
+                    }
                     // `DIRI_VISUAL_TRUSTED_LINKS=ssh,vscode` lists trusted
                     // app-link schemes in Settings › Terminal.
                     if let Ok(schemes) = std::env::var("DIRI_VISUAL_TRUSTED_LINKS") {
@@ -11521,6 +11807,18 @@ mod tests {
                     if let Some(value) = transparency {
                         harness.surfaces.update(cx, |surfaces, cx| {
                             surfaces.set_window_transparency(value, cx);
+                        });
+                    }
+                    // DIRI_APPEARANCE_SYSTEM: following the system appearance,
+                    // with a chosen light and dark theme.
+                    if std::env::var_os("DIRI_APPEARANCE_SYSTEM").is_some() {
+                        harness.surfaces.update(cx, |surfaces, cx| {
+                            surfaces.update_prefs(|prefs| {
+                                prefs.follow_system_theme = true;
+                                prefs.set_system_theme(false, "github-light-default", true);
+                                prefs.set_system_theme(true, "vesper", true);
+                            });
+                            cx.notify();
                         });
                     }
                     let family = std::env::var("DIRI_APPEARANCE_FONT").ok();
@@ -12983,6 +13281,76 @@ mod tests {
     }
 
     #[gpui::test]
+    fn terminal_settings_edit_the_new_terminal_command(cx: &mut TestAppContext) {
+        let (harness, cx) = cx.add_window_view(|window, cx| {
+            SettingsWorkbenchHarness::open_at(SettingsTab::Terminal, window, cx)
+        });
+        cx.simulate_resize(size(px(1200.0), px(800.0)));
+        cx.run_until_parked();
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        assert!(cx.debug_bounds("shell-command-field").is_none());
+
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_shell_command_editor();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("shell-command-field").is_some());
+        // An unbalanced quote stays open with the reason.
+        surfaces.update(cx, |surfaces, _| {
+            let editor = surfaces.shell_command_editor.as_mut().unwrap();
+            editor.text.insert("zsh -c 'oops");
+            surfaces.save_shell_command();
+            assert!(surfaces.shell_command_editor.as_ref().unwrap().error.is_some());
+            assert!(surfaces.prefs.terminal_shell_command.is_empty());
+            let editor = surfaces.shell_command_editor.as_mut().unwrap();
+            editor.text = QueryEditor::default();
+            editor.text.insert("  nix develop  ");
+            surfaces.save_shell_command();
+            assert!(surfaces.shell_command_editor.is_none());
+            assert_eq!(surfaces.prefs.terminal_shell_command, "nix develop");
+            let store = surfaces.store.read().unwrap();
+            assert_eq!(
+                store.terminal_settings().shell_command,
+                Some(vec!["nix".to_owned(), "develop".to_owned()]),
+                "the Engine is sent argv"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn reduce_motion_turns_animations_off_and_back_on(cx: &mut TestAppContext) {
+        let (harness, cx) = cx.add_window_view(|window, cx| {
+            SettingsWorkbenchHarness::open_at(SettingsTab::Appearance, window, cx)
+        });
+        cx.simulate_resize(size(px(1200.0), px(1600.0)));
+        cx.run_until_parked();
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        cx.update(|_, cx| crate::motion::set_system(false, cx));
+        assert!(!cx.update(|_, cx| cx.reduce_motion()));
+
+        for expected in [true, false] {
+            let toggle = cx
+                .debug_bounds("reduce_motion")
+                .expect("the motion toggle renders");
+            cx.simulate_click(toggle.center(), Modifiers::default());
+            cx.run_until_parked();
+            assert_eq!(cx.update(|_, cx| cx.reduce_motion()), expected);
+            surfaces.read_with(cx, |surfaces, _| {
+                assert_eq!(surfaces.prefs.reduce_motion, expected);
+                assert_eq!(
+                    surfaces.store.read().unwrap().preferences().reduce_motion,
+                    expected
+                );
+            });
+        }
+        // With Diri's own setting off, the system setting still decides.
+        cx.update(|_, cx| crate::motion::set_system(true, cx));
+        assert!(cx.update(|_, cx| cx.reduce_motion()));
+        cx.update(|_, cx| crate::motion::set_system(false, cx));
+    }
+
+    #[gpui::test]
     fn appearance_modes_switch_the_palette_and_persist_system_following(cx: &mut TestAppContext) {
         let (harness, cx) = cx.add_window_view(|window, cx| {
             SettingsWorkbenchHarness::open_at(SettingsTab::Appearance, window, cx)
@@ -13015,6 +13383,35 @@ mod tests {
             });
             assert!(cx.debug_bounds("APPEARANCE_WORKSPACE_PREVIEW").is_some());
         }
+
+        // Following the system, the page offers a theme for each side
+        // instead of one theme, and a pick stays on System.
+        assert!(cx.debug_bounds("terminal-theme-dropdown").is_none());
+        assert!(cx.debug_bounds("terminal-theme-light-dropdown").is_some());
+        assert!(cx.debug_bounds("terminal-theme-dark-dropdown").is_some());
+        surfaces.update(cx, |surfaces, _| {
+            let system_is_dark = surfaces.system_is_dark;
+            surfaces.settings_menu = Some(SettingsMenu::TerminalThemeLight);
+            surfaces.choose_terminal_theme("github-light-default");
+            surfaces.settings_menu = Some(SettingsMenu::TerminalThemeDark);
+            surfaces.choose_terminal_theme("vesper");
+            let prefs = &surfaces.prefs;
+            assert!(prefs.follow_system_theme);
+            assert_eq!(prefs.system_theme(false), "github-light-default");
+            assert_eq!(prefs.system_theme(true), "vesper");
+            assert_eq!(
+                prefs.terminal_theme,
+                if system_is_dark { "vesper" } else { "github-light-default" }
+            );
+        });
+        // The Light card then uses the light side's theme.
+        let card = cx.debug_bounds("FEATURED_THEME_1").unwrap();
+        cx.simulate_click(card.center(), Modifiers::default());
+        cx.run_until_parked();
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(!surfaces.prefs.follow_system_theme);
+            assert_eq!(surfaces.prefs.terminal_theme, "github-light-default");
+        });
     }
 
     #[gpui::test]

@@ -384,6 +384,9 @@ fn random_sequences_match_the_current_core() {
         "\x1b[?1000h",
         "\x1b[?1006h",
         "\x1b[3g",
+        "\x1b[?1016h",
+        "\x1b[?1005h",
+        "\x1b[?1016l",
         "🇷🇴",
         "\u{1F3FB}",
         "\x1b[1;1H\x1b[2J",
@@ -405,6 +408,70 @@ fn random_sequences_match_the_current_core() {
         }
         let (lines, cols) = [(5, 9), (3, 4), (7, 16)][run % 3];
         check(lines, cols, 12, input.as_bytes());
+    }
+}
+
+/// A cluster that widens at the right margin moves to the next row with
+/// its hyperlink (it was read after the leading spacer overwrote it).
+#[test]
+fn a_cluster_widening_at_the_margin_keeps_its_link() {
+    for cols in [3, 4, 5] {
+        check(3, cols, 6, "ab\x1b]8;;u://x\x07🇴\x1b]8;;\x07🇴".as_bytes());
+        check(
+            3,
+            cols,
+            6,
+            "a\x1b]8;id=7;u://y\x07b❤\x1b]8;;\x07\u{FE0F}x\x1b]8;;u://z\x07🇷🇴\x1b]8;;\x07"
+                .as_bytes(),
+        );
+    }
+}
+
+/// Hyperlinks (explicit ids and none) over clusters that widen and narrow
+/// at the margins, wide characters, wraps and scrolls, at narrow widths.
+#[test]
+fn random_links_over_clusters_and_margins() {
+    const TOKENS: &[&str] = &[
+        "a",
+        "bc",
+        "漢",
+        "🇴",
+        "🇷",
+        "❤",
+        "\u{FE0F}",
+        "\u{FE0E}",
+        "\u{200D}",
+        "👍",
+        "\u{1F3FD}",
+        "e\u{301}",
+        "\r\n",
+        "\n",
+        "\x1b]8;;u://x\x07",
+        "\x1b]8;id=1;u://y\x07",
+        "\x1b]8;id=2;u://y\x07",
+        "\x1b]8;;\x07",
+        "\x1b[?2027h",
+        "\x1b[?2027l",
+        "\x1b[?7l",
+        "\x1b[?7h",
+        "\x1b[2D",
+        "\x1b[K",
+    ];
+    let mut seed = 0x9E37_79B9_u32;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    let runs = std::env::var("CORE_V2_FUZZ").map_or(48, |n| n.parse().expect("count"));
+    for run in 0..runs {
+        let mut input = String::new();
+        for _ in 0..50 {
+            input.push_str(TOKENS[next() as usize % TOKENS.len()]);
+        }
+        let (lines, cols) = [(3, 3), (4, 4), (3, 5), (5, 7)][run % 4];
+        check(lines, cols, 8, input.as_bytes());
     }
 }
 
@@ -496,5 +563,91 @@ fn adversarial_corpus_matches_the_current_core() {
         let input = &input[..input.len().min(4096)];
         eprintln!("{}", path.display());
         check_same_reads(24, 80, 100, input);
+    }
+}
+
+/// Events as comparable text: closures are applied to fixed inputs.
+fn event_text(event: &alacritty_terminal::event::Event) -> String {
+    use alacritty_terminal::event::{Event, WindowSize};
+    use alacritty_terminal::vte::ansi::Rgb;
+    let size = WindowSize {
+        num_lines: 24,
+        num_cols: 80,
+        cell_width: 9,
+        cell_height: 18,
+    };
+    match event {
+        Event::ClipboardLoad(kind, reply) => format!("load {kind:?} {}", reply("pasted")),
+        Event::ColorRequest(index, reply) => {
+            format!("color {index} {}", reply(Rgb { r: 1, g: 2, b: 3 }))
+        }
+        Event::TextAreaSizeRequest(reply) => format!("area {}", reply(size)),
+        Event::CellSizeRequest(reply) => format!("cell {}", reply(size)),
+        other => format!("{other:?}"),
+    }
+}
+
+#[derive(Clone, Default)]
+struct Recorder(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl alacritty_terminal::event::EventListener for Recorder {
+    fn send_event(&self, event: alacritty_terminal::event::Event) {
+        self.0.lock().unwrap().push(event_text(&event));
+    }
+}
+
+#[test]
+fn events_titles_colors_replies_keyboard_and_cursor_style() {
+    use alacritty_terminal::term::Osc52;
+    let input = b"\x1b]0;first\x07\x1b[22;0t\x1b]2;second\x1b\\\x1b[23;0t\x1b]0;\x07\
+                  \x1b]4;1;rgb:10/20/30\x07\x1b]10;?\x07\x1b]11;rgb:ff/00/00\x07\x1b]104;1\x07\x1b]110\x07\
+                  \x1b]52;c;aGVsbG8=\x07\x1b]52;p;?\x07\x1b]52;x;Zg==\x07\
+                  \x1b[c\x1b[>c\x1b[5n\x1b[3;4H\x1b[6n\x1b[?6n\x1b[?996n\x1b[14t\x1b[16t\x1b[18t\x1b[19t\x1b[>q\
+                  \x1bP+q544E;436F;626164\x1b\\\x1b[1;31;48;5;20;58:2::1:2:3m\x1bP$qm\x1b\\\x1b[2;5r\x1bP$qr\x1b\\\
+                  \x1b[5 q\x1bP$q q\x1b\\\x1b[?12l\x1b[?12$p\x1b[?1016h\x1b[?1016$p\x1b[?1006h\x1b[?1016$p\x1b[?1049$p\x1b[4$p\x1b[99$p\x1b[?7$p\x1b[?69$p\
+                  \x1b[>1u\x1b[>5u\x1b[?u\x1b[=3;2u\x1b[?u\x1b[<u\x1b[?u\x1b[?1049h\x1b[>2u\x1b[?u\x1b[?1049l\x1b[?u\
+                  \x07\x1b[?1000h\x1b[?1000l\x1b[?2048h\x1b[?12h\x1b[!p\x1b]0;again\x07\x1b]4;2;rgb:01/02/03\x07\x1bc";
+    let config = Config {
+        scrolling_history: 10,
+        kitty_keyboard: true,
+        osc52: Osc52::CopyPaste,
+        terminal_version: Some("diri 1.0".into()),
+        ..Config::default()
+    };
+    for reads in [
+        vec![&input[..]],
+        input.chunks(1).collect::<Vec<_>>(),
+        input.chunks(7).collect(),
+    ] {
+        let want_events = Recorder::default();
+        let mut want = Term::new(config.clone(), &TermSize::new(20, 6), want_events.clone());
+        let mut parser = Processor::<StdSyncHandler>::new();
+        for read in &reads {
+            parser.advance(&mut want, read);
+        }
+        let got_events = Recorder::default();
+        let mut got = Core::new(6, 20, 10);
+        got.set_events(config.clone(), Box::new(got_events.clone()));
+        let mut parser = Processor::<StdSyncHandler>::new();
+        for read in &reads {
+            parser.advance(&mut got, read);
+        }
+        assert_eq!(
+            *got_events.0.lock().unwrap(),
+            *want_events.0.lock().unwrap()
+        );
+        assert!(
+            want_events.0.lock().unwrap().len() > 30,
+            "the input exercises events"
+        );
+        compare(&got, &want).unwrap();
+        assert_eq!(got.colors_generation(), want.colors_generation());
+        for index in 0..alacritty_terminal::term::color::COUNT {
+            assert_eq!(got.colors()[index], want.colors()[index], "color {index}");
+        }
+        assert_eq!(
+            format!("{:?}", got.cursor_style()),
+            format!("{:?}", want.cursor_style())
+        );
     }
 }

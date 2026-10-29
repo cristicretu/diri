@@ -367,6 +367,8 @@ mod tests {
         );
     }
 
+    // Sets the Unix executable bit.
+    #[cfg(unix)]
     #[test]
     fn runnable_files_are_told_from_documents() {
         let dir = tempfile::tempdir().unwrap();

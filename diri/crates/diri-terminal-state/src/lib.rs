@@ -18,6 +18,10 @@ pub mod core_v2;
 mod inline_images;
 mod notifications;
 mod program_status;
+/// Per-thread totals of the OSCs the parser dispatched (benchmark
+/// verification only).
+#[cfg(feature = "bench-verify")]
+pub use alacritty_terminal::vte::observe as osc_observe;
 pub use inline_images::{
     DEFAULT_CELL_PIXELS, STORE_BUDGET_BYTES as INLINE_IMAGE_BUDGET_BYTES, StoredImage,
 };
@@ -36,6 +40,7 @@ use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{CONTENT_CHANGED, Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
+use alacritty_terminal::vte::scan::{C0Index, c0_positions};
 use diri_proto::grid::{
     ChangedRow, CursorShape, CursorStyle, GridCell, GridRowCodec, GridUpdate, LinkSpan,
     RowMetadata, StyleSpan, TermColor, TermStyle, UnderlineKind,
@@ -531,6 +536,10 @@ pub struct HeadlessScreen {
     /// Trailing bytes of the previous chunk, so an OSC split across a read
     /// boundary is still recognized.
     progress_carry: Vec<u8>,
+    /// Where the current read's C0 bytes are, when it has string sequences:
+    /// one scan that the progress, notification and image scanners and the
+    /// parser all find their string terminators in. Emptied when idle.
+    c0_index: Vec<u32>,
     notifications: Option<notifications::NotificationParser>,
     /// Kitty graphics and iTerm2 inline images; `None` unless opted in.
     images: Option<Box<inline_images::InlineImages>>,
@@ -635,6 +644,7 @@ impl HeadlessScreen {
             current_damage_rows: vec![false; geometry.rows],
             pending_damage_rows: vec![true; geometry.rows],
             progress_carry: Vec::new(),
+            c0_index: Vec::new(),
             notifications: None,
             images: None,
             replies: Vec::new(),
@@ -680,6 +690,16 @@ impl HeadlessScreen {
     pub fn release_idle_memory(&mut self) {
         #[cfg(feature = "compact-history")]
         self.term.release_primary_history_spare_rows();
+    }
+
+    /// Parses printable text one character at a time, through the
+    /// emulator's per-character input, instead of as runs. The resulting
+    /// state is identical; benches and tests use it as the reference the
+    /// run paths are checked against.
+    #[doc(hidden)]
+    pub fn with_per_character_input(mut self) -> Self {
+        self.parser.set_per_character_print(true);
+        self
     }
 
     /// Answer `OSC 7501` support queries among this terminal's replies, in
@@ -915,15 +935,25 @@ impl HeadlessScreen {
         // they are the only ones, no side scanner below can find anything, so
         // they are skipped instead of each looking at every escape.
         let csi_only = only_csi_escapes(bytes);
+        // A read with string sequences (OSC, DCS, APC...) is indexed once;
+        // each layer below then finds its terminators in the index instead
+        // of scanning the bodies again. Dense controls skip the index.
+        let mut c0_index = std::mem::take(&mut self.c0_index);
+        let indexed = !csi_only && c0_positions(bytes, &mut c0_index, C0_INDEX_CAP);
+        let index = indexed.then(|| C0Index::new(&c0_index));
         if !(csi_only && self.progress_carry.is_empty()) {
-            self.scan_progress(bytes);
+            self.scan_progress(bytes, index);
         }
         if let Some(parser) = &mut self.notifications {
             if historical_bytes != 0 {
                 parser.reset_sequence();
             }
             if !(csi_only && parser.is_idle()) {
-                parser.feed(&bytes[historical_bytes.min(bytes.len())..]);
+                let historical = historical_bytes.min(bytes.len());
+                parser.feed_indexed(
+                    &bytes[historical..],
+                    index.map(|index| index.offset(historical)),
+                );
             }
             // An `OSC 7501` support query is answered ahead of the emulator's
             // replies for the same chunk. Programs detect support by sending
@@ -935,7 +965,8 @@ impl HeadlessScreen {
                 self.replies.append(&mut parser.replies);
             }
         }
-        self.advance_with_images(bytes, historical_bytes, csi_only);
+        self.advance_with_images(bytes, historical_bytes, csi_only, index);
+        self.c0_index = c0_index;
         self.settle();
     }
 
@@ -949,6 +980,7 @@ impl HeadlessScreen {
         self.parser.release_idle_buffers();
         self.replies.shrink_to_fit();
         self.progress_carry.shrink_to_fit();
+        self.c0_index = Vec::new();
         self.moved_digests = Vec::new();
         self.moved_filled_cells = Vec::new();
         self.moved_stale = Vec::new();
@@ -1376,7 +1408,9 @@ impl HeadlessScreen {
         } else {
             MouseTrackingMode::Off
         };
-        let encoding = if mode.contains(TermMode::SGR_MOUSE) {
+        let encoding = if mode.contains(TermMode::SGR_PIXEL_MOUSE) {
+            MouseEncoding::SgrPixels
+        } else if mode.contains(TermMode::SGR_MOUSE) {
             MouseEncoding::Sgr
         } else {
             MouseEncoding::Legacy
@@ -1592,7 +1626,13 @@ impl HeadlessScreen {
         self.prepare_history_read();
         let history = self.term.grid().history_size().min(HISTORY_EXPORT_ROWS);
         let cols = self.geometry.cols;
-        let mut payload = Vec::new();
+        // Reserved at the bound so the payload never grows. Growing a
+        // multi-megabyte buffer by reallocation left every intermediate
+        // buffer resident in the macOS allocator after the read (~8 MB per
+        // 10k-row checkpoint, per session, for good), while pages of the
+        // reservation that the encoding never reaches are never touched.
+        let mut payload =
+            Vec::with_capacity(history * diri_proto::grid::GridRowCodec::max_row_len(cols));
         let mut row = Vec::with_capacity(cols);
         for index in 0..history {
             let line = Line(index as i32 - history as i32);
@@ -1785,8 +1825,10 @@ impl HeadlessScreen {
         if let Some(mode) = mouse.tracking.dec_private_mode() {
             bytes.extend_from_slice(format!("\x1b[?{mode}h").as_bytes());
         }
-        if matches!(mouse.encoding, MouseEncoding::Sgr) {
-            bytes.extend_from_slice(b"\x1b[?1006h");
+        match mouse.encoding {
+            MouseEncoding::Sgr => bytes.extend_from_slice(b"\x1b[?1006h"),
+            MouseEncoding::SgrPixels => bytes.extend_from_slice(b"\x1b[?1016h"),
+            MouseEncoding::Legacy | MouseEncoding::Unknown => {}
         }
         bytes.extend_from_slice(if update.cursor_visible {
             b"\x1b[?25h"
@@ -2471,8 +2513,14 @@ impl HeadlessScreen {
     ///
     /// Agents use this to say "I am working, 40% through"; the emulator has no
     /// concept of it and would silently drop the sequence.
-    fn scan_progress(&mut self, bytes: &[u8]) {
+    fn scan_progress(&mut self, bytes: &[u8], index: Option<C0Index<'_>>) {
         if self.progress_carry.is_empty() {
+            if let Some(index) = index {
+                if let Some(start) = self.scan_progress_indexed(bytes, index) {
+                    self.progress_carry.extend_from_slice(&bytes[start..]);
+                }
+                return;
+            }
             if memchr::memchr(0x1b, bytes).is_none() {
                 return;
             }
@@ -2532,19 +2580,57 @@ impl HeadlessScreen {
     /// Scans one buffer for progress reports, returning where a carry for the
     /// next chunk should begin if the buffer ends mid-sequence.
     fn scan_progress_within(&mut self, haystack: &[u8]) -> Option<usize> {
-        const PREFIX: &[u8] = b"\x1b]9;4;";
+        self.scan_progress_with(
+            haystack,
+            |haystack, from| find(&haystack[from..], PROGRESS_PREFIX).map(|found| from + found),
+            |haystack, from| {
+                haystack[from..]
+                    .iter()
+                    .position(|&b| b == 0x07 || b == 0x1b)
+                    .map(|offset| from + offset)
+            },
+        )
+    }
+
+    /// [`Self::scan_progress_within`] for one read, finding escapes and
+    /// terminators in its C0 index instead of scanning it.
+    fn scan_progress_indexed(&mut self, bytes: &[u8], index: C0Index<'_>) -> Option<usize> {
+        self.scan_progress_with(
+            bytes,
+            |bytes, mut from| loop {
+                // Every report starts with ESC: try each escape in turn.
+                let at = index.next(bytes, from, &[0x1b]);
+                if at == bytes.len() {
+                    return None;
+                }
+                if bytes[at..].starts_with(PROGRESS_PREFIX) {
+                    return Some(at);
+                }
+                from = at + 1;
+            },
+            |bytes, from| {
+                let at = index.next(bytes, from, &[0x07, 0x1b]);
+                (at < bytes.len()).then_some(at)
+            },
+        )
+    }
+
+    /// The progress scan, given how to find the next report from an offset
+    /// and the next BEL or ESC from an offset.
+    fn scan_progress_with(
+        &mut self,
+        haystack: &[u8],
+        next_report: impl Fn(&[u8], usize) -> Option<usize>,
+        next_end: impl Fn(&[u8], usize) -> Option<usize>,
+    ) -> Option<usize> {
+        const PREFIX: &[u8] = PROGRESS_PREFIX;
         const MAX_INCOMPLETE_BYTES: usize = 64;
         let mut search_from = 0;
         let mut incomplete = None;
-        while let Some(found) = find(&haystack[search_from..], PREFIX) {
-            let prefix_start = search_from + found;
+        while let Some(prefix_start) = next_report(haystack, search_from) {
             let start = prefix_start + PREFIX.len();
             // Terminated by BEL or ST (ESC \).
-            let Some(end) = haystack[start..]
-                .iter()
-                .position(|&b| b == 0x07 || b == 0x1b)
-                .map(|offset| start + offset)
-            else {
+            let Some(end) = next_end(haystack, start) else {
                 // Truncated: keep it for the next chunk.
                 incomplete = Some(prefix_start);
                 break;
@@ -3036,6 +3122,13 @@ fn only_csi_escapes(bytes: &[u8]) -> bool {
     }
     true
 }
+
+const PROGRESS_PREFIX: &[u8] = b"\x1b]9;4;";
+
+/// Most C0 bytes one read is indexed with; denser output (short lines,
+/// bursts of escapes) is scanned as before. At most 16 KiB, released when the
+/// terminal goes idle.
+const C0_INDEX_CAP: usize = 4096;
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
@@ -4915,6 +5008,41 @@ mod tests {
             MouseModes::new(MouseTrackingMode::Off, MouseEncoding::Sgr),
             "1006 is independent of tracking"
         );
+    }
+
+    /// DECSET 1016 is one of the exclusive mouse encodings, set, reset and
+    /// reported like the others (DECRQM `1`/`2`, not the `4` it answered
+    /// when it was only recognized), and survives a checkpoint restore.
+    #[test]
+    fn sgr_pixel_mouse_is_an_exclusive_encoding_reported_and_restored() {
+        let mut screen = HeadlessScreen::new(80, 24);
+        let modes = |screen: &mut HeadlessScreen| {
+            screen.feed(b"\x1b[?1006$p\x1b[?1016$p");
+            String::from_utf8(screen.take_replies()).unwrap()
+        };
+        assert_eq!(modes(&mut screen), "\x1b[?1006;2$y\x1b[?1016;2$y");
+        screen.feed(b"\x1b[?1002h\x1b[?1006h\x1b[?1016h");
+        assert_eq!(
+            screen.mouse_modes(),
+            MouseModes::new(MouseTrackingMode::ButtonMotion, MouseEncoding::SgrPixels)
+        );
+        assert_eq!(modes(&mut screen), "\x1b[?1006;2$y\x1b[?1016;1$y");
+
+        let snapshot = screen.full_snapshot();
+        let mut restored = HeadlessScreen::new(80, 24);
+        assert!(restored.restore(&[], &snapshot, false, false, screen.mouse_modes()));
+        assert_eq!(restored.mouse_modes(), screen.mouse_modes());
+
+        screen.feed(b"\x1b[?1006h");
+        assert_eq!(
+            screen.mouse_modes().encoding,
+            MouseEncoding::Sgr,
+            "last set wins"
+        );
+        screen.feed(b"\x1b[?1016h\x1b[?1016l");
+        assert_eq!(screen.mouse_modes().encoding, MouseEncoding::Legacy);
+        screen.feed(b"\x1b[?1016h\x1bc");
+        assert_eq!(screen.mouse_modes(), MouseModes::OFF, "RIS clears it");
     }
 
     /// Wheel bytes per mode, as a reference xterm-compatible emulator sends

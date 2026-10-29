@@ -43,7 +43,7 @@ pub fn compare<T>(core: &Core, reference: &Term<T>) -> Result<(), String> {
     if core.unsupported != 0 {
         return Err(format!("{} unsupported sequences", core.unsupported));
     }
-    let modes = !(TermMode::KITTY_KEYBOARD_PROTOCOL | TermMode::VI);
+    let modes = !TermMode::VI;
     if core.mode & modes != *reference.mode() & modes {
         return Err(format!(
             "modes {:?}, reference {:?}",
@@ -84,8 +84,16 @@ pub fn compare<T>(core: &Core, reference: &Term<T>) -> Result<(), String> {
             let want_link = want.hyperlink();
             let same_link = match (&link, &want_link) {
                 (None, None) => true,
+                // An explicit id must match exactly. Without one the current
+                // core generates a process-unique `<n>_alacritty` id, which
+                // v2 does not imitate: the reference must then carry a
+                // generated id, not an explicit one.
                 (Some(got), Some(want)) => {
-                    got.uri == want.uri() && got.id.as_ref().is_none_or(|id| id == want.id())
+                    got.uri == want.uri()
+                        && match &got.id {
+                            Some(id) => id == want.id(),
+                            None => want.id().ends_with("_alacritty"),
+                        }
                 }
                 _ => false,
             };

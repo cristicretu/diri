@@ -12,8 +12,9 @@ use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::grapheme::{self, BreakState, Class, Cluster, Info};
 use alacritty_terminal::vte::ansi::{
-    Attr, CharsetIndex, ClearMode, Handler, Hyperlink, LineClearMode, Mode, PrivateMode,
-    ShellCommandMark, StandardCharset, TabulationClearMode,
+    Attr, CharsetIndex, ClearMode, CursorShape, CursorStyle, Handler, Hyperlink, KeyboardModes,
+    KeyboardModesApplyBehavior, LineClearMode, Mode, PrivateMode, Rgb, ShellCommandMark,
+    StandardCharset, TabulationClearMode,
 };
 
 use super::cell::{
@@ -57,6 +58,9 @@ pub struct Core {
     /// The other screen (alternate while on the primary, and the reverse),
     /// created on first use.
     pub(super) other: Option<Box<Inactive>>,
+    /// Titles, colors, cursor style, keyboard protocol, options and the
+    /// event listener.
+    pub(super) events: super::events::Events,
     /// Sequences the prototype does not implement.
     pub unsupported: u64,
     /// Decode ground-state text from raw bytes (`Handler::input_bytes`)
@@ -112,6 +116,7 @@ impl Core {
             slow_text: false,
             saved: Saved::default(),
             other: None,
+            events: Default::default(),
             unsupported: 0,
             raw_text: true,
         }
@@ -579,6 +584,12 @@ impl Core {
             let cluster = self.get(line, col);
             let cluster_style = self.style_of(line as i32, cluster);
             let zerowidth = self.zerowidth_hot(line, col).to_vec();
+            // Read before the leading spacer overwrites the cell and the
+            // wrap scrolls `line` away.
+            let link = cluster
+                .has(super::cell::HYPERLINK)
+                .then(|| self.link_at(line as i32, col))
+                .flatten();
             self.wrap_pending = false;
             self.col = col;
             self.write_at_cursor(' ', LEADING);
@@ -591,10 +602,6 @@ impl Core {
             let style =
                 (self.pages.page_mut(p).styles.intern(&cluster_style) as u64) << STYLE_SHIFT;
             let keep = cluster.0 & (super::cell::CP | super::cell::HYPERLINK);
-            let link = cluster
-                .has(super::cell::HYPERLINK)
-                .then(|| self.link_at(line as i32, col))
-                .flatten();
             self.set(l, c, |_| Cell(keep | style | WIDE | marks));
             if let Some(link) = link {
                 let (p, r) = self.pages.locate(l);
@@ -1429,6 +1436,114 @@ impl Handler for Core {
 
     fn mark_shell_command(&mut self, mark: ShellCommandMark) {
         self.mark_command(mark);
+    }
+
+    fn bell(&mut self) {
+        self.send(alacritty_terminal::event::Event::Bell);
+    }
+
+    fn identify_terminal(&mut self, intermediate: Option<char>) {
+        self.identify_terminal_inner(intermediate);
+    }
+
+    fn report_keyboard_mode(&mut self) {
+        self.report_keyboard_mode_inner();
+    }
+
+    fn push_keyboard_mode(&mut self, mode: KeyboardModes) {
+        self.push_keyboard_mode_inner(mode);
+    }
+
+    fn pop_keyboard_modes(&mut self, to_pop: u16) {
+        self.pop_keyboard_modes_inner(to_pop);
+    }
+
+    fn set_keyboard_mode(&mut self, mode: KeyboardModes, apply: KeyboardModesApplyBehavior) {
+        self.set_keyboard_mode_inner(mode, apply);
+    }
+
+    fn device_status(&mut self, arg: usize) {
+        self.device_status_inner(arg);
+    }
+
+    fn private_device_status(&mut self, arg: usize) {
+        self.private_device_status_inner(arg);
+    }
+
+    fn set_color(&mut self, index: usize, color: Rgb) {
+        self.set_color_inner(index, color);
+    }
+
+    fn dynamic_color_sequence(&mut self, prefix: String, index: usize, terminator: &str) {
+        self.dynamic_color_sequence_inner(prefix, index, terminator);
+    }
+
+    fn reset_color(&mut self, index: usize) {
+        self.reset_color_inner(index);
+    }
+
+    fn clipboard_store(&mut self, clipboard: u8, base64: &[u8]) {
+        self.clipboard_store_inner(clipboard, base64);
+    }
+
+    fn clipboard_load(&mut self, clipboard: u8, terminator: &str) {
+        self.clipboard_load_inner(clipboard, terminator);
+    }
+
+    fn report_mode(&mut self, mode: Mode) {
+        self.report_mode_inner(mode);
+    }
+
+    fn report_private_mode(&mut self, mode: PrivateMode) {
+        self.report_private_mode_inner(mode);
+    }
+
+    fn set_cursor_style(&mut self, style: Option<CursorStyle>) {
+        self.set_cursor_style_inner(style);
+    }
+
+    fn set_cursor_shape(&mut self, shape: CursorShape) {
+        self.set_cursor_shape_inner(shape);
+    }
+
+    fn set_title(&mut self, title: Option<String>) {
+        self.set_title_inner(title);
+    }
+
+    fn push_title(&mut self) {
+        self.push_title_inner();
+    }
+
+    fn pop_title(&mut self) {
+        self.pop_title_inner();
+    }
+
+    fn text_area_size_pixels(&mut self) {
+        self.text_area_size_pixels_inner();
+    }
+
+    fn cell_size_pixels(&mut self) {
+        self.cell_size_pixels_inner();
+    }
+
+    fn text_area_size_chars(&mut self) {
+        self.text_area_size_chars_inner();
+    }
+
+    fn screen_size_chars(&mut self) {
+        self.screen_size_chars_inner();
+    }
+
+    fn report_version(&mut self) {
+        self.report_version_inner();
+    }
+
+    fn request_termcap(&mut self, names: &[u8]) {
+        self.request_termcap_inner(names);
+    }
+
+    fn request_setting(&mut self, setting: &[u8]) {
+        self.request_setting_inner(setting);
     }
 }
 
