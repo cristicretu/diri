@@ -53,11 +53,13 @@
 //! commit in the file's header. Captured payloads are matched by SHA-256, so
 //! a different capture has no golden digest and is refused.
 //!
-//! A change that alters how many history rows the budget holds (a codec
-//! that compresses differently) declares its count per payload in
-//! `DECLARED_HISTORY_ROWS`, and the golden is regenerated at the reference
-//! with that declaration: the content of the rows kept is still checked
-//! against the reference, and their number against the declaration.
+//! Any PR that changes history retention (how many rows the budget keeps,
+//! or what they hold) must regenerate the golden in the same PR, generated
+//! and kitten sections both, and declare the row delta per workload.
+//! The delta is declared in `DECLARED_HISTORY_ROWS` and the golden is
+//! regenerated at the reference with that declaration: the content of the
+//! rows kept is still checked against the reference, and their number
+//! against the declaration.
 //!
 //! `DIRI_VT_BENCH_WRITE=<dir>` writes the payloads it uses there and exits,
 //! for `diri-engine`'s `vtbench` (the same workloads through Holder and

@@ -1,15 +1,14 @@
 # Golden digests for benches/vt_workloads.rs. Do not edit by hand.
 #
-# Reference: diri 589d0a46c (origin/main, with #921's live-byte history
-# budget, #925's style hash, #843's query replies, #927's observers,
-# #924's LZ skip and #922/#923's parser paths; no other change), built in
-# release and fed one byte per read with the OSC checksum on. The
-# generated digests are identical to the first reference (3fc4feb66 with
-# #921's c23006a27); the kitten capture digests are carried over from it.
-# The generated ascii and unicode digests cover the newest rows that
-# `DECLARED_HISTORY_ROWS` declares (62,961 and 53,648; the reference kept
-# 63,313 and 54,128), regenerated at the same reference with that
-# declaration:
+# Reference: diri 589d0a46c (origin/main), regenerated after #924's
+# declared history retention change (its LZ codec skips faster through
+# text that does not repeat, so the 4 MiB budget keeps fewer rows: ascii
+# 63537 -> 63313 generated / 63793 -> 63569 kitten, unicode 54608 ->
+# 54128 both). Only history row counts, scrollback cells/metadata and the
+# links digest changed; every other field of every workload is identical
+# to the previous reference (0b54ea089, and 3fc4feb66 with #921's
+# c23006a27 before it). Built in release and fed one byte per read with
+# the OSC checksum on, generated and kitten capture sections both:
 #
 #   cargo build --release -p diri-terminal-state --features bench-verify --bench vt_workloads
 #   DIRI_VT_BENCH_GOLDEN=$PWD/crates/diri-terminal-state/benches/vt_workloads.golden <bench binary> --bench
@@ -18,7 +17,8 @@
 # Sections are "[workload payload-sha256]": the generated payloads, and the
 # kitten 0.48 `__benchmark__` captures (one repetition each) the published
 # numbers use. Regenerate only from a known-good reference commit, never
-# from the code being measured, and name that commit here.
+# from the code being measured, and name that commit here. Any PR that
+# changes history retention must regenerate this file in the same PR.
 
 [ascii 5b1de281ecd8d0f0db1696ae1dbf745069c6ff3815c809f02e31791d50cb131d]
 bytes_fed = 67109280
@@ -199,12 +199,12 @@ bytes_fed = 67109280
 clipboard = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 cursor = (98, 79, true)
 grid_sha256 = d211d26b236ecb833159905984aecdec2d379b7ab041d44075f079356eeff683
-history_rows_checked = 63793
-history_rows_reference = 63793
+history_rows_checked = 63569
+history_rows_reference = 63569
 images_held_bytes = 0
 images_stored = count=0
 keyboard = KeyboardState { enhancements: Some(KeyboardEnhancements(0)), application_cursor_keys: false, application_keypad: false }
-links = 0 sha256=b3d547a234b0cc3542a3da5b101df29dba35c600d8d534955039ef0b86600797
+links = 0 sha256=c63bbade364353d86b1dfafe1a6877f58c7b4c588e3438f12520edfff446081f
 modes = alt=false paste=false focus=false mouse=MouseModes { tracking: Off, encoding: Legacy } cursor=CursorStyle { shape: Block, steady: false }
 notifications = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 osc_checksum = cbf29ce484222325
@@ -215,8 +215,8 @@ program_status = None
 progress = None
 replies = 0B sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 reps = 32
-scrollback_cells_sha256 = e2f8d5cdef655a4c038ba08dda982b433ebdbc490a9f117b1c2c4d3c68fcf48f
-scrollback_metadata_sha256 = cc5fe5589862a40ac15327afc729bc2ee1d33e31f6eac0036978578ef4606ed8
+scrollback_cells_sha256 = 330518018033e74fa230ab7a253a6b3ab365eabbfd8be658f6bf9595571efee3
+scrollback_metadata_sha256 = d01f8a6b1f44ca4db8b6c591f70c5516dd41d1ddb36847236478a5351e6e915a
 scrollback_text_sha256 = 7fa9fdeeb9edbf75bea4090118429effb8e5dc11df047f6dbcfad658c2da1b83
 size = 120x80
 synchronized = completed_any=false open=false
@@ -315,12 +315,12 @@ bytes_fed = 68308992
 clipboard = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 cursor = (119, 79, true)
 grid_sha256 = ca960410b38b77fd8ddf41457286c96eed6c84978fb0953a6c749de5bbbbbcc6
-history_rows_checked = 54608
-history_rows_reference = 54608
+history_rows_checked = 54128
+history_rows_reference = 54128
 images_held_bytes = 0
 images_stored = count=0
 keyboard = KeyboardState { enhancements: Some(KeyboardEnhancements(0)), application_cursor_keys: false, application_keypad: false }
-links = 0 sha256=6ba09a3a49fa41eab1d3938fe652b63857a85fab24ffbec4058bff9394b1717f
+links = 0 sha256=b19834e04c46069d46a0b1762ea76136af8ba0d369b40169371446c955bbda2b
 modes = alt=false paste=false focus=false mouse=MouseModes { tracking: Off, encoding: Legacy } cursor=CursorStyle { shape: Block, steady: false }
 notifications = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 osc_checksum = cbf29ce484222325
@@ -331,8 +331,8 @@ program_status = None
 progress = None
 replies = 0B sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 reps = 36
-scrollback_cells_sha256 = 47c95b57d98a9d0c5e31685a1770f9054cc45725f296963a5409af5f9e2ca9b3
-scrollback_metadata_sha256 = cb89a788cfd9974ca01d96202b2d751d7ee528bb13a057cb83e088942bdf44b5
+scrollback_cells_sha256 = 00851ea30e40141b86a9663b9d66a16aed30553acd42b31bdb690f9846febf92
+scrollback_metadata_sha256 = ed9f0d6a5e05dfd2a247e46f713b1e3c0cca7483f753448d9f88e14120ece5a9
 scrollback_text_sha256 = 856845797c33154e92f0cd1a4b29155c148d3d1b8e396c7b1b225fa73fd34bee
 size = 120x80
 synchronized = completed_any=false open=false
