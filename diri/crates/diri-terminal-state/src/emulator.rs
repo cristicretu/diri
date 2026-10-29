@@ -170,6 +170,33 @@ pub(crate) trait Emulator: Sized {
         }
     }
     fn cell(&self, line: Line, column: Column) -> Self::CellRef<'_>;
+    /// The text fingerprint and filled cells of `line`'s first `cols`
+    /// cells (see `HeadlessScreen::fingerprint_row`). An emulator that can
+    /// read its own storage faster overrides it with the same result.
+    #[inline]
+    fn fingerprint_row(&self, line: Line, cols: usize) -> (u64, usize) {
+        crate::fingerprint_cells(&self.row(line), cols)
+    }
+    /// Calls `each` with every slot of `out` and the wire form of `line`'s
+    /// cell in that column, left to right, and returns whether any of
+    /// those cells may carry row annotations (a link, combining marks, an
+    /// underline color or a span-drawn decoration). An override may
+    /// over-report: the annotations are then read and found empty.
+    #[inline]
+    fn wire_row(
+        &self,
+        line: Line,
+        out: &mut [GridCell],
+        mut each: impl FnMut(&mut GridCell, GridCell),
+    ) -> bool {
+        let row = self.row(line);
+        let mut annotated = false;
+        for (slot, source) in out.iter_mut().zip(row.cells()) {
+            annotated |= source.has_extra() | source.cell_flags().intersects(crate::SPAN_FLAGS);
+            each(slot, crate::wire_cell(source));
+        }
+        annotated
+    }
     /// Runs `edit` over the cells of `line`; what it changes is written
     /// back to the emulator.
     fn edit_row<R>(&mut self, line: Line, edit: impl FnOnce(&mut Self::RowMut) -> R) -> R;

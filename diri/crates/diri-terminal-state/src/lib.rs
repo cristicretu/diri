@@ -76,7 +76,7 @@ const DEFAULT_CURSOR: alacritty_terminal::vte::ansi::CursorStyle =
 
 /// Cell flags whose drawing needs a [`StyleSpan`]: every underline kind but
 /// the plain one, and overline. A plain underline needs one only for a color.
-const SPAN_FLAGS: Flags = Flags::DOUBLE_UNDERLINE
+pub(crate) const SPAN_FLAGS: Flags = Flags::DOUBLE_UNDERLINE
     .union(Flags::UNDERCURL)
     .union(Flags::DOTTED_UNDERLINE)
     .union(Flags::DASHED_UNDERLINE)
@@ -1528,29 +1528,20 @@ impl HeadlessScreen {
             // Links, combining marks, underline colors and decoration flags
             // are the only sources of row metadata. Noting them in the one
             // pass over the cells spares a plain row a second pass.
-            let mut annotated = false;
-            let source = self.term.row(line);
-            let source = source.cells();
             // Two loops rather than a branch per cell: this is the
             // publication hot path, and the common case has no overrides.
-            if let Some(colors) = overrides {
-                for (x, previous) in row.iter_mut().enumerate() {
-                    let source = &source[x];
-                    annotated |= source.has_extra() | source.cell_flags().intersects(SPAN_FLAGS);
-                    let mut cell = wire_cell(source);
+            let annotated = if let Some(colors) = overrides {
+                self.term.wire_row(line, row, |previous, mut cell| {
                     apply_palette(&mut cell, colors);
                     row_changed |= *previous != cell;
                     *previous = cell;
-                }
+                })
             } else {
-                for (x, previous) in row.iter_mut().enumerate() {
-                    let source = &source[x];
-                    annotated |= source.has_extra() | source.cell_flags().intersects(SPAN_FLAGS);
-                    let cell = wire_cell(source);
+                self.term.wire_row(line, row, |previous, cell| {
                     row_changed |= *previous != cell;
                     *previous = cell;
-                }
-            }
+                })
+            };
             let metadata = if annotated {
                 self.row_metadata(line)
             } else {
@@ -1595,15 +1586,10 @@ impl HeadlessScreen {
         let mut all = Vec::with_capacity(rows);
         for y in 0..rows {
             let line = Line(y as i32);
-            let mut row = Vec::with_capacity(cols);
-            let source = self.term.row(line);
-            let source = source.cells();
-            let mut annotated = false;
-            for x in 0..cols {
-                let source = &source[x];
-                annotated |= source.has_extra() | source.cell_flags().intersects(SPAN_FLAGS);
-                row.push(wire_cell(source));
-            }
+            let mut row = vec![GridCell::BLANK; cols];
+            let annotated = self
+                .term
+                .wire_row(line, &mut row, |slot, cell| *slot = cell);
             if let Some(colors) = overrides {
                 row.iter_mut().for_each(|cell| apply_palette(cell, colors));
             }
@@ -1646,12 +1632,9 @@ impl HeadlessScreen {
         let mut rows = Vec::with_capacity(exported);
         for index in 0..exported {
             let line = Line(index as i32 - exported as i32);
-            let mut row = Vec::with_capacity(cols);
-            let source = self.term.row(line);
-            let source = source.cells();
-            for cell in &source[..cols] {
-                row.push(wire_cell(cell));
-            }
+            let mut row = vec![GridCell::BLANK; cols];
+            self.term
+                .wire_row(line, &mut row, |slot, cell| *slot = cell);
             rows.push(row);
             self.finish_history_read_batch(index + 1, index + 1 == exported);
         }
@@ -1678,9 +1661,9 @@ impl HeadlessScreen {
         for index in 0..history {
             let line = Line(index as i32 - history as i32);
             row.clear();
-            let source = self.term.row(line);
-            let source = source.cells();
-            row.extend((0..cols).map(|x| wire_cell(&source[x])));
+            row.resize(cols, GridCell::BLANK);
+            self.term
+                .wire_row(line, &mut row, |slot, cell| *slot = cell);
             // A row is at most the terminal width, far below the codec's
             // u16 cell limit, so encoding cannot fail.
             let _ = diri_proto::grid::GridRowCodec::append_row(&row, &mut payload);
@@ -2088,16 +2071,13 @@ impl HeadlessScreen {
         let overrides = palette_overrides(self.host_replies, &self.term).cloned();
         for index in start..end {
             let line = Line(index as i32 - history as i32);
-            let mut row = Vec::with_capacity(cols);
-            let source = self.term.row(line);
-            let source = source.cells();
-            for cell in &source[..cols] {
-                let mut cell = wire_cell(cell);
+            let mut row = vec![GridCell::BLANK; cols];
+            self.term.wire_row(line, &mut row, |slot, mut cell| {
                 if let Some(colors) = &overrides {
                     apply_palette(&mut cell, colors);
                 }
-                row.push(cell);
-            }
+                *slot = cell;
+            });
             rows.push(row);
             metadata.push(self.row_metadata_with_budget(
                 line,
@@ -2144,9 +2124,10 @@ impl HeadlessScreen {
                 break;
             };
             remaining -= bytes;
-            let source = self.term.row(line);
-            let source = source.cells();
-            rows.push((0..cols).map(|x| wire_cell(&source[x])).collect());
+            let mut row = vec![GridCell::BLANK; cols];
+            self.term
+                .wire_row(line, &mut row, |slot, cell| *slot = cell);
+            rows.push(row);
             metadata.push(annotations);
         }
         if rows.len() < visible {
@@ -2555,7 +2536,8 @@ impl HeadlessScreen {
         #[cfg(test)]
         self.fingerprinted_rows
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        fingerprint_cells(&self.term.row(Line(row as i32)), self.geometry.cols)
+        self.term
+            .fingerprint_row(Line(row as i32), self.geometry.cols)
     }
 
     fn rebuild_content_cache(&mut self) {
@@ -2733,7 +2715,7 @@ fn text_char(c: char) -> char {
     if c < ' ' { ' ' } else { c }
 }
 
-fn wire_cell<C: CellView>(cell: &C) -> GridCell {
+pub(crate) fn wire_cell<C: CellView>(cell: &C) -> GridCell {
     let flags = cell.cell_flags();
     let c = cell.ch();
     let scalar = if flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
@@ -2861,43 +2843,107 @@ fn row_metadata_budgeted<R: RowView>(
 
 /// A row's text fingerprint and filled cells; see
 /// [`HeadlessScreen::fingerprint_row`].
-fn fingerprint_cells<R: RowView>(source: &R, cols: usize) -> (u64, usize) {
+pub(crate) fn fingerprint_cells<R: RowView>(source: &R, cols: usize) -> (u64, usize) {
     let all = source.cells();
     let width = cols.min(all.len());
     // Default cells after the content add only their count, so a short
     // line in a wide row hashes its text, not the blank rest of the row.
     let content = source.content_width().min(width);
-    let cells = &all[..content];
-    let mut state = RowHashState::default();
-    let mut lanes = [
-        0xcbf2_9ce4_8422_2325u64,
-        0x8422_2325_cbf2_9ce4,
-        0x243f_6a88_85a3_08d3,
-        0x1319_8a2e_0370_7344,
-    ];
-    let (chunks, remainder) = cells.as_chunks::<4>();
-    let mut column = 0;
-    for chunk in chunks {
-        let words = [
-            state.word(column, &chunk[0]),
-            state.word(column + 1, &chunk[1]),
-            state.word(column + 2, &chunk[2]),
-            state.word(column + 3, &chunk[3]),
-        ];
-        lanes[0] = fold_mix(lanes[0], words[0]);
-        lanes[1] = fold_mix(lanes[1], words[1]);
-        lanes[2] = fold_mix(lanes[2], words[2]);
-        lanes[3] = fold_mix(lanes[3], words[3]);
-        column += 4;
+    let mut hasher = RowHasher::new();
+    hasher.feed(&all[..content]);
+    hasher.finish(width, content)
+}
+
+/// The fold behind [`fingerprint_cells`], fed a row's content cells in
+/// order. Every slice but the last must hold a multiple of four cells, so
+/// each cell lands in the lane of its column whatever the slicing: an
+/// emulator that reads its cells as views (core v2) feeds them a chunk at
+/// a time and gets the same fingerprint.
+pub(crate) struct RowHasher<L> {
+    state: RowHashState<L>,
+    lanes: [u64; 4],
+    column: usize,
+}
+
+impl<L: LinkView> RowHasher<L> {
+    #[inline(always)]
+    pub(crate) fn new() -> Self {
+        Self {
+            state: RowHashState::default(),
+            lanes: [
+                0xcbf2_9ce4_8422_2325u64,
+                0x8422_2325_cbf2_9ce4,
+                0x243f_6a88_85a3_08d3,
+                0x1319_8a2e_0370_7344,
+            ],
+            column: 0,
+        }
     }
-    for (offset, cell) in remainder.iter().enumerate() {
-        lanes[offset] = fold_mix(lanes[offset], state.word(column + offset, cell));
+
+    #[inline(always)]
+    pub(crate) fn feed<C: CellView<Link = L>>(&mut self, cells: &[C]) {
+        let Self {
+            state,
+            lanes,
+            column,
+        } = self;
+        let (chunks, remainder) = cells.as_chunks::<4>();
+        for chunk in chunks {
+            let words = [
+                state.word(*column, &chunk[0]),
+                state.word(*column + 1, &chunk[1]),
+                state.word(*column + 2, &chunk[2]),
+                state.word(*column + 3, &chunk[3]),
+            ];
+            lanes[0] = fold_mix(lanes[0], words[0]);
+            lanes[1] = fold_mix(lanes[1], words[1]);
+            lanes[2] = fold_mix(lanes[2], words[2]);
+            lanes[3] = fold_mix(lanes[3], words[3]);
+            *column += 4;
+        }
+        for (offset, cell) in remainder.iter().enumerate() {
+            lanes[offset] = fold_mix(lanes[offset], state.word(*column + offset, cell));
+        }
+        *column += remainder.len();
     }
-    let mut digest = fold_mix(state.marks, (width as u64) << 32 | content as u64);
-    for lane in lanes {
-        digest = fold_mix(digest, lane);
+
+    /// Folds the next cell, as [`Self::feed`] does.
+    #[cfg(feature = "core-v2-screen")]
+    #[inline]
+    pub(crate) fn cell<C: CellView<Link = L>>(&mut self, cell: &C) {
+        let word = self.state.word(self.column, cell);
+        let lane = &mut self.lanes[self.column & 3];
+        *lane = fold_mix(*lane, word);
+        self.column += 1;
     }
-    (digest, state.filled)
+
+    /// Folds the next cell as [`Self::cell`] would, for a cell with no
+    /// link, combining marks or underline color whose character is `ch`
+    /// and whose [`style_word`] is `style_hash`.
+    #[cfg(feature = "core-v2-screen")]
+    #[inline(always)]
+    pub(crate) fn plain(&mut self, ch: char, style_hash: u64) {
+        let state = &mut self.state;
+        if state.previous_link.is_some() {
+            state.marks = fold_mix(state.marks, self.column as u64 | 1 << 63);
+            state.previous_link = None;
+        }
+        state.filled += usize::from(ch != ' ' && ch != '\0');
+        let lane = &mut self.lanes[self.column & 3];
+        *lane = fold_mix(*lane, u64::from(ch) ^ style_hash);
+        self.column += 1;
+    }
+
+    /// The fingerprint of a row `width` cells wide whose first `content`
+    /// cells were fed, and its filled cells.
+    #[inline(always)]
+    pub(crate) fn finish(self, width: usize, content: usize) -> (u64, usize) {
+        let mut digest = fold_mix(self.state.marks, (width as u64) << 32 | content as u64);
+        for lane in self.lanes {
+            digest = fold_mix(digest, lane);
+        }
+        (digest, self.state.filled)
+    }
 }
 
 /// The last color index cells are painted with: 0–255, then the default
@@ -3162,7 +3208,7 @@ fn raw_style_key<C: CellView>(cell: &C) -> u128 {
 
 /// Hash of a cell's wire style bits and both wire colors.
 #[inline]
-fn style_word(flags: Flags, fg: Color, bg: Color) -> u64 {
+pub(crate) fn style_word(flags: Flags, fg: Color, bg: Color) -> u64 {
     let colors = u64::from(wire_color(fg).packed()) | u64::from(wire_color(bg).packed()) << 32;
     // The wire collapses underline kinds into one style bit and carries the
     // kind and overline in a span: hash the raw flags that reach the screen.

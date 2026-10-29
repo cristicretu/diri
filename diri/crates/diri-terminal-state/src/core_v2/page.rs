@@ -95,6 +95,12 @@ impl StyleTable {
         }
     }
 
+    /// The table by id, for [`style_in`] (id 0 may be absent).
+    #[inline]
+    pub fn as_slice(&self) -> &[Style] {
+        &self.table
+    }
+
     pub fn len(&self) -> usize {
         self.table.len()
     }
@@ -1575,6 +1581,14 @@ impl Page {
     /// The link id recorded for cell `index` (meaningful with HYPERLINK).
     pub fn link_of(&self, index: usize) -> Option<u32> {
         self.links.as_ref()?.map.get(&(index as u32)).copied()
+    }
+
+    /// The link of cell `index` (`row * cols + col`) of this unpacked page,
+    /// which has the HYPERLINK bit, borrowed.
+    #[inline]
+    pub fn link_at(&self, index: usize) -> Option<&Link> {
+        let links = self.links.as_ref()?;
+        links.table.get(*links.map.get(&(index as u32))? as usize)
     }
 
     fn link(&self, id: u32) -> Option<Link> {
