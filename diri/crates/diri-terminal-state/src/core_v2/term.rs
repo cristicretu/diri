@@ -737,7 +737,12 @@ impl Core {
                 if fits > 0 && x >= occ {
                     // Fresh cells: nothing to keep or clear.
                     let (glyph, spacer) = (WIDE | style, ' ' as u64 | SPACER | style);
-                    for (pair, &cp) in row[x..x + 2 * fits].chunks_exact_mut(2).zip(&cps[..fits]) {
+                    for (pair, &cp) in row[x..x + 2 * fits]
+                        .as_chunks_mut::<2>()
+                        .0
+                        .iter_mut()
+                        .zip(&cps[..fits])
+                    {
                         pair[0].0 = cp as u64 | glyph;
                         pair[1].0 = spacer;
                     }
