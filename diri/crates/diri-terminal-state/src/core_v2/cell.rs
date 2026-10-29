@@ -211,13 +211,13 @@ mod neon {
 /// `cells.fill(cell)`, sixteen bytes per store.
 #[inline(always)]
 pub fn fill_cells(cells: &mut [Cell], cell: Cell) {
-    let mut pairs = cells.chunks_exact_mut(2);
-    for pair in &mut pairs {
+    let (pairs, rest) = cells.as_chunks_mut::<2>();
+    for pair in pairs {
         // SAFETY: two cells are sixteen bytes in bounds; `Cell` is a
         // transparent u64 with no invalid bit patterns.
         unsafe { (pair.as_mut_ptr() as *mut [u64; 2]).write_unaligned([cell.0, cell.0]) };
     }
-    for c in pairs.into_remainder() {
+    for c in rest {
         *c = cell;
     }
 }
