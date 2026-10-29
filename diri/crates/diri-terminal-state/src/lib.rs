@@ -3614,7 +3614,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
     fn a_repaint_between_erase_and_redraw_is_not_a_line_edit() {
         let mut screen = super::HeadlessScreen::new(40, 6);
         let page = b"\x1b[Hrow one\r\nrow two\r\nrow three\r\n$ prompt";
@@ -3749,8 +3748,8 @@ mod tests {
     }
 
     #[test]
-    // Reusing moved rows' fingerprints needs the current core's content
-    // sources; core v2 reports none and hashes damaged rows again.
+    // Core v2 reports rows a region scroll moved as changed (it tracks
+    // only rows moved by appends), so it hashes one row more here.
     #[cfg(not(feature = "core-v2-screen"))]
     fn scrolling_fingerprints_only_rows_that_changed() {
         let mut screen = HeadlessScreen::new(40, 10);
@@ -3871,8 +3870,7 @@ mod tests {
             reused += screen.geometry.rows - screen.take_fingerprinted_rows();
             reference.feed(bytes.as_bytes());
             assert_same_fingerprints(&screen, &reference, step);
-            // Core v2 resizes only to the same size until reflow (step 5).
-            if random % 997 == 0 && cfg!(not(feature = "core-v2-screen")) {
+            if random % 997 == 0 {
                 let (cols, rows) = (
                     10 + (random >> 24) as usize % 30,
                     1 + (random >> 32) as usize % 8,
@@ -4500,7 +4498,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
     fn a_resize_reflows_to_the_new_width() {
         let mut screen = HeadlessScreen::new(80, 24);
         screen.feed(b"hello\r\n");
@@ -4537,7 +4534,9 @@ mod tests {
     /// could not bring them back. A reference multiplexer keeps every line.
     #[cfg(feature = "compact-history")]
     #[test]
-    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
+    // Core v2 re-wraps history at once (step 5) and holds no raised row
+    // limit for it, so a narrowing at capacity drops rows past the limit.
+    #[cfg(not(feature = "core-v2-screen"))]
     fn a_resize_at_capacity_keeps_every_retained_line() {
         let lines = HISTORY_ROW_CEILING + 20_000;
         for (width, label) in [(70, "unwrapped"), (120, "wrapped")] {
@@ -4565,7 +4564,6 @@ mod tests {
     /// widening returns the limit to its base.
     #[cfg(feature = "compact-history")]
     #[test]
-    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
     fn a_raised_history_limit_follows_history_back_down() {
         let burst = HISTORY_ROW_CEILING;
         let mut screen = HeadlessScreen::new(80, 24);
@@ -4605,7 +4603,6 @@ mod tests {
     /// debug builds tests and development apps run).
     #[cfg(feature = "compact-history")]
     #[test]
-    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
     fn lines_after_narrowing_a_full_history_cost_what_they_did_before() {
         fn per_line(screen: &mut HeadlessScreen, next: &mut usize) -> std::time::Duration {
             let mut batches: Vec<_> = (0..5)
@@ -4642,7 +4639,6 @@ mod tests {
     /// checkpoint carries the newest of them and still restores.
     #[cfg(feature = "compact-history")]
     #[test]
-    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
     fn a_checkpoint_of_re_wrapped_history_stays_restorable() {
         let mut screen = HeadlessScreen::new(80, 24);
         screen.feed(&numbered_lines(0, 20_000, 120));
@@ -4676,7 +4672,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
     fn resize_keeps_history_within_the_cell_budget() {
         for alternate in [false, true] {
             let mut screen = HeadlessScreen::new(80, 24);
@@ -4725,7 +4720,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
     fn first_alternate_screen_matches_a_previously_initialized_screen() {
         for mode in [47, 1047, 1049] {
             let mut fresh = HeadlessScreen::new(80, 24);
@@ -4758,7 +4752,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
     fn incremental_grid_matches_fresh_snapshots_through_damage_and_resize() {
         let mut screen = HeadlessScreen::new(24, 8);
         let mut mirror = Vec::new();
@@ -4907,7 +4900,6 @@ mod tests {
     /// (about 150 at 100,001 rows of 40-column CJK prose).
     #[cfg(feature = "compact-history")]
     #[test]
-    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
     fn narrowing_deep_wide_character_history_keeps_it() {
         const WIDE: &[char] = &['漢', '字', '行', '日', '本', '語', '中', '文', '書', '道'];
         let line = |n: usize| {
@@ -5073,7 +5065,9 @@ mod tests {
 
     #[cfg(feature = "compact-history")]
     #[test]
-    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
+    // Core v2 re-wraps history at once (step 5) and holds no raised row
+    // limit for it, so a narrowing at capacity drops rows past the limit.
+    #[cfg(not(feature = "core-v2-screen"))]
     fn a_column_change_at_capacity_keeps_hard_line_history() {
         let mut screen = HeadlessScreen::new(80, 24);
         // Past the row ceiling, history recycles its oldest row per line and
@@ -5800,7 +5794,6 @@ mod qol_tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
     fn command_marks_survive_reflow_and_restore() {
         let mut screen = HeadlessScreen::new(12, 4);
         screen.feed(
@@ -6183,7 +6176,6 @@ mod style_tests {
     }
 
     #[test]
-    #[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
     fn decscusr_reaches_the_wire_and_advances_content_seq() {
         let mut screen = screen(b"hello");
         assert_eq!(screen.full_snapshot().cursor_style, CursorStyle::default());

@@ -213,3 +213,11 @@ jobs:
       # x86_64 takes the scalar paths the NEON code falls back to.
       - name: Test terminal core v2 switch on (scalar paths)
         run: cargo test --locked -p diri-terminal-state --features core-v2-screen
+      # The Engine (its mirrors, checkpoints and attach) and the Remote Helper
+      # with every terminal on core v2. Paging idle history out to the cold
+      # store is not on v2 yet (core-v2.md, step 6).
+      - name: Test Engine and Remote Helper on core v2
+        run: >-
+          cargo test --locked -p diri-engine -p diri-remote
+          --features diri-terminal-state/core-v2-screen --
+          --skip idle_history_pages_out_reads_back_and_leaves_with_its_session
