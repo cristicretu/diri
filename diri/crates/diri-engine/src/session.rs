@@ -524,6 +524,9 @@ struct Shared {
     /// The exit status a `returnToLoginShell` wrapper reported for its agent,
     /// which the PTY's own exit never carries: the login shell outlives it.
     agent_exit: Mutex<Option<i32>>,
+    /// A program rang the bell since the Registry watcher last looked. A
+    /// flag, so it never bumps the record or wakes anything by itself.
+    bell: AtomicBool,
     /// The manifest's `relaunchNotice`, for a wrapped agent that declares one.
     relaunch_notice: Option<String>,
     /// The wrapped agent exited asking to be started again; the Registry
@@ -2658,6 +2661,11 @@ impl Session {
             .take_notifications()
     }
 
+    /// Whether a program rang the bell since the last call.
+    pub fn take_bell(&self) -> bool {
+        self.shared.bell.swap(false, Ordering::Relaxed)
+    }
+
     /// The newest OSC 52 clipboard write since the last call, decoded.
     pub fn take_clipboard(&self) -> Option<String> {
         let data = self
@@ -3963,6 +3971,7 @@ fn new_shared(
         remote_stopping: AtomicBool::new(false),
         exit_recorded: AtomicBool::new(false),
         agent_exit: Mutex::new(None),
+        bell: AtomicBool::new(false),
         relaunch_notice: engine
             .manifest(&spec.manifest_id)
             .and_then(|manifest| manifest.agent.as_ref())
@@ -5302,6 +5311,9 @@ fn apply_remote_output(
         if screen.has_notifications() {
             shared.bump_state_version();
         }
+        if screen.take_bell() {
+            shared.bell.store(true, Ordering::Relaxed);
+        }
         // The Holder answers its program's queries from its own emulator;
         // this mirror's would otherwise pile up unread for the session's
         // lifetime. A Holder from before `query-replies-v1` leaves the
@@ -6018,6 +6030,9 @@ fn feed_output_batch(
             screen.feed(&buffer[..count]);
             if screen.has_notifications() {
                 shared.bump_state_version();
+            }
+            if screen.take_bell() {
+                shared.bell.store(true, Ordering::Relaxed);
             }
             if let Some(status) = screen.take_agent_exit() {
                 note_agent_exit(shared, status, &mut screen);
@@ -7242,6 +7257,9 @@ fn held_turn(state: Box<HeldPump>, mut resumed: bool, may_park: bool) -> HeldTur
                 }
                 if screen.has_notifications() {
                     shared.bump_state_version();
+                }
+                if screen.take_bell() {
+                    shared.bell.store(true, Ordering::Relaxed);
                 }
                 if let Some(status) = screen.take_agent_exit() {
                     note_agent_exit(&shared, status, &mut screen);
