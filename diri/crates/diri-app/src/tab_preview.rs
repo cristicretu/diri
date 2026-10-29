@@ -241,6 +241,7 @@ mod source_tests {
                 ],
             )],
             cursor_style: Default::default(),
+            history: None,
         }
     }
 
@@ -409,6 +410,7 @@ pub(crate) mod screenshot_fixture {
                                 })
                                 .collect(),
                             cursor_style: Default::default(),
+                            history: None,
                         };
                         stream
                             .get_mut()

@@ -555,6 +555,17 @@ mode is state only; the host encodes the reports. RIS clears it with the rest
 of the mode bits. Mode 69 (DECLRMM) still answers `4`: left and right margins
 are not implemented.
 
+## Stable history rows
+
+`Grid` counts the rows that leave history from its oldest end (`history_origin`):
+rows a full scroll region recycles at the row limit, rows `update_history`
+trims, `bound_history_storage` evictions and `clear_history`. `history_origin +
+index` therefore names a history row stably while output evicts older rows.
+Diri publishes it with each primary-screen grid diff (`grid-history-v1`) so a
+client can keep a selection on text that scrolls into history. One `u64` per
+grid, no per-row cost; not serialized. Resizes that reflow history renumber rows
+as before.
+
 ## Reply helpers for core v2
 
 `term::xtgettcap_reply`, `term::da2_version`, `term::osc52_store_text` and

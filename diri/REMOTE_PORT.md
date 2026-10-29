@@ -2428,6 +2428,53 @@ which the desktop shows as an out-of-date Helper. The Engine answers
 `cleared: false` without contacting the Holder when its mirror shows the
 alternate screen. Footprint: one boolean per Holder connection.
 
+## Grid history positions (protocol minor 23)
+
+Protocol minor 23 adds optional `grid-history-v1`. Every primary-screen grid
+(snapshot or delta) may carry a `GridHistory { origin, rows }`: `rows` is the
+history length (the `liveStartRow` a `session.read_scrollback_cells` reply
+made at that moment reports) and `origin` the rows that have left history
+from its oldest end (row-limit recycling, the 4 MiB byte bound, `ED 3`). Both
+are absolute, so a client compares any two grids it applied, across
+coalesced, discarded or reseeded diffs: `(origin + rows) - (origin' + rows')`
+lines scrolled into history between them and `origin - origin'` were evicted.
+Either count going backwards (a new emulator after an Engine restart or Holder
+replacement, a reflowing resize) means the two do not follow. The alternate
+screen has no history and sends none. The vendored alacritty_terminal `Grid`
+gains the `history_origin` counter (one `u64`, not serialized; see its
+`DIRI-PATCH.md`).
+
+Wire form: grid flag bit 6, then two LEB128 varints between the changed rows
+and the annotation block, whose length must end the payload. That is 2 bytes
+per grid for a fresh terminal, 3 at 10,000 rows of history, 5-6 once eviction
+has run for a while. A decoder that predates it cannot skip the bytes when
+annotations follow, so it is negotiated like `terminal-styles-v1` and only on
+top of it: the Engine lists `grid-history-v1` in `Hello.requiredCapabilities`
+for a Helper at minor 23 or above; a Holder rejects it below minor 23 or
+without `terminal-styles-v1`, and strips positions from snapshots and deltas
+for every controller that did not ask, naming the capability in `HelloAck`
+only to one that did. Minors 19-22 belong to other optional capabilities;
+this one is negotiated by name and assumes none of them. The Engine's mirror republishes the latest position with
+a full update. Locally `AttachRequest.gridHistory` opts in; the Engine sends a
+client without it the exact styled bytes from before, encoding a third form
+only for a publication with a position while such a sink is attached.
+Checkpoints, completed-run captures and previews keep the forms they had.
+
+The client uses it to keep a live selection on its text. Before applying a
+grid, a view that follows live takes the publisher's `rows` as its live
+origin; old live rows `y + scrolled` are new rows `y`. Selected rows leaving
+the live grid are copied into the view's row cache at their history numbers,
+so the selection still paints when scrolled to and copies the same text with
+no fetch. The selection is renumbered by eviction, dropped when any selected
+cell shows different text at its new position (a rewrite, an erase, a footer
+redraw), when its first row is evicted, and on any position that does not
+follow. A reading view keeps the origin of its own fetches as before, but a
+view that leaves live from a followed origin anchors to it, so output during
+its first fetch no longer moves the rows being read. Without positions (an
+older Engine or Holder, the alternate screen) the client keeps the earlier
+rule: any repaint overlapping the selection drops it. No Holder task, timer,
+queue or per-row state is added.
+
 ## Read-only output log ownership
 
 Opening a raw output log as a reader never creates directories, creates a missing

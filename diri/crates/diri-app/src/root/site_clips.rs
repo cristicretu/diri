@@ -336,6 +336,7 @@ fn live(pane: &str, screen: &Screen) -> GridBuffer {
                 })
                 .collect(),
             cursor_style: Default::default(),
+            history: None,
         });
         buffer.clone()
     })

@@ -1464,6 +1464,11 @@ pub struct AttachRequest {
     /// decoration spans). An older client omits it and gets the legacy form.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub terminal_styles: bool,
+    /// The client decodes `grid-history-v1`: each primary-screen grid
+    /// carries the history position, so a selection can follow its text
+    /// into history. Only honoured together with `terminal_styles`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub grid_history: bool,
     pub attach: SessionId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from_offset: Option<u64>,

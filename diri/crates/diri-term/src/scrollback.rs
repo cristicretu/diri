@@ -16,7 +16,9 @@ use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
 
-use diri_proto::grid::{GridCell, GridCodecError, GridRowCodec, LinkSpan, RowMetadata};
+use diri_proto::grid::{
+    GridCell, GridCodecError, GridHistory, GridRowCodec, GridUpdate, LinkSpan, RowMetadata,
+};
 use diri_proto::methods::ReadScrollbackCellsResult;
 use diri_proto::model::SessionId;
 use diri_proto::terminal::MouseModes;
@@ -190,6 +192,13 @@ pub struct ScrollbackViewport {
     /// Set while a column change re-wraps the history under a reader; see
     /// [`Relocation`].
     relocation: Option<Relocation>,
+    /// The history position of the latest grid that carried one
+    /// (`grid-history-v1`), on any screen and in any view.
+    published_history: Option<GridHistory>,
+    /// `live_start_row` is the history position of the grid the live mirror
+    /// last applied, so it names the mirror's rows exactly. Only a live view
+    /// follows the position; anything else that sets the origin clears this.
+    live_synced: bool,
 }
 
 /// Characters of a hard line kept to recognize it after a re-wrap.
@@ -271,6 +280,32 @@ fn line_key<'a>(rows: impl IntoIterator<Item = &'a [GridCell]>) -> (String, bool
     (text, false)
 }
 
+/// How a grid publication moved a live view's rows; see
+/// [`ScrollbackViewport::follow_history`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HistoryFollow {
+    /// No position to follow (an older Engine or Holder, the alternate
+    /// screen) or a view that is not following live: absolute rows mean
+    /// what they meant before.
+    Untracked,
+    /// The live rows moved up into history by a known amount.
+    Moved(HistoryStep),
+    /// The origin moved to a position that does not follow the last one
+    /// (the first grid, a resize, a new terminal): absolute rows from
+    /// before name nothing in particular.
+    Rebased,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HistoryStep {
+    /// Old live row `y + scrolled` is new live row `y`.
+    pub scrolled: usize,
+    /// Added to an absolute row from before the grid, names the same text
+    /// after it: rows that left history from its oldest end move every
+    /// number down.
+    pub renumber: i64,
+}
+
 impl ScrollbackViewport {
     pub fn has_find_source(&self, source: &crate::find::RetainedFindSnapshot) -> bool {
         self.find_source.as_deref() == Some(source)
@@ -286,6 +321,7 @@ impl ScrollbackViewport {
         self.cache.clear();
         self.annotations.clear();
         self.live_start_row = source.live_start_row;
+        self.live_synced = false;
         self.total_rows = source.first_row + source.row_count() as i64;
         self.cache_seq = Some(source.capture_revision);
         self.geometry_known = true;
@@ -549,7 +585,7 @@ impl ScrollbackViewport {
     /// history. While geometry is unknown the offset is the state, and it
     /// carries over unchanged.
     fn sync_anchor(&mut self) {
-        self.anchor = (self.geometry_known && self.is_reading())
+        self.anchor = ((self.geometry_known || self.live_synced) && self.is_reading())
             .then(|| self.live_start_row.saturating_sub(self.view_offset));
     }
 
@@ -713,7 +749,9 @@ impl ScrollbackViewport {
     pub(crate) fn hold_reading_view(&mut self, buffer: &GridBuffer) {
         if self.find_source.is_none() && self.is_reading() && self.held_live.is_none() {
             self.held_live = Some(buffer.clone());
-            self.held_live_start = self.geometry_known.then_some(self.live_start_row);
+            // A live origin that follows the grids names this exact screen.
+            self.held_live_start =
+                (self.geometry_known || self.live_synced).then_some(self.live_start_row);
         }
     }
 
@@ -1139,6 +1177,7 @@ impl ScrollbackViewport {
             self.held_live_start = Some(live_start_row);
         }
         self.live_start_row = live_start_row;
+        self.live_synced = false;
         self.total_rows = total_rows.max(0);
         self.geometry_known = true;
         self.history_rows = Some(live_start_row.max(0));
@@ -1185,6 +1224,72 @@ impl ScrollbackViewport {
             content_seq,
             visible_rows,
         );
+    }
+
+    /// Follows the history position `update` carries, before the live mirror
+    /// applies it. A live view takes the publisher's origin, so absolute
+    /// rows of the live grid keep naming the same text as output scrolls it
+    /// into history; rows this view keeps itself (see [`Self::pin_row`])
+    /// are renumbered with it. A reading view keeps the origin of its own
+    /// fetches, as before.
+    pub(crate) fn follow_history(
+        &mut self,
+        update: &GridUpdate,
+        buffer: &GridBuffer,
+    ) -> HistoryFollow {
+        let Some(position) = update.history else {
+            if !self.is_reading() {
+                self.live_synced = false;
+            }
+            return HistoryFollow::Untracked;
+        };
+        let previous = self.published_history.replace(position);
+        if self.is_reading() {
+            return HistoryFollow::Untracked;
+        }
+        let Ok(live_start_row) = i64::try_from(position.rows) else {
+            self.live_synced = false;
+            return HistoryFollow::Rebased;
+        };
+        let old_live_start = self.live_start_row;
+        self.live_start_row = live_start_row;
+        self.history_rows = Some(live_start_row);
+        self.total_rows = live_start_row.saturating_add(i64::from(update.rows));
+        let same_screen = buffer.cols == update.cols && buffer.rows == update.rows;
+        let step = previous
+            .filter(|_| same_screen)
+            .and_then(|previous| position.since(previous))
+            .and_then(|(scrolled, _)| usize::try_from(scrolled).ok());
+        self.live_synced = true;
+        let Some(scrolled) = step else {
+            return HistoryFollow::Rebased;
+        };
+        // Text at old row `old_live_start + y + scrolled` is at new row
+        // `live_start_row + y`. A synced origin makes this the eviction
+        // count; a stale one (the last fetch's) is rebased onto the grids.
+        let renumber = live_start_row
+            .saturating_sub(old_live_start)
+            .saturating_sub(i64::try_from(scrolled).unwrap_or(i64::MAX));
+        if renumber != 0 && !self.cache.is_empty() {
+            self.cache = renumbered(std::mem::take(&mut self.cache), renumber);
+            self.annotations = renumbered(std::mem::take(&mut self.annotations), renumber);
+        }
+        HistoryFollow::Moved(HistoryStep { scrolled, renumber })
+    }
+
+    /// Keeps a live row that is about to scroll into history, numbered as
+    /// it will be there, so a selection over it can still be painted and
+    /// copied without a fetch. A live view holds no other history rows.
+    pub(crate) fn pin_row(&mut self, absolute_row: i64, cells: &[GridCell], metadata: RowMetadata) {
+        if absolute_row < 0 || self.is_reading() {
+            return;
+        }
+        self.cache.insert(absolute_row, cells.to_vec());
+        if metadata.is_empty() {
+            self.annotations.remove(&absolute_row);
+        } else {
+            self.annotations.insert(absolute_row, metadata);
+        }
     }
 
     /// Alternate screen has no history. Entering it always returns to live.
@@ -1304,6 +1409,17 @@ impl ScrollbackViewport {
             }
         }
     }
+}
+
+/// `rows` with every key moved by `delta`; rows moved before the oldest
+/// retained one are gone.
+fn renumbered<T>(rows: BTreeMap<i64, T>, delta: i64) -> BTreeMap<i64, T> {
+    rows.into_iter()
+        .filter_map(|(row, value)| {
+            let row = row.checked_add(delta)?;
+            (row >= 0).then_some((row, value))
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

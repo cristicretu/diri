@@ -942,6 +942,7 @@ impl ControlServer {
                         crate::attach::AttachCapabilities {
                             enhanced_keyboard: attach.enhanced_keyboard,
                             terminal_styles: attach.terminal_styles,
+                            grid_history: attach.grid_history,
                         },
                         reader.into_inner(),
                         buffered,
@@ -9491,6 +9492,7 @@ mod tests {
                     diri_proto::grid::ChangedRow::new(1, row),
                 ],
                 cursor_style: Default::default(),
+                history: None,
             },
             marker_buffer: Vec::new(),
             alt_screen: false,

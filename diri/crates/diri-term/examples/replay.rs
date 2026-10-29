@@ -265,6 +265,7 @@ fn full_snapshot() -> GridUpdate {
             .map(|(y, cells)| ChangedRow::new(y as u16, cells))
             .collect(),
         cursor_style: Default::default(),
+        history: None,
     }
 }
 
@@ -300,6 +301,7 @@ fn animated_diff(frame: usize) -> GridUpdate {
         is_full_snapshot: false,
         changed_rows: vec![ChangedRow::new(6, gradient), ChangedRow::new(12, scrolling)],
         cursor_style: Default::default(),
+        history: None,
     }
 }
 
