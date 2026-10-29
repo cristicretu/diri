@@ -99,7 +99,7 @@ struct Run {
 }
 
 /// One run, as `vt_workloads::run` feeds the current core.
-fn run(data: &[u8], reps: usize, checksum: bool) -> (f64, Run) {
+fn run(data: &[u8], reps: usize, checksum: bool) -> (f64, Option<(u64, u64)>, Run) {
     let mut out = Run {
         screen: screen(),
         bytes_fed: 0,
@@ -108,6 +108,7 @@ fn run(data: &[u8], reps: usize, checksum: bool) -> (f64, Run) {
         clipboard: Vec::new(),
     };
     osc_observe::reset(checksum);
+    let counters = cpu_counters();
     let started = Instant::now();
     for _ in 0..reps {
         for chunk in data.chunks(READ) {
@@ -122,7 +123,11 @@ fn run(data: &[u8], reps: usize, checksum: bool) -> (f64, Run) {
             out.clipboard.extend(out.screen.take_clipboard());
         }
     }
-    (started.elapsed().as_secs_f64(), out)
+    let secs = started.elapsed().as_secs_f64();
+    let counted = counters
+        .zip(cpu_counters())
+        .map(|((c0, i0), (c1, i1))| (c1 - c0, i1 - i0));
+    (secs, counted, out)
 }
 
 /// Image anchors name a per-screen store nonce; only the rest must match.
@@ -303,6 +308,26 @@ fn mismatches(
         .collect()
 }
 
+/// This process's (cycles, instructions) so far, from macOS's per-process
+/// counters (which count only while it runs). `None` elsewhere.
+fn cpu_counters() -> Option<(u64, u64)> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+        // SAFETY: the buffer is a `rusage_info_v4`, the flavor asked for.
+        let ok = unsafe {
+            libc::proc_pid_rusage(
+                std::process::id() as i32,
+                libc::RUSAGE_INFO_V4,
+                &mut info as *mut _ as *mut libc::rusage_info_t,
+            )
+        } == 0;
+        ok.then_some((info.ri_cycles, info.ri_instructions))
+    }
+    #[cfg(not(target_os = "macos"))]
+    None
+}
+
 fn summary(mut values: Vec<f64>) -> String {
     values.sort_by(f64::total_cmp);
     format!(
@@ -345,7 +370,7 @@ fn main() {
 
         // Untimed: the per-byte OSC checksum, and the rows v2 keeps for
         // the byte-at-a-time reference.
-        let (_, mut first) = run(&payload, reps, true);
+        let (_, _, mut first) = run(&payload, reps, true);
         let kept = first.screen.core.history_size();
         let mut failure = mismatches(&digest(&mut first, checked), want, true);
         drop(first);
@@ -366,11 +391,12 @@ fn main() {
         }
 
         let mut rates = Vec::new();
+        let (mut cycles, mut instructions) = (Vec::new(), Vec::new());
         for _ in 0..rounds {
             if !failure.is_empty() {
                 break;
             }
-            let (secs, mut out) = run(&payload, reps, false);
+            let (secs, counted, mut out) = run(&payload, reps, false);
             let bytes = payload.len() * reps;
             if out.bytes_fed != bytes {
                 failure.push(format!("fed {} of {bytes} bytes", out.bytes_fed));
@@ -389,12 +415,25 @@ fn main() {
             out.screen.core.release_read_cache();
             if failure.is_empty() {
                 rates.push(bytes as f64 / secs / 1e6);
+                if let Some((c, i)) = counted {
+                    cycles.push(c as f64 / bytes as f64);
+                    instructions.push(i as f64 / bytes as f64);
+                }
             }
         }
         if failure.is_empty() {
+            let per_byte = |mut v: Vec<f64>| {
+                if v.is_empty() {
+                    return "-".to_owned();
+                }
+                v.sort_by(f64::total_cmp);
+                format!("{:.3} ({:.3}..{:.3})", v[v.len() / 2], v[0], v[v.len() - 1])
+            };
             println!(
-                "{name:<18} {:>22} MB/s  rows {kept}  golden ok x{} + checksum",
+                "{name:<18} {:>22} MB/s  cycles/B {}  instructions/B {}  rows {kept}  golden ok x{} + checksum",
                 summary(rates),
+                per_byte(cycles),
+                per_byte(instructions),
                 rounds
             );
         } else {
