@@ -96,3 +96,71 @@ fn find_capture_is_bounded_atomic_and_pinned_to_the_original_session_owner() {
         .remove("find-fixture", &temp.path().join("logs"))
         .unwrap();
 }
+
+#[test]
+fn find_history_reaches_rows_older_than_the_capture() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = server(temp.path());
+    server.registry.lock().unwrap().spawn(SessionSpec {
+        id: "deep-find".into(),
+        pty: crate::pty::PtySpec::new(vec!["/bin/sh".into(), "-c".into(),
+            "printf 'OLDEST needle\\r\\n'; i=0; while [ $i -lt 12000 ]; do printf 'hay %d\\r\\n' $i; i=$((i+1)); done; printf 'DEEP READY'; read line".into()], temp.path()).size(80, 24),
+        manifest_id: "shell".into(), authority: Authority::ProcessOnly,
+        logs_dir: temp.path().join("logs"), holder: None, remote: None, defer_launch: false,
+    }, test_record("deep-find")).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !server
+        .registry
+        .lock()
+        .unwrap()
+        .get("deep-find")
+        .unwrap()
+        .read_scrollback()
+        .lines
+        .iter()
+        .any(|line| line.contains("DEEP READY"))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fixture never finished"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let capture: diri_proto::CaptureFindResult = serde_json::from_value(
+        server
+            .session_capture_find(Some(json!({"sessionID":"deep-find"})))
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(capture.partial, "the capture holds only the newest rows");
+    let origin = capture
+        .history_origin
+        .expect("local captures carry an origin");
+    // Continue below the capture, page by page, as the app does.
+    let mut before = Some(origin + capture.cells.first_row);
+    let mut found = Vec::new();
+    while let Some(row) = before {
+        let page: diri_proto::find::FindHistoryResult = serde_json::from_value(
+            server
+                .session_find_history(Some(json!({
+                    "sessionID": "deep-find", "query": "needle", "beforeRow": row,
+                    "cols": capture.cells.cols, "maxMatches": 64, "budgetMs": 20
+                })))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(page.cols, 80);
+        found.extend(page.matches);
+        before = page.next_before_row;
+    }
+    // The command line echo may also match; the printed line is the oldest.
+    let oldest = found.last().expect("the oldest line is found");
+    assert!(oldest[0] < origin + capture.cells.first_row);
+    assert_eq!(&oldest[1..], &[7, 13]);
+    server
+        .registry
+        .lock()
+        .unwrap()
+        .remove("deep-find", &temp.path().join("logs"))
+        .unwrap();
+}

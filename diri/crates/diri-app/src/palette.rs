@@ -53,6 +53,10 @@ pub enum PaletteCommand {
         note_id: String,
         block: Option<usize>,
     },
+    /// A command `init.lua` added with `diri.command`, by id.
+    Script {
+        id: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -377,6 +381,7 @@ fn append_management_actions(
                             | CommandId::ImportTerminalSetup
                             | CommandId::TogglePerfOverlay
                             | CommandId::ToggleRenderCounters
+                            | CommandId::ReloadScripts
                             | CommandId::ClearScrollback
                             | CommandId::ResetTerminal
                     )
@@ -732,6 +737,7 @@ pub fn actions_for_default_host(
         registered_action(CommandId::ImportTerminalSetup),
         registered_action(CommandId::TogglePerfOverlay),
         registered_action(CommandId::ToggleRenderCounters),
+        registered_action(CommandId::ReloadScripts),
     ]);
     result
 }
@@ -1389,6 +1395,7 @@ mod tests {
                 "import-terminal-setup",
                 "toggle-perf-overlay",
                 "toggle-render-counters",
+                "reload-scripts",
             ]
         );
         assert_eq!(result[0].title, "New Codex Session");

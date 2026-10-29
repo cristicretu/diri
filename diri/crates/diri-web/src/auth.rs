@@ -25,6 +25,14 @@ pub struct Auth {
 }
 
 impl Auth {
+    /// A token that exists only in memory and is shown to nobody: what a
+    /// tailnet-admitted gateway holds, since it never accepts one.
+    pub fn ephemeral() -> io::Result<Self> {
+        Ok(Self {
+            token: mint_token()?,
+        })
+    }
+
     #[cfg(test)]
     pub fn temporary() -> io::Result<Self> {
         Ok(Self {
@@ -71,25 +79,9 @@ impl Auth {
         &self.token
     }
 
-    /// The token this request presents, by any of the accepted routes.
-    fn presented(request: &Request) -> Option<String> {
-        if let Some(header) = request.header("authorization")
-            && let Some(rest) = header.strip_prefix("Bearer ")
-        {
-            return Some(rest.trim().to_string());
-        }
-        if let Some(header) = request.header("x-diri-token") {
-            return Some(header.trim().to_string());
-        }
-        if let Some(query) = request.query.get("token") {
-            return Some(query.clone());
-        }
-        request.cookie(COOKIE)
-    }
-
     #[must_use]
     pub fn authorizes(&self, request: &Request) -> bool {
-        Self::presented(request).is_some_and(|presented| constant_time_eq(&presented, &self.token))
+        presented(request).is_some_and(|presented| constant_time_eq(&presented, &self.token))
     }
 
     /// True when the token arrived in the URL, meaning the browser should be
@@ -113,6 +105,23 @@ impl Auth {
             self.token
         )
     }
+}
+
+/// The secret this request presents, by any of the accepted routes: the
+/// bearer token, or under tailnet admission a one-time pairing code.
+pub(crate) fn presented(request: &Request) -> Option<String> {
+    if let Some(header) = request.header("authorization")
+        && let Some(rest) = header.strip_prefix("Bearer ")
+    {
+        return Some(rest.trim().to_string());
+    }
+    if let Some(header) = request.header("x-diri-token") {
+        return Some(header.trim().to_string());
+    }
+    if let Some(query) = request.query.get("token") {
+        return Some(query.clone());
+    }
+    request.cookie(COOKIE)
 }
 
 /// A state-changing request must not be driven by another origin's page.
@@ -150,14 +159,19 @@ pub fn default_token_path() -> PathBuf {
 }
 
 fn mint_token() -> io::Result<String> {
-    let mut bytes = [0_u8; TOKEN_BYTES];
+    mint_secret(TOKEN_BYTES)
+}
+
+/// `len` bytes of system entropy, hex-encoded.
+pub(crate) fn mint_secret(len: usize) -> io::Result<String> {
+    let mut bytes = vec![0_u8; len];
     getrandom::fill(&mut bytes)
         .map_err(|error| io::Error::other(format!("no system entropy: {error}")))?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 #[cfg(unix)]
-fn write_owner_only(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_owner_only(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = std::fs::OpenOptions::new()
@@ -173,24 +187,24 @@ fn write_owner_only(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn write_owner_only(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_owner_only(path: &Path, bytes: &[u8]) -> io::Result<()> {
     std::fs::write(path, bytes)
 }
 
 #[cfg(unix)]
-fn restrict(path: &Path, mode: u32) -> io::Result<()> {
+pub(crate) fn restrict(path: &Path, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
 #[cfg(not(unix))]
-fn restrict(_path: &Path, _mode: u32) -> io::Result<()> {
+pub(crate) fn restrict(_path: &Path, _mode: u32) -> io::Result<()> {
     Ok(())
 }
 
 /// Compares without leaking the position of the first difference through
 /// timing. Length is allowed to leak; the token length is not a secret.
-fn constant_time_eq(left: &str, right: &str) -> bool {
+pub(crate) fn constant_time_eq(left: &str, right: &str) -> bool {
     if left.len() != right.len() {
         return false;
     }

@@ -123,9 +123,14 @@ fn signature(schema: &Value) -> String {
         .and_then(Value::as_array)
         .map(|keys| keys.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
-    // Required first, so the line reads like a call.
+    // Required first, so the line reads like a call; then by name, so the
+    // text is the same whether or not serde_json keeps insertion order (a
+    // workspace build can unify `preserve_order` on).
     let mut keys: Vec<&String> = properties.keys().collect();
-    keys.sort_by_key(|key| !required.contains(&key.as_str()));
+    keys.sort_by(|a, b| {
+        (!required.contains(&a.as_str()), a.as_str())
+            .cmp(&(!required.contains(&b.as_str()), b.as_str()))
+    });
     keys.into_iter()
         .map(|key| {
             if required.contains(&key.as_str()) {
@@ -366,6 +371,12 @@ mod catalog {
                 SessionIdParams,
                 "CaptureFindResult",
                 "Screen plus history as text, for find."
+            ),
+            entry!(
+                Method::SESSION_FIND_HISTORY,
+                crate::find::FindHistoryParams,
+                "FindHistoryResult",
+                "One bounded page of a search over a session's whole history, by stable row."
             ),
             entry!(
                 Method::SESSION_READ_SCROLLBACK,

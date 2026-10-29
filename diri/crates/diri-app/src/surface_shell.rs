@@ -148,6 +148,7 @@ enum SettingsMenu {
     PaneDensity,
     CursorShape,
     CursorBlink,
+    SidebarUsageIndicator,
     TalkVoice,
     TalkAnswer,
     TalkTabs,
@@ -578,6 +579,9 @@ pub struct UtilitySurfaces {
     phone_loading: bool,
     phone_error: Option<String>,
     phone_setup: Option<crate::phone_access::TailscaleSetup>,
+    /// Devices paired under Tailscale identity admission; shared with the
+    /// gateway so removing one closes its connections at once.
+    phone_devices: Arc<diri_web::Devices>,
     focus: FocusHandle,
     surface: Surface,
     worktrees: WorktreesSheet,
@@ -837,6 +841,7 @@ impl UtilitySurfaces {
             phone_loading: false,
             phone_error: None,
             phone_setup: None,
+            phone_devices: crate::phone_access::paired_devices(),
             surface: if diagnostics_preview {
                 Surface::Diagnostics
             } else if settings_preview.is_some() {
@@ -3766,9 +3771,13 @@ impl UtilitySurfaces {
                                     this.phone_loading = true;
                                     this.phone_error = None;
                                     let client = Arc::clone(this.store_runtime.client());
-                                    let task = this
-                                        .runtime
-                                        .spawn(crate::phone_access::PhoneAccess::start(client));
+                                    let tailnet = this
+                                        .prefs
+                                        .phone_tailnet_identity
+                                        .then(|| Arc::clone(&this.phone_devices));
+                                    let task = this.runtime.spawn(
+                                        crate::phone_access::PhoneAccess::start(client, tailnet),
+                                    );
                                     cx.spawn(async move |this, cx| {
                                         let result = task
                                             .await
@@ -3842,8 +3851,16 @@ impl UtilitySurfaces {
                                 .flex()
                                 .flex_col()
                                 .gap(px(10.0))
-                                .child(copy(t("settings.phone.scan_hint")))
-                                .child(copy(t("settings.phone.code_warning")))
+                                .child(copy(if access.identifies_devices() {
+                                    t("settings.phone.pair_hint")
+                                } else {
+                                    t("settings.phone.scan_hint")
+                                }))
+                                .child(copy(if access.identifies_devices() {
+                                    t("settings.phone.pair_warning")
+                                } else {
+                                    t("settings.phone.code_warning")
+                                }))
                                 .child(
                                     div()
                                         .flex()
@@ -3869,6 +3886,19 @@ impl UtilitySurfaces {
                                             colors,
                                             cx,
                                             |this, cx| {
+                                                // A one-time code is replaced
+                                                // in place; paired devices
+                                                // stay connected.
+                                                if let Some(access) = this
+                                                    .phone_access
+                                                    .as_mut()
+                                                    .filter(|access| access.identifies_devices())
+                                                {
+                                                    this.phone_error =
+                                                        access.new_pairing_code().err();
+                                                    cx.notify();
+                                                    return;
+                                                }
                                                 // Stop serving the old code
                                                 // before it is replaced.
                                                 this.phone_access = None;
@@ -3878,8 +3908,10 @@ impl UtilitySurfaces {
                                                     Arc::clone(this.store_runtime.client());
                                                 let task = this.runtime.spawn(async move {
                                                     crate::phone_access::PhoneAccess::reset_pairing()?;
-                                                    crate::phone_access::PhoneAccess::start(client)
-                                                        .await
+                                                    crate::phone_access::PhoneAccess::start(
+                                                        client, None,
+                                                    )
+                                                    .await
                                                 });
                                                 cx.spawn(async move |this, cx| {
                                                     let result = task
@@ -3917,7 +3949,76 @@ impl UtilitySurfaces {
                     colors,
                 ))
             });
+        let content = content.child(self.phone_identity_settings(cx));
         settings_page(t("settings.phone.title"), content, colors)
+    }
+
+    /// Who may connect: the identity toggle and, when it is on, the paired
+    /// devices with a per-device Remove.
+    fn phone_identity_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let enabled = self.prefs.phone_tailnet_identity;
+        let devices = if enabled {
+            self.phone_devices.list()
+        } else {
+            Vec::new()
+        };
+        let mut section = div().flex().flex_col().child(toggle_row(
+            t("settings.phone.identity"),
+            t("settings.phone.identity_detail"),
+            enabled,
+            "phone-identity",
+            colors,
+            cx,
+            |this, cx| {
+                let enabled = !this.prefs.phone_tailnet_identity;
+                if this.update_prefs(move |prefs| prefs.phone_tailnet_identity = enabled) {
+                    // The running gateway admits the old way; stop it so the
+                    // next Enable uses the new rule.
+                    this.phone_access = None;
+                }
+                cx.notify();
+            },
+        ));
+        if enabled {
+            section = section.child(setting_divider(colors));
+            if devices.is_empty() {
+                section = section.child(setting_row(
+                    t("settings.phone.devices"),
+                    t("settings.phone.no_devices"),
+                    div(),
+                    colors,
+                ));
+            }
+            for device in devices {
+                let id = device.id.clone();
+                let detail = [device.os.as_str(), device.login.as_str()]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                section = section.child(setting_row(
+                    device.name,
+                    detail,
+                    surface_button(
+                        t("settings.phone.remove_device"),
+                        SharedString::from(format!("phone-device-{}", device.id)),
+                        colors,
+                        cx,
+                        move |this, cx| {
+                            this.phone_error = this
+                                .phone_devices
+                                .revoke(&id)
+                                .err()
+                                .map(|error| error.to_string());
+                            cx.notify();
+                        },
+                    ),
+                    colors,
+                ));
+            }
+        }
+        setting_section(t("settings.phone.who_can_connect"), section, colors)
     }
 
     /// Decodes the thumbnails' stills once per appearance, off the main thread.
@@ -5805,6 +5906,7 @@ impl UtilitySurfaces {
             SettingsMenu::PaneDensity => (self.pane_density_options(colors, cx), 172.0),
             SettingsMenu::CursorShape => (self.cursor_shape_options(colors, cx), 172.0),
             SettingsMenu::CursorBlink => (self.cursor_blink_options(colors, cx), 172.0),
+            SettingsMenu::SidebarUsageIndicator => (self.sidebar_usage_options(colors, cx), 210.0),
             SettingsMenu::TalkVoice => (self.talk_voice_options(colors, cx), 400.0),
             SettingsMenu::TalkAnswer => (self.talk_answer_options(colors, cx), 204.0),
             SettingsMenu::TalkTabs => (self.talk_tabs_options(colors, cx), 204.0),
@@ -6245,6 +6347,53 @@ impl UtilitySurfaces {
                     cx.notify();
                 },
             ));
+        }
+        options.into_any_element()
+    }
+
+    fn sidebar_usage_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let open = self.settings_menu == Some(SettingsMenu::SidebarUsageIndicator);
+        let mut control = div()
+            .debug_selector(|| "sidebar-usage-dropdown".into())
+            .relative()
+            .min_w(px(160.0))
+            .child(settings_select_button(
+                self.prefs.sidebar_usage_indicator.title().to_owned(),
+                "sidebar-usage-dropdown",
+                open,
+                SettingsMenu::SidebarUsageIndicator,
+                colors,
+                cx,
+            ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        control.into_any_element()
+    }
+
+    fn sidebar_usage_options(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for (index, choice) in crate::store::SidebarUsageIndicator::ALL
+            .into_iter()
+            .enumerate()
+        {
+            options = options.child(
+                div()
+                    .debug_selector(move || format!("sidebar-usage-option-{index}"))
+                    .child(settings_choice_row(
+                        format!("sidebar-usage-option-{index}"),
+                        choice.title().to_owned(),
+                        choice == self.prefs.sidebar_usage_indicator,
+                        colors,
+                        cx,
+                        move |this, cx| {
+                            this.settings_menu = None;
+                            this.update_prefs(move |prefs| prefs.sidebar_usage_indicator = choice);
+                            cx.notify();
+                        },
+                    )),
+            );
         }
         options.into_any_element()
     }
@@ -6806,6 +6955,11 @@ impl UtilitySurfaces {
                         .child(row(
                             t("settings.appearance.density"),
                             self.pane_density_dropdown(cx).into_any_element(),
+                        ))
+                        .child(setting_divider(colors))
+                        .child(row(
+                            t("sidebar.usage.setting"),
+                            self.sidebar_usage_dropdown(cx),
                         ))
                         .child(setting_divider(colors))
                         .child(row(
@@ -10699,6 +10853,14 @@ mod tests {
                             cx.notify();
                         });
                     }
+                    // `DIRI_VISUAL_USAGE_MENU=1` opens Appearance's sidebar
+                    // usage indicator menu.
+                    if std::env::var_os("DIRI_VISUAL_USAGE_MENU").is_some() {
+                        harness.surfaces.update(cx, |surfaces, cx| {
+                            surfaces.settings_menu = Some(SettingsMenu::SidebarUsageIndicator);
+                            cx.notify();
+                        });
+                    }
                     // `DIRI_VISUAL_TRUSTED_LINKS=ssh,vscode` lists trusted
                     // app-link schemes in Settings › Terminal.
                     if let Ok(schemes) = std::env::var("DIRI_VISUAL_TRUSTED_LINKS") {
@@ -12945,6 +13107,49 @@ mod tests {
         // The panel now shows what is actually stored, so a second action
         // cannot resurrect the stale copy either.
         surfaces.read_with(cx, |surfaces, _| assert_eq!(surfaces.prefs, saved));
+    }
+
+    #[gpui::test]
+    fn footer_preference_appearance_keeps_newer_shared_preferences(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        let store = surfaces.read_with(cx, |surfaces, _| surfaces.store.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.settings_tab = SettingsTab::Appearance;
+            cx.notify();
+        });
+        store
+            .write()
+            .unwrap()
+            .update_preferences(|prefs| {
+                prefs
+                    .muted_notification_sessions
+                    .insert("footer-fixture".into());
+                prefs.pane_density = crate::store::PaneDensity::Compact;
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let dropdown = cx
+            .debug_bounds("sidebar-usage-dropdown")
+            .expect("Appearance usage setting");
+        cx.simulate_click(dropdown.center(), Modifiers::default());
+        cx.run_until_parked();
+        let option = cx
+            .debug_bounds("sidebar-usage-option-2")
+            .expect("Remaining quota choice");
+        cx.simulate_click(option.center(), Modifiers::default());
+        cx.run_until_parked();
+        let saved = store.read().unwrap().preferences().clone();
+        assert_eq!(
+            saved.sidebar_usage_indicator,
+            crate::store::SidebarUsageIndicator::RemainingQuota
+        );
+        assert_eq!(saved.pane_density, crate::store::PaneDensity::Compact);
+        assert!(saved.muted_notification_sessions.contains("footer-fixture"));
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(surfaces.prefs, saved);
+            assert_eq!(surfaces.settings_menu, None);
+        });
     }
 
     /// The toggle used to save `start_at_login` and stop. It now goes through

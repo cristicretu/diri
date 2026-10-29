@@ -107,6 +107,7 @@ mod telemetry;
 mod terminal_import;
 pub mod terminal_pane;
 mod text_input;
+mod scripting;
 mod toast;
 mod tooltip_warmth;
 pub mod transcript;
@@ -550,6 +551,8 @@ fn main() {
             .clone();
         commands::bind_keys(cx, &shortcut_overrides);
         install_app_menus(cx);
+        cx.on_action(|_: &commands::ReloadScripts, cx| scripting::reload(cx));
+        scripting::start(cx);
         let activation_services = Arc::clone(&services);
         cx.on_action(move |_: &commands::ShowApp, cx| {
             let activation_services = Arc::clone(&activation_services);

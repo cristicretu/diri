@@ -73,7 +73,7 @@ pub fn exposure(id: CommandId) -> Exposure {
         | ZoomOut | ResetZoom | EnterCopyMode | FindSelection | InsertPath | PreviousPrompt
         | NextPrompt | ToggleActivity | SplitPaneLeft | SplitPaneAbove | SplitPaneBestFit
         | MovePaneToNewTab | MovePaneToNextTab | MovePaneToPreviousTab | MoveTabToNewWindow
-        | MoveTabToNextWindow | GoToDirectory => Exposure::Safe,
+        | MoveTabToNextWindow | GoToDirectory | ReloadScripts => Exposure::Safe,
     }
 }
 
@@ -264,7 +264,11 @@ pub fn resolve(request: &AppPerformRequest) -> Result<Resolved, ControlError> {
 pub fn handled_globally(id: CommandId) -> bool {
     matches!(
         id,
-        CommandId::Quit | CommandId::CloseWindow | CommandId::CloseSession | CommandId::NewWindow
+        CommandId::Quit
+            | CommandId::CloseWindow
+            | CommandId::CloseSession
+            | CommandId::NewWindow
+            | CommandId::ReloadScripts
     )
 }
 

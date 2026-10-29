@@ -270,6 +270,12 @@ pub struct HolderOutputStream {
     /// When the last run was handed back: a run that begins soon after it is
     /// part of streaming output.
     last_run: Option<Instant>,
+    /// How long a streaming run waits for its next frame, and in all.
+    /// Always [`STREAMING_RUN_GAP`] and [`STREAMING_RUN_WAIT`] outside tests,
+    /// which widen them so the joining they check does not depend on how
+    /// quickly a loaded machine schedules the fake Holder.
+    streaming_gap: Duration,
+    streaming_wait: Duration,
 }
 
 impl HolderOutputStream {
@@ -313,6 +319,8 @@ impl HolderOutputStream {
             resumed: resume_from.is_some() && response.resumed == Some(true),
             timeout: None,
             last_run: None,
+            streaming_gap: STREAMING_RUN_GAP,
+            streaming_wait: STREAMING_RUN_WAIT,
         }))
     }
 
@@ -403,7 +411,7 @@ impl HolderOutputStream {
         // [`STREAMING_RUN_TARGET`]. A lone echo or prompt never waits.
         let following = self
             .last_run
-            .is_some_and(|at| at.elapsed() < STREAMING_RUN_WAIT);
+            .is_some_and(|at| at.elapsed() < self.streaming_wait);
         let mut waited: Option<Instant> = None;
         while run.len() < budget {
             let streaming =
@@ -412,9 +420,9 @@ impl HolderOutputStream {
                 _ if !streaming => Duration::ZERO,
                 None => {
                     waited = Some(Instant::now());
-                    STREAMING_RUN_GAP
+                    self.streaming_gap
                 }
-                Some(started) if started.elapsed() < STREAMING_RUN_WAIT => STREAMING_RUN_GAP,
+                Some(started) if started.elapsed() < self.streaming_wait => self.streaming_gap,
                 Some(_) => Duration::ZERO,
             };
             match self.read_frame_into(wait, run) {
@@ -767,28 +775,103 @@ mod deadline_tests {
         (stream, worker)
     }
 
+    /// Bytes sitting unread in the socket behind `descriptor`.
+    fn unread_bytes(descriptor: i32) -> libc::c_int {
+        let mut unread: libc::c_int = 0;
+        // SAFETY: a live socket and a correctly sized out-parameter.
+        let result = unsafe { libc::ioctl(descriptor, libc::FIONREAD, &mut unread) };
+        assert_eq!(result, 0, "FIONREAD");
+        unread
+    }
+
+    /// The receive timeout set on the socket behind `descriptor`.
+    fn receive_timeout(descriptor: i32) -> Duration {
+        // SAFETY: zeroed is a valid `timeval`.
+        let mut timeout: libc::timeval = unsafe { std::mem::zeroed() };
+        let mut length = std::mem::size_of_val(&timeout) as libc::socklen_t;
+        // SAFETY: a live socket and a correctly sized out-parameter.
+        let result = unsafe {
+            libc::getsockopt(
+                descriptor,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                (&mut timeout as *mut libc::timeval).cast(),
+                &mut length,
+            )
+        };
+        assert_eq!(result, 0, "SO_RCVTIMEO");
+        Duration::new(timeout.tv_sec as u64, timeout.tv_usec as u32 * 1000)
+    }
+
     #[test]
     fn streaming_frames_a_read_apart_join_one_run() {
         let temp = tempfile::tempdir_in("/tmp").unwrap();
         let path = temp.path().join("output.sock");
-        // A flood: kilobyte frames 20 µs apart, as a PTY hands them over.
-        let (mut stream, worker) = stream_of_frames(&path, 64, Duration::from_micros(20));
+        let listener = UnixListener::bind(&path).unwrap();
+        // Deadlines no scheduling delay can reach: every frame is inside them.
+        const DEADLINE: Duration = Duration::from_secs(60);
+        let (descriptor_tx, descriptor_rx) = std::sync::mpsc::channel::<i32>();
+        // Each frame is written only once the reader has taken every byte of
+        // the one before off the socket and set the socket to wait the full
+        // deadline, which it does only right before a blocking read. So every
+        // frame arrives a read apart, while the reader waits for it: none is
+        // ever already queued when the run looks for the next, and a reader
+        // that only polls (a near-zero timeout) is never handed one. That ordering,
+        // not the scheduler, decides what the reader sees.
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&mut socket).read_line(&mut line).unwrap();
+            let mut reply = serde_json::to_vec(&HolderResponse::output_stream(
+                HOLDER_OUTPUT_STREAM_VERSION,
+                0,
+            ))
+            .unwrap();
+            reply.push(b'\n');
+            socket.write_all(&reply).unwrap();
+            let reader = descriptor_rx.recv().unwrap();
+            for frame in 0..64_usize {
+                while unread_bytes(reader) > 0 || receive_timeout(reader) != DEADLINE {
+                    std::thread::yield_now();
+                }
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(&(frame as u64 * 1024).to_be_bytes());
+                bytes.extend_from_slice(&1024_u32.to_be_bytes());
+                bytes.extend_from_slice(&[b'a' + (frame % 26) as u8; 1024]);
+                socket.write_all(&bytes).unwrap();
+            }
+            // Closing ends the run that is still waiting for a 65th frame.
+        });
+        let mut stream = HolderClient::at(&path)
+            .open_output_stream()
+            .unwrap()
+            .expect("stream supported");
+        stream.streaming_gap = DEADLINE;
+        stream.streaming_wait = DEADLINE;
+        {
+            use std::os::fd::AsRawFd;
+            descriptor_tx
+                .send(stream.stream.get_ref().as_raw_fd())
+                .unwrap();
+        }
         let mut run = Vec::new();
-        let mut runs = 0;
+        let mut runs = Vec::new();
         let mut received = 0;
         while received < 64 << 10 {
             let at = stream
-                .next_run_into(Duration::from_secs(5), 1 << 20, &mut run)
+                .next_run_into(DEADLINE, 1 << 20, &mut run)
                 .unwrap()
                 .expect("a run");
             assert_eq!(at, received as u64, "contiguous");
             received += run.len();
-            runs += 1;
+            runs.push(run.len());
         }
-        let _socket = worker.join().unwrap();
+        worker.join().unwrap();
         assert_eq!(received, 64 << 10);
-        // Without the streaming wait each frame arrived alone: 64 runs.
-        assert!(runs <= 8, "{runs} runs");
+        // The first frame is a lone kilobyte and returns alone; every later
+        // one follows it within the deadline and joins a single run. Without
+        // the streaming wait each frame arrives alone: 64 runs.
+        assert!(runs.len() <= 2, "runs of {runs:?}");
     }
 
     #[test]

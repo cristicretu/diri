@@ -63,6 +63,9 @@ pub struct RetainedFindSnapshot {
     pub visible_rows: usize,
     pub partial: bool,
     pub is_alt_screen: bool,
+    /// Stable row of absolute row 0 when captured; present when the Engine
+    /// can search the history older than this capture.
+    pub history_origin: Option<i64>,
     rows: Vec<Box<[GridCell]>>,
     metadata: Vec<RowMetadata>,
     retained_bytes: usize,
@@ -146,6 +149,7 @@ impl RetainedFindSnapshot {
             visible_rows: result.visible_rows,
             partial: result.partial,
             is_alt_screen: result.is_alt_screen,
+            history_origin: result.history_origin,
             rows,
             metadata: cells.metadata,
             retained_bytes: bytes,
@@ -219,7 +223,7 @@ fn metadata_bytes(rows: &Vec<RowMetadata>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::find::{FindSnapshot, SEARCH_DEBOUNCE, TerminalFindModel};
+    use crate::find::{FindSnapshot, NavigationTarget, SEARCH_DEBOUNCE, TerminalFindModel};
     use crate::scrollback::ScrollbackViewport;
     use diri_terminal_state::HeadlessScreen;
     use std::time::Duration;
@@ -233,6 +237,7 @@ mod tests {
             is_alt_screen: screen.is_alt_screen(),
             visible_rows: screen.size().1,
             partial: cells.first_row > 0,
+            history_origin: Some(screen.history_origin()),
             cells,
         }
     }
@@ -559,5 +564,123 @@ mod tests {
         assert_eq!(RETAINED.load(Ordering::Acquire), base_bytes);
         drop(reservation);
         assert_eq!(VIEWS.load(Ordering::Acquire), base_views);
+    }
+
+    /// What the Engine answers for one older-history page.
+    fn answer(
+        screen: &mut HeadlessScreen,
+        request: &crate::find::OlderRequest,
+    ) -> diri_proto::find::FindHistoryResult {
+        let params = request.params(diri_proto::SessionId::new("fixture"));
+        let origin = screen.history_origin();
+        let mut search = diri_terminal_state::HistorySearch::new(&params.query).unwrap();
+        let mut found = Vec::new();
+        let before = (params.before_row.unwrap() - origin).max(0) as usize;
+        let next = screen.find_rows_before(before, 4096, &mut search, usize::MAX, &mut found);
+        diri_proto::find::FindHistoryResult {
+            history_origin: origin,
+            cols: screen.size().0 as i64,
+            live_start_row: screen.history_rows() as i64,
+            total_rows: screen.total_rows() as i64,
+            content_seq: screen.content_seq(),
+            matches: found
+                .into_iter()
+                .map(|[row, start, end]| [row + origin, start, end])
+                .collect(),
+            next_before_row: (next > 0).then_some(origin + next as i64),
+            scanned_rows: 0,
+        }
+    }
+
+    #[test]
+    fn find_reaches_every_row_the_terminal_retains_and_navigates_into_it() {
+        let _budget = budget();
+        // 30,000 rows: far past what a capture holds (2,000 at 80 columns).
+        let mut screen = HeadlessScreen::new(80, 24);
+        let mut bytes = Vec::new();
+        for row in 0..30_000 {
+            let word = if row % 1_000 == 7 { "needle" } else { "hay" };
+            bytes.extend_from_slice(format!("{row} {word}\r\n").as_bytes());
+        }
+        screen.feed(&bytes);
+        let (mut model, live, mut viewport) = searched(&screen);
+        let in_capture = model.matches().len();
+        assert!(in_capture < 30, "the capture holds only the newest rows");
+        assert!(model.is_partial());
+
+        let mut pages = 0;
+        while let Some(request) = model.take_older_request() {
+            assert!(model.take_older_request().is_none(), "one page in flight");
+            let page = answer(&mut screen, &request);
+            assert!(model.apply_older_page(&request, Ok(page)));
+            pages += 1;
+        }
+        assert!(pages > 1, "the search pages through history");
+        assert_eq!(model.match_count(), 30);
+        assert!(!model.is_partial());
+        // The selection stayed on the capture match it started on.
+        assert!(model.current_index() >= 30 - in_capture);
+
+        // Walk older until the oldest match: it is read from the Engine.
+        let mut target = None;
+        for _ in 0..model.match_count() {
+            target = model.navigate_with_live(true, &mut viewport, &live);
+            if model.current_index() == 0 {
+                break;
+            }
+        }
+        let Some(NavigationTarget::History { absolute_row, .. }) = target else {
+            panic!("{target:?}");
+        };
+        // Row 7 is the oldest needle; nothing was evicted.
+        assert_eq!(absolute_row, 7);
+        assert!(model.is_paused());
+        assert!(viewport.is_reading());
+        let request = viewport
+            .begin_fetch(24)
+            .expect("the view fetches the match");
+        assert!(request.range().contains(&7));
+        let (highlights, current) = model.reading_highlights().unwrap();
+        assert_eq!(highlights[current].absolute_row, 7);
+        assert_eq!(highlights.len(), 30);
+        let row = screen.scrollback_cells(7, 1);
+        let cells = GridRowCodec::decode_rows(&row.payload, 1).unwrap();
+        let text: String = cells[0]
+            .iter()
+            .filter_map(|cell| char::from_u32(cell.scalar))
+            .collect();
+        let item = &highlights[current];
+        assert_eq!(&text[item.start_col..item.end_col_exclusive], "needle");
+    }
+
+    #[test]
+    fn a_new_query_abandons_the_older_search() {
+        let _budget = budget();
+        let mut screen = HeadlessScreen::new(80, 24);
+        screen.feed("needle hay\r\n".repeat(5_000).as_bytes());
+        let (mut model, _, _) = searched(&screen);
+        let stale = model.take_older_request().unwrap();
+        model.set_query("hay", Duration::from_secs(1));
+        assert!(
+            model.take_older_request().is_none(),
+            "no capture for it yet"
+        );
+        let page = answer(&mut screen, &stale);
+        assert!(!model.apply_older_page(&stale, Ok(page)));
+        assert_eq!(model.match_count(), 0);
+    }
+
+    #[test]
+    fn an_engine_without_history_search_keeps_the_capture_results() {
+        let _budget = budget();
+        let mut screen = HeadlessScreen::new(80, 24);
+        screen.feed("needle\r\n".repeat(5_000).as_bytes());
+        let (mut model, _, _) = searched(&screen);
+        let count = model.match_count();
+        let request = model.take_older_request().unwrap();
+        model.apply_older_page(&request, Err(()));
+        assert_eq!(model.match_count(), count);
+        assert!(model.take_older_request().is_none());
+        assert!(model.is_partial(), "older output was not searched");
     }
 }
