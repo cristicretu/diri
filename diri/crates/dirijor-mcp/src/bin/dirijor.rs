@@ -1,7 +1,7 @@
-#[path = "dirijor/completion.rs"]
-mod completion;
 #[path = "dirijor/api.rs"]
 mod api;
+#[path = "dirijor/completion.rs"]
+mod completion;
 #[path = "dirijor/notes.rs"]
 mod notes;
 #[path = "dirijor/organization.rs"]

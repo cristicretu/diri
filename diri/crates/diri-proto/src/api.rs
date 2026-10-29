@@ -350,6 +350,18 @@ mod catalog {
                 "Reset the emulator without touching the process."
             ),
             entry!(
+                Method::SESSION_CLEAR_SCROLLBACK,
+                SessionIdParams,
+                "{}",
+                "Drop the scrollback and clear the screen; the process keeps running."
+            ),
+            entry!(
+                Method::SESSION_LIST_DIR,
+                SessionListDirParams,
+                "SessionListDirResult",
+                "List a directory as the session sees it, local or remote, relative to its working directory."
+            ),
+            entry!(
                 Method::SESSION_CAPTURE_FIND,
                 SessionIdParams,
                 "CaptureFindResult",

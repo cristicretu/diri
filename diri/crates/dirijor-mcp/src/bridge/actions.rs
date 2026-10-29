@@ -282,7 +282,10 @@ mod tests {
                 &json!({"action": "close-session", "args": {"session_id": "other"}}),
             )
             .unwrap_err();
-        assert!(foreign.contains("outside its direct children"), "{foreign}");
+        assert!(
+            foreign.contains("cannot terminate a session outside"),
+            "{foreign}"
+        );
         assert!(!performed(&calls), "no refused action reached the app");
 
         peer.bridge()

@@ -59,9 +59,6 @@ impl Method {
     /// Replies `{"sessionID", "cleared"}`; `cleared` is false while the
     /// alternate screen shows. Remote sessions: `terminal_clear_unsupported`.
     pub const SESSION_CLEAR_SCROLLBACK: &'static str = "session.clear_scrollback";
-    /// Sets the palette local terminals answer color queries from
-    /// ([`TerminalPalette`]). Engine-wide; the result is empty.
-    pub const TERMINAL_SET_PALETTE: &'static str = "terminal.set_palette";
     pub const SESSION_CAPTURE_FIND: &'static str = "session.capture_find";
     pub const SESSION_READ_SCROLLBACK: &'static str = "session.read_scrollback";
     pub const SESSION_READ_SCROLLBACK_CELLS: &'static str = "session.read_scrollback_cells";
@@ -201,6 +198,8 @@ impl Method {
         Self::SESSION_READ_SCREEN,
         Self::SESSION_TERMINAL_TITLE,
         Self::SESSION_RESET_TERMINAL,
+        Self::SESSION_CLEAR_SCROLLBACK,
+        Self::SESSION_LIST_DIR,
         Self::SESSION_CAPTURE_FIND,
         Self::SESSION_READ_SCROLLBACK,
         Self::SESSION_READ_SCROLLBACK_CELLS,
@@ -741,6 +740,7 @@ pub enum TerminalAppearance {
 /// this. The App sends it whenever its theme settles on a new palette.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TerminalPalette {
     pub appearance: TerminalAppearance,
     pub foreground: [u8; 3],
@@ -778,6 +778,7 @@ pub use SessionIdParams as SessionIDParams;
 /// joined to the working directory.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ListDirQuery {
     #[serde(default)]
     pub path: String,
@@ -795,6 +796,7 @@ fn default_list_dir_query_limit() -> u32 {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionListDirParams {
     #[serde(rename = "sessionID")]
     pub session_id: SessionId,
@@ -931,6 +933,7 @@ pub struct SessionRenameParams {
 /// Who asked for a [`SessionRenameParams`] rename besides the user.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum RenameAuthor {
     /// The session's own Agent naming it after its task. Refused over a
     /// name the user or Diri gave, and while the setting is off.

@@ -1048,6 +1048,7 @@ The server ships inside the app. Claude Code, Codex and Cursor get it automatica
 | Panes | `spawn_agent` with `split`, `manage_layout`, `get_layout` | Open a dev server or a helper agent in a split beside the agent, zoom it, or move it back to its own tab. |
 | Notes | `read_note`, `write_note`, `create_note`, `start_from_note` | Read a brief from a note, write findings back, tick its to-dos. |
 | Browser | `browser` | Drive a real browser isolated to the session. |
+| Window | `list_actions`, `perform_action` | Run any command the app's menus, keys and command palette run: split or zoom a pane, select a tab, toggle the sidebar, change the theme. The window names the agent while it changes. |
 
 You do not need to name tools. Ask in plain words and the agent picks them:
 
@@ -1790,6 +1791,23 @@ Name your own Diri session (its tab and sidebar row) after the task: 2-4 lowerca
 | --- | --- | --- |
 | `name` | string | **Required.** |
 | `user_requested` | boolean |  |
+
+### `list_actions`
+
+List the Diri app's window actions: what its menus, keys and command palette do (split, focus, zoom or equalize panes, select tabs, toggle the sidebar, find, font size, theme). query filters by name or title. Run one with perform_action.
+
+| Argument | Type | Notes |
+| --- | --- | --- |
+| `query` | string |  |
+
+### `perform_action`
+
+Run one Diri app action from list_actions in the person's window; args must match its schema. The window names you while it changes, so change it only when the user asked. Destructive actions need args.session_id of a session you may manage, or are the person's to run.
+
+| Argument | Type | Notes |
+| --- | --- | --- |
+| `action` | string | **Required.** |
+| `args` | object |  |
 
 ### `note_links`
 

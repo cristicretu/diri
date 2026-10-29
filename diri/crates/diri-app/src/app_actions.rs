@@ -46,13 +46,15 @@ pub fn exposure(id: CommandId) -> Exposure {
         | QuoteSelectionToSession => Exposure::Hidden,
         // A save panel the person must answer.
         ExportScrollback => Exposure::Hidden,
+        // Reads other terminals' settings files from disk.
+        ImportTerminalSetup => Exposure::Hidden,
         // Bringing Diri forward or hiding it moves the person's focus.
         HideApp | ShowApp => Exposure::Hidden,
         Quit | CloseWindow | CloseSession | ArchiveSelectedSession | RemoveFocusedPane
-        | CheckForUpdates => Exposure::Destructive,
+        | CheckForUpdates | ClearScrollback | ResetTerminal => Exposure::Destructive,
         NewWindow | ReopenSession | OpenLauncher | NewDefaultSession | NewTerminal
         | NewCodexSession | ToggleCommandPalette | ToggleQuickOpen | ToggleHistory
-        | ToggleNotifications | ToggleOverview | ToggleTabPeek | ReviewLaunches
+        | ToggleNotifications | ToggleOverview | ToggleTabPeek
         | FocusPaneLeft | FocusPaneRight | FocusPaneUp | FocusPaneDown | SplitPaneRight
         | SplitPaneBelow | FocusPreviousPane | FocusNextPane | EqualizePanes
         | TogglePaneZoom | PaneGrowWidth | PaneShrinkWidth | PaneGrowHeight
@@ -69,7 +71,9 @@ pub fn exposure(id: CommandId) -> Exposure {
         | SelectSession3 | SelectSession4 | SelectSession5 | SelectSession6 | SelectSession7
         | SelectSession8 | SelectLastSession | OpenFind | FindNext | FindPrevious | ZoomIn
         | ZoomOut | ResetZoom | EnterCopyMode | FindSelection | InsertPath | PreviousPrompt
-        | NextPrompt => Exposure::Safe,
+        | NextPrompt | ToggleActivity | SplitPaneLeft | SplitPaneAbove | SplitPaneBestFit
+        | MovePaneToNewTab | MovePaneToNextTab | MovePaneToPreviousTab | MoveTabToNewWindow
+        | MoveTabToNextWindow | GoToDirectory => Exposure::Safe,
     }
 }
 
