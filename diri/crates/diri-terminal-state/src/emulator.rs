@@ -159,6 +159,16 @@ pub(crate) trait Emulator: Sized {
     // Cells. Lines below zero are history, oldest at `-history_rows()`.
 
     fn row(&self, line: Line) -> Self::RowRef<'_>;
+    /// Calls `f` with the column and target of every linked cell of
+    /// `line`, left to right, within the first `cols()` columns.
+    fn each_link_target(&self, line: Line, f: &mut dyn FnMut(usize, &str)) {
+        let row = self.row(line);
+        for (column, cell) in row.cells()[..self.cols()].iter().enumerate() {
+            if let Some(link) = cell.link() {
+                f(column, link.target());
+            }
+        }
+    }
     fn cell(&self, line: Line, column: Column) -> Self::CellRef<'_>;
     /// Runs `edit` over the cells of `line`; what it changes is written
     /// back to the emulator.

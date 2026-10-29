@@ -33,7 +33,7 @@ use alacritty_terminal::vte::ansi::{CursorStyle, KeyboardModes};
 use diri_proto::grid::GridCell as WireCell;
 
 use super::Core;
-use super::cell::Style;
+use super::cell::{HYPERLINK, Style};
 use super::page::Link;
 use super::resize::{self, ANONYMOUS_LINK, grid_cell};
 use crate::emulator::{Emulator, RowView, RowWrite};
@@ -68,6 +68,8 @@ pub(crate) struct Screen {
     /// while `dirty_listed`.
     dirty: Vec<u32>,
     dirty_listed: bool,
+    /// `0..lines`: the moved-line sources when nothing moved.
+    identity: Vec<u32>,
 }
 
 /// One row read from a [`Screen`].
@@ -232,6 +234,7 @@ impl Emulator for Screen {
             moved_known: false,
             dirty: Vec::new(),
             dirty_listed: false,
+            identity: Vec::new(),
         };
         screen.layout = screen.layout();
         screen
@@ -316,6 +319,35 @@ impl Emulator for Screen {
 
     fn set_link_pen(&mut self, uri: Option<String>) {
         self.restore_pen((Style::default(), uri.map(|uri| Link { id: None, uri })));
+    }
+
+    /// Reads link targets where the cells' link bit is set, without
+    /// converting the row to current-core cells.
+    fn each_link_target(&self, line: Line, f: &mut dyn FnMut(usize, &str)) {
+        let pages = &self.core.pages;
+        let cols = self.core.cols();
+        let (p, r) = pages.locate_line(line.0);
+        let occ = (pages.meta(p, r).occ as usize).min(cols);
+        let mut linked = [0u16; 64];
+        let mut columns = Vec::new();
+        let mut n = 0;
+        pages.read(p, |_, cells, _| {
+            for (x, cell) in cells[r * cols..r * cols + occ].iter().enumerate() {
+                if cell.has(HYPERLINK) {
+                    if n < linked.len() {
+                        linked[n] = x as u16;
+                    } else {
+                        columns.push(x as u16);
+                    }
+                    n += 1;
+                }
+            }
+        });
+        for &x in linked[..n.min(linked.len())].iter().chain(&columns) {
+            if let Some(link) = pages.read_link(p, r * cols + x as usize) {
+                f(x as usize, &link.uri);
+            }
+        }
     }
 
     fn row(&self, line: Line) -> ScreenRow {
@@ -404,6 +436,37 @@ impl Emulator for Screen {
         let pages = &self.core.pages;
         self.moved.clear();
         self.dirty.clear();
+        self.dirty_listed = true;
+        if !full {
+            // Nothing moved: each line is its own source, and settling
+            // reads sources only of lines it was not given (none of them
+            // dirty), so the identity serves without a per-line write.
+            if self.identity.len() != lines {
+                self.identity = (0..lines as u32).collect();
+            }
+            let rows = pages.rows_per_page();
+            let (mut p, mut r) = pages.locate(0);
+            let mut y = 0;
+            while y < lines {
+                let take = (rows - r).min(lines - y);
+                for (k, meta) in pages.page(p).meta[r..r + take].iter().enumerate() {
+                    if meta.dirty {
+                        self.dirty.push((y + k) as u32);
+                    }
+                }
+                y += take;
+                p += 1;
+                r = 0;
+            }
+            for &y in &self.dirty {
+                on_line(y as usize);
+            }
+            if self.core.colors_generation() != self.colors_seen {
+                on_line(self.cursor_line);
+                on_line(self.core.line);
+            }
+            return false;
+        }
         for y in 0..lines {
             let (p, r) = pages.locate(y);
             let dirty = pages.page(p).meta[r].dirty;
@@ -419,23 +482,19 @@ impl Emulator for Screen {
                 });
             }
         }
-        self.dirty_listed = true;
-        if full {
-            return true;
-        }
-        for &y in &self.dirty {
-            on_line(y as usize);
-        }
-        if self.core.colors_generation() != self.colors_seen {
-            on_line(self.cursor_line);
-            on_line(self.core.line);
-        }
-        false
+        true
     }
 
     #[inline]
     fn moved_line_sources(&self) -> Option<&[u32]> {
-        self.moved_known.then_some(self.moved.as_slice())
+        if !self.moved_known {
+            return None;
+        }
+        Some(if self.moved.is_empty() {
+            &self.identity
+        } else {
+            &self.moved
+        })
     }
 
     fn clear_damage(&mut self) {
