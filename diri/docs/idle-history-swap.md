@@ -107,9 +107,10 @@ block reads as blank rows of its width and the Engine logs
   batches do not end on block boundaries) for the length of the export.
 - **Records:** `counter (8 bytes) | ciphertext | GCM tag (16)`, 24 bytes of
   framing per 64-row block (0.6%).
-- **Sealing:** AES-256-GCM (RustCrypto `aes-gcm`; `aes` and `cipher` were
-  already linked). The key is 32 bytes from the OS random source, made once
-  per Engine process and held only in memory; it is never written anywhere.
+- **Sealing:** AES-256-GCM (RustCrypto `aes-gcm` 0.11, which uses the ARMv8
+  AES and PMULL instructions, detected at run time, with no build flag).
+  The key is 32 bytes from the OS random source, made once per Engine
+  process and held only in memory; it is never written anywhere.
   The 96-bit nonce is a random 32-bit per-process prefix and a 64-bit
   process-wide counter, so no nonce repeats under the key. The file's random
   id, the record's offset and its length are authenticated with each record:
@@ -167,8 +168,9 @@ Full tables and commands are in `PERF.md` ("Idle history on disk"). At 100
 sessions × 100,000 styled lines the Engine went from 4.95 to 1.13–1.53 MB per
 session (`phys_footprint`, 80–125 s idle), with 1.5 MB of history left in
 memory for the whole fleet and 373 MB on disk. The first screen of
-paged-out history reads in 0.13–0.40 ms at p95 (0.07 ms resident); a
-checkpoint export of 10,000 paged-out rows takes 13 ms instead of 9.8 ms.
+paged-out history reads in 0.12–0.40 ms at p95 (0.07 ms resident); a
+checkpoint export of 10,000 paged-out rows takes 9.8–10 ms at p50, as from
+memory (12.7–13.5 ms p95).
 An idle transition writes the history sealed since the last one: 3.7 MB for
 a fresh 100,000-line session, nothing after a few commands.
 

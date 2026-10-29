@@ -3531,18 +3531,20 @@ the same build with `DIRI_HISTORY_SWAP=0`):
 
 | read | resident p50 / p95 | paged out p50 / p95 |
 | --- | ---: | ---: |
-| oldest screen (40 rows, `read_scrollback_cells`) | 0.05 / 0.07 ms | 0.11–0.24 / 0.13–0.40 ms |
-| newest history screen | 0.05 / 0.06 ms | 0.04–0.08 / 0.05–0.16 ms |
-| checkpoint export (newest 10,000 rows) | 9.8 / 10.1 ms | 13.0 / 14.4 ms |
-| Find capture | 1.5 / 1.9 ms | 2.2 / 2.4 ms |
+| oldest screen (40 rows, `read_scrollback_cells`) | 0.05 / 0.07 ms | 0.09–0.18 / 0.12–0.40 ms |
+| newest history screen | 0.05 / 0.06 ms | 0.06–0.11 / 0.08–0.22 ms |
+| checkpoint export (newest 10,000 rows) | 9.8 / 10.1 ms | 9.8–10.0 / 12.7–13.5 ms |
+| Find capture | 1.5 / 1.9 ms | 1.8 / 2.1–2.5 ms |
 
 The first fetched screen of paged-out history is under 0.5 ms at p95 in
 every 100-session run. With ten sessions (ten samples, so p95 is the
 slowest) it was 0.2–1.6 ms, and once 7.6 ms for a single read. One record
-costs about 24 µs opened per read, 13.5 µs through a held descriptor
-(`history_swap::tests::record_load_cost`); AES here is the crate's portable
-implementation (no `aes_armv8` cfg). A page-out seals about 6.6 ms of CPU per
-MB on the pump thread, once per idle period.
+costs about 11 µs opened per read, 1.3 µs through a held descriptor
+(`history_swap::tests::record_load_cost`). `aes-gcm` 0.11 (`aes` 0.9,
+`polyval` 0.7) detects the ARMv8 AES and PMULL instructions at run time with
+no build flag; on 0.10 the portable code took 24 / 13.5 µs. A page-out seals
+about 1.6 ms of CPU per MB (6.6 ms on the portable code) on the pump thread,
+once per idle period.
 
 **Wake.** After 90 s idle with history paged out: keystroke echo p95
 0.28 ms, command output p95 0.80 ms (10 × 100k), as before.

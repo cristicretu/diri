@@ -298,7 +298,7 @@ impl SwapFile {
 
     #[cfg(unix)]
     fn store_all(&self, payloads: &[&[u8]]) -> io::Result<Vec<u64>> {
-        use aes_gcm::aead::AeadInPlace;
+        use aes_gcm::aead::AeadInOut;
         use std::os::unix::fs::FileExt;
         let seal = seal().ok_or_else(|| io::Error::other("no sealing key"))?;
         let mut extents = self.extents.lock().expect("swap extents");
@@ -330,10 +330,10 @@ impl SwapFile {
             staging.extend_from_slice(payload);
             let tag = seal
                 .cipher
-                .encrypt_in_place_detached(
+                .encrypt_inout_detached(
                     &nonce(seal.prefix, counter),
                     &associated(self.id, at, payload.len()),
-                    &mut staging[start..],
+                    (&mut staging[start..]).into(),
                 )
                 .map_err(|_| io::Error::other("seal failed"));
             match tag {
@@ -360,7 +360,7 @@ impl SwapFile {
 
     #[cfg(unix)]
     fn load_one(&self, slot: u64, len: usize) -> io::Result<Vec<u8>> {
-        use aes_gcm::aead::AeadInPlace;
+        use aes_gcm::aead::AeadInOut;
         use std::os::unix::fs::FileExt;
         let seal = seal().ok_or_else(|| io::Error::other("no sealing key"))?;
         let mut held = self.reader.lock().ok();
@@ -380,12 +380,12 @@ impl SwapFile {
         }
         let counter = u64::from_be_bytes(record[..8].try_into().expect("8 bytes"));
         let (body, tag) = record[8..].split_at_mut(len);
-        let tag = aes_gcm::Tag::clone_from_slice(tag);
+        let tag = aes_gcm::Tag::try_from(&*tag).expect("16-byte tag");
         seal.cipher
-            .decrypt_in_place_detached(
+            .decrypt_inout_detached(
                 &nonce(seal.prefix, counter),
                 &associated(self.id, slot, len),
-                body,
+                body.into(),
                 &tag,
             )
             .map_err(|_| {
