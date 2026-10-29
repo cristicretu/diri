@@ -9,6 +9,7 @@ mod hue_tests;
 mod lineage;
 mod pane_drop;
 mod project_picker;
+mod question_lines;
 mod rename_input;
 mod rows;
 mod split_mark;
@@ -770,6 +771,8 @@ pub struct Sidebar {
     title_clock: fn() -> Instant,
     /// The instant every title in this pass is sampled at.
     title_now: Instant,
+    /// Waiting rows' question lines, opening and closing.
+    question_lines: question_lines::QuestionLines,
     /// The last paint asked the display link for another frame of a title
     /// settle.
     title_tick: bool,
@@ -968,6 +971,7 @@ impl Sidebar {
             title_settles: TitleSettles::default(),
             title_clock: Instant::now,
             title_now: Instant::now(),
+            question_lines: Default::default(),
             title_tick: false,
             row_motion: Default::default(),
             hover_trails: hover_linger::HoverTrails::default(),
@@ -3056,7 +3060,9 @@ impl Sidebar {
         if frame.reveal > 0.0 {
             let mut children = Vec::new();
             for (row, presence, ghost) in super::row_motion::paint_order(&rows, &slots) {
-                let height = self.session_row_height() * presence.height;
+                let question = self.observe_question(row, cx.reduce_motion());
+                let natural = question.1;
+                let height = natural * presence.height;
                 let margin = 2.0 * presence.height;
                 let moving = presence != super::row_motion::Presence::FULL || ghost;
                 if !self.place_row(
@@ -3086,13 +3092,14 @@ impl Sidebar {
                     drop,
                     group.host.is_some(),
                     colors,
+                    question,
                     presence != super::row_motion::Presence::FULL || ghost,
                     window,
                     cx,
                 );
                 // A leaving row does not keep the activity tick alive.
                 self.working_row_rendered &= !ghost || working;
-                let rendered = self.row_slot(rendered, presence, ghost);
+                let rendered = self.row_slot(rendered, presence, natural, ghost);
                 let rendered = if collapsed || ghost {
                     rendered
                 } else {
@@ -3286,7 +3293,9 @@ impl Sidebar {
             let slots = self.arrange_rows(bucket.label(), &bucket_rows);
             let mut children = Vec::new();
             for (row, presence, ghost) in super::row_motion::paint_order(&bucket_rows, &slots) {
-                let height = self.session_row_height() * presence.height;
+                let question = self.observe_question(row, cx.reduce_motion());
+                let natural = question.1;
+                let height = natural * presence.height;
                 let margin = 2.0 * presence.height;
                 let moving = presence != super::row_motion::Presence::FULL || ghost;
                 if !self.place_row((!ghost).then(|| row.id()), margin, height, moving) {
@@ -3300,7 +3309,7 @@ impl Sidebar {
                     .flatten();
                 let working = self.working_row_rendered;
                 let rendered =
-                    self.mount_session_row(row, shortcut, drop, false, colors, moving, window, cx);
+                    self.mount_session_row(row, shortcut, drop, false, colors, question, moving, window, cx);
                 self.working_row_rendered &= !ghost || working;
                 // Buckets interleave every project and the row names none of
                 // them, so here the row wears its project's hue.
@@ -3309,7 +3318,7 @@ impl Sidebar {
                         .relative()
                         .child(rendered)
                         .child(
-                            crate::project_hue::row_tick(hue, self.session_row_height())
+                            crate::project_hue::row_tick(hue, natural)
                                 .debug_selector({
                                     let id = id.clone();
                                     move || format!("PROJECT_HUE_{}", id.0)
@@ -3318,7 +3327,7 @@ impl Sidebar {
                         .into_any_element(),
                     None => rendered,
                 };
-                let rendered = self.row_slot(rendered, presence, ghost);
+                let rendered = self.row_slot(rendered, presence, natural, ghost);
                 let rendered = if ghost {
                     rendered
                 } else {
@@ -3704,7 +3713,8 @@ impl Sidebar {
             ref drag_selection,
             migrating,
             activity_state,
-            ref blocker,
+            ref question,
+            height: row_height,
             ref activity,
             panes,
             progress,
@@ -3794,7 +3804,7 @@ impl Sidebar {
                 .id(format!("rename:{}", id.0))
                 .pl(px(Space::ROW_H))
                 .pr(px(Space::ROW_H))
-                .h(px(self.session_row_height()))
+                .h(px(row_height))
                 .flex()
                 .items_center()
                 .gap(px(8.0))
@@ -3896,7 +3906,7 @@ impl Sidebar {
             // rows (New Agent, project headers).
             .pl(px(Space::ROW_H - 1.0))
             .pr(px(Space::ROW_H - 1.0))
-            .h(px(self.session_row_height()))
+            .h(px(row_height))
             .flex()
             .items_center()
             .gap(px(8.0))
@@ -4050,15 +4060,10 @@ impl Sidebar {
             ))
             .child(
                 {
-                    // A row waiting on a named question shows the question
-                    // in place of its title. Under Activity the question is
-                    // the second line instead, and a typed filter matches
-                    // titles, so both keep the title.
-                    let asking = blocker.is_some() && activity.is_none() && filter.trim().is_empty();
-                    let title = match blocker {
-                        Some(blocker) if asking => blocker.clone(),
-                        _ => title,
-                    };
+                    // A row waiting on a named question keeps its title and
+                    // reads the question on a second line, as Activity does.
+                    let question = question.as_ref().filter(|_| activity.is_none());
+                    let two_lines = activity.is_some() || question.is_some();
                     let element = if let Some(range) = super::filter::label_match(&title, filter) {
                     div()
                         .w(px(title_available_width))
@@ -4076,7 +4081,7 @@ impl Sidebar {
                         .into_any_element()
                 } else if let Some(settling) = self
                     .settling_title(&id, title_available_width)
-                    .filter(|_| !asking)
+                    .filter(|_| !two_lines)
                 {
                     // The marquee's own box, so the title stays where it is.
                     div()
@@ -4101,30 +4106,45 @@ impl Sidebar {
                     .font_weight(Typo::ROW.weight)
                     .into_any_element()
                 };
-                    match activity {
-                        // Two lines ellipsize to the room they get rather
-                        // than scroll on hover.
-                        Some((line, age)) => activity_title(
-                            if filter.trim().is_empty() {
-                                div()
-                                    .min_w(px(0.0))
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .text_size(px(Typo::ROW.size))
-                                    .font_weight(Typo::ROW.weight)
-                                    .text_color(title_color)
-                                    .child(display_title(session))
-                                    .into_any_element()
-                            } else {
-                                element
-                            },
+                    // Two lines ellipsize to the room they get rather than
+                    // scroll on hover.
+                    let still_title = if !two_lines {
+                        None
+                    } else if filter.trim().is_empty() {
+                        Some(
+                            div()
+                                .min_w(px(0.0))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_size(px(Typo::ROW.size))
+                                .font_weight(Typo::ROW.weight)
+                                .text_color(title_color)
+                                .child(display_title(session))
+                                .into_any_element(),
+                        )
+                    } else {
+                        None
+                    };
+                    let still_title = |element| still_title.unwrap_or(element);
+                    match (activity, question) {
+                        (Some((line, age)), _) => activity_title(
+                            still_title(element),
                             line,
                             age.as_deref(),
+                            1.0,
                             title_available_width,
                             colors,
                         ),
-                        None => element,
+                        (None, Some(question)) => activity_title(
+                            still_title(element),
+                            &question.text,
+                            None,
+                            question.reveal,
+                            title_available_width,
+                            colors,
+                        ),
+                        (None, None) => element,
                     }
                 },
             )
@@ -8500,10 +8520,12 @@ impl Sidebar {
             .unwrap_or_default();
         self.lineage_roles = lineage_roles;
         retain_live_glyphs(&mut self.glyphs, &projection.display_order);
+        self.question_lines.retain(&projection.display_order);
         self.end_lift_if_released(cx);
         // The session list is the sidebar's most expensive frame work,
         // and settings has no use for it.
         self.row_motion.begin_layout(self.title_now);
+        self.question_lines.begin_pass();
         let list = self.settings_nav.is_none().then(|| {
             let mut list = div()
                 .id("sidebar-list")
@@ -8543,7 +8565,8 @@ impl Sidebar {
             list
         });
         self.row_motion.end_layout();
-        self.disclosure_animating |= self.row_motion.is_animating(self.title_now);
+        self.disclosure_animating |= self.row_motion.is_animating(self.title_now)
+            || self.question_lines.is_animating(self.title_now);
         self.rows_mounted = list.is_some();
         self.rows_stale = false;
         self.notify_keeps_rows = false;
@@ -9848,12 +9871,15 @@ fn read_toggle(session: &diri_proto::SessionRecord, notification_unread: bool) -
 
 /// Unread inbox entries share the completion mark, while active work and
 /// requests for input retain priority. There is never a second unread dot.
-/// A row's title over its Activity line: what it is doing or left for you,
-/// and the age right-aligned.
+/// A row's title over its second line: under Activity, what it is doing or
+/// left for you, and the age right-aligned; elsewhere, the question it waits
+/// on. `reveal` (0–1) is how far that line has opened: it grows from no
+/// height, fading in, so the title rises with the row as it grows.
 fn activity_title(
     title: AnyElement,
     line: &str,
     age: Option<&str>,
+    reveal: f32,
     width: f32,
     colors: SemanticColors,
 ) -> AnyElement {
@@ -9864,13 +9890,18 @@ fn activity_title(
         .overflow_hidden()
         .flex()
         .flex_col()
-        .gap(px(1.0))
+        .gap(px(1.0 * reveal))
         .child(div().flex().items_center().overflow_hidden().child(title))
         .child(
             div()
                 .flex()
                 .items_center()
                 .gap(px(8.0))
+                .when(reveal < 1.0, |line| {
+                    line.h(px(SECOND_LINE_HEIGHT * reveal))
+                        .overflow_hidden()
+                        .opacity(reveal)
+                })
                 .text_size(px(Typo::META.size))
                 .child(
                     div()
@@ -9895,6 +9926,10 @@ fn activity_title(
         )
         .into_any_element()
 }
+
+/// The second line's own height at the META size, which the row's growth
+/// from one line to two makes room for.
+const SECOND_LINE_HEIGHT: f32 = 18.0;
 
 fn sidebar_activity_state(state: StatusState, unread: bool) -> StatusState {
     match state {
@@ -10383,9 +10418,24 @@ mod tests {
         };
         let everything = listed(cx);
         assert!(sidebar.read_with(cx, |sidebar, _| sidebar.age_wake.is_none()));
-        assert!(cx.debug_bounds("session-activity-line").is_none());
-        // The waiting row reads its question in place of its title.
-        assert_eq!(row_bounds(&sidebar, cx, "preview-claude").size.height, px(30.0));
+        assert!(cx.debug_bounds("session-activity-age").is_none());
+        // The waiting row keeps its title and reads its question on a
+        // second line, the same line Activity shows.
+        let claude = SessionId::new("preview-claude");
+        let (question, title) = sidebar.read_with(cx, |sidebar, cx| {
+            let props = &sidebar.session_row_views[&claude].read(cx).props;
+            (
+                props.question.as_ref().map(|line| line.text.clone()),
+                display_title(&props.row.session),
+            )
+        });
+        assert_eq!(question.as_deref(), Some("Wants to publish the release tag"));
+        assert_ne!(title, "Wants to publish the release tag");
+        assert_eq!(
+            row_bounds(&sidebar, cx, "preview-claude").size.height,
+            px(super::activity::ACTIVITY_ROW_HEIGHT)
+        );
+        assert!(cx.debug_bounds("session-activity-line").is_some());
 
         sidebar.update(cx, |sidebar, cx| sidebar.toggle_activity_filter(cx));
         cx.run_until_parked();
@@ -10426,13 +10476,19 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(listed(cx), everything);
         assert!(sidebar.read_with(cx, |sidebar, _| sidebar.age_wake.is_none()));
-        assert_eq!(row_bounds(&sidebar, cx, "preview-claude").size.height, px(30.0));
+        assert_eq!(
+            row_bounds(&sidebar, cx, "preview-claude").size.height,
+            px(super::activity::ACTIVITY_ROW_HEIGHT),
+            "a waiting row keeps its second line"
+        );
+        assert_eq!(row_bounds(&sidebar, cx, "preview-codex").size.height, px(30.0));
     }
 
-    /// A question replaces only its own row's title, re-renders only that
-    /// row, and gives the title back once answered.
+    /// A question keeps its row's title and opens a second line under it:
+    /// the change re-renders only that row, the row grows over the arrival
+    /// time instead of jumping, and the line closes once answered.
     #[gpui::test]
-    fn a_blocker_retitles_only_its_own_row(cx: &mut TestAppContext) {
+    fn a_blocker_opens_a_second_line_under_only_its_own_row(cx: &mut TestAppContext) {
         let (sidebar, _, cx) = drag_harness(cx);
         sidebar.update(cx, |sidebar, _| sidebar.use_manual_title_clock());
         cx.run_until_parked();
@@ -10440,6 +10496,7 @@ mod tests {
         let record = sidebar.read_with(cx, |sidebar, _| {
             sidebar.store.read().unwrap().sessions()[&id].as_ref().clone()
         });
+        let title = display_title(&record);
         let mut asking = record.clone();
         asking.status = diri_proto::SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Question);
         asking.needs_input = Some(diri_proto::NeedsInputDetail {
@@ -10455,24 +10512,94 @@ mod tests {
         });
         let shown = |cx: &mut VisualTestContext| {
             sidebar.read_with(cx, |sidebar, cx| {
-                sidebar.session_row_views[&id].read(cx).props.blocker.clone()
+                let props = &sidebar.session_row_views[&id].read(cx).props;
+                (
+                    props.question.as_ref().map(|line| (line.text.clone(), line.reveal)),
+                    display_title(&props.row.session),
+                )
             })
         };
-        assert_eq!(shown(cx), None);
+        let settle = |cx: &mut VisualTestContext| {
+            super::titles::testing::advance(crate::sidebar::row_motion::ENTER);
+            sidebar.update(cx, |sidebar, cx| sidebar.store_changed(cx));
+            cx.run_until_parked();
+        };
+        // Every other row's top, and how far it moves: rows below the
+        // asking row by its growth, rows above it not at all.
+        let tops = |cx: &mut VisualTestContext| {
+            sidebar.read_with(cx, |sidebar, _| {
+                let mut tops: Vec<(String, f32)> = sidebar
+                    .row_bounds
+                    .borrow()
+                    .iter()
+                    .filter(|(row, _)| **row != id)
+                    .map(|(row, bounds)| (row.0.clone(), f32::from(bounds.top())))
+                    .collect();
+                tops.sort_by(|a, b| a.0.cmp(&b.0));
+                tops
+            })
+        };
+        assert_eq!(shown(cx), (None, title.clone()));
+        let cursor_top = row_bounds(&sidebar, cx, "preview-cursor").top();
+        assert_eq!(row_bounds(&sidebar, cx, "preview-cursor").size.height, px(30.0));
+        let resting = tops(cx);
+        assert!(
+            resting.iter().any(|(_, top)| *top > f32::from(cursor_top)),
+            "a row sits below the asking row"
+        );
+        let grown: Vec<(String, f32)> = resting
+            .iter()
+            .map(|(row, top)| {
+                let shift = if *top > f32::from(cursor_top) {
+                    super::activity::ACTIVITY_ROW_HEIGHT - 30.0
+                } else {
+                    0.0
+                };
+                (row.clone(), top + shift)
+            })
+            .collect();
+
         render_probe::take();
         sidebar.update(cx, |sidebar, cx| {
             sidebar.store.write().unwrap().upsert_session(asking);
             sidebar.store_changed(cx);
         });
         cx.run_until_parked();
-        assert_eq!(shown(cx).as_deref(), Some("Allow deploy to staging?"));
         assert_eq!(render_probe::take().0, 1, "only the asking row renders");
+        // The row starts from one line, so nothing below it jumps.
+        assert_eq!(row_bounds(&sidebar, cx, "preview-cursor").size.height, px(30.0));
+        assert_eq!(tops(cx), resting);
+        let reveal = sidebar.read_with(cx, |sidebar, _| {
+            sidebar.question_lines.is_animating(sidebar.title_now)
+        });
+        assert!(reveal, "the second line opens over time");
+
+        settle(cx);
+        assert_eq!(
+            shown(cx),
+            (Some(("Allow deploy to staging?".to_owned(), 1.0)), title.clone()),
+            "the title stays; the question is the second line"
+        );
+        assert_eq!(
+            row_bounds(&sidebar, cx, "preview-cursor").size.height,
+            px(super::activity::ACTIVITY_ROW_HEIGHT)
+        );
+        assert_eq!(tops(cx), grown);
+        // At rest, a redraw with nothing new reuses every row.
+        render_probe::take();
+        sidebar.update(cx, |sidebar, cx| sidebar.store_changed(cx));
+        cx.run_until_parked();
+        assert_eq!(render_probe::take().0, 0, "unchanged rows are reused");
+
         sidebar.update(cx, |sidebar, cx| {
             sidebar.store.write().unwrap().upsert_session(record);
             sidebar.store_changed(cx);
         });
         cx.run_until_parked();
-        assert_eq!(shown(cx), None);
+        settle(cx);
+        assert_eq!(shown(cx), (None, title));
+        assert_eq!(row_bounds(&sidebar, cx, "preview-cursor").size.height, px(30.0));
+        assert_eq!(tops(cx), resting);
     }
 
     /// Held-⌘ hints fade in and out on cached session rows: the fade reaches
@@ -12658,7 +12785,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_split_strip_tab_shows_its_waiting_pane_and_its_layout(cx: &mut TestAppContext) {
+    fn a_split_strip_tab_marks_its_waiting_pane_and_draws_its_layout(cx: &mut TestAppContext) {
         cx.update(|cx| cx.set_asset_source_for_test(diri_ui::IconAssets));
         let (view, cx) = cx.add_window_view(|_, cx| {
             let sidebar = cx.new(|cx| {
@@ -12673,15 +12800,17 @@ mod tests {
         });
         cx.run_until_parked();
         let sidebar = view.read_with(cx, |view, _| view.sidebar.clone());
-        let (title, state) = sidebar.read_with(cx, |sidebar, cx| {
+        let (title, question, state) = sidebar.read_with(cx, |sidebar, cx| {
             let props = sidebar.strip_tab_views[&SessionId::new("preview-codex")]
                 .read(cx)
                 .props_for_test();
-            (props.title.clone(), props.state)
+            (props.title.clone(), props.question.clone(), props.state)
         });
-        // Codex itself is working; the deploy pane beside it is asking, and
-        // the tab says so the way its sidebar row does.
-        assert_eq!(title, "Allow deploy to staging?");
+        // Codex itself is working; the deploy pane beside it is asking. The
+        // tab keeps its title, shows the pane's state, and its tooltip asks
+        // the pane's question.
+        assert_eq!(title, "Polish the left sidebar hierarchy");
+        assert_eq!(question.as_deref(), Some("Allow deploy to staging?"));
         assert!(matches!(state, StatusState::NeedsInput { .. }));
         assert!(
             cx.debug_bounds("horizontal-tab-panes-preview-codex")

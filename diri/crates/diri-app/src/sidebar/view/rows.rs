@@ -47,9 +47,12 @@ pub(in crate::sidebar) struct SessionRowProps {
     pub(super) drag_selection: Option<Vec<SessionId>>,
     pub(super) migrating: bool,
     pub(super) activity_state: StatusState,
-    /// What the row says instead of its title while it waits on a named
-    /// question or permission (`session_presentation::blocker_line`).
-    pub(super) blocker: Option<String>,
+    /// The question or permission the row waits on
+    /// (`session_presentation::blocker_line`), as a second line under its
+    /// title, and how far that line is open.
+    pub(super) question: Option<super::question_lines::QuestionLine>,
+    /// The row's natural height: taller while it shows a second line.
+    pub(super) height: f32,
     /// Under the Activity filter, the second line: the state and its age.
     pub(super) activity: Option<(String, Option<String>)>,
     /// Panes in this row's tab, when it is split.
@@ -128,6 +131,7 @@ impl Sidebar {
         drop: Option<RowDrop>,
         host_marked_above: bool,
         colors: SemanticColors,
+        (question, height): (Option<super::question_lines::QuestionLine>, f32),
         reduce_motion: bool,
         window: &Window,
     ) -> SessionRowProps {
@@ -154,11 +158,7 @@ impl Sidebar {
         let (panes, shells) = pane_group.unwrap_or_default();
         // The pane that makes the row ask: the row's own session, unless a
         // split pane is the one waiting.
-        let asking = std::iter::once(&**session)
-            .chain(shells.iter().map(|shell| &**shell))
-            .find(|pane| matches!(status_state(pane, false), StatusState::NeedsInput { .. }))
-            .unwrap_or(&**session);
-        let blocker = crate::session_presentation::blocker_line(asking);
+        let asking = super::question_lines::asking_pane(session, &shells);
         let activity = self.activity_filter.then(|| {
             let line = crate::session_presentation::activity_line(
                 asking,
@@ -183,7 +183,8 @@ impl Sidebar {
             drag_selection,
             migrating,
             activity_state,
-            blocker,
+            question,
+            height,
             activity,
             panes,
             progress: crate::progress_mark::face(session, self.activity_frame, reduce_motion),
@@ -217,17 +218,20 @@ impl Sidebar {
         drop: Option<RowDrop>,
         host_marked_above: bool,
         colors: SemanticColors,
+        question: (Option<super::question_lines::QuestionLine>, f32),
         moving: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.mounted_row_ids.insert(row.id().clone());
+        let height = question.1;
         let props = self.session_row_props(
             row,
             shortcut,
             drop,
             host_marked_above,
             colors,
+            question,
             cx.reduce_motion(),
             window,
         );
@@ -270,7 +274,7 @@ impl Sidebar {
         view.cached(
             gpui::StyleRefinement::default()
                 .w_full()
-                .h(px(self.session_row_height()))
+                .h(px(height))
                 .flex_none(),
         )
         .force_render_if(force || changed)

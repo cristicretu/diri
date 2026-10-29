@@ -56,6 +56,11 @@ pub(in crate::sidebar) struct StripTabProps {
     pub(super) settling: bool,
     /// A terminal's directory, shown when the pointer rests on its tab.
     pub(super) location: Option<String>,
+    /// The question the tab waits on. The strip has no room for a second
+    /// line, so the tab keeps its title and its status mark, and the
+    /// question shows when the pointer rests on it. In a split tab it is
+    /// the question of the pane that asks.
+    pub(super) question: Option<String>,
     /// The tab's layout with each pane's state, when it is split.
     pub(super) split: Option<super::split_mark::SplitMark>,
     /// The fraction of the hover fill a tab the pointer just left still
@@ -126,7 +131,7 @@ impl Sidebar {
             asking,
             split,
         } = marks;
-        // The pane that asks names the question.
+        // The pane that asks names the question in the tooltip.
         let asking = asking.as_deref().unwrap_or(session);
         // The same rule the sidebar rows follow: ⌘1–⌘8, then ⌘9 = last.
         let rank = if index < 8 {
@@ -147,9 +152,7 @@ impl Sidebar {
         };
         StripTabProps {
             id: id.clone(),
-            // A tab waiting on a named question shows the question.
-            title: crate::session_presentation::blocker_line(asking)
-                .unwrap_or_else(|| display_title(session)),
+            title: display_title(session),
             kind: session.effective_kind().clone(),
             active,
             rank,
@@ -169,6 +172,7 @@ impl Sidebar {
             shift,
             settling: self.settling_title(id, 0.0).is_some(),
             location: crate::switcher::terminal_location(session),
+            question: crate::session_presentation::blocker_line(asking),
             split,
             hover_linger: if active {
                 0.0
