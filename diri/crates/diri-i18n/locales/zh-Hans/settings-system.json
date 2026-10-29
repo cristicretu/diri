@@ -19,6 +19,7 @@
   "settings.appearance.cursor_follows_programs": "允许程序更改光标",
   "settings.appearance.cursor_follows_programs_detail": "Vim 等编辑器在输入时会切换为竖线。关闭后，所有终端都保持你选择的形状。",
   "settings.appearance.cursor_shape": "形状",
+  "settings.appearance.dark_theme": "深色主题",
   "settings.appearance.density": "密度",
   "settings.appearance.editor_automatic": "自动（{editor}）",
   "settings.appearance.editor_automatic_default": "自动（默认 App）",
@@ -42,6 +43,7 @@
   "settings.appearance.last_folder_detail": "从上一个终端所在位置开始，而不是项目文件夹。",
   "settings.appearance.ligatures": "连字",
   "settings.appearance.ligatures_detail": "在支持连字的字体中，将 => 和 != 等字符组合显示为一个符号。",
+  "settings.appearance.light_theme": "浅色主题",
   "settings.appearance.line_height": "行高",
   "settings.appearance.mode_dark": "深色",
   "settings.appearance.mode_light": "浅色",
@@ -207,5 +209,12 @@
   "settings.terminal.option_off": "关闭",
   "settings.terminal.option_right": "右 Option",
   "settings.terminal.panes": "拆分窗格",
-  "settings.terminal.shell": "Shell"
+  "settings.terminal.shell": "Shell",
+  "settings.terminal.shell_command": "新终端命令",
+  "settings.terminal.shell_command_custom": "直接运行 {command}，不经过 shell。远程主机使用其自身的 shell。",
+  "settings.terminal.shell_command_edit": "编辑…",
+  "settings.terminal.shell_command_login": "你的登录 shell。远程主机始终使用其自身的 shell。",
+  "settings.terminal.shell_command_placeholder": "zsh -l、nix develop、tmux new -A -s main",
+  "settings.terminal.shell_command_reset": "使用登录 shell",
+  "settings.terminal.shell_command_save": "保存"
 }

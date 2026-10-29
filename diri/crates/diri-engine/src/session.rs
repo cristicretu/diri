@@ -3485,9 +3485,11 @@ impl Session {
     /// cursor's line, keeping that line (a shell prompt and what was typed
     /// at it) at the top. The child is not told. Returns `Ok(false)` when
     /// the alternate screen is showing, which a full-screen program owns and
-    /// is left alone. Held local sessions only, queued for the pump like a
-    /// reset so the checkpoint at that offset makes it survive an Engine
-    /// restart. A remote Holder owns its grid and has no clear operation yet.
+    /// is left alone. Held local sessions queue it for the pump like a reset
+    /// so the checkpoint at that offset makes it survive an Engine restart.
+    /// Remote sessions ask a Holder that negotiated `terminal-clear-v1`; it
+    /// answers with a reset boundary and a full grid. Acceptance means
+    /// queued, not applied.
     pub fn clear_scrollback(&self) -> std::io::Result<bool> {
         if self.shared.exited.load(Ordering::SeqCst) {
             return Err(std::io::Error::new(
@@ -3510,7 +3512,27 @@ impl Session {
                 self.shared.note_hot();
                 Ok(true)
             }
-            Transport::Remote(_) | Transport::Direct(_) => Err(std::io::Error::new(
+            Transport::Remote(client) => {
+                if !client.supports_terminal_clear() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "live Holder does not support terminal-clear-v1",
+                    ));
+                }
+                let alt_screen = self
+                    .shared
+                    .remote_grid
+                    .lock()
+                    .expect("remote grid")
+                    .as_ref()
+                    .is_some_and(|remote| remote.mirror.modes().0);
+                if alt_screen {
+                    return Ok(false);
+                }
+                client.clear_terminal()?;
+                Ok(true)
+            }
+            Transport::Direct(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "this session's terminal cannot be cleared from the Engine",
             )),
@@ -7598,7 +7620,7 @@ fn persist_checkpoint(
     }
     let (rows, payload) = history.unwrap_or_default();
     // A failed write must not stop the session; the checkpoint is a cache.
-    if checkpoint.write_with_history(path, rows, &payload).is_ok() {
+    if checkpoint.write_with_history(path, rows, payload).is_ok() {
         *last_key = Some(key);
     }
 }

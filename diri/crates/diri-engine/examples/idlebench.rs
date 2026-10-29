@@ -13,6 +13,9 @@
 //! session in turn, timing the keystroke echo and a command's output, then
 //! types into up to 20 sessions while they are active (keys 50 ms apart).
 //!
+//! With `IDLE_FILE` set, each session prints that file instead of
+//! `scrollback-lines` numbers (styled, realistic history).
+//!
 //! Set `DIRI_HOLDER_BIN` to a built `diri-holder`. Everything lives in a
 //! private temporary directory; nothing touches an installed Diri.
 
@@ -177,7 +180,10 @@ fn main() {
     let spawn_started = Instant::now();
     for index in 0..count {
         let script = if lines > 0 {
-            format!("seq 1 {lines}; exec /bin/zsh -f -i")
+            match std::env::var("IDLE_FILE") {
+                Ok(f) => format!("cat {f}; exec /bin/zsh -f -i"),
+                Err(_) => format!("seq 1 {lines}; exec /bin/zsh -f -i"),
+            }
         } else {
             "exec /bin/zsh -f -i".to_string()
         };

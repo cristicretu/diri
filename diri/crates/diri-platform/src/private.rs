@@ -88,6 +88,29 @@ pub fn replace_via(temporary: &Path, path: &Path, contents: impl AsRef<[u8]>) ->
     result
 }
 
+/// [`replace_via`] for contents produced by `write` into a buffered stream on
+/// the owner-only temporary, so a large file is never staged in memory.
+pub fn replace_streamed(
+    temporary: &Path,
+    path: &Path,
+    write: impl FnOnce(&mut io::BufWriter<File>) -> io::Result<()>,
+) -> io::Result<()> {
+    let result = create(temporary)
+        .and_then(|file| {
+            let mut stream = io::BufWriter::new(file);
+            write(&mut stream)?;
+            stream
+                .into_inner()
+                .map_err(io::IntoInnerError::into_error)?;
+            Ok(())
+        })
+        .and_then(|()| std::fs::rename(temporary, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
+}
+
 /// What one [`tighten_tree`] pass saw and changed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Tightened {
@@ -163,6 +186,28 @@ mod tests {
         let result = body();
         unsafe { libc::umask(previous) };
         result
+    }
+
+    #[test]
+    fn a_streamed_replacement_is_owner_only_and_leaves_nothing_on_failure() {
+        with_open_umask(|| {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("screen.plist");
+            let tmp = temp.path().join("screen.plist.tmp");
+            write(&path, b"old").unwrap();
+            replace_streamed(&tmp, &path, |stream| stream.write_all(b"new")).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"new");
+            assert_eq!(mode(&path), 0o600);
+            assert!(!tmp.exists());
+
+            let failed = replace_streamed(&tmp, &path, |stream| {
+                stream.write_all(b"partial")?;
+                Err(io::Error::other("encode failed"))
+            });
+            assert!(failed.is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), b"new", "kept on failure");
+            assert!(!tmp.exists(), "temporary removed");
+        });
     }
 
     #[test]

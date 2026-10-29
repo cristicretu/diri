@@ -106,7 +106,7 @@ fn executable(pid: u32) -> io::Result<String> {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn working_directory(pid: u32) -> io::Result<String> {
+pub fn working_directory(pid: u32) -> io::Result<String> {
     proc_link(pid, "cwd")
 }
 
@@ -236,7 +236,7 @@ fn executable(pid: u32) -> io::Result<String> {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn working_directory(pid: u32) -> io::Result<String> {
+pub fn working_directory(pid: u32) -> io::Result<String> {
     // SAFETY: native SDK-matching struct, initialized before the native call.
     let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of_val(&info) as i32;
@@ -298,7 +298,7 @@ fn executable(_: u32) -> io::Result<String> {
     Err(io::ErrorKind::Unsupported.into())
 }
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn working_directory(_: u32) -> io::Result<String> {
+pub fn working_directory(_: u32) -> io::Result<String> {
     Err(io::ErrorKind::Unsupported.into())
 }
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

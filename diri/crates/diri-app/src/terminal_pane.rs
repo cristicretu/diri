@@ -8431,6 +8431,10 @@ mod tests {
             session.cwd = root.path().display().to_string();
             root
         });
+        if scene.starts_with("insert-path-remote") {
+            session.host = Some("forge".into());
+            session.cwd = "/home/cristi/work/replay-web".into();
+        }
         let id = session.id.clone();
         {
             let mut store = runtime.store.write().unwrap();
@@ -8760,6 +8764,33 @@ mod tests {
                             if let Ok(query) = std::env::var("DIRI_QOL_QUERY") {
                                 pane.path_picker_query_for_test(&query);
                             }
+                        }
+                        // The root level as a `list-dir-v1` Helper lists it.
+                        "insert-path-remote" => {
+                            use diri_proto::remote_pty::{ListDirEntry, ListDirEntryKind, ListDirResult};
+                            pane.open_path_picker(&crate::commands::InsertPath, window, cx);
+                            let entry = |name: &str, dir: bool| ListDirEntry {
+                                name: name.into(),
+                                kind: if dir { ListDirEntryKind::Directory } else { ListDirEntryKind::File },
+                                symlink: false,
+                            };
+                            pane.path_picker_adopt_for_test(crate::path_picker::PathIndex::from_remote(&ListDirResult {
+                                cwd: "/home/cristi/work/replay-web".into(),
+                                path: "/home/cristi/work/replay-web".into(),
+                                entries: vec![
+                                    entry(".git", true),
+                                    entry("Dockerfile", false),
+                                    entry("LICENSE", false),
+                                    entry("apps", true),
+                                    entry("design_assets", true),
+                                    entry("dns", true),
+                                    entry("docker-compose.yml", false),
+                                    entry("flake.nix", false),
+                                    entry("node_modules", true),
+                                ],
+                                truncated: false,
+                                failure: None,
+                            }));
                         }
                         scene if scene.starts_with("insert-path") => {
                             pane.open_path_picker(&crate::commands::InsertPath, window, cx);

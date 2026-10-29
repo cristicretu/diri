@@ -227,6 +227,9 @@ impl RemoteSessionClient {
             if self.helper.protocol.minor >= diri_proto::remote_pty::TERMINAL_RESET_PROTOCOL_MINOR {
                 required_capabilities.push(diri_proto::remote_pty::RemoteCapability::TerminalReset);
             }
+            if self.supports_terminal_clear() {
+                required_capabilities.push(diri_proto::remote_pty::RemoteCapability::TerminalClear);
+            }
             // An older Holder rejects a capability it does not know, so it is
             // asked for only from a Helper whose minor defines it.
             if self.helper.protocol.minor >= diri_proto::remote_pty::TERMINAL_STYLES_PROTOCOL_MINOR
@@ -381,6 +384,18 @@ impl RemoteSessionClient {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "remote Holder did not confirm terminal-reset-v1",
+            ));
+        }
+        if self.supports_terminal_clear()
+            && (acknowledgement.protocol.minor
+                < diri_proto::remote_pty::TERMINAL_CLEAR_PROTOCOL_MINOR
+                || !acknowledgement
+                    .capabilities
+                    .contains(&diri_proto::remote_pty::RemoteCapability::TerminalClear))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote Holder did not confirm terminal-clear-v1",
             ));
         }
         if REQUIRED_CAPABILITIES
@@ -550,6 +565,42 @@ impl RemoteSessionClient {
         )
     }
 
+    /// `terminal-clear-v1` rides on the reset boundary, so a Helper must
+    /// define both before the Engine asks for it.
+    pub(crate) fn supports_terminal_clear(&self) -> bool {
+        self.supports_terminal_reset()
+            && self.helper.protocol.minor >= diri_proto::remote_pty::TERMINAL_CLEAR_PROTOCOL_MINOR
+    }
+
+    /// Queues one Clear Screen and Scrollback. Like a reset it is never
+    /// coalesced, retained for reconnect or retried after an uncertain write.
+    pub(crate) fn clear_terminal(&self) -> io::Result<()> {
+        if !self.supports_terminal_clear() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "live Holder does not support terminal-clear-v1",
+            ));
+        }
+        let mut writer = self.writer.lock().expect("remote writer");
+        ensure_available(&writer)?;
+        let epoch = writer
+            .controller_epoch
+            .filter(|_| writer.control_granted)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "remote controller is reconnecting; clear was not accepted",
+                )
+            })?;
+        write_message(
+            &mut writer,
+            &RemoteMessage::TerminalClear(diri_proto::remote_pty::TerminalClear {
+                controller_epoch: epoch,
+                expected_incarnation: self.incarnation.clone(),
+            }),
+        )
+    }
+
     pub(crate) fn observe_terminal_reset(&self, generation: u64) {
         self.reset_generation.store(generation, Ordering::Release);
         self.scrollback_requests
@@ -645,6 +696,31 @@ impl RemoteSessionClient {
             },
             deadline,
         )
+    }
+
+    /// One directory level relative to the remote child's live working
+    /// directory (`list-dir-v1`). A short-lived Helper process answers it, so
+    /// neither the attach channel nor the Holder's PTY loop is involved.
+    pub(crate) fn list_dir(
+        &self,
+        query: &diri_proto::ListDirQuery,
+        deadline: std::time::Instant,
+    ) -> io::Result<diri_proto::remote_pty::ListDirResult> {
+        let timeout = diri_pty::unix_socket::remaining(deadline)?;
+        let request = diri_proto::remote_pty::ListDirRequest {
+            selector: SessionSelector {
+                session_id: self.session_id.clone(),
+                session_token: self.token.clone(),
+                expected_incarnation: Some(self.incarnation.clone()),
+            },
+            path: query.path.clone(),
+            include_files: query.include_files,
+            prefix: query.prefix.clone(),
+            limit: query.limit,
+            timeout_ms: (timeout.as_millis() as u32)
+                .clamp(1, diri_proto::remote_pty::MAX_LIST_DIR_TIMEOUT_MS),
+        };
+        self.manager.list_dir(&self.helper, &request, deadline)
     }
 
     pub fn read_scrollback_cells(
@@ -887,7 +963,9 @@ fn write_message(writer: &mut WriterState, message: &RemoteMessage) -> io::Resul
         {
             (None, frame.resize_payload(), false)
         }
-        RemoteMessage::Signal(_) | RemoteMessage::TerminalReset(_) => (None, None, true),
+        RemoteMessage::Signal(_)
+        | RemoteMessage::TerminalReset(_)
+        | RemoteMessage::TerminalClear(_) => (None, None, true),
         _ => (None, None, false),
     };
     writer.pending_bytes += bytes.len();
@@ -1150,6 +1228,133 @@ pub(crate) mod tests {
                 assert!(client.validate_hello(&ack).is_err());
             }
         }
+    }
+
+    /// Old Helpers (forge runs several) never see the clear frame: the
+    /// Engine refuses locally, which the control layer reports as
+    /// `terminal_clear_unsupported`. A current Helper must confirm it.
+    #[cfg(unix)]
+    #[test]
+    fn terminal_clear_is_sent_only_to_holders_that_negotiated_it() {
+        use crate::remote::{
+            executor::ProcessExecutor, manager::ArtifactCatalog, ssh::SshTransport,
+        };
+        use diri_proto::remote_pty::{RemoteCapability, TERMINAL_CLEAR_PROTOCOL_MINOR};
+        use std::io::Read as _;
+        let temp = tempfile::tempdir().unwrap();
+        let host = diri_proto::HostEntry {
+            transport: Default::default(),
+            id: "fixture".into(),
+            name: None,
+            ssh: "fixture".into(),
+            default_cwd: None,
+            node: None,
+        };
+        let manager = Arc::new(
+            RemoteManager::new(
+                ProcessExecutor::new("/bin/false"),
+                ArtifactCatalog::without_artifacts_for_test(),
+                temp.path().join("control"),
+            )
+            .unwrap(),
+        );
+        let client_for = |minor: u16| {
+            RemoteSessionClient::new(
+                Arc::clone(&manager),
+                InstalledHelper {
+                    target: RemoteTarget::MacosAarch64,
+                    build_id: "fixture".into(),
+                    protocol: ProtocolVersion { major: 1, minor },
+                    transport: SshTransport::new(&host, temp.path().join("control/socket")),
+                },
+                "fixture".into(),
+                SessionToken::new("fixture-token-long-enough").unwrap(),
+                "incarnation".into(),
+                RemoteBindingStore::new(temp.path().join(format!("binding-{minor}"))).unwrap(),
+                0,
+            )
+            .unwrap()
+        };
+        let ack = |minor: u16, capabilities: &[RemoteCapability]| {
+            let mut all = REQUIRED_CAPABILITIES.to_vec();
+            all.extend([
+                RemoteCapability::EnhancedKeyboard,
+                RemoteCapability::InputModes,
+                RemoteCapability::TerminalReset,
+            ]);
+            all.extend_from_slice(capabilities);
+            HelloAck {
+                protocol: ProtocolVersion { major: 1, minor },
+                holder_build_id: "fixture".into(),
+                session_incarnation: "incarnation".into(),
+                capabilities: all,
+                controller_epoch: 3,
+                process_state: RemoteProcessState::Running { pid: 123 },
+                child_identity: None,
+                output_offset: 0,
+                snapshot_sequence: 1,
+                foreground_pid: None,
+                grid_resume: None,
+            }
+        };
+        let mut sent = [0_u8; 4096];
+
+        let old = client_for(TERMINAL_CLEAR_PROTOCOL_MINOR - 1);
+        assert!(old.supports_terminal_reset());
+        assert!(!old.supports_terminal_clear());
+        assert!(
+            old.validate_hello(&ack(TERMINAL_CLEAR_PROTOCOL_MINOR - 1, &[]))
+                .is_ok()
+        );
+        let (writer, mut output) = pipe_writer();
+        *old.writer.lock().unwrap() = writer;
+        assert_eq!(
+            old.clear_terminal().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            output.read(&mut sent).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "nothing reaches a Holder that would close the Bridge on kind 53"
+        );
+
+        let current = client_for(TERMINAL_CLEAR_PROTOCOL_MINOR);
+        assert!(current.supports_terminal_clear());
+        assert!(
+            current
+                .validate_hello(&ack(TERMINAL_CLEAR_PROTOCOL_MINOR, &[]))
+                .is_err(),
+            "a current Holder that omits terminal-clear-v1 fails closed"
+        );
+        assert!(
+            current
+                .validate_hello(&ack(
+                    TERMINAL_CLEAR_PROTOCOL_MINOR,
+                    &[RemoteCapability::TerminalClear]
+                ))
+                .is_ok()
+        );
+        let (writer, mut output) = pipe_writer();
+        *current.writer.lock().unwrap() = writer;
+        current.clear_terminal().unwrap();
+        let count = output.read(&mut sent).unwrap();
+        let messages = RemoteCodec::new().feed(&sent[..count]).unwrap();
+        assert_eq!(
+            messages,
+            vec![RemoteMessage::TerminalClear(
+                diri_proto::remote_pty::TerminalClear {
+                    controller_epoch: 3,
+                    expected_incarnation: "incarnation".into(),
+                }
+            )]
+        );
+
+        // Without a granted lease the clear is refused, never queued.
+        current.writer.lock().unwrap().control_granted = false;
+        assert_eq!(
+            current.clear_terminal().unwrap_err().kind(),
+            io::ErrorKind::NotConnected
+        );
     }
 
     #[cfg(unix)]

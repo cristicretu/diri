@@ -269,6 +269,7 @@ fn message_kinds(messages: &[RemoteMessage]) -> String {
             RemoteMessage::ForegroundProcess(_) => "ForegroundProcess",
             RemoteMessage::InputModes(_) => "InputModes",
             RemoteMessage::TerminalReset(_) => "TerminalReset",
+            RemoteMessage::TerminalClear(_) => "TerminalClear",
             RemoteMessage::TerminalResetState(_) => "TerminalResetState",
             RemoteMessage::ImageRequest(_) => "ImageRequest",
             RemoteMessage::ImageResponse(_) => "ImageResponse",

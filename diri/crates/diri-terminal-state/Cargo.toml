@@ -10,6 +10,10 @@ license.workspace = true
 # retained only for storage differential tests and allocation comparisons.
 default = ["compact-history"]
 compact-history = ["alacritty_terminal/compact-history"]
+# Benchmark verification only, never in a product build: the parser counts
+# and checksums each OSC body it dispatches and the image store logs each
+# image it stores, so `vt_workloads` can compare every run with a reference.
+bench-verify = ["alacritty_terminal/observe"]
 # Prototype of the page-based terminal core (docs/core-v2.md). Off by
 # default and not used by the Engine or the Remote Helper.
 core-v2 = []
@@ -27,7 +31,8 @@ diri-pty.workspace = true
 diri-platform.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-# SHA-256 for the core v2 bench's golden digests; already in the lockfile.
+# SHA-256 of payloads, images and state in the benchmark golden checks
+# (vt_workloads and the core v2 bench).
 sha2.workspace = true
 
 [[bench]]
@@ -53,6 +58,7 @@ harness = false
 [[bench]]
 name = "vt_workloads"
 harness = false
+required-features = ["bench-verify"]
 
 [[bench]]
 name = "history_depth"

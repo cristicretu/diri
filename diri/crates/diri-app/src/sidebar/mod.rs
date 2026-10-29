@@ -14,7 +14,7 @@ pub use state::{
     CursorMove, DragItem, DropZone, Popover, SidebarUiState, drop_zone, move_before, move_past,
     move_to_end,
 };
-pub(crate) use view::DraggedSidebarItem;
+pub(crate) use view::{DraggedSidebarItem, DraggedTab};
 pub use view::Sidebar;
 pub(crate) use view::{AccountRequest, SidebarEvent};
 // Only the macOS frame fixture drives the title clock from outside the view.
