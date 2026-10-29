@@ -308,4 +308,41 @@ final class TerminalModelTests: XCTestCase {
             "key-enter", "key-backtab", "key-ctrl-c", "key-pipe", "key-slash", "key-tilde", "key-dash",
         ])
     }
+
+    // MARK: Cells from the gateway
+
+    func testRunsArePlacedOnTheGatewaysCells() throws {
+        // What diri-web sends for `a测试🎉é─` (see its test
+        // `non_ascii_runs_carry_their_cells_so_widths_are_never_guessed`).
+        let json = #"{"runs":[{"a":0,"bg":null,"fg":null,"g":[[1,1,1],[2,1,2],[1,2,2],[2,1,1]],"t":"a测试🎉é─"}],"wrapped":false}"#
+        let line = try JSONDecoder().decode(TermLine.self, from: Data(json.utf8))
+        let run = line.runs[0]
+        XCTAssertEqual(run.columns, 1 + 2 + 2 + 2 + 1 + 1)
+        XCTAssertEqual(run.cellTexts.map { "\($0.text):\($0.width)" }, ["a:1", "测:2", "试:2", "🎉:2", "é:1", "─:1"])
+        // The digest covers the cells exactly as the gateway serialised them.
+        XCTAssertEqual(line.wireDigest, FNVTest.digest(json))
+    }
+
+    /// The Engine's width wins over the phone's guess: an Indic spacing mark
+    /// the phone would fold into its consonant still gets its own column.
+    func testTheGatewaysWidthWinsOverTheLocalGuess() throws {
+        let json = #"{"runs":[{"a":0,"bg":null,"fg":null,"g":[[3,1,1]],"t":"কা!"}],"wrapped":false}"#
+        let run = try JSONDecoder().decode(TermLine.self, from: Data(json.utf8)).runs[0]
+        XCTAssertEqual(run.columns, 3)
+        XCTAssertEqual(CellWidth.of(run.text), 2, "the local tables would have drifted the row by one")
+    }
+
+    func testCursorBlinkDecodes() throws {
+        let cursor = try JSONDecoder().decode(TermCursor.self, from: Data(#"{"x":1,"y":2,"visible":true,"shape":"bar","blink":true}"#.utf8))
+        XCTAssertEqual(cursor.shape, .bar)
+        XCTAssertTrue(cursor.blink)
+    }
+}
+
+enum FNVTest {
+    static func digest(_ text: String) -> UInt32 {
+        var hash = FNV1a()
+        hash.add(text)
+        return hash.value
+    }
 }

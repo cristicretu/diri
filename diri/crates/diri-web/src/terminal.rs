@@ -21,7 +21,9 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use diri_client::{ClientError, DaemonClient, EventEnvelope, SessionPreview, TerminalChunk};
-use diri_proto::grid::{GridCell, GridRowCodec, GridUpdate, RowMetadata, TermColor, TermStyle};
+use diri_proto::grid::{
+    CursorShape, CursorStyle, GridCell, GridRowCodec, GridUpdate, RowMetadata, TermColor, TermStyle,
+};
 use diri_proto::terminal::MouseTrackingMode;
 use diri_proto::{ReadScrollbackCellsResult, SessionId, SessionStatus};
 use serde_json::{Map, Value, json};
@@ -197,7 +199,7 @@ impl Paint {
 /// graphemes restored, and trailing default blanks trimmed. An empty row is
 /// `{"runs":[],"wrapped":false}`.
 pub fn line_json(cells: &[GridCell], metadata: &RowMetadata, palette: &TerminalPalette) -> Value {
-    let mut runs: Vec<(Paint, Paint, u8, String)> = Vec::new();
+    let mut runs: Vec<(Paint, Paint, u8, String, Vec<Cell>)> = Vec::new();
     let mut wrapped = false;
     let mut graphemes = metadata.graphemes.iter().peekable();
     for (col, cell) in cells.iter().enumerate() {
@@ -219,10 +221,11 @@ pub fn line_json(cells: &[GridCell], metadata: &RowMetadata, palette: &TerminalP
         let run = match runs.last_mut() {
             Some(last) if (last.0, last.1, last.2) == style => last,
             _ => {
-                runs.push((style.0, style.1, style.2, String::new()));
+                runs.push((style.0, style.1, style.2, String::new(), Vec::new()));
                 runs.last_mut().expect("just pushed")
             }
         };
+        let before = run.3.len();
         match graphemes.peek() {
             Some((at, text)) if usize::from(*at) == col => run.3.push_str(text),
             _ => run.3.push(match cell.scalar {
@@ -230,6 +233,13 @@ pub fn line_json(cells: &[GridCell], metadata: &RowMetadata, palette: &TerminalP
                 scalar => char::from_u32(scalar).unwrap_or('\u{fffd}'),
             }),
         }
+        let wide = cells
+            .get(col + 1)
+            .is_some_and(|next| next.style.contains(TermStyle::WIDE_SPACER));
+        run.4.push(Cell {
+            units: run.3[before..].encode_utf16().count(),
+            width: if wide { 2 } else { 1 },
+        });
     }
     // Trailing blanks the client would paint identically by leaving them out.
     const VISIBLE_ON_BLANK: u8 = A_INVERSE | A_UNDERLINE | A_STRIKE;
@@ -238,6 +248,9 @@ pub fn line_json(cells: &[GridCell], metadata: &RowMetadata, palette: &TerminalP
             break;
         }
         let kept = last.3.trim_end_matches(' ').len();
+        // Each trimmed blank was a one-unit, one-column cell of its own.
+        let trimmed = last.3.len() - kept;
+        last.4.truncate(last.4.len().saturating_sub(trimmed));
         last.3.truncate(kept);
         if !last.3.is_empty() {
             break;
@@ -245,14 +258,51 @@ pub fn line_json(cells: &[GridCell], metadata: &RowMetadata, palette: &TerminalP
         runs.pop();
     }
     json!({
-        "runs": runs.into_iter().map(|(fg, bg, a, t)| json!({
-            "t": t,
-            "fg": fg.json(),
-            "bg": bg.json(),
-            "a": a,
-        })).collect::<Vec<_>>(),
+        "runs": runs.into_iter().map(|(fg, bg, a, t, cells)| {
+            let mut run = json!({
+                "t": t,
+                "fg": fg.json(),
+                "bg": bg.json(),
+                "a": a,
+            });
+            if !t.is_ascii() {
+                run["g"] = cell_groups(&cells);
+            }
+            run
+        }).collect::<Vec<_>>(),
         "wrapped": wrapped,
     })
+}
+
+/// One grid cell of a run: how much of the run's text it holds (UTF-16
+/// units, what a phone or browser string indexes by) and how many columns
+/// it covers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Cell {
+    units: usize,
+    width: u8,
+}
+
+/// `Run.g`, sent with any run that is not plain ASCII: the run's cells as
+/// `[count, units, width]` groups, so a client places every character on
+/// the column the grid put it in instead of guessing widths from its own
+/// Unicode tables (which disagree with the Engine on emoji sequences,
+/// ambiguous-width and Indic spacing marks, and drift the rest of the row).
+/// Additive: clients that ignore it keep working as before.
+fn cell_groups(cells: &[Cell]) -> Value {
+    let mut groups: Vec<(usize, Cell)> = Vec::new();
+    for cell in cells {
+        match groups.last_mut() {
+            Some((count, last)) if last == cell => *count += 1,
+            _ => groups.push((1, *cell)),
+        }
+    }
+    Value::Array(
+        groups
+            .into_iter()
+            .map(|(count, cell)| json!([count, cell.units, cell.width]))
+            .collect(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -274,6 +324,8 @@ pub struct Mirror {
     cols: u16,
     rows: Vec<(Vec<GridCell>, RowMetadata)>,
     cursor: (u16, u16, bool),
+    /// DECSCUSR: shape and whether it blinks.
+    cursor_style: CursorStyle,
     modes: Modes,
     history_size: i64,
     has_grid: bool,
@@ -298,8 +350,9 @@ impl Mirror {
         }
         self.has_grid = true;
         let cursor = (update.cursor_col, update.cursor_row, update.cursor_visible);
-        if cursor != self.cursor {
+        if cursor != self.cursor || update.cursor_style != self.cursor_style {
             self.cursor = cursor;
+            self.cursor_style = update.cursor_style;
             self.meta_dirty = true;
         }
         let cols = usize::from(update.cols);
@@ -342,8 +395,13 @@ impl Mirror {
             "x": self.cursor.0,
             "y": self.cursor.1,
             "visible": self.cursor.2,
-            // The Engine's terminal state does not track DECSCUSR.
-            "shape": "block",
+            // DECSCUSR, as the Engine's grid carries it (#838).
+            "shape": match self.cursor_style.shape {
+                CursorShape::Block => "block",
+                CursorShape::Underline => "underline",
+                CursorShape::Bar => "bar",
+            },
+            "blink": !self.cursor_style.steady,
         })
     }
 
@@ -910,7 +968,7 @@ mod tests {
         assert_eq!(snapshot["lines"].as_array().unwrap().len(), 4);
         assert_eq!(
             snapshot["cursor"],
-            json!({"x":1,"y":2,"visible":true,"shape":"block"})
+            json!({"x":1,"y":2,"visible":true,"shape":"block","blink":true})
         );
         mirror.apply(update(false, &[(3, "three")]));
         mirror.apply(update(false, &[(3, "four")]));
@@ -928,6 +986,79 @@ mod tests {
             .iter()
             .map(line_digest)
             .collect()
+    }
+
+    #[test]
+    fn non_ascii_runs_carry_their_cells_so_widths_are_never_guessed() {
+        let palette = current_palette();
+        let mut cells = Vec::new();
+        for ch in ['a', '测', '试', '🎉', 'é', '─'] {
+            cells.push(GridCell::new(
+                u32::from(ch),
+                TermColor::Default,
+                TermColor::DefaultInverted,
+                TermStyle::empty(),
+            ));
+            if matches!(ch, '测' | '试' | '🎉') {
+                cells.push(GridCell::new(
+                    0,
+                    TermColor::Default,
+                    TermColor::DefaultInverted,
+                    TermStyle::WIDE_SPACER,
+                ));
+            }
+        }
+        cells.push(GridCell::BLANK);
+        cells.push(GridCell::BLANK);
+        let line = line_json(&cells, &RowMetadata::default(), &palette);
+        let run = &line["runs"][0];
+        assert_eq!(run["t"], "a测试🎉é─");
+        // a: 1 unit 1 col; 测试: 1 unit 2 cols each; 🎉: 2 units (a
+        // surrogate pair) 2 cols; é and ─: 1 unit 1 col. Trailing blanks
+        // are trimmed from the cells as from the text.
+        assert_eq!(
+            run["g"],
+            json!([[1, 1, 1], [2, 1, 2], [1, 2, 2], [2, 1, 1]])
+        );
+
+        let ascii = line_json(
+            &[GridCell::new(
+                u32::from('x'),
+                TermColor::Default,
+                TermColor::DefaultInverted,
+                TermStyle::empty(),
+            )],
+            &RowMetadata::default(),
+            &palette,
+        );
+        assert!(
+            ascii["runs"][0].get("g").is_none(),
+            "plain ASCII stays as it was"
+        );
+    }
+
+    #[test]
+    fn the_cursor_carries_the_programs_shape_and_blink() {
+        let mut mirror = Mirror::default();
+        let mut grid = update(true, &[(0, "x")]);
+        grid.cursor_style = CursorStyle {
+            shape: CursorShape::Bar,
+            steady: true,
+        };
+        mirror.apply(grid);
+        assert_eq!(mirror.cursor_json()["shape"], "bar");
+        assert_eq!(mirror.cursor_json()["blink"], false);
+        let mut changed = update(false, &[]);
+        changed.cursor_style = CursorStyle {
+            shape: CursorShape::Underline,
+            steady: false,
+        };
+        mirror.dirty.clear();
+        mirror.meta_dirty = false;
+        mirror.apply(changed);
+        assert!(mirror.meta_dirty, "a shape change alone is sent");
+        assert_eq!(mirror.cursor_json()["shape"], "underline");
+        assert_eq!(mirror.cursor_json()["blink"], true);
     }
 
     #[test]

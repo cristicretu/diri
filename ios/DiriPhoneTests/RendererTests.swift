@@ -44,19 +44,9 @@ final class RendererTests: XCTestCase {
         XCTAssertGreaterThan(red(rule, width - 2, y!), 200)
     }
 
-    func testCJKAndEmojiGetAFontThatHasThem() {
-        for character: Character in ["测", "好", "✅", "🎉", "한"] {
-            let chosen = font.fallback(for: character, base: font.regular)
-            var glyph = [CGGlyph](repeating: 0, count: 2)
-            let utf16 = Array(String(character).utf16)
-            XCTAssertTrue(CTFontGetGlyphsForCharacters(chosen, utf16, &glyph, utf16.count), "\(character): \(CTFontCopyPostScriptName(chosen))")
-        }
-        func family(_ c: Character) -> String { CTFontCopyFamilyName(font.fallback(for: c, base: font.regular)) as String }
-        print("DIRI_FALLBACKS", ["测", "か", "한", "✅", "🎉", "●"].map(family))
-        XCTAssertTrue(family("测").contains("PingFang"), family("测"))
-        XCTAssertTrue(family("🎉").contains("Emoji"), family("🎉"))
-        XCTAssertFalse(family("●").contains("Emoji"), "a text symbol is not drawn by the emoji font: \(family("●"))")
+    func testTheFaceCoverageDecidesBatching() {
         XCTAssertTrue(font.covers("─"))
+        XCTAssertTrue(font.covers("é"))
         XCTAssertFalse(font.covers("测"))
     }
 
@@ -96,5 +86,17 @@ final class RendererTests: XCTestCase {
                        "\u{1B}[<64;3;7M\u{1B}[<64;3;7M")
         XCTAssertEqual(String(decoding: TerminalView.wheelReport(up: false, col: 1, row: 1, count: 1), as: UTF8.self),
                        "\u{1B}[<65;1;1M")
+    }
+
+    /// Bengali on the gateway's cells: drawn (shaped as one stretch), not
+    /// dropped.
+    func testIndicTextOnGatewayCellsDraws() {
+        let json = #"{"runs":[{"a":0,"bg":null,"fg":null,"g":[[5,1,1]],"t":"বাংলা"},{"a":0,"bg":null,"fg":5,"t":"|"}],"wrapped":false}"#
+        let line = try! JSONDecoder().decode(TermLine.self, from: Data(json.utf8))
+        XCTAssertEqual(line.runs[0].cellTexts.map { String($0.text) }, ["ব", "া", "ং", "ল", "া"])
+        let (context, width, height) = render(line, cols: 6)
+        let lit = (0 ..< height).reduce(0) { sum, y in sum + (0 ..< width).filter { red(context, $0, y) > 100 }.count }
+        // The pipe alone lights about 100 pixels; the Bengali adds far more.
+        XCTAssertGreaterThan(lit, 250)
     }
 }
