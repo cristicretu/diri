@@ -44,9 +44,13 @@ struct SessionScreen: View {
             VStack(spacing: 8) {
                 Spacer(minLength: 0)
                 linkBanner(terminal)
-                if !voiceMode, let detail = session?.needsInput, session?.attention == .needsInput {
-                    NeedsInputBanner(detail: detail) { index in
-                        terminal.send(Array(String(index + 1).utf8))
+                if !voiceMode, let current = session, let detail = current.needsInput, current.attention == .needsInput {
+                    NeedsInputBanner(detail: detail) { approve in
+                        Task {
+                            do { try await model.answer(current, approve: approve) } catch {
+                                self.error = SessionListView.describe(error)
+                            }
+                        }
                     }
                 }
                 if voiceMode {
@@ -314,31 +318,51 @@ struct SessionScreen: View {
 /// answer with a tap.
 struct NeedsInputBanner: View {
     let detail: NeedsInputDetail
-    var onOption: (Int) -> Void = { _ in }
+    /// Approve (true) or deny a permission prompt with the agent's own keys.
+    var onAnswer: (Bool) -> Void = { _ in }
+
+    @State private var confirmingDestructive = false
+
+    private var isPermission: Bool { if case .permission = detail.kind { return true } else { return false } }
 
     var body: some View {
         if let text = detail.promptExcerpt ?? summaryIfSpecific {
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 8) {
                 Text(text)
                     .font(.system(size: 14, weight: .medium))
                     .foregroundStyle(Tokens.Ink.primary)
                     .lineLimit(3)
-                if let options = detail.options, !options.isEmpty {
+                // Options are shown, not typed: a picker may focus something
+                // else first, so a blind number can choose the wrong answer.
+                // Answer them in the terminal (the key row has the arrows).
+                if let options = detail.options, !options.isEmpty, !isPermission {
                     ForEach(Array(options.enumerated()), id: \.offset) { index, option in
-                        Button { onOption(index) } label: {
-                            Text("\(index + 1)  \(option)")
-                                .font(.system(size: 14))
-                                .foregroundStyle(Tokens.Ink.secondary)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .contentShape(.rect)
+                        Text("\(index + 1)  \(option)")
+                            .font(.system(size: 14))
+                            .foregroundStyle(Tokens.Ink.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                if isPermission {
+                    HStack(spacing: 8) {
+                        Button("Deny") { onAnswer(false) }
+                            .buttonStyle(BannerButtonStyle(fill: Color.white.opacity(0.12), ink: Tokens.Ink.primary))
+                            .accessibilityIdentifier("banner-deny")
+                        Button("Approve") {
+                            if detail.riskHint == .destructive { confirmingDestructive = true } else { onAnswer(true) }
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(BannerButtonStyle(fill: risk, ink: .black))
+                        .accessibilityIdentifier("banner-approve")
                     }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(14)
             .glass(in: RoundedRectangle(cornerRadius: 22, style: .continuous), tint: risk.opacity(0.18))
+            .confirmationDialog("Approve a destructive action?", isPresented: $confirmingDestructive, titleVisibility: .visible) {
+                Button("Approve", role: .destructive) { onAnswer(true) }
+                Button("Cancel", role: .cancel) {}
+            }
         }
     }
 
@@ -350,5 +374,18 @@ struct NeedsInputBanner: View {
         guard let summary = detail.summary else { return nil }
         let generic = summary.lowercased().contains("waiting for your input")
         return generic && (detail.options?.isEmpty ?? true) ? nil : summary
+    }
+}
+
+private struct BannerButtonStyle: ButtonStyle {
+    let fill: Color
+    let ink: Color
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(ink)
+            .frame(maxWidth: .infinity, minHeight: 34)
+            .background(Capsule().fill(fill.opacity(configuration.isPressed ? 0.7 : 1)))
     }
 }

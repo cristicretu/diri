@@ -110,6 +110,7 @@ impl Api {
             ("GET", ["api", "session", id, "transcript"]) => self.transcript(id, request).await,
             ("GET", ["api", "session", id, "spoken"]) => self.spoken(id).await,
             ("POST", ["api", "session", id, "send"]) => self.send(id, request).await,
+            ("POST", ["api", "session", id, "answer"]) => self.answer(id, request).await,
             ("POST", ["api", "session", id, "key"]) => self.key(id, request).await,
             ("POST", ["api", "session", id, "resize"]) => self.resize(id, request).await,
             ("POST", ["api", "session", id, "seen"]) => self.seen(id).await,
@@ -378,6 +379,115 @@ impl Api {
             .filter(|latest| latest.turn == Some(turn))
             .and_then(|latest| latest.text);
         json!({ "sessionID": session, "turn": turn, "spoken": spoken })
+    }
+
+    /// Approves or denies a permission prompt with the agent's own
+    /// keystrokes (its manifest's `approve` / `deny`, the same answers the
+    /// Mac's attention inbox sends), from a phone list row or notification.
+    ///
+    /// Re-checked when it arrives, never trusted from when it was shown: the
+    /// session must still be waiting on the prompt the phone saw (`occurredAt`)
+    /// or the answer is refused with `409 moved_on`. A keystroke typed into a
+    /// prompt that has since changed (or into the composer that replaced it)
+    /// would say something the person never meant. Exactly once: `id` names
+    /// the answer, and a resend after a lost reply is not written again.
+    async fn answer(&self, id: &str, request: &Request) -> Response {
+        let body = request.json();
+        let approve = match body.get("answer").and_then(Value::as_str) {
+            Some("approve") => true,
+            Some("deny") => false,
+            _ => return Response::error(400, "answer must be approve or deny"),
+        };
+        let Some(batch) = body.get("id").and_then(Value::as_str) else {
+            return Response::error(400, "missing id");
+        };
+        let Some(seen) = body.get("occurredAt").and_then(Value::as_f64) else {
+            return Response::error(400, "missing occurredAt");
+        };
+        let key = format!("{id}/answer/{batch}");
+        // A resend of an answer that landed: the agent has moved on because
+        // of it, which is success, not a refusal.
+        if self.inputs.delivered(&key) {
+            return Response::json(&json!({ "ok": true, "once": true }));
+        }
+        let sessions = match self.client.sessions().await {
+            Ok(result) => result.sessions,
+            Err(error) => return daemon_error(&error),
+        };
+        let Some(record) = sessions.iter().find(|record| record.id.0 == id) else {
+            return Response::coded_error(404, "no_session", "That session is gone");
+        };
+        let waiting = matches!(record.status, diri_proto::SessionStatus::NeedsInput(_));
+        let Some(detail) = record.needs_input.as_ref().filter(|_| waiting) else {
+            return Response::coded_error(409, "moved_on", "The agent is no longer waiting");
+        };
+        // A key for the prompt seen; a later prompt needs its own look.
+        if (detail.occurred_at.0 - seen).abs() > 0.5 {
+            return Response::coded_error(
+                409,
+                "moved_on",
+                "The agent is asking something else now",
+            );
+        }
+        if detail.secret || detail.kind != diri_proto::NeedsInputKind::Permission {
+            return Response::coded_error(
+                422,
+                "not_a_permission",
+                "Answer this one in the session",
+            );
+        }
+        let readiness = self
+            .client
+            .agent_readiness(diri_proto::AgentReadinessParams {
+                host: record.host.clone(),
+                force_refresh: false,
+            })
+            .await;
+        let descriptor = readiness
+            .as_ref()
+            .ok()
+            .and_then(|result| result.descriptor(record.effective_kind()));
+        let keystroke = if approve {
+            descriptor.and_then(|descriptor| descriptor.approve.clone())
+        } else {
+            Some(
+                descriptor
+                    .and_then(|descriptor| descriptor.deny.clone())
+                    .unwrap_or(diri_proto::AgentKeystroke {
+                        text: "\u{1b}".into(),
+                        submit: false,
+                    }),
+            )
+        };
+        let Some(keystroke) = keystroke else {
+            return Response::coded_error(
+                422,
+                "no_quick_approve",
+                "This agent's prompt has no verified approve key; answer it in the session",
+            );
+        };
+        let session = session_id(id);
+        let mut timed_out = None;
+        let delivered = self
+            .inputs
+            .deliver(&key, || async {
+                match self
+                    .client
+                    .send_text(&session, keystroke.text.clone(), keystroke.submit)
+                    .await
+                {
+                    Err(error @ ClientError::Timeout(_)) => {
+                        timed_out = Some(error);
+                        Ok(())
+                    }
+                    other => other,
+                }
+            })
+            .await;
+        match timed_out.map_or(delivered, Err) {
+            Ok(()) => Response::json(&json!({ "ok": true, "once": true })),
+            Err(error) => daemon_error(&error),
+        }
     }
 
     async fn send(&self, id: &str, request: &Request) -> Response {
@@ -956,6 +1066,104 @@ mod tests {
             engine.calls.try_recv().is_err(),
             "nothing invalid was written"
         );
+    }
+
+    /// A record of `kind` waiting on a prompt raised at `occurred`.
+    fn waiting(kind: &str, needs: &str, occurred: f64) -> Value {
+        json!({
+            "id": "s_a", "kind": {"claudeCode": {}}, "cwd": "/r", "projectID": "p", "title": "t",
+            "titleSource": 0, "status": {"needsInput": {"_0": needs}}, "resumability": "live",
+            "createdAt": 1.0, "updatedAt": 1.0, "pinned": false,
+            "needsInput": {"kind": kind, "source": "screen", "summary": "Run tests?",
+                           "riskHint": "unknown", "occurredAt": occurred},
+        })
+    }
+
+    #[tokio::test]
+    async fn an_answer_types_the_agents_own_keys_once_and_only_for_the_prompt_seen() {
+        use diri_proto::Method;
+        let record = Arc::new(std::sync::Mutex::new(waiting(
+            "permission",
+            "permission",
+            1000.0,
+        )));
+        let listed = Arc::clone(&record);
+        let mut engine = crate::testing::fake_engine(move |method, _| match method {
+            Method::SESSION_LIST => json!({"sessions": [listed.lock().unwrap().clone()], "projects": []}),
+            Method::AGENT_READINESS => json!({"agents": [{"kind": "claude-code", "binary": "claude",
+                "descriptor": {"id": "claude-code", "displayName": "Claude Code",
+                    "approve": {"text": "1", "submit": true}, "deny": {"text": "\u{1b}", "submit": false}}}]}),
+            _ => json!({}),
+        })
+        .await;
+        let api = Api {
+            client: Arc::clone(&engine.client),
+            auth: Auth::temporary().unwrap(),
+            host_label: "Mac".into(),
+            inputs: Default::default(),
+            tailnet: None,
+        };
+        let sent = |engine: &mut crate::testing::FakeEngine| {
+            let mut writes = Vec::new();
+            while let Ok((method, params)) = engine.calls.try_recv() {
+                if method == Method::SESSION_SEND_TEXT {
+                    let params = params.unwrap();
+                    writes.push((
+                        params["text"].as_str().unwrap().to_owned(),
+                        params["submit"].as_bool().unwrap(),
+                    ));
+                }
+            }
+            writes
+        };
+        let approve = json!({"answer": "approve", "id": "a1", "occurredAt": 1000.0}).to_string();
+        let (status, _) = call(&api, "POST", "/api/session/s_a/answer", &approve).await;
+        assert_eq!(status, 200);
+        assert_eq!(sent(&mut engine), vec![("1".to_owned(), true)]);
+
+        // The reply was lost and the phone resends; the agent has moved on
+        // because of the first one. Success, and nothing typed twice.
+        *record.lock().unwrap() = json!({"id": "s_a", "kind": {"claudeCode": {}}, "cwd": "/r", "projectID": "p",
+            "title": "t", "titleSource": 0, "status": {"working": {}}, "resumability": "live",
+            "createdAt": 1.0, "updatedAt": 1.0, "pinned": false});
+        assert_eq!(
+            call(&api, "POST", "/api/session/s_a/answer", &approve)
+                .await
+                .0,
+            200
+        );
+        assert!(sent(&mut engine).is_empty());
+
+        // A new answer to a prompt that is gone, or a different prompt.
+        let late = json!({"answer": "approve", "id": "a2", "occurredAt": 1000.0}).to_string();
+        assert_eq!(
+            call(&api, "POST", "/api/session/s_a/answer", &late).await.0,
+            409
+        );
+        *record.lock().unwrap() = waiting("permission", "permission", 2000.0);
+        assert_eq!(
+            call(&api, "POST", "/api/session/s_a/answer", &late).await.0,
+            409
+        );
+
+        // Deny uses the agent's deny key.
+        let deny = json!({"answer": "deny", "id": "a3", "occurredAt": 2000.0}).to_string();
+        assert_eq!(
+            call(&api, "POST", "/api/session/s_a/answer", &deny).await.0,
+            200
+        );
+        assert_eq!(sent(&mut engine), vec![("\u{1b}".to_owned(), false)]);
+
+        // A question, not a permission prompt, is answered in the session.
+        *record.lock().unwrap() = waiting("question", "question", 3000.0);
+        let question = json!({"answer": "approve", "id": "a4", "occurredAt": 3000.0}).to_string();
+        assert_eq!(
+            call(&api, "POST", "/api/session/s_a/answer", &question)
+                .await
+                .0,
+            422
+        );
+        assert!(sent(&mut engine).is_empty());
     }
 
     #[tokio::test]

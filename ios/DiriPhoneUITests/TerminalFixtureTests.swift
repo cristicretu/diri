@@ -23,12 +23,12 @@ final class TerminalFixtureTests: XCTestCase {
         if let shots { try FileManager.default.createDirectory(atPath: shots, withIntermediateDirectories: true) }
     }
 
-    private func launch() throws -> XCUIApplication {
+    private func launch(_ session: String? = "s_shell") throws -> XCUIApplication {
         let url = try String(contentsOfFile: dir + "/url", encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
         let app = XCUIApplication()
-        app.launchArguments = ["-endpoint", url, "-session", "s_claude"]
+        app.launchArguments = ["-endpoint", url] + (session.map { ["-session", $0] } ?? [])
         app.launch()
-        XCTAssertTrue(terminal(app).waitForExistence(timeout: 20))
+        if session != nil { XCTAssertTrue(terminal(app).waitForExistence(timeout: 20)) }
         return app
     }
 
@@ -108,5 +108,41 @@ final class TerminalFixtureTests: XCTestCase {
             settle(0.25)
         }
         XCTAssertEqual(sent, expected)
+    }
+
+    /// The list leads with what is waiting. Approve answers a permission
+    /// prompt with the agent's own key, once; a destructive one asks first;
+    /// a question opens its session instead of typing a guess.
+    func testWaitingSessionsCanBeAnsweredFromTheList() throws {
+        let app = try launch(nil)
+        XCTAssertTrue(app.descendants(matching: .any)["waiting-header"].waitForExistence(timeout: 20))
+        settle(1)
+        save("waiting")
+        let before = typed()
+        app.buttons["approve-s_claude"].tap()
+        let gone = NSPredicate(format: "exists == false")
+        expectation(for: gone, evaluatedWith: app.buttons["approve-s_claude"])
+        waitForExpectations(timeout: 10)
+        XCTAssertEqual(String(typed().dropFirst(before.count)), "1\n", "Claude's approve key, typed once")
+
+        // Destructive: nothing is sent until confirmed.
+        settle(1.5)
+        let mark = typed()
+        let destructive = app.buttons["approve-s_cleanup"]
+        XCTAssertTrue(destructive.waitForExistence(timeout: 5))
+        destructive.tap()
+        // The dialog's own Approve, not the card's button under it.
+        let confirm = app.buttons.matching(NSPredicate(format: "label == 'Approve' AND NOT (identifier BEGINSWITH 'approve-')")).firstMatch
+        XCTAssertTrue(app.staticTexts["Approve a destructive action?"].waitForExistence(timeout: 3))
+        save("destructive-confirm")
+        XCTAssertEqual(typed(), mark)
+        confirm.tap()
+        let deadline = Date().addingTimeInterval(8)
+        while Date() < deadline, typed() == mark { settle(0.25) }
+        XCTAssertEqual(String(typed().dropFirst(mark.count)), "1\n")
+
+        // A question opens the session.
+        app.buttons["answer-s_codex"].tap()
+        XCTAssertTrue(terminal(app).waitForExistence(timeout: 10))
     }
 }
