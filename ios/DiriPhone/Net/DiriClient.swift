@@ -41,13 +41,18 @@ actor DiriClient {
 
     enum Failure: LocalizedError {
         case unauthorized
+        /// Tailnet admission (#952) turned the device away for a reason
+        /// pairing again would not fix: another Tailscale user, a tagged
+        /// device, not over the tailnet, or the Mac cannot ask Tailscale.
+        case refused(code: String, message: String)
         case daemonUnreachable(String)
         case http(Int, String)
         case malformed
 
         var errorDescription: String? {
             switch self {
-            case .unauthorized: "That token was not accepted."
+            case .unauthorized: "This iPhone is not paired with that computer. Scan its pairing code again."
+            case let .refused(code, message): PairingHelp.refusal(code: code, message: message)
             case let .daemonUnreachable(detail): "The daemon is not reachable: \(detail)"
             case let .http(code, message): message.isEmpty ? "HTTP \(code)" : message
             case .malformed: "The response could not be read."
@@ -128,13 +133,24 @@ actor DiriClient {
         switch http.statusCode {
         case 200 ..< 300:
             return data
-        case 401:
-            throw Failure.unauthorized
         default:
-            let message = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? String
-            throw Failure.http(http.statusCode, message ?? "")
+            let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            let message = body?["error"] as? String ?? ""
+            // 401 is "pair (again)": a token gateway's wrong token, or tailnet
+            // admission's `device_not_paired` (never paired, or removed).
+            if http.statusCode == 401 { throw Failure.unauthorized }
+            if let code = body?["code"] as? String, Self.admissionRefusals.contains(code) {
+                throw Failure.refused(code: code, message: message)
+            }
+            throw Failure.http(http.statusCode, message)
         }
     }
+
+    /// Tailnet admission's refusals that pairing again does not fix.
+    static let admissionRefusals: Set<String> = [
+        "tailnet_identity_unavailable", "not_a_tailnet_peer", "tagged_node_refused",
+        "tailnet_owner_unknown", "not_the_owner", "foreign_origin",
+    ]
 
     func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
         do {

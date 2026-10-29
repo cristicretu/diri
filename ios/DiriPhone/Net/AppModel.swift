@@ -91,6 +91,10 @@ final class AppModel {
 
     var hasGateways: Bool { !gateways.isEmpty }
 
+    /// A paired computer now turns this iPhone away as unpaired (removed in
+    /// Settings, or a new pairing code minted): offer to pair again.
+    var needsPairing: Bool { outcomes.values.contains(.unauthorized) }
+
     var liveGateway: Gateway? { gateways.first { $0.id == liveGatewayID } }
 
     // MARK: - Gateways
@@ -199,6 +203,9 @@ final class AppModel {
                     return .reachable(host: health.host)
                 } catch DiriClient.Failure.unauthorized {
                     return .unauthorized
+                } catch let refusal as DiriClient.Failure {
+                    if case .refused = refusal { return .refused(refusal.localizedDescription) }
+                    return .unreachable(refusal.localizedDescription)
                 } catch {
                     return .unreachable(error.localizedDescription)
                 }
@@ -237,8 +244,14 @@ final class AppModel {
         } else {
             host = ""
             let unauthorized = results.values.contains(.unauthorized)
-            connection = .offline(unauthorized ? "Token rejected" : "No paired computer answered")
-            banner = unauthorized ? "That token was not accepted." : nil
+            let refusal = results.values.compactMap { outcome -> String? in
+                if case let .refused(message) = outcome { return message } else { return nil }
+            }.first
+            connection = .offline(
+                unauthorized ? "This iPhone isn’t paired with your Mac any more. Pair it again with the code in Diri → Settings → Phone access."
+                    : refusal ?? "No paired computer answered"
+            )
+            banner = unauthorized ? "Not paired" : refusal
         }
         if previousLive != liveGatewayID { Task { await loadAgents() } }
 
