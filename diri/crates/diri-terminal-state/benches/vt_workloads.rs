@@ -299,6 +299,15 @@ const DECLARED_HISTORY_ROWS: &[(&str, usize)] = &[
         "unicode 33d19ab233c8bb6434f594a1afa41aec58f12bc44005b87e0c059b11ced0033b",
         53_648,
     ),
+    // The kitten 0.48 captures.
+    (
+        "ascii af0751e04c0301ae668fb64fee70eb53a45637e32ec2d5999c6367df6d10d515",
+        63_217,
+    ),
+    (
+        "unicode d5c85baa3324d1f35a7ac69f020494d7ec82fd281ceaf72bafa17ae871679c4a",
+        53_648,
+    ),
 ];
 
 /// History rows compared: all the reference kept, or the declared count

@@ -19,6 +19,13 @@
 # numbers use. Regenerate only from a known-good reference commit, never
 # from the code being measured, and name that commit here. Any PR that
 # changes history retention must regenerate this file in the same PR.
+#
+# #928 (faster LZ skipping) keeps fewer rows and declares them in
+# `DECLARED_HISTORY_ROWS`: ascii 62,961 generated / 63,217 kitten (the
+# reference keeps 63,313 / 63,569), unicode 53,648 both (reference 54,128).
+# Those four sections were regenerated at the same reference (589d0a46c,
+# generated and kitten captures) with the declaration, so they cover the
+# newest declared rows; every other field and section is unchanged.
 
 [ascii 5b1de281ecd8d0f0db1696ae1dbf745069c6ff3815c809f02e31791d50cb131d]
 bytes_fed = 67109280
@@ -199,12 +206,12 @@ bytes_fed = 67109280
 clipboard = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 cursor = (98, 79, true)
 grid_sha256 = d211d26b236ecb833159905984aecdec2d379b7ab041d44075f079356eeff683
-history_rows_checked = 63569
+history_rows_checked = 63217
 history_rows_reference = 63569
 images_held_bytes = 0
 images_stored = count=0
 keyboard = KeyboardState { enhancements: Some(KeyboardEnhancements(0)), application_cursor_keys: false, application_keypad: false }
-links = 0 sha256=c63bbade364353d86b1dfafe1a6877f58c7b4c588e3438f12520edfff446081f
+links = 0 sha256=e670e8db64175251dd3c2be0deb0014062d2517f4d77e32450759890c7e9044e
 modes = alt=false paste=false focus=false mouse=MouseModes { tracking: Off, encoding: Legacy } cursor=CursorStyle { shape: Block, steady: false }
 notifications = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 osc_checksum = cbf29ce484222325
@@ -215,8 +222,8 @@ program_status = None
 progress = None
 replies = 0B sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 reps = 32
-scrollback_cells_sha256 = 330518018033e74fa230ab7a253a6b3ab365eabbfd8be658f6bf9595571efee3
-scrollback_metadata_sha256 = d01f8a6b1f44ca4db8b6c591f70c5516dd41d1ddb36847236478a5351e6e915a
+scrollback_cells_sha256 = 2f0922fdb8f1ef183b56fcd1f87801a51db74c6c36540ae67dded5a5b2cb5940
+scrollback_metadata_sha256 = fbf877b62a80ec79d725f1f82f0d7406ff7c81870571ce5b3b57d5bfa3bf0d2b
 scrollback_text_sha256 = 7fa9fdeeb9edbf75bea4090118429effb8e5dc11df047f6dbcfad658c2da1b83
 size = 120x80
 synchronized = completed_any=false open=false
@@ -315,12 +322,12 @@ bytes_fed = 68308992
 clipboard = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 cursor = (119, 79, true)
 grid_sha256 = ca960410b38b77fd8ddf41457286c96eed6c84978fb0953a6c749de5bbbbbcc6
-history_rows_checked = 54128
+history_rows_checked = 53648
 history_rows_reference = 54128
 images_held_bytes = 0
 images_stored = count=0
 keyboard = KeyboardState { enhancements: Some(KeyboardEnhancements(0)), application_cursor_keys: false, application_keypad: false }
-links = 0 sha256=b19834e04c46069d46a0b1762ea76136af8ba0d369b40169371446c955bbda2b
+links = 0 sha256=e1dcb7586d97d67ccdbe73d9d325429f19411e640a150ed31ed1cea76e75a619
 modes = alt=false paste=false focus=false mouse=MouseModes { tracking: Off, encoding: Legacy } cursor=CursorStyle { shape: Block, steady: false }
 notifications = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 osc_checksum = cbf29ce484222325
@@ -331,8 +338,8 @@ program_status = None
 progress = None
 replies = 0B sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 reps = 36
-scrollback_cells_sha256 = 00851ea30e40141b86a9663b9d66a16aed30553acd42b31bdb690f9846febf92
-scrollback_metadata_sha256 = ed9f0d6a5e05dfd2a247e46f713b1e3c0cca7483f753448d9f88e14120ece5a9
+scrollback_cells_sha256 = fb4b8ae2f70ef440c80ebfd15c6443e9e4bf0c19757d7768955bbbe840afadeb
+scrollback_metadata_sha256 = 9284f11ba0dde714b8b8400d83618d9346edd59a0eea6b7ab7e0c92504e67cab
 scrollback_text_sha256 = 856845797c33154e92f0cd1a4b29155c148d3d1b8e396c7b1b225fa73fd34bee
 size = 120x80
 synchronized = completed_any=false open=false
