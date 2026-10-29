@@ -15,9 +15,6 @@ final class TerminalFont {
     let ascent: CGFloat
     let descent: CGFloat
     let scale: CGFloat
-    /// Per character: the font that draws it (nil: this one), so the
-    /// fallback search runs once per character, not once per frame.
-    private var fallbacks: [Character: CTFont?] = [:]
     /// Whether the regular face has glyphs for a scalar.
     private var covered: [UInt32: Bool] = [:]
 
@@ -53,32 +50,6 @@ final class TerminalFont {
         let found = CTFontGetGlyphsForCharacters(regular, utf16, &glyphs, utf16.count)
         covered[scalar.value] = found
         return found
-    }
-
-    /// The font for a character the terminal face lacks, found once per
-    /// character and cached, so a redraw never repeats Core Text's cascade
-    /// search. The search starts from the system text face: from SF Mono it
-    /// answered with the emoji font even for CJK and `●`.
-    func fallback(for character: Character, base: CTFont) -> CTFont {
-        if let cached = fallbacks[character] { return cached ?? base }
-        let text = String(character)
-        let utf16 = Array(text.utf16)
-        func draws(_ font: CTFont) -> Bool {
-            var glyphs = [CGGlyph](repeating: 0, count: utf16.count)
-            return CTFontGetGlyphsForCharacters(font, utf16, &glyphs, utf16.count)
-        }
-        let traits = CTFontGetSymbolicTraits(base)
-        let system = UIFont.systemFont(ofSize: size, weight: traits.contains(.traitBold) ? .semibold : .regular) as CTFont
-        let cascade = CTFontCreateForString(system, text as CFString, CFRange(location: 0, length: utf16.count))
-        var chosen: CTFont? = draws(cascade) ? cascade : nil
-        if chosen == nil {
-            for name in ["PingFangSC-Regular", "HiraginoSans-W3", "AppleSDGothicNeo-Regular", "AppleColorEmoji"] {
-                let candidate = CTFontCreateWithName(name as CFString, size, nil)
-                if draws(candidate) { chosen = candidate; break }
-            }
-        }
-        fallbacks[character] = .some(chosen)
-        return chosen ?? base
     }
 
     func font(for attributes: TermAttributes) -> CTFont {
@@ -247,9 +218,10 @@ enum LineRenderer {
             }
             flush()
             if character != " " {
-                let ownFont = font.covers(character) ? face : font.fallback(for: character, base: face)
+                // Core Text's own cascade from the terminal face picks the
+                // font for a character the face lacks.
                 drawText(substituted, x: CGFloat(col) * cell, baseline: baseline,
-                         font: ownFont, color: color, in: context, fitting: CGFloat(max(w, 1)) * cell)
+                         font: face, color: color, in: context, fitting: CGFloat(max(w, 1)) * cell)
             }
             col += w
             pendingStart = col

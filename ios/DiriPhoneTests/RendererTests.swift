@@ -44,19 +44,9 @@ final class RendererTests: XCTestCase {
         XCTAssertGreaterThan(red(rule, width - 2, y!), 200)
     }
 
-    func testCJKAndEmojiGetAFontThatHasThem() {
-        for character: Character in ["测", "好", "✅", "🎉", "한"] {
-            let chosen = font.fallback(for: character, base: font.regular)
-            var glyph = [CGGlyph](repeating: 0, count: 2)
-            let utf16 = Array(String(character).utf16)
-            XCTAssertTrue(CTFontGetGlyphsForCharacters(chosen, utf16, &glyph, utf16.count), "\(character): \(CTFontCopyPostScriptName(chosen))")
-        }
-        func family(_ c: Character) -> String { CTFontCopyFamilyName(font.fallback(for: c, base: font.regular)) as String }
-        print("DIRI_FALLBACKS", ["测", "か", "한", "✅", "🎉", "●"].map(family))
-        XCTAssertTrue(family("测").contains("PingFang"), family("测"))
-        XCTAssertTrue(family("🎉").contains("Emoji"), family("🎉"))
-        XCTAssertFalse(family("●").contains("Emoji"), "a text symbol is not drawn by the emoji font: \(family("●"))")
+    func testTheFaceCoverageDecidesBatching() {
         XCTAssertTrue(font.covers("─"))
+        XCTAssertTrue(font.covers("é"))
         XCTAssertFalse(font.covers("测"))
     }
 
