@@ -130,6 +130,15 @@ fn run(data: &[u8], reps: usize, checksum: bool) -> (f64, Option<(u64, u64)>, Ru
     (secs, counted, out)
 }
 
+/// `vt_workloads::without_history_position`: the snapshot's history
+/// position (how many rows are kept) is compared through the history keys.
+fn without_history_position(mut text: String) -> String {
+    if let Some(at) = text.rfind(", history: ") {
+        text.replace_range(at..text.len() - " }".len(), "");
+    }
+    text
+}
+
 /// Image anchors name a per-screen store nonce; only the rest must match.
 fn without_store_nonce(text: String) -> String {
     const ANCHOR: &str = "diri-image:";
@@ -218,7 +227,13 @@ fn digest(run: &mut Run, checked: usize) -> BTreeMap<String, String> {
     let mut bridged = HeadlessScreen::from_core_v2(&screen.core);
     put(
         "grid_sha256",
-        sha256(without_store_nonce(format!("{:?}", bridged.full_snapshot())).as_bytes()),
+        sha256(
+            without_history_position(without_store_nonce(format!(
+                "{:?}",
+                bridged.full_snapshot()
+            )))
+            .as_bytes(),
+        ),
     );
     let kept = bridged.history_rows();
     put(
