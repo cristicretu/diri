@@ -1552,9 +1552,22 @@ impl HeadlessScreen {
         }
     }
 
+    /// Whether the screen has rows [`Self::grid_update`] has not handed out
+    /// yet: output since the last update, or a new geometry. While it does,
+    /// a [`Self::full_snapshot`] differs from the diff baseline, and a client
+    /// seeded from it is not repaired by the next diff alone, which skips
+    /// every row that has returned to what the last update sent.
+    #[must_use]
+    pub fn has_unpublished_rows(&self) -> bool {
+        self.last_grid_cols != self.geometry.cols
+            || self.last_grid_rows != self.geometry.rows
+            || self.pending_damage_rows.contains(&true)
+    }
+
     /// A full-screen snapshot that does NOT disturb the diff baseline. Used
     /// to seed a fresh sink (or repair one that fell behind) without breaking
-    /// other sinks' diffs.
+    /// other sinks' diffs. When [`Self::has_unpublished_rows`], the caller
+    /// must make the next publication full.
     pub fn full_snapshot(&self) -> GridUpdate {
         let cols = self.geometry.cols;
         let rows = self.geometry.rows;
