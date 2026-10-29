@@ -684,11 +684,9 @@ async fn respond(request: &Request, api: &Api) -> Response {
             "application/manifest+json; charset=utf-8",
             ui::MANIFEST,
         ),
-        ("GET" | "HEAD", "/term.js") => Response::text(
-            200,
-            "text/javascript; charset=utf-8",
-            ui::TERMINAL_JS,
-        ),
+        ("GET" | "HEAD", "/term.js") => {
+            Response::text(200, "text/javascript; charset=utf-8", ui::TERMINAL_JS)
+        }
         ("GET" | "HEAD", "/icon.svg") => {
             Response::text(200, "image/svg+xml; charset=utf-8", ui::ICON_SVG)
         }
@@ -1648,7 +1646,10 @@ mod tests {
         }
 
         async fn seed(preview: &mut UnixStream, rows: &[(u16, &str)]) {
-            preview.write_all(&grid_frame(&grid(true, rows))).await.unwrap();
+            preview
+                .write_all(&grid_frame(&grid(true, rows)))
+                .await
+                .unwrap();
             let modes = diri_proto::frames::Frame::modes_with_bracketed_paste(
                 false,
                 true,
@@ -1754,8 +1755,7 @@ mod tests {
                     }
                     "need exit" => {
                         let exited: diri_proto::ExitInfo =
-                            serde_json::from_value(json!({"reason": "exited", "code": 0}))
-                                .unwrap();
+                            serde_json::from_value(json!({"reason": "exited", "code": 0})).unwrap();
                         engine
                             .events
                             .send((

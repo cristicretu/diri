@@ -938,7 +938,10 @@ mod tests {
         let digests = digests_of(&mut mirror);
         let token = format!(
             "10x4{}",
-            digests.iter().map(|d| format!(".{d:x}")).collect::<String>()
+            digests
+                .iter()
+                .map(|d| format!(".{d:x}"))
+                .collect::<String>()
         );
         let resume = Resume::parse(&token).unwrap();
 
@@ -952,7 +955,10 @@ mod tests {
         let delta = mirror.resume(&resume).unwrap();
         assert_eq!(delta["lines"].as_object().unwrap().len(), 1);
         assert_eq!(delta["lines"]["1"]["runs"][0]["t"], "TWO");
-        assert!(!mirror.has_changes(), "the resume frame covers pending rows");
+        assert!(
+            !mirror.has_changes(),
+            "the resume frame covers pending rows"
+        );
 
         // Another width or height means a snapshot.
         let narrower = Resume::parse(&token.replacen("10x", "9x", 1)).unwrap();
@@ -972,11 +978,16 @@ mod tests {
         assert_eq!(line_digest(&json!({"runs": [], "wrapped": false})), {
             "{\"runs\":[],\"wrapped\":false}"
                 .bytes()
-                .fold(0x811c_9dc5_u32, |h, b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193))
+                .fold(0x811c_9dc5_u32, |h, b| {
+                    (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+                })
         });
         // Serialised key order and escapes are what JSON.stringify writes.
         assert_eq!(
-            serde_json::to_string(&json!({"runs": [{"t": "a\u{1}\"é", "fg": null, "bg": 3, "a": 1}], "wrapped": true})).unwrap(),
+            serde_json::to_string(
+                &json!({"runs": [{"t": "a\u{1}\"é", "fg": null, "bg": 3, "a": 1}], "wrapped": true})
+            )
+            .unwrap(),
             r#"{"runs":[{"a":1,"bg":3,"fg":null,"t":"a\u0001\"é"}],"wrapped":true}"#
         );
     }
