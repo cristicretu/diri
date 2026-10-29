@@ -989,7 +989,6 @@ impl Sidebar {
                 });
             }
             Ok("account") => sidebar.ui.popover = Some(Popover::Account),
-            Ok("layout") => sidebar.ui.popover = Some(Popover::SidebarLayout),
             _ => {}
         }
         sidebar
@@ -1750,69 +1749,6 @@ impl Sidebar {
 
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
-        if self.ui.popover == Some(Popover::SidebarLayout)
-            && !modifiers.platform
-            && !modifiers.control
-            && !modifiers.alt
-        {
-            let handled = match key {
-                "up" => {
-                    self.move_layout_menu_cursor(-1);
-                    true
-                }
-                "down" => {
-                    self.move_layout_menu_cursor(1);
-                    true
-                }
-                "home" => {
-                    self.ui.layout_menu_index = 0;
-                    true
-                }
-                "end" => {
-                    self.ui.layout_menu_index = self.layout_menu_item_count().saturating_sub(1);
-                    true
-                }
-                "enter" | "space" => {
-                    self.activate_layout_menu_cursor();
-                    true
-                }
-                "p" => {
-                    self.set_sidebar_grouping(SidebarGrouping::Project);
-                    true
-                }
-                "r" => {
-                    self.set_sidebar_grouping(SidebarGrouping::Recency);
-                    true
-                }
-                "c" => {
-                    let project_grouped = self
-                        .store
-                        .read()
-                        .expect("session store lock poisoned")
-                        .preferences()
-                        .sidebar_grouping
-                        == SidebarGrouping::Project;
-                    if project_grouped {
-                        self.set_sidebar_ordering(SidebarOrdering::Custom);
-                    }
-                    project_grouped
-                }
-                "n" => {
-                    self.set_sidebar_ordering(SidebarOrdering::NewestFirst);
-                    true
-                }
-                "o" => {
-                    self.set_sidebar_ordering(SidebarOrdering::OldestFirst);
-                    true
-                }
-                _ => false,
-            };
-            if handled {
-                cx.stop_propagation();
-                cx.notify();
-                return;
-            }
-        }
         if key == "escape" && self.cancel_delegation(cx) {
             cx.stop_propagation();
             return;
@@ -1840,11 +1776,6 @@ impl Sidebar {
                 self.filter_generation += 1;
                 self.filter_open = true;
                 self.filter_focus.focus(window, cx);
-                true
-            }
-            "g" => {
-                self.open_sidebar_layout_popover();
-                cx.notify();
                 true
             }
             // Deliberately consumed but unbound. Hold-to-peek owns Space in
@@ -2154,8 +2085,6 @@ impl Sidebar {
         let in_settings = self.settings_nav.is_some();
         let primary_control = if in_settings { "settings" } else { "search" };
         let primary_hover = self.ui.hovered_control == Some(primary_control);
-        let layout_open = self.ui.popover == Some(Popover::SidebarLayout);
-        let layout_hover = self.ui.hovered_control == Some("sidebar-layout") || layout_open;
         let toggle_hover = self.ui.hovered_control == Some("sidebar-toggle");
         // Search and Settings back share one fixed slot. Settings itself lives
         // in the account menu, keeping the everyday chrome to two controls.
@@ -2213,29 +2142,6 @@ impl Sidebar {
                 TRAILING_COLUMN_CENTER - Metrics::TOOLBAR_CONTROL_SIZE / 2.0
             ))
             .gap(px(Metrics::TOOLBAR_COMPACT_GAP))
-            .when(!in_settings, |bar| {
-                bar.child(icon_button(
-                    "sidebar-layout",
-                    t("sidebar.group_and_order"),
-                    None,
-                    "gearshape",
-                    layout_hover,
-                    colors,
-                    cx.listener(|this, _, window, cx| {
-                        this.focus_handle.focus(window, cx);
-                        if this.ui.popover == Some(Popover::SidebarLayout) {
-                            this.ui.popover = None;
-                        } else {
-                            this.open_sidebar_layout_popover();
-                        }
-                        cx.notify();
-                    }),
-                    cx.listener(|this, hovered: &bool, _, cx| {
-                        this.ui.hovered_control = hovered.then_some("sidebar-layout");
-                        cx.notify();
-                    }),
-                ))
-            })
             .child(primary_button)
             .child(crate::held_hints::below(
                 icon_button(
@@ -5024,7 +4930,6 @@ impl Sidebar {
                 Some(self.new_agent_popover(directory, host, colors, cx))
             }
             Popover::Account => Some(self.account_popover(colors, cx)),
-            Popover::SidebarLayout => Some(self.sidebar_layout_popover(colors, cx)),
             Popover::ProjectActions { id, position } => {
                 Some(self.project_actions_popover(id, position, colors, cx))
             }
@@ -5034,115 +4939,7 @@ impl Sidebar {
         }
     }
 
-    fn sidebar_layout_popover(
-        &self,
-        colors: SemanticColors,
-        cx: &mut Context<Self>,
-    ) -> PopoverSpec {
-        let (grouping, ordering) = {
-            let store = self.store.read().expect("session store lock poisoned");
-            (
-                store.preferences().sidebar_grouping,
-                store.preferences().sidebar_ordering,
-            )
-        };
-        let section_label = |label: &'static str| {
-            div()
-                .px(px(9.0))
-                .pt(px(7.0))
-                .pb(px(3.0))
-                .text_size(px(Typo::SECTION_HEADER.size))
-                .font_weight(Typo::SECTION_HEADER.weight)
-                .text_color(colors.tertiary)
-                .child(label)
-        };
-        let mut content = div()
-            .id("sidebar-view-options")
-            .flex()
-            .flex_col()
-            .role(Role::Menu)
-            .aria_label(t("sidebar.layout.options"))
-            .rounded(px(Radius::FLOATING_MENU))
-            .p(px(4.0))
-            .child(section_label(t("sidebar.layout.grouping")))
-            .child(choice_menu_row(
-                "sidebar-group-project",
-                t("sidebar.layout.project"),
-                "P",
-                grouping == SidebarGrouping::Project,
-                self.ui.layout_menu_index == 0,
-                colors,
-                cx.listener(|this, _, _, cx| {
-                    this.set_sidebar_grouping(SidebarGrouping::Project);
-                    cx.notify();
-                }),
-            ))
-            .child(choice_menu_row(
-                "sidebar-group-recency",
-                t("sidebar.layout.recency"),
-                "R",
-                grouping == SidebarGrouping::Recency,
-                self.ui.layout_menu_index == 1,
-                colors,
-                cx.listener(|this, _, _, cx| {
-                    this.set_sidebar_grouping(SidebarGrouping::Recency);
-                    cx.notify();
-                }),
-            ))
-            .child(menu_divider(colors))
-            .child(section_label(t("sidebar.layout.ordering")));
-        if grouping == SidebarGrouping::Project {
-            content = content.child(choice_menu_row(
-                "sidebar-order-custom",
-                t("sidebar.layout.custom"),
-                "C",
-                ordering == SidebarOrdering::Custom,
-                self.ui.layout_menu_index == 2,
-                colors,
-                cx.listener(|this, _, _, cx| {
-                    this.set_sidebar_ordering(SidebarOrdering::Custom);
-                    cx.notify();
-                }),
-            ));
-        }
-        content = content
-            .child(choice_menu_row(
-                "sidebar-order-newest",
-                t("sidebar.layout.newest_first"),
-                "N",
-                ordering == SidebarOrdering::NewestFirst,
-                self.ui.layout_menu_index
-                    == if grouping == SidebarGrouping::Project {
-                        3
-                    } else {
-                        2
-                    },
-                colors,
-                cx.listener(|this, _, _, cx| {
-                    this.set_sidebar_ordering(SidebarOrdering::NewestFirst);
-                    cx.notify();
-                }),
-            ))
-            .child(choice_menu_row(
-                "sidebar-order-oldest",
-                t("sidebar.layout.oldest_first"),
-                "O",
-                ordering == SidebarOrdering::OldestFirst,
-                self.ui.layout_menu_index
-                    == if grouping == SidebarGrouping::Project {
-                        4
-                    } else {
-                        3
-                    },
-                colors,
-                cx.listener(|this, _, _, cx| {
-                    this.set_sidebar_ordering(SidebarOrdering::OldestFirst);
-                    cx.notify();
-                }),
-            ));
-        self.popover_shell(Metrics::TITLE_BAR - 2.0, content, colors, cx)
-    }
-
+    #[cfg(test)]
     fn set_sidebar_grouping(&mut self, grouping: SidebarGrouping) {
         let _ = self
             .store
@@ -5158,85 +4955,6 @@ impl Sidebar {
             });
         self.ui.popover = None;
         self.list_scroll.set_offset(point(px(0.0), px(0.0)));
-    }
-
-    fn open_sidebar_layout_popover(&mut self) {
-        let grouping = self
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .preferences()
-            .sidebar_grouping;
-        self.ui.layout_menu_index = usize::from(grouping == SidebarGrouping::Recency);
-        self.ui.popover = Some(Popover::SidebarLayout);
-    }
-
-    fn layout_menu_item_count(&self) -> usize {
-        let project_grouped = self
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .preferences()
-            .sidebar_grouping
-            == SidebarGrouping::Project;
-        if project_grouped { 5 } else { 4 }
-    }
-
-    fn move_layout_menu_cursor(&mut self, delta: isize) {
-        let count = self.layout_menu_item_count();
-        if count == 0 {
-            return;
-        }
-        self.ui.layout_menu_index =
-            (self.ui.layout_menu_index as isize + delta).rem_euclid(count as isize) as usize;
-    }
-
-    fn activate_layout_menu_cursor(&mut self) {
-        let grouping = self
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .preferences()
-            .sidebar_grouping;
-        match (grouping, self.ui.layout_menu_index) {
-            (_, 0) => self.set_sidebar_grouping(SidebarGrouping::Project),
-            (_, 1) => self.set_sidebar_grouping(SidebarGrouping::Recency),
-            (SidebarGrouping::Project, 2) => self.set_sidebar_ordering(SidebarOrdering::Custom),
-            (SidebarGrouping::Project, 3) | (SidebarGrouping::Recency, 2) => {
-                self.set_sidebar_ordering(SidebarOrdering::NewestFirst)
-            }
-            (SidebarGrouping::Project, 4) | (SidebarGrouping::Recency, 3) => {
-                self.set_sidebar_ordering(SidebarOrdering::OldestFirst)
-            }
-            _ => {}
-        }
-    }
-
-    fn set_sidebar_ordering(&mut self, ordering: SidebarOrdering) {
-        let _ = self
-            .store
-            .write()
-            .expect("session store lock poisoned")
-            .update_preferences(|prefs| prefs.sidebar_ordering = ordering);
-        self.ui.popover = None;
-        self.list_scroll.set_offset(point(px(0.0), px(0.0)));
-    }
-
-    fn popover_shell(
-        &self,
-        top: f32,
-        child: impl IntoElement,
-        colors: SemanticColors,
-        cx: &mut Context<Self>,
-    ) -> PopoverSpec {
-        self.popover_shell_at(
-            point(px(12.0), px(top)),
-            Anchor::TopLeft,
-            276.0,
-            child,
-            colors,
-            cx,
-        )
     }
 
     /// Anchors above the account footer (Swift: popover opens upward).
@@ -6354,9 +6072,10 @@ impl Sidebar {
         panel
     }
 
-    /// Version and update state, always present: Check when idle, Download
-    /// or Restart when an update is available or staged, no action while a
-    /// check or download runs or on builds that cannot update themselves.
+    /// "Check for Updates…" beside the running version when idle; otherwise
+    /// the update state itself, which downloads or restarts when clicked and
+    /// does nothing while a check or download runs or on builds that cannot
+    /// update themselves.
     fn update_menu_row(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
         let unsupported = matches!(self.update.phase, UpdatePhase::Unsupported(_));
         let command = match &self.update.phase {
@@ -6370,52 +6089,25 @@ impl Sidebar {
                 user_initiated: true,
             }),
         };
-        let label = if self.preview {
-            format!("diri {}", crate::updates::CURRENT_VERSION)
-        } else {
-            self.update.summary()
-        };
-        let mut row = div()
-            .id("account-version")
-            .debug_selector(|| "account-version".into())
-            .mx(px(6.0))
-            .px(px(8.0))
-            .h(px(ACCOUNT_MENU_ACTION_ROW_HEIGHT))
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
-            .text_size(px(Typo::ROW.size))
-            .text_color(if unsupported {
-                colors.tertiary
-            } else {
-                colors.primary
-            })
-            .child(
-                div()
-                    .min_w(px(0.0))
-                    .flex_1()
-                    .whitespace_nowrap()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .child(label),
+        let idle = self.preview
+            || matches!(
+                self.update.phase,
+                UpdatePhase::Idle | UpdatePhase::UpToDate
             );
+        let (label, trailing) = if idle {
+            (
+                t("sidebar.update.check_for_updates").to_owned(),
+                Some(SharedString::from(crate::updates::CURRENT_VERSION)),
+            )
+        } else {
+            (self.update.summary(), None)
+        };
+        let mut row = account_menu_item("account-version", label, false, trailing, colors)
+            .when(unsupported, |row| row.text_color(colors.tertiary));
         if let Some(command) = command {
-            let action = match command {
-                UpdateCommand::Download => t("sidebar.update.download"),
-                UpdateCommand::Install => t("sidebar.update.restart"),
-                _ => t("sidebar.update.check"),
-            };
             row = row
                 .cursor_pointer()
                 .glass_menu_row(colors, false)
-                .child(
-                    div()
-                        .flex_none()
-                        .text_size(px(Typo::META.size))
-                        .text_color(colors.tertiary)
-                        .child(action),
-                )
                 .on_click(cx.listener(move |this, _, _, cx: &mut Context<Self>| {
                     cx.emit(SidebarEvent::Update(command.clone()));
                     this.ui.popover = None;
@@ -6458,11 +6150,20 @@ impl Sidebar {
                 div()
                     .mx(px(6.0))
                     .px(px(8.0))
-                    .h(px(32.0))
+                    .h(px(ACCOUNT_MENU_ACTION_ROW_HEIGHT + 4.0))
                     .flex()
                     .items_center()
-                    .gap(px(8.0))
-                    .child(account_avatar(&account_label, 20.0, colors))
+                    .gap(px(6.0))
+                    // Centred on the check column, so the name lines up with
+                    // the items below even though the avatar is a little wider.
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(ACCOUNT_MENU_CHECK_COLUMN))
+                            .flex()
+                            .justify_center()
+                            .child(account_avatar(&account_label, 18.0, colors)),
+                    )
                     .child(
                         div()
                             .min_w(px(0.0))
@@ -6471,15 +6172,9 @@ impl Sidebar {
                             .overflow_hidden()
                             .text_ellipsis()
                             .text_size(px(Typo::ROW.size))
+                            .font_weight(FontWeight::MEDIUM)
                             .text_color(colors.primary)
                             .child(account_label),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(Typo::META.size))
-                            .text_color(colors.tertiary)
-                            .child(t("sidebar.account.this_mac")),
                     ),
             )
             .child(menu_divider(colors))
@@ -6491,19 +6186,26 @@ impl Sidebar {
                 colors,
             ))
             .child(menu_divider(colors))
-            .child(account_action_row(
-                "account-settings",
-                t("sidebar.account.settings"),
-                crate::commands::command(CommandId::OpenSettings).shortcut_label(),
-                colors,
-                cx.listener(|this, _, window, cx| {
+            .child(
+                account_menu_item(
+                    "account-settings",
+                    t("sidebar.account.settings"),
+                    false,
+                    crate::commands::command(CommandId::OpenSettings)
+                        .shortcut_label()
+                        .map(SharedString::from),
+                    colors,
+                )
+                .cursor_pointer()
+                .glass_menu_row(colors, false)
+                .on_click(cx.listener(|this, _, window, cx| {
                     this.ui.popover = None;
                     this.in_main_window(window, cx, |_, window, cx| {
                         window.dispatch_action(Box::new(OpenSettings), cx);
                     });
                     cx.notify();
-                }),
-            ))
+                })),
+            )
             .child(self.update_menu_row(colors, cx))
             .child(div().h(px(3.0)));
         self.popover_shell_above_footer(content, colors, cx)
@@ -9444,68 +9146,6 @@ fn menu_row(
         .into_any_element()
 }
 
-fn choice_menu_row(
-    id: &'static str,
-    label: &'static str,
-    shortcut: &'static str,
-    selected: bool,
-    focused: bool,
-    colors: SemanticColors,
-    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-) -> AnyElement {
-    div()
-        .id(id)
-        .debug_selector(move || id.into())
-        .role(Role::MenuItem)
-        .aria_label(label)
-        .aria_description(if selected {
-            t("sidebar.a11y.selected")
-        } else {
-            t("sidebar.a11y.not_selected")
-        })
-        .aria_keyshortcuts(shortcut)
-        .px(px(8.0))
-        .h(px(30.0))
-        .flex()
-        .items_center()
-        .gap(px(8.0))
-        .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
-        .cursor_pointer()
-        // The checkmark names the current choice; the keyboard cursor and the
-        // pointer share the sidebar's selected pill.
-        .bg(Fill::selected(colors, selected && !focused))
-        .glass_menu_row(colors, focused)
-        .active(|element| element.opacity(0.74))
-        .text_size(px(Typo::ROW.size))
-        .text_color(colors.primary)
-        .child(
-            div()
-                .size(px(14.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .when(selected, |slot| {
-                    slot.child(sf_symbol_weighted(
-                        "checkmark",
-                        9.0,
-                        SymbolWeight::Bold,
-                        colors.primary,
-                    ))
-                }),
-        )
-        .child(div().min_w(px(0.0)).flex_1().child(label))
-        .child(
-            div()
-                .font_family(crate::fonts::mono_family())
-                .text_size(px(Typo::META_MONO.size))
-                .text_color(colors.tertiary)
-                .child(shortcut),
-        )
-        .on_click(on_click)
-        .into_any_element()
-}
-
 fn directory_row(
     symbol: &'static str,
     label: String,
@@ -9643,9 +9283,17 @@ fn account_avatar(label: &str, size: f32, colors: SemanticColors) -> AnyElement 
         .into_any_element()
 }
 
-/// Height of the plain action rows at the bottom of the account menu.
 const PROJECT_MENU_WIDTH: f32 = 252.0;
+/// Height of the clickable rows in the account menu.
 const ACCOUNT_MENU_ACTION_ROW_HEIGHT: f32 = 28.0;
+
+/// Leading column of the account menu: the avatar in the header, a
+/// checkmark beside the login in use, empty otherwise. Every label starts
+/// after it, as in an AppKit menu.
+const ACCOUNT_MENU_CHECK_COLUMN: f32 = 16.0;
+
+/// Where account menu text starts: row margin, padding, check column, gap.
+const ACCOUNT_MENU_TEXT_INSET: f32 = 6.0 + 8.0 + ACCOUNT_MENU_CHECK_COLUMN + 6.0;
 
 /// Height of the single-line stat rows in the account menu.
 const ACCOUNT_MENU_STAT_ROW_HEIGHT: f32 = 22.0;
@@ -9704,7 +9352,8 @@ fn account_limits_menu(
 /// One quiet line of status under an eyebrow: loading, stale, or an error.
 fn menu_note(text: impl Into<SharedString>, colors: SemanticColors) -> AnyElement {
     div()
-        .px(px(14.0))
+        .pl(px(ACCOUNT_MENU_TEXT_INSET))
+        .pr(px(14.0))
         .py(px(3.0))
         .text_size(px(Typo::META.size))
         .text_color(colors.tertiary)
@@ -9755,8 +9404,8 @@ fn account_meter_row(
     div()
         .id(id)
         .debug_selector(move || selector.to_string())
-        .mx(px(6.0))
-        .px(px(8.0))
+        .pl(px(ACCOUNT_MENU_TEXT_INSET))
+        .pr(px(14.0))
         .h(px(ACCOUNT_MENU_STAT_ROW_HEIGHT))
         .flex()
         .items_center()
@@ -9821,39 +9470,79 @@ fn account_meter_row(
         .into_any_element()
 }
 
-/// A plain menu action: label on the left, shortcut or hint on the right.
-fn account_action_row(
-    id: &'static str,
-    label: &'static str,
-    trailing: Option<String>,
+/// One account menu item: the check column, the label, and a shortcut or
+/// hint on the right. Callers add the hover pill and click when it acts.
+fn account_menu_item(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    checked: bool,
+    trailing: Option<SharedString>,
     colors: SemanticColors,
-    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-) -> AnyElement {
+) -> gpui::Stateful<gpui::Div> {
+    let id = id.into();
+    let selector = id.clone();
     div()
         .id(id)
-        .debug_selector(move || id.into())
+        .debug_selector(move || selector.to_string())
         .mx(px(6.0))
         .px(px(8.0))
         .h(px(ACCOUNT_MENU_ACTION_ROW_HEIGHT))
         .flex()
         .items_center()
-        .gap(px(8.0))
+        .gap(px(6.0))
         .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
-        .cursor_pointer()
-        .glass_menu_row(colors, false)
         .text_size(px(Typo::ROW.size))
         .text_color(colors.primary)
-        .child(div().min_w(px(0.0)).flex_1().child(label))
+        .child(
+            div()
+                .flex_none()
+                .w(px(ACCOUNT_MENU_CHECK_COLUMN))
+                .flex()
+                .justify_center()
+                .when(checked, |slot| {
+                    slot.child(sf_symbol_weighted(
+                        "checkmark",
+                        9.0,
+                        SymbolWeight::Bold,
+                        colors.primary,
+                    ))
+                }),
+        )
+        .child(
+            div()
+                .min_w(px(0.0))
+                .flex_1()
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(label.into()),
+        )
         .when_some(trailing, |row, trailing| {
             row.child(
                 div()
                     .flex_none()
+                    .max_w(px(96.0))
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_ellipsis()
                     .text_size(px(Typo::META.size))
                     .text_color(colors.tertiary)
                     .child(trailing),
             )
         })
-        .on_click(on_click)
+}
+
+/// A disabled-looking heading over a group of account menu items.
+fn account_menu_section(label: impl Into<SharedString>, colors: SemanticColors) -> AnyElement {
+    div()
+        .pl(px(ACCOUNT_MENU_TEXT_INSET))
+        .pr(px(14.0))
+        .pt(px(4.0))
+        .pb(px(1.0))
+        .text_size(px(Typo::SECTION_HEADER.size))
+        .font_weight(Typo::SECTION_HEADER.weight)
+        .text_color(colors.tertiary)
+        .child(label.into())
         .into_any_element()
 }
 
@@ -11243,7 +10932,7 @@ mod tests {
         sidebar.update_in(cx, |sidebar, window, cx| {
             sidebar.conceal(cx);
             sidebar.peek(window, cx);
-            sidebar.ui.popover = Some(Popover::SidebarLayout);
+            sidebar.ui.popover = Some(Popover::Account);
             cx.notify();
         });
         cx.run_until_parked();
@@ -11343,7 +11032,7 @@ mod tests {
                     "blur" => cx.deactivate_window(),
                     "hide" => sidebar.update(cx, |sidebar, cx| sidebar.conceal(cx)),
                     "menu" => sidebar.update(cx, |sidebar, cx| {
-                        sidebar.ui.popover = Some(Popover::SidebarLayout);
+                        sidebar.ui.popover = Some(Popover::Account);
                         cx.notify();
                     }),
                     "leave" => cx.simulate_mouse_move(
@@ -12627,7 +12316,6 @@ mod tests {
         cx.update(|cx| crate::fonts::init(cx));
         for popover in [
             Popover::Account,
-            Popover::SidebarLayout,
             Popover::NewAgent {
                 directory: None,
                 host: None,
@@ -12852,8 +12540,8 @@ mod tests {
     /// review without touching a running Diri instance. Set
     /// `DIRI_VISUAL_GROUPING=recency`, `DIRI_VISUAL_LIGHT=1`,
     /// `DIRI_VISUAL_THEME=<theme id>`, or
-    /// `DIRI_VISUAL_POPOVER=none|project|session|server|new-agent` to select
-    /// the state to capture (the default opens the grouping menu),
+    /// `DIRI_VISUAL_POPOVER=project|session|server|new-agent|account` to
+    /// open a menu (the default captures none),
     /// `DIRI_VISUAL_LANGUAGE=zh-Hans` to render in another catalog, and
     /// `DIRI_VISUAL_READ=seen|unseen` to finish that session's turn.
     /// `DIRI_VISUAL_BACKDROP=62616e` supplies a fixed RGB backdrop under glass;
@@ -12891,7 +12579,8 @@ mod tests {
                 directory: None,
                 host: None,
             }),
-            _ => Some(Popover::SidebarLayout),
+            "account" => Some(Popover::Account),
+            _ => None,
         };
         // DIRI_VISUAL_LANGUAGE=zh-Hans renders the sidebar in that catalog.
         // Ignored fixture only: the language is process-wide.
