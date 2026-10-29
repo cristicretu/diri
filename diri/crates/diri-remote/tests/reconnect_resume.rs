@@ -443,6 +443,57 @@ fn engine_reconnect_resumes_without_a_full_snapshot() {
     });
 }
 
+/// Clear Screen and Scrollback on a remote session: the Engine asks the
+/// Holder (terminal-clear-v1), the Holder clears its own grid and history and
+/// the child keeps running with the prompt line it was showing.
+#[test]
+fn remote_clear_keeps_the_prompt_line_and_drops_history() {
+    let fixture = Fixture::spawn("remote-clear", &busy_screen(false), 120, 40);
+    fixture.wait_connected();
+    wait_until("screen filled", Duration::from_secs(10), || {
+        fixture.session.screen_lines().join("\n").contains("ready>")
+    });
+    let history = fixture.session.read_scrollback_cells(0, 1);
+    assert!(
+        history.live_start_row > 0,
+        "the fixture scrolled rows into history first: {history:?}"
+    );
+    let mut display = diri_engine::GridSignature::default();
+    while fixture
+        .session
+        .grid_update_if_changed(&mut display)
+        .is_some()
+    {}
+
+    assert!(fixture.session.clear_scrollback().expect("remote clear"));
+    wait_until("cleared grid", Duration::from_secs(10), || {
+        fixture.session.screen_lines() == vec!["ready>".to_owned()]
+    });
+    let update = fixture
+        .session
+        .grid_update_if_changed(&mut display)
+        .expect("the clear reaches the display");
+    assert!(
+        update.is_full_snapshot,
+        "a display never diffs against pre-clear cells"
+    );
+    wait_until("history dropped", Duration::from_secs(10), || {
+        fixture.session.read_scrollback_cells(0, 1).live_start_row == 0
+    });
+
+    fixture
+        .session
+        .write_input(b"after-clear\n")
+        .expect("input after a clear");
+    wait_until("child still answers", Duration::from_secs(10), || {
+        fixture
+            .session
+            .screen_lines()
+            .join("\n")
+            .contains("bye:after-clear")
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Holder-level harness: a real Holder and PTY, attached over its Unix socket
 // directly so each test controls exactly which frames a controller receives.

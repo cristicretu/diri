@@ -437,7 +437,9 @@ and that encoding cost about as much as parsing (ASCII at 120x80: LZ 30%,
 payload layout:
 
 - **LZ skips faster through text without repeats.** A miss now lengthens the
-  step to the next probe by one byte every 8 misses (it was every 64), and a
+  step to the next probe by one byte every 8 misses (it was every 64, then
+  every 32 with "Faster skipping through text that does not repeat", which
+  this supersedes), and a
   match found after a skip is first extended backwards over the bytes the
   skip stepped over. The hash table is 2,048 `u32` slots, zero-filled (it was
   4,096 filled with `u32::MAX`); an empty slot costs one comparison. The
@@ -461,6 +463,7 @@ Tests: `assert_codec_round_trip` (used by every codec test) also checks that
 `encode_recycled_cells` writes the same payload and leaves default rows with
 occupancy zero; the LZ round-trip test covers the new matcher.
 
+
 ## Program colors: a generation, and RIS resets them
 
 `Term` keeps `colors_generation`, advanced whenever `set_color` or
@@ -470,6 +473,26 @@ OSC 4/10/11 changes no cell, so without it the host's change detection saw no
 change and never republished the screen. `reset_state` (RIS, `ESC c`) also
 clears every color a program set, as xterm and libghostty do; upstream kept
 them across `reset`. No wire, checkpoint or protocol change.
+
+## Shared cell extras are not re-cloned
+
+`input_ascii` writes the cursor template's `extra` (underline color,
+hyperlink, zero-width characters) into each cell. A cell that already shares
+the template's `Arc` (a repeated character, a redrawn row) now keeps it
+instead of an atomic increment and decrement per cell. The cell ends the
+same. No wire, checkpoint or protocol change.
+
+## Faster skipping through text that does not repeat
+
+The history LZ codec steps one byte further per 32 consecutive missed
+matches, instead of per 64, as LZ4's acceleration does. On floods of text
+that repeats little, compressing took a third of the parser thread; this
+makes ASCII floods about 10% faster (Unicode 5%). Payloads stay valid LZ
+streams, decoded unchanged, but find slightly fewer matches: the 4 MiB budget
+keeps 0.35% fewer rows of kitten ASCII, 0.9% of kitten Unicode and 0.4% of
+`git log -p` at 160 columns (outputs at the 150,000-row ceiling are
+unchanged).
+
 
 ## Public grapheme module
 
@@ -515,6 +538,12 @@ O(1) amortized. Release builds compile none of it; no behavior, wire,
 checkpoint or protocol change. Test:
 `lines_after_narrowing_a_full_history_cost_what_they_did_before`
 (`diri-terminal-state`); probe: `--bench narrow_history`.
+
+## Test-only `observe` feature
+
+`observe = ["vte/observe"]` only forwards the vendored VTE's test-only OSC
+totals (see its DIRI-PATCH.md) so `diri-terminal-state`'s `bench-verify`
+feature can reach them. No source change.
 
 ## SGR-Pixels mouse (DECSET 1016)
 

@@ -296,10 +296,6 @@ const CONNECTING_NOTICE_GRACE: Duration = Duration::from_millis(1500);
 pub struct RootView {
     spawn_owner: crate::store::SpawnOwner,
     window_store: crate::store::WindowStore,
-    launches_expanded: bool,
-    launches_focus: FocusHandle,
-    launch_cursor: Option<u64>,
-    launch_scroll: gpui::ScrollHandle,
     active_workspace: Option<diri_proto::workspace::WorkspaceId>,
     /// The last workspace failure shown, and the layout revision it failed at.
     workspace_error: Option<(u64, String)>,
@@ -1537,10 +1533,6 @@ impl RootView {
         let mut root = Self {
             spawn_owner: window_store.owner(),
             window_store,
-            launches_expanded: false,
-            launches_focus: cx.focus_handle(),
-            launch_cursor: None,
-            launch_scroll: gpui::ScrollHandle::new(),
             active_workspace: None,
             workspace_error: None,
             pending_tab: None,
@@ -2592,7 +2584,6 @@ impl RootView {
                     .session_surfaces
                     .as_ref()
                     .is_some_and(|view| view.read(cx).tab_peek_visible())
-                || (self.launches_expanded && self.launches_focus.contains_focused(window, cx))
                 || self.quote_target_picker.is_some();
             let handled = !blocked
                 && self.active_workspace.is_some()
@@ -2682,11 +2673,6 @@ impl RootView {
                         navigation.toggle_search_notes(&SearchNotes, window, cx)
                     });
                 }
-            }
-            CommandId::ReviewLaunches => {
-                self.launches_expanded = true;
-                window.focus(&self.launches_focus, cx);
-                cx.notify();
             }
             CommandId::ToggleTabPeek => self.toggle_tab_peek(window, cx),
             CommandId::ToggleOverview => {
@@ -6113,11 +6099,6 @@ impl Render for RootView {
                     this.run_command(CommandId::MoveTabToNextWindow, window, cx);
                 }),
             )
-            .on_action(
-                cx.listener(|this, _: &crate::commands::ReviewLaunches, window, cx| {
-                    this.run_command(CommandId::ReviewLaunches, window, cx);
-                }),
-            )
             .on_action(cx.listener(|this, _: &ToggleTabPeek, window, cx| {
                 this.toggle_tab_peek(window, cx);
             }))
@@ -6484,9 +6465,6 @@ impl Render for RootView {
         if seam_dragging {
             root = root.child(self.resize_shield(cx));
         }
-        if let Some(launches) = self.workspace_launches(colors, cx) {
-            root = root.child(launches);
-        }
         if crate::alerts::enabled(cx) {
             self.sync_close_prompt(window, cx);
         } else if let Some(confirmation) = self.close_confirmation(colors, cx) {
@@ -6559,14 +6537,6 @@ impl Render for RootView {
         }
         root.into_any_element()
     }
-}
-
-fn bounded_notice_body(body: &str) -> String {
-    body.trim()
-        .chars()
-        .filter(|character| !character.is_control())
-        .take(240)
-        .collect()
 }
 
 fn quote_target_id(targets: &[SessionRecord], index: usize) -> Option<SessionId> {
@@ -9823,107 +9793,6 @@ mod tests {
     }
 
     #[gpui::test]
-    fn launch_review_keyboard_opens_exact_session_retries_only_placement_and_dismisses(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        use crate::store::{SpawnOwner, WorkspaceSpawnState, WorkspaceSpawnTarget};
-        use diri_proto::workspace::WorkspaceId;
-        let services = test_services();
-        let runtime = services.store.clone();
-        runtime
-            .store
-            .write()
-            .unwrap()
-            .hydrate(SidebarPreviewFixture::make(PreviewScenario::Typical).list);
-        let (root, cx) = cx.add_window_view(move |window, cx| {
-            RootView::new(services, true, PreviewScenario::Typical, window, cx)
-        });
-        let target = WorkspaceSpawnTarget {
-            owner: SpawnOwner::default(),
-            workspace: WorkspaceId::new("removed"),
-            selected_tab: None,
-        };
-        let retry_id = runtime
-            .store
-            .write()
-            .unwrap()
-            .seed_workspace_spawn_for_test(
-                target.clone(),
-                WorkspaceSpawnState::Unplaced {
-                    session: SessionId::new("preview-codex"),
-                    detail: "The workspace was removed. Your session remains available.".into(),
-                },
-            );
-        let dismiss_id = runtime
-            .store
-            .write()
-            .unwrap()
-            .seed_workspace_spawn_for_test(
-                target,
-                WorkspaceSpawnState::Unconfirmed(
-                    "Check All sessions before creating another session.".into(),
-                ),
-            );
-        root.update(cx, |root, cx| {
-            root.launches_expanded = true;
-            cx.notify();
-        });
-        cx.run_until_parked();
-        let button = cx
-            .debug_bounds("workspace-launches-toggle")
-            .unwrap()
-            .center();
-        cx.simulate_click(button, Modifiers::default());
-        cx.simulate_click(button, Modifiers::default());
-        cx.simulate_keystrokes("backspace");
-        assert!(
-            !runtime
-                .store
-                .read()
-                .unwrap()
-                .workspace_spawn_receipts()
-                .any(|r| r.id == dismiss_id)
-        );
-        cx.simulate_keystrokes("enter");
-        assert_eq!(
-            root.read_with(cx, |root, _| root
-                .window_store
-                .read()
-                .unwrap()
-                .selected_session_id()
-                .cloned())
-                .as_ref(),
-            Some(&SessionId::new("preview-codex"))
-        );
-        assert!(!root.read_with(cx, |root, _| root.launches_expanded));
-        cx.simulate_click(button, Modifiers::default());
-        cx.simulate_keystrokes("r");
-        assert_eq!(
-            runtime
-                .store
-                .read()
-                .unwrap()
-                .workspace_spawn_receipts()
-                .find(|r| r.id == retry_id)
-                .unwrap()
-                .state,
-            WorkspaceSpawnState::Placing(SessionId::new("preview-codex"))
-        );
-        cx.simulate_keystrokes("backspace");
-        assert!(
-            runtime
-                .store
-                .read()
-                .unwrap()
-                .workspace_spawn_receipts()
-                .any(|r| r.id == retry_id),
-            "pending placement cannot be cancelled by dismiss"
-        );
-        cx.simulate_keystrokes("escape");
-        assert!(!root.read_with(cx, |root, _| root.launches_expanded));
-    }
-
-    #[gpui::test]
     fn project_filter_and_group_collapse_preserve_workspace_terminal_and_restore_agents(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -10917,13 +10786,7 @@ mod tests {
         let window = cx
             .open_window(size(px(width), px(800.0)), |window, cx| {
                 cx.new(|cx| {
-                    let mut root = RootView::new(services, false, PreviewScenario::Empty, window, cx);
-                    if let Ok(mode) = std::env::var("DIRI_WORKSPACE_LAUNCHES") {
-                        let target = crate::store::WorkspaceSpawnTarget { owner: root.spawn_owner, workspace: workspace.clone(), selected_tab: Some(TabId::new("release-tab")) };
-                        let state = if mode == "pending" { crate::store::WorkspaceSpawnState::Creating } else { crate::store::WorkspaceSpawnState::Unplaced { session: SessionId::new("preview-codex"), detail: "The workspace changed while this session was starting. Your session is ready in All sessions. Retry placement to use the current layout.".into() } };
-                        root.services.store.store.write().unwrap().seed_workspace_spawn_for_test(target, state);
-                        root.launches_expanded = mode != "pending";
-                    }
+                    let root = RootView::new(services, false, PreviewScenario::Empty, window, cx);
                     root.sidebar.update(cx, |sidebar, cx| {
                         if std::env::var("DIRI_WORKSPACE_GROUPS").as_deref() == Ok("filter") {
                             sidebar.seed_workspace_filter_for_test("review", cx);

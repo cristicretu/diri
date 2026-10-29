@@ -2723,12 +2723,18 @@ impl SessionStore {
         // Decide on everything the close terminates, not only the clicked
         // rows: an exited parent can still own a running auxiliary terminal.
         let ids = self.closure_set(ids);
-        let has_running = ids.iter().any(|id| {
-            self.sessions
-                .get(id)
-                .is_some_and(|session| !matches!(session.status, SessionStatus::Exited(_)))
+        // A shell sitting at its prompt has nothing to lose, so only agents
+        // and shells with a program actually running ask first.
+        let has_blocking = ids.iter().any(|id| {
+            self.sessions.get(id).is_some_and(|session| {
+                if session.effective_kind() == &AgentKind::SHELL {
+                    matches!(session.status, SessionStatus::Working)
+                } else {
+                    !matches!(session.status, SessionStatus::Exited(_))
+                }
+            })
         });
-        if self.prefs.confirm_before_closing_session && has_running {
+        if self.prefs.confirm_before_closing_session && has_blocking {
             self.pending_close = Some(PendingClose { ids, project: None });
         } else {
             self.remove_sessions(ids);

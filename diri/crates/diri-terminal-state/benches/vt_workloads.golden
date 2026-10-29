@@ -1,14 +1,14 @@
 # Golden digests for benches/vt_workloads.rs. Do not edit by hand.
 #
-# Reference: diri 0b54ea089 (origin/main, with #921's live-byte history
-# budget, #925's style hash and #843's query replies) and only the
-# passive `bench-verify` observers added (no parser change), built in
+# Reference: diri 589d0a46c (origin/main, with #921's live-byte history
+# budget, #925's style hash, #843's query replies, #927's observers,
+# #924's LZ skip and #922/#923's parser paths; no other change), built in
 # release and fed one byte per read with the OSC checksum on. The
 # generated digests are identical to the first reference (3fc4feb66 with
 # #921's c23006a27); the kitten capture digests are carried over from it.
 # The generated ascii and unicode digests cover the newest rows that
 # `DECLARED_HISTORY_ROWS` declares (62,961 and 53,648; the reference kept
-# 63,537 and 54,608), regenerated at the same reference with that
+# 63,313 and 54,128), regenerated at the same reference with that
 # declaration:
 #
 #   cargo build --release -p diri-terminal-state --features bench-verify --bench vt_workloads
@@ -26,7 +26,7 @@ clipboard = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b785
 cursor = (9, 79, true)
 grid_sha256 = 0bdd638dfe0da16daa647ea76e34c74502b6ba23ca84afd27820cb74733c1365
 history_rows_checked = 62961
-history_rows_reference = 63537
+history_rows_reference = 63313
 images_held_bytes = 0
 images_stored = count=0
 keyboard = KeyboardState { enhancements: Some(KeyboardEnhancements(0)), application_cursor_keys: false, application_keypad: false }
@@ -142,7 +142,7 @@ clipboard = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b785
 cursor = (119, 79, true)
 grid_sha256 = e92d906246c828031f21a118c93fd783e7bdf357f1383f6ec35554e82d93b0b9
 history_rows_checked = 53648
-history_rows_reference = 54608
+history_rows_reference = 54128
 images_held_bytes = 0
 images_stored = count=0
 keyboard = KeyboardState { enhancements: Some(KeyboardEnhancements(0)), application_cursor_keys: false, application_keypad: false }

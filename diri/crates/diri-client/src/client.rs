@@ -739,6 +739,23 @@ impl DaemonClient {
             .await
     }
 
+    /// One directory level on the session's own host, relative to its
+    /// child's live working directory (`session.list_dir`).
+    pub async fn list_dir(
+        &self,
+        session_id: &SessionId,
+        query: diri_proto::ListDirQuery,
+    ) -> Result<diri_proto::SessionListDirResult, ClientError> {
+        self.typed(
+            Method::SESSION_LIST_DIR,
+            &diri_proto::SessionListDirParams {
+                session_id: session_id.clone(),
+                query,
+            },
+        )
+        .await
+    }
+
     pub async fn reconnect(
         &self,
         session_id: &SessionId,

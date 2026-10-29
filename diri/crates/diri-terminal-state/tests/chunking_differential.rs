@@ -17,7 +17,9 @@
 //! same stream with one span missing (as a terminal that overwrites a read
 //! ring would) must not compare equal.
 
-use diri_terminal_state::HeadlessScreen;
+#[path = "support/observed.rs"]
+mod observed;
+use observed::{Feeder, Observed, assert_same, screen};
 
 const COLS: usize = 48;
 const ROWS: usize = 12;
@@ -263,141 +265,8 @@ fn lasting_stream(lines: usize) -> Vec<u8> {
     out
 }
 
-fn screen() -> HeadlessScreen {
-    // The local Engine's configuration.
-    HeadlessScreen::new_with_keyboard_enhancements(COLS, ROWS)
-        .with_notifications()
-        .with_inline_images()
-        .with_host_replies("diri-test")
-}
-
-/// Everything observable that does not count reads.
-#[derive(Debug, PartialEq)]
-struct Observed {
-    replies: Vec<u8>,
-    notifications: Vec<String>,
-    clipboard: Vec<String>,
-    scrollback_lines: Vec<String>,
-    scrollback_text_cells: String,
-    visible_start_row: i64,
-    cells_payload: Vec<u8>,
-    cells_metadata: String,
-    full_snapshot: String,
-    link_text: String,
-    links: Vec<(usize, String)>,
-    title: Option<String>,
-    modes: String,
-    cursor: (u16, u16, bool),
-    keyboard: String,
-    progress: Option<(i64, i64)>,
-    /// Whether any synchronized update was closed, and whether one is open.
-    /// How many closed is not compared: the parser counts at most one per
-    /// read, which is all the Engine asks of it (did a frame complete).
-    synchronized: (bool, bool),
-    image_bytes: usize,
-    program_status: String,
-}
-
-struct Feeder {
-    screen: HeadlessScreen,
-    replies: Vec<u8>,
-    notifications: Vec<String>,
-    clipboard: Vec<String>,
-}
-
-impl Feeder {
-    fn new() -> Self {
-        Self::with(screen())
-    }
-
-    /// Per-character input instead of runs: the unoptimized reference.
-    fn per_character() -> Self {
-        Self::with(screen().with_per_character_input())
-    }
-
-    fn with(screen: HeadlessScreen) -> Self {
-        Self {
-            screen,
-            replies: Vec::new(),
-            notifications: Vec::new(),
-            clipboard: Vec::new(),
-        }
-    }
-
-    /// One read, handled the way the Engine pump handles it.
-    fn feed(&mut self, bytes: &[u8]) {
-        self.screen.feed(bytes);
-        self.replies.extend(self.screen.take_replies());
-        self.notifications.extend(
-            self.screen
-                .take_notifications()
-                .into_iter()
-                .map(|n| format!("{n:?}")),
-        );
-        self.clipboard.extend(self.screen.take_clipboard());
-    }
-
-    fn observe(mut self) -> Observed {
-        let screen = &mut self.screen;
-        let scrollback = screen.scrollback();
-        let cells = screen.scrollback_cells(0, i64::MAX);
-        let links = screen.link_source(usize::MAX);
-        Observed {
-            replies: self.replies,
-            notifications: self.notifications,
-            clipboard: self.clipboard,
-            scrollback_lines: scrollback.lines,
-            scrollback_text_cells: format!("{:?}", scrollback.text_cells),
-            visible_start_row: scrollback.visible_start_row,
-            cells_payload: cells.payload,
-            cells_metadata: without_store_nonce(format!("{:?}", cells.metadata)),
-            full_snapshot: without_store_nonce(format!("{:?}", screen.full_snapshot())),
-            link_text: links.text,
-            links: links
-                .hyperlinks
-                .into_iter()
-                .map(|(at, uri)| (at, without_store_nonce(uri)))
-                .collect(),
-            title: screen.title().map(str::to_owned),
-            modes: format!(
-                "alt={} paste={} focus={} mouse={:?} cursor={:?}",
-                screen.is_alt_screen(),
-                screen.bracketed_paste(),
-                screen.focus_reporting(),
-                screen.mouse_modes(),
-                screen.cursor_style(),
-            ),
-            cursor: screen.cursor(),
-            keyboard: format!("{:?}", screen.keyboard_state()),
-            progress: screen.progress(),
-            synchronized: (
-                screen.synchronized_updates_completed() > 0,
-                screen.in_synchronized_update(),
-            ),
-            image_bytes: screen.inline_image_bytes(),
-            program_status: format!("{:?}", screen.program_status()),
-        }
-    }
-}
-
-/// Image anchors name a per-screen store; only the rest must match.
-fn without_store_nonce(text: String) -> String {
-    const ANCHOR: &str = "diri-image:";
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text.as_str();
-    while let Some(at) = rest.find(ANCHOR) {
-        out.push_str(&rest[..at + ANCHOR.len()]);
-        rest = &rest[at + ANCHOR.len()..];
-        let nonce = rest.find('.').unwrap_or(0);
-        out.push('#');
-        rest = &rest[nonce..];
-    }
-    out.push_str(rest);
-    out
-}
-
 fn observe_chunks<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> Observed {
-    let mut feeder = Feeder::new();
+    let mut feeder = Feeder::new(COLS, ROWS);
     for chunk in chunks {
         feeder.feed(chunk);
     }
@@ -422,184 +291,6 @@ fn random_chunks<'a>(bytes: &'a [u8], rng: &mut Rng, max: usize) -> Vec<&'a [u8]
 }
 
 /// Names the first field that differs, so a failure says what was lost.
-fn assert_same(expected: &Observed, actual: &Observed, how: &str) {
-    if expected == actual {
-        return;
-    }
-    let e = format!("{expected:#?}");
-    let a = format!("{actual:#?}");
-    let field = e
-        .lines()
-        .zip(a.lines())
-        .take_while(|(x, y)| x == y)
-        .filter(|(x, _)| x.starts_with("    ") && !x.starts_with("     "))
-        .last()
-        .map_or("", |(x, _)| x);
-    let line = e
-        .lines()
-        .zip(a.lines())
-        .position(|(x, y)| x != y)
-        .unwrap_or(0);
-    let (x, y) = e.lines().zip(a.lines()).nth(line).unwrap_or(("", ""));
-    let column = x
-        .char_indices()
-        .zip(y.chars())
-        .find(|((_, p), q)| p != q)
-        .map_or(0, |((i, _), _)| i);
-    let window = |s: &str| {
-        let start = s.floor_char_boundary(column.saturating_sub(120));
-        let end = s.ceil_char_boundary((column + 120).min(s.len()));
-        s[start..end].to_owned()
-    };
-    eprintln!(
-        "first difference:\n  one shot: {}\n  {how}: {}",
-        window(x),
-        window(y)
-    );
-    let context = |s: &str| {
-        s.lines()
-            .skip(line.saturating_sub(3))
-            .take(6)
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    panic!(
-        "{how}: state differs from a one-shot parse (after {field})\n--- one shot\n{}\n--- {how}\n{}",
-        context(&e),
-        context(&a)
-    );
-}
-
-fn observe_per_character<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> Observed {
-    let mut feeder = Feeder::per_character();
-    for chunk in chunks {
-        feeder.feed(chunk);
-    }
-    feeder.observe()
-}
-
-/// Text that stresses writing runs of cells: ASCII and wide characters
-/// reaching the right margin at every column, combining and spacing marks,
-/// emoji with modifiers, ZWJ sequences and variation selectors, overwrites of
-/// wide characters and their spacers, insert mode, autowrap off, the line
-/// drawing charset, shell marks, links and colors, C1 controls and invalid
-/// UTF-8.
-fn text_stream(seed: u64, pieces: usize) -> Vec<u8> {
-    const TEXT: &[&str] = &[
-        "abc",
-        "The quick brown fox",
-        "~!@#",
-        " ",
-        "漢字",
-        "界",
-        "ｈｉ",
-        "é",
-        "e\u{301}",
-        "a\u{301}\u{302}\u{303}",
-        "\u{9b2}\u{9cb}",
-        "\u{e01}\u{e33}",
-        "👍🏽",
-        "👩\u{200d}💻",
-        "❤\u{fe0f}",
-        "\u{1f1fa}\u{1f1f8}",
-        "ß→€",
-        "\u{a0}",
-        "\u{ad}",
-        "\u{200b}",
-        "한국어",
-        "ｶﾀｶﾅ",
-        "\u{301}",
-        "\u{200d}",
-        "\u{fe0f}",
-        "❤",
-        "\u{1f3fd}",
-        "1\u{fe0f}\u{20e3}",
-        "\u{1100}\u{1161}\u{11a8}",
-        "\u{915}\u{94d}\u{937}",
-        "\u{1f1f7}",
-        "\x1b[?2027h",
-        "\x1b[?2027l",
-    ];
-    const CONTROLS: &[&[u8]] = &[
-        b"\r\n",
-        b"\r",
-        b"\n",
-        b"\t",
-        b"\x08",
-        b"\x08\x08",
-        b"\x1b[4h",
-        b"\x1b[4l",
-        b"\x1b[?7l",
-        b"\x1b[?7h",
-        b"\x1b(0",
-        b"\x1b(B",
-        b"\x1b[31;1m",
-        b"\x1b[0m",
-        b"\x1b[3@",
-        b"\x1b[2P",
-        b"\x1b[3X",
-        b"\x1b[2K",
-        b"\x1b[H",
-        b"\x1b]8;;https://example.invalid\x07",
-        b"\x1b]8;;\x07",
-        b"\x1b]133;A\x07",
-        b"\x1b]133;B\x07",
-        b"\x1b]133;C\x07",
-        b"\x1b[2b",
-        b"\xc2\x85",
-        b"\xc2\x9b2C",
-        b"\xff",
-        b"\xe6\x97",
-        b"\x7f",
-        b"\x1b[1;1H\x1b[3;8r",
-        b"\x1b[r",
-    ];
-    let mut rng = Rng(seed);
-    let mut out = Vec::new();
-    for _ in 0..pieces {
-        match rng.below(6) {
-            0 => out.extend_from_slice(CONTROLS[rng.below(CONTROLS.len())]),
-            // Land the next text anywhere, including the last two columns.
-            1 => out.extend_from_slice(
-                format!(
-                    "\x1b[{};{}H",
-                    1 + rng.below(ROWS),
-                    COLS - rng.below(COLS.min(6))
-                )
-                .as_bytes(),
-            ),
-            _ => {
-                for _ in 0..1 + rng.below(12) {
-                    out.extend_from_slice(TEXT[rng.below(TEXT.len())].as_bytes());
-                }
-            }
-        }
-    }
-    out
-}
-
-#[test]
-fn runs_parse_the_same_as_per_character_input() {
-    for seed in 1..=16u64 {
-        let mut rng = Rng(seed.wrapping_mul(0x2545_f491_4f6c_dd1d) | 1);
-        for stream in [text_stream(seed, 3_000), dense_stream(seed)] {
-            let reference = observe_per_character(stream.chunks(1));
-            assert_same(&reference, &observe_chunks([&stream[..]]), "runs, one shot");
-            assert_same(
-                &reference,
-                &observe_per_character([&stream[..]]),
-                "per character, one shot",
-            );
-            let chunks = random_chunks(&stream, &mut rng, 4096);
-            assert_same(
-                &reference,
-                &observe_chunks(chunks),
-                &format!("runs, seed {seed}"),
-            );
-        }
-    }
-}
-
 #[test]
 fn the_dense_stream_parses_the_same_split_at_every_offset() {
     let stream = dense_stream(0x5eed);
@@ -774,7 +465,7 @@ fn a_cut_inside_an_escape_never_prints_its_parameters() {
 fn state_after_hundreds_of_events_in_one_read_survives() {
     // One read with more events than a small bounded queue holds: the title
     // set after them, and every query's answer, must still arrive.
-    let mut screen = screen();
+    let mut screen = screen(COLS, ROWS);
     screen.feed(
         &[
             &b"\x07".repeat(500)[..],
@@ -890,7 +581,8 @@ fn can_or_sub_cancels_an_image_command_like_any_other_string() {
     // query after that must be cancelled by its own SUB, not answered.
     let stream = b"\x1b_Gf=32,s=1,v=1;AAAA\x18tail\x1bP+q54\x1a!\x1b_Gi=3;AA\x1amore";
     let mut parser_only =
-        HeadlessScreen::new_with_keyboard_enhancements(COLS, ROWS).with_host_replies("diri-test");
+        diri_terminal_state::HeadlessScreen::new_with_keyboard_enhancements(COLS, ROWS)
+            .with_host_replies("diri-test");
     parser_only.feed(stream);
     let with_images = observe_chunks([&stream[..]]);
     assert!(
@@ -903,7 +595,7 @@ fn can_or_sub_cancels_an_image_command_like_any_other_string() {
         "{:?}",
         parser_only.row_text(0)
     );
-    let mut screen = screen();
+    let mut screen = screen(COLS, ROWS);
     screen.feed(stream);
     assert_eq!(screen.row_text(0), parser_only.row_text(0));
     assert_eq!(screen.take_replies(), parser_only.take_replies());
@@ -938,5 +630,135 @@ fn can_or_sub_ends_an_inline_image_osc_like_any_other_osc() {
             &observe_chunks([&stream[..split], &stream[split..]]),
             &format!("split at {split}"),
         );
+    }
+}
+
+fn observe_per_character<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> Observed {
+    let mut feeder = Feeder::per_character(COLS, ROWS);
+    for chunk in chunks {
+        feeder.feed(chunk);
+    }
+    feeder.observe()
+}
+
+/// Text that stresses writing runs of cells: ASCII and wide characters
+/// reaching the right margin at every column, combining and spacing marks,
+/// emoji with modifiers, ZWJ sequences and variation selectors, overwrites of
+/// wide characters and their spacers, insert mode, autowrap off, the line
+/// drawing charset, shell marks, links and colors, C1 controls and invalid
+/// UTF-8.
+fn text_stream(seed: u64, pieces: usize) -> Vec<u8> {
+    const TEXT: &[&str] = &[
+        "abc",
+        "The quick brown fox",
+        "~!@#",
+        " ",
+        "漢字",
+        "界",
+        "ｈｉ",
+        "é",
+        "e\u{301}",
+        "a\u{301}\u{302}\u{303}",
+        "\u{9b2}\u{9cb}",
+        "\u{e01}\u{e33}",
+        "👍🏽",
+        "👩\u{200d}💻",
+        "❤\u{fe0f}",
+        "\u{1f1fa}\u{1f1f8}",
+        "ß→€",
+        "\u{a0}",
+        "\u{ad}",
+        "\u{200b}",
+        "한국어",
+        "ｶﾀｶﾅ",
+        "\u{301}",
+        "\u{200d}",
+        "\u{fe0f}",
+        "❤",
+        "\u{1f3fd}",
+        "1\u{fe0f}\u{20e3}",
+        "\u{1100}\u{1161}\u{11a8}",
+        "\u{915}\u{94d}\u{937}",
+        "\u{1f1f7}",
+        "\x1b[?2027h",
+        "\x1b[?2027l",
+    ];
+    const CONTROLS: &[&[u8]] = &[
+        b"\r\n",
+        b"\r",
+        b"\n",
+        b"\t",
+        b"\x08",
+        b"\x08\x08",
+        b"\x1b[4h",
+        b"\x1b[4l",
+        b"\x1b[?7l",
+        b"\x1b[?7h",
+        b"\x1b(0",
+        b"\x1b(B",
+        b"\x1b[31;1m",
+        b"\x1b[0m",
+        b"\x1b[3@",
+        b"\x1b[2P",
+        b"\x1b[3X",
+        b"\x1b[2K",
+        b"\x1b[H",
+        b"\x1b]8;;https://example.invalid\x07",
+        b"\x1b]8;;\x07",
+        b"\x1b]133;A\x07",
+        b"\x1b]133;B\x07",
+        b"\x1b]133;C\x07",
+        b"\x1b[2b",
+        b"\xc2\x85",
+        b"\xc2\x9b2C",
+        b"\xff",
+        b"\xe6\x97",
+        b"\x7f",
+        b"\x1b[1;1H\x1b[3;8r",
+        b"\x1b[r",
+    ];
+    let mut rng = Rng(seed);
+    let mut out = Vec::new();
+    for _ in 0..pieces {
+        match rng.below(6) {
+            0 => out.extend_from_slice(CONTROLS[rng.below(CONTROLS.len())]),
+            // Land the next text anywhere, including the last two columns.
+            1 => out.extend_from_slice(
+                format!(
+                    "\x1b[{};{}H",
+                    1 + rng.below(ROWS),
+                    COLS - rng.below(COLS.min(6))
+                )
+                .as_bytes(),
+            ),
+            _ => {
+                for _ in 0..1 + rng.below(12) {
+                    out.extend_from_slice(TEXT[rng.below(TEXT.len())].as_bytes());
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn runs_parse_the_same_as_per_character_input() {
+    for seed in 1..=16u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x2545_f491_4f6c_dd1d) | 1);
+        for stream in [text_stream(seed, 3_000), dense_stream(seed)] {
+            let reference = observe_per_character(stream.chunks(1));
+            assert_same(&reference, &observe_chunks([&stream[..]]), "runs, one shot");
+            assert_same(
+                &reference,
+                &observe_per_character([&stream[..]]),
+                "per character, one shot",
+            );
+            let chunks = random_chunks(&stream, &mut rng, 4096);
+            assert_same(
+                &reference,
+                &observe_chunks(chunks),
+                &format!("runs, seed {seed}"),
+            );
+        }
     }
 }
