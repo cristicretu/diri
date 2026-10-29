@@ -23,7 +23,7 @@ pub const RESULT_LIMIT: usize = 50;
 pub const RANK_DEBOUNCE: Duration = Duration::from_millis(25);
 /// Bump when `DirectoryEntry`'s shape or the traversal's meaning changes, so a
 /// new build never ranks against an index built under different rules.
-pub const INDEX_CACHE_VERSION: u32 = 2;
+pub const INDEX_CACHE_VERSION: u32 = 3;
 /// How long a scan stays fresh enough to skip re-walking the filesystem.
 pub const RESCAN_AFTER: Duration = Duration::from_secs(30);
 
@@ -39,6 +39,22 @@ const SKIP_NAMES: &[&str] = &[
     "target",
     "Pods",
 ];
+
+/// Home folders macOS guards with a privacy prompt (TCC). Walking home must not
+/// open them, or a fresh install asks for Documents/Downloads/Desktop before
+/// the user opened anything (#826). Listing one as a root, or naming it in
+/// `.diri-include`, still indexes it.
+#[cfg(target_os = "macos")]
+const PROTECTED_HOME_FOLDERS: &[&str] = &[
+    "Desktop",
+    "Documents",
+    "Downloads",
+    "Movies",
+    "Music",
+    "Pictures",
+];
+#[cfg(not(target_os = "macos"))]
+const PROTECTED_HOME_FOLDERS: &[&str] = &[];
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct DirectoryEntry {
@@ -403,13 +419,15 @@ struct WalkItem {
 /// truncates the deepest, least useful level instead of the second half of the
 /// alphabet.
 pub fn scan(roots: &[PathBuf], standalone_roots: &[PathBuf]) -> Vec<DirectoryEntry> {
-    scan_with(roots, standalone_roots, &IncludeRules::default())
+    scan_with(roots, standalone_roots, &IncludeRules::default(), None)
 }
 
+/// `home`, when given, is where `PROTECTED_HOME_FOLDERS` are not entered.
 pub fn scan_with(
     roots: &[PathBuf],
     standalone_roots: &[PathBuf],
     include: &IncludeRules,
+    home: Option<&Path>,
 ) -> Vec<DirectoryEntry> {
     let mut result = Vec::new();
     let mut seen = HashSet::new();
@@ -445,7 +463,7 @@ pub fn scan_with(
                 result.push(entry(&item.path, depth));
             }
             if depth < MAX_DEPTH {
-                children(&item.path, &item.root, include, &mut next);
+                children(&item.path, &item.root, include, home, &mut next);
             }
         }
         frontier = next;
@@ -456,8 +474,15 @@ pub fn scan_with(
 /// Append the indexable subdirectories of `path`, skipping hidden entries, the
 /// build/dependency noise in `SKIP_NAMES`, and symlinks (which would otherwise
 /// let a loop re-enter the tree). `.diri-include` patterns can opt those
-/// skipped names back in.
-fn children(path: &Path, root: &Path, include: &IncludeRules, out: &mut Vec<WalkItem>) {
+/// skipped names back in, as can the protected folders directly inside `home`.
+fn children(
+    path: &Path,
+    root: &Path,
+    include: &IncludeRules,
+    home: Option<&Path>,
+    out: &mut Vec<WalkItem>,
+) {
+    let in_home = home == Some(path);
     let Ok(entries) = fs::read_dir(path) else {
         return;
     };
@@ -469,7 +494,9 @@ fn children(path: &Path, root: &Path, include: &IncludeRules, out: &mut Vec<Walk
             Ok(prefix) => prefix.join(name.as_ref()),
             Err(_) => PathBuf::from(name.as_ref()),
         };
-        if skipped_name(&name) && !include.allows(&relative) {
+        let skipped =
+            skipped_name(&name) || (in_home && PROTECTED_HOME_FOLDERS.contains(&name.as_ref()));
+        if skipped && !include.allows(&relative) {
             continue;
         }
         let Ok(file_type) = child.file_type() else {
@@ -844,6 +871,50 @@ mod tests {
 
     use super::*;
 
+    /// #826: the default `~` root must not open the folders macOS guards with a
+    /// privacy prompt, while an explicit root or `.diri-include` still can.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn walking_home_skips_privacy_protected_folders() {
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("home");
+        for folder in PROTECTED_HOME_FOLDERS {
+            fs::create_dir_all(home.join(folder).join("private")).unwrap();
+        }
+        fs::create_dir_all(home.join("code/repo")).unwrap();
+        fs::create_dir_all(home.join("notes/Documents")).unwrap();
+        let roots = vec![home.clone()];
+
+        let names = |entries: &[DirectoryEntry]| -> HashSet<PathBuf> {
+            entries.iter().map(|entry| entry.path.clone()).collect()
+        };
+        let walked = names(&scan_with(&roots, &[], &IncludeRules::default(), Some(&home)));
+        assert!(walked.contains(&home.join("code/repo")));
+        // Only home's own children are guarded, not a namesake deeper down.
+        assert!(walked.contains(&home.join("notes/Documents")));
+        for folder in PROTECTED_HOME_FOLDERS {
+            assert!(!walked.contains(&home.join(folder)), "{folder}");
+        }
+
+        let opted_in = names(&scan_with(
+            &roots,
+            &[],
+            &IncludeRules::parse("Documents\n"),
+            Some(&home),
+        ));
+        assert!(opted_in.contains(&home.join("Documents/private")));
+        assert!(!opted_in.contains(&home.join("Desktop")));
+
+        let documents = vec![home.join("Documents")];
+        let explicit = names(&scan_with(
+            &documents,
+            &[],
+            &IncludeRules::default(),
+            Some(&home),
+        ));
+        assert!(explicit.contains(&home.join("Documents/private")));
+    }
+
     #[test]
     fn create_target_resolves_names_under_the_base_and_paths_as_written() {
         let dir = tempdir().unwrap();
@@ -1202,6 +1273,7 @@ mod tests {
             std::slice::from_ref(&root),
             &[],
             &IncludeRules::parse("*/.worktrees/\n"),
+            None,
         );
         let names: HashSet<_> = included.iter().map(|entry| entry.name.as_str()).collect();
         assert!(names.contains(".worktrees"));
