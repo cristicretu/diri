@@ -35,6 +35,8 @@ final class TerminalView: UIScrollView, UIKeyInput, UITextInputTraits {
     private let padding: CGFloat = 10
     private let overscan = 6
     private lazy var accessory = KeyAccessoryView(terminal: self)
+    private lazy var wheelPan = UIPanGestureRecognizer(target: self, action: #selector(wheeled(_:)))
+    private var wheelCarry: CGFloat = 0
 
     static let fontSizeKey = "terminal.fontSize"
     static let defaultFontSize: CGFloat = 11
@@ -58,6 +60,9 @@ final class TerminalView: UIScrollView, UIKeyInput, UITextInputTraits {
 
         addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped)))
         addGestureRecognizer(UIPinchGestureRecognizer(target: self, action: #selector(pinched(_:))))
+        wheelPan.maximumNumberOfTouches = 1
+        wheelPan.isEnabled = false
+        addGestureRecognizer(wheelPan)
 
         isAccessibilityElement = true
         accessibilityTraits = [.staticText, .allowsDirectInteraction]
@@ -260,7 +265,51 @@ final class TerminalView: UIScrollView, UIKeyInput, UITextInputTraits {
         // ones whose content differs, so a diff costs exactly its rows.
         setNeedsLayout()
         if change.cursor { placeCursor() }
+        updateWheelMode()
         accessibilityLabelCache = nil
+    }
+
+    // MARK: - Mouse wheel
+
+    /// A full-screen program that asked for the mouse (vim, less, htop, a
+    /// TUI's own scrollback) has no history to scroll here: a vertical drag
+    /// becomes wheel reports instead, one per line of travel, as the browser
+    /// terminal does.
+    var wantsWheel: Bool { session.buffer.modes.altScreen && session.buffer.modes.mouse }
+
+    private func updateWheelMode() {
+        let wants = wantsWheel
+        guard wheelPan.isEnabled != wants else { return }
+        wheelPan.isEnabled = wants
+        isScrollEnabled = !wants
+        if wants { scrollToBottom() }
+    }
+
+    @objc private func wheeled(_ gesture: UIPanGestureRecognizer) {
+        switch gesture.state {
+        case .began:
+            wheelCarry = 0
+        case .changed:
+            wheelCarry += gesture.translation(in: self).y
+            gesture.setTranslation(.zero, in: self)
+            let steps = Int(wheelCarry / lineHeight)
+            guard steps != 0 else { return }
+            wheelCarry -= CGFloat(steps) * lineHeight
+            let point = gesture.location(in: canvas)
+            let buffer = session.buffer
+            let col = Int((point.x - padding) / font.cellWidth) + 1
+            let row = Int(point.y / lineHeight) - buffer.historySize + 1
+            // Finger down drags the content down: earlier lines, wheel up.
+            session.send(Self.wheelReport(up: steps > 0, col: min(max(col, 1), buffer.cols),
+                                          row: min(max(row, 1), buffer.rows), count: min(10, abs(steps))))
+        default:
+            break
+        }
+    }
+
+    /// SGR wheel reports (buttons 64 up, 65 down) at a 1-based cell.
+    nonisolated static func wheelReport(up: Bool, col: Int, row: Int, count: Int) -> [UInt8] {
+        Array(String(repeating: "\u{1B}[<\(up ? 64 : 65);\(col);\(row)M", count: max(0, count)).utf8)
     }
 
     // MARK: - Font size

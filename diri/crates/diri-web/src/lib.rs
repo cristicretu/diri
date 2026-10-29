@@ -1818,6 +1818,13 @@ mod tests {
                     json!({"idle": {}}),
                     json!({})
                 ),
+                record(
+                    "s_pager",
+                    json!({"shell": {}}),
+                    "less build.log",
+                    json!({"idle": {}}),
+                    json!({})
+                ),
             ]);
             for value in list.as_array().unwrap() {
                 serde_json::from_value::<diri_proto::SessionRecord>(value.clone())
@@ -1826,21 +1833,45 @@ mod tests {
             json!({"sessions": list, "projects": [{"id": "p_diri", "name": "diri", "root": "/Users/me/code/diri"}]})
         }
 
-        async fn seed(stream: &mut diri_platform::ipc::asynchronous::UnixStream, variant: &str) {
-            let rows = screen(variant)
-                .into_iter()
-                .enumerate()
-                .map(|(y, cells)| (y as u16, cells))
+        /// A full-screen program that asked for the mouse, as `less` or vim
+        /// does: the alternate screen with SGR mouse reporting on.
+        fn pager() -> Vec<Vec<GridCell>> {
+            let mut rows: Vec<Vec<GridCell>> = (1..ROWS)
+                .map(|n| plain(&format!("pager line {n}")))
                 .collect();
+            rows.push(row(&[(":", D, BG, TermStyle::INVERSE)]));
+            rows
+        }
+
+        async fn seed(
+            stream: &mut diri_platform::ipc::asynchronous::UnixStream,
+            id: &str,
+            variant: &str,
+        ) {
+            let full_screen = id == "s_pager";
+            let rows = if full_screen {
+                pager()
+            } else {
+                screen(variant)
+            }
+            .into_iter()
+            .enumerate()
+            .map(|(y, cells)| (y as u16, cells))
+            .collect();
             stream
                 .write_all(&grid_frame(&grid(true, rows)))
                 .await
                 .unwrap();
-            let modes = diri_proto::frames::Frame::modes_with_bracketed_paste(
-                false,
-                true,
-                diri_proto::terminal::MouseModes::OFF,
-            );
+            let mouse = if full_screen {
+                diri_proto::terminal::MouseModes::new(
+                    diri_proto::terminal::MouseTrackingMode::ButtonEvents,
+                    diri_proto::terminal::MouseEncoding::Sgr,
+                )
+            } else {
+                diri_proto::terminal::MouseModes::OFF
+            };
+            let modes =
+                diri_proto::frames::Frame::modes_with_bracketed_paste(full_screen, true, mouse);
             stream
                 .write_all(&diri_proto::frames::FrameCodec::encode(&modes).unwrap())
                 .await
@@ -1895,7 +1926,7 @@ mod tests {
             loop {
                 tokio::select! {
                     Some((id, mut stream)) = engine.previews.recv() => {
-                        seed(&mut stream, &format!(" stream {generation}")).await;
+                        seed(&mut stream, &id, &format!(" stream {generation}")).await;
                         previews.insert(id, stream);
                     }
                     Some((method, params)) = engine.calls.recv() => {
