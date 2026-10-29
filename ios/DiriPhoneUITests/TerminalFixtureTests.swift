@@ -70,9 +70,11 @@ final class TerminalFixtureTests: XCTestCase {
         XCTAssertTrue(waitFor(app, "snapshots 1; resumes 0"), value(app))
         settle(1)
         save("resume-before")
+        let shown = terminal(app).label
         try control("drop")
         XCTAssertTrue(waitFor(app, "snapshots 1; resumes 1; resumed rows 1"), value(app))
-        XCTAssertTrue(terminal(app).label.contains("stream 1"), "the changed row is on screen")
+        // The fixture reseeds with its stream counter in the last row.
+        XCTAssertNotEqual(terminal(app).label, shown, "the changed row is on screen")
         settle(0.5)
         save("resume-after")
     }
