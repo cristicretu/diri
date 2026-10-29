@@ -126,4 +126,38 @@ final class TerminalFixtureTests: XCTestCase {
         XCTAssertTrue(sent.contains("\\u{1b}[<64;"), sent)
         XCTAssertFalse(sent.contains("[<65;"), "a downward drag is wheel up only: \(sent)")
     }
+
+    /// Long-press selects the word under the finger, Copy puts it on the
+    /// pasteboard, and pasting it back into the terminal sends exactly it.
+    func testLongPressSelectsAWordAndCopiesIt() throws {
+        let app = try launch("s_shell")
+        XCTAssertTrue(waitFor(app, "snapshots 1"))
+        settle(1)
+        let terminal = terminal(app)
+        // The fixture's "12345| end" row sits just above the composer.
+        terminal.coordinate(withNormalizedOffset: CGVector(dx: 0.08, dy: 0.0))
+            .withOffset(CGVector(dx: 0, dy: app.textViews["composer-field"].exists
+                ? app.textViews["composer-field"].frame.minY - 34 : app.textFields["composer-field"].frame.minY - 34))
+            .press(forDuration: 0.8)
+        settle(0.6)
+        XCTAssertTrue(waitFor(app, "selection [12345"), value(app))
+        save("selection")
+        let copy = app.buttons["Copy"].firstMatch.exists ? app.buttons["Copy"].firstMatch : app.menuItems["Copy"].firstMatch
+        XCTAssertTrue(copy.waitForExistence(timeout: 3), app.debugDescription)
+        copy.tap()
+        XCTAssertTrue(waitFor(app, "selection none"))
+        // Paste it back into the program from the same menu.
+        let row = terminal.coordinate(withNormalizedOffset: CGVector(dx: 0.08, dy: 0.0))
+            .withOffset(CGVector(dx: 0, dy: app.textViews["composer-field"].exists
+                ? app.textViews["composer-field"].frame.minY - 34 : app.textFields["composer-field"].frame.minY - 34))
+        row.press(forDuration: 0.8)
+        let paste = app.buttons["Paste"].firstMatch.exists ? app.buttons["Paste"].firstMatch : app.menuItems["Paste"].firstMatch
+        XCTAssertTrue(paste.waitForExistence(timeout: 3))
+        let before = typed()
+        paste.tap()
+        let deadline = Date().addingTimeInterval(8)
+        while Date() < deadline, typed().count == before.count { settle(0.25) }
+        save("after-paste")
+        XCTAssertTrue(String(typed().dropFirst(before.count)).contains("12345"), typed())
+    }
 }
