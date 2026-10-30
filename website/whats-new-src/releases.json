@@ -3,7 +3,7 @@
     "version": "0.11.0",
     "date": "October 30, 2026",
     "headline": "Scripting, splits you can read, and nothing lost under load",
-    "summary": "diri 0.11.0 adds Lua scripting, shows what every pane in a split is doing, imports your old terminal's setup, keeps every byte of output when programs flood the terminal, and runs on a new terminal core.",
+    "summary": "diri 0.11.0 adds Lua scripting, readable splits and terminal setup import, keeps every byte of a flood, and runs on a faster terminal core.",
     "items": [
       {
         "title": "Script diri with Lua",

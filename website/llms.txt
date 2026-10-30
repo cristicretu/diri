@@ -69,7 +69,7 @@ Each page is available as Markdown at the URL below. The docs are concatenated i
 
 ## Releases
 
-- [diri 0.11.0: Scripting, splits you can read, and nothing lost under load](https://diri.sh/whats-new/0.11.0/): diri 0.11.0 adds Lua scripting, shows what every pane in a split is doing, imports your old terminal's setup, keeps every byte of output when programs flood the terminal, and runs on a new terminal core.
+- [diri 0.11.0: Scripting, splits you can read, and nothing lost under load](https://diri.sh/whats-new/0.11.0/): diri 0.11.0 adds Lua scripting, readable splits and terminal setup import, keeps every byte of a flood, and runs on a faster terminal core.
 - [diri 0.10.0: Voice, Mac apps, and current model prices](https://diri.sh/whats-new/0.10.0/): diri 0.10.0 reads finished turns aloud, lets agents use Mac apps in the background, prices new models from LiteLLM, and moves to AGPL-3.0.
 - [diri 0.9.0: Notes, and to-dos that start agents](https://diri.sh/whats-new/0.9.0/): diri 0.9.0 adds Notes: plans and to-do lists that sit next to your agents, where any to-do can start an agent with the note as its brief.
 
