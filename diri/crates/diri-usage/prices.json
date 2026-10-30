@@ -99,6 +99,7 @@
   "gpt-6-luna": {"input": 0.1, "output": 0.5, "cache_read": 0.01, "cache_write_5m": 0.125},
   "gpt-6-sol": {"input": 2.0, "output": 10.0, "cache_read": 0.2, "cache_write_5m": 2.5},
   "gpt-6.1-sol": {"input": 2.0, "output": 10.0, "cache_read": 0.1, "cache_write_5m": 2.5},
+  "gpt-6.1-terra": {"input": 1.0, "output": 5.0, "cache_read": 0.05, "cache_write_5m": 1.25},
   "gpt-audio": {"input": 2.5, "output": 10.0},
   "gpt-audio-1.5": {"input": 2.5, "output": 10.0},
   "gpt-audio-2025-08-28": {"input": 2.5, "output": 10.0},
