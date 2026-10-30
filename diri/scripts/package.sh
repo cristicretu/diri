@@ -63,6 +63,12 @@ verify_universal() {
 
 cd "${workspace_dir}"
 
+# Install the pinned toolchain once, here, if rustup has to: the background
+# Helper build and the foreground cargo below would otherwise both auto-install
+# it at once, and the loser fails with "the 'cargo' binary ... is not
+# applicable to the toolchain".
+cargo --version >/dev/null
+
 # The remote Helper catalog shares nothing with the macOS products, so it builds
 # alongside them in its own target dir (one target dir admits one cargo at a
 # time) and is copied into the bundle once cargo-packager has made it.
