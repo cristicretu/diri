@@ -116,6 +116,9 @@ enum GatewayProbe {
     enum Outcome: Equatable, Sendable {
         case reachable(host: String)
         case unauthorized
+        /// Reached, but tailnet admission refused this device (the sentence
+        /// says why and what to do).
+        case refused(String)
         case unreachable(String)
 
         var isReachable: Bool {

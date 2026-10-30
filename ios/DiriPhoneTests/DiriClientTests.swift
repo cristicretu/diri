@@ -56,6 +56,31 @@ final class DiriClientTests: XCTestCase {
         XCTAssertFalse(TerminalSession.isTransient(DiriClient.Failure.unauthorized))
     }
 
+    /// Tailnet admission (#952): 401 `device_not_paired` means pair again;
+    /// its other refusals say what to fix instead, in words.
+    func testAdmissionRefusalsAreToldApart() async throws {
+        StubProtocol.respond(json: #"{"error":"This device is not paired. Scan the pairing code in Diri Settings","code":"device_not_paired"}"#, status: 401)
+        do { _ = try await client.health(); XCTFail("refused") } catch DiriClient.Failure.unauthorized {} catch { XCTFail("\(error)") }
+
+        StubProtocol.respond(json: #"{"error":"This device belongs to another Tailscale user","code":"not_the_owner"}"#, status: 403)
+        do {
+            _ = try await client.health()
+            XCTFail("refused")
+        } catch let DiriClient.Failure.refused(code, _) {
+            XCTAssertEqual(code, "not_the_owner")
+        }
+        let owner = PairingHelp.message(for: DiriClient.Failure.refused(code: "not_the_owner", message: ""))
+        XCTAssertTrue(owner.contains("same account"), owner)
+
+        StubProtocol.respond(json: #"{"error":"This computer cannot ask Tailscale who is connecting","code":"tailnet_identity_unavailable"}"#, status: 503)
+        do { _ = try await client.health(); XCTFail("refused") } catch let DiriClient.Failure.refused(code, _) {
+            XCTAssertEqual(code, "tailnet_identity_unavailable")
+        }
+        // An uncoded 503 is still an ordinary HTTP failure.
+        StubProtocol.respond(json: #"{"error":"engine timeout"}"#, status: 503)
+        do { _ = try await client.health(); XCTFail("failed") } catch DiriClient.Failure.http(503, "engine timeout") {}
+    }
+
     func testPairingRejectsUnsafeOrAmbiguousURLs() {
         for link in ["file:///tmp?token=t", "ftp://host?token=t", "http://user:pass@host?token=t",
                      "http://host?token=a&token=b", "http://host?token=t#secret", "http://host"] {

@@ -1896,13 +1896,48 @@ mod tests {
                 .unwrap_or(7391);
             let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
             let auth = Auth::temporary().unwrap();
-            let url = format!("http://127.0.0.1:{port}/?token={}", auth.token());
+            // `DIRI_PHONE_FIXTURE_ADMIT=tailnet`: tailnet admission (#952)
+            // with a fake LocalAPI that reports every peer as the owner's
+            // phone `nPhone`. The link then holds a one-time pairing code;
+            // `revoke` removes the phone, `code` mints a new link, `stranger`
+            // makes the phone another Tailscale user's.
+            let tailnet =
+                std::env::var("DIRI_PHONE_FIXTURE_ADMIT").is_ok_and(|mode| mode == "tailnet");
+            let mut admission = None;
+            let devices = Arc::new(crate::devices::Devices::open(dir.join("devices.json")));
+            let local = if tailnet {
+                let local = crate::tailnet::fake::start().await;
+                local.whois.lock().unwrap().insert(
+                    "100.64.0.2".into(),
+                    crate::tailnet::fake::device(
+                        "nPhone",
+                        "fixture-iphone",
+                        crate::tailnet::fake::OWNER,
+                        &[],
+                    ),
+                );
+                let gate = Arc::new(tailnet::Admission::new(
+                    local.api(),
+                    tailnet::Owner::ThisNode,
+                    Arc::clone(&devices),
+                ));
+                *gate.test_peer.lock().unwrap() = Some("100.64.0.2".parse().unwrap());
+                admission = Some(gate);
+                Some(local)
+            } else {
+                None
+            };
+            let link = |code: &str| format!("http://127.0.0.1:{port}/?token={code}");
+            let url = match &admission {
+                Some(_) => link(&devices.mint_code().unwrap()),
+                None => link(auth.token()),
+            };
             let api = Arc::new(Api {
                 client: Arc::clone(&engine.client),
                 auth,
                 host_label: "fixture-mac".into(),
                 inputs: Default::default(),
-                tailnet: None,
+                tailnet: admission,
             });
             let server = tokio::spawn(serve_connections(listener, api));
             std::fs::write(dir.join("url"), &url).unwrap();
@@ -1963,6 +1998,20 @@ mod tests {
                                 }
                                 (Some("history"), Some(n), _) => {
                                     HISTORY.store(n.parse().unwrap_or(1_200), Ordering::Relaxed);
+                                }
+                                (Some("revoke"), _, _) => {
+                                    let _ = devices.revoke("nPhone");
+                                }
+                                (Some("code"), _, _) => {
+                                    let _ = std::fs::write(dir.join("url"), link(&devices.mint_code().unwrap()));
+                                }
+                                (Some("stranger"), _, _) => {
+                                    if let Some(local) = &local {
+                                        local.whois.lock().unwrap().insert(
+                                            "100.64.0.2".into(),
+                                            crate::tailnet::fake::device("nPhone", "fixture-iphone", 99, &[]),
+                                        );
+                                    }
                                 }
                                 (Some("drop"), _, _) => {
                                     generation += 1;

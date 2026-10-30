@@ -210,10 +210,30 @@ struct ConnectView: View {
 }
 
 enum PairingHelp {
+  /// Tailnet admission's refusals, as what to do about them.
+  static func refusal(code: String, message: String) -> String {
+    switch code {
+    case "not_the_owner":
+      "This iPhone is signed in to Tailscale as a different person than your Mac. Sign Tailscale in with the same account on both."
+    case "tagged_node_refused":
+      "This iPhone is a tagged Tailscale device. Diri only lets in your own, untagged devices."
+    case "not_a_tailnet_peer":
+      "That didn’t arrive over your tailnet. Turn Tailscale on, then use the Mac’s Tailscale address."
+    case "tailnet_identity_unavailable":
+      "Your Mac couldn’t ask Tailscale who is connecting. Check that Tailscale is running on the Mac."
+    case "tailnet_owner_unknown":
+      "That computer doesn’t know whose devices to let in. Set its Tailscale owner (diri-web --tailnet-owner)."
+    default:
+      message.isEmpty ? "Your Mac refused this iPhone." : message
+    }
+  }
+
   static func message(for error: Error) -> String {
     switch error {
     case DiriClient.Failure.unauthorized:
-      "This code is no longer valid. Scan the current code in Diri → Settings → Phone access on your Mac."
+      "This code is no longer valid (codes work once, for 10 minutes). Scan the current code in Diri → Settings → Phone access on your Mac."
+    case let DiriClient.Failure.refused(code, message):
+      refusal(code: code, message: message)
     case DiriClient.Failure.daemonUnreachable:
       // A transport failure: the request never got an answer. Usually the
       // tailnet's access policy (a custom ACL may allow nothing into the Mac).

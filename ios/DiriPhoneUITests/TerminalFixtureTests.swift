@@ -145,4 +145,40 @@ final class TerminalFixtureTests: XCTestCase {
         app.buttons["answer-s_codex"].tap()
         XCTAssertTrue(terminal(app).waitForExistence(timeout: 10))
     }
+
+    /// Tailnet admission end to end (fixture run with
+    /// `DIRI_PHONE_FIXTURE_ADMIT=tailnet`): the one-time code pairs the
+    /// phone; removing it on the Mac turns the list into "pair again", and a
+    /// fresh code pairs it back in place.
+    func testARemovedPhoneIsAskedToPairAgainAndCanRepair() throws {
+        // A tailnet fixture's link holds a 128-bit pairing code, not a
+        // 256-bit bearer token.
+        let url = (try? String(contentsOfFile: dir + "/url", encoding: .utf8)) ?? ""
+        guard let token = url.components(separatedBy: "token=").last?.trimmingCharacters(in: .whitespacesAndNewlines),
+              token.count == 32
+        else { throw XCTSkip("Run the fixture with DIRI_PHONE_FIXTURE_ADMIT=tailnet.") }
+        let app = try launch(nil)
+        XCTAssertTrue(app.staticTexts["fixture-mac"].firstMatch.waitForExistence(timeout: 20), "the code paired the phone")
+        settle(1)
+        save("paired")
+        try control("revoke")
+        let pairAgain = app.buttons["pair-again"]
+        XCTAssertTrue(pairAgain.waitForExistence(timeout: 30), "the next probe sees the phone is no longer paired")
+        save("not-paired")
+        try control("code")
+        settle(0.6)
+        let link = try String(contentsOfFile: dir + "/url", encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+        pairAgain.tap()
+        let paste = app.descendants(matching: .any)["pairing-paste"].firstMatch
+        XCTAssertTrue(paste.waitForExistence(timeout: 5))
+        paste.tap()
+        let field = app.textViews["pairing-link-field"].exists ? app.textViews["pairing-link-field"] : app.textFields["pairing-link-field"]
+        XCTAssertTrue(field.waitForExistence(timeout: 5))
+        field.tap()
+        field.typeText(link)
+        app.buttons["pairing-connect"].tap()
+        XCTAssertTrue(app.staticTexts["fixture-mac"].firstMatch.waitForExistence(timeout: 20), "paired again")
+        XCTAssertFalse(app.buttons["pair-again"].exists)
+        save("repaired")
+    }
 }

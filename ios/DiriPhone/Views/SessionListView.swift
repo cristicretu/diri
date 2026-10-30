@@ -16,7 +16,7 @@ struct SessionListView: View {
     var body: some View {
         Group {
             if model.groups.isEmpty {
-                EmptyStateView(connection: model.connection, onNew: onNew)
+                EmptyStateView(connection: model.connection, needsPairing: model.needsPairing, onNew: onNew, onPair: onPair)
             } else {
                 list
             }
@@ -146,6 +146,9 @@ struct SessionListView: View {
                             Button("Forget this computer", systemImage: "trash", role: .destructive) {
                                 model.removeGateway(gateway.id)
                             }
+                            if model.outcomes[gateway.id] == .unauthorized {
+                                Button("Pair again…", systemImage: "qrcode.viewfinder", action: onPair)
+                            }
                         } label: {
                             Label(gateway.name, systemImage: gatewaySymbol(gateway))
                             Text(gatewayStatus(gateway))
@@ -185,7 +188,8 @@ struct SessionListView: View {
         if gateway.id == model.liveGatewayID { return "Live" }
         switch model.outcomes[gateway.id] {
         case .reachable: return "Reachable"
-        case .unauthorized: return "Pairing expired — pair again"
+        case .unauthorized: return "Not paired — pair again"
+        case let .refused(message): return message
         case let .unreachable(detail): return "Unreachable · \(detail)"
         case nil: return "Checking…"
         }
@@ -257,7 +261,9 @@ struct ConnectionDot: View {
 
 struct EmptyStateView: View {
     let connection: AppModel.Connection
+    var needsPairing = false
     let onNew: () -> Void
+    var onPair: () -> Void = {}
 
     var body: some View {
         VStack(spacing: 10) {
@@ -267,17 +273,25 @@ struct EmptyStateView: View {
                 Image(systemName: "wifi.exclamationmark")
                     .font(.system(size: 24))
                     .foregroundStyle(Tokens.Ink.danger)
-                Text("Can’t reach your Mac")
+                Text(needsPairing ? "Pair this iPhone again" : "Can’t reach your Mac")
                     .font(.system(size: 17, weight: .semibold))
                     .foregroundStyle(Tokens.Ink.primary)
                 Text(detail)
                     .font(.system(size: 13))
                     .foregroundStyle(Tokens.Ink.tertiary)
                     .multilineTextAlignment(.center)
-                Text("Keep your Mac awake with Diri open and Tailscale connected. If access was restarted, use the connection menu to pair again.")
-                    .font(.system(size: 13))
-                    .foregroundStyle(Tokens.Ink.tertiary)
-                    .multilineTextAlignment(.center)
+                if needsPairing {
+                    Button("Scan pairing code", action: onPair)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(Tokens.Ink.clay)
+                        .padding(.top, 6)
+                        .accessibilityIdentifier("pair-again")
+                } else {
+                    Text("Keep your Mac awake with Diri open and Tailscale connected. If access was restarted, use the connection menu to pair again.")
+                        .font(.system(size: 13))
+                        .foregroundStyle(Tokens.Ink.tertiary)
+                        .multilineTextAlignment(.center)
+                }
             case .connecting:
                 ProgressView().tint(Tokens.Ink.secondary)
             default:
