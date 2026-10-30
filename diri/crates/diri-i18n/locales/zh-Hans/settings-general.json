@@ -48,7 +48,7 @@
   "settings.general.quick_open": "快速打开",
   "settings.general.render_counters": "渲染计数",
   "settings.general.render_counters_detail": "在主要视图上标出渲染次数，并在浮层中列出。",
-  "settings.general.roots_empty_hint": "留空时使用你的个人文件夹及各项目的上级文件夹。“添加根目录”会打开系统选择器。",
+  "settings.general.roots_empty_hint": "留空时使用你的个人文件夹及各项目的上级文件夹。个人文件夹中的桌面、文稿、下载和媒体文件夹只有添加为根目录后才会扫描。“添加根目录”会打开系统选择器。",
   "settings.general.roots_hint": "每行一个文件夹，向下扫描四层。“添加根目录”可再加一个。",
   "settings.general.save": "保存",
   "settings.general.save_failed": "无法保存设置：{error}",

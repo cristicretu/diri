@@ -678,7 +678,9 @@ impl NavigationOverlay {
             let (entries, snapshot, includes, roots) = cx
                 .background_spawn(async move {
                     let include = quick_open::IncludeRules::parse(&includes);
-                    let entries = quick_open::scan_with(&roots, &standalone, &include);
+                    // `index_roots`' only standalone root is home.
+                    let home = standalone.first().map(PathBuf::as_path);
+                    let entries = quick_open::scan_with(&roots, &standalone, &include, home);
                     quick_open::store_cache(&cache, &roots, &includes, &entries);
                     let snapshot = quick_open::build_snapshot(&entries, &projects, &cwds);
                     (entries, snapshot, includes, roots)
@@ -1145,8 +1147,7 @@ impl NavigationOverlay {
                     // `select` only records the id. The menu bar asks the
                     // window to show it; without that, Enter closes the
                     // palette and the terminal stays on the previous session.
-                    self.store
-                        .enqueue(crate::store::WindowAction::Select(id));
+                    self.store.enqueue(crate::store::WindowAction::Select(id));
                     self._runtime.publish_local_change();
                     self.close_overlay(window, cx);
                 } else {
