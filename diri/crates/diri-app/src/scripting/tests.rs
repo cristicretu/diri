@@ -240,7 +240,8 @@ fn a_mode_reads_keys_first_and_escape_leaves_it(cx: &mut TestAppContext) {
             .map(|mode| mode.name.clone())
     };
 
-    window.simulate_keystrokes(&crate::commands::test_chords("cmd-shift-r"));
+    // Script keys are bound as written (`cmd` is Super off macOS).
+    window.simulate_keystrokes("cmd-shift-r");
     assert_eq!(current().as_deref(), Some("resize"), "entered without the script thread");
     assert!(rx.try_recv().is_err());
     window.simulate_keystrokes(&crate::commands::test_chords("h"));
@@ -249,18 +250,18 @@ fn a_mode_reads_keys_first_and_escape_leaves_it(cx: &mut TestAppContext) {
         _ => panic!("a mode key reaches the script"),
     }
     // Exclusive: an unbound key is swallowed and the mode stays.
-    window.simulate_keystrokes(&crate::commands::test_chords("cmd-shift-j"));
+    window.simulate_keystrokes("cmd-shift-j");
     assert!(rx.try_recv().is_err());
     assert_eq!(current().as_deref(), Some("resize"));
     window.simulate_keystrokes(&crate::commands::test_chords("q"));
     assert_eq!(current(), None, "a binding can leave the mode");
 
-    window.simulate_keystrokes(&crate::commands::test_chords("cmd-shift-r"));
+    window.simulate_keystrokes("cmd-shift-r");
     window.simulate_keystrokes(&crate::commands::test_chords("escape"));
     assert_eq!(current(), None, "escape leaves a mode that does not bind it");
 
     // Once: the next key, bound or not, ends the mode.
-    window.simulate_keystrokes(&crate::commands::test_chords("cmd-shift-g"));
+    window.simulate_keystrokes("cmd-shift-g");
     window.simulate_keystrokes(&crate::commands::test_chords("t"));
     assert!(matches!(rx.try_recv(), Ok(Input::Binding { id: 5, .. })));
     assert_eq!(current(), None);

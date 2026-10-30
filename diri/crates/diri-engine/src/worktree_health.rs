@@ -712,7 +712,9 @@ mod tests {
             "sh",
             &[
                 "-c",
-                "i=0; while [ $i -lt 10000 ]; do printf '0123456789'; i=$((i+1)); done",
+                // 100 KB, past any pipe buffer, in one write: a 10 000-step
+                // shell loop can outlast the deadline on a loaded Windows runner.
+                "printf '%0100000d' 0",
             ],
             temp.path(),
             Duration::from_secs(3),

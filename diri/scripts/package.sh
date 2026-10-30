@@ -75,8 +75,14 @@ esac
 # Install the pinned toolchain once, here, if rustup has to: the background
 # Helper build and the foreground cargo below would otherwise both auto-install
 # it at once, and the loser fails with "the 'cargo' binary ... is not
-# applicable to the toolchain".
+# applicable to the toolchain". This RUSTUP_HOME may not be the one a CI step
+# added targets to, so add the ones this script builds for here (a no-op when
+# they are already installed).
 cargo --version >/dev/null
+if command -v rustup >/dev/null 2>&1; then
+    rustup target add aarch64-apple-darwin x86_64-apple-darwin \
+        aarch64-unknown-linux-musl x86_64-unknown-linux-musl >/dev/null
+fi
 
 # The remote Helper catalog shares nothing with the macOS products, so it builds
 # alongside them in its own target dir (one target dir admits one cargo at a
