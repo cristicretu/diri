@@ -276,11 +276,18 @@ impl Fixture {
         // The fake ssh runs in its own session (the Engine setsids it), so
         // its process group is the whole local+remote transport: ssh dying.
         let ssh = fs::read_to_string(self.control.join(format!("ssh.{current}"))).expect("ssh pid");
-        let status = std::process::Command::new("kill")
-            .args(["-9", &format!("-{}", ssh.trim())])
-            .status()
-            .expect("kill bridge");
-        assert!(status.success());
+        let group: libc::pid_t = ssh.trim().parse().expect("ssh pid");
+        // Signal the group directly: Ubuntu 24.04's procps `kill -9 -<pgid>`
+        // reads the group as a second signal option, kills nothing and still
+        // exits 0, so on Linux the transport never dropped.
+        // SAFETY: a plain kill(2) on the fake ssh's own process group.
+        let killed = unsafe { libc::kill(-group, libc::SIGKILL) };
+        assert_eq!(
+            killed,
+            0,
+            "kill transport group: {}",
+            std::io::Error::last_os_error()
+        );
         let next = current + 1;
         wait_until("Engine notices the drop", Duration::from_secs(10), || {
             connection_state(&self.session) == Some(RemoteConnectionState::Reconnecting)
