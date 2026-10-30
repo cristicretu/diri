@@ -29,6 +29,16 @@ pub const SESSION_REMOVED: &str = "session.removed";
 /// A program in a session posted a notification (OSC 9/777, an Agent's
 /// hook). `{session_id, title, body}`.
 pub const SESSION_NOTIFICATION: &str = "session.notification";
+/// A shell's working directory changed (`cd`). `{session, kind, from, to}`;
+/// the paths are the live terminal directory, not the launch `cwd`.
+pub const SESSION_CWD: &str = "session.cwd";
+/// The foreground program of a shell changed: `vim` started, or the shell
+/// is back at its prompt (`to` is nil). `{session, kind, from, to}`, names
+/// only, never arguments.
+pub const SESSION_PROGRAM: &str = "session.program";
+/// A program rang the terminal bell. `{session_id}`; bursts within the
+/// Engine's 150 ms publish tick arrive as one.
+pub const SESSION_BELL: &str = "session.bell";
 /// Workspaces, tabs or splits changed. The new snapshot.
 pub const WORKSPACE_UPDATED: &str = "workspace.updated";
 /// A schedule was created, changed, ran or was deleted. `{id}`.
@@ -53,6 +63,18 @@ pub const ALL: &[(&str, &str)] = &[
         "A session's title changed: {session, kind, from, to}.",
     ),
     (SESSION_REMOVED, "A session was closed: {id, reason}."),
+    (
+        SESSION_CWD,
+        "A shell's live working directory changed: {session, kind, from, to}.",
+    ),
+    (
+        SESSION_PROGRAM,
+        "A shell's foreground program changed (to is nil back at the prompt): {session, kind, from, to}.",
+    ),
+    (
+        SESSION_BELL,
+        "A program rang the terminal bell: {session_id}.",
+    ),
     (
         SESSION_NOTIFICATION,
         "A program posted a notification: {session_id, title, body}.",
@@ -83,6 +105,7 @@ pub const ENGINE_KINDS: &[&str] = &[
     EventName::SESSION_UPDATED,
     EventName::SESSION_REMOVED,
     EventName::SESSION_NOTIFICATION,
+    EventName::SESSION_BELL,
     EventName::WORKSPACE_UPDATED,
     EventName::SCHEDULE_UPDATED,
 ];
@@ -112,6 +135,8 @@ pub fn status_kind(record: &Value) -> &'static str {
 struct Seen {
     status: &'static str,
     title: String,
+    cwd: Option<String>,
+    program: Option<String>,
 }
 
 /// Turns Engine events into script events.
@@ -149,6 +174,10 @@ impl Deriver {
                     "body": params["body"].clone(),
                 }),
             )],
+            EventName::SESSION_BELL => vec![(
+                SESSION_BELL,
+                json!({"session_id": params["sessionId"].clone()}),
+            )],
             EventName::WORKSPACE_UPDATED => vec![(WORKSPACE_UPDATED, params)],
             EventName::SCHEDULE_UPDATED => vec![(SCHEDULE_UPDATED, params)],
             _ => Vec::new(),
@@ -171,6 +200,18 @@ impl Deriver {
             out.push((
                 SESSION_TITLE,
                 json!({"session": record, "kind": kind, "from": before.title, "to": now.title}),
+            ));
+        }
+        if before.cwd != now.cwd && now.cwd.is_some() {
+            out.push((
+                SESSION_CWD,
+                json!({"session": record, "kind": kind, "from": before.cwd, "to": now.cwd}),
+            ));
+        }
+        if before.program != now.program {
+            out.push((
+                SESSION_PROGRAM,
+                json!({"session": record, "kind": kind, "from": before.program, "to": now.program}),
             ));
         }
         if before.status != now.status {
@@ -204,9 +245,12 @@ pub fn kind_id(record: &Value) -> String {
 }
 
 fn seen(record: &Value) -> Seen {
+    let text = |key: &str| record[key].as_str().map(str::to_owned);
     Seen {
         status: status_kind(record),
         title: record["title"].as_str().unwrap_or_default().to_owned(),
+        cwd: text("terminalCwd"),
+        program: text("foregroundProgram"),
     }
 }
 
@@ -289,6 +333,34 @@ mod tests {
             kind_id(&json!({"kind": {"agent": {"id": "opencode"}}})),
             "opencode"
         );
+    }
+
+    #[test]
+    fn cwd_program_and_bell_become_their_own_events() {
+        let mut deriver = Deriver::default();
+        deriver.seed(&[json!({"id": "a", "status": {"idle": {}}, "terminalCwd": "/src"})]);
+        let moved = deriver.derive(
+            EventName::SESSION_UPDATED,
+            json!({"id": "a", "status": {"working": {}}, "terminalCwd": "/src/app",
+                   "foregroundProgram": "vim"}),
+        );
+        let names: Vec<&str> = moved.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, vec![SESSION_CWD, SESSION_PROGRAM, SESSION_STATUS]);
+        assert_eq!(moved[0].1["from"], "/src");
+        assert_eq!(moved[0].1["to"], "/src/app");
+        assert_eq!(moved[1].1["from"], Value::Null);
+        assert_eq!(moved[1].1["to"], "vim");
+
+        let back = deriver.derive(
+            EventName::SESSION_UPDATED,
+            json!({"id": "a", "status": {"working": {}}, "terminalCwd": "/src/app"}),
+        );
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].0, SESSION_PROGRAM);
+        assert_eq!(back[0].1["to"], Value::Null, "back at the prompt");
+
+        let bell = deriver.derive(EventName::SESSION_BELL, json!({"sessionId": "a"}));
+        assert_eq!(bell, vec![(SESSION_BELL, json!({"session_id": "a"}))]);
     }
 
     #[test]

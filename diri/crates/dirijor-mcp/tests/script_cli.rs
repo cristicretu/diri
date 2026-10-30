@@ -355,3 +355,26 @@ fn new_opens_a_shell_tab_and_prints_its_id() {
     assert!(record["kind"].get("shell").is_some(), "{record}");
     fixture.ok(&["session", "release", &id, "--remove"]);
 }
+
+#[test]
+fn a_script_waits_for_a_bell_from_a_real_terminal() {
+    let fixture = Fixture::new();
+    let id = fixture
+        .ok(&[
+            "run",
+            "--",
+            "/bin/sh",
+            "-c",
+            "while :; do printf '\\a'; sleep 0.2; done",
+        ])
+        .trim()
+        .to_owned();
+    let heard = fixture.ok(&[
+        "script",
+        "-e",
+        "local e = diri.wait('session.bell', {session_id = diri.args.id}, 10000)\n\
+         print(e and ('rang ' .. e.session_id) or 'timeout')",
+        &format!("id={id}"),
+    ]);
+    assert_eq!(heard.trim(), format!("rang {id}"));
+}

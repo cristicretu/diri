@@ -291,6 +291,10 @@ impl EventName {
     pub const SESSION_NOTIFICATION: &'static str = "session.notification";
     /// A program in the session wrote the clipboard with OSC 52.
     pub const SESSION_CLIPBOARD: &'static str = "session.clipboard";
+    /// A program in the session rang the terminal bell (`{"sessionId"}`).
+    /// One per Engine publish tick however many rang; only subscribers that
+    /// ask for it by name receive it.
+    pub const SESSION_BELL: &'static str = "session.bell";
     pub const SESSION_UPDATED: &'static str = "session.updated";
     /// Coverage-gap marker: the Engine evicted events this subscriber never
     /// saw. Sequence zero; `dropped`, `fromSeq`, `toSeq` in the params.
