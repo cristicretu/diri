@@ -12,6 +12,13 @@ diri-platform.workspace = true
 diri-proto = { workspace = true, features = ["schema"] }
 mlua.workspace = true
 serde_json.workspace = true
+# SHA-256 of a script's text: a stored exec grant is tied to one version of
+# the file, so an edited script is asked again.
+sha2.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Kills the process group a timed-out `diri.exec` started.
+libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true

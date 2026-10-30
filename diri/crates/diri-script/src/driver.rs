@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use crate::engine::{self, EngineClient};
 use crate::events::{self, Deriver};
-use crate::{Host, Layer, Level, LoadError, Options, Runtime};
+use crate::{Host, Layer, Level, LoadError, Options, Reply, Runtime, Waker};
 
 /// Edits often land as several writes; a reload waits this long for quiet.
 const RELOAD_SETTLE: Duration = Duration::from_millis(120);
@@ -40,10 +40,21 @@ pub enum Input {
         name: String,
         payload: Value,
     },
-    /// A key bound to a script function, by binding id.
-    Binding(u64),
-    /// A script palette command, by id.
-    Command(u64),
+    /// A key bound to a script function, by binding id. `context` is what
+    /// the function receives: `{session, pane, window, origin}`.
+    Binding {
+        id: u64,
+        context: Value,
+    },
+    /// A script palette command, by id; run from the palette, or by name
+    /// through `app.perform` with `reply` waiting for its result.
+    Command {
+        id: u64,
+        context: Value,
+        reply: Option<Reply>,
+    },
+    /// A process `diri.exec` started printed or ended.
+    Wake,
     /// The script file changed.
     Reload,
     /// A REPL line; the answer goes back on `reply`.
@@ -152,6 +163,10 @@ impl Driver {
 
     fn build(&mut self) -> Result<Runtime, LoadError> {
         let mut options = self.config.options.clone();
+        let tx = self.tx.clone();
+        options.waker = Some(Waker(std::sync::Arc::new(move || {
+            let _ = tx.send(Input::Wake);
+        })));
         if let Source::File(path) = &self.config.source
             && options.root.is_none()
         {
@@ -225,14 +240,22 @@ impl Driver {
                     runtime.emit(&name, &payload);
                 }
             }
-            Input::Binding(id) => {
+            Input::Binding { id, context } => {
                 if let Some(runtime) = &self.runtime {
-                    runtime.run_binding(id);
+                    runtime.run_binding(id, &context);
                 }
             }
-            Input::Command(id) => {
+            Input::Command { id, context, reply } => match &self.runtime {
+                Some(runtime) => runtime.run_command(id, &context, reply),
+                None => {
+                    if let Some(reply) = reply {
+                        reply(Err("the script did not load".into()));
+                    }
+                }
+            },
+            Input::Wake => {
                 if let Some(runtime) = &self.runtime {
-                    runtime.run_command(id);
+                    runtime.pump();
                 }
             }
             Input::Eval { code, reply } => {
@@ -398,6 +421,20 @@ fn read_events(socket: &std::path::Path, build: &str, tx: &Sender<Input>) {
 pub struct ConsoleHost {
     client: EngineClient,
     context: &'static str,
+    grants: ConsoleGrants,
+}
+
+/// How `dirijor script` answers `diri.require_grant`: programs allowed on
+/// the command line, answers remembered per file version, else asking at
+/// the terminal. With no terminal and no flag, nothing is granted.
+#[derive(Clone, Debug, Default)]
+pub struct ConsoleGrants {
+    /// `--allow-exec PROG`.
+    pub allow: Vec<String>,
+    /// Remembered "always" answers, by the script's SHA-256.
+    pub store: Option<PathBuf>,
+    /// Whether to ask at the terminal (`/dev/tty`).
+    pub ask: bool,
 }
 
 impl ConsoleHost {
@@ -405,7 +442,13 @@ impl ConsoleHost {
         Self {
             client: EngineClient::new(socket, build),
             context: "cli",
+            grants: ConsoleGrants::default(),
         }
+    }
+
+    pub fn with_grants(mut self, grants: ConsoleGrants) -> Self {
+        self.grants = grants;
+        self
     }
 }
 
@@ -439,5 +482,181 @@ impl Host for ConsoleHost {
 
     fn context(&self) -> &'static str {
         self.context
+    }
+
+    fn grant(&mut self, request: &crate::GrantRequest) -> bool {
+        let missing: Vec<String> = request
+            .exec
+            .iter()
+            .filter(|program| !self.grants.allow.contains(program))
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            return true;
+        }
+        if let Some(store) = &self.grants.store
+            && grants::remembered(store, &request.digest, &missing)
+        {
+            return true;
+        }
+        let asked = if self.grants.ask {
+            grants::ask(&request.script, &missing)
+        } else {
+            None
+        };
+        match asked {
+            Some(grants::Answer::Once) => true,
+            Some(grants::Answer::Always) => {
+                if let Some(store) = &self.grants.store
+                    && let Err(error) = grants::remember(store, request, &missing)
+                {
+                    eprintln!("dirijor: could not remember the answer: {error}");
+                }
+                true
+            }
+            Some(grants::Answer::No) => false,
+            None => {
+                eprintln!(
+                    "dirijor: {} asks to run {}; allow it with --allow-exec {}, or run it from a terminal to be asked",
+                    request.script,
+                    missing.join(", "),
+                    missing.join(" --allow-exec ")
+                );
+                false
+            }
+        }
+    }
+}
+
+/// Remembered exec grants for `dirijor script`: a small owner-only JSON
+/// file in Diri's state directory, keyed by the script's SHA-256, so an
+/// edited script is asked again.
+pub mod grants {
+    #[cfg(unix)]
+    use std::io::{BufRead, Write};
+    use std::path::{Path, PathBuf};
+
+    use serde_json::{Value, json};
+
+    use crate::GrantRequest;
+
+    pub enum Answer {
+        Once,
+        Always,
+        No,
+    }
+
+    /// `<state dir>/script-grants.json`.
+    pub fn default_store() -> Option<PathBuf> {
+        diri_platform::home_dir()
+            .map(|home| diri_proto::paths::DirijorPaths::state_dir(home).join("script-grants.json"))
+    }
+
+    fn read(store: &Path) -> Value {
+        std::fs::read(store)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_else(|| json!({"grants": []}))
+    }
+
+    /// Whether every one of `programs` was granted "always" to this exact
+    /// version of the script.
+    pub fn remembered(store: &Path, digest: &str, programs: &[String]) -> bool {
+        let file = read(store);
+        let granted: Vec<&str> = file["grants"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|grant| grant["digest"] == digest)
+            .flat_map(|grant| grant["exec"].as_array().into_iter().flatten())
+            .filter_map(Value::as_str)
+            .collect();
+        programs
+            .iter()
+            .all(|program| granted.contains(&program.as_str()))
+    }
+
+    pub fn remember(
+        store: &Path,
+        request: &GrantRequest,
+        programs: &[String],
+    ) -> std::io::Result<()> {
+        let mut file = read(store);
+        if !file["grants"].is_array() {
+            file = json!({"grants": []});
+        }
+        file["grants"]
+            .as_array_mut()
+            .expect("an array")
+            .push(json!({
+                "digest": request.digest,
+                "script": request.script,
+                "exec": programs,
+            }));
+        if let Some(dir) = store.parent() {
+            diri_platform::private::create_dir_all(dir)?;
+        }
+        let text = serde_json::to_vec_pretty(&file).map_err(std::io::Error::other)?;
+        diri_platform::private::write(store, text)
+    }
+
+    /// Asks at the controlling terminal. `None` when there is none.
+    #[cfg(unix)]
+    pub fn ask(script: &str, programs: &[String]) -> Option<Answer> {
+        let tty = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .ok()?;
+        let mut writer = tty.try_clone().ok()?;
+        let _ = write!(
+            writer,
+            "{script} asks to run: {}\nAllow? [y] this run, [a] always for this version of the file, [N] no: ",
+            programs.join(", ")
+        );
+        let _ = writer.flush();
+        let mut line = String::new();
+        std::io::BufReader::new(tty).read_line(&mut line).ok()?;
+        Some(match line.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => Answer::Once,
+            "a" | "always" => Answer::Always,
+            _ => Answer::No,
+        })
+    }
+
+    /// Asks at the controlling terminal: not on this platform yet.
+    #[cfg(not(unix))]
+    pub fn ask(_script: &str, _programs: &[String]) -> Option<Answer> {
+        None
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn an_always_answer_holds_for_that_version_of_the_file_only() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = dir.path().join("state/script-grants.json");
+            let request = GrantRequest {
+                exec: vec!["git".into()],
+                script: "deploy.lua".into(),
+                digest: "abc".into(),
+            };
+            assert!(!remembered(&store, "abc", &request.exec));
+            remember(&store, &request, &request.exec).unwrap();
+            assert!(remembered(&store, "abc", &request.exec));
+            assert!(
+                !remembered(&store, "abd", &request.exec),
+                "an edit asks again"
+            );
+            assert!(!remembered(&store, "abc", &["curl".into()]));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&store).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600);
+            }
+        }
     }
 }

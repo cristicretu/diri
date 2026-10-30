@@ -80,8 +80,30 @@ pub fn action_name(lua_key: &str) -> String {
 
 /// Core `diri` functions. A method namespace may never shadow one.
 pub const CORE: &[&str] = &[
-    "on", "off", "call", "action", "actions", "keymap", "command", "notify", "log", "after",
-    "every", "stop", "json", "inspect", "methods", "events", "context", "version",
+    "on",
+    "off",
+    "call",
+    "action",
+    "actions",
+    "keymap",
+    "command",
+    "notify",
+    "log",
+    "after",
+    "every",
+    "stop",
+    "json",
+    "inspect",
+    "methods",
+    "events",
+    "context",
+    "version",
+    "sleep",
+    "wait",
+    "exec",
+    "require_grant",
+    "args",
+    "session_id",
 ];
 
 /// The API reference: core functions, events, Engine methods, app actions.
@@ -255,22 +277,76 @@ function diri.call(method, params, opts) end
 ---@return any
 function diri.action(name, args) end
 
----Bind keys to an action name, `{action=, args=}`, or a function. The
----shortcuts a person records in Settings still win over these.
----@param keys string  e.g. "cmd-shift-d" or "ctrl-a c"
----@param target string|table|fun()
+---Where a key or command ran: the focused session and pane, the window, and
+---what started it ("key", "mode", "palette", "cli", "agent", "script").
+---A command run by name also gets its `args`.
+---@class diri.Context
+---@field session? string
+---@field pane? string
+---@field window? integer
+---@field origin string
+---@field args? table
+---@field actor? string
+
+---Bind keys to an action name, `{action=, args=}`, `{mode = "name"}` (enter
+---a mode), `{mode = false}` (leave it), or a function. `"mode/key"` binds a
+---key inside a mode. The shortcuts a person records in Settings still win.
+---@param keys string  e.g. "cmd-shift-d", "ctrl-a c" or "resize/h"
+---@param target string|table|fun(ctx: diri.Context)
 ---@param opts? {desc?: string}
 ---@return integer
 function diri.keymap.set(keys, target, opts) end
 
----Free a key from its default command.
+---Free a key from its default command, or a key inside a mode.
 ---@param keys string
 function diri.keymap.del(keys) end
 
----Add a command to the palette.
----@param spec {name: string, title?: string, run: string|fun(), args?: table}
+---Declare a key mode. `exclusive` swallows keys the mode does not bind;
+---`once` leaves after the next key. Escape leaves a mode that does not bind it.
+---@param name string
+---@param opts? {exclusive?: boolean, once?: boolean, desc?: string}
+---@return string
+function diri.keymap.mode(name, opts) end
+
+---Enter a key mode from a callback (needs the app).
+---@param name string
+function diri.keymap.enter(name) end
+
+---Leave the key mode that is on.
+function diri.keymap.exit() end
+
+---Add a command to the palette, also run by name as `script.NAME`
+---(`dirijor do script.NAME k=v`); what `run` returns is the answer.
+---@param spec {name: string, title?: string, run: string|fun(ctx: diri.Context): any, args?: table, desc?: string, destructive?: boolean}
 ---@return integer
 function diri.command(spec) end
+
+---Pause this callback (or the script's top level) for `ms` milliseconds,
+---without blocking anything else.
+---@param ms number
+function diri.sleep(ms) end
+
+---Pause until `event` happens with a payload matching `filter` (fields to
+---equal, `{session = id}` matching a record's id, or a function). Returns
+---the payload, or nil after `timeout_ms`.
+---@param event diri.Event
+---@param filter? table|fun(payload: table): boolean
+---@param timeout_ms? number
+---@return table|nil
+function diri.wait(event, filter, timeout_ms) end
+
+---Ask to run programs with diri.exec. Granted in init.lua; asked at the
+---terminal (or `--allow-exec`) for `dirijor script`. Returns whether granted.
+---@param spec {exec: string[]}
+---@return boolean
+function diri.require_grant(spec) end
+
+---Run a granted program: an argv, never a shell string. Output is kept up
+---to 1 MiB per stream; `on_output(line, stream)` sees it as it arrives.
+---@param argv string[]
+---@param opts? {timeout?: number, cwd?: string, env?: table<string, string>, stdin?: string, on_output?: fun(line: string, stream: "stdout"|"stderr")}
+---@return {ok: boolean, code?: integer, signal?: integer, stdout: string, stderr: string, timed_out: boolean, truncated: boolean, error?: string}
+function diri.exec(argv, opts) end
 
 ---Show a toast in the window (stderr from `dirijor script`).
 ---@param message string
@@ -292,8 +368,9 @@ function diri.after(seconds, fn) end
 ---@return integer
 function diri.every(seconds, fn) end
 
----End a `dirijor script` run.
-function diri.stop() end
+---End a `dirijor script` run, with this exit code (default 0).
+---@param code? integer
+function diri.stop(code) end
 
 ---Render a value as readable text.
 ---@return string
@@ -315,6 +392,14 @@ diri.events = {}
 ---"app" inside Diri, "cli" from `dirijor script`.
 ---@type string
 diri.context = ""
+
+---What `dirijor script FILE k=v` or `--args JSON` passed; `{}` otherwise.
+---@type table
+diri.args = {}
+
+---The session the script runs in (`$DIRIJOR_SESSION_ID`), or nil.
+---@type string|nil
+diri.session_id = nil
 
 "#;
 

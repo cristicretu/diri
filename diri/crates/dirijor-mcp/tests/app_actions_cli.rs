@@ -90,13 +90,14 @@ fn fake_app(socket: &Path) -> (Arc<Mutex<Vec<Value>>>, std::thread::JoinHandle<(
             "build": "fake",
             "actions": [
                 {"name": "toggle-sidebar", "title": "Toggle Sidebar", "args": {"type":"object","properties":{},"additionalProperties":false}},
+                {"name": "list-keys", "title": "List Key Bindings", "args": {"type":"object","properties":{},"additionalProperties":false}},
                 {"name": "select-tab", "title": "Select Tab", "args": {"type":"object","properties":{"index":{"type":"integer","minimum":-1,"maximum":9}},"required":["index"],"additionalProperties":false}}
             ]
         }}),
     );
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
-    assert!(line.contains("\"registered\":2"), "{line}");
+    assert!(line.contains("\"registered\":3"), "{line}");
     let asked = Arc::new(Mutex::new(Vec::new()));
     let record = asked.clone();
     let worker = std::thread::spawn(move || {
@@ -113,11 +114,22 @@ fn fake_app(socket: &Path) -> (Arc<Mutex<Vec<Value>>>, std::thread::JoinHandle<(
             let request = message["params"].clone();
             record.lock().unwrap().push(request.clone());
             next += 1;
+            let result = if request["action"] == "list-keys" {
+                json!({
+                    "bindings": [
+                        {"keys": "cmd-b", "action": "toggle-sidebar", "source": "default"},
+                        {"keys": "h", "mode": "resize", "action": "pane-shrink-width", "source": "init.lua:4"},
+                    ],
+                    "modes": [{"name": "resize", "exclusive": true, "once": false, "source": "init.lua:2"}],
+                })
+            } else {
+                json!({"ran": request["action"], "args": request["args"]})
+            };
             send(
                 &mut stream,
                 json!({"id": next, "method": Method::APP_REPLY, "params": {
                     "requestId": request["requestId"],
-                    "result": {"ran": request["action"], "args": request["args"]}
+                    "result": result
                 }}),
             );
         }
@@ -162,6 +174,14 @@ fn the_cli_runs_app_actions_and_describes_the_api() {
     assert!(!bad.status.success());
     assert!(String::from_utf8_lossy(&bad.stderr).contains("invalid_args"));
     assert_eq!(asked.lock().unwrap().len(), 1);
+
+    let keymap = server.command(&["keymap"], None);
+    assert!(keymap.status.success(), "{}", text(&keymap.stderr));
+    let keymap = text(&keymap.stdout);
+    assert!(keymap.starts_with("KEY"), "{keymap}");
+    assert!(keymap.contains("resize/h"), "{keymap}");
+    assert!(keymap.contains("init.lua:4"), "{keymap}");
+    assert!(keymap.contains("exclusive"), "{keymap}");
 
     let api = server.command(&["api", "list", "--json"], None);
     let api: Value = serde_json::from_slice(&api.stdout).unwrap();
@@ -240,5 +260,99 @@ end)
         "stdout: {}\nstderr: {}",
         text(&listened.stdout),
         text(&listened.stderr)
+    );
+}
+
+#[test]
+fn a_script_takes_arguments_its_session_and_an_exit_code() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = Server::start(temp.path());
+    let echoed = server.command(
+        &[
+            "script",
+            "-e",
+            "print(diri.args.branch, diri.args.count + 1, diri.session_id)",
+            "branch=main",
+            "count=2",
+        ],
+        Some("s_inside"),
+    );
+    assert!(echoed.status.success(), "{}", text(&echoed.stderr));
+    assert_eq!(text(&echoed.stdout).trim(), "main\t3\ts_inside");
+
+    let stopped = server.command(&["script", "-e", "diri.stop(3)"], None);
+    assert_eq!(stopped.status.code(), Some(3), "{}", text(&stopped.stderr));
+
+    // A wait in the top level: the script runs until it is satisfied.
+    let slept = server.command(&["script", "-e", "diri.sleep(50) print('after')"], None);
+    assert!(slept.status.success(), "{}", text(&slept.stderr));
+    assert_eq!(text(&slept.stdout).trim(), "after");
+}
+
+#[test]
+fn check_validates_without_running() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = Server::start(temp.path());
+    let good = temp.path().join("good.lua");
+    std::fs::write(
+        &good,
+        "diri.keymap.mode('resize', {exclusive = true})\n\
+         diri.keymap.set('resize/h', 'pane-shrink-width')\n\
+         diri.on('session.status', function() end)\n\
+         diri.require_grant{exec = {'git'}}\n\
+         diri.session.spawn{kind = 'shell', cwd = '/tmp'}\n\
+         error('not run')\n",
+    )
+    .unwrap();
+    let checked = server.command(&["script", "--check", good.to_str().unwrap()], None);
+    assert!(checked.status.success(), "{}", text(&checked.stderr));
+    let report = text(&checked.stdout);
+    assert!(
+        report.contains("1 key, 1 mode, 0 commands, 1 handler"),
+        "{report}"
+    );
+    assert!(report.contains("asks to run: git"), "{report}");
+    assert!(report.contains("stopped at good.lua:5"), "{report}");
+    let listed = server.command(&["session", "list", "--json"], None);
+    assert!(
+        !text(&listed.stdout).contains("\"kind\""),
+        "a check spawns nothing"
+    );
+
+    let bad = temp.path().join("bad.lua");
+    std::fs::write(&bad, "diri.on('focus', function()\n").unwrap();
+    let failed = server.command(&["script", "--check", bad.to_str().unwrap()], None);
+    assert_eq!(failed.status.code(), Some(1));
+    assert!(
+        text(&failed.stderr).contains("bad.lua:"),
+        "{}",
+        text(&failed.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_runs_only_granted_programs_and_streams_their_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = Server::start(temp.path());
+    let code = "local ok = diri.require_grant{exec = {'sh'}}\n\
+                if not ok then print('denied') return end\n\
+                local r = diri.exec({'sh', '-c', 'echo one; echo two'}, {\n\
+                  on_output = function(line, stream) print(stream, line) end})\n\
+                print('code', r.code)";
+    let denied = server.command(&["script", "-e", code], None);
+    assert!(denied.status.success(), "{}", text(&denied.stderr));
+    assert_eq!(text(&denied.stdout).trim(), "denied");
+    assert!(
+        text(&denied.stderr).contains("--allow-exec sh"),
+        "{}",
+        text(&denied.stderr)
+    );
+
+    let allowed = server.command(&["script", "-e", code, "--allow-exec", "sh"], None);
+    assert!(allowed.status.success(), "{}", text(&allowed.stderr));
+    assert_eq!(
+        text(&allowed.stdout).trim(),
+        "stdout\tone\nstdout\ttwo\ncode\t0"
     );
 }

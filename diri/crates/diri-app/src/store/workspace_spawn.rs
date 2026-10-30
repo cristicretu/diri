@@ -13,6 +13,13 @@ const MAX_RECEIPTS: usize = 32;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct SpawnOwner(u64);
 
+impl SpawnOwner {
+    /// A number that names this window for its lifetime (scripts' `window`).
+    pub fn number(self) -> u64 {
+        self.0
+    }
+}
+
 impl Default for SpawnOwner {
     fn default() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);

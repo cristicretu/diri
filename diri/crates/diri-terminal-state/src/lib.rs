@@ -39,6 +39,7 @@ pub use program_status::{
     QUERY_REPLY as PROGRAM_STATUS_QUERY_REPLY,
 };
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
@@ -474,7 +475,7 @@ impl Dimensions for Geometry {
 /// its latest value, and replies are bounded by [`MAX_PENDING_EVENTS`] per
 /// parse, a backstop that no program answering its own queries reaches.
 #[derive(Clone)]
-struct Collector(Arc<Mutex<Inbox>>);
+struct Collector(Arc<Mutex<Inbox>>, Arc<AtomicBool>);
 
 #[derive(Default)]
 struct Inbox {
@@ -505,7 +506,10 @@ impl EventListener for Collector {
                     inbox.events.push(event);
                 }
             }
-            // Bells, mouse-cursor, blink and other notices: nothing reads them.
+            // A flag, not a queue: a burst of bells is one ring, and setting
+            // it never takes the inbox lock.
+            Event::Bell => self.1.store(true, Ordering::Relaxed),
+            // Mouse-cursor, blink and other notices: nothing reads them.
             _ => {}
         }
     }
@@ -521,6 +525,9 @@ pub struct HeadlessScreen {
     term: Emu,
     parser: Processor,
     events: Arc<Mutex<Inbox>>,
+    /// Set when a program rings the bell (BEL outside a string); see
+    /// [`HeadlessScreen::take_bell`].
+    bell: Arc<AtomicBool>,
     /// Drained events, kept to reuse the allocation.
     drained_events: Vec<Event>,
     geometry: Geometry,
@@ -652,12 +659,18 @@ impl HeadlessScreen {
             default_cursor_style: DEFAULT_CURSOR,
             ..Config::default()
         };
-        let term = Emu::create(config, &geometry, Collector(Arc::clone(&events)));
+        let bell = Arc::new(AtomicBool::new(false));
+        let term = Emu::create(
+            config,
+            &geometry,
+            Collector(Arc::clone(&events), Arc::clone(&bell)),
+        );
         let mut screen = Self {
             keyboard_enhancements_known: true,
             term,
             parser: Processor::new(),
             events,
+            bell,
             drained_events: Vec::new(),
             geometry,
             title: None,
@@ -950,6 +963,12 @@ impl HeadlessScreen {
     /// program cleared them, the terminal was reset, or the program ended.
     pub fn program_status_removal(&self) -> Option<ProgramRemoval> {
         self.notifications.as_ref()?.program.removal()
+    }
+
+    /// Whether a program rang the bell since the last call. One relaxed
+    /// atomic swap, cheap enough to call after every feed.
+    pub fn take_bell(&self) -> bool {
+        self.bell.swap(false, Ordering::Relaxed)
     }
 
     pub fn take_notifications(&mut self) -> Vec<TerminalNotification> {
@@ -4070,6 +4089,17 @@ mod tests {
         // A repeat of the same value still counts as a report.
         screen.feed(b"\x1b]9;4;1\x07");
         assert_eq!(screen.progress_reports(), reports + 1);
+    }
+
+    #[test]
+    fn a_bell_is_one_flag_and_a_string_terminator_is_not_a_bell() {
+        let mut screen = HeadlessScreen::new(20, 4);
+        assert!(!screen.take_bell());
+        screen.feed(b"\x1b]0;title\x07\x1b]9;4;1;5\x07");
+        assert!(!screen.take_bell(), "BEL ending an OSC is not a ring");
+        screen.feed(b"a\x07b\x07\x07");
+        assert!(screen.take_bell());
+        assert!(!screen.take_bell(), "taken once per burst");
     }
 
     #[test]

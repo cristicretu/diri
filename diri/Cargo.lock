@@ -1823,8 +1823,10 @@ version = "0.1.0"
 dependencies = [
  "diri-platform",
  "diri-proto",
+ "libc",
  "mlua",
  "serde_json",
+ "sha2 0.11.1",
  "tempfile",
 ]
 

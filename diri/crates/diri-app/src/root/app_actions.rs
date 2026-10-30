@@ -16,12 +16,49 @@ impl RootView {
     pub(super) fn perform_app_actions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for request in self.window_store.take_app_performs() {
             let id = request.request_id;
+            if crate::scripting::is_script_action(&request.action) {
+                // A script command answers when its function returns, on
+                // the script thread; the window does not wait for it.
+                match crate::scripting::perform(&request) {
+                    Ok(answer) => {
+                        cx.spawn(async move |this, cx| {
+                            let result = answer.await.unwrap_or_else(|_| {
+                                Err(ControlError::new(
+                                    "script_error",
+                                    "the script stopped before it answered",
+                                ))
+                            });
+                            let _ = this.update(cx, |this, _| {
+                                this.window_store
+                                    .write()
+                                    .expect("store")
+                                    .reply_app_perform(id, result);
+                            });
+                        })
+                        .detach();
+                    }
+                    Err(error) => self
+                        .window_store
+                        .write()
+                        .expect("store")
+                        .reply_app_perform(id, Err(error)),
+                }
+                continue;
+            }
             let result = self.perform_app_action(&request, window, cx);
             self.window_store
                 .write()
                 .expect("store")
                 .reply_app_perform(id, result);
         }
+    }
+
+    /// Publishes the window's actions again: the script's commands changed.
+    pub(crate) fn republish_app_actions(&mut self) {
+        self.window_store
+            .write()
+            .expect("store")
+            .request_app_actions_publish();
     }
 
     fn perform_app_action(
@@ -92,6 +129,7 @@ impl RootView {
                     .archive_sessions(vec![id.clone()]);
                 Ok(json!({"archived": id.0}))
             }
+            Resolved::ListKeys => Ok(crate::scripting::keymap_listing()),
             Resolved::SetTheme(theme) => {
                 self.window_store
                     .write()
