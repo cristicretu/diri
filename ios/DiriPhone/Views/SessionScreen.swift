@@ -26,6 +26,11 @@ struct SessionScreen: View {
     var body: some View {
         if let client = model.client(for: sessionID) {
             content(TerminalRegistry.shared.session(for: sessionID, client: client), client: client)
+        } else if let terminal = TerminalRegistry.shared.existingSession(sessionID) {
+            // The computer stopped answering probes. Keep the screen it was
+            // showing, dimmed, while the terminal keeps trying to resume:
+            // a spinner here would throw away exactly what you were reading.
+            content(terminal, client: terminal.client)
         } else {
             ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity).background(Tokens.Ink.background)
         }
@@ -70,6 +75,8 @@ struct SessionScreen: View {
                         onFocus: { focused in typing = focused }
                     )
                     .accessibilityIdentifier("terminal-host")
+                    .opacity(terminal.stale ? 0.5 : 1)
+                    .animation(.easeOut(duration: 0.25), value: terminal.stale)
 
                     // Fades the terminal out under the bars so text never
                     // collides with the title or the composer.
@@ -256,7 +263,9 @@ struct SessionScreen: View {
     @ViewBuilder
     private func linkBanner(_ terminal: TerminalSession) -> some View {
         switch terminal.link {
-        case let .reconnecting(detail):
+        // Only once the screen is stale: a quick resume after unlocking
+        // should not flash a banner.
+        case let .reconnecting(detail) where terminal.stale:
             Text(detail)
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(Tokens.Ink.attention)

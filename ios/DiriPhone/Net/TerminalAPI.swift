@@ -6,6 +6,8 @@ extension DiriClient {
     enum TerminalEvent: Sendable {
         case snapshot(GridSnapshot)
         case diff(GridDiff)
+        /// The answer to `?resume=`: only the rows that changed while away.
+        case resume(GridDiff)
         case exit
     }
 
@@ -38,18 +40,28 @@ extension DiriClient {
     /// `diri-web` answers 404, and the phone falls back to polling `/screen`.
     enum StreamOutcome: Sendable { case ended, unsupported, unauthorized }
 
-    /// The live grid. The first event is a full snapshot; diffs follow. The
-    /// stream ends when the connection drops — the caller reconnects and gets
-    /// a fresh snapshot, so a missed diff can never leave the screen wrong.
-    func terminalStream(sessionID: String) -> (AsyncStream<TerminalEvent>, Task<StreamOutcome, Never>) {
+    /// Silence after which a stream is presumed dead: two missed heartbeats.
+    static let streamStallTimeout: TimeInterval = 45
+
+    /// The live grid. The first event is a full snapshot — or, when `resume`
+    /// describes what the phone still shows, a `resume` of only the rows that
+    /// differ — and diffs follow. The stream ends when the connection drops;
+    /// the caller reconnects, so a missed diff can never leave the screen
+    /// wrong. A gateway without resume ignores the query and sends a snapshot.
+    func terminalStream(sessionID: String, resume: String? = nil) -> (AsyncStream<TerminalEvent>, Task<StreamOutcome, Never>) {
         var continuation: AsyncStream<TerminalEvent>.Continuation!
         let stream = AsyncStream<TerminalEvent>(bufferingPolicy: .unbounded) { continuation = $0 }
         let output = continuation!
         let task = Task<StreamOutcome, Never> {
             defer { output.finish() }
             do {
-                var request = try request("/api/session/\(escape(sessionID))/stream")
-                request.timeoutInterval = 60
+                var path = "/api/session/\(escape(sessionID))/stream"
+                if let resume { path += "?resume=" + resume }
+                var request = try request(path)
+                // The gateway writes a heartbeat every 20 s. Two missed ones
+                // mean the connection is gone (a Wi-Fi to cellular hop often
+                // leaves the old socket open but silent): give up and resume.
+                request.timeoutInterval = Self.streamStallTimeout
                 request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
                 let (bytes, response) = try await session.bytes(for: request)
                 guard let http = response as? HTTPURLResponse else { return .ended }
@@ -67,6 +79,8 @@ extension DiriClient {
                             if let value = try? decoder.decode(GridSnapshot.self, from: data) { output.yield(.snapshot(value)) }
                         case "diff":
                             if let value = try? decoder.decode(GridDiff.self, from: data) { output.yield(.diff(value)) }
+                        case "resume":
+                            if let value = try? decoder.decode(GridDiff.self, from: data) { output.yield(.resume(value)) }
                         case "exit":
                             output.yield(.exit)
                         default:
