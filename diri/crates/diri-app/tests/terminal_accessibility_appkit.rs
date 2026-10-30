@@ -179,12 +179,20 @@ mod appkit {
         let gpui_view = AnyClass::get(c"GPUIView").expect("gpui_macos registers GPUIView");
         let selector = sel!(accessibilityFocusedUIElement);
         unsafe {
-            let class = objc_allocateClassPair(NSView::class(), c"DiriTestGpuiHost".as_ptr(), 0);
-            assert!(!class.is_null());
-            let imp = class_getMethodImplementation(gpui_view, selector).expect("patched method");
-            assert!(class_addMethod(class, selector, imp, c"@@:".as_ptr()));
-            objc_registerClassPair(class);
-            let object: *mut AnyObject = msg_send![&*class, alloc];
+            let class: &AnyClass = match AnyClass::get(c"DiriTestGpuiHost") {
+                Some(class) => class,
+                None => {
+                    let class =
+                        objc_allocateClassPair(NSView::class(), c"DiriTestGpuiHost".as_ptr(), 0);
+                    assert!(!class.is_null());
+                    let imp =
+                        class_getMethodImplementation(gpui_view, selector).expect("patched method");
+                    assert!(class_addMethod(class, selector, imp, c"@@:".as_ptr()));
+                    objc_registerClassPair(class);
+                    &*class
+                }
+            };
+            let object: *mut AnyObject = msg_send![class, alloc];
             let object: *mut AnyObject = msg_send![object, initWithFrame: frame];
             Retained::from_raw(object.cast::<NSView>()).expect("host view")
         }
@@ -193,6 +201,7 @@ mod appkit {
     pub(super) fn verify() {
         let mtm = MainThreadMarker::new().expect("AppKit test must run on the main thread");
         let frame = NSRect::new(NSPoint::new(200.0, 300.0), NSSize::new(400.0, 300.0));
+        plain_siblings(mtm, frame);
         // Never ordered front: no window appears on screen.
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -361,6 +370,53 @@ mod appkit {
             "a closed terminal is not exposed"
         );
         drop(other);
+        window.close();
+    }
+
+    /// A floating panel's window: GPUI's view beside its blur view and an
+    /// ordinary control, no terminal. AppKit's own `isAccessibilityFocused`
+    /// asks the window for its focused element, so the patch used to recurse
+    /// until the stack overflowed on the panel's first `makeFirstResponder`.
+    fn plain_siblings(mtm: MainThreadMarker, frame: NSRect) {
+        let window = unsafe {
+            NSWindow::initWithContentRect_styleMask_backing_defer(
+                mtm.alloc(),
+                frame,
+                NSWindowStyleMask::Titled,
+                NSBackingStoreType::Buffered,
+                false,
+            )
+        };
+        unsafe { window.setReleasedWhenClosed(false) };
+        let content = window.contentView().expect("content view");
+        let blur: Retained<NSView> = unsafe {
+            let blur: *mut AnyObject = msg_send![objc2::class!(NSVisualEffectView), alloc];
+            let blur: *mut AnyObject = msg_send![blur, initWithFrame: content.bounds()];
+            Retained::from_raw(blur.cast()).expect("blur view")
+        };
+        content.addSubview(&blur);
+        let button: Retained<NSView> = unsafe {
+            let button: *mut AnyObject = msg_send![objc2::class!(NSButton), alloc];
+            let button: *mut AnyObject = msg_send![button, initWithFrame: content.bounds()];
+            Retained::from_raw(button.cast()).expect("button")
+        };
+        content.addSubview(&button);
+        let host = gpui_focus_host(content.bounds());
+        content.addSubview(&host);
+        // Key, as a panel is when it opens; far off screen so nothing shows.
+        window.setFrameOrigin(NSPoint::new(-20_000.0, -20_000.0));
+        window.makeKeyAndOrderFront(None);
+        window.makeFirstResponder(Some(&host));
+        let focused: Option<Retained<AnyObject>> =
+            unsafe { msg_send![&*window, accessibilityFocusedUIElement] };
+        let focused = focused.expect("a focused element");
+        for sibling in [&blur, &button] {
+            let _ = attr(sibling, "AXFocused");
+        }
+        assert!(
+            !std::ptr::eq(&*focused, Retained::as_ptr(&blur).cast::<AnyObject>()),
+            "the blur view is not focused content"
+        );
         window.close();
     }
 
