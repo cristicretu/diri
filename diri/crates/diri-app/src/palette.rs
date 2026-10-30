@@ -53,6 +53,8 @@ pub enum PaletteCommand {
         note_id: String,
         block: Option<usize>,
     },
+    /// Flip the power mode easter egg.
+    TogglePowerMode,
     /// A command `init.lua` added with `diri.command`, by id.
     Script {
         id: u64,
@@ -449,6 +451,32 @@ pub fn account_actions(
             }
         })
         .collect()
+}
+
+/// The power mode easter egg's switch. It is never listed: it appears only
+/// when the query is exactly "power mode".
+pub fn power_mode_action(query: &str, on: bool) -> Option<PaletteAction> {
+    let typed: String = query
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    (typed == "powermode").then(|| PaletteAction {
+        id: "power-mode".into(),
+        title: t(if on {
+            "palette.power_mode_off"
+        } else {
+            "palette.power_mode_on"
+        })
+        .into(),
+        system_image: "sparkles",
+        shortcut: None,
+        detail: None,
+        enabled: true,
+        is_default: false,
+        command: PaletteCommand::TogglePowerMode,
+        keywords: "power mode".into(),
+    })
 }
 
 /// "Resume All (N)", offered while more than one session a restart ended

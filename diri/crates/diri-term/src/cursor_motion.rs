@@ -557,6 +557,11 @@ impl CursorDriver {
         self.clock = clock;
     }
 
+    /// A frame render or test owns the clock and paints frames by hand.
+    pub(crate) fn clocked(&self) -> bool {
+        self.clock.is_some()
+    }
+
     #[cfg(test)]
     pub(crate) fn painted_focused(&self) -> Option<bool> {
         self.focus.painted_focused()

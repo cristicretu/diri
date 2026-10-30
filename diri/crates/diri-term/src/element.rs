@@ -23,6 +23,7 @@ use crate::find::{
 };
 use crate::inline_images::{DrawGrid, ImageDraw, InlineImageCache, append_row_draws};
 use crate::metrics::CellMetrics;
+use crate::power_mode::{PowerKey, PowerMode, PowerShape};
 use crate::scrollback::{
     HistoryFollow, HistoryStep, ScrollRouter, ScrollbackApplyError, ScrollbackRequest,
     ScrollbackViewport, ScrolledState, TerminalModes, WheelDelta, WheelEvent, WheelRoute,
@@ -115,6 +116,7 @@ pub struct TerminalElement {
     suspended: bool,
     hovered_reference: Option<ReferenceHit>,
     reduce_motion: bool,
+    power_mode: bool,
     cursor_hidden: bool,
     /// Host padding around the grid that a full-screen program's own
     /// background may extend into. Zero paints nothing outside the bounds.
@@ -383,6 +385,7 @@ impl TerminalDamageObserver {
         let replaces_grid =
             update.is_full_snapshot || buffer.cols != update.cols || buffer.rows != update.rows;
         note_cursor_damage(&self.shared.cursor, &buffer, update, replaces_grid);
+        note_power_damage(&self.shared, &buffer, update);
         let mut selection = mutex_lock(&self.shared.selection);
         if let HistoryFollow::Moved(step) = follow {
             // `grid-history-v1`: the publisher said how far the rows moved.
@@ -546,6 +549,9 @@ impl TerminalInputHandler {
         let returned =
             !text.is_empty() && set_view_offset(&self.view.shared, &self.view.buffer, 0, 0);
         let solid = note_keystroke(&self.cursor);
+        if !text.is_empty() {
+            note_power_key(&self.view.shared, PowerKey::Type);
+        }
         (self.text_input)(text);
         returned || solid
     }
@@ -691,6 +697,8 @@ struct ElementSharedState {
     /// Decoded inline images; empty and inert until a host installs a
     /// requester.
     inline_images: Arc<InlineImageCache>,
+    /// The power mode easter egg's particles; inert unless the host turns it on.
+    power: Mutex<PowerMode>,
 }
 
 /// Rows an OSC 133 end is looked for below the window, so a prompt near the
@@ -1129,6 +1137,7 @@ impl TerminalElement {
                 command_marks: Mutex::default(),
                 interactions: AtomicU64::new(0),
                 inline_images: Arc::default(),
+                power: Mutex::default(),
             }),
             theme: TermTheme::default(),
             background_opacity: 1.0,
@@ -1145,6 +1154,7 @@ impl TerminalElement {
             suspended: false,
             hovered_reference: None,
             reduce_motion: false,
+            power_mode: false,
             cursor_preferences: CursorPreferences::default(),
             cursor_hidden: false,
             padding_extend: Edges::default(),
@@ -1332,6 +1342,14 @@ impl TerminalElement {
         self
     }
 
+    /// The power mode easter egg: sparks, fire and lightning off the cursor
+    /// as the user types. Reduce motion keeps it off.
+    #[must_use]
+    pub fn power_mode(mut self, power_mode: bool) -> Self {
+        self.power_mode = power_mode;
+        self
+    }
+
     /// The user's cursor shape, blink speed, and whether programs may
     /// change the shape.
     #[must_use]
@@ -1348,6 +1366,14 @@ impl TerminalElement {
     pub fn note_user_input(&self) -> bool {
         self.note_interaction();
         note_keystroke(&self.shared.cursor)
+    }
+
+    /// The bytes behind [`Self::note_user_input`], for power mode to tell a
+    /// delete from a jump.
+    pub fn note_power_input(&self, bytes: &[u8]) {
+        if let Some(key) = PowerKey::from_bytes(bytes) {
+            note_power_key(&self.shared, key);
+        }
     }
 
     /// A press the terminal application receives: like typing, it ends a
@@ -2671,6 +2697,99 @@ impl TerminalElement {
         Some(cursor)
     }
 
+    /// Paints power mode's particles over the grid and keeps frames coming
+    /// until the last one burns out. Off, it only drops what was in the air.
+    fn paint_power_mode(
+        &self,
+        bounds: Bounds<Pixels>,
+        metrics: CellMetrics,
+        scroll_shift: Pixels,
+        window: &mut Window,
+    ) {
+        let enabled = self.power_mode && !self.reduce_motion;
+        let (shapes, running, clocked) = {
+            let mut power = mutex_lock(&self.shared.power);
+            power.set_enabled(enabled);
+            if !enabled {
+                return;
+            }
+            let driver = mutex_lock(&self.shared.cursor);
+            let (now, clocked) = (driver.now(), driver.clocked());
+            drop(driver);
+            let shapes = power.sample(
+                now,
+                f32::from(metrics.cell_width),
+                f32::from(metrics.line_height),
+            );
+            (shapes, power.is_running(now), clocked)
+        };
+        if shapes.is_empty() {
+            return;
+        }
+        let origin = point(bounds.left(), bounds.top() - scroll_shift);
+        let at = |x: f32, y: f32| point(origin.x + px(x), origin.y + px(y));
+        let color = |rgb: [f32; 3], alpha: f32| gpui::Rgba {
+            r: rgb[0],
+            g: rgb[1],
+            b: rgb[2],
+            a: alpha.clamp(0.0, 1.0),
+        };
+        // Sparks may fly a little past the grid, into the host's padding.
+        let mask = Bounds::from_corners(
+            point(
+                bounds.left() - self.padding_extend.left,
+                bounds.top() - self.padding_extend.top,
+            ),
+            point(
+                bounds.right() + self.padding_extend.right,
+                bounds.bottom() + self.padding_extend.bottom,
+            ),
+        );
+        window.with_content_mask(Some(ContentMask { bounds: mask }), |window| {
+            for shape in shapes {
+                match shape {
+                    PowerShape::Dot {
+                        x,
+                        y,
+                        radius,
+                        rgb,
+                        alpha,
+                    } => {
+                        let corner = at(x - radius, y - radius);
+                        window.paint_quad(
+                            fill(
+                                Bounds::new(corner, size(px(radius * 2.0), px(radius * 2.0))),
+                                color(rgb, alpha),
+                            )
+                            .corner_radii(px(radius)),
+                        );
+                    }
+                    PowerShape::Stroke {
+                        points,
+                        width,
+                        rgb,
+                        alpha,
+                    } => {
+                        let mut path = gpui::PathBuilder::stroke(px(width));
+                        let mut points = points.into_iter();
+                        if let Some((x, y)) = points.next() {
+                            path.move_to(at(x, y));
+                        }
+                        for (x, y) in points {
+                            path.line_to(at(x, y));
+                        }
+                        if let Ok(path) = path.build() {
+                            window.paint_path(path, color(rgb, alpha));
+                        }
+                    }
+                }
+            }
+        });
+        if running && !clocked {
+            window.request_animation_frame();
+        }
+    }
+
     fn paint_moving_cursor(
         &self,
         cursor: CursorPaint,
@@ -2775,6 +2894,37 @@ fn note_interaction(shared: &ElementSharedState, buffer: &SharedGridBuffer) {
 
 fn note_keystroke(cursor: &Mutex<CursorDriver>) -> bool {
     mutex_lock(cursor).note_keystroke()
+}
+
+fn note_power_key(shared: &ElementSharedState, key: PowerKey) {
+    let now = mutex_lock(&shared.cursor).now();
+    mutex_lock(&shared.power).note_key(key, now);
+}
+
+fn note_power_damage(shared: &ElementSharedState, buffer: &GridBuffer, update: &GridUpdate) {
+    if !buffer.cursor.visible || !update.cursor_visible {
+        return;
+    }
+    let mut power = mutex_lock(&shared.power);
+    if !power.enabled() {
+        return;
+    }
+    let now = mutex_lock(&shared.cursor).now();
+    power.note_move(
+        CursorCell {
+            col: buffer.cursor.col,
+            row: buffer.cursor.row,
+        },
+        CursorCell {
+            col: update.cursor_col,
+            row: update.cursor_row,
+        },
+        update
+            .changed_rows
+            .iter()
+            .any(|changed| changed.y == update.cursor_row),
+        now,
+    );
 }
 
 fn note_cursor_damage(
@@ -3775,6 +3925,7 @@ impl Element for TerminalElement {
                 }
             }
         });
+        self.paint_power_mode(bounds, metrics, scroll_shift, window);
         // Last, so the theme fill under the grid does not cover the sliver
         // between the final whole cell and the bounds. Nothing else paints there.
         if !prepaint.padding_quads.is_empty() {
