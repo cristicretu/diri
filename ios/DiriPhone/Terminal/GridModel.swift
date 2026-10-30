@@ -264,9 +264,11 @@ struct GridDiff: Sendable, Decodable {
     var historySize: Int?
     var cols: Int?
     var rows: Int?
+    /// Sent by a `resume` frame (and harmless on a diff).
+    var palette: TermPalette?
 
     init(seq: UInt64, lines: [Int: TermLine], cursor: TermCursor? = nil, modes: TermModes? = nil,
-         historySize: Int? = nil, cols: Int? = nil, rows: Int? = nil) {
+         historySize: Int? = nil, cols: Int? = nil, rows: Int? = nil, palette: TermPalette? = nil) {
         self.seq = seq
         self.lines = lines
         self.cursor = cursor
@@ -274,9 +276,10 @@ struct GridDiff: Sendable, Decodable {
         self.historySize = historySize
         self.cols = cols
         self.rows = rows
+        self.palette = palette
     }
 
-    private enum Keys: String, CodingKey { case seq, lines, cursor, modes, historySize, cols, rows }
+    private enum Keys: String, CodingKey { case seq, lines, cursor, modes, historySize, cols, rows, palette }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: Keys.self)
@@ -290,6 +293,7 @@ struct GridDiff: Sendable, Decodable {
         historySize = try? container.decodeIfPresent(Int.self, forKey: .historySize)
         cols = try? container.decodeIfPresent(Int.self, forKey: .cols)
         rows = try? container.decodeIfPresent(Int.self, forKey: .rows)
+        palette = try? container.decodeIfPresent(TermPalette.self, forKey: .palette)
     }
 }
 
@@ -298,4 +302,84 @@ struct HistoryPage: Sendable, Decodable {
     /// Absolute index of `lines[0]`.
     var start: Int
     var historySize: Int
+}
+
+// MARK: - Resume digests
+
+/// What `diri-web` hashes to decide which rows a reconnecting client still
+/// shows correctly (`?resume=COLSxROWS.HEX…`, answered by a `resume` frame).
+///
+/// The gateway takes FNV-1a over a line's JSON exactly as it serialises it:
+/// `{"runs":[{"a":…,"bg":…,"fg":…,"t":"…"}],"wrapped":…}`, keys sorted,
+/// serde_json's escapes. The line model keeps every field of that shape, so
+/// the bytes are rebuilt here rather than kept from the wire. A digest that
+/// differs only costs that row being sent again.
+extension TermLine {
+    var wireDigest: UInt32 {
+        var hash = FNV1a()
+        hash.add("{\"runs\":[")
+        for (index, run) in runs.enumerated() {
+            if index > 0 { hash.add(",") }
+            hash.add("{\"a\":")
+            hash.add(String(run.attributes.rawValue))
+            hash.add(",\"bg\":")
+            hash.add(run.bg)
+            hash.add(",\"fg\":")
+            hash.add(run.fg)
+            hash.add(",\"t\":")
+            hash.addJSONString(run.text)
+            hash.add("}")
+        }
+        hash.add("],\"wrapped\":")
+        hash.add(wrapped ? "true" : "false")
+        hash.add("}")
+        return hash.value
+    }
+}
+
+struct FNV1a {
+    private(set) var value: UInt32 = 0x811C_9DC5
+
+    mutating func add(byte: UInt8) {
+        value = (value ^ UInt32(byte)) &* 0x0100_0193
+    }
+
+    mutating func add(_ text: String) {
+        for byte in text.utf8 { add(byte: byte) }
+    }
+
+    mutating func add(_ color: TermColor) {
+        switch color {
+        case .standard: add("null")
+        case let .index(index): add(String(index))
+        case let .rgb(value):
+            let hex = String(value, radix: 16)
+            add("\"#")
+            add(String(repeating: "0", count: max(0, 6 - hex.count)) + hex)
+            add("\"")
+        }
+    }
+
+    /// A JSON string as serde_json writes it: `"` and `\` escaped, the short
+    /// forms for \b \f \n \r \t, `\u00xx` (lower-case) for other controls,
+    /// and everything else as raw UTF-8.
+    mutating func addJSONString(_ text: String) {
+        add(byte: UInt8(ascii: "\""))
+        for byte in text.utf8 {
+            switch byte {
+            case UInt8(ascii: "\""): add("\\\"")
+            case UInt8(ascii: "\\"): add("\\\\")
+            case 0x08: add("\\b")
+            case 0x0C: add("\\f")
+            case 0x0A: add("\\n")
+            case 0x0D: add("\\r")
+            case 0x09: add("\\t")
+            case 0x00 ..< 0x20:
+                let hex = String(byte, radix: 16)
+                add("\\u00" + (hex.count == 1 ? "0" + hex : hex))
+            default: add(byte: byte)
+            }
+        }
+        add(byte: UInt8(ascii: "\""))
+    }
 }

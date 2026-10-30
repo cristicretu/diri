@@ -120,7 +120,7 @@ Revoking a device deletes its record. Its next request gets
   the QR held. Under tailnet admission that value is the pairing code, so
   neither client needs a change to pair.
 
-### 2. Browser terminal (next PR)
+### 2. Browser terminal (implemented)
 
 `diri-web` already serves everything a terminal needs. The phone page just
 doesn't use it yet:
@@ -146,12 +146,13 @@ PTY bytes, so the right resume converges on the current grid with the fewest
 bytes. Nothing is ever replayed twice and nothing is ever lost.
 
 - **Output:** the client reconnects the stream with
-  `?resume=<epoch>:<seq>:<rows digest>`. The gateway's preview mirror compares
-  per-row digests, the same scheme as #831's `grid-resume-v1` between Engine
-  and Holder, and answers with a `delta` of only the rows that changed, or a
-  `snapshot` if it can't. #831 measured 102 KB → 0.9–3.4 KB for a
-  160×48 screen. No state is kept between connections, so a gateway restart
-  costs one snapshot and nothing else.
+  `?resume=COLSxROWS.<hex digest per row>`, where each digest is FNV-1a over
+  the row's JSON as the stream sent it. The gateway's fresh preview mirror
+  compares digests, the same idea as #831's `grid-resume-v1` between Engine
+  and Holder, and answers with a `resume` frame holding only the rows that
+  differ (plus cursor, modes and palette), or a `snapshot` if the size
+  changed. An unchanged screen resumes with zero rows. No state is kept
+  between connections, so a mismatch only costs the rows it covers.
 - **Input:** already exactly-once. Every batch has a client id. The ledger
   drops resends, so a POST that timed out on a cell handoff can be resent
   blindly.
@@ -283,9 +284,9 @@ it into a corner.
 ## Order of work
 
 1. Tailnet admission, device pairing and revocation, Settings toggle. **Done.**
-2. Browser terminal on the existing stream, input and scrollback routes.
-3. Row-digest resume on `/stream`. The iOS app drops its stored token under
-   tailnet admission.
+2. Browser terminal on the existing stream, input and scrollback routes. **Done.**
+3. Row-digest resume on `/stream`. **Done.** The iOS app drops its stored
+   token under tailnet admission.
 4. Mac-to-Mac computers in the sidebar, rendered by `diri-term`.
 5. `--computer` for the CLI.
 6. Phase 2 relay, push, and an encrypted computer list.
