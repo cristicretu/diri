@@ -1017,11 +1017,11 @@ impl RemoteManager {
         self.rpc_empty(helper, HelperCommand::Gc, RPC_TIMEOUT)
     }
 
-    pub fn attach(&self, helper: &InstalledHelper) -> io::Result<SshChannel> {
+    pub fn attach(&self, helper: &InstalledHelper, session_id: &str) -> io::Result<SshChannel> {
         self.open_ssh(
             helper
                 .transport
-                .helper_command(&helper.build_id, HelperCommand::Attach)
+                .helper_attach_command(&helper.build_id, session_id)
                 .map_err(io::Error::other)?,
         )
     }
@@ -1502,7 +1502,7 @@ mod tests {
         // long-lived Engine; OpenSSH then cannot bind its ControlPath socket.
         fs::remove_dir(&control).expect("prune control directory");
 
-        drop(manager.attach(&helper).expect("attach"));
+        drop(manager.attach(&helper, "s_1").expect("attach"));
 
         let metadata = fs::symlink_metadata(&control).expect("control directory");
         assert!(metadata.is_dir());
