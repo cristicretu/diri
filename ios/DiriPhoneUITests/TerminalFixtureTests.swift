@@ -23,10 +23,10 @@ final class TerminalFixtureTests: XCTestCase {
         if let shots { try FileManager.default.createDirectory(atPath: shots, withIntermediateDirectories: true) }
     }
 
-    private func launch() throws -> XCUIApplication {
+    private func launch(_ session: String = "s_claude") throws -> XCUIApplication {
         let url = try String(contentsOfFile: dir + "/url", encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
         let app = XCUIApplication()
-        app.launchArguments = ["-endpoint", url, "-session", "s_claude"]
+        app.launchArguments = ["-endpoint", url, "-session", session]
         app.launch()
         XCTAssertTrue(terminal(app).waitForExistence(timeout: 20))
         return app
@@ -108,5 +108,22 @@ final class TerminalFixtureTests: XCTestCase {
             settle(0.25)
         }
         XCTAssertEqual(sent, expected)
+    }
+
+    /// In a full-screen program that asked for the mouse, a drag scrolls the
+    /// program (SGR wheel reports), not the phone's view of the grid.
+    func testADragInAFullScreenMouseProgramSendsWheelReports() throws {
+        let app = try launch("s_pager")
+        XCTAssertTrue(waitFor(app, "snapshots 1"))
+        settle(1)
+        let before = typed()
+        let terminal = terminal(app)
+        let start = terminal.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.35))
+        start.press(forDuration: 0.05, thenDragTo: terminal.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.6)))
+        let deadline = Date().addingTimeInterval(8)
+        while Date() < deadline, !typed().dropFirst(before.count).contains("[<64;") { settle(0.25) }
+        let sent = String(typed().dropFirst(before.count))
+        XCTAssertTrue(sent.contains("\\u{1b}[<64;"), sent)
+        XCTAssertFalse(sent.contains("[<65;"), "a downward drag is wheel up only: \(sent)")
     }
 }

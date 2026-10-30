@@ -14,9 +14,13 @@ final class TerminalFont {
     let lineHeight: CGFloat
     let ascent: CGFloat
     let descent: CGFloat
+    let scale: CGFloat
+    /// Whether the regular face has glyphs for a scalar.
+    private var covered: [UInt32: Bool] = [:]
 
     init(size: CGFloat, scale: CGFloat) {
         self.size = size
+        self.scale = scale
         let base = UIFont.monospacedSystemFont(ofSize: size, weight: .regular)
         let heavy = UIFont.monospacedSystemFont(ofSize: size, weight: .semibold)
         regular = base as CTFont
@@ -34,6 +38,18 @@ final class TerminalFont {
         descent = CTFontGetDescent(regular)
         // Pixel-aligned rows: a fractional height smears every line edge.
         lineHeight = (ceil((ascent + descent) * 1.18 * scale)) / scale
+    }
+
+    /// True when the regular face draws `character` itself (one cell wide),
+    /// so it can share a Core Text line with its neighbours.
+    func covers(_ character: Character) -> Bool {
+        guard character.unicodeScalars.count == 1, let scalar = character.unicodeScalars.first else { return false }
+        if let known = covered[scalar.value] { return known }
+        let utf16 = Array(String(character).utf16)
+        var glyphs = [CGGlyph](repeating: 0, count: utf16.count)
+        let found = CTFontGetGlyphsForCharacters(regular, utf16, &glyphs, utf16.count)
+        covered[scalar.value] = found
+        return found
     }
 
     func font(for attributes: TermAttributes) -> CTFont {
@@ -125,15 +141,7 @@ enum LineRenderer {
                     drawText(run.text, x: x0, baseline: baseline, font: ctFont, color: fg, in: context)
                 }
             } else {
-                var col = column
-                for character in run.text {
-                    let w = CellWidth.of(character)
-                    if character != " " {
-                        drawText(substitute(character), x: CGFloat(col) * cell, baseline: baseline,
-                                 font: ctFont, color: fg, in: context, fitting: CGFloat(max(w, 1)) * cell)
-                    }
-                    col += w
-                }
+                drawMixed(run.text, from: column, baseline: baseline, font: font, face: ctFont, color: fg, in: context)
             }
 
             if attributes.contains(.underline) || attributes.contains(.strike) {
@@ -151,6 +159,75 @@ enum LineRenderer {
             }
         }
         context.restoreGState()
+    }
+
+    /// A run with non-ASCII text. Characters the terminal face draws itself
+    /// (`─`, `é`, `⎿` …) are batched into one Core Text line per stretch, as
+    /// ASCII is; box-drawing and block characters are drawn as geometry; only
+    /// wide or fallback-font characters get a line each, centred in their
+    /// cells. A border row is now a few rect fills, not one line per cell.
+    private static func drawMixed(_ text: String, from start: Int, baseline: CGFloat, font: TerminalFont,
+                                  face: CTFont, color: CGColor, in context: CGContext) {
+        let cell = font.cellWidth
+        var col = start
+        var pending = ""
+        var pendingStart = start
+        func flush() {
+            if pending.contains(where: { $0 != " " }) {
+                drawText(pending, x: CGFloat(pendingStart) * cell, baseline: baseline, font: face, color: color, in: context)
+            }
+            pending = ""
+        }
+        // A stretch of one horizontal rule character, drawn as one bar.
+        var rule: (scalar: Unicode.Scalar, start: Int, count: Int)?
+        func flushRule() {
+            guard let current = rule else { return }
+            BoxDrawing.draw(current.scalar, in: CGRect(x: CGFloat(current.start) * cell, y: 0,
+                                                       width: CGFloat(current.count) * cell, height: font.lineHeight),
+                            scale: font.scale, color: color, context: context)
+            rule = nil
+        }
+        for character in text {
+            let w = CellWidth.of(character)
+            if w == 1, let scalar = character.unicodeScalars.first, character.unicodeScalars.count == 1,
+               BoxDrawing.handles(scalar) {
+                flush()
+                if BoxDrawing.isRule(scalar) {
+                    if let current = rule, current.scalar == scalar {
+                        rule?.count += 1
+                    } else {
+                        flushRule()
+                        rule = (scalar, col, 1)
+                    }
+                } else {
+                    flushRule()
+                    BoxDrawing.draw(scalar, in: CGRect(x: CGFloat(col) * cell, y: 0, width: cell, height: font.lineHeight),
+                                    scale: font.scale, color: color, context: context)
+                }
+                col += 1
+                pendingStart = col
+                continue
+            }
+            flushRule()
+            let substituted = substitute(character)
+            if w == 1, substituted == String(character), font.covers(character) {
+                if pending.isEmpty { pendingStart = col }
+                pending.append(character)
+                col += 1
+                continue
+            }
+            flush()
+            if character != " " {
+                // Core Text's own cascade from the terminal face picks the
+                // font for a character the face lacks.
+                drawText(substituted, x: CGFloat(col) * cell, baseline: baseline,
+                         font: face, color: color, in: context, fitting: CGFloat(max(w, 1)) * cell)
+            }
+            col += w
+            pendingStart = col
+        }
+        flush()
+        flushRule()
     }
 
     /// Glyphs SF Mono lacks whose fallback font draws them as something else
