@@ -1,5 +1,37 @@
 [
   {
+    "version": "0.11.0",
+    "date": "October 30, 2026",
+    "headline": "Scripting, splits you can read, and nothing lost under load",
+    "summary": "diri 0.11.0 adds Lua scripting, shows what every pane in a split is doing, imports your old terminal's setup, keeps every byte of output when programs flood the terminal, and runs on a new terminal core.",
+    "items": [
+      {
+        "title": "Script diri with Lua",
+        "text": "An init.lua in ~/.config/diri adds keys, key modes, palette commands and event handlers, and reloads when you save. dirijor script runs one-off scripts."
+      },
+      {
+        "title": "Splits you can read at a glance",
+        "text": "A split tab draws its layout in the sidebar and tab strip, each pane colored by what it's doing. Drag panes by their title to rearrange them."
+      },
+      {
+        "title": "See the question, keep the title",
+        "text": "A waiting session keeps its name and shows its question on a second line."
+      },
+      {
+        "title": "Bring your terminal setup",
+        "text": "Import font, theme and cursor from Ghostty, iTerm2, WezTerm, kitty, Alacritty or Terminal, with every change shown first."
+      },
+      {
+        "title": "Nothing lost, less waiting",
+        "text": "Floods of output arrive complete, idle tabs cost nothing, Find searches all of history, and resizing keeps every line."
+      },
+      {
+        "title": "A faster terminal core",
+        "text": "diri's terminal engine is rewritten and processes terminal text 3–4× faster."
+      }
+    ]
+  },
+  {
     "version": "0.10.0",
     "date": "October 18, 2026",
     "headline": "Voice, Mac apps, and current model prices",

@@ -71,7 +71,7 @@ jobs:
       - name: Release build
         run: cargo build --workspace --release
 
-  # The nightly channel ships terminal core v2 (docs/core-v2.md, step 8):
+  # Stable and nightly ship terminal core v2 (docs/core-v2.md, step 8):
   # its golden, the screenshots against the current core, and the
   # Holder->Engine vtbench A/B (checked runs; numbers reported, not gated).
   core-v2:
@@ -202,7 +202,8 @@ jobs:
       - name: Install native musl linker
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install --yes musl-tools
-      - name: Build exact release Helper
+      # The previous core, which DIRI_TERMINAL_CORE=v1 rebuilds.
+      - name: Build Helper on the previous core (v1 override)
         env:
           DIRI_REMOTE_BUILD_ID: ci-${{ matrix.target }}
         run: cargo build --locked --release --package diri-remote --target "${{ matrix.target }}"
@@ -219,7 +220,7 @@ jobs:
             --arg build "${EXPECTED_BUILD}" \
             '.target == $target and .buildId == $build and .protocol.major == 1 and .supported and .holderAvailable' \
             <<<"${probe}"
-      # The nightly channel's Helper runs on terminal core v2.
+      # Stable and nightly Helpers run on terminal core v2.
       - name: Build exact release Helper on core v2
         env:
           DIRI_REMOTE_BUILD_ID: ci-${{ matrix.target }}-core-v2
@@ -385,7 +386,7 @@ jobs:
           # diri-voice needs the macOS 26 SDK (Foundation Models); macos-15
           # still defaults to Xcode 16.4.
           DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
-          # As the nightly channel ships it (scripts/nightly-macos.sh).
+          # package.sh's default, as stable and nightly ship it.
           DIRI_TERMINAL_CORE: v2
         run: diri/scripts/package.sh
       - name: Verify bundle structure and signature
@@ -489,6 +490,9 @@ jobs:
           stage="${RUNNER_TEMP}/diri-desktop-entry"
           dpkg-deb --extract "${deb}" "${stage}"
           file --brief "${stage}/usr/bin/diri" | grep -F "${machine}"
+          # Built on terminal core v2, so the bundled Helper's Build ID says so.
+          "${stage}/usr/bin/diri-remote" probe --format=json \
+            | jq -e '.buildId | endswith("-core-v2")'
           desktop-file-validate "${stage}/usr/share/applications/diri.desktop"
           (cd diri/dist/linux && sha256sum --check SHA256SUMS)
           jq -e \

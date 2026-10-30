@@ -18,8 +18,9 @@ if [[ -n "$(git -C "${workspace_dir}" status --porcelain --untracked-files=norma
 fi
 # A Helper built on terminal core v2 is a different binary from the same
 # source tree on the current core, so it gets its own Build ID: the two never
-# share an install path on a remote host.
-if [[ "${DIRI_TERMINAL_CORE:-v1}" == "v2" ]]; then
+# share an install path on a remote host. v2 is the default; v1 rebuilds the
+# Helper on the previous core under the plain Build ID.
+if [[ "${DIRI_TERMINAL_CORE:-v2}" == "v2" ]]; then
     build_id="${build_id}-core-v2"
 fi
 if [[ ! "${build_id}" =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
@@ -43,10 +44,10 @@ file_length() {
     fi
 }
 
-# DIRI_TERMINAL_CORE=v2 builds the Helper on terminal core v2
-# (docs/core-v2.md); the default, v1, is the current core.
+# The Helper builds on terminal core v2 (docs/core-v2.md) unless
+# DIRI_TERMINAL_CORE=v1 asks for the previous core.
 core_features=()
-case "${DIRI_TERMINAL_CORE:-v1}" in
+case "${DIRI_TERMINAL_CORE:-v2}" in
     v1) ;;
     v2) core_features=(--features diri-terminal-state/core-v2-screen) ;;
     *) echo "error: DIRI_TERMINAL_CORE must be v1 or v2" >&2; exit 1 ;;
