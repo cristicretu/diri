@@ -109,4 +109,33 @@ final class TerminalFixtureTests: XCTestCase {
         }
         XCTAssertEqual(sent, expected)
     }
+
+    /// The emoji keyboard is reachable (the ASCII-only keyboard type hid it,
+    /// and with it every non-Latin keyboard), and an emoji reaches the
+    /// program as typed.
+    func testTheEmojiKeyboardTypesIntoTheTerminal() throws {
+        let app = try launch()
+        XCTAssertTrue(waitFor(app, "snapshots 1"))
+        app.buttons["terminal-keyboard"].tap()
+        if app.buttons["Continue"].waitForExistence(timeout: 1.5) { app.buttons["Continue"].tap() }
+        XCTAssertTrue(app.buttons["key-esc"].waitForExistence(timeout: 5))
+        let emojiKey = app.keyboards.buttons["Emoji"].firstMatch
+        XCTAssertTrue(emojiKey.waitForExistence(timeout: 3), "the keyboard offers emoji")
+        save("emoji-key")
+        let before = typed()
+        emojiKey.tap()
+        settle(1.5)
+        save("emoji-keyboard")
+        // The first "frequently used" emoji. The emoji grid exposes no
+        // elements to UI tests, so it is tapped by position: 40 pt above the
+        // bottom of the emoji keyboard's top section (iPhone 17 Pro layout).
+        let keyboard = app.keyboards.firstMatch.frame
+        let cell = CGPoint(x: keyboard.minX + 27, y: keyboard.minY + 84)
+        app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: cell.x, dy: cell.y)).tap()
+        let deadline = Date().addingTimeInterval(8)
+        while Date() < deadline, typed().count == before.count { settle(0.25) }
+        let sent = String(typed().dropFirst(before.count))
+        // An emoji is one non-ASCII scalar, escaped by the fixture as \u{1f…}.
+        XCTAssertTrue(sent.contains("\\u{1f") || sent.contains("\\u{2"), sent)
+    }
 }

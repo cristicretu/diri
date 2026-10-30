@@ -8,7 +8,7 @@ import UIKit
 /// from the session's cache; one that is not there yet draws blank and its
 /// page is requested — the scroll never waits for the network.
 @MainActor
-final class TerminalView: UIScrollView, UIKeyInput, UITextInputTraits {
+final class TerminalView: UIScrollView, UITextInput {
     let session: TerminalSession
 
     /// Insets the SwiftUI chrome floats over the terminal with.
@@ -23,18 +23,27 @@ final class TerminalView: UIScrollView, UIKeyInput, UITextInputTraits {
     private(set) var ctrlLatched = false { didSet { accessory.ctrlLatched = ctrlLatched } }
 
     private(set) var font: TerminalFont
-    private var colors = TerminalColors(palette: .standard)
+    private(set) var colors = TerminalColors(palette: .standard)
     private var lineLayers: [Int: LineLayer] = [:]
     private var pool: [LineLayer] = []
     private let cursorLayer = CALayer()
-    private let canvas = UIView()
+    let canvas = UIView()
     private var following = true
     private var lastOffset: CGFloat = 0
     private var lastOffsetTime: CFTimeInterval = 0
     private var velocity: CGFloat = 0
-    private let padding: CGFloat = 10
+    let padding: CGFloat = 10
     private let overscan = 6
     private lazy var accessory = KeyAccessoryView(terminal: self)
+
+    // Input-method state (see TerminalTextInput.swift). The document the
+    // keyboard sees is only the text being composed: committed text goes
+    // straight to the PTY, which owns everything already typed.
+    var marked = ""
+    var markedSelection = NSRange(location: 0, length: 0)
+    weak var inputDelegate: UITextInputDelegate?
+    lazy var tokenizer: UITextInputTokenizer = UITextInputStringTokenizer(textInput: self)
+    let markedLabel = UILabel()
 
     static let fontSizeKey = "terminal.fontSize"
     static let defaultFontSize: CGFloat = 11
@@ -55,6 +64,9 @@ final class TerminalView: UIScrollView, UIKeyInput, UITextInputTraits {
         addSubview(canvas)
         cursorLayer.actions = ["position": NSNull(), "bounds": NSNull(), "hidden": NSNull(), "frame": NSNull()]
         canvas.layer.addSublayer(cursorLayer)
+        markedLabel.isHidden = true
+        markedLabel.accessibilityIdentifier = "terminal-composition"
+        canvas.addSubview(markedLabel)
 
         addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped)))
         addGestureRecognizer(UIPinchGestureRecognizer(target: self, action: #selector(pinched(_:))))
@@ -167,6 +179,7 @@ final class TerminalView: UIScrollView, UIKeyInput, UITextInputTraits {
             }
         }
         placeCursor()
+        placeMarked()
         CATransaction.commit()
 
         // Lines-per-second, negative towards history, drives how far ahead
@@ -374,18 +387,35 @@ final class TerminalView: UIScrollView, UIKeyInput, UITextInputTraits {
 
     var hasText: Bool { true }
 
+    /// Bytes for the PTY. Tests replace this to observe what typing sends.
+    var emit: (([UInt8]) -> Void)?
+
+    func send(_ bytes: [UInt8]) {
+        if let emit { emit(bytes) } else { session.send(bytes) }
+    }
+
+    /// Committed text from the keyboard: a key, a chosen IME candidate, an
+    /// emoji, a dictated phrase. Text still being composed is never sent.
     func insertText(_ text: String) {
+        if !marked.isEmpty { clearMarked() }
         if ctrlLatched {
             ctrlLatched = false
-            session.send(KeyEncoder.encodeText(text, modifiers: .ctrl))
+            send(KeyEncoder.encodeText(text, modifiers: .ctrl))
         } else {
-            session.send(KeyEncoder.encodeText(text))
+            send(KeyEncoder.encodeText(text))
         }
         snapToBottomForInput()
     }
 
     func deleteBackward() {
-        session.send(.backspace)
+        // While composing, the input method edits its own marked text (it
+        // calls `setMarkedText` with the shorter string); nothing reaches the
+        // program until a candidate is committed.
+        if !marked.isEmpty {
+            setMarkedText(String(marked.dropLast()), selectedRange: NSRange(location: max(0, marked.utf16.count - 1), length: 0))
+            return
+        }
+        send(KeyEncoder.encode(.backspace))
         snapToBottomForInput()
     }
 
@@ -397,9 +427,9 @@ final class TerminalView: UIScrollView, UIKeyInput, UITextInputTraits {
             ctrlLatched = false
         }
         if case let .text(text) = key {
-            session.send(KeyEncoder.encodeText(text, modifiers: modifiers))
+            send(KeyEncoder.encodeText(text, modifiers: modifiers))
         } else {
-            session.send(key, modifiers: modifiers)
+            send(KeyEncoder.encode(key, modifiers: modifiers, appCursor: session.buffer.modes.appCursor))
         }
         snapToBottomForInput()
     }
@@ -417,7 +447,9 @@ final class TerminalView: UIScrollView, UIKeyInput, UITextInputTraits {
     var smartDashesType: UITextSmartDashesType { get { .no } set {} }
     var smartInsertDeleteType: UITextSmartInsertDeleteType { get { .no } set {} }
     var keyboardAppearance: UIKeyboardAppearance { get { .dark } set {} }
-    var keyboardType: UIKeyboardType { get { .asciiCapable } set {} }
+    // `.default`, not `.asciiCapable`: the ASCII keyboard type hides every
+    // non-Latin keyboard (Pinyin, Kana, Hangul) and the emoji keyboard.
+    var keyboardType: UIKeyboardType { get { .default } set {} }
     var returnKeyType: UIReturnKeyType { get { .default } set {} }
     var inlinePredictionType: UITextInlinePredictionType { get { .no } set {} }
 
@@ -428,7 +460,11 @@ final class TerminalView: UIScrollView, UIKeyInput, UITextInputTraits {
 
     override func paste(_ sender: Any?) {
         guard let text = UIPasteboard.general.string, !text.isEmpty else { return }
-        session.paste(text)
+        if let emit {
+            emit(KeyEncoder.paste(text, bracketed: session.buffer.modes.bracketedPaste))
+        } else {
+            session.paste(text)
+        }
         snapToBottomForInput()
     }
 
@@ -455,6 +491,12 @@ final class TerminalView: UIScrollView, UIKeyInput, UITextInputTraits {
     @objc private func commandNext() { onCommand?(.next) }
 
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        // A hardware keyboard with an input method: arrows, return and escape
+        // belong to the composition until it is committed.
+        if !marked.isEmpty {
+            super.pressesBegan(presses, with: event)
+            return
+        }
         var unhandled = Set<UIPress>()
         for press in presses {
             guard let key = press.key, let mapped = Self.map(key) else {
