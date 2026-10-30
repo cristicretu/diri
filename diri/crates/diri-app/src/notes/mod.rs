@@ -23,6 +23,7 @@ pub(crate) mod work_item;
 pub(crate) mod work_item_tests;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use diri_notes::edit::Editor;
@@ -41,6 +42,48 @@ use editor_view::{EditorEvent, MentionDirectory, MentionEntry, NoteEditorView};
 
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(350);
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(120);
+/// How often quitting checks whether the last note writes have landed.
+const QUIT_POLL: Duration = Duration::from_millis(2);
+
+/// Note writes running off the main thread, counted so quitting can wait
+/// for them: a write cut off by the process exiting loses the typing in it.
+#[derive(Clone, Default)]
+struct Writes(Arc<AtomicUsize>);
+
+impl Writes {
+    fn spawn<T: Send + 'static>(
+        &self,
+        cx: &App,
+        write: impl FnOnce() -> T + Send + 'static,
+    ) -> Task<T> {
+        struct Landed(Arc<AtomicUsize>);
+        impl Drop for Landed {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        self.0.fetch_add(1, Ordering::AcqRel);
+        // Made out here, so a write dropped before it starts still counts down.
+        let landed = Landed(Arc::clone(&self.0));
+        cx.background_spawn(async move {
+            let _landed = landed;
+            write()
+        })
+    }
+
+    fn pending(&self) -> bool {
+        self.0.load(Ordering::Acquire) > 0
+    }
+}
+
+/// How writing a closed note ended.
+enum ClosedWrite {
+    Saved,
+    /// The file is gone: moved or deleted outside.
+    Moved,
+    /// Outside writes kept landing between our reads and writes.
+    Busy,
+}
 
 pub(crate) fn key_bindings() -> Vec<KeyBinding> {
     editor_view::key_bindings()
@@ -83,6 +126,8 @@ pub(crate) struct NotePane {
     /// Keeps mention chips' session status and the `@` menu live.
     _sessions_task: Task<()>,
     error: Option<SharedString>,
+    writes: Writes,
+    _quit: Subscription,
     /// The open note's Version History panel, while it is shown.
     versions: Option<versions::VersionPanel>,
     /// The open note's linked and unlinked mentions, shown under it.
@@ -166,6 +211,19 @@ impl NotePane {
             _watcher: watcher,
             _sessions_task: sessions_task,
             error: None,
+            writes: Writes::default(),
+            // Typing still inside the autosave's debounce, and writes still
+            // in flight, land before the app exits.
+            _quit: cx.on_app_quit(|this, cx| {
+                this.save(cx);
+                let writes = this.writes.clone();
+                let executor = cx.background_executor().clone();
+                async move {
+                    while writes.pending() {
+                        executor.timer(QUIT_POLL).await;
+                    }
+                }
+            }),
             versions: None,
             backlinks: None,
             graph: None,
@@ -211,7 +269,7 @@ impl NotePane {
             PaneState::Empty => false,
         };
         if !same {
-            self.save(cx);
+            self.save_closing(true, cx);
             self.load(session, note_id, window, cx);
         }
         if let Some(graph) = &self.graph {
@@ -368,6 +426,9 @@ impl NotePane {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         if this
                             .update(cx, |this, cx| {
+                                if this.release_closed(cx) {
+                                    return;
+                                }
                                 this.push_mentions(cx);
                                 this.push_work(cx);
                             })
@@ -746,6 +807,104 @@ impl NotePane {
         self.sync_title(&note.doc.title, cx);
     }
 
+    /// Writes the note being switched away from off the main thread: the
+    /// store's compare, atomic rename, fsync and history cost tens of ms on a
+    /// long note, a visible stall on every switch. Only serializing happens
+    /// here. The write merges an outside edit in the way a flush does, so
+    /// nothing is lost now that no editor is left to merge into; reopening
+    /// the note before it lands sees it as the store's own write and takes
+    /// it in through the watcher.
+    /// `retitle`: the note's Session is still listed, so its sidebar title
+    /// follows the note's.
+    fn save_closing(&mut self, retitle: bool, cx: &mut Context<Self>) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let PaneState::Open(open) = &self.state else {
+            return;
+        };
+        let ours = Note {
+            front: open.front.clone(),
+            doc: open.editor.read(cx).editor.document(),
+        };
+        let landing = open.in_flight.clone();
+        let known = landing.as_deref().unwrap_or(&open.saved);
+        let unchanged = ours.to_markdown() == known;
+        let id = open.id.clone();
+        let expected = open.saved.clone();
+        if retitle {
+            self.sync_title(&ours.doc.title, cx);
+        }
+        if unchanged {
+            return;
+        }
+        // The pane shows another note (or none) by the time this lands, so
+        // the error names the note it is about.
+        let title = if ours.doc.title.trim().is_empty() {
+            crate::i18n::t("notes.untitled").to_owned()
+        } else {
+            ours.doc.title.clone()
+        };
+        let write = self.writes.spawn(cx, move || {
+            write_closed(&store, &id, ours, expected, landing.as_deref())
+        });
+        cx.spawn(async move |this, cx| {
+            let failed = |err: &dyn std::fmt::Display| {
+                crate::i18n::tf(
+                    "notes.error.closed_save",
+                    &[("title", &title), ("error", &err)],
+                )
+            };
+            let error: SharedString = match write.await {
+                Ok(ClosedWrite::Saved) => return,
+                Ok(ClosedWrite::Moved) => {
+                    crate::i18n::tf("notes.error.closed_moved", &[("title", &title)]).into()
+                }
+                Ok(ClosedWrite::Busy) => {
+                    failed(&std::io::Error::other("the note kept changing")).into()
+                }
+                Err(err) => failed(&err).into(),
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.error = Some(error);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Lets go of a note whose tab was closed: its editor, undo history and
+    /// panels. Reopening it from Search notes makes a new Session and reads
+    /// the file afresh, so nothing held here would be used again. Typing
+    /// not yet saved is written first. Returns whether the note was let go.
+    pub(crate) fn release_closed(&mut self, cx: &mut Context<Self>) -> bool {
+        let session = match &self.state {
+            PaneState::Open(open) => &open.session,
+            PaneState::Missing { session, .. } => session,
+            PaneState::Empty => return false,
+        };
+        if self
+            .runtime
+            .store
+            .read()
+            .expect("store")
+            .sessions()
+            .contains_key(session)
+        {
+            return false;
+        }
+        self.save_closing(false, cx);
+        self.save_task = Task::ready(());
+        self.state = PaneState::Empty;
+        self.backlinks = None;
+        self.versions = None;
+        self.graph = None;
+        self.pending_reveal = None;
+        self.error = None;
+        cx.notify();
+        true
+    }
+
     /// The sidebar row is the Session's title; keep it the note's title.
     fn sync_title(&mut self, title: &str, cx: &mut Context<Self>) {
         let PaneState::Open(open) = &mut self.state else {
@@ -796,10 +955,9 @@ impl NotePane {
         open.in_flight = Some(markdown);
         let title = current.doc.title.clone();
         let write_id = id.clone();
-        let write =
-            cx.background_spawn(
-                async move { store.save_if_unchanged(&write_id, &current, &expected) },
-            );
+        let write = self.writes.spawn(cx, move || {
+            store.save_if_unchanged(&write_id, &current, &expected)
+        });
         cx.spawn(async move |this, cx| {
             let outcome = write.await;
             let _ = this.update(cx, |this, cx| {
@@ -852,6 +1010,44 @@ impl NotePane {
         }
         cx.notify();
     }
+}
+
+/// Saves `ours` over `expected`, the version its editor last knew. An
+/// outside write in between is three-way merged in and saved over, as the
+/// flush does into the open editor; `landing` is our own autosave, still in
+/// flight when the note closed, and is not an outside write. Bounded like
+/// the flush, but with no later save to retry it, a note that keeps changing
+/// is reported.
+fn write_closed(
+    store: &NoteStore,
+    id: &str,
+    mut ours: Note,
+    mut expected: String,
+    landing: Option<&str>,
+) -> std::io::Result<ClosedWrite> {
+    for _ in 0..3 {
+        match store.save_if_unchanged(id, &ours, &expected)? {
+            store::SaveOutcome::Saved { .. } => return Ok(ClosedWrite::Saved),
+            store::SaveOutcome::Conflict {
+                current: Some(outside),
+            } if landing == Some(outside.as_str()) => expected = outside,
+            store::SaveOutcome::Conflict {
+                current: Some(outside),
+            } => {
+                let outside = store.notice_outside_change(id).unwrap_or(outside);
+                let mut theirs = store::parse_note(&outside);
+                store::repair_front(&mut theirs.front, id, &ours.front);
+                let base = store::parse_note(&expected).doc;
+                ours = Note {
+                    doc: diri_notes::merge::merge3(&base, &ours.doc, &theirs.doc).doc,
+                    front: theirs.front,
+                };
+                expected = outside;
+            }
+            store::SaveOutcome::Conflict { current: None } => return Ok(ClosedWrite::Moved),
+        }
+    }
+    Ok(ClosedWrite::Busy)
 }
 
 impl Render for NotePane {

@@ -148,6 +148,9 @@ pub(super) struct TableFrame {
 /// The glass table menu's state.
 pub(super) struct TableMenu {
     pub selected: usize,
+    /// Where the menu opens: under the pointer that opened it. From the
+    /// keyboard, the caret's cell is scrolled into view and anchors it.
+    pub anchor: Option<Bounds<Pixels>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -224,6 +227,11 @@ pub(super) const TABLE_MENU: floating::Target<NoteEditorView> = floating::Target
         cx.notify();
     },
 };
+
+/// A pointer's position as a menu anchor: the menu opens just under it.
+fn pointer_anchor(at: Point<Pixels>) -> Bounds<Pixels> {
+    Bounds::new(at, size(px(2.0), px(0.0)))
+}
 
 impl NoteEditorView {
     /// Column widths for the table at `range`: each column's widest cell,
@@ -412,8 +420,21 @@ impl NoteEditorView {
                     .text_color(colors.primary)
                     .font_family(ui)
                     .child(styled);
+                // A right click is the ⋯ menu for this cell: caret where it
+                // landed (or at the cell's end), menu under the pointer.
+                let on_context = cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    window.focus(&this.focus, cx);
+                    let at = this
+                        .hit(event.position)
+                        .filter(|pos| pos.block == index)
+                        .unwrap_or_else(|| Pos::new(index, this.editor.block(index).text.len()));
+                    this.editor.set_caret(at);
+                    this.open_table_menu(Some(pointer_anchor(event.position)), cx);
+                });
                 let cell = div()
                     .relative()
+                    .on_mouse_down(MouseButton::Right, on_context)
                     .opacity(alpha)
                     .w(px(width))
                     .flex_none()
@@ -487,7 +508,7 @@ impl NoteEditorView {
             .child(crate::icons::sf_symbol("ellipsis", 11.0, colors.secondary))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                     cx.stop_propagation();
                     if this
                         .editor
@@ -497,7 +518,7 @@ impl NoteEditorView {
                         let len = this.editor.block(start).text.len();
                         this.editor.set_caret(Pos::new(start, len));
                     }
-                    this.open_table_menu(cx);
+                    this.open_table_menu(Some(pointer_anchor(event.position)), cx);
                 }),
             );
         // The block hugs the grid (capped at the column), so the handle sits
@@ -510,11 +531,31 @@ impl NoteEditorView {
             .max_w_full()
             .py(px(TABLE_PAD))
             .child(
+                // Scrolled here rather than by `overflow_x_scroll`, which
+                // also turns vertical wheel motion sideways and cannot tell
+                // a swipe's axis: only a gesture locked sideways moves the
+                // table, and it then stops short of the page.
                 div()
                     .id(("table-scroll", first_id))
                     .w_full()
-                    .overflow_x_scroll()
+                    .overflow_x_hidden()
                     .track_scroll(&scroll)
+                    .on_scroll_wheel({
+                        let scroll = scroll.clone();
+                        cx.listener(move |this, event: &ScrollWheelEvent, window, cx| {
+                            if this.wheel_axis(event) != Some(gpui::Axis::Horizontal) {
+                                return;
+                            }
+                            cx.stop_propagation();
+                            let dx = event.delta.pixel_delta(window.line_height()).x;
+                            let offset = scroll.offset();
+                            let x = (offset.x + dx).clamp(-scroll.max_offset().x, px(0.0));
+                            if x != offset.x {
+                                scroll.set_offset(point(x, offset.y));
+                                cx.notify();
+                            }
+                        })
+                    })
                     .child(grid),
             )
             .child(handle)
@@ -608,14 +649,42 @@ impl NoteEditorView {
     // -----------------------------------------------------------------------
     // Menu
 
-    pub(crate) fn open_table_menu(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn open_table_menu(
+        &mut self,
+        anchor: Option<Bounds<Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
         if self.editor.caret_table().is_none() {
             return;
         }
         self.slash = None;
         self.mention = None;
-        self.table_menu = Some(TableMenu { selected: 0 });
+        self.block_menu = None;
+        if anchor.is_none() {
+            // The caret anchors the menu: bring its cell into view first.
+            self.autoscroll = true;
+        }
+        self.table_menu = Some(TableMenu {
+            selected: 0,
+            anchor,
+        });
         cx.notify();
+    }
+
+    /// The menu's anchor when a pointer opened it.
+    pub(super) fn table_menu_anchor(&self) -> Option<Bounds<Pixels>> {
+        self.table_menu.as_ref()?.anchor
+    }
+
+    /// The viewport a table cell's text is clipped to, while block `index`
+    /// is a cell of a table that has been drawn.
+    pub(super) fn cell_clip(&self, index: usize) -> Option<ScrollHandle> {
+        if !self.editor.block(index).kind.is_cell() {
+            return None;
+        }
+        let range = table_range(self.editor.blocks(), index)?;
+        let first = self.editor.block(range.start).id;
+        self.table_scrolls.borrow().get(&first).cloned()
     }
 
     fn table_menu_content(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -791,7 +860,7 @@ impl NoteEditorView {
         cx: &mut Context<Self>,
     ) {
         if self.editor.caret_table().is_some() {
-            self.open_table_menu(cx);
+            self.open_table_menu(None, cx);
         } else {
             cx.propagate();
         }

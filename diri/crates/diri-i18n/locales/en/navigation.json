@@ -154,6 +154,8 @@
   "notes.block.todo": "To-do",
   "notes.block.turn_into": "Turn into",
   "notes.cancel": "Cancel",
+  "notes.error.closed_moved": "“{title}” was moved or deleted outside Diri before its last edits were saved.",
+  "notes.error.closed_save": "Couldn't save “{title}”: {error}",
   "notes.error.link": "Couldn't link that mention: {error}",
   "notes.error.moved_outside": "This note's file was moved or deleted outside Diri; your text is still here.",
   "notes.error.save": "Couldn't save this note: {error}",

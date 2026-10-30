@@ -220,16 +220,29 @@ impl NoteEditorView {
             // The gutter sits outside its row: on the way to the grip the
             // pointer leaves the row, and the handle must stay.
             .hover(|gutter| gutter.opacity(1.0))
+            .debug_selector(move || format!("note-handle-{id}"))
             .child(plus)
             .child(handle)
             .into_any_element()
     }
 
+    /// Where the dragged block sits and the blocks it carries, looked up
+    /// once a frame for every row's [`Self::drop_line`].
+    pub(super) fn dragged(&self) -> Option<(usize, std::ops::Range<usize>)> {
+        let from = self.index_of_id(self.dragging?)?;
+        Some((from, self.editor.block_span(from)))
+    }
+
     /// The line a drop would put the dragged block at: above this row when
     /// the block comes from below, under it when it comes from above.
-    pub(super) fn drop_line(&self, index: usize, group: SharedString) -> Option<AnyElement> {
-        let from = self.index_of_id(self.dragging?)?;
-        if from == index || self.editor.block_span(from).contains(&index) {
+    pub(super) fn drop_line(
+        dragged: Option<&(usize, std::ops::Range<usize>)>,
+        index: usize,
+        group: SharedString,
+    ) -> Option<AnyElement> {
+        let (from, span) = dragged?;
+        let from = *from;
+        if from == index || span.contains(&index) {
             return None;
         }
         let line = div()

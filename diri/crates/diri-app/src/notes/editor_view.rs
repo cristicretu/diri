@@ -27,9 +27,9 @@ use gpui::{
     Animation, AnimationExt, AnyElement, App, Bounds, ClipboardItem, Context, ElementInputHandler,
     Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, FontStyle, FontWeight,
     HighlightStyle, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Render, ScrollHandle, SharedString, StrikethroughStyle,
-    StyledText, Task, TextLayout, UTF16Selection, UnderlineStyle, Window, actions, anchored,
-    canvas, deferred, div, fill, point, prelude::*, px, size,
+    MouseUpEvent, Pixels, Point, Render, ScrollHandle, ScrollWheelEvent, SharedString,
+    StrikethroughStyle, StyledText, Task, TextLayout, UTF16Selection, UnderlineStyle, Window,
+    actions, anchored, canvas, deferred, div, fill, point, prelude::*, px, size,
 };
 
 use crate::floating;
@@ -37,6 +37,8 @@ use crate::floating;
 #[path = "table_view.rs"]
 mod table_view;
 use table_view::{TABLE_MENU, TableMenu};
+#[path = "anchor.rs"]
+mod anchor;
 #[path = "block_handle.rs"]
 mod block_handle;
 use block_handle::{BLOCK_MENU, BlockDrag, BlockMenu};
@@ -110,6 +112,14 @@ actions!(
         Escape,
         ShowCharacterPalette,
         StartWork,
+    ]
+);
+
+actions!(
+    diri_notes,
+    [
+        /// ⌘B bolded in a note instead of toggling the sidebar.
+        BoldShortcutUsed
     ]
 );
 
@@ -311,6 +321,9 @@ pub(super) const MARKER_WIDTH: f32 = 26.0;
 const INDENT_STEP: f32 = 24.0;
 /// Space above the title inside the scroll area.
 const PAGE_TOP: f32 = 56.0;
+/// A pause in wheel events this long ends a gesture's axis lock, for
+/// trackpads that report no gesture phases.
+const WHEEL_LOCK_GAP: Duration = Duration::from_millis(200);
 /// Space either side of the text column: room for the block handle, and a
 /// list item's fold chevron beside it.
 const PAGE_SIDE: f32 = 56.0;
@@ -534,9 +547,9 @@ pub(crate) struct NoteEditorView {
     colors: SemanticColors,
     /// One layout per block from the last frame, valid for `layout_revision`.
     /// `None` for blocks this frame did not lay out (off screen or folded).
-    layouts: Vec<Option<TextLayout>>,
+    layouts: Rc<Vec<Option<TextLayout>>>,
     /// Each block's laid-out text, parallel to `layouts`.
-    shown: Vec<Shown>,
+    shown: Rc<Vec<Shown>>,
     layout_revision: u64,
     layout_count: usize,
     /// IME composition range, in bytes of the caret's block.
@@ -563,6 +576,15 @@ pub(crate) struct NoteEditorView {
     footer: Option<gpui::AnyView>,
     /// Each table's sideways scroll, by its first cell's id.
     table_scrolls: std::cell::RefCell<std::collections::HashMap<u64, ScrollHandle>>,
+    /// The axis the current trackpad gesture scrolls, and its last event.
+    wheel_lock: Option<(gpui::Axis, Instant)>,
+    /// Holds the row being read still while rows above it are measured.
+    anchor: anchor::ScrollAnchor,
+    /// The row the pointer was last over: the only one that builds its
+    /// `+` and grip. It stays set while the pointer crosses to the gutter.
+    hovered_row: Rc<std::cell::Cell<Option<u64>>>,
+    /// The column width `row_heights` were measured at.
+    heights_width: Pixels,
     mentions: Rc<MentionDirectory>,
     assets: Option<AssetHome>,
     /// Each image's on-screen bounds from the last paint, for clicks.
@@ -601,8 +623,8 @@ impl NoteEditorView {
             editor,
             focus: cx.focus_handle(),
             colors,
-            layouts: Vec::new(),
-            shown: Vec::new(),
+            layouts: Rc::default(),
+            shown: Rc::default(),
             layout_revision: u64::MAX,
             layout_count: 0,
             marked: None,
@@ -623,6 +645,10 @@ impl NoteEditorView {
             dragging: None,
             footer: None,
             table_scrolls: Default::default(),
+            wheel_lock: None,
+            anchor: Rc::default(),
+            hovered_row: Rc::default(),
+            heights_width: px(0.0),
             mentions: Rc::default(),
             assets: None,
             image_rects: Rc::default(),
@@ -646,6 +672,9 @@ impl NoteEditorView {
     fn trigger_anchor(&self) -> Option<Bounds<Pixels>> {
         if self.block_menu.is_some() {
             return self.block_menu_anchor();
+        }
+        if let Some(anchor) = self.table_menu_anchor() {
+            return Some(anchor);
         }
         let (block_id, offset) = if let Some(menu) = &self.slash {
             (menu.block_id, menu.slash)
@@ -686,12 +715,87 @@ impl NoteEditorView {
     }
 
     #[cfg(test)]
+    pub(crate) fn table_menu_for_test(&self) -> Option<Option<Bounds<Pixels>>> {
+        self.table_menu.as_ref().map(|menu| menu.anchor)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_table_menu_for_test(&mut self, cx: &mut Context<Self>) {
+        self.table_menu = None;
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_table_menu_from_keys_for_test(&mut self, cx: &mut Context<Self>) {
+        self.open_table_menu(None, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn caret_bounds_for_test(&self) -> Option<Bounds<Pixels>> {
+        self.caret_bounds
+    }
+
+    #[cfg(test)]
+    pub(crate) fn measured_rows_for_test(&self) -> usize {
+        self.row_heights.borrow().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scroll_for_test(&self) -> ScrollHandle {
+        self.scroll.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn table_scrolls_for_test(&self) -> Vec<ScrollHandle> {
+        self.table_scrolls.borrow().values().cloned().collect()
+    }
+
+    #[cfg(test)]
     pub(crate) fn scroll_by_for_test(&mut self, dy: Pixels, cx: &mut Context<Self>) {
         let offset = self.scroll.offset();
         let max = self.scroll.max_offset().y;
         self.scroll
             .set_offset(point(offset.x, (offset.y + dy).clamp(-max, px(0.0))));
         cx.notify();
+    }
+
+    /// The axis a wheel event scrolls. A trackpad gesture keeps the axis its
+    /// first movement chose, momentum included, the way AppKit locks it: a
+    /// sideways swipe over a table never drifts the page, and scrolling the
+    /// page never nudges a table it passes. A mouse wheel decides per notch.
+    /// Asked by every handler the event bubbles through, so it is idempotent.
+    pub(super) fn wheel_axis(&mut self, event: &ScrollWheelEvent) -> Option<gpui::Axis> {
+        let now = Instant::now();
+        if event.touch_phase == gpui::TouchPhase::Started
+            || self
+                .wheel_lock
+                .is_some_and(|(_, at)| now.duration_since(at) > WHEEL_LOCK_GAP)
+        {
+            self.wheel_lock = None;
+        }
+        let delta = event.delta.pixel_delta(px(1.0));
+        if delta.x == px(0.0) && delta.y == px(0.0) {
+            return self.wheel_lock.map(|(axis, _)| axis);
+        }
+        let dominant = if delta.x.abs() > delta.y.abs() {
+            gpui::Axis::Horizontal
+        } else {
+            gpui::Axis::Vertical
+        };
+        if !event.delta.precise() {
+            return Some(dominant);
+        }
+        let axis = self.wheel_lock.map_or(dominant, |(axis, _)| axis);
+        self.wheel_lock = Some((axis, now));
+        Some(axis)
+    }
+
+    /// Runs inside the scroll area, so before it: a gesture locked sideways
+    /// stops short of the page.
+    fn page_wheel(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.wheel_axis(event) == Some(gpui::Axis::Horizontal) {
+            cx.stop_propagation();
+        }
     }
 
     /// Where this note's pictures are saved and resolved from.
@@ -1723,8 +1827,10 @@ impl NoteEditorView {
         cx.notify();
     }
 
-    fn bold(&mut self, _: &Bold, _: &mut Window, cx: &mut Context<Self>) {
+    fn bold(&mut self, _: &Bold, window: &mut Window, cx: &mut Context<Self>) {
         self.style(Style::Bold, cx);
+        // ⌘B is also Toggle Sidebar: the app may say how to reach it.
+        window.dispatch_action(Box::new(BoldShortcutUsed), cx);
     }
     fn italic(&mut self, _: &Italic, _: &mut Window, cx: &mut Context<Self>) {
         self.style(Style::Italic, cx);
@@ -2610,6 +2716,8 @@ impl AlphaExt for gpui::Rgba {
 struct PaintState {
     selection: Vec<Bounds<Pixels>>,
     caret: Option<Bounds<Pixels>>,
+    /// False when the caret's cell is scrolled out of its table's view.
+    caret_shown: bool,
 }
 
 impl Render for NoteEditorView {
@@ -2639,10 +2747,32 @@ impl Render for NoteEditorView {
         // sized from their last measured (or estimated) height. The caret's
         // and the anchor's blocks are always laid out so motion, autoscroll
         // and menus have their geometry.
-        let rendered = self.visible_blocks(&hidden);
+        let (rendered, estimates) = self.visible_blocks(&hidden);
         let heights = Rc::clone(&self.row_heights);
+        let content = {
+            use std::hash::{Hash as _, Hasher as _};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            (self.editor.revision, &hidden).hash(&mut hasher);
+            hasher.finish()
+        };
+        // Rows re-wrap at a new width: what was measured at the old one no
+        // longer sizes their spacers. The anchor keeps the text still while
+        // they are measured again.
+        let width = self.anchor.borrow().width();
+        // The first frame's width is a first measurement, not a new width.
+        if width != self.heights_width {
+            if self.heights_width > px(0.0) {
+                self.row_heights.borrow_mut().clear();
+            }
+            self.heights_width = width;
+        }
+        self.anchor.borrow_mut().begin(content);
+        let held = self.anchor.borrow().held();
+        let anchor = Rc::clone(&self.anchor);
+        let dragged = self.dragged();
         let mut spacer = 0.0f32;
         let mut table_end = 0;
+        let mut tables = Vec::new();
         let autoscroll_now = self.autoscroll;
         for (index, block) in self.editor.blocks().iter().enumerate() {
             if index < table_end {
@@ -2650,6 +2780,7 @@ impl Render for NoteEditorView {
             }
             // A table is drawn whole, as one grid of its cells.
             if block.kind.is_cell() {
+                tables.push(block.id);
                 let frame =
                     self.render_table(index, &rendered, focused, colors, autoscroll_now, cx);
                 table_end = index + frame.layouts.len();
@@ -2671,7 +2802,7 @@ impl Render for NoteEditorView {
                 layouts.push(None);
                 shown_all.push(Shown::default());
                 if !hidden[index] {
-                    spacer += self.row_height(block);
+                    spacer += estimates[index];
                 }
                 continue;
             }
@@ -2888,8 +3019,21 @@ impl Render for NoteEditorView {
                     indent
                 };
                 let target = block.id;
-                row.child(self.block_handle(index, gutter, look.top, look.line, group.clone(), cx))
-                    .children(self.drop_line(index, group.clone()))
+                // Hidden until hovered, the handle is built only where the
+                // pointer is: a few elements per row is a good part of a
+                // scrolling frame's layout.
+                let handle = (self.hovered_row.get() == Some(target)
+                    || self.block_menu.as_ref().is_some_and(|m| m.block_id == target))
+                .then(|| self.block_handle(index, gutter, look.top, look.line, group.clone(), cx));
+                let hovered = Rc::clone(&self.hovered_row);
+                row.children(handle)
+                    .on_hover(cx.listener(move |_, over: &bool, _, cx| {
+                        if *over && hovered.get() != Some(target) {
+                            hovered.set(Some(target));
+                            cx.notify();
+                        }
+                    }))
+                    .children(Self::drop_line(dragged.as_ref(), index, group.clone()))
                     .on_drop(cx.listener(move |this, drag: &BlockDrag, _, cx| {
                         this.drop_block(drag.block_id, target, cx);
                     }))
@@ -2898,19 +3042,39 @@ impl Render for NoteEditorView {
             };
             let id = block.id;
             let heights = Rc::clone(&heights);
+            let anchor = Rc::clone(&anchor);
+            let hovered = Rc::clone(&self.hovered_row);
             let row = row.child(
                 canvas(
-                    move |bounds, _, _| {
+                    move |bounds, window, _| {
                         heights
                             .borrow_mut()
                             .insert(id, f32::from(bounds.size.height));
+                        if !folded_away {
+                            anchor.borrow_mut().row(id, bounds.top());
+                        }
+                        // Rows scrolled under a resting pointer send no
+                        // mouse move: the handle follows them here.
+                        if !folded_away
+                            && index > 0
+                            && hovered.get() != Some(id)
+                            && bounds.contains(&window.mouse_position())
+                        {
+                            hovered.set(Some(id));
+                            window.request_animation_frame();
+                        }
                     },
                     |_, _, _, _| {},
                 )
                 .absolute()
                 .inset_0(),
             );
-            column = column.child(row.debug_selector(move || format!("note-row-{id}")));
+            let row = row.debug_selector(move || format!("note-row-{id}"));
+            column = if held == Some(id) {
+                column.child(anchor::probe(row, Rc::clone(&self.anchor)))
+            } else {
+                column.child(row)
+            };
             if !folded_away && let Some(status) = self.work_status_line(block, indent, colors, cx) {
                 column = column.child(status);
             }
@@ -2918,8 +3082,14 @@ impl Render for NoteEditorView {
         if spacer > 0.0 {
             column = column.child(div().flex_none().h(px(spacer)));
         }
-        self.layouts = layouts.clone();
-        self.shown = shown_all.clone();
+        // A table deleted or merged away takes its sideways scroll with it.
+        self.table_scrolls
+            .borrow_mut()
+            .retain(|id, _| tables.contains(id));
+        let layouts = Rc::new(layouts);
+        let shown_all = Rc::new(shown_all);
+        self.layouts = Rc::clone(&layouts);
+        self.shown = Rc::clone(&shown_all);
         self.layout_revision = self.editor.revision;
         self.layout_count = self.editor.blocks().len();
 
@@ -2952,7 +3122,7 @@ impl Render for NoteEditorView {
             }
         }
         let icon_ink = colors.secondary;
-        let chip_layouts = layouts.clone();
+        let chip_layouts = Rc::clone(&layouts);
         let chip_fill = super::chip::fill(colors);
         let chip_border = super::chip::border(colors);
         let chip_backdrop = canvas(
@@ -3035,13 +3205,21 @@ impl Render for NoteEditorView {
         let focus = self.focus.clone();
         let selection_color = accent().alpha(if focused { 0.28 } else { 0.14 });
         let caret_color = accent();
-        let blocks_meta: Vec<(usize, bool)> = self
-            .editor
-            .blocks()
-            .iter()
-            .map(|b| (b.text.len(), b.text.is_empty()))
+        // Text length, emptiness and fold of the blocks the selection spans,
+        // by index from its first: all the overlay reads.
+        let first = selection.start().block;
+        let blocks_meta: Vec<(usize, bool, bool)> = (first..=selection.end().block)
+            .map(|i| {
+                let text = &self.editor.block(i).text;
+                (text.len(), text.is_empty(), hidden[i])
+            })
             .collect();
-        let folded_away = hidden.clone();
+        // A table cell's selection and caret show only inside the table's
+        // sideways-scrolled viewport: drawn over everything, a cell scrolled
+        // out of view put its caret in the page margin.
+        let clips: Vec<Option<ScrollHandle>> = (first..=selection.end().block)
+            .map(|i| self.cell_clip(i))
+            .collect();
         // A selected image or divider shows as selected, not with a caret.
         let head_atomic = self.editor.block(selection.head.block).kind.is_atomic();
         let overlay_shown = shown_all;
@@ -3058,10 +3236,10 @@ impl Render for NoteEditorView {
                         let Some(Some(layout)) = layouts.get(index) else {
                             continue;
                         };
-                        if folded_away[index] {
+                        let (len, empty, folded_away) = blocks_meta[index - first];
+                        if folded_away {
                             continue;
                         }
-                        let (len, empty) = blocks_meta[index];
                         let from = if index == start.block {
                             start.offset
                         } else {
@@ -3070,7 +3248,18 @@ impl Render for NoteEditorView {
                         let to = if index == end.block { end.offset } else { len };
                         let shown = &overlay_shown[index];
                         let (from, to) = (shown.to_display(from), shown.to_display(to));
-                        rects.extend(selection_rects(layout, from, to, empty, index != end.block));
+                        let clip = clips[index - first].as_ref().map(ScrollHandle::bounds);
+                        rects.extend(
+                            selection_rects(layout, from, to, empty, index != end.block)
+                                .into_iter()
+                                .filter_map(|rect| match clip {
+                                    Some(clip) => {
+                                        let rect = rect.intersect(&clip);
+                                        (rect.size.width > px(0.0)).then_some(rect)
+                                    }
+                                    None => Some(rect),
+                                }),
+                        );
                     }
                 }
                 // The head's position is tracked for every selection (menus
@@ -3081,7 +3270,7 @@ impl Render for NoteEditorView {
                         .get(selection.head.block)
                         .and_then(Option::as_ref)
                         .and_then(|layout| {
-                            let (_, empty) = blocks_meta[selection.head.block];
+                            let (_, empty, _) = blocks_meta[selection.head.block - first];
                             let offset = if empty {
                                 0
                             } else {
@@ -3092,9 +3281,16 @@ impl Render for NoteEditorView {
                             Some(Bounds::new(at, size(px(2.0), layout.line_height())))
                         })
                 };
+                let caret_shown = caret.is_some_and(|caret| {
+                    clips[selection.head.block - first].as_ref().is_none_or(|clip| {
+                        let clip = clip.bounds();
+                        caret.left() >= clip.left() && caret.right() <= clip.right()
+                    })
+                });
                 PaintState {
                     selection: rects,
                     caret,
+                    caret_shown,
                 }
             },
             move |bounds, state, window, cx| {
@@ -3103,7 +3299,7 @@ impl Render for NoteEditorView {
                     window.paint_quad(fill(*rect, selection_color).corner_radii(px(3.0)));
                 }
                 if let Some(caret) = state.caret {
-                    if caret_on && selection.is_collapsed() && !head_atomic {
+                    if caret_on && selection.is_collapsed() && !head_atomic && state.caret_shown {
                         window.paint_quad(fill(caret, caret_color));
                     }
                     if autoscroll {
@@ -3189,6 +3385,14 @@ impl Render for NoteEditorView {
                 .child(footer)
         });
 
+        let mut page_scroll = div()
+            .id("note-editor-scroll")
+            .size_full()
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll)
+            .cursor_text();
+        // A sideways swipe is not a page scroll.
+        page_scroll.style().restrict_scroll_to_axis = Some(true);
         div()
             .id("note-editor")
             .key_context(if self.link_editor.is_some() {
@@ -3262,12 +3466,7 @@ impl Render for NoteEditorView {
             .on_action(cx.listener(Self::show_character_palette))
             .on_action(cx.listener(Self::start_work))
             .child(
-                div()
-                    .id("note-editor-scroll")
-                    .size_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
-                    .cursor_text()
+                page_scroll
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_move(cx.listener(Self::on_mouse_move))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -3290,6 +3489,7 @@ impl Render for NoteEditorView {
                             .px(px(PAGE_SIDE))
                             .pt(px(PAGE_TOP))
                             .pb(px(240.0))
+                            .on_scroll_wheel(cx.listener(Self::page_wheel))
                             .child(
                                 div()
                                     .relative()
@@ -3297,10 +3497,16 @@ impl Render for NoteEditorView {
                                     .max_w(px(MEASURE))
                                     .mx_auto()
                                     .child(chip_backdrop)
-                                    .child(column)
+                                    .child(anchor::anchored(
+                                        column,
+                                        Rc::clone(&self.anchor),
+                                        self.scroll.clone(),
+                                    ))
                                     .child(overlay),
                             )
-                            .children(footer),
+                            .children(
+                                footer.map(|footer| anchor::follow(footer, Rc::clone(&self.anchor))),
+                            ),
                     ),
             )
             .children(slash_menu)
@@ -3450,18 +3656,24 @@ impl NoteEditorView {
         self.insert_image_files(paths.paths(), "drop", cx);
     }
 
-    /// Which blocks this frame lays out: those within a screen of the
+    /// Which blocks this frame lays out: those within half a screen of the
     /// viewport (found by walking measured or estimated heights), the title,
     /// and the blocks holding the selection's ends. Folded blocks never are.
-    fn visible_blocks(&self, hidden: &[bool]) -> Vec<bool> {
+    /// Layout is most of a scrolling frame's cost, so the margin is only
+    /// what a fast flick covers in a frame or two; the scroll anchor keeps
+    /// rows measured on their way in from moving the text.
+    /// Also returns each block's height as walked (zero for table cells and
+    /// folded blocks), for the spacers standing in for the rest.
+    fn visible_blocks(&self, hidden: &[bool]) -> (Vec<bool>, Vec<f32>) {
         let blocks = self.editor.blocks();
         let viewport = f32::from(self.scroll.bounds().size.height);
         let viewport = if viewport > 0.0 { viewport } else { 1200.0 };
         let top = -f32::from(self.scroll.offset().y) - PAGE_TOP;
-        let (lo, hi) = (top - viewport, top + 2.0 * viewport);
+        let (lo, hi) = (top - 0.5 * viewport, top + 1.5 * viewport);
         let selection = self.editor.selection;
         let mut y = 0.0;
         let mut rendered = vec![false; blocks.len()];
+        let mut heights = vec![0.0; blocks.len()];
         let mut index = 0;
         while index < blocks.len() {
             if hidden[index] {
@@ -3476,7 +3688,9 @@ impl NoteEditorView {
             let height = if blocks[index].kind.is_cell() {
                 self.table_row_height(index)
             } else {
-                self.row_height(&blocks[index])
+                let height = self.row_height(&blocks[index]);
+                heights[index] = height;
+                height
             };
             let holds_selection =
                 |i: usize| i == selection.head.block || i == selection.anchor.block;
@@ -3488,7 +3702,7 @@ impl NoteEditorView {
             y += height;
             index = unit.end;
         }
-        rendered
+        (rendered, heights)
     }
 
     /// A block's height from its last paint, or an estimate from its kind

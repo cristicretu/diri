@@ -154,6 +154,8 @@
   "notes.block.todo": "待办",
   "notes.block.turn_into": "转换为",
   "notes.cancel": "取消",
+  "notes.error.closed_moved": "“{title}”在保存最后的修改之前已在 diri 之外被移动或删除。",
+  "notes.error.closed_save": "无法保存“{title}”：{error}",
   "notes.error.link": "无法链接该提及：{error}",
   "notes.error.moved_outside": "此笔记的文件已在 diri 之外被移动或删除；你的文字仍保留在这里。",
   "notes.error.save": "无法保存此笔记：{error}",

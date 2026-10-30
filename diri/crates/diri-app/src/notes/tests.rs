@@ -736,7 +736,6 @@ fn a_callout_glyph_cycles_its_tone(cx: &mut gpui::TestAppContext) {
 /// A long, realistic note: sections of paragraphs with bold and links,
 /// to-dos, bullets with children, quotes, a code block, mention and tool
 /// chips, repeated to `blocks` blocks.
-#[cfg(target_os = "macos")]
 pub(crate) fn big_note_markdown(blocks: usize) -> String {
     let mut out = String::from("# Research log\n\n");
     let mut count = 0;
@@ -1252,5 +1251,352 @@ fn backlinks_sit_below_the_last_row_of_wrapped_text(cx: &mut gpui::TestAppContex
         "backlinks at {:?} overlap the last row ending at {:?}",
         footer.top(),
         row.bottom()
+    );
+}
+
+/// A trackpad gesture keeps to the axis it started on. Regression: a
+/// sideways swipe scrolled the page instead of the table under it, since the
+/// page turned horizontal motion vertical, and the table turned vertical
+/// wheel motion sideways.
+#[gpui::test]
+fn wheel_gestures_keep_to_their_axis(cx: &mut gpui::TestAppContext) {
+    use gpui::{ScrollDelta, ScrollWheelEvent, TouchPhase, point};
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Arc::new(NoteStore::open(dir.path().join("notes")).expect("store"));
+    let cell = "a cell with more text than any column has room for";
+    let mut md = String::from("# Wide\n\n");
+    md.push_str(&format!("|{}\n|{}\n", " Head |".repeat(8), "---|".repeat(8)));
+    for _ in 0..3 {
+        md.push_str(&format!("|{}\n", format!(" {cell} |").repeat(8)));
+    }
+    for i in 0..60 {
+        md.push_str(&format!("\nParagraph {i}.\n"));
+    }
+    let (_, doc) = markdown::parse(&md);
+    let (id, _) = store.create(doc, None).expect("create");
+    let (pane, cx) = pane(cx, store);
+    cx.simulate_resize(gpui::size(px(900.0), px(600.0)));
+    pane.update_in(cx, |pane, window, cx| {
+        pane.show(&SessionId::new("s_note"), &id, window, cx)
+    });
+    cx.run_until_parked();
+    let editor = editor(&pane, cx);
+    // The caret starts at the note's end; bring the table back into view.
+    editor.update(cx, |view, cx| view.scroll_by_for_test(px(1e6), cx));
+    cx.run_until_parked();
+    let table = editor.read_with(cx, |view, _| {
+        let scrolls = view.table_scrolls_for_test();
+        assert_eq!(scrolls.len(), 1);
+        scrolls[0].clone()
+    });
+    let page = editor.read_with(cx, |view, _| view.scroll_for_test());
+    assert!(table.max_offset().x > px(0.0), "the table is wider than the page");
+    assert!(page.max_offset().y > px(0.0), "the note scrolls");
+    let gesture = |cx: &mut gpui::VisualTestContext, at, dx: f32, dy: f32| {
+        for (touch_phase, delta) in [
+            (TouchPhase::Started, point(px(0.0), px(0.0))),
+            (TouchPhase::Moved, point(px(dx), px(dy))),
+            // Off-axis drift later in the gesture stays locked out.
+            (TouchPhase::Moved, point(px(dy), px(dx))),
+            (TouchPhase::Ended, point(px(0.0), px(0.0))),
+        ] {
+            cx.simulate_event(ScrollWheelEvent {
+                position: at,
+                delta: ScrollDelta::Pixels(delta),
+                touch_phase,
+                ..ScrollWheelEvent::default()
+            });
+        }
+    };
+
+    gesture(cx, table.bounds().center(), -60.0, -4.0);
+    assert_eq!(table.offset().x, px(-64.0));
+    assert_eq!(page.offset().y, px(0.0), "a sideways swipe left the page");
+
+    gesture(cx, table.bounds().center(), 3.0, -50.0);
+    assert_eq!(page.offset().y, px(-47.0));
+    assert_eq!(table.offset().x, px(-64.0), "page scrolling left the table");
+
+    let below = point(table.bounds().center().x, table.bounds().bottom() + px(200.0));
+    gesture(cx, below, -60.0, -4.0);
+    assert_eq!(page.offset().y, px(-47.0), "a sideways swipe left the page");
+    assert_eq!(table.offset().x, px(-64.0));
+
+    // A mouse wheel over the table scrolls the page, as on the web.
+    cx.simulate_event(ScrollWheelEvent {
+        position: table.bounds().center(),
+        delta: ScrollDelta::Lines(point(0.0, -1.0)),
+        ..ScrollWheelEvent::default()
+    });
+    assert!(page.offset().y < px(-47.0));
+    assert_eq!(table.offset().x, px(-64.0));
+}
+
+/// Text under the reader moves exactly as far as the scroll. Regression:
+/// a long note opens at its end, and scrolling up swapped each block's
+/// estimated height for its measured one as it entered the layout window,
+/// so the text jumped by a line or two every few steps. The backlinks under
+/// the note move with it, not one frame behind the correction.
+#[gpui::test]
+fn scrolling_up_a_long_note_never_jumps(cx: &mut gpui::TestAppContext) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Arc::new(NoteStore::open(dir.path().join("notes")).expect("store"));
+    let (_, doc) = markdown::parse(&big_note_markdown(400));
+    let (id, _) = store.create(doc, None).expect("create");
+    let (pane, cx) = pane(cx, store);
+    cx.simulate_resize(gpui::size(px(900.0), px(700.0)));
+    pane.update_in(cx, |pane, window, cx| {
+        pane.show(&SessionId::new("s_note"), &id, window, cx)
+    });
+    cx.run_until_parked();
+    let editor = editor(&pane, cx);
+    // Draw the frame the caret's autoscroll asked for.
+    editor.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+    let page = editor.read_with(cx, |view, _| view.scroll_for_test());
+    assert!(page.offset().y < px(-2000.0), "the note opens at its end");
+    let ids: Vec<u64> = editor.read_with(cx, |view, _| {
+        view.editor.blocks().iter().map(|b| b.id).collect()
+    });
+    let mut steps = 0;
+    let mut footer_steps = 0;
+    while page.offset().y < px(-40.0) {
+        let footer = cx
+            .debug_bounds("note-footer")
+            .map(|bounds| bounds.top())
+            .filter(|top| *top < px(700.0));
+        // A row in the middle of the viewport, before and after one step.
+        let (selector, top) = ids
+            .iter()
+            .rev()
+            .find_map(|id| {
+                let selector: &'static str = format!("note-row-{id}").leak();
+                let bounds = cx.debug_bounds(selector)?;
+                (bounds.top() > px(200.0) && bounds.top() < px(500.0))
+                    .then_some((selector, bounds.top()))
+            })
+            .expect("a row on screen");
+        editor.update(cx, |view, cx| view.scroll_by_for_test(px(40.0), cx));
+        cx.run_until_parked();
+        let moved = cx.debug_bounds(selector).expect("still laid out").top() - top;
+        assert!(
+            (moved - px(40.0)).abs() < px(0.5),
+            "step {steps}: the text moved {moved:?} for a 40px scroll"
+        );
+        if let Some(top) = footer
+            && let Some(after) = cx.debug_bounds("note-footer")
+        {
+            let moved = after.top() - top;
+            assert!(
+                (moved - px(40.0)).abs() < px(0.5),
+                "step {steps}: the backlinks moved {moved:?} for a 40px scroll"
+            );
+            footer_steps += 1;
+        }
+        steps += 1;
+    }
+    assert!(steps > 50);
+    assert!(footer_steps > 0, "the backlinks were on screen at the end");
+}
+
+/// Only the row under the pointer builds its `+` and grip, and the handle
+/// follows rows that scroll under a resting pointer.
+#[gpui::test]
+fn the_block_handle_follows_the_pointer(cx: &mut gpui::TestAppContext) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Arc::new(NoteStore::open(dir.path().join("notes")).expect("store"));
+    let (_, doc) = markdown::parse(&big_note_markdown(120));
+    let (id, _) = store.create(doc, None).expect("create");
+    let (pane, cx) = pane(cx, store);
+    cx.simulate_resize(gpui::size(px(900.0), px(700.0)));
+    pane.update_in(cx, |pane, window, cx| {
+        pane.show(&SessionId::new("s_note"), &id, window, cx)
+    });
+    let editor = editor(&pane, cx);
+    editor.update(cx, |view, cx| view.scroll_by_for_test(px(1e6), cx));
+    cx.run_until_parked();
+    let ids: Vec<u64> = editor.read_with(cx, |view, _| {
+        view.editor.blocks().iter().map(|b| b.id).collect()
+    });
+    let row = |cx: &mut gpui::VisualTestContext, id: u64| {
+        let selector: &'static str = format!("note-row-{id}").leak();
+        cx.debug_bounds(selector)
+    };
+    let handles = |cx: &mut gpui::VisualTestContext| {
+        ids.iter()
+            .copied()
+            .filter(|id| {
+                let selector: &'static str = format!("note-handle-{id}").leak();
+                cx.debug_bounds(selector).is_some()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(handles(cx).is_empty(), "no row is hovered yet");
+    let at = row(cx, ids[3]).expect("row on screen").center();
+    cx.simulate_mouse_move(at, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(handles(cx), vec![ids[3]]);
+
+    // Scroll so another row sits under the still pointer.
+    editor.update(cx, |view, cx| view.scroll_by_for_test(px(-200.0), cx));
+    cx.run_until_parked();
+    // The frame that paint asked for, as the display link delivers it.
+    cx.update(|window, cx| window.simulate_next_frame(cx));
+    cx.run_until_parked();
+    let under = ids
+        .iter()
+        .copied()
+        .find(|&id| row(cx, id).is_some_and(|b| b.contains(&at)))
+        .expect("a row under the pointer");
+    assert_ne!(under, ids[3]);
+    assert_eq!(handles(cx), vec![under]);
+}
+
+/// Switching notes writes the one left behind off the main thread, and an
+/// outside write that landed meanwhile is merged in, not overwritten.
+#[gpui::test]
+fn switching_notes_saves_the_last_one_off_the_main_thread(cx: &mut gpui::TestAppContext) {
+    let (_dir, store, id) = store_with_plan();
+    let (_, doc) = markdown::parse("# Other\n\nSomething else.\n");
+    let (other, _) = store.create(doc, None).expect("create");
+    let (pane, cx) = pane(cx, store.clone());
+    let session = SessionId::new("s_note");
+    pane.update_in(cx, |pane, window, cx| pane.show(&session, &id, window, cx));
+    let editor = editor(&pane, cx);
+    editor.update_in(cx, |view, window, cx| {
+        let last = view.editor.blocks().len() - 1;
+        view.editor.set_caret(diri_notes::edit::Pos::new(last, 0));
+        for ch in "typed before leaving".chars() {
+            view.replace_text_in_range(None, &ch.to_string(), window, cx);
+        }
+    });
+    store
+        .append(
+            &id,
+            "- [ ] added by an agent",
+            &diri_notes::history::Author::Session("s_agent".into()),
+        )
+        .unwrap();
+    let path = store.path_for(&id).unwrap();
+    let before = std::fs::read_to_string(&path).unwrap();
+    pane.update_in(cx, |pane, window, cx| {
+        pane.show(&session, &other, window, cx);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "the switch did not wait on the write"
+        );
+    });
+    cx.run_until_parked();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("typed before leaving"), "{text}");
+    assert!(text.contains("- [ ] added by an agent"), "{text}");
+}
+
+/// Heights measured at one column width do not size spacers at another.
+#[gpui::test]
+fn a_new_width_forgets_measured_heights(cx: &mut gpui::TestAppContext) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Arc::new(NoteStore::open(dir.path().join("notes")).expect("store"));
+    let (_, doc) = markdown::parse(&big_note_markdown(120));
+    let (id, _) = store.create(doc, None).expect("create");
+    let (pane, cx) = pane(cx, store);
+    cx.simulate_resize(gpui::size(px(900.0), px(700.0)));
+    pane.update_in(cx, |pane, window, cx| {
+        pane.show(&SessionId::new("s_note"), &id, window, cx)
+    });
+    cx.run_until_parked();
+    let editor = editor(&pane, cx);
+    editor.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+    let measured = editor.read_with(cx, |view, _| view.measured_rows_for_test());
+    assert!(measured > 0);
+    // Narrower than the text column: every row re-wraps.
+    cx.simulate_resize(gpui::size(px(500.0), px(700.0)));
+    cx.run_until_parked();
+    editor.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+    let after = editor.read_with(cx, |view, _| view.measured_rows_for_test());
+    assert!(
+        after < measured,
+        "rows measured at the old width were kept: {after} of {measured}"
+    );
+}
+
+/// A right click on a table cell opens the table menu under the pointer
+/// with the caret in that cell. Opened from the keyboard after the table was
+/// scrolled away from the caret, the menu's anchor, the caret, is scrolled
+/// back into view first. Regression: the menu opened at a caret scrolled
+/// out of the table, out in the page margin.
+#[gpui::test]
+fn the_table_menu_opens_where_it_was_asked_for(cx: &mut gpui::TestAppContext) {
+    use gpui::{Modifiers, MouseButton, MouseDownEvent, ScrollDelta, ScrollWheelEvent, point};
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Arc::new(NoteStore::open(dir.path().join("notes")).expect("store"));
+    let cell = "a cell with more text than any column has room for";
+    let mut md = String::from("# Wide\n\n");
+    md.push_str(&format!("|{}\n|{}\n", " Head |".repeat(8), "---|".repeat(8)));
+    for _ in 0..3 {
+        md.push_str(&format!("|{}\n", format!(" {cell} |").repeat(8)));
+    }
+    md.push_str("\nAfter the table.\n");
+    let (_, doc) = markdown::parse(&md);
+    let (id, _) = store.create(doc, None).expect("create");
+    let (pane, cx) = pane(cx, store);
+    cx.simulate_resize(gpui::size(px(900.0), px(600.0)));
+    pane.update_in(cx, |pane, window, cx| {
+        pane.show(&SessionId::new("s_note"), &id, window, cx)
+    });
+    cx.run_until_parked();
+    let editor = editor(&pane, cx);
+    editor.update(cx, |view, cx| view.scroll_by_for_test(px(1e6), cx));
+    cx.run_until_parked();
+    let table = editor.read_with(cx, |view, _| view.table_scrolls_for_test()[0].clone());
+
+    let at = point(table.bounds().left() + px(40.0), table.bounds().center().y);
+    cx.simulate_event(MouseDownEvent {
+        button: MouseButton::Right,
+        position: at,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.run_until_parked();
+    let (anchor, in_table) = editor.read_with(cx, |view, _| {
+        (
+            view.table_menu_for_test(),
+            view.editor.caret_table().is_some(),
+        )
+    });
+    assert_eq!(anchor.flatten().map(|b| b.origin), Some(at));
+    assert!(in_table, "the caret went into the clicked cell");
+
+    // Swipe the table well away from the caret's column, then open the
+    // menu from the keyboard.
+    editor.update(cx, |view, cx| view.close_table_menu_for_test(cx));
+    cx.run_until_parked();
+    for (touch_phase, dx) in [
+        (gpui::TouchPhase::Started, 0.0),
+        (gpui::TouchPhase::Moved, -1500.0),
+        (gpui::TouchPhase::Ended, 0.0),
+    ] {
+        cx.simulate_event(ScrollWheelEvent {
+            position: table.bounds().center(),
+            delta: ScrollDelta::Pixels(point(px(dx), px(0.0))),
+            touch_phase,
+            ..ScrollWheelEvent::default()
+        });
+    }
+    cx.run_until_parked();
+    assert!(table.offset().x < px(-1000.0));
+    editor.update(cx, |view, cx| view.open_table_menu_from_keys_for_test(cx));
+    cx.run_until_parked();
+    let caret = editor
+        .read_with(cx, |view, _| view.caret_bounds_for_test())
+        .expect("caret laid out");
+    let view = table.bounds();
+    assert!(
+        caret.left() >= view.left() && caret.right() <= view.right(),
+        "caret {caret:?} is outside the table's view {view:?}"
     );
 }
