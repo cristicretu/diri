@@ -166,7 +166,7 @@ export const header = (active = '') => `<header class="site-header">
 export const footer = `<footer class="site-footer">
       <div class="footer-main">
         <a class="footer-brand" href="/" aria-label="Diri home"><img class="app-mark" src="/assets/brand/diri-icon.svg" width="26" height="26" alt="">diri</a>
-        <nav class="footer-links" aria-label="Resources"><a href="${repo}/releases/latest">Download</a><a href="/whats-new/">What's new</a><a href="/docs/">Docs</a><a href="/guides/">Guides</a><a href="/agents/">Agents</a><a href="/compare/">Compare</a><a href="${repo}/blob/main/ROADMAP.md">Roadmap</a><a href="${repo}">GitHub</a><a href="${repo}/blob/main/PRIVACY.md">Privacy</a><a href="${repo}/blob/main/SECURITY.md">Security</a><a href="${repo}/blob/main/LICENSE">AGPL-3.0</a></nav>
+        <nav class="footer-links" aria-label="Resources"><a href="${repo}/releases/latest">Download</a><a href="/whats-new/">What's new</a><a href="/docs/">Docs</a><a href="/guides/">Guides</a><a href="/agents/">Agents</a><a href="/compare/">Compare</a><a href="${repo}/blob/main/ROADMAP.md">Roadmap</a><a href="${repo}">GitHub</a><a href="/docs/privacy/">Privacy</a><a href="${repo}/blob/main/SECURITY.md">Security</a><a href="${repo}/blob/main/LICENSE">AGPL-3.0</a></nav>
       </div>
     </footer>`;
 

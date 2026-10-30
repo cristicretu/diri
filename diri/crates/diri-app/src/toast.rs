@@ -37,6 +37,8 @@ pub enum ToastCommand {
     CopyDetails(String),
     /// Put back the terminal settings an import replaced.
     UndoTerminalImport,
+    /// The person answered the one-time diagnostics question.
+    ShareDiagnostics(bool),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1135,21 +1135,13 @@ impl RootView {
         if !preview {
             crate::voice::install(Arc::clone(&services.store), services.tokio.handle().clone());
         }
-        // Once, the first time a build that records runs: say so, and where
-        // to turn it off. The standard toast, held a little longer.
-        if !preview && crate::telemetry::take_first_run_notice() {
+        // Once per install: ask whether to share diagnostics. Sharing is
+        // opt-in; ignoring the question leaves it off, and Settings › Privacy
+        // can change it any time.
+        if !preview && crate::telemetry::take_consent_prompt() {
             cx.spawn(async move |this, cx| {
                 let _ = this.update(cx, |this, cx| {
-                    this.show_toast(
-                        Toast::info(crate::i18n::t("toast.privacy_reports"))
-                            .detail(crate::i18n::t("toast.privacy_reports_detail"))
-                            .action(
-                                crate::i18n::t("toast.action_settings"),
-                                ToastCommand::OpenPrivacySettings,
-                            )
-                            .hold(Duration::from_secs(20)),
-                        cx,
-                    );
+                    this.show_toast(diagnostics_consent_toast(), cx);
                 });
             })
             .detach();
@@ -1937,6 +1929,24 @@ impl RootView {
             ToastCommand::UndoTerminalImport => {
                 self.toast.dismiss();
                 self.undo_terminal_import(cx);
+            }
+            ToastCommand::ShareDiagnostics(share) => {
+                self.toast.dismiss();
+                if crate::telemetry::choose_sharing(share).is_err() {
+                    self.show_toast(
+                        Toast::error(crate::i18n::t("settings.privacy.save_failed")),
+                        cx,
+                    );
+                } else if share {
+                    self.show_toast(
+                        Toast::success(crate::i18n::t("toast.privacy_shared"))
+                            .action(
+                                crate::i18n::t("toast.action_settings"),
+                                ToastCommand::OpenPrivacySettings,
+                            ),
+                        cx,
+                    );
+                }
             }
         }
         cx.notify();
@@ -6648,6 +6658,23 @@ fn preview_hint(system_image: &str, label: &str, colors: SemanticColors) -> AnyE
         .into_any_element()
 }
 
+
+/// The one-time question: share anonymous diagnostics? Non-blocking, held
+/// long enough to read; Settings › Privacy has the same switch.
+pub(crate) fn diagnostics_consent_toast() -> Toast {
+    Toast::info(crate::i18n::t("toast.privacy_consent"))
+        .detail(crate::i18n::t("toast.privacy_consent_detail"))
+        .action(
+            crate::i18n::t("toast.privacy_consent_share"),
+            ToastCommand::ShareDiagnostics(true),
+        )
+        .action(
+            crate::i18n::t("toast.privacy_consent_decline"),
+            ToastCommand::ShareDiagnostics(false),
+        )
+        .hold(Duration::from_secs(45))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11297,11 +11324,7 @@ mod tests {
             std::env::var("DIRI_TOAST_STYLES").unwrap_or_else(|_| "capsule,card,ink".into());
         type State = (&'static str, fn() -> Toast);
         let states: [State; 3] = [
-            ("privacy", || {
-                Toast::info("diri sends crash and error reports")
-                    .detail("Terminal contents never leave your Mac.")
-                    .action("Settings", ToastCommand::OpenPrivacySettings)
-            }),
+            ("privacy", diagnostics_consent_toast),
             ("error", || {
                 Toast::error(t("window.toast.workspace_not_saved"))
             }),

@@ -22,7 +22,7 @@ export const NAV = [
     ['remote-hosts', 'server'],
   ] },
   { group: 'Reference', pages: [
-    ['security', 'shield'], ['troubleshooting', 'lifebuoy'],
+    ['security', 'shield'], ['privacy', 'external-link'], ['troubleshooting', 'lifebuoy'],
   ] },
 ];
 
@@ -44,6 +44,13 @@ function schemaType(schema = {}) {
   if (schema.enum) return schema.enum.map(v => `\`${v}\``).join(', ');
   if (schema.type === 'array') return `${schemaType(schema.items)} array`.replace(/^object array$/, 'array of objects');
   return schema.type || 'any';
+}
+
+// ── The connection list is shared with Settings › Privacy ───────────────────
+function connectionMarkdown(connections) {
+  const cell = text => text.replace(/\|/g, '/').replace(/\n/g, ' ');
+  const rows = connections.map(c => `| **${cell(c.name)}** | ${cell(c.destination)} | ${cell(c.sends)} | ${cell(c.when)} | ${cell(c.optional)} | ${cell(c.off)} |`);
+  return ['| Connection | Goes to | What is sent | When | Optional | How to turn it off |', '| --- | --- | --- | --- | --- | --- |', ...rows].join('\n');
 }
 
 function toolMarkdown(catalog) {
@@ -172,6 +179,10 @@ export async function buildDocs() {
     if (markdown.includes('{{mcp-tools}}')) {
       const catalog = JSON.parse(await readFile(resolve(source, 'mcp-tools.json'), 'utf8'));
       markdown = markdown.replace('{{mcp-tools}}', toolMarkdown(catalog).trim());
+    }
+    if (markdown.includes('{{connections}}')) {
+      const { connections } = JSON.parse(await readFile(resolve(source, 'connections.json'), 'utf8'));
+      markdown = markdown.replace('{{connections}}', connectionMarkdown(connections).trim());
     }
     pages.set(slug, { meta, markdown });
   }

@@ -1,0 +1,149 @@
+{
+  "_comment": "Every outbound connection the diri app, Engine, Holders, phone access and updater make. Rendered into /docs/privacy/ and mirrored in Settings > Privacy (diri-app checks the ids match). Add a row here before shipping a new connection.",
+  "connections": [
+    {
+      "id": "diagnostics",
+      "name": "Diagnostics",
+      "destination": "telemetry.diri.sh (Cloudflare Worker run by the project)",
+      "sends": "Recorded diagnostics (crashes, hangs, errors, timings, counts), a random install id, your Support ID, app/OS/CPU versions and the name you set. Never terminal contents, prompts, files or environment variables.",
+      "when": "About once an hour, and within a minute after a crash, by the Engine.",
+      "optional": "Opt-in. New installs send nothing until you choose Share. Existing installs keep the setting they already had.",
+      "off": "Settings › Privacy › Share diagnostics. `DIRI_TELEMETRY=off` also stops recording."
+    },
+    {
+      "id": "report",
+      "name": "Send now and Report a Problem",
+      "destination": "telemetry.diri.sh",
+      "sends": "The same diagnostics as above, once.",
+      "when": "Only when you click Send now or Help › Report a Problem.",
+      "optional": "Yes. The click is the consent, even with sharing off.",
+      "off": "Don't click them."
+    },
+    {
+      "id": "updates",
+      "name": "Update checks",
+      "destination": "GitHub Releases (appcast.json and the release ZIP), with updates.diri.sh as a mirror when GitHub is slow",
+      "sends": "Plain downloads. No install id, cookies or account; only a fixed `diri-updater` User-Agent and your IP address.",
+      "when": "20 seconds after launch, then every 6 hours, and when you click Check for Updates.",
+      "optional": "Yes.",
+      "off": "Turn off automatic updates in Settings. `DIRI_UPDATE_MIRROR=off` uses GitHub only."
+    },
+    {
+      "id": "whats_new",
+      "name": "Release notes",
+      "destination": "api.github.com (the latest diri release)",
+      "sends": "A plain request, no identifiers. The What's New clips ship inside the app and are never downloaded.",
+      "when": "When you open Settings › What's New.",
+      "optional": "Yes.",
+      "off": "Don't open that tab."
+    },
+    {
+      "id": "agent_usage",
+      "name": "Claude and Codex usage limits",
+      "destination": "api.anthropic.com and chatgpt.com",
+      "sends": "The agent's own sign-in token, read from Claude Code's keychain item or Codex's auth file, to read your remaining quota and account profile. Tokens are never refreshed or sent anywhere else.",
+      "when": "When you open the account menu or Accounts settings, on account switching, and every 3 minutes if the sidebar shows remaining quota.",
+      "optional": "Yes.",
+      "off": "Keep the sidebar indicator on its default and don't open the account menu."
+    },
+    {
+      "id": "cursor_usage",
+      "name": "Cursor usage",
+      "destination": "cursor.com and api2.cursor.sh",
+      "sends": "Cursor's own session token and machine id, to read your Cursor usage events. Refreshes the Cursor token when it has expired.",
+      "when": "At launch and every minute, only if Cursor is signed in on this machine.",
+      "optional": "Only runs with a Cursor sign-in.",
+      "off": "Sign out of Cursor. There is no separate switch yet."
+    },
+    {
+      "id": "pull_requests",
+      "name": "Pull request status",
+      "destination": "GitHub, through your own `gh` CLI",
+      "sends": "Pull request links that appeared in your sessions, with your `gh` sign-in.",
+      "when": "Every minute while diri is in front, every 5 minutes or less often in the background, and when you open Worktrees.",
+      "optional": "Only runs when `gh` is installed.",
+      "off": "Uninstall or sign out of `gh`."
+    },
+    {
+      "id": "ssh_hosts",
+      "name": "Your SSH hosts",
+      "destination": "The hosts you add, through your own `ssh` and `scp`",
+      "sends": "Session input and output, the diri-remote helper binary (copied from the app, never downloaded), pasted images, and usage queries.",
+      "when": "Only for remote sessions and hosts you configure.",
+      "optional": "Yes.",
+      "off": "Remove the host."
+    },
+    {
+      "id": "git",
+      "name": "Git remotes",
+      "destination": "Your repository's `origin`, through your own `git`",
+      "sends": "Your git credentials and the session branch.",
+      "when": "A fetch before starting an agent in a new worktree from the default branch, and push/fetch when you move a session to another machine.",
+      "optional": "Yes. Offline it uses the last fetched branch.",
+      "off": "Start agents without a new worktree, and don't move sessions."
+    },
+    {
+      "id": "agent_install",
+      "name": "Agent installers",
+      "destination": "The agent vendor's installer (claude.ai, chatgpt.com, npm, opencode.ai and others)",
+      "sends": "Whatever the vendor's installer sends. diri types the command into a terminal you can see.",
+      "when": "Only when you click Install for an agent and confirm.",
+      "optional": "Yes.",
+      "off": "Install agents yourself."
+    },
+    {
+      "id": "computer_use",
+      "name": "Computer use driver",
+      "destination": "github.com (a pinned cua-driver release, checked by SHA-256 and signing team)",
+      "sends": "A plain download.",
+      "when": "Only when you click Set up in Settings › Agents › Computer use.",
+      "optional": "Yes.",
+      "off": "Don't set it up."
+    },
+    {
+      "id": "voice",
+      "name": "Kokoro voice",
+      "destination": "huggingface.co, github.com and raw.githubusercontent.com",
+      "sends": "Plain downloads of the voice model, checked by SHA-256. Speech recognition and system voices stay on device.",
+      "when": "When you pick a Kokoro voice and its files are missing.",
+      "optional": "Yes.",
+      "off": "Use a system voice (the default)."
+    },
+    {
+      "id": "api_tab",
+      "name": "API tab",
+      "destination": "Any URL you or an agent enter",
+      "sends": "The request as written.",
+      "when": "When you click Send. An agent may send a GET it opened for you.",
+      "optional": "Yes.",
+      "off": "Don't use the API tab."
+    },
+    {
+      "id": "browser",
+      "name": "Browser",
+      "destination": "Any site you or an agent open",
+      "sends": "Normal web traffic from the in-app browser or the agent browser tool (your own Node and Playwright).",
+      "when": "Only while you or an agent browse.",
+      "optional": "Yes.",
+      "off": "Don't use the browser."
+    },
+    {
+      "id": "phone",
+      "name": "Phone access",
+      "destination": "Local: listens on your Tailscale address only, and asks the local Tailscale service who is connecting",
+      "sends": "Nothing to the internet. No relay or cloud pairing service.",
+      "when": "Only while Phone access is turned on in Settings.",
+      "optional": "Yes, off by default.",
+      "off": "Turn off Phone access."
+    },
+    {
+      "id": "local",
+      "name": "Engine and MCP",
+      "destination": "Local: a Unix socket and a loopback-only MCP port",
+      "sends": "Nothing leaves the machine.",
+      "when": "Always, between diri's own processes and the agents it starts.",
+      "optional": "Required.",
+      "off": "Not needed: it never leaves the machine."
+    }
+  ]
+}

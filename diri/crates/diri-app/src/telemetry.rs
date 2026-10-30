@@ -1393,25 +1393,34 @@ impl PrivacySettings {
     }
 }
 
-/// True the first time a build that records runs: no one has seen, or
-/// changed, the diagnostics settings yet. Marks the notice as shown by
-/// writing the (default) settings file the Engine's uploader reads.
-pub(crate) fn take_first_run_notice() -> bool {
+/// True once, on a new install: no diagnostics settings exist yet. Saves
+/// sharing off, so ignoring the question keeps it off and it is not asked
+/// again. Installs from before opt-in already have settings and keep them.
+pub(crate) fn take_consent_prompt() -> bool {
     if !diri_telemetry::is_enabled() {
         return false;
     }
     let Some(dir) = state_dir() else {
         return false;
     };
-    let path = diri_telemetry::telemetry_dir(&dir).join("config.json");
-    if path.exists() {
+    take_consent_prompt_in(&dir)
+}
+
+fn take_consent_prompt_in(dir: &std::path::Path) -> bool {
+    if Config::exists(dir) || Config::default().save(dir).is_err() {
         return false;
     }
-    if Config::default().save(&dir).is_err() {
-        return false;
-    }
-    event!("privacy.notice_shown");
+    event!("privacy.prompt_shown");
     true
+}
+
+/// The person answered the prompt or flipped the Settings toggle.
+pub(crate) fn choose_sharing(share: bool) -> std::io::Result<Config> {
+    let dir = state_dir().ok_or_else(|| std::io::Error::other("no state directory"))?;
+    let config = Config::load(&dir).choose(share, diri_telemetry::now_ms());
+    config.save(&dir)?;
+    event!("privacy.upload_changed", upload = share);
+    Ok(config)
 }
 
 /// Asks the Engine to upload everything recorded so far, now, even with
@@ -1575,17 +1584,15 @@ mod tests {
             folder: Some(dir.path().join("telemetry")),
             ..PrivacySettings::default()
         };
-        Config::default().save(dir.path()).unwrap();
-        let disabled = Config {
-            upload: false,
-            name: Some(String::new()),
-        };
+        Config::default().choose(true, 1).save(dir.path()).unwrap();
+        settings.config = Config::load(dir.path());
+        let disabled = settings.config.choose(false, 2);
         let config_path = dir.path().join("telemetry/config.json");
         std::fs::remove_file(&config_path).unwrap();
         std::fs::create_dir(&config_path).unwrap();
         assert!(settings.save_config(disabled.clone()).is_err());
         assert!(
-            settings.config.upload,
+            settings.config.sharing_allowed(),
             "UI must keep its last confirmed setting"
         );
         std::fs::remove_dir(&config_path).unwrap();
@@ -1723,9 +1730,28 @@ mod tests {
     }
 
     #[test]
+    fn consent_prompt_asks_new_installs_once_and_leaves_existing_ones_alone() {
+        let fresh = tempfile::tempdir().unwrap();
+        assert!(take_consent_prompt_in(fresh.path()));
+        assert!(!take_consent_prompt_in(fresh.path()), "only once");
+        assert!(!Config::load(fresh.path()).sharing_allowed(), "off until yes");
+
+        // Installed before opt-in, sharing on by default: unchanged, no prompt.
+        let existing = tempfile::tempdir().unwrap();
+        let path = diri_telemetry::telemetry_dir(existing.path()).join("config.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let before = r#"{"upload": true, "name": null}"#;
+        std::fs::write(&path, before).unwrap();
+        assert!(!take_consent_prompt_in(existing.path()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert!(Config::load(existing.path()).sharing_allowed());
+    }
+
+    #[test]
     fn tests_never_touch_the_real_telemetry_dir() {
         assert_eq!(state_dir(), None);
-        assert!(!take_first_run_notice());
+        assert!(!take_consent_prompt());
+        assert!(choose_sharing(true).is_err());
         assert_eq!(PrivacySettings::load(), PrivacySettings::default());
     }
 }

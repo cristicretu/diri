@@ -5,6 +5,31 @@
 use super::*;
 use crate::telemetry::PrivacySettings;
 
+/// The public list of every network connection, the same as Settings shows.
+pub(crate) const PRIVACY_PAGE_URL: &str = "https://diri.sh/docs/privacy/";
+
+/// Every outbound connection, in the order of `website/docs-src/connections.json`
+/// (the privacy page's source): id, name key, detail key. A test keeps the
+/// two lists equal, so a new connection lands in both.
+pub(super) const CONNECTIONS: &[(&str, &str, &str)] = &[
+    ("diagnostics", "settings.privacy.connection.diagnostics", "settings.privacy.connection.diagnostics_detail"),
+    ("report", "settings.privacy.connection.report", "settings.privacy.connection.report_detail"),
+    ("updates", "settings.privacy.connection.updates", "settings.privacy.connection.updates_detail"),
+    ("whats_new", "settings.privacy.connection.whats_new", "settings.privacy.connection.whats_new_detail"),
+    ("agent_usage", "settings.privacy.connection.agent_usage", "settings.privacy.connection.agent_usage_detail"),
+    ("cursor_usage", "settings.privacy.connection.cursor_usage", "settings.privacy.connection.cursor_usage_detail"),
+    ("pull_requests", "settings.privacy.connection.pull_requests", "settings.privacy.connection.pull_requests_detail"),
+    ("ssh_hosts", "settings.privacy.connection.ssh_hosts", "settings.privacy.connection.ssh_hosts_detail"),
+    ("git", "settings.privacy.connection.git", "settings.privacy.connection.git_detail"),
+    ("agent_install", "settings.privacy.connection.agent_install", "settings.privacy.connection.agent_install_detail"),
+    ("computer_use", "settings.privacy.connection.computer_use", "settings.privacy.connection.computer_use_detail"),
+    ("voice", "settings.privacy.connection.voice", "settings.privacy.connection.voice_detail"),
+    ("api_tab", "settings.privacy.connection.api_tab", "settings.privacy.connection.api_tab_detail"),
+    ("browser", "settings.privacy.connection.browser", "settings.privacy.connection.browser_detail"),
+    ("phone", "settings.privacy.connection.phone", "settings.privacy.connection.phone_detail"),
+    ("local", "settings.privacy.connection.local", "settings.privacy.connection.local_detail"),
+];
+
 #[derive(Default)]
 pub(super) struct PrivacyState {
     settings: PrivacySettings,
@@ -69,9 +94,12 @@ impl UtilitySurfaces {
     }
 
     fn toggle_diagnostics_upload(&mut self, cx: &mut Context<Self>) {
-        let upload = !self.privacy.settings.config.upload;
-        let mut config = self.privacy.settings.config.clone();
-        config.upload = upload;
+        let upload = !self.privacy.settings.config.sharing_allowed();
+        let config = self
+            .privacy
+            .settings
+            .config
+            .choose(upload, diri_telemetry::now_ms());
         if self.save_privacy_config(config) {
             diri_telemetry::event!("privacy.upload_changed", upload = upload);
         }
@@ -188,7 +216,7 @@ impl UtilitySurfaces {
                 .child(toggle_row(
                     t("settings.privacy.share"),
                     t("settings.privacy.share_detail"),
-                    privacy.settings.config.upload,
+                    privacy.settings.config.sharing_allowed(),
                     "toggle-share-diagnostics",
                     colors,
                     cx,
@@ -294,6 +322,30 @@ impl UtilitySurfaces {
         )
     }
 
+    /// Settings › Privacy › Network connections: every place diri reaches
+    /// the network, one line each, and the page with the full details.
+    pub(super) fn network_connections_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let mut column = div().flex().flex_col().child(setting_row(
+            t("settings.privacy.page"),
+            t("settings.privacy.page_detail"),
+            surface_button(
+                t("settings.privacy.page_open"),
+                "open-privacy-page",
+                colors,
+                cx,
+                |_, cx| cx.open_url(PRIVACY_PAGE_URL),
+            ),
+            colors,
+        ));
+        for &(_, name, detail) in CONNECTIONS {
+            column = column
+                .child(setting_divider(colors))
+                .child(setting_row(t(name), t(detail), div(), colors));
+        }
+        setting_section(t("settings.privacy.connections"), column, colors)
+    }
+
     fn privacy_name_field(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.settings_colors();
         let active = self.privacy.name_active;
@@ -338,5 +390,30 @@ impl UtilitySurfaces {
                 cx.notify();
             }))
             .child(content)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CONNECTIONS;
+
+    #[test]
+    fn settings_list_every_connection_on_the_privacy_page() {
+        let page: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../website/docs-src/connections.json"
+        ))
+        .unwrap();
+        let page_ids: Vec<&str> = page["connections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap())
+            .collect();
+        let settings_ids: Vec<&str> = CONNECTIONS.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(settings_ids, page_ids);
+        for (id, name, detail) in CONNECTIONS {
+            assert_eq!(*name, format!("settings.privacy.connection.{id}"));
+            assert_eq!(*detail, format!("settings.privacy.connection.{id}_detail"));
+        }
     }
 }
