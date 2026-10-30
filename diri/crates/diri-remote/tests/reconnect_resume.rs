@@ -54,7 +54,11 @@ case "$last" in
     while [ ! -e "$dir/allow.$n" ]; do sleep 0.002; done
     mkfifo "$dir/fifo.$n"
     tee "$dir/down.$n" < "$dir/fifo.$n" & tee_pid=$!
-    tee "$dir/up.$n" | /bin/sh -c "$last" > "$dir/fifo.$n" & bridge=$!
+    # An asynchronous list's stdin is /dev/null in a non-interactive shell
+    # (dash applies that even under an explicit `<&0`), so the Engine's pipe
+    # reaches tee through fd 3.
+    exec 3<&0
+    tee "$dir/up.$n" <&3 | /bin/sh -c "$last" > "$dir/fifo.$n" & bridge=$!
     echo $bridge > "$dir/bridge.$n"
     wait $bridge
     wait $tee_pid
