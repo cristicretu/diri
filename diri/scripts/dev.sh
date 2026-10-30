@@ -272,10 +272,17 @@ for item in "${launch_environment[@]}"; do
         echo "    engine: ${item#DIRIJORD_PATH=}"
     fi
 done
+# A terminal inside diri hands its sessions this environment. Left set, the
+# dev app would open the installed app's notes folder (DIRI_NOTES_DIR wins
+# over DIRIJOR_APP_SUPPORT) and carry the parent's MCP token and recovery
+# directory. Cleared, everything resolves under the dev support directory.
 exec env \
     -u DIRIJOR_SOCKET \
     -u DIRIJOR_SESSION_ID \
     -u DIRIJOR_CLI \
+    -u DIRIJOR_MCP_TOKEN \
+    -u DIRIJOR_SESSION_RECOVERY_DIR \
+    -u DIRI_NOTES_DIR \
     -u NO_COLOR \
     -u FORCE_COLOR \
     "${launch_environment[@]}" \
