@@ -31,14 +31,16 @@ use serde_json::Value;
 use super::{ComputerUse, Shared};
 
 /// The release Diri was tested with, and downloads: Diri's own build of Cua
-/// Driver, the cua-driver-rs-v0.36.0 release plus the macOS 27
-/// background-click fix (trycua/cua#5425), until Cua ships that fix. Source:
-/// github.com/cristicretu/cua, tag cua-driver-rs-v0.36.1-diri.
-pub const TESTED_VERSION: &str = "0.36.1";
+/// Driver, upstream main after the cua-driver-rs-v0.38.0 release plus the
+/// macOS 27 background-click fix (trycua/cua#5425), background element and
+/// keyboard actions on different apps in parallel, and a proxy that answers
+/// tool calls as they finish. Source: github.com/cristicretu/cua, tag
+/// cua-driver-rs-v0.38.1-diri.
+pub const TESTED_VERSION: &str = "0.38.1";
 const ARCHIVE_URL: &str = "https://github.com/cristicretu/cua/releases/download/\
-     cua-driver-rs-v0.36.1-diri/cua-driver-rs-0.36.1-diri-darwin-universal-binary.tar.gz";
+     cua-driver-rs-v0.38.1-diri/cua-driver-rs-0.38.1-diri-darwin-universal-binary.tar.gz";
 /// From the release's SHA256SUMS.
-const ARCHIVE_SHA256: &str = "0bf1956f63299595656e20e19ae71ad9f83beeb78da784ad6b7d6c265c3dae9e";
+const ARCHIVE_SHA256: &str = "3204e5535e358b2b084a35566abfa191dc78ba0a9529f89b13c434f2583ca7a8";
 /// The Developer ID team that signs Diri's driver build. A binary signed by
 /// anyone else is not used.
 const DRIVER_TEAM_ID: &str = "A56RVNJ69X";
@@ -503,7 +505,7 @@ fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     }
 }
 
-/// `cua-driver 0.36.1` → `0.36.1`.
+/// `cua-driver 0.38.1` → `0.38.1`.
 fn driver_version(binary: &Path) -> Option<String> {
     let output = quiet(Command::new(binary).arg("--version"))
         .stdout(Stdio::piped())

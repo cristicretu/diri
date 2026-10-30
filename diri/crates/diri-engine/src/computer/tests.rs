@@ -147,7 +147,7 @@ fn summaries_end_at_the_first_sentence() {
 /// catalog, and echoes each call's request line back as structured content.
 const FAKE_DRIVER: &str = r#"#!/bin/sh
 case "$1" in
-  --version) printf 'cua-driver %s\n' "$(cat "$0.version" 2>/dev/null || echo 0.36.1)"; exit 0 ;;
+  --version) printf 'cua-driver %s\n' "$(cat "$0.version" 2>/dev/null || echo 0.38.1)"; exit 0 ;;
   call)
     [ "$2" = check_permissions ] || exit 2
     cat "$0.grants" 2>/dev/null || printf '{"accessibility":true,"screen_recording":true}\n'
@@ -499,7 +499,7 @@ fn status_reads_version_and_grants() {
 
     let status = computer.status(false);
     assert!(status.supported);
-    assert_eq!(status.version.as_deref(), Some("0.36.1"));
+    assert_eq!(status.version.as_deref(), Some(TESTED_VERSION));
     assert!(!status.outdated);
     assert_eq!(status.accessibility, Some(false));
     assert_eq!(status.screen_recording, Some(false));
