@@ -158,6 +158,37 @@ impl SshTransport {
         })
     }
 
+    /// Attaches to one Session's Holder socket.
+    ///
+    /// A Helper puts Holder sockets under `$XDG_RUNTIME_DIR/diri` when that is
+    /// set and under `${TMPDIR:-/tmp}/diri-remote-<uid>` otherwise, so the
+    /// root follows the environment of whichever SSH session ran the command,
+    /// and sshd does not give every session the same one. A Holder launched
+    /// without `XDG_RUNTIME_DIR` is unreachable from a Bridge that has it: the
+    /// Bridge exits before any Hello, on every attempt. The prelude points the
+    /// Bridge at whichever root actually holds this Session's socket. Every
+    /// Helper build agrees on the hashed name, so this also reaches Holders
+    /// that are already running.
+    pub fn helper_attach_command(
+        &self,
+        build_id: &str,
+        session_id: &str,
+    ) -> Result<CommandSpec, BootstrapError> {
+        validate_component("build id", build_id)?;
+        validate_component("session id", session_id)?;
+        Ok(self.channel(&format!(
+            "set -eu; [ -d \"$HOME/.cache\" ] && [ ! -L \"$HOME/.cache\" ] || exit 73; \
+             u=$(id -u); s={socket}; t=\"${{TMPDIR:-/tmp}}/diri-remote-$u/$s\"; \
+             if [ -n \"${{XDG_RUNTIME_DIR:-}}\" ]; then \
+             if [ ! -S \"$XDG_RUNTIME_DIR/diri/$s\" ] && [ -S \"$t\" ]; then unset XDG_RUNTIME_DIR; fi; \
+             elif [ ! -S \"$t\" ] && [ -S \"/run/user/$u/diri/$s\" ]; then export XDG_RUNTIME_DIR=\"/run/user/$u\"; fi; \
+             exec \"$HOME/.cache/diri/bin/protocol-{major}/{build_id}/diri-remote\" {command}",
+            socket = holder_socket_name(session_id),
+            major = diri_proto::remote_pty::PROTOCOL_MAJOR,
+            command = HelperCommand::Attach.as_str(),
+        )))
+    }
+
     /// Probes the exact Helper and, only when that probe exits successfully,
     /// runs one read-only management `command` in the same `ssh -T` channel.
     /// Stdout is the probe line followed by the command's response, so a warm
@@ -316,6 +347,20 @@ fn posix_shell_command(script: &str) -> String {
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r#"'"'"'"#))
+}
+
+/// The Holder socket's file name, as every Helper build derives it from the
+/// Session ID: the first 16 bytes of its SHA-256, in hex.
+fn holder_socket_name(session_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(session_id.as_bytes());
+    let mut name = String::with_capacity(37);
+    for byte in &digest[..16] {
+        let _ = write!(name, "{byte:02x}");
+    }
+    name.push_str(".sock");
+    name
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -586,5 +631,81 @@ mod tests {
             .expect("execute wrapper");
         assert!(output.status.success());
         assert_eq!(output.stdout, b"hello world");
+    }
+
+    #[test]
+    fn holder_socket_name_matches_the_helper() {
+        // diri-remote's StatePaths::session: sha256(session id)[..16] in hex.
+        assert_eq!(
+            holder_socket_name("s_abab2a31abd7"),
+            "e14565ad01a4d152241fc060d3422a0f.sock"
+        );
+    }
+
+    #[test]
+    fn attach_reaches_the_socket_root_its_holder_actually_used() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        // Short root: socket paths must fit sockaddr_un.
+        let root = tempfile::Builder::new()
+            .prefix("dra")
+            .tempdir_in("/tmp")
+            .expect("root");
+        let home = root.path().join("h");
+        let helper_dir = home.join(".cache/diri/bin/protocol-1/build-123");
+        std::fs::create_dir_all(&helper_dir).expect("helper dir");
+        let helper = helper_dir.join("diri-remote");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\nprintf '%s' \"${XDG_RUNTIME_DIR-unset}\"\n",
+        )
+        .expect("helper");
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let uid = unsafe { libc::getuid() };
+        let socket = holder_socket_name("s_1");
+        let xdg = root.path().join("x");
+        let tmp = root.path().join("t");
+        std::fs::create_dir_all(xdg.join("diri")).expect("xdg");
+        std::fs::create_dir_all(tmp.join(format!("diri-remote-{uid}"))).expect("tmp");
+
+        let transport = SshTransport::new(&host(), "/tmp/control");
+        let spec = transport
+            .helper_attach_command("build-123", "s_1")
+            .expect("attach");
+        let words = words(&spec);
+        let remote = words.last().expect("remote command");
+        let run = |xdg_env: Option<&Path>| {
+            let mut command = std::process::Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg(remote)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", &home)
+                .env("TMPDIR", &tmp);
+            if let Some(xdg_env) = xdg_env {
+                command.env("XDG_RUNTIME_DIR", xdg_env);
+            }
+            let output = command.output().expect("run attach");
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout).expect("utf8")
+        };
+
+        // No socket anywhere: the environment is left as it was.
+        assert_eq!(run(Some(&xdg)), xdg.display().to_string());
+        assert_eq!(run(None), "unset");
+
+        // A Holder that started without XDG_RUNTIME_DIR listens under TMPDIR;
+        // a Bridge that has it must drop it to reach that socket.
+        let listener = UnixListener::bind(tmp.join(format!("diri-remote-{uid}")).join(&socket))
+            .expect("tmp socket");
+        assert_eq!(run(Some(&xdg)), "unset");
+        assert_eq!(run(None), "unset");
+
+        // Once the runtime root has the socket, it wins.
+        let runtime = UnixListener::bind(xdg.join("diri").join(&socket)).expect("xdg socket");
+        assert_eq!(run(Some(&xdg)), xdg.display().to_string());
+        drop((listener, runtime));
     }
 }

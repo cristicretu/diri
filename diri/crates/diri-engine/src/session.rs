@@ -4723,8 +4723,13 @@ fn pump_remote(
     client: Arc<RemoteSessionClient>,
     manifest_id: String,
 ) {
-    let mut reconnect_delay = Duration::from_millis(50);
+    let mut reconnect_delay = REMOTE_RECONNECT_MIN;
     let mut reconnects = 0_u32;
+    // Attempts since a Bridge last reached a live Holder. Spawning `ssh` is
+    // not progress: a Bridge that cannot reach its socket exits before any
+    // Hello, and resetting the delay on every spawn made that a tight loop of
+    // several `ssh` processes a second per Session.
+    let mut unreachable = 0_u32;
     while !shared.stop.load(Ordering::SeqCst) && !shared.exited.load(Ordering::SeqCst) {
         let output_offset = shared.remote_output_offset.load(Ordering::SeqCst);
         let grid_sequence = shared
@@ -4743,14 +4748,14 @@ fn pump_remote(
         else {
             set_remote_reconnecting(&shared);
             reconnects = reconnects.saturating_add(1);
+            unreachable = unreachable.saturating_add(1);
             if reconnects.is_multiple_of(3) && remote_inspection_exited(&shared, &client) {
                 break;
             }
             wait_for_remote_retry(&shared, reconnect_delay);
-            reconnect_delay = (reconnect_delay * 2).min(Duration::from_secs(2));
+            reconnect_delay = next_remote_reconnect_delay(reconnect_delay, unreachable);
             continue;
         };
-        reconnect_delay = Duration::from_millis(50);
         let disposition = pump_remote_connection(
             &shared,
             &engine,
@@ -4776,13 +4781,19 @@ fn pump_remote(
         match settle_during_stop(&shared, disposition) {
             RemoteConnectionDisposition::Continue => continue,
             RemoteConnectionDisposition::Reconnect => {
+                if remote_connected(&shared) {
+                    reconnect_delay = REMOTE_RECONNECT_MIN;
+                    unreachable = 0;
+                } else {
+                    unreachable = unreachable.saturating_add(1);
+                }
                 set_remote_reconnecting(&shared);
                 reconnects = reconnects.saturating_add(1);
                 if reconnects.is_multiple_of(3) && remote_inspection_exited(&shared, &client) {
                     break;
                 }
                 wait_for_remote_retry(&shared, reconnect_delay);
-                reconnect_delay = (reconnect_delay * 2).min(Duration::from_secs(2));
+                reconnect_delay = next_remote_reconnect_delay(reconnect_delay, unreachable);
             }
             RemoteConnectionDisposition::Exited | RemoteConnectionDisposition::Stopped => break,
             RemoteConnectionDisposition::Fatal => {
@@ -5637,6 +5648,35 @@ fn mark_remote_transport_failed(shared: &Shared) {
     set_remote_connection(shared, diri_proto::RemoteConnectionState::Failed);
     // The last PID/grid remain observable. Neither transport failure nor an
     // uncertain write supplies an Agent exit code or permission to replay input.
+}
+
+const REMOTE_RECONNECT_MIN: Duration = Duration::from_millis(50);
+/// Ceiling while a Holder answered recently: a dropped link comes back fast.
+const REMOTE_RECONNECT_MAX: Duration = Duration::from_secs(2);
+/// Ceiling once that many attempts in a row never reached the Holder.
+const REMOTE_UNREACHABLE_MAX: Duration = Duration::from_secs(30);
+const REMOTE_UNREACHABLE_ATTEMPTS: u32 = 8;
+
+fn next_remote_reconnect_delay(current: Duration, unreachable: u32) -> Duration {
+    let ceiling = if unreachable >= REMOTE_UNREACHABLE_ATTEMPTS {
+        REMOTE_UNREACHABLE_MAX
+    } else {
+        REMOTE_RECONNECT_MAX
+    };
+    (current * 2).min(ceiling)
+}
+
+/// Whether the current Bridge reached a live Holder: a snapshot or an
+/// accepted resume marks the mirror Connected.
+fn remote_connected(shared: &Shared) -> bool {
+    shared
+        .remote_grid
+        .lock()
+        .expect("remote grid")
+        .as_ref()
+        .is_some_and(|remote| {
+            remote.connection.state == diri_proto::RemoteConnectionState::Connected
+        })
 }
 
 /// A lost Bridge is a reconnect, unless the session already ended or is
@@ -10458,5 +10498,23 @@ mod relaunch_notice_tests {
             $ codex\r\nToken usage: total=1\r\nTo continue this session, run codex resume 1\r\n\
             $ \r\nbye\r\n";
         assert!(!shows_relaunch_notice(&screen(80, text), NOTICE));
+    }
+}
+
+#[cfg(test)]
+mod remote_reconnect_delay_tests {
+    use super::*;
+
+    #[test]
+    fn unreachable_holders_back_off_past_the_live_ceiling() {
+        let mut delay = REMOTE_RECONNECT_MIN;
+        for attempt in 1..REMOTE_UNREACHABLE_ATTEMPTS {
+            delay = next_remote_reconnect_delay(delay, attempt);
+        }
+        assert_eq!(delay, REMOTE_RECONNECT_MAX);
+        for attempt in REMOTE_UNREACHABLE_ATTEMPTS..REMOTE_UNREACHABLE_ATTEMPTS + 8 {
+            delay = next_remote_reconnect_delay(delay, attempt);
+        }
+        assert_eq!(delay, REMOTE_UNREACHABLE_MAX);
     }
 }
