@@ -55,7 +55,10 @@ jobs:
   app:
     name: Rust workspace
     runs-on: macos-15
-    timeout-minutes: 20
+    # A cold cache (no macOS-cargo-test hit) spends ~11 m compiling before
+    # the test run starts, and 20 minutes cancelled the job mid-tests on
+    # main and on PRs alike.
+    timeout-minutes: 40
     defaults:
       run:
         working-directory: diri
