@@ -227,10 +227,27 @@ final class TerminalView: UIScrollView, UIKeyInput, UITextInputTraits {
         let h = lineHeight
         cursorLayer.isHidden = false
         cursorLayer.backgroundColor = colors.foreground.copy(alpha: cursor.shape == .block ? 0.55 : 0.9)
-        switch cursor.shape {
-        case .block: cursorLayer.frame = CGRect(x: x, y: y, width: w, height: h)
-        case .bar: cursorLayer.frame = CGRect(x: x, y: y + 1, width: 2, height: h - 2)
-        case .underline: cursorLayer.frame = CGRect(x: x, y: y + h - 2, width: w, height: 2)
+        let frame = switch cursor.shape {
+        case .block: CGRect(x: x, y: y, width: w, height: h)
+        case .bar: CGRect(x: x, y: y + 1, width: 2, height: h - 2)
+        case .underline: CGRect(x: x, y: y + h - 2, width: w, height: 2)
+        }
+        let moved = frame != cursorLayer.frame
+        cursorLayer.frame = frame
+        // The program's DECSCUSR blink, eased and bounded like the Mac's:
+        // ten cycles after the cursor last moved, then it stays solid.
+        if !cursor.blink {
+            cursorLayer.removeAnimation(forKey: "blink")
+        } else if moved {
+            let blink = CABasicAnimation(keyPath: "opacity")
+            blink.fromValue = 1
+            blink.toValue = 0.15
+            blink.duration = 0.53
+            blink.autoreverses = true
+            blink.repeatCount = 10
+            blink.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            blink.isRemovedOnCompletion = true
+            cursorLayer.add(blink, forKey: "blink")
         }
     }
 

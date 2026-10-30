@@ -129,6 +129,13 @@ doesn't use it yet:
   styled grid rows (`GridRowCodec`), 16 ms coalescing, a bounded queue of 4,
   and a snapshot reseed when the client falls behind. It is the same grid the
   Mac renders.
+  - A run that is not plain ASCII carries `g`: its cells as
+    `[count, utf16Units, columns]` groups, so clients place every character
+    on the Engine's column instead of guessing widths (emoji sequences,
+    ambiguous width and Indic spacing marks otherwise drift the row).
+    Additive: a client that ignores it keeps its own width tables.
+  - `cursor.shape` follows DECSCUSR (`block`, `underline`, `bar`) and
+    `cursor.blink` is false when the program asked for a steady cursor.
 - `POST /api/session/:id/input` (idempotent batches, `input_ledger.rs`),
   `/key`, `/resize`, `GET /scrollback` and `/history` pages.
 

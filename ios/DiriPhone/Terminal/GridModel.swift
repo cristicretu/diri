@@ -59,17 +59,65 @@ struct TermRun: Hashable, Sendable {
     var fg: TermColor
     var bg: TermColor
     var attributes: TermAttributes
+    /// The run's grid cells, from the gateway (`g`): nil for plain ASCII or
+    /// an older gateway, when one character is one column.
+    var cells: [CellGroup]?
 
-    init(_ text: String, fg: TermColor = .standard, bg: TermColor = .standard, attributes: TermAttributes = []) {
+    init(_ text: String, fg: TermColor = .standard, bg: TermColor = .standard, attributes: TermAttributes = [],
+         cells: [CellGroup]? = nil) {
         self.text = text
         self.fg = fg
         self.bg = bg
         self.attributes = attributes
+        self.cells = cells
+    }
+}
+
+/// `count` consecutive cells, each holding `units` UTF-16 units of the run's
+/// text and covering `width` columns: where the grid put each character, so
+/// the phone never works widths out from its own Unicode tables.
+struct CellGroup: Hashable, Sendable {
+    var count: Int
+    var units: Int
+    var width: Int
+}
+
+extension TermRun {
+    /// The run as (text, columns) cells. From the gateway's cells when it
+    /// sent them, otherwise one grapheme per cell with a local width guess.
+    var cellTexts: [(text: Substring, width: Int)] {
+        if let cells {
+            // Cells are cut on Unicode scalars, not graphemes: the Engine may
+            // give a vowel sign a cell of its own where Swift would fold it
+            // into the consonant's Character.
+            var result: [(Substring, Int)] = []
+            let scalars = text.unicodeScalars
+            var index = text.utf16.startIndex
+            for group in cells {
+                for _ in 0 ..< group.count {
+                    guard let end = text.utf16.index(index, offsetBy: group.units, limitedBy: text.utf16.endIndex)
+                    else { return result }
+                    result.append((Substring(scalars[index ..< end]), group.width))
+                    index = end
+                }
+            }
+            return result
+        }
+        return text.indices.map { i in
+            let character = text[i]
+            return (text[i ..< text.index(after: i)], CellWidth.of(character))
+        }
+    }
+
+    /// Columns the run covers.
+    var columns: Int {
+        if let cells { return cells.reduce(0) { $0 + $1.count * $1.width } }
+        return CellWidth.of(text)
     }
 }
 
 extension TermRun: Decodable {
-    private enum Keys: String, CodingKey { case t, fg, bg, a }
+    private enum Keys: String, CodingKey { case t, fg, bg, a, g }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: Keys.self)
@@ -78,6 +126,13 @@ extension TermRun: Decodable {
         bg = (try? container.decodeIfPresent(TermColor.self, forKey: .bg)) ?? .standard
         let bits = (try? container.decodeIfPresent(Int.self, forKey: .a)) ?? 0
         attributes = TermAttributes(rawValue: UInt8(truncatingIfNeeded: bits))
+        let groups = (try? container.decodeIfPresent([[Int]].self, forKey: .g)) ?? nil
+        cells = groups.flatMap { list in
+            let parsed = list.compactMap { $0.count == 3 && $0[0] > 0 && $0[1] > 0 && $0[2] >= 0
+                ? CellGroup(count: $0[0], units: $0[1], width: $0[2]) : nil }
+            // A malformed list is ignored rather than trusted halfway.
+            return parsed.count == list.count ? parsed : nil
+        }
     }
 }
 
@@ -123,15 +178,18 @@ struct TermCursor: Hashable, Sendable, Decodable {
     var y: Int
     var visible: Bool
     var shape: Shape
+    /// The program did not ask for a steady cursor (DECSCUSR).
+    var blink: Bool
 
-    init(x: Int = 0, y: Int = 0, visible: Bool = true, shape: Shape = .block) {
+    init(x: Int = 0, y: Int = 0, visible: Bool = true, shape: Shape = .block, blink: Bool = false) {
         self.x = x
         self.y = y
         self.visible = visible
         self.shape = shape
+        self.blink = blink
     }
 
-    private enum Keys: String, CodingKey { case x, y, visible, shape }
+    private enum Keys: String, CodingKey { case x, y, visible, shape, blink }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: Keys.self)
@@ -140,6 +198,7 @@ struct TermCursor: Hashable, Sendable, Decodable {
         visible = (try? container.decode(Bool.self, forKey: .visible)) ?? true
         let raw = ((try? container.decode(String.self, forKey: .shape)) ?? "block").lowercased()
         shape = raw.contains("bar") || raw.contains("beam") ? .bar : (raw.contains("under") ? .underline : .block)
+        blink = (try? container.decode(Bool.self, forKey: .blink)) ?? false
     }
 }
 
@@ -326,6 +385,13 @@ extension TermLine {
             hash.add(run.bg)
             hash.add(",\"fg\":")
             hash.add(run.fg)
+            if let cells = run.cells {
+                hash.add(",\"g\":[")
+                for (n, group) in cells.enumerated() {
+                    hash.add((n > 0 ? ",[" : "[") + "\(group.count),\(group.units),\(group.width)]")
+                }
+                hash.add("]")
+            }
             hash.add(",\"t\":")
             hash.addJSONString(run.text)
             hash.add("}")

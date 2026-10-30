@@ -1147,7 +1147,7 @@ mod tests {
         assert_eq!(snapshot["historySize"], 42);
         assert_eq!(
             snapshot["cursor"],
-            json!({"x": 2, "y": 1, "visible": true, "shape": "block"})
+            json!({"x": 2, "y": 1, "visible": true, "shape": "block", "blink": true})
         );
         assert_eq!(
             snapshot["modes"],
@@ -1718,6 +1718,20 @@ mod tests {
                 plain(""),
                 row(&[("▌", orange, BG, N), (variant, grey, BG, N)]),
             ];
+            // Columns the phone must take from the grid: an Indic spacing mark
+            // is its own cell to the Engine; the pipes line up only if the
+            // client places each cell where the grid put it.
+            rows.push(plain(""));
+            rows.push(row(&[
+                ("বাংলা", D, BG, N),
+                ("|", TermColor::Ansi(5), BG, N),
+                (" end", D, BG, N),
+            ]));
+            rows.push(row(&[
+                ("12345", D, BG, N),
+                ("|", TermColor::Ansi(5), BG, N),
+                (" end", D, BG, N),
+            ]));
             rows.resize(usize::from(ROWS), plain(""));
             rows
         }

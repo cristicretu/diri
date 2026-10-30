@@ -108,7 +108,7 @@ enum LineRenderer {
         // Backgrounds first, in one pass, so glyph overhang is never clipped
         // by the next run's fill.
         for run in line.runs {
-            let width = CellWidth.of(run.text)
+            let width = run.columns
             defer { column += width }
             let inverse = run.attributes.contains(.inverse)
             let bgColor: TermColor = inverse ? run.fg : run.bg
@@ -122,7 +122,7 @@ enum LineRenderer {
         context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
         column = 0
         for run in line.runs {
-            let width = CellWidth.of(run.text)
+            let width = run.columns
             defer { column += width }
             let attributes = run.attributes
             if attributes.contains(.invisible) { continue }
@@ -134,14 +134,14 @@ enum LineRenderer {
             let ctFont = font.font(for: attributes)
             let x0 = CGFloat(column) * cell
 
-            if run.text.utf8.allSatisfy({ $0 >= 0x20 && $0 < 0x7F }) {
+            if run.cells == nil, run.text.utf8.allSatisfy({ $0 >= 0x20 && $0 < 0x7F }) {
                 // ASCII: one Core Text line for the whole run — a monospaced
                 // font's advance already is the cell width.
                 if run.text.contains(where: { $0 != " " }) {
                     drawText(run.text, x: x0, baseline: baseline, font: ctFont, color: fg, in: context)
                 }
             } else {
-                drawMixed(run.text, from: column, baseline: baseline, font: font, face: ctFont, color: fg, in: context)
+                drawMixed(run.cellTexts, from: column, baseline: baseline, font: font, face: ctFont, color: fg, in: context)
             }
 
             if attributes.contains(.underline) || attributes.contains(.strike) {
@@ -161,17 +161,29 @@ enum LineRenderer {
         context.restoreGState()
     }
 
-    /// A run with non-ASCII text. Characters the terminal face draws itself
-    /// (`─`, `é`, `⎿` …) are batched into one Core Text line per stretch, as
-    /// ASCII is; box-drawing and block characters are drawn as geometry; only
-    /// wide or fallback-font characters get a line each, centred in their
-    /// cells. A border row is now a few rect fills, not one line per cell.
-    private static func drawMixed(_ text: String, from start: Int, baseline: CGFloat, font: TerminalFont,
-                                  face: CTFont, color: CGColor, in context: CGContext) {
+    /// A run with non-ASCII text, cell by cell.
+    ///
+    /// - Characters the terminal face draws itself (`─`, `é`, `⎿` …) are
+    ///   batched into one Core Text line per stretch, as ASCII is.
+    /// - Box-drawing and block characters are geometry; a run of one
+    ///   horizontal rule is one bar.
+    /// - Single-column characters the face lacks (Indic, Thai, symbols) are
+    ///   also batched, as their own stretch, so Core Text shapes them
+    ///   together (a vowel sign joins its consonant); the stretch ends on the
+    ///   column the grid says, so any difference in advance cannot shift the
+    ///   rest of the row.
+    /// - Wide characters are centred in their two columns.
+    ///
+    /// Columns come from the gateway's cells when it sent them, so the phone
+    /// never decides a width the Engine decided differently.
+    private static func drawMixed(_ cells: [(text: Substring, width: Int)], from start: Int, baseline: CGFloat,
+                                  font: TerminalFont, face: CTFont, color: CGColor, in context: CGContext) {
         let cell = font.cellWidth
         var col = start
+        // One stretch of single-column text, covered by the face or not.
         var pending = ""
         var pendingStart = start
+        var pendingCovered = true
         func flush() {
             if pending.contains(where: { $0 != " " }) {
                 drawText(pending, x: CGFloat(pendingStart) * cell, baseline: baseline, font: face, color: color, in: context)
@@ -187,9 +199,9 @@ enum LineRenderer {
                             scale: font.scale, color: color, context: context)
             rule = nil
         }
-        for character in text {
-            let w = CellWidth.of(character)
-            if w == 1, let scalar = character.unicodeScalars.first, character.unicodeScalars.count == 1,
+        for (text, w) in cells {
+            let character = text.count == 1 ? text.first : nil
+            if w == 1, let character, let scalar = character.unicodeScalars.first, character.unicodeScalars.count == 1,
                BoxDrawing.handles(scalar) {
                 flush()
                 if BoxDrawing.isRule(scalar) {
@@ -209,17 +221,17 @@ enum LineRenderer {
                 continue
             }
             flushRule()
-            let substituted = substitute(character)
-            if w == 1, substituted == String(character), font.covers(character) {
-                if pending.isEmpty { pendingStart = col }
-                pending.append(character)
+            let substituted = character.map(substitute) ?? String(text)
+            if w == 1 {
+                let covered = character.map { substituted == String($0) && font.covers($0) } ?? false
+                if !pending.isEmpty, covered != pendingCovered { flush() }
+                if pending.isEmpty { pendingStart = col; pendingCovered = covered }
+                pending += substituted
                 col += 1
                 continue
             }
             flush()
-            if character != " " {
-                // Core Text's own cascade from the terminal face picks the
-                // font for a character the face lacks.
+            if text != " " {
                 drawText(substituted, x: CGFloat(col) * cell, baseline: baseline,
                          font: face, color: color, in: context, fitting: CGFloat(max(w, 1)) * cell)
             }

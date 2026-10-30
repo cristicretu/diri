@@ -87,4 +87,16 @@ final class RendererTests: XCTestCase {
         XCTAssertEqual(String(decoding: TerminalView.wheelReport(up: false, col: 1, row: 1, count: 1), as: UTF8.self),
                        "\u{1B}[<65;1;1M")
     }
+
+    /// Bengali on the gateway's cells: drawn (shaped as one stretch), not
+    /// dropped.
+    func testIndicTextOnGatewayCellsDraws() {
+        let json = #"{"runs":[{"a":0,"bg":null,"fg":null,"g":[[5,1,1]],"t":"বাংলা"},{"a":0,"bg":null,"fg":5,"t":"|"}],"wrapped":false}"#
+        let line = try! JSONDecoder().decode(TermLine.self, from: Data(json.utf8))
+        XCTAssertEqual(line.runs[0].cellTexts.map { String($0.text) }, ["ব", "া", "ং", "ল", "া"])
+        let (context, width, height) = render(line, cols: 6)
+        let lit = (0 ..< height).reduce(0) { sum, y in sum + (0 ..< width).filter { red(context, $0, y) > 100 }.count }
+        // The pipe alone lights about 100 pixels; the Bengali adds far more.
+        XCTAssertGreaterThan(lit, 250)
+    }
 }
