@@ -33,6 +33,7 @@ const IDENTITY_TTL: Duration = Duration::from_secs(30);
 const MAX_CACHED_PEERS: usize = 256;
 
 /// Unix sockets the open-source `tailscaled` listens on, by platform.
+#[cfg(unix)]
 const SOCKETS: [&str; 3] = [
     "/var/run/tailscale/tailscaled.sock",
     "/run/tailscale/tailscaled.sock",

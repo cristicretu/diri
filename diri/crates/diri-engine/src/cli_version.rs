@@ -160,14 +160,31 @@ fn identify(executable: &Path) -> Option<(PathBuf, Stamp)> {
 
 /// Runs `<executable> --version` with no stdin and a deadline.
 fn probe(executable: &Path) -> Option<Version> {
-    let mut child = Command::new(executable)
-        .arg("--version")
-        .current_dir(std::env::temp_dir())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+    let spawn = || {
+        Command::new(executable)
+            .arg("--version")
+            .current_dir(std::env::temp_dir())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+    };
+    // A file still open for writing somewhere (an updater mid-write, or any
+    // process forked while it was) cannot be executed yet. The answer is
+    // cached for this stamp, so wait that out briefly rather than recording
+    // the CLI as unknown until it next changes.
+    let mut attempts = 0;
+    let mut child = loop {
+        match spawn() {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 20 =>
+            {
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            spawned => break spawned.ok()?,
+        }
+    };
     let mut stdout = child.stdout.take()?;
     let (done, finished) = std::sync::mpsc::channel();
     std::thread::spawn(move || {

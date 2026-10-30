@@ -101,14 +101,16 @@ fn exercise(session: &mut Session) {
     wait_until(session, "the prompt after the query", || at_prompt(session));
 
     session.write_input(SCRIPT.as_bytes()).unwrap();
+    // The report's progress is noted under the screen lock and the reducer
+    // hears of it just after, outside it: wait for both, not the first.
     wait_until(session, "working with progress", || {
         session.view().terminal_progress
             == Some(TerminalProgress {
                 state: TerminalProgressState::Normal,
                 percent: 40,
             })
+            && session.status() == SessionStatus::Working
     });
-    assert_eq!(session.status(), SessionStatus::Working);
     // The job is waiting on a line, which by itself would read as a
     // question; the program has said it is working.
     std::thread::sleep(Duration::from_millis(2_500));

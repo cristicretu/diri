@@ -2121,6 +2121,9 @@ fn unsolicited_output_is_published_on_its_leading_edge() {
         // Paced, so every write starts after quiet.
         std::thread::sleep(Duration::from_millis(30));
     }
+    // A slave fd held past the Agent's death keeps a Linux PTY master from
+    // ever reporting hangup, so the Holder cannot confirm the stop.
+    drop(terminal);
     let _: SessionInspection = run_json("kill", &state_dir, Some(&selector));
     let mut sorted = latencies.clone();
     sorted.sort_unstable();
@@ -2273,6 +2276,7 @@ fn an_erase_waits_for_its_redraw_instead_of_the_leading_edge() {
             break;
         }
     }
+    drop(terminal);
     let _: SessionInspection = run_json("kill", &state_dir, Some(&selector));
     assert!(
         outcomes.iter().any(|(_, _, whole)| *whole),

@@ -109,7 +109,9 @@ fn a_script_key_and_command_reach_the_script_thread(cx: &mut TestAppContext) {
         }
         _ => panic!("focus reaches the script"),
     }
-    window.simulate_keystrokes(&crate::commands::test_chords("cmd-shift-j"));
+    // A script's keys are bound as written: `cmd` is Super off macOS, not the
+    // Ctrl that shipped bindings move to there.
+    window.simulate_keystrokes("cmd-shift-j");
     match rx.try_recv() {
         Ok(Input::Binding { id: 7, context }) => assert_eq!(
             context,

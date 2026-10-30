@@ -20,6 +20,7 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 /// Ticks from key repeat are capped at about 30 per second.
 #[cfg(target_os = "macos")]
 const MIN_GAP: Duration = Duration::from_millis(32);
+#[cfg(any(target_os = "macos", test))]
 const TICK_VARIANTS: u32 = 4;
 #[cfg(target_os = "macos")]
 const VOLUME: f32 = 0.42;
@@ -49,6 +50,7 @@ pub enum Clip {
 }
 
 impl Clip {
+    #[cfg(any(target_os = "macos", test))]
     fn for_key(key: PowerKey, sequence: u32) -> Self {
         match key {
             PowerKey::Type => Self::Tick(sequence % TICK_VARIANTS),

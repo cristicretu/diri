@@ -642,6 +642,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn attach_reaches_the_socket_root_its_holder_actually_used() {
         use std::os::unix::fs::PermissionsExt;

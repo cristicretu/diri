@@ -5198,7 +5198,6 @@ fn handle_remote_message(
             {
                 RemoteConnectionDisposition::Fatal
             } else {
-                set_remote_connection(shared, diri_proto::RemoteConnectionState::Connected);
                 RemoteConnectionDisposition::Continue
             }
         }
@@ -5210,7 +5209,6 @@ fn handle_remote_message(
                 diri_telemetry::count("remote.delta_gaps", 1);
                 RemoteConnectionDisposition::Reconnect
             } else {
-                set_remote_connection(shared, diri_proto::RemoteConnectionState::Connected);
                 RemoteConnectionDisposition::Continue
             }
         }
@@ -5434,6 +5432,9 @@ fn apply_remote_snapshot(
         remote.revision = remote.revision.saturating_add(1);
         remote.pending = Some(snapshot.grid.clone());
     }
+    // Live before anything shows the seed: a reader that sees this grid must
+    // also see its keyboard state, which is withheld while not Connected.
+    set_remote_connection(shared, diri_proto::RemoteConnectionState::Connected);
     shared.grid_wake.notify();
     restore_remote_status_screen(
         shared,
@@ -5488,6 +5489,7 @@ fn apply_remote_resume(
         };
         full
     };
+    set_remote_connection(shared, diri_proto::RemoteConnectionState::Connected);
     shared.grid_wake.notify();
     // Replayed output was logged, not parsed: seed the status screen from the
     // resumed grid exactly as a snapshot would.

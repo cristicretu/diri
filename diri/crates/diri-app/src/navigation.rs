@@ -787,8 +787,9 @@ impl NavigationOverlay {
             "down" => self.move_highlight(1, cx),
             "p" if modifiers.control => self.move_highlight(-1, cx),
             "n" if modifiers.control => self.move_highlight(1, cx),
+            // ⌘↩ on macOS, Ctrl-↩ elsewhere: the primary modifier there.
             "enter"
-                if modifiers.platform
+                if modifiers.secondary()
                     && !modifiers.shift
                     && self.overlay == Some(Overlay::CommandPalette) =>
             {
