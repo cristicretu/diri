@@ -676,14 +676,18 @@ fn engine_bootstraps_detaches_and_adopts_the_same_remote_process() {
         "reattaching an existing remote Agent must not look like a new launch"
     );
     wait_for_grid(&session, "next>");
-    assert_eq!(
-        session.keyboard_state(),
-        Some(diri_proto::terminal_input::KeyboardState {
-            enhancements: Some(0.try_into().unwrap()),
-            application_cursor_keys: false,
-            application_keypad: true
-        })
-    );
+    // The adopted Session paints the Holder's snapshot before it records the
+    // connection as live, and keyboard state is withheld until it does. Wait
+    // for that, then require exactly the modes the Agent left behind.
+    let restored = Some(diri_proto::terminal_input::KeyboardState {
+        enhancements: Some(0.try_into().unwrap()),
+        application_cursor_keys: false,
+        application_keypad: true,
+    });
+    wait_until("the adopted keyboard state", Duration::from_secs(5), || {
+        session.keyboard_state().is_some()
+    });
+    assert_eq!(session.keyboard_state(), restored);
     let after = manager
         .inspect(
             &installed,
@@ -1369,6 +1373,15 @@ fn engine_reads_remote_inline_images_from_a_capable_holder() {
     let client = session
         .remote_inline_images()
         .expect("the bootstrapped Holder negotiated inline-images-v1");
+    // The Holder grants control right after the snapshot that painted the
+    // prompt, so the first read can still find the lease pending. Only that
+    // answer is retried; any other failure or a missing image fails below.
+    wait_until("the controller lease", Duration::from_secs(5), || {
+        !matches!(
+            client.read_image(&key, 0),
+            Err(error) if error.kind() == std::io::ErrorKind::NotConnected
+        )
+    });
     let mut read = Vec::new();
     while read.len() < pixels.len() {
         let chunk = client
@@ -2242,12 +2255,28 @@ exit($? >> 8);
 /// frame, whether it answers a keystroke or nobody typed for it.
 #[test]
 fn a_remote_repaint_is_published_with_its_redraw() {
-    let flashes = remote_repaint_flashes(Duration::ZERO, 5, &[(true, 5), (false, 5)]);
-    assert_eq!(
-        flashes,
-        [0, 0],
-        "erased frames per (keystroke, background) repaint"
-    );
+    // The Holder holds an erase up to 16 ms for its redraw. A redraw written
+    // later than that may correctly be published on its own, and a shared CI
+    // runner (a macOS VM above all) can stretch a slept 5 ms gap past it. So
+    // both writers spin instead of sleeping, each repaint measures the gap it
+    // actually had (from before the erase was written to after the redraw
+    // was), and only repaints well inside the hold are judged; enough must be.
+    const CONCLUSIVE: Duration = Duration::from_millis(12);
+    const REQUIRED: usize = 3;
+    let trials = remote_repaint_flashes(Duration::ZERO, 10, &[(true, 5), (false, 5)]);
+    for (trigger, trials) in ["keystroke", "background"].into_iter().zip(&trials) {
+        let held: Vec<_> = trials.iter().filter(|(gap, _)| *gap < CONCLUSIVE).collect();
+        assert!(
+            held.len() >= REQUIRED,
+            "{trigger}: too few repaints had a gap inside {CONCLUSIVE:?} to judge \
+             (gap, erased frame shown): {trials:?}"
+        );
+        assert!(
+            held.iter().all(|(_, flashed)| !flashed),
+            "{trigger}: a repaint whose redraw followed its erase inside the interval \
+             showed an erased frame (gap, erased frame shown): {trials:?}"
+        );
+    }
 }
 
 /// Whether a remote destructive repaint (an erase, then its redraw a few
@@ -2284,7 +2313,8 @@ fn measure_remote_destructive_repaint() {
         .collect();
     eprintln!("one-way ssh delay {delay:?}, {trials} repaints per gap");
     let flashes = remote_repaint_flashes(delay, trials, &cases);
-    for ((typed, gap), flashed) in cases.iter().zip(flashes) {
+    for ((typed, gap), outcomes) in cases.iter().zip(flashes) {
+        let flashed = outcomes.iter().filter(|(_, flashed)| *flashed).count();
         let trigger = if *typed { "keystroke " } else { "background" };
         eprintln!("REPAINT {trigger} gap {gap:>2} ms: {flashed}/{trials} showed an erased frame");
     }
@@ -2292,8 +2322,14 @@ fn measure_remote_destructive_repaint() {
 
 /// Runs `trials` repaints per `(typed, gap ms)` case in a remote session
 /// behind a fake `ssh` with `delay` each way and counts, per case, the
-/// repaints whose erase reached an Engine attach before its redraw.
-fn remote_repaint_flashes(delay: Duration, trials: usize, cases: &[(bool, u64)]) -> Vec<usize> {
+/// repaints whose erase reached an Engine attach before its redraw. Each
+/// trial reports the gap it actually had (an upper bound: from before the
+/// erase was written to after the redraw was) and whether it flashed.
+fn remote_repaint_flashes(
+    delay: Duration,
+    trials: usize,
+    cases: &[(bool, u64)],
+) -> Vec<Vec<(Duration, bool)>> {
     use diri_engine::control::ControlServer;
     use diri_engine::registry::Registry;
     use diri_proto::frames::{FrameCodec, FrameType};
@@ -2308,22 +2344,31 @@ fn remote_repaint_flashes(delay: Duration, trials: usize, cases: &[(bool, u64)])
     fs::create_dir(&home).unwrap();
     let script = temporary.path().join("repaint.pl");
     let tty_file = temporary.path().join("tty");
+    let gaps_file = temporary.path().join("gaps");
     // Each input line is "<letter> <gap ms>": erase the screen, wait the
-    // gap, redraw every row with the letter.
+    // gap, redraw every row with the letter, then append the gap it actually
+    // took in microseconds. It spins, so timer slack cannot stretch the gap.
     fs::write(
         &script,
         format!(
-            r#"use strict; use Time::HiRes qw(sleep); $| = 1;
+            r#"use strict; use Time::HiRes qw(time); $| = 1;
 system("stty -echo -icanon min 1; tty > '{tty}'");
 print "ready\r\n";
 while (my $line = <STDIN>) {{
     my ($letter, $gap) = split ' ', $line;
+    my $redraw = "\e[H" . join("\r\n", map {{ $letter x 60 }} 1 .. {ROWS});
+    my $start = time;
     syswrite(STDOUT, "\e[H\e[2J");
-    sleep($gap / 1000) if $gap > 0;
-    syswrite(STDOUT, "\e[H" . join("\r\n", map {{ $letter x 60 }} 1 .. {ROWS}));
+    1 while time - $start < $gap / 1000;
+    syswrite(STDOUT, $redraw);
+    my $took = int((time - $start) * 1e6);
+    open(my $gaps, '>>', '{gaps}') or die;
+    print $gaps "$took\n";
+    close $gaps;
 }}
 "#,
-            tty = tty_file.display()
+            tty = tty_file.display(),
+            gaps = gaps_file.display()
         ),
     )
     .unwrap();
@@ -2507,26 +2552,49 @@ while (my $line = <STDIN>) {{
     while frames.try_recv().is_ok() {}
     let tty = fs::read_to_string(&tty_file).unwrap().trim().to_string();
     let mut terminal = fs::OpenOptions::new().write(true).open(&tty).unwrap();
+    // The perl side logged the warm-up repaint; typed trials follow it.
+    let mut typed_gaps = 1;
     let mut flashes = Vec::with_capacity(cases.len());
     for &(typed, gap) in cases {
-        let mut flashed = 0;
+        let mut outcomes = Vec::with_capacity(trials);
         for trial in 0..trials {
             let letter = char::from(b'b' + (trial % 24) as u8);
-            if typed {
+            let took = if typed {
                 session_input(format!("{letter} {gap}\n").as_bytes());
+                None
             } else {
-                terminal.write_all(b"\x1b[H\x1b[2J").unwrap();
-                std::thread::sleep(Duration::from_millis(gap));
                 let rows = vec![letter.to_string().repeat(60); ROWS].join("\r\n");
-                write!(terminal, "\x1b[H{rows}").unwrap();
-            }
-            if repaint(letter) {
-                flashed += 1;
-            }
+                let redraw = format!("\x1b[H{rows}");
+                let start = Instant::now();
+                terminal.write_all(b"\x1b[H\x1b[2J").unwrap();
+                while start.elapsed() < Duration::from_millis(gap) {
+                    std::hint::spin_loop();
+                }
+                terminal.write_all(redraw.as_bytes()).unwrap();
+                Some(start.elapsed())
+            };
+            let flashed = repaint(letter);
+            let took = took.unwrap_or_else(|| {
+                typed_gaps += 1;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let logged = fs::read_to_string(&gaps_file).unwrap_or_default();
+                    let lines: Vec<&str> = logged.lines().collect();
+                    if lines.len() >= typed_gaps {
+                        break Duration::from_micros(lines[typed_gaps - 1].parse().unwrap());
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "the repaint never logged its gap"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+            outcomes.push((took, flashed));
             std::thread::sleep(Duration::from_millis(60));
             while frames.try_recv().is_ok() {}
         }
-        flashes.push(flashed);
+        flashes.push(outcomes);
     }
     let _ = attach.shutdown(std::net::Shutdown::Both);
     drop(attach_worker);
