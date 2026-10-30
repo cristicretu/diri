@@ -29,6 +29,12 @@ struct Entries {
 }
 
 impl InputLedger {
+    /// Whether a batch with this id was already written.
+    pub fn delivered(&self, id: &str) -> bool {
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries.cells.get(id).is_some_and(|cell| cell.initialized())
+    }
+
     /// Runs `write` unless a batch with this id was already delivered.
     pub async fn deliver<F, Fut, E>(&self, id: &str, write: F) -> Result<(), E>
     where

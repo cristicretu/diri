@@ -131,6 +131,13 @@ doesn't use it yet:
   Mac renders.
 - `POST /api/session/:id/input` (idempotent batches, `input_ledger.rs`),
   `/key`, `/resize`, `GET /scrollback` and `/history` pages.
+- `POST /api/session/:id/answer` `{answer: approve|deny, id, occurredAt}`:
+  answers a permission prompt with the agent's manifest keys (what the Mac's
+  attention inbox sends). The gateway re-checks that the session is still on
+  the prompt raised at `occurredAt` and refuses with `409 moved_on`
+  otherwise; questions and secret prompts get `422`. `id` makes it
+  exactly-once, like `/input`. Phone list cards and notification actions use
+  it, so a stale tap can never type into whatever replaced the prompt.
 
 The work is a small JS renderer in `ui/` that paints rows into a monospace
 DOM grid (one `<div>` per row, spans per style run; no canvas, so text

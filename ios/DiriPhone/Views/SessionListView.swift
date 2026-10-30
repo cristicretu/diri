@@ -11,6 +11,7 @@ struct SessionListView: View {
     @Environment(AppModel.self) private var model
     @State private var actionError: String?
     @State private var confirmingKill: SessionRecord?
+    @State private var answerError: String?
 
     var body: some View {
         Group {
@@ -23,6 +24,10 @@ struct SessionListView: View {
         .navigationTitle("diri")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { toolbar }
+        .alert("Answer not sent", isPresented: .init(
+            get: { answerError != nil }, set: { if !$0 { answerError = nil } }
+        )) { Button("OK", role: .cancel) { answerError = nil } }
+        message: { Text(answerError ?? "") }
         .alert("Couldn't stop the session", isPresented: .init(
             get: { actionError != nil }, set: { if !$0 { actionError = nil } }
         )) { Button("OK", role: .cancel) { actionError = nil } }
@@ -45,6 +50,32 @@ struct SessionListView: View {
 
     private var list: some View {
         List {
+            if !model.waiting.isEmpty {
+                Section {
+                    ForEach(model.waiting) { session in
+                        WaitingCard(session: session, computer: model.computerName(of: session)) {
+                            onSelect(session.id)
+                        } onAnswer: { approve in
+                            Task {
+                                do { try await model.answer(session, approve: approve) } catch {
+                                    answerError = Self.describe(error)
+                                }
+                            }
+                        }
+                        .listRowSeparator(.hidden)
+                        .listRowBackground(Color.clear)
+                        .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 12))
+                    }
+                } header: {
+                    Text(model.waiting.count == 1 ? "Waiting for you" : "\(model.waiting.count) waiting for you")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Tokens.Ink.attention)
+                        .textCase(nil)
+                        .padding(.leading, 10)
+                        .accessibilityAddTraits(.isHeader)
+                        .accessibilityIdentifier("waiting-header")
+                }
+            }
             ForEach(model.computers) { computer in
                 Section {
                     ForEach(computer.rows) { row in rowButton(row) }
@@ -158,6 +189,14 @@ struct SessionListView: View {
         case let .unreachable(detail): return "Unreachable · \(detail)"
         case nil: return "Checking…"
         }
+    }
+
+    /// A refused answer says why in words: the gateway's own message.
+    static func describe(_ error: Error) -> String {
+        if case let DiriClient.Failure.http(code, message) = error, code == 409 || code == 422 {
+            return message.isEmpty ? "The agent is no longer waiting on that." : message
+        }
+        return error.localizedDescription
     }
 
     private func displayTitle(_ session: SessionRecord) -> String {

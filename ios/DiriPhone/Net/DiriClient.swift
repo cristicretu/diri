@@ -256,6 +256,16 @@ actor DiriClient {
         _ = try await send(try request(path, method: "POST", body: ["key": key.wireName]))
     }
 
+    /// Approves or denies the permission prompt the phone saw, with the
+    /// agent's own keys. The gateway re-checks that the session is still on
+    /// that prompt (`occurredAt`) and refuses with 409 otherwise; `answerID`
+    /// makes a resend after a lost reply land once.
+    func answer(sessionID: String, approve: Bool, occurredAt: Double, answerID: String) async throws {
+        let path = "/api/session/\(escape(sessionID))/answer"
+        let body: [String: Any] = ["answer": approve ? "approve" : "deny", "id": answerID, "occurredAt": occurredAt]
+        _ = try await send(try request(path, method: "POST", body: body))
+    }
+
     func kill(sessionID: String) async throws {
         _ = try await send(try request("/api/session/\(escape(sessionID))/kill", method: "POST"))
     }

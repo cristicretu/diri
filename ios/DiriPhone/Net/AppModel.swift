@@ -472,6 +472,31 @@ final class AppModel {
         if let owner = sessionOwner[id] { await refresh(gateway: owner) }
     }
 
+    /// Sessions waiting on you, newest question first, across computers.
+    var waiting: [SessionRecord] {
+        sessions.filter { $0.attention == .needsInput && !$0.isArchived }
+            .sorted { ($0.needsInput?.occurredAt ?? 0) > ($1.needsInput?.occurredAt ?? 0) }
+    }
+
+    /// Answers a permission prompt from the list. A dropped reply is resent
+    /// with the same id (the gateway writes it once); a refusal is not.
+    func answer(_ session: SessionRecord, approve: Bool) async throws {
+        guard let client = client(for: session.id), let occurredAt = session.needsInput?.occurredAt else { return }
+        let answerID = UUID().uuidString
+        var attempt = 0
+        while true {
+            do {
+                try await client.answer(sessionID: session.id, approve: approve, occurredAt: occurredAt, answerID: answerID)
+                break
+            } catch {
+                guard attempt < TerminalSession.inputRetryDelays.count, TerminalSession.isTransient(error) else { throw error }
+                try? await Task.sleep(for: TerminalSession.inputRetryDelays[attempt])
+                attempt += 1
+            }
+        }
+        if let owner = sessionOwner[session.id] { await refresh(gateway: owner) }
+    }
+
     func kill(_ id: String) async throws {
         guard let client = client(for: id) else { return }
         try await client.kill(sessionID: id)

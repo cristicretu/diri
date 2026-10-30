@@ -1808,8 +1808,25 @@ mod tests {
                     "s_codex",
                     json!({"codex": {}}),
                     "Port the key row",
-                    json!({"working": {}}),
-                    json!({})
+                    json!({"needsInput": {"_0": "question"}}),
+                    json!({"needsInput": {
+                        "kind": "question", "source": "screen",
+                        "summary": "Which branch should the key row PR target?",
+                        "options": ["main", "feat/browser-terminal"],
+                        "riskHint": "neutral", "occurredAt": now - 60_000,
+                    }})
+                ),
+                record(
+                    "s_cleanup",
+                    json!({"claudeCode": {}}),
+                    "Clean up worktrees",
+                    json!({"needsInput": {"_0": "permission"}}),
+                    json!({"needsInput": {
+                        "kind": "permission", "source": "screen", "toolName": "Bash",
+                        "summary": "Run rm -rf /private/tmp/diri-old-*?",
+                        "promptExcerpt": "Bash(rm -rf /private/tmp/diri-old-*)",
+                        "riskHint": "destructive", "occurredAt": now - 120_000,
+                    }})
                 ),
                 record(
                     "s_shell",
@@ -1854,10 +1871,21 @@ mod tests {
                 std::env::var("DIRI_PHONE_FIXTURE_DIR").expect("DIRI_PHONE_FIXTURE_DIR"),
             );
             std::fs::create_dir_all(&dir).unwrap();
-            let listed = sessions();
+            // Shared with the loop below, which marks a session working once
+            // the phone answers its prompt.
+            let listed = Arc::new(std::sync::Mutex::new(sessions()));
+            let answered = Arc::clone(&listed);
             let mut engine = crate::testing::fake_engine(move |method, params| match method {
                 Method::EVENTS_SUBSCRIBE => json!({"subscribed": true}),
-                Method::SESSION_LIST => listed.clone(),
+                Method::SESSION_LIST => listed.lock().unwrap().clone(),
+                Method::AGENT_READINESS => json!({"agents": [
+                    {"kind": "claude-code", "binary": "claude", "path": "/usr/local/bin/claude",
+                     "descriptor": {"id": "claude-code", "displayName": "Claude Code",
+                        "approve": {"text": "1", "submit": true}, "deny": {"text": "\u{1b}", "submit": false}}},
+                    {"kind": "codex", "binary": "codex", "path": "/usr/local/bin/codex",
+                     "descriptor": {"id": "codex", "displayName": "Codex",
+                        "approve": {"text": "", "submit": true}}},
+                ]}),
                 Method::SESSION_READ_SCROLLBACK_CELLS => scrollback(params),
                 _ => json!({}),
             })
@@ -1900,6 +1928,17 @@ mod tests {
                     }
                     Some((method, params)) = engine.calls.recv() => {
                         if method == Method::SESSION_SEND_TEXT {
+                            let target = params.as_ref().and_then(|p| p["sessionID"].as_str()).unwrap_or_default().to_owned();
+                            if params.as_ref().is_some_and(|p| p["submit"] == true) {
+                                // An approve (typed keys never submit): back to work.
+                                let mut list = answered.lock().unwrap();
+                                for record in list["sessions"].as_array_mut().into_iter().flatten() {
+                                    if record["id"] == target.as_str() {
+                                        record["status"] = json!({"working": {}});
+                                        record.as_object_mut().map(|o| o.remove("needsInput"));
+                                    }
+                                }
+                            }
                             let text = params.as_ref().and_then(|p| p["text"].as_str()).unwrap_or_default().to_owned();
                             let escaped: String = text.chars().flat_map(char::escape_default).collect();
                             let mut file = std::fs::OpenOptions::new().append(true).open(&typed).unwrap();
