@@ -95,6 +95,7 @@ mod shortcut_recorder;
 pub mod sidebar;
 mod skills_catalog;
 mod skills_page;
+pub mod power_sounds;
 pub mod sounds;
 mod stall_stack;
 mod status_debug;

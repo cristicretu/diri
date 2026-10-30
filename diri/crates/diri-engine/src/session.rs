@@ -501,6 +501,10 @@ struct Shared {
     /// erase is already in `screen`. The pump publishes when it ends; anyone
     /// else waking clients meanwhile would show them the erased screen.
     awaiting_redraw: AtomicBool,
+    /// A client was seeded from rows the diff baseline does not hold yet.
+    /// The next publication is full, so rows that return to what the last
+    /// publication sent (a repaint the seed caught erased) reach it too.
+    full_publication_due: AtomicBool,
     grid_wake: GridWake,
     /// The manifest this session runs, for telemetry.
     agent: String,
@@ -2841,6 +2845,13 @@ impl Session {
             }
             .unwrap_or_else(|| {
                 let screen = self.shared.screen.lock().expect("screen");
+                // Set under the screen lock, so the publication that next
+                // takes it cannot have diffed these rows already.
+                if screen.has_unpublished_rows() {
+                    self.shared
+                        .full_publication_due
+                        .store(true, Ordering::SeqCst);
+                }
                 (
                     screen.full_snapshot(),
                     (
@@ -2971,7 +2982,11 @@ impl Session {
             None
         } else {
             *signature = current;
-            Some(screen.grid_update(false))
+            let full = self
+                .shared
+                .full_publication_due
+                .swap(false, Ordering::SeqCst);
+            Some(screen.grid_update(full))
         };
         drop(screen);
         TerminalPublication {
@@ -3954,6 +3969,7 @@ fn new_shared(
         held_screen_offset: AtomicU64::new(0),
         held_parsed_bytes: AtomicU64::new(0),
         awaiting_redraw: AtomicBool::new(false),
+        full_publication_due: AtomicBool::new(false),
         grid_wake: GridWake::for_agent(&spec.manifest_id),
         agent: spec.manifest_id.clone(),
         launched_at,
