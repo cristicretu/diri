@@ -47,9 +47,10 @@ const MAX_IMAGE_DIMENSION: u64 = 2560;
 /// Results are relayed on the control socket, one line of at most
 /// `MAX_CONTROL_LINE_BYTES`; leave room for the envelope.
 const MAX_RESULT_BYTES: usize = diri_proto::control::MAX_CONTROL_LINE_BYTES - 64 * 1024;
-/// The driver runs every session's calls through one queue (measured on
-/// 0.36: a second daemon barely helps), so one long batch would hold up
-/// every other Agent. Batches stay short enough to interleave.
+/// The driver runs background element and keyboard actions on different apps
+/// in parallel, but every pixel, foreground and desktop action still goes
+/// through one queue, so one long batch of those would hold up every other
+/// Agent. Batches stay short enough to interleave.
 const MAX_BATCH_STEPS: usize = 20;
 /// Cua caps badge labels at 28 characters.
 const MAX_LABEL_CHARS: usize = 28;
@@ -62,7 +63,9 @@ const NAME_TAG_LEN: usize = 4;
 const NAME_ATTEMPTS: u64 = 4;
 /// Each session's cursor glides quickly and does not linger. Measured on
 /// Cua Driver 0.36: an action costs ~1.27 s with the default motion and
-/// ~0.8 s with this one; ~0.72 s of every action is the driver's own floor.
+/// ~0.8 s with this one; 0.38.1 brings a click to ~0.6 s. Ten sessions on
+/// ten apps reach ~12 element clicks or text entries per second together
+/// through the one MCP pipe, which answers calls as they finish.
 const CURSOR_GLIDE_MS: u64 = 100;
 
 /// Driver tools Diri does not hand to Agents: Diri owns each session's
