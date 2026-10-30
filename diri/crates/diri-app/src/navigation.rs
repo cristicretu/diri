@@ -1255,6 +1255,16 @@ impl NavigationOverlay {
                 self.close_overlay(window, cx);
                 crate::scripting::run_command(id);
             }
+            PaletteCommand::TogglePowerMode => {
+                let _ = self
+                    .store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .update_preferences(|prefs| {
+                        prefs.terminal_power_mode = !prefs.terminal_power_mode;
+                    });
+                self.close_overlay(window, cx);
+            }
         }
     }
 
@@ -1299,6 +1309,10 @@ impl NavigationOverlay {
                 crate::usage::Clock::read(&crate::usage::SystemClock).unix_seconds,
             ));
             actions.extend(crate::scripting::palette_actions());
+            actions.extend(palette::power_mode_action(
+                self.query.text(),
+                store.preferences().terminal_power_mode,
+            ));
             let orientation = store.preferences().tab_orientation;
             let density = store.preferences().pane_density;
             let style = store.preferences().interface_style();

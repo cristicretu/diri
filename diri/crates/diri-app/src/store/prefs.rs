@@ -827,6 +827,11 @@ pub struct Prefs {
     /// Let programs change the cursor's shape and blink (vim's bar in
     /// insert mode). Off, every terminal keeps the shape above.
     pub terminal_cursor_follows_programs: bool,
+    /// The power mode easter egg: typing throws sparks, deleting burns, and
+    /// cursor jumps leave lightning, with sound. Typing "power mode" in the
+    /// command palette is the only way to flip it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub terminal_power_mode: bool,
     /// Give new zsh and bash terminals Diri's OSC 133 prompt and command
     /// marks. The Engine applies it; the store pushes it on every change.
     pub terminal_shell_integration: bool,
@@ -1013,6 +1018,7 @@ impl Default for Prefs {
             terminal_cursor_shape: CursorShapePref::Block,
             terminal_cursor_blink: CursorBlinkPref::Normal,
             terminal_cursor_follows_programs: true,
+            terminal_power_mode: false,
             terminal_shell_integration: true,
             terminal_file_editor: FileEditor::Automatic,
             terminal_shell_command: String::new(),

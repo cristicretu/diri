@@ -256,6 +256,8 @@
   "palette.new_agent_session": "Nueva sesión de {agent}",
   "palette.new_terminal": "Nuevo terminal",
   "palette.new_terminal_on": "Nuevo terminal en {host}",
+  "palette.power_mode_off": "Desactivar modo potencia",
+  "palette.power_mode_on": "Activar modo potencia",
   "palette.script": "Script",
   "palette.switch_account": "Cambiar {agent} a {account}",
   "palette.sync_prefs_to": "Sincronizar preferencias con {host}",
