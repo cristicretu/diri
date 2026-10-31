@@ -40,6 +40,9 @@ use table_view::{TABLE_MENU, TableMenu};
 #[path = "block_handle.rs"]
 mod block_handle;
 use block_handle::{BLOCK_MENU, BlockDrag, BlockMenu};
+#[path = "find_bar.rs"]
+mod find_bar;
+use find_bar::{FIND_EDITOR_CONTEXT, FindBar};
 
 pub(crate) const EDITOR_CONTEXT: &str = "DiriNoteEditor";
 /// The editor's context while the ⌘K link panel owns the keyboard: none of
@@ -110,6 +113,9 @@ actions!(
         Escape,
         ShowCharacterPalette,
         StartWork,
+        Find,
+        FindNext,
+        FindPrevious,
     ]
 );
 
@@ -185,6 +191,9 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-e", InlineCode, c),
         KeyBinding::new("cmd-shift-x", Strike, c),
         KeyBinding::new("cmd-k", Link, c),
+        KeyBinding::new("cmd-f", Find, c),
+        KeyBinding::new("cmd-g", FindNext, c),
+        KeyBinding::new("cmd-shift-g", FindPrevious, c),
         KeyBinding::new("cmd-enter", ToggleTodo, c),
         KeyBinding::new("cmd-alt-enter", ToggleFold, c),
         KeyBinding::new(KEY_TABLE_ROW_ABOVE, TableRowAbove, c),
@@ -554,6 +563,8 @@ pub(crate) struct NoteEditorView {
     slash: Option<SlashMenu>,
     mention: Option<MentionMenu>,
     link_editor: Option<LinkEditor>,
+    /// The ⌘F bar, while open.
+    find_bar: Option<FindBar>,
     table_menu: Option<TableMenu>,
     /// The menu opened from a block's grip.
     block_menu: Option<BlockMenu>,
@@ -618,6 +629,7 @@ impl NoteEditorView {
             slash: None,
             mention: None,
             link_editor: None,
+            find_bar: None,
             table_menu: None,
             block_menu: None,
             dragging: None,
@@ -1762,6 +1774,7 @@ impl NoteEditorView {
         }
         self.slash = None;
         self.mention = None;
+        self.release_find_keyboard();
         self.link_editor = Some(LinkEditor {
             query,
             selection,
@@ -2005,6 +2018,7 @@ impl NoteEditorView {
             || self.link_editor.take().is_some()
             || self.table_menu.take().is_some()
             || self.block_menu.take().is_some()
+            || self.find_bar.take().is_some()
         {
             cx.notify();
             return;
@@ -2070,6 +2084,7 @@ impl NoteEditorView {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus, cx);
+        self.release_find_keyboard();
         if event.click_count == 1
             && !event.modifiers.shift
             && let Some(hit) = self.chip_at(event.position)
@@ -2243,6 +2258,9 @@ impl EntityInputHandler for NoteEditorView {
             cx.notify();
             return;
         }
+        if self.find_insert(text, cx) {
+            return;
+        }
         let block = self.ime_block();
         let range = range_utf16
             .as_ref()
@@ -2278,8 +2296,8 @@ impl EntityInputHandler for NoteEditorView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // A composition in the link field lands when it commits.
-        if self.link_editor.is_some() {
+        // A composition in the link or find field lands when it commits.
+        if self.link_editor.is_some() || self.find_typing() {
             let _ = (new_text, new_selected_range_utf16);
             return;
         }
@@ -2609,12 +2627,15 @@ impl AlphaExt for gpui::Rgba {
 
 struct PaintState {
     selection: Vec<Bounds<Pixels>>,
+    /// Find matches other than the current one (that one is the selection).
+    matches: Vec<Bounds<Pixels>>,
     caret: Option<Bounds<Pixels>>,
 }
 
 impl Render for NoteEditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::perf_overlay::rendered("note editor");
+        self.sync_find();
         let colors = self.colors;
         let focused = self.focus.is_focused(window);
         self.focused_last_frame = focused;
@@ -3047,8 +3068,22 @@ impl Render for NoteEditorView {
         let overlay_shown = shown_all;
         let autoscroll = std::mem::take(&mut self.autoscroll);
         let scroll = self.scroll.clone();
+        let find_hits = self.find_highlights();
+        let match_color = accent().alpha(0.16);
         let overlay = canvas(
             move |_, _, _| {
+                let mut matches = Vec::new();
+                for (index, range) in &find_hits {
+                    let Some(Some(layout)) = layouts.get(*index) else {
+                        continue;
+                    };
+                    if folded_away.get(*index).copied().unwrap_or(true) {
+                        continue;
+                    }
+                    let shown = &overlay_shown[*index];
+                    let (from, to) = (shown.to_display(range.start), shown.to_display(range.end));
+                    matches.extend(selection_rects(layout, from, to, false, false));
+                }
                 let mut rects = Vec::new();
                 let start = selection.start();
                 let end = selection.end();
@@ -3094,11 +3129,15 @@ impl Render for NoteEditorView {
                 };
                 PaintState {
                     selection: rects,
+                    matches,
                     caret,
                 }
             },
             move |bounds, state, window, cx| {
                 window.handle_input(&focus, ElementInputHandler::new(bounds, entity.clone()), cx);
+                for rect in &state.matches {
+                    window.paint_quad(fill(*rect, match_color).corner_radii(px(3.0)));
+                }
                 for rect in &state.selection {
                     window.paint_quad(fill(*rect, selection_color).corner_radii(px(3.0)));
                 }
@@ -3178,6 +3217,7 @@ impl Render for NoteEditorView {
             None
         };
         let work_menu = self.work_menu(window, cx);
+        let find_bar = self.find_bar_view(cx);
         let footer = self.footer.clone().map(|footer| {
             div()
                 .w_full()
@@ -3193,10 +3233,13 @@ impl Render for NoteEditorView {
             .id("note-editor")
             .key_context(if self.link_editor.is_some() {
                 LINK_EDITOR_CONTEXT
+            } else if self.find_typing() {
+                FIND_EDITOR_CONTEXT
             } else {
                 EDITOR_CONTEXT
             })
             .on_key_down(cx.listener(Self::link_editor_key_down))
+            .on_key_down(cx.listener(Self::find_key_down))
             .track_focus(&self.focus)
             .relative()
             .size_full()
@@ -3261,6 +3304,9 @@ impl Render for NoteEditorView {
             .on_action(cx.listener(Self::escape))
             .on_action(cx.listener(Self::show_character_palette))
             .on_action(cx.listener(Self::start_work))
+            .on_action(cx.listener(Self::find))
+            .on_action(cx.listener(Self::find_next))
+            .on_action(cx.listener(Self::find_previous))
             .child(
                 div()
                     .id("note-editor-scroll")
@@ -3309,6 +3355,7 @@ impl Render for NoteEditorView {
             .children(link_menu)
             .children(table_menu)
             .children(block_menu)
+            .children(find_bar)
     }
 }
 
