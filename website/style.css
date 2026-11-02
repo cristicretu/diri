@@ -589,19 +589,11 @@ isolation: isolate;
 @media (max-width: 600px) { .app-sidebar { display: none; } }
 @media (max-width: 600px) { .pane-tool { display: none; } }
 
-/* One sky for the whole hero: dark where the text sits, a warm horizon behind the window, dark again below. */
-.page-sky { position: absolute; z-index: -1; top: 0; left: 0; right: 0; height: 1500px; pointer-events: none; overflow: hidden;
-  background:
-    radial-gradient(48% 30% at 50% 66%, #f6cdb2d9, transparent 72%),
-    radial-gradient(34% 30% at 12% 62%, #dc9387cc, transparent 70%),
-    radial-gradient(34% 30% at 90% 56%, #a8c2e8a6, transparent 66%),
-    radial-gradient(44% 30% at 72% 84%, #7d6db6d0, transparent 70%),
-    radial-gradient(40% 26% at 26% 86%, #b77fa8b0, transparent 70%),
-    linear-gradient(180deg, #191724 0%, #1f1b2e 16%, #3c2f55 30%, #8a6f9a 46%, #c99aa6 60%, #6e5d96 76%, #2a2440 90%, #191724 100%);
-  -webkit-mask-image: linear-gradient(#000 82%, transparent); mask-image: linear-gradient(#000 82%, transparent); }
-.page-sky::before { content: ''; position: absolute; inset: 0; opacity: .2; mix-blend-mode: soft-light; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E"); }
+/* The hero is dark; the only light is the glyph fire rising from under the window. */
+.page-sky { position: absolute; z-index: -1; top: 0; left: 0; right: 0; height: 1500px; pointer-events: none; overflow: hidden; }
 /* Glyph fire rising out of the warm horizon: ember.js pins the white-hot bed to the hero window's bottom edge, so the window hides it and the flames lick up its sides into the iris. */
 .glyph-ember { position: absolute; left: 0; width: 100%; top: var(--ember-top, 20%); height: min(720px, 62vw); display: block;
+  background: radial-gradient(60% 34% at 50% 100%, #f6cdb238, #b77fa826 40%, #7d6db614 70%, transparent);
   -webkit-mask-image: linear-gradient(transparent 4%, #000 44%, #000 96%, transparent); mask-image: linear-gradient(transparent 4%, #000 44%, #000 96%, transparent); }
 .desktop-stage { padding: 0; background: none; box-shadow: none; border-radius: 0; overflow: visible; }
 .desktop-stage::before, .desktop-stage::after { content: none; }

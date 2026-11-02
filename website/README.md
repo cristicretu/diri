@@ -14,7 +14,7 @@ Open http://localhost:4177. Requires Node.js; no install or build step. Set `POR
 
 ## The hero
 
-The window under the headline is a recording of the real app, not a mock: `assets/features/agents.webp`, made by `diri/scripts/site-clips.sh` from the ignored `render_site_clips` test in `diri-app`. It is captured with the glass material, so the sidebar keeps its alpha and the page's gradient shows through it, blurred by `backdrop-filter` behind the image. The feature clips below it come from the same recorder.
+The window under the headline is a recording of the real app, not a mock: `assets/features/agents.webp`, made by `diri/scripts/site-clips.sh` from the ignored `render_site_clips` test in `diri-app`. It is captured with the glass material, so the sidebar keeps its alpha. The hero background is dark; its only light is the glyph fire from `ember.js`, which rises from under the window's bottom edge. The feature clips below it come from the same recorder.
 
 ## Feature coverage
 
