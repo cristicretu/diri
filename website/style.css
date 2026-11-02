@@ -688,7 +688,7 @@ isolation: isolate;
 /* Hero actions: one primary download, one quiet door to everything else. No fine print under the fold. */
 .button-mark { width: 15px; height: 15px; margin-top: -2px; filter: brightness(0) saturate(100%) invert(10%) sepia(10%) saturate(800%) hue-rotate(270deg); }
 .download-options { position: relative; }
-x: 5; top: calc(100% + 8px); left: 50%; translate: -50% 0; min-width: 280px; display: flex; flex-direction: column; gap: 2px; padding: 6px; text-align: left; background: #26243af7; border: 1px solid #ffffff1f; border-radius: 12px; box-shadow: 0 20px 50px -12px #0009; font-size: 13px; animation: panel-in 160ms var(--ease) both; }
+.download-menu { position: absolute; z-index: 5; top: calc(100% + 8px); left: 50%; translate: -50% 0; min-width: 280px; display: flex; flex-direction: column; gap: 2px; padding: 6px; text-align: left; background: #26243af7; border: 1px solid #ffffff1f; border-radius: 12px; box-shadow: 0 20px 50px -12px #0009; font-size: 13px; animation: panel-in 160ms var(--ease) both; }
 .download-menu a, .download-upcoming, .download-menu-head { display: flex; align-items: center; gap: 9px; min-height: 34px; padding: 0 10px; border-radius: 7px; color: var(--rp-text); }
 .download-menu-head { justify-content: space-between; color: var(--rp-subtle); border-bottom: 1px solid #ffffff12; border-radius: 0; margin-bottom: 4px; padding-bottom: 2px; }
 .download-menu-head a { min-height: 0; padding: 0; color: var(--rp-iris); }
@@ -1161,3 +1161,8 @@ cSystemFont, sans-serif; font-size: 20px; line-height: 1.5; font-weight: 500; le
 /* The headline reads like the closing call: white claim, the second half in ember coral; the detail line warms toward peach. */
 .intro-heading h1 span { display: block; color: #dc9387; }
 .intro-heading p { color: #b8a7ad; }
+
+/* Other platforms: the same dark glass as the windows, warmed by the fire's palette. */
+.download-menu { min-width: 300px; background: #1d1a29f5; border-color: #f6cdb21f; box-shadow: 0 1px 0 #f6cdb214 inset, 0 24px 60px -16px #000c, 0 30px 70px -40px #dc938740; -webkit-backdrop-filter: blur(18px); backdrop-filter: blur(18px); }
+.download-menu-head a { color: #dc9387; }
+.download-menu a:not(.download-menu-head a) { color: #e9e4f2; }
