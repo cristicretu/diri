@@ -322,6 +322,14 @@
     "hash": "4c9bc17f79d23e17"
   },
   {
+    "key": "whats-new-0-11-1",
+    "url": "/whats-new/0.11.1/",
+    "eyebrow": "Release · November 2, 2026",
+    "title": "diri 0.11.1",
+    "subtitle": "Hold ⌘T for anything new",
+    "hash": "18e1c09e359a0689"
+  },
+  {
     "key": "whats-new-0-11-0",
     "url": "/whats-new/0.11.0/",
     "eyebrow": "Release · October 30, 2026",
@@ -349,9 +357,9 @@
     "key": "whats-new",
     "url": "/whats-new/",
     "eyebrow": "What's new",
-    "title": "diri 0.11.0",
-    "subtitle": "Scripting, splits you can read, and nothing lost under load",
-    "hash": "a12d887a6b8a16d3"
+    "title": "diri 0.11.1",
+    "subtitle": "Hold ⌘T for anything new",
+    "hash": "90c8d44f6ecc3010"
   },
   {
     "key": "guides-agent-teams",

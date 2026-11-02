@@ -1,5 +1,45 @@
 [
   {
+    "version": "0.11.1",
+    "date": "November 2, 2026",
+    "headline": "Hold ⌘T for anything new",
+    "summary": "diri 0.11.1 adds a launch ring on a held ⌘T, find in notes, smoother note scrolling, and safer computer use for agents working side by side.",
+    "items": [
+      {
+        "title": "Hold ⌘T for anything new",
+        "text": "Hold ⌘T and a ring opens under the pointer: flick toward an agent, Terminal or Note and let go. A tap still starts your default agent, and holding the keys never starts more than one.",
+        "clip": "/assets/whats-new/launch-ring.webp",
+        "width": 1440,
+        "height": 900,
+        "alt": "Holding ⌘T opens a ring of agents under the pointer; the pointer glides past Codex to Terminal, and letting go opens a new terminal."
+      },
+      {
+        "title": "Talk with your agent",
+        "text": "When an agent finishes, diri reads what matters aloud. Answer out loud and end with “send to agent”. Everything stays on this Mac.",
+        "clip": "/assets/features/voice.webp",
+        "width": 1280,
+        "height": 900,
+        "alt": "Claude Code finishes a fix, diri reads its question aloud, and the spoken answer lands in the prompt and is sent."
+      },
+      {
+        "title": "Agents use your Mac, side by side",
+        "text": "Agents open apps in the background, each with its own cursor, and ten can work at once without touching your mouse or keyboard. Computer use now waits for controls to be ready and checks each action landed.",
+        "clip": "/assets/features/computer.webp",
+        "width": 2280,
+        "height": 1400,
+        "alt": "Claude Code, Codex and Pi each drive their own iPhone Simulator at once, every agent with a labelled cursor."
+      },
+      {
+        "title": "Find in a note",
+        "text": "⌘F searches the open note, every match highlighted. ⌘B makes text bold."
+      },
+      {
+        "title": "Smoother notes",
+        "text": "Notes scroll smoothly, wide tables scroll sideways on their own, and the line you're reading holds still."
+      }
+    ]
+  },
+  {
     "version": "0.11.0",
     "date": "October 30, 2026",
     "headline": "Scripting, splits you can read, and nothing lost under load",
