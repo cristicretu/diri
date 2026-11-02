@@ -16,6 +16,10 @@ Open http://localhost:4177. Requires Node.js; no install or build step. Set `POR
 
 The window under the headline is a recording of the real app, not a mock: `assets/features/agents.webp`, made by `diri/scripts/site-clips.sh` from the ignored `render_site_clips` test in `diri-app`. It is captured with the glass material, so the sidebar keeps its alpha. The hero background is dark; its only light is the glyph fire from `ember.js`, which rises from under the window's bottom edge. The feature clips below it come from the same recorder.
 
+## The fire
+
+`ember.js` runs every `.glyph-ember` on the page: the hero's, rising from under the window (`data-occlude=".hero-clip"` skips the cells it hides), and a quieter one under the closing call (`data-intensity`, `data-fade-bottom`). Each pauses offscreen and in hidden tabs and draws one still frame under reduced motion. The rest of the page borrows its palette for accents: iris `#7d6db6`, rose `#b77fa8`, coral `#dc9387`, peach `#f6cdb2`.
+
 ## Feature coverage
 
 The page has one primary download action with other packages in an expandable list, a GitHub mark in the masthead, and 24 feature descriptions grouped by agents/sessions, parallel work, review, usage/accounts, workspace preferences, and devices. The complete inventory is static HTML, available without JavaScript. It uses shared columns and subtle separators instead of individual cards or hidden accordions.

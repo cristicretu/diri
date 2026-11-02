@@ -1130,3 +1130,24 @@ cSystemFont, sans-serif; font-size: 20px; line-height: 1.5; font-weight: 500; le
   .brew-line code { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
   .brew-copy { flex: none; }
 }
+
+/* The rest of the page carries the hero's fire: ember-lit windows and accents, and the page ends on a second, quieter fire.
+   Palette (from ember.js): iris #7d6db6, rose #b77fa8, coral #dc9387, peach #f6cdb2. */
+.feature-clip { box-shadow: 0 1px 0 #f6cdb214 inset, 0 40px 80px -40px #000, 0 50px 90px -60px #dc938755; }
+.also dt .icon { color: #dc9387; }
+.faq-list details[open] summary .icon { color: #f6cdb2; }
+.faq-list details:first-child { border-top-color: transparent; border-image: linear-gradient(90deg, #dc938740, #7d6db626 55%, #ffffff0f) 1; }
+.site-footer::before { background: linear-gradient(90deg, transparent, #dc938733 30%, #7d6db626 70%, transparent); }
+
+/* Closing: the same call as the hero, centered, with flames rising from under it into the footer line. */
+.closing { position: relative; flex-direction: column; justify-content: flex-start; gap: 22px; margin: 24px 0 0; padding: 32px 0 280px; border-top: 0; text-align: center; }
+.closing h2 { font-size: clamp(30px, 3.4vw, 40px); line-height: 1.1; font-weight: 600; letter-spacing: -.03em; text-wrap: balance; }
+.closing h2 span { display: block; color: #dc9387; }
+.closing .brew-line { margin-top: -6px; }
+.closing .brew-pill { background: #191724; }
+.closing-ember { --ember-h: 480px; }
+@media (max-width: 600px) {
+  .closing { align-items: center; margin-top: 72px; padding: 48px 0 200px; }
+  .closing h2 { font-size: 28px; }
+  .closing-ember { --ember-h: 300px; }
+}

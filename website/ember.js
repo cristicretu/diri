@@ -6,31 +6,37 @@
 //   by the compositor, so no CSS filter re-runs over the full canvas each frame;
 // - the top fade is per-row alpha, not a CSS mask (which would force an offscreen pass per frame).
 // Paused offscreen and in hidden tabs; one still frame under reduced motion.
-const canvas = document.querySelector('.ember-glyphs');
-const hazeCanvas = document.querySelector('.ember-haze');
-const ctx = canvas?.getContext('2d', { alpha: true });
-const haze = hazeCanvas?.getContext('2d', { alpha: true });
+// Every .glyph-ember on the page is its own fire. Options, as data attributes on it:
+//   data-occlude="<selector>"  an opaque element in front: cells fully behind it are not drawn;
+//   data-intensity="0.6"       overall exposure, for fires that sit behind text;
+//   data-fade-bottom="0.45"    how much of the height the bed fades over (default 0.22), for an exposed bed.
+{
+const RAMP = " .'`,:;-~^\"!il|/()[]{}?+<>1tfjrxnuvczJLYXUCOZQ0mwqpdbkhao*#MW&8%B@$";
+const SPARKS = ['+', '*', '+', '.'];
+// Heat → color, sampled from the sky palette: iris → rose → coral → peach → white-hot.
+const STOPS = [
+  [0.00, [125, 109, 182]], [0.22, [150, 128, 205]], [0.42, [183, 127, 168]],
+  [0.60, [220, 147, 135]], [0.80, [246, 205, 178]], [1.00, [255, 246, 238]],
+];
+const BUCKETS = 12, MIN_HEAT = 0.07, FPS = 30;
+const colorAt = h => {
+  let j = 0; while (j < STOPS.length - 2 && h > STOPS[j + 1][0]) j++;
+  const [h0, c0] = STOPS[j], [h1, c1] = STOPS[j + 1];
+  const k = Math.min(1, Math.max(0, (h - h0) / (h1 - h0)));
+  return c0.map((v, i) => Math.round(v + (c1[i] - v) * k));
+};
+const bucketRgb = Array.from({ length: BUCKETS }, (_, b) => colorAt((b + 0.5) / BUCKETS));
+// 256-entry lookup for the haze so the per-cell loop does no color math.
+const hazeLut = Array.from({ length: 256 }, (_, i) => colorAt(i / 255 * 0.82));
 
-if (ctx && haze) {
-  const RAMP = " .'`,:;-~^\"!il|/()[]{}?+<>1tfjrxnuvczJLYXUCOZQ0mwqpdbkhao*#MW&8%B@$";
-  const SPARKS = ['+', '*', '+', '.'];
-  // Heat → color, sampled from the sky palette: iris → rose → coral → peach → white-hot.
-  const STOPS = [
-    [0.00, [125, 109, 182]], [0.22, [150, 128, 205]], [0.42, [183, 127, 168]],
-    [0.60, [220, 147, 135]], [0.80, [246, 205, 178]], [1.00, [255, 246, 238]],
-  ];
-  const BUCKETS = 12, MIN_HEAT = 0.07, FPS = 30;
-  const colorAt = h => {
-    let j = 0; while (j < STOPS.length - 2 && h > STOPS[j + 1][0]) j++;
-    const [h0, c0] = STOPS[j], [h1, c1] = STOPS[j + 1];
-    const k = Math.min(1, Math.max(0, (h - h0) / (h1 - h0)));
-    return c0.map((v, i) => Math.round(v + (c1[i] - v) * k));
-  };
-  const bucketRgb = Array.from({ length: BUCKETS }, (_, b) => colorAt((b + 0.5) / BUCKETS));
-  // 256-entry lookup for the haze so the per-cell loop does no color math.
-  const hazeLut = Array.from({ length: 256 }, (_, i) => colorAt(i / 255 * 0.82));
+const reduced = matchMedia('(prefers-reduced-motion: reduce)');
 
-  const reduced = matchMedia('(prefers-reduced-motion: reduce)');
+const mount = root => {
+  const canvas = root.querySelector('.ember-glyphs'), hazeCanvas = root.querySelector('.ember-haze');
+  const ctx = canvas?.getContext('2d', { alpha: true }), haze = hazeCanvas?.getContext('2d', { alpha: true });
+  if (!ctx || !haze) return;
+  const intensity = Math.min(1, Math.max(0, parseFloat(root.dataset.intensity ?? '1')));
+  const fadeBottom = Math.min(0.8, Math.max(0.05, parseFloat(root.dataset.fadeBottom ?? '0.22')));
   let cols = 0, rows = 0, cw = 0, ch = 0, dpr = 1, gw = 0, gh = 0;
   let hx0 = 0, hx1 = -1, hy0 = 0, hy1 = -1;
   let heat, next, strength, glyph, blurA, blurB, rowAlpha, hazeImage, atlas, sparks = [], t = 0;
@@ -45,16 +51,16 @@ if (ctx && haze) {
     a.textBaseline = 'top';
     for (let b = 0; b < BUCKETS; b++) {
       const [r, g, bl] = bucketRgb[b], h = (b + 0.5) / BUCKETS;
-      a.fillStyle = `rgba(${r},${g},${bl},${Math.min(1, 0.05 + 1.25 * h ** 1.35).toFixed(3)})`;
+      a.fillStyle = `rgba(${r},${g},${bl},${(intensity * Math.min(1, 0.05 + 1.25 * h ** 1.35)).toFixed(3)})`;
       for (let k = 1; k < RAMP.length; k++) a.fillText(RAMP[k], k * gw, b * gh);
     }
     a.fillStyle = '#fff3ea'; a.shadowColor = 'rgba(246,205,178,0.95)'; a.shadowBlur = 4 * dpr;
     SPARKS.forEach((s, i) => a.fillText(s, i * gw, BUCKETS * gh));
   };
 
-  // Cells fully behind the hero window are never seen (its glass sidebar blurs them away), so they are
-  // not drawn: that is most of the bed and most of the per-frame blits.
-  const hero = document.querySelector('.hero-clip');
+  // Cells fully behind the occluding element (the hero window) are never seen, so they are not drawn:
+  // for the hero that is most of the bed and most of the per-frame blits.
+  const hero = root.dataset.occlude ? document.querySelector(root.dataset.occlude) : null;
   const occlude = () => {
     hx1 = hy1 = -1;
     if (!hero || !cols) return;
@@ -79,11 +85,11 @@ if (ctx && haze) {
     heat = new Float32Array(n); next = new Float32Array(n); strength = new Float32Array(cols);
     blurA = new Float32Array(n); blurB = new Float32Array(n);
     glyph = new Uint8Array(n).map(() => Math.random() * 255);
-    // Eased fades: tips dissolve over the top 60%, and the bed melts away over the last 22% so it never ends in a line.
+    // Eased fades: tips dissolve over the top 60%, and the bed melts away over the bottom (fadeBottom) so it never ends in a line.
     const ease = v => { v = Math.min(1, Math.max(0, v)); return v * v * (3 - 2 * v); };
     rowAlpha = Float32Array.from({ length: rows }, (_, y) => {
       const f = (y + 0.5) / rows;
-      return ease(f / 0.6) ** 1.5 * ease((1 - f) / 0.22) ** 1.3;
+      return ease(f / 0.6) ** 1.5 * ease((1 - f) / fadeBottom) ** 1.3;
     });
     hazeCanvas.width = cols; hazeCanvas.height = rows;
     hazeImage = haze.createImageData(cols, rows);
@@ -148,7 +154,7 @@ if (ctx && haze) {
       for (let x = 0; x < cols; x++) {
         const i = y * cols + x, h = Math.min(1, blurB[i]), o = i * 4, rgb = hazeLut[(h * 255) | 0];
         px[o] = rgb[0]; px[o + 1] = rgb[1]; px[o + 2] = rgb[2];
-        px[o + 3] = h < 0.05 ? 0 : Math.min(150, h * h * 190) * fade;
+        px[o + 3] = h < 0.05 ? 0 : Math.min(150, h * h * 190) * fade * intensity;
       }
     }
     haze.putImageData(hazeImage, 0, 0);
@@ -185,7 +191,7 @@ if (ctx && haze) {
   const frame = now => {
     raf = 0;
     if (!visible || document.hidden || reduced.matches) return;
-    if (now - last >= 1000 / FPS - 2) { last = now; const a = performance.now(); step(); const b = performance.now(); draw(); const c = performance.now(); const st = (window.__em ??= { n: 0, s: 0, d: 0, cells: cols * rows }); st.n++; st.s += b - a; st.d += c - b; }
+    if (now - last >= 1000 / FPS - 2) { last = now; step(); draw(); }
     raf = requestAnimationFrame(frame);
   };
   const start = () => {
@@ -201,4 +207,7 @@ if (ctx && haze) {
   const sizes = new ResizeObserver(() => { clearTimeout(resizeTimer); resizeTimer = setTimeout(reset, 120); });
   sizes.observe(canvas); if (hero) sizes.observe(hero);
   reset();
+};
+
+document.querySelectorAll('.glyph-ember').forEach(mount);
 }
