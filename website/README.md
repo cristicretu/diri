@@ -18,7 +18,7 @@ The window under the headline is a recording of the real app, not a mock: `asset
 
 ## The fire
 
-`ember.js` runs every `.glyph-ember` on the page: the hero's, rising from under the window (`data-occlude=".hero-clip"` skips the cells it hides), and a quieter one under the closing call (`data-intensity`, `data-fade-bottom`). Each pauses offscreen and in hidden tabs and draws one still frame under reduced motion. The rest of the page borrows its palette for accents: iris `#7d6db6`, rose `#b77fa8`, coral `#dc9387`, peach `#f6cdb2`.
+`ember.js` runs every `.glyph-ember` on the page: the hero's, rising from under the window (`data-occlude=".hero-clip"` skips the cells it hides), a smaller, dimmer one under each feature window (`data-occlude="+"`, `data-fps`, `data-fade-sides`), and a quieter one under the closing call (`data-intensity`, `data-fade-bottom`). Each pauses offscreen and in hidden tabs and draws one still frame under reduced motion. The rest of the page borrows its palette for accents: iris `#7d6db6`, rose `#b77fa8`, coral `#dc9387`, peach `#f6cdb2`.
 
 ## Feature coverage
 

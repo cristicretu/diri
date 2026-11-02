@@ -7,7 +7,10 @@
 // - the top fade is per-row alpha, not a CSS mask (which would force an offscreen pass per frame).
 // Paused offscreen and in hidden tabs; one still frame under reduced motion.
 // Every .glyph-ember on the page is its own fire. Options, as data attributes on it:
-//   data-occlude="<selector>"  an opaque element in front: cells fully behind it are not drawn;
+//   data-occlude="<selector>"  an opaque element in front: cells fully behind it are not drawn
+//                              ("+" means the element right after the fire);
+//   data-fps="20"              frame rate (default 30), lower for the smaller, quieter fires;
+//   data-fade-sides="0.18"     fade the left and right edges over this fraction of the width;
 //   data-intensity="0.6"       overall exposure, for fires that sit behind text;
 //   data-fade-bottom="0.45"    how much of the height the bed fades over (default 0.22), for an exposed bed.
 {
@@ -18,7 +21,7 @@ const STOPS = [
   [0.00, [125, 109, 182]], [0.22, [150, 128, 205]], [0.42, [183, 127, 168]],
   [0.60, [220, 147, 135]], [0.80, [246, 205, 178]], [1.00, [255, 246, 238]],
 ];
-const BUCKETS = 12, MIN_HEAT = 0.07, FPS = 30;
+const BUCKETS = 12, MIN_HEAT = 0.07;
 const colorAt = h => {
   let j = 0; while (j < STOPS.length - 2 && h > STOPS[j + 1][0]) j++;
   const [h0, c0] = STOPS[j], [h1, c1] = STOPS[j + 1];
@@ -36,10 +39,12 @@ const mount = root => {
   const ctx = canvas?.getContext('2d', { alpha: true }), haze = hazeCanvas?.getContext('2d', { alpha: true });
   if (!ctx || !haze) return;
   const intensity = Math.min(1, Math.max(0, parseFloat(root.dataset.intensity ?? '1')));
+  const FPS = Math.min(60, Math.max(8, parseFloat(root.dataset.fps ?? '30')));
+  const fadeSides = Math.min(0.5, Math.max(0, parseFloat(root.dataset.fadeSides ?? '0')));
   const fadeBottom = Math.min(0.8, Math.max(0.05, parseFloat(root.dataset.fadeBottom ?? '0.22')));
   let cols = 0, rows = 0, cw = 0, ch = 0, dpr = 1, gw = 0, gh = 0;
   let hx0 = 0, hx1 = -1, hy0 = 0, hy1 = -1;
-  let heat, next, strength, glyph, blurA, blurB, rowAlpha, hazeImage, atlas, sparks = [], t = 0;
+  let colAlpha, heat, next, strength, glyph, blurA, blurB, rowAlpha, hazeImage, atlas, sparks = [], t = 0;
 
   // Rasterize every ramp glyph in every bucket color, plus glowing spark sprites in the last row.
   const buildAtlas = size => {
@@ -60,7 +65,7 @@ const mount = root => {
 
   // Cells fully behind the occluding element (the hero window) are never seen, so they are not drawn:
   // for the hero that is most of the bed and most of the per-frame blits.
-  const hero = root.dataset.occlude ? document.querySelector(root.dataset.occlude) : null;
+  const hero = root.dataset.occlude === '+' ? root.nextElementSibling : root.dataset.occlude ? document.querySelector(root.dataset.occlude) : null;
   const occlude = () => {
     hx1 = hy1 = -1;
     if (!hero || !cols) return;
@@ -91,6 +96,7 @@ const mount = root => {
       const f = (y + 0.5) / rows;
       return ease(f / 0.6) ** 1.5 * ease((1 - f) / fadeBottom) ** 1.3;
     });
+    colAlpha = Float32Array.from({ length: cols }, (_, x) => fadeSides ? ease(Math.min(x + 0.5, cols - x - 0.5) / (cols * fadeSides)) : 1);
     hazeCanvas.width = cols; hazeCanvas.height = rows;
     hazeImage = haze.createImageData(cols, rows);
     buildAtlas(size);
@@ -154,7 +160,7 @@ const mount = root => {
       for (let x = 0; x < cols; x++) {
         const i = y * cols + x, h = Math.min(1, blurB[i]), o = i * 4, rgb = hazeLut[(h * 255) | 0];
         px[o] = rgb[0]; px[o + 1] = rgb[1]; px[o + 2] = rgb[2];
-        px[o + 3] = h < 0.05 ? 0 : Math.min(150, h * h * 190) * fade * intensity;
+        px[o + 3] = h < 0.05 ? 0 : Math.min(150, h * h * 190) * fade * intensity * colAlpha[x];
       }
     }
     haze.putImageData(hazeImage, 0, 0);
@@ -173,7 +179,8 @@ const mount = root => {
       for (let x = 0; x < cols; x++) {
         if (hidden && x === hx0) { x = hx1; continue; }
         const i = y * cols + x, h = heat[i];
-        if (h < MIN_HEAT) continue;
+        if (h < MIN_HEAT || colAlpha[x] < 0.02) continue;
+        if (fadeSides) ctx.globalAlpha = fade * colAlpha[x];
         // Dense glyphs where it's hot; a little per-cell jitter keeps neighbours from repeating.
         const k = Math.min(n, Math.max(1, Math.round(h * n * 0.92 + (glyph[i] / 255 - 0.5) * 9)));
         const b = Math.min(BUCKETS - 1, (h * BUCKETS) | 0);

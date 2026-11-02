@@ -1151,3 +1151,9 @@ cSystemFont, sans-serif; font-size: 20px; line-height: 1.5; font-weight: 500; le
   .closing h2 { font-size: 28px; }
   .closing-ember { --ember-h: 300px; }
 }
+
+/* Each feature window rests on its own smaller, dimmer fire, like the hero's: same palette, fading at the sides. */
+.clip-stage { position: relative; }
+.clip-ember { --ember-h: 300px; width: calc(100% + 240px); }
+@media (max-width: 600px) { .clip-ember { --ember-h: 200px; width: 100vw; } }
+.feature-detail .clip-ember { --ember-h: 210px; }
