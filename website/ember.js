@@ -33,7 +33,7 @@ if (ctx && haze) {
   const reduced = matchMedia('(prefers-reduced-motion: reduce)');
   let cols = 0, rows = 0, cw = 0, ch = 0, dpr = 1, gw = 0, gh = 0;
   let hx0 = 0, hx1 = -1, hy0 = 0, hy1 = -1;
-  let fuel, heat, next, strength, glyph, blurA, blurB, rowAlpha, hazeImage, atlas, sparks = [], t = 0;
+  let heat, next, strength, glyph, blurA, blurB, rowAlpha, hazeImage, atlas, sparks = [], t = 0;
 
   // Rasterize every ramp glyph in every bucket color, plus glowing spark sprites in the last row.
   const buildAtlas = size => {
@@ -61,13 +61,6 @@ if (ctx && haze) {
     const c = canvas.getBoundingClientRect(), h = hero.getBoundingClientRect();
     hx0 = Math.ceil((h.left - c.left) / c.width * cols); hx1 = Math.floor((h.right - c.left) / c.width * cols) - 1;
     hy0 = Math.ceil((h.top - c.top) / c.height * rows); hy1 = Math.floor((h.bottom - c.top) / c.height * rows) - 1;
-    // The fire burns under the window: full fuel across its width, easing to nothing a little past each edge,
-    // so the sides of the page stay dark instead of ending in a hard-cut band.
-    const reach = Math.max(10, cols * 0.2);
-    for (let x = 0; x < cols; x++) {
-      const out = Math.min(1, Math.max(0, hx0 - x + reach * 0.2, x - hx1 + reach * 0.2) / reach);
-      fuel[x] = out >= 1 ? 0 : 1 - out * out * (3 - 2 * out);
-    }
   };
 
   const resize = () => {
@@ -84,14 +77,13 @@ if (ctx && haze) {
     cols = Math.ceil(rect.width / cw); rows = Math.ceil(rect.height / ch);
     const n = cols * rows;
     heat = new Float32Array(n); next = new Float32Array(n); strength = new Float32Array(cols);
-    fuel = new Float32Array(cols).fill(1);
     blurA = new Float32Array(n); blurB = new Float32Array(n);
     glyph = new Uint8Array(n).map(() => Math.random() * 255);
-    // Eased fades: tips dissolve over the top 60%, and the bed softens over the last 10% (it sits behind the window).
+    // Eased fades: tips dissolve over the top 60%, and the bed melts away over the last 22% so it never ends in a line.
     const ease = v => { v = Math.min(1, Math.max(0, v)); return v * v * (3 - 2 * v); };
     rowAlpha = Float32Array.from({ length: rows }, (_, y) => {
       const f = (y + 0.5) / rows;
-      return ease(f / 0.6) ** 1.5 * ease((1 - f) / 0.1);
+      return ease(f / 0.6) ** 1.5 * ease((1 - f) / 0.22) ** 1.3;
     });
     hazeCanvas.width = cols; hazeCanvas.height = rows;
     hazeImage = haze.createImageData(cols, rows);
@@ -109,8 +101,8 @@ if (ctx && haze) {
     t += 1 / FPS;
     const bed = (rows - 1) * cols;
     for (let x = 0; x < cols; x++) {
-      const f = strength[x] = tongue(x) * fuel[x];
-      heat[bed + x] = fuel[x] * Math.min(1, 0.5 + f * 0.6 + Math.random() * 0.12);
+      const f = strength[x] = tongue(x);
+      heat[bed + x] = Math.min(1, 0.5 + f * 0.6 + Math.random() * 0.12);
     }
     const wind = Math.sin(t * 0.4) * 0.6, scale = 40 / rows + 0.4;
     for (let y = 0; y < rows - 1; y++) {
