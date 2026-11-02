@@ -159,6 +159,7 @@
   <link rel="stylesheet" href="style.css">
   <link rel="stylesheet" href="guides.css">
   <script src="app.js" defer></script>
+  <script src="ember.js" defer></script>
   <script type="module" src="downloads.js"></script>
   <script type="module" src="stats.js"></script>
   <noscript><style>.star-count { opacity: 1; }</style></noscript>
@@ -175,8 +176,8 @@
     <main id="main">
       <section class="intro" aria-labelledby="page-title">
         <div class="intro-heading">
-          <h1 id="page-title">Run your coding agents side by side.</h1>
-          <p>diri is a native Mac app for Claude Code, Codex and 20 more agents, locally or over SSH.</p>
+          <h1 id="page-title">Every coding agent. <span>All at once.</span></h1>
+          <p>Claude Code, Codex and 20 more, locally or over SSH.</p>
         </div>
         <div class="intro-actions">
           <a id="download-primary" class="button primary" href="https://github.com/cristicretu/diri/releases/latest"><img class="button-mark" src="/assets/brand/apple.svg" width="15" height="15" alt=""><span class="button-label">Download for macOS</span></a>
@@ -196,6 +197,7 @@
 
 
       <section class="product" aria-label="Diri preview" data-nosnippet>
+        <div class="glyph-ember" data-occlude=".hero-clip" aria-hidden="true"><canvas class="ember-haze"></canvas><canvas class="ember-glyphs"></canvas></div>
         <figure class="hero-clip"><span class="clip-lights" aria-hidden="true"><i></i><i></i><i></i></span><img src="/assets/features/agents.webp" width="1520" height="930" decoding="async" fetchpriority="high" alt="Claude Code starts Codex on a remote host called forge in a split pane beside it, waits for it to fix a flaky test, and reads back its result."></figure>
       </section>
 
@@ -214,9 +216,9 @@
       <section class="features" id="features" aria-labelledby="features-title">
         <h2 id="features-title" class="sr-only">Features</h2>
         <div class="feature-list">
-          <section class="feature feature-detail" aria-labelledby="feature-schedules"><figure class="feature-clip"><span class="clip-lights" style="--clip-pt: 640" aria-hidden="true"><i></i><i></i><i></i></span><img src="/assets/features/schedules.webp" width="640" height="450" loading="lazy" decoding="async" alt="A scheduled Claude Code session, marked with an indigo clock because diri woke the Mac for it, triages new GitHub issues and opens a pull request."></figure><div class="feature-copy"><h3 id="feature-schedules">Scheduled runs that wake your Mac.</h3><p>Every weekday at 7, or once tomorrow. diri wakes your Mac for the run.</p></div></section>
-          <section class="feature feature-detail" aria-labelledby="feature-voice"><figure class="feature-clip"><img src="/assets/features/voice.webp" width="640" height="450" loading="lazy" decoding="async" alt="Claude Code finishes and hands diri a summary to read aloud; dictation listens to the spoken answer, pastes it into the prompt and sends it."></figure><div class="feature-copy"><h3 id="feature-voice">Talk while you do something else.</h3><p>diri reads you each summary. Answer out loud and it goes back to the agent.</p></div></section>
-          <section class="feature feature-wide" aria-labelledby="feature-computer"><figure class="feature-clip"><span class="clip-lights" style="--clip-pt: 1140" aria-hidden="true"><i></i><i></i><i></i></span><img src="/assets/features/computer.webp" width="1140" height="700" loading="lazy" decoding="async" alt="Claude Code splits an onboarding check with Codex and Pi in three tabs. Each opens its own iPhone Simulator: Codex signs in on the SE and finds an overlap, Pi pages through the tour in dark mode, and Claude Code turns on notifications; the overlap is then fixed."></figure><div class="feature-copy"><h3 id="feature-computer">Computer use for every agent.</h3><p>Any agent can use your Mac’s apps in the background. Your cursor stays yours.</p></div></section>
+          <section class="feature feature-detail" aria-labelledby="feature-schedules"><div class="clip-stage"><div class="glyph-ember clip-ember" data-occlude="+" data-intensity="0.55" data-fps="20" data-fade-sides="0.2" data-fade-bottom="0.3" aria-hidden="true"><canvas class="ember-haze"></canvas><canvas class="ember-glyphs"></canvas></div><figure class="feature-clip"><span class="clip-lights" style="--clip-pt: 640" aria-hidden="true"><i></i><i></i><i></i></span><img src="/assets/features/schedules.webp" width="640" height="450" loading="lazy" decoding="async" alt="A scheduled Claude Code session, marked with an indigo clock because diri woke the Mac for it, triages new GitHub issues and opens a pull request."></figure></div><div class="feature-copy"><h3 id="feature-schedules">Scheduled runs that wake your Mac.</h3><p>Every weekday at 7, or once tomorrow. diri wakes your Mac for the run.</p></div></section>
+          <section class="feature feature-detail" aria-labelledby="feature-voice"><div class="clip-stage"><div class="glyph-ember clip-ember" data-occlude="+" data-intensity="0.55" data-fps="20" data-fade-sides="0.2" data-fade-bottom="0.3" aria-hidden="true"><canvas class="ember-haze"></canvas><canvas class="ember-glyphs"></canvas></div><figure class="feature-clip"><img src="/assets/features/voice.webp" width="640" height="450" loading="lazy" decoding="async" alt="Claude Code finishes and hands diri a summary to read aloud; dictation listens to the spoken answer, pastes it into the prompt and sends it."></figure></div><div class="feature-copy"><h3 id="feature-voice">Talk while you do something else.</h3><p>diri reads you each summary. Answer out loud and it goes back to the agent.</p></div></section>
+          <section class="feature feature-wide" aria-labelledby="feature-computer"><div class="clip-stage"><div class="glyph-ember clip-ember" data-occlude="+" data-intensity="0.55" data-fps="20" data-fade-sides="0.2" data-fade-bottom="0.3" aria-hidden="true"><canvas class="ember-haze"></canvas><canvas class="ember-glyphs"></canvas></div><figure class="feature-clip"><span class="clip-lights" style="--clip-pt: 1140" aria-hidden="true"><i></i><i></i><i></i></span><img src="/assets/features/computer.webp" width="1140" height="700" loading="lazy" decoding="async" alt="Claude Code splits an onboarding check with Codex and Pi in three tabs. Each opens its own iPhone Simulator: Codex signs in on the SE and finds an overlap, Pi pages through the tour in dark mode, and Claude Code turns on notifications; the overlap is then fixed."></figure></div><div class="feature-copy"><h3 id="feature-computer">Computer use for every agent.</h3><p>Any agent can use your Mac’s apps in the background. Your cursor stays yours.</p></div></section>
         </div>
         <h3 class="also-title">And everything else</h3>
         <dl class="also">
@@ -243,6 +245,7 @@
         </section>
       </section>
       <section class="closing" aria-labelledby="closing-title">
+        <div class="glyph-ember closing-ember" data-intensity="0.7" data-fade-bottom="0.5" aria-hidden="true"><canvas class="ember-haze"></canvas><canvas class="ember-glyphs"></canvas></div>
         <h2 id="closing-title">Start one agent. <span>Let it run the rest.</span></h2>
         <div class="closing-actions">
           <a class="button primary" href="https://github.com/cristicretu/diri/releases/latest"><img class="button-mark" src="/assets/brand/apple.svg" width="14" height="14" alt=""><span class="button-label">Download for macOS</span></a>
