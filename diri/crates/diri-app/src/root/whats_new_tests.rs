@@ -11,11 +11,23 @@ fn newest() -> &'static str {
     crate::whats_new::RELEASES[0].version
 }
 
+/// The Notes release: three highlights, each with a Try it command.
+const NOTES_RELEASE: &str = "0.9.0";
+
 fn open<'a>(
     cx: &'a mut TestAppContext,
     seen: &str,
 ) -> (Entity<RootView>, &'a mut VisualTestContext) {
-    crate::whats_new::set_current_version_for_test(Some(newest()));
+    open_running(cx, seen, newest())
+}
+
+/// [`open`] in a build running `current`.
+fn open_running<'a>(
+    cx: &'a mut TestAppContext,
+    seen: &str,
+    current: &str,
+) -> (Entity<RootView>, &'a mut VisualTestContext) {
+    crate::whats_new::set_current_version_for_test(Some(current));
     let services = test_services();
     services
         .store
@@ -103,7 +115,7 @@ fn a_seen_release_and_a_new_install_show_nothing(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn try_it_closes_the_sheet_and_runs_the_command(cx: &mut TestAppContext) {
-    let (root, cx) = open(cx, "0.0.1");
+    let (root, cx) = open_running(cx, "0.0.1", NOTES_RELEASE);
     root.update_in(cx, |root, window, cx| root.open_whats_new(window, cx));
     cx.run_until_parked();
     let try_it = cx.debug_bounds("whats-new-try").expect("Try it");
@@ -128,7 +140,7 @@ fn the_command_replays_the_highlights_after_they_were_seen(cx: &mut TestAppConte
 
 #[gpui::test]
 fn a_settings_thumbnail_opens_the_sheet_on_its_highlight(cx: &mut TestAppContext) {
-    let (root, cx) = open(cx, newest());
+    let (root, cx) = open_running(cx, NOTES_RELEASE, NOTES_RELEASE);
     let surfaces = root.read_with(cx, |root, _| root.utility_surfaces.clone().unwrap());
     surfaces.update(cx, |_, cx| {
         cx.emit(crate::surface_shell::UtilitySurfacesEvent::ShowWhatsNew(2))

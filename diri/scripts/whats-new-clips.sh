@@ -29,6 +29,11 @@ mkdir -p "$out"
 for dir in "$frames"/*/; do
   name=$(basename "$dir")
   [[ -f $dir/frames.txt ]] || continue
+  # Gesture clips carry their pointer and keys separately (overlay.txt).
+  if [[ -f $dir/overlay.txt && ! -f $dir/.overlaid ]]; then
+    python3 scripts/whats-new-overlay.py "$dir"
+    touch "$dir/.overlaid"
+  fi
   scaled=$(mktemp -d)
   args=(-loop 0 -min_size)
   while read -r frame hold; do
