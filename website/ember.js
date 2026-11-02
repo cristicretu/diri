@@ -2,10 +2,12 @@
 // (deep iris at the tips, rose and coral in the body, the peach horizon going white-hot at the bed).
 // A Doom-fire heat field on a monospace grid, drawn in a handful of color buckets so each frame is one
 // fillStyle change per bucket. Paused offscreen and in hidden tabs; one still frame under reduced motion.
-const canvas = document.querySelector('.glyph-ember');
+const canvas = document.querySelector('.ember-glyphs');
+const hazeCanvas = document.querySelector('.ember-haze');
 const ctx = canvas?.getContext('2d', { alpha: true });
+const haze = hazeCanvas?.getContext('2d', { alpha: true });
 
-if (ctx) {
+if (ctx && haze) {
   const RAMP = " .'`,:;-~^\"!il|/()[]{}?+<>1tfjrxnuvczJLYXUCOZQ0mwqpdbkhao*#MW&8%B@$";
   const SPARK_GLYPHS = ['+', '*', '·', '+', '.'];
   // Heat → color, sampled from .page-sky: #6e5d96 / #7d6db6 → #b77fa8 → #dc9387 → #f6cdb2 → white-hot.
@@ -14,6 +16,7 @@ if (ctx) {
     [0.60, [220, 147, 135]], [0.80, [246, 205, 178]], [1.00, [255, 246, 238]],
   ];
   const BUCKETS = 14;
+  const hazeRgb = [];
   const lerp = (a, b, t) => a + (b - a) * t;
   const palette = Array.from({ length: BUCKETS }, (_, i) => {
     const h = (i + 0.5) / BUCKETS;
@@ -21,27 +24,19 @@ if (ctx) {
     const [h0, c0] = STOPS[j], [h1, c1] = STOPS[j + 1];
     const t = Math.min(1, Math.max(0, (h - h0) / (h1 - h0)));
     const rgb = c0.map((v, k) => Math.round(lerp(v, c1[k], t)));
+    hazeRgb.push(rgb);
     const alpha = Math.min(1, 0.3 + h * 1.1);
     return `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${alpha.toFixed(3)})`;
   });
 
   const reduced = matchMedia('(prefers-reduced-motion: reduce)');
   let cols = 0, rows = 0, cw = 0, ch = 0, font = '', dpr = 1;
-  let heat, next, glyph, sparks = [], t = 0;
-
-  // Pin the bed just under the hero window's bottom edge, whatever the breakpoint and zoom.
-  const sky = canvas.parentElement, hero = document.querySelector('.hero-clip');
-  const place = () => {
-    if (!hero) return;
-    const skyTop = sky.getBoundingClientRect().top, heroBottom = hero.getBoundingClientRect().bottom;
-    const zoom = parseFloat(getComputedStyle(document.documentElement).zoom) || 1;
-    canvas.style.setProperty('--ember-top', `${(heroBottom - skyTop) / zoom - canvas.offsetHeight * 0.94}px`);
-  };
+  let heat, next, glyph, hazeImage, sparks = [], t = 0;
 
   const resize = () => {
-    place();
     const rect = canvas.getBoundingClientRect();
     if (!rect.width || !rect.height) return false;
+    if (heat && Math.round(rect.width * Math.min(devicePixelRatio || 1, 2)) === canvas.width && Math.round(rect.height * Math.min(devicePixelRatio || 1, 2)) === canvas.height) return false;
     dpr = Math.min(devicePixelRatio || 1, 2);
     canvas.width = Math.round(rect.width * dpr);
     canvas.height = Math.round(rect.height * dpr);
@@ -52,6 +47,8 @@ if (ctx) {
     cols = Math.ceil(rect.width / cw); rows = Math.ceil(rect.height / ch);
     heat = new Float32Array(cols * rows); next = new Float32Array(cols * rows);
     glyph = new Uint8Array(cols * rows).map(() => Math.random() * 255);
+    hazeCanvas.width = cols; hazeCanvas.height = rows;
+    hazeImage = haze.createImageData(cols, rows);
     return true;
   };
 
@@ -93,10 +90,22 @@ if (ctx) {
     sparks = sparks.filter(s => { s.y -= s.vy; s.x += s.vx + Math.sin((s.y + t * 40) * 0.03) * 0.25; s.life -= 0.006 + Math.random() * 0.004; return s.life > 0 && s.y > -ch; });
   };
 
+  // One pixel per cell: color by heat, alpha rising steeply so only the body and bed glow.
+  const drawHaze = () => {
+    const px = hazeImage.data;
+    for (let i = 0; i < heat.length; i++) {
+      const h = heat[i], rgb = hazeRgb[Math.min(BUCKETS - 1, Math.floor(h * BUCKETS))], o = i * 4;
+      px[o] = rgb[0]; px[o + 1] = rgb[1]; px[o + 2] = rgb[2]; px[o + 3] = h < 0.05 ? 0 : Math.min(255, Math.sqrt(h) * h * 330);
+    }
+    haze.putImageData(hazeImage, 0, 0);
+  };
+
   const draw = () => {
+    drawHaze();
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.font = font; ctx.textBaseline = 'top';
+    ctx.globalCompositeOperation = 'lighter';
     const n = RAMP.length - 1;
     for (let b = 0; b < BUCKETS; b++) {
       const lo = b / BUCKETS, hi = (b + 1) / BUCKETS;
@@ -117,7 +126,7 @@ if (ctx) {
       ctx.fillStyle = '#fff3ea';
       ctx.fillText(s.g, s.x, s.y);
     }
-    ctx.globalAlpha = 1; ctx.shadowBlur = 0;
+    ctx.globalAlpha = 1; ctx.shadowBlur = 0; ctx.globalCompositeOperation = 'source-over';
   };
 
   let raf = 0, last = 0, visible = true;
@@ -137,7 +146,6 @@ if (ctx) {
   document.addEventListener('visibilitychange', start);
   reduced.addEventListener?.('change', start);
   let resizeTimer = 0;
-  const sizes = new ResizeObserver(() => { clearTimeout(resizeTimer); resizeTimer = setTimeout(reset, 120); });
-  sizes.observe(canvas); if (hero) sizes.observe(hero);
+  new ResizeObserver(() => { clearTimeout(resizeTimer); resizeTimer = setTimeout(reset, 120); }).observe(canvas);
   reset();
 }
