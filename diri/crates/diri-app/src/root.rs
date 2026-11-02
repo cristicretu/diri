@@ -422,6 +422,14 @@ pub struct RootView {
     /// Hold-⌘ shortcut hints for this window; published while it is key.
     held_hints: crate::held_hints::HeldHints,
     _held_hint_timer: Option<Task<()>>,
+    /// Hold the New Session shortcut for the launch ring; a tap still starts
+    /// the default Agent. See `crate::radial_launcher`.
+    radial: crate::radial_launcher::RadialPress,
+    _radial_timer: Option<Task<()>>,
+    /// Watches the held shortcut for its release while a press is live.
+    _radial_release: Option<Task<()>>,
+    #[cfg(target_os = "macos")]
+    radial_watch: Option<crate::macos::key_release::ReleaseWatch>,
     /// Waits for frames to stop while the performance overlay shows, then
     /// repaints it once as idle. See `crate::perf_overlay`.
     perf_idle_repaint: Option<Task<()>>,
@@ -1161,6 +1169,9 @@ impl RootView {
             if !window.is_window_active() {
                 let effect = this.held_hints.deactivated();
                 this.apply_held_hint_effect(effect, window, cx);
+                let now = crate::held_hints::now(cx);
+                let effect = this.radial.reset(now);
+                this.apply_radial_effect(effect, window, cx);
                 if let Some(surfaces) = &this.session_surfaces {
                     surfaces.update(cx, |s, cx| {
                         s.cancel_overview_pinch(cx);
@@ -1200,6 +1211,33 @@ impl RootView {
                 let effect = this.held_hints.key_down(now);
                 this.apply_held_hint_effect(effect, window, cx);
             });
+        });
+        // The New Session shortcut, before its binding runs: a press is a tap
+        // or a hold for the launch ring, and its key repeats start nothing.
+        let radial_root = cx.weak_entity();
+        let radial_window = window.window_handle();
+        let radial_keys = cx.intercept_keystrokes(move |event, window, cx| {
+            if window.window_handle() != radial_window {
+                return;
+            }
+            let Some(root) = radial_root.upgrade() else {
+                return;
+            };
+            let shortcut =
+                crate::commands::matches_keystroke(CommandId::NewDefaultSession, &event.keystroke);
+            if shortcut {
+                cx.stop_propagation();
+                root.update(cx, |this, cx| this.radial_shortcut_down(window, cx));
+                return;
+            }
+            if event.keystroke.key == "escape" && root.read(cx).radial.active() {
+                cx.stop_propagation();
+                root.update(cx, |this, cx| {
+                    let now = crate::held_hints::now(cx);
+                    let effect = this.radial.cancel(now);
+                    this.apply_radial_effect(effect, window, cx);
+                });
+            }
         });
         let bounds_observer = (!preview).then(|| {
             cx.observe_window_bounds(window, |this, window, cx| {
@@ -1622,8 +1660,14 @@ impl RootView {
             notifier,
             held_hints: crate::held_hints::HeldHints::default(),
             _held_hint_timer: None,
+            radial: crate::radial_launcher::RadialPress::default(),
+            _radial_timer: None,
+            _radial_release: None,
+            #[cfg(target_os = "macos")]
+            radial_watch: None,
             _subscriptions: std::iter::once(activation)
                 .chain(std::iter::once(held_hint_keys))
+                .chain(std::iter::once(radial_keys))
                 .chain(bounds_observer)
                 .chain(appearance_observer)
                 .chain(peek_observer)
@@ -3879,6 +3923,11 @@ impl RootView {
     }
 
     fn on_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.radial.active() && radial_shortcut_key(&event.keystroke.key) {
+            cx.stop_propagation();
+            self.radial_released(window, cx);
+            return;
+        }
         if self
             .session_surfaces
             .as_ref()
@@ -3903,11 +3952,244 @@ impl RootView {
         let now = crate::held_hints::now(cx);
         let effect = self.held_hints.modifiers_changed(event.modifiers, now);
         self.apply_held_hint_effect(effect, window, cx);
+        if self.radial.active() && radial_shortcut_modifiers_released(event.modifiers) {
+            self.radial_released(window, cx);
+        }
         if let Some(surfaces) = &self.session_surfaces {
             surfaces.update(cx, |surfaces, cx| {
                 surfaces.handle_modifiers_changed(event, window, cx);
             });
         }
+    }
+
+    /// The New Session shortcut went down (or repeated).
+    fn radial_shortcut_down(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let now = crate::held_hints::now(cx);
+        let effect = self.radial.shortcut_down(now);
+        if let crate::radial_launcher::PressEffect::Arm(_) = effect {
+            self.watch_radial_release(window, cx);
+        }
+        self.apply_radial_effect(effect, window, cx);
+    }
+
+    fn radial_released(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let now = crate::held_hints::now(cx);
+        let effect = self.radial.released(now);
+        self.apply_radial_effect(effect, window, cx);
+    }
+
+    /// Listens for the shortcut's release. GPUI sees it on its own except
+    /// on macOS, where AppKit swallows key-ups while ⌘ is down.
+    fn watch_radial_release(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            let code = gpui_macos::current_physical_key().map(|(code, _)| code);
+            if let Some((watch, mut releases)) = crate::macos::key_release::watch(code) {
+                self.radial_watch = Some(watch);
+                self._radial_release = Some(cx.spawn_in(window, async move |this, cx| {
+                    while releases.recv().await.is_some() {
+                        let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
+                            this.radial_released(window, cx);
+                        });
+                    }
+                }));
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (window, cx);
+    }
+
+    fn apply_radial_effect(
+        &mut self,
+        effect: crate::radial_launcher::PressEffect,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::radial_launcher::{HOLD_DELAY, PressEffect};
+        match effect {
+            PressEffect::None => return,
+            PressEffect::Arm(generation) => {
+                self._radial_timer = Some(cx.spawn_in(window, async move |this, cx| {
+                    cx.background_executor().timer(HOLD_DELAY).await;
+                    let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
+                        this._radial_timer = None;
+                        if this.radial.hold_elapsed(generation) {
+                            this.open_radial(window, cx);
+                        }
+                    });
+                }));
+                return;
+            }
+            PressEffect::Tap => {
+                self.run_command(CommandId::NewDefaultSession, window, cx);
+            }
+            PressEffect::Launch(item) => self.launch_ring_item(item, window, cx),
+            PressEffect::Closed | PressEffect::Redraw => {}
+        }
+        if !self.radial.active() {
+            self._radial_timer = None;
+            #[cfg(target_os = "macos")]
+            {
+                self.radial_watch = None;
+            }
+            self._radial_release = None;
+        }
+        cx.notify();
+    }
+
+    /// Everything the shortcut could start, laid out around the ring.
+    fn ring_items(&self) -> (Vec<crate::radial_launcher::RingItem>, String) {
+        use crate::radial_launcher::{RingItem, arrange};
+        let mut store = self
+            .window_store
+            .write()
+            .expect("session store lock poisoned");
+        let host = store.default_spawn_host();
+        if store.agent_catalog(host.as_deref()).is_none() {
+            store.request_agent_catalog(host.clone(), false);
+        }
+        let catalog = store.agent_catalog(host.as_deref());
+        let default = crate::agent_catalog::resolved_target_agent(
+            &store.preferences().default_agent,
+            catalog,
+        );
+        let mut agents: Vec<RingItem> = crate::agent_catalog::quick_agent_options(catalog)
+            .into_iter()
+            .filter(|option| !option.kind.is_terminal() && option.kind != AgentKind::NOTE)
+            .map(|option| RingItem {
+                is_default: option.kind == default,
+                kind: option.kind,
+                title: option.display_name,
+            })
+            .collect();
+        if let Some(position) = agents.iter().position(|item| item.is_default) {
+            let lead = agents.remove(position);
+            agents.insert(0, lead);
+        }
+        let extras = vec![
+            RingItem {
+                kind: AgentKind::SHELL,
+                title: t("sidebar.new_agent.terminal").to_owned(),
+                is_default: default.is_terminal(),
+            },
+            RingItem {
+                kind: AgentKind::NOTE,
+                title: t("sidebar.new_agent.note").to_owned(),
+                is_default: false,
+            },
+        ];
+        let directory = store.default_new_agent_directory();
+        let place = directory
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&directory)
+            .to_owned();
+        (arrange(agents, extras), place)
+    }
+
+    fn open_radial(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (items, place) = self.ring_items();
+        let pointer = window.mouse_position();
+        let pointer = window.is_window_hovered().then_some(pointer);
+        let center = crate::radial_launcher::place(pointer, window.viewport_size());
+        let now = crate::held_hints::now(cx);
+        self.radial
+            .open(crate::radial_launcher::Ring::new(center, items, place, now), now);
+        cx.notify();
+    }
+
+    fn launch_ring_item(
+        &mut self,
+        item: crate::radial_launcher::RingItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if item.is_default {
+            self.run_command(CommandId::NewDefaultSession, window, cx);
+        } else if item.kind.is_terminal() {
+            self.run_command(CommandId::NewTerminal, window, cx);
+        } else if item.kind == AgentKind::NOTE {
+            self.run_command(CommandId::NewNote, window, cx);
+        } else if self.spawn(Some(item.kind)) {
+            self.focus_spawned_session(window, cx);
+        }
+    }
+
+    /// The open ring, or the one fading out, over everything in the window.
+    fn radial_overlay(
+        &mut self,
+        colors: SemanticColors,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let now = crate::held_hints::now(cx);
+        if let Some(ring) = self.radial.ring() {
+            let ring = crate::radial_launcher::render_ring(ring, None, None, now, colors, window);
+            return Some(
+                deferred(
+                    div()
+                        .id("radial-launcher")
+                        .debug_selector(|| "radial-launcher".into())
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                            let now = crate::held_hints::now(cx);
+                            if this.radial.pointer_moved(event.position, now) {
+                                if let Some(ring) = this.radial.ring()
+                                    && let Some(index) = ring.hovered
+                                {
+                                    crate::haptics::perform(
+                                        crate::haptics::Haptic::Snap,
+                                        crate::haptics::key("radial-launcher", index),
+                                    );
+                                }
+                                cx.notify();
+                            } else if this.radial.ring().is_some() {
+                                // The pointer tick follows the hand.
+                                cx.notify();
+                            }
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                let now = crate::held_hints::now(cx);
+                                let effect = this.radial.click(event.position, now);
+                                this.apply_radial_effect(effect, window, cx);
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, _, window, cx| {
+                                cx.stop_propagation();
+                                let now = crate::held_hints::now(cx);
+                                let effect = this.radial.cancel(now);
+                                this.apply_radial_effect(effect, window, cx);
+                            }),
+                        )
+                        .child(ring),
+                )
+                .with_priority(3)
+                .into_any_element(),
+            );
+        }
+        let leaving = self.radial.leaving(now)?.clone();
+        let ring = crate::radial_launcher::render_ring(
+            &leaving.ring,
+            leaving.chosen,
+            Some(leaving.since),
+            now,
+            colors,
+            window,
+        );
+        Some(
+            deferred(div().absolute().inset_0().child(ring))
+                .with_priority(3)
+                .into_any_element(),
+        )
     }
 
     /// Carries out what the hold-⌘ state machine asked for: start the one-shot
@@ -6513,6 +6795,9 @@ impl Render for RootView {
         if let Some(panel) = self.notification_panel(window, cx) {
             root = root.child(deferred(panel));
         }
+        if let Some(ring) = self.radial_overlay(colors, window, cx) {
+            root = root.child(ring);
+        }
         if let Some(stack) = self.toast_stack(recovery_notice, colors, (seam, inspector_seam), cx) {
             root = root.child(stack);
         }
@@ -6646,6 +6931,35 @@ fn preview_hint(system_image: &str, label: &str, colors: SemanticColors) -> AnyE
                 .child(label.to_owned()),
         )
         .into_any_element()
+}
+
+/// Whether a key-up is the New Session shortcut's key.
+fn radial_shortcut_key(key: &str) -> bool {
+    shortcut_chords(CommandId::NewDefaultSession)
+        .iter()
+        .any(|chord| chord.key == key)
+}
+
+/// Whether `modifiers` no longer hold any of the New Session shortcut's
+/// chords, so the press is over even if its key-up never arrives.
+fn radial_shortcut_modifiers_released(modifiers: gpui::Modifiers) -> bool {
+    let chords = shortcut_chords(CommandId::NewDefaultSession);
+    !chords.is_empty()
+        && chords.iter().all(|chord| {
+            let wanted = chord.modifiers;
+            (wanted.platform && !modifiers.platform)
+                || (wanted.control && !modifiers.control)
+                || (wanted.alt && !modifiers.alt)
+                || (wanted.shift && !modifiers.shift)
+        })
+}
+
+fn shortcut_chords(id: CommandId) -> Vec<gpui::Keystroke> {
+    crate::commands::command(id)
+        .effective_keystrokes(&crate::commands::active_overrides())
+        .into_iter()
+        .filter_map(|binding| gpui::Keystroke::parse(&binding).ok())
+        .collect()
 }
 
 #[cfg(test)]
@@ -11782,6 +12096,121 @@ mod tests {
         }
     }
 
+    /// The hold-⌘T launch ring over a workbench. `DIRI_RADIAL_SCREENSHOTS=<dir>`
+    /// writes one PNG per state: nothing chosen, a slice chosen, and light.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes launch ring previews to DIRI_RADIAL_SCREENSHOTS"]
+    fn render_radial_launcher_screenshots() {
+        use gpui::{AppContext as _, HeadlessAppContext};
+        let output = std::env::var("DIRI_RADIAL_SCREENSHOTS").expect("DIRI_RADIAL_SCREENSHOTS");
+        std::fs::create_dir_all(&output).unwrap();
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(false);
+        });
+        // (name, light, pointer offset from the centre)
+        type State = (&'static str, bool, Option<(f32, f32)>);
+        let states: [State; 5] = [
+            ("idle-dark", false, None),
+            ("codex-dark", false, Some((70.0, -50.0))),
+            ("terminal-dark", false, Some((0.0, 90.0))),
+            ("claude-light", true, Some((0.0, -80.0))),
+            ("idle-light", true, None),
+        ];
+        for (name, light, pointer) in states {
+            let services = test_services();
+            let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+            {
+                let mut store = services.store.store.write().unwrap();
+                store.hydrate(fixture.list);
+                store.select(fixture.selected_session_id.unwrap());
+                let agents = [
+                    ("claude-code", "Claude Code"),
+                    ("codex", "Codex"),
+                    ("antigravity", "Antigravity"),
+                    ("cursor", "Cursor"),
+                    ("gemini", "Gemini"),
+                    ("opencode", "OpenCode"),
+                ];
+                store.set_agent_catalog(diri_proto::AgentReadinessResult {
+                    host: None,
+                    scanned_at: None,
+                    agents: agents
+                        .iter()
+                        .map(|(id, name)| diri_proto::AgentReadinessItem {
+                            kind: AgentKind::new(*id),
+                            binary: (*id).to_owned(),
+                            path: Some(format!("/usr/local/bin/{id}")),
+                            show_in_quick_create: true,
+                            descriptor: Some(diri_proto::AgentDescriptor {
+                                id: (*id).to_owned(),
+                                display_name: (*name).to_owned(),
+                                first_class: true,
+                                ..diri_proto::AgentDescriptor::default()
+                            }),
+                            ..diri_proto::AgentReadinessItem::default()
+                        })
+                        .collect(),
+                });
+                store
+                    .update_preferences(|prefs| {
+                        prefs.sidebar_visible = true;
+                        prefs.default_agent = AgentKind::CLAUDE_CODE;
+                        prefs.terminal_theme =
+                            if light { "dirijor-light" } else { "dirijor-dark" }.into();
+                        if let Ok(theme) = std::env::var("DIRI_VISUAL_THEME") {
+                            prefs.terminal_theme = theme;
+                        }
+                    })
+                    .unwrap();
+            }
+            let window = cx
+                .open_window(size(px(1100.0), px(720.0)), |window, cx| {
+                    cx.new(|cx| RootView::new(services, false, PreviewScenario::Empty, window, cx))
+                })
+                .unwrap();
+            cx.run_until_parked();
+            cx.update_window(window.into(), |view, window, cx| {
+                view.downcast::<RootView>().unwrap().update(cx, |root, cx| {
+                    let now = crate::held_hints::now(cx);
+                    root.radial.shortcut_down(now);
+                    let (items, place) = root.ring_items();
+                    let center = gpui::point(px(640.0), px(360.0));
+                    root.radial.open(
+                        crate::radial_launcher::Ring::new(center, items, place, now),
+                        now,
+                    );
+                    if let Some((dx, dy)) = pointer {
+                        root.radial
+                            .pointer_moved(gpui::point(center.x + px(dx), center.y + px(dy)), now);
+                    }
+                    window.refresh();
+                });
+            })
+            .unwrap();
+            cx.run_until_parked();
+            // The appear and highlight motion is wall-clock.
+            std::thread::sleep(Duration::from_millis(260));
+            cx.update_window(window.into(), |_, window, _| window.refresh())
+                .unwrap();
+            cx.run_until_parked();
+            cx.capture_screenshot(window.into())
+                .unwrap()
+                .save(std::path::Path::new(&output).join(format!("{name}.png")))
+                .unwrap();
+            cx.update_window(window.into(), |_, window, _| window.remove_window())
+                .unwrap();
+            cx.run_until_parked();
+        }
+    }
+
     /// The window as Windows draws it: no native caption strip, the caption
     /// buttons in the corner of diri's own title row. Rendered on a Mac with
     /// the caption forced on. `DIRI_CAPTION_SCREENSHOTS=<dir>`.
@@ -13738,3 +14167,4 @@ mod tests {
         assert!(!is_quote_target(&exited));
     }
 }
+

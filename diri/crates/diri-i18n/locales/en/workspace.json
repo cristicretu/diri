@@ -212,6 +212,8 @@
   "sidebar.new_agent.manage_agents": "Manage Agents…",
   "sidebar.new_agent.note": "Note",
   "sidebar.new_agent.parent_folder": "Parent folder",
+  "sidebar.new_agent.radial_default": "Default",
+  "sidebar.new_agent.radial_new_in": "New in",
   "sidebar.new_agent.repo": "repo",
   "sidebar.new_agent.repo_missing": "{repo} not on {place} — opens in {folder}",
   "sidebar.new_agent.setup": "Setup…",

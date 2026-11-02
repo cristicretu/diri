@@ -212,6 +212,8 @@
   "sidebar.new_agent.manage_agents": "管理智能体…",
   "sidebar.new_agent.note": "笔记",
   "sidebar.new_agent.parent_folder": "上级文件夹",
+  "sidebar.new_agent.radial_default": "默认",
+  "sidebar.new_agent.radial_new_in": "新建于",
   "sidebar.new_agent.repo": "仓库",
   "sidebar.new_agent.repo_missing": "{place} 上没有 {repo}，将在 {folder} 中打开",
   "sidebar.new_agent.setup": "设置…",
