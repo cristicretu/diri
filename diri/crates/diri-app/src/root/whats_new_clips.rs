@@ -636,6 +636,258 @@ fn record_search(cx: &mut HeadlessAppContext, dir: PathBuf, light: bool) {
     rec.finish();
 }
 
+/// Text grid for the selected pane, cursor after the last line.
+fn text_grid(text: &str) -> diri_term::buffer::GridBuffer {
+    let lines: Vec<_> = text.lines().collect();
+    let width = 100usize;
+    let mut grid = diri_term::buffer::GridBuffer::new(width as u16, 40);
+    grid.cursor = diri_term::buffer::CursorState {
+        col: lines.last().map_or(0, |line| line.chars().count()) as u16,
+        row: lines.len().saturating_sub(1) as u16,
+        visible: true,
+        ..diri_term::buffer::CursorState::default()
+    };
+    for (y, line) in lines.iter().enumerate() {
+        for (x, ch) in line.chars().take(width).enumerate() {
+            grid.cells[y * width + x].scalar = ch as u32;
+        }
+    }
+    grid
+}
+
+/// Hold ⌘T, flick past Codex to Terminal, let go: a new terminal opens.
+///
+/// The recording has no OS cursor or keyboard, so alongside the frames it
+/// writes `overlay.txt` (`<x> <y> <held>` per frame, window points) and
+/// `scripts/whats-new-clips.sh` draws the pointer and the ⌘T keycaps.
+fn record_launch_ring(cx: &mut HeadlessAppContext, dir: PathBuf, light: bool) {
+    use crate::radial_launcher::{PressEffect, Ring};
+    let services = test_services();
+    let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+    let template = fixture.list.sessions[0].clone();
+    let mut claude = template.clone();
+    claude.id = SessionId::new("s_ring_claude");
+    claude.kind = AgentKind::CLAUDE_CODE;
+    claude.title = "Tighten the onboarding copy".into();
+    claude.status = SessionStatus::Idle;
+    claude.parent = None;
+    claude.archived_at = None;
+    claude.pinned = false;
+    claude.needs_input = None;
+    claude.pull_requests = None;
+    let mut list = fixture.list;
+    list.sessions.insert(0, claude);
+    {
+        let mut store = services.store.store.write().unwrap();
+        store.hydrate(list);
+        store.mark_connected_for_test();
+        store.set_agent_catalog(crate::agent_setup::bundled_catalog(&[
+            "claude-code",
+            "codex",
+            "cursor",
+            "gemini",
+            "opencode",
+        ]));
+        store.select(SessionId::new("s_ring_claude"));
+        store
+            .update_preferences(|prefs| {
+                prefs.sidebar_visible = true;
+                prefs.default_agent = AgentKind::CLAUDE_CODE;
+                prefs.terminal_theme = theme(light).into();
+                prefs.window_material = crate::store::WindowMaterial::Opaque;
+            })
+            .unwrap();
+    }
+    let runtime = Arc::clone(&services.store);
+    let window: AnyWindowHandle = cx
+        .open_window(size(px(WINDOW.0), px(WINDOW.1)), |window, cx| {
+            cx.new(|cx| RootView::new(services, false, PreviewScenario::Empty, window, cx))
+        })
+        .unwrap()
+        .into();
+    cx.run_until_parked();
+    for _ in 0..3 {
+        std::thread::sleep(Duration::from_millis(120));
+        cx.update_window(window, |_, window, _| window.refresh()).unwrap();
+        cx.run_until_parked();
+    }
+    let root = |cx: &mut HeadlessAppContext| {
+        cx.update_window(window, |view, _, _| view.downcast::<RootView>().unwrap())
+            .unwrap()
+    };
+    let seed = |cx: &mut HeadlessAppContext, text: &str| {
+        let root = root(cx);
+        let grid = text_grid(text);
+        cx.update(|cx| {
+            let terminal = root.read(cx).terminal.clone().expect("terminal pane");
+            terminal.update(cx, |terminal, cx| {
+                terminal.seed_preview_grid_for_test(grid, cx);
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+    };
+    seed(
+        cx,
+        "\n> tighten the onboarding copy, keep it under 12 words per line\n\n\
+         ⏺ Read(src/onboarding/welcome.md)\n\
+         ⏺ Update(src/onboarding/welcome.md)\n\
+           ⎿ Updated 6 lines\n\n\
+         ⏺ Every line on the welcome screen is now 12 words or fewer. The\n\
+           sign-in step reads \"Sign in to start your first agent\".\n\n\
+         > ",
+    );
+    let start = std::time::Instant::now();
+    let mut elapsed = 0u32;
+    let mut overlay: Vec<(f32, f32, bool)> = Vec::new();
+    let mut pointer = (700.0f32, 300.0f32);
+    let mut held = false;
+    let mut rec = Recorder::new(cx, window, dir.clone());
+    // One frame: freeze the app clock at the clip's own time, capture, log
+    // where the pointer and keys are.
+    let frame = |rec: &mut Recorder, overlay: &mut Vec<(f32, f32, bool)>,
+                     elapsed: &mut u32, pointer: (f32, f32), held: bool, hold: u32| {
+        let now = start + Duration::from_millis(u64::from(*elapsed));
+        rec.cx.update(|cx| crate::held_hints::HeldHintsState::freeze_clock(Some(now), cx));
+        rec.shot(hold);
+        overlay.push((pointer.0, pointer.1, held));
+        *elapsed += hold;
+    };
+    let with_root = |rec: &mut Recorder, f: &mut dyn FnMut(&mut RootView, std::time::Instant)| {
+        rec.cx
+            .update_window(window, |view, _, cx| {
+                view.downcast::<RootView>().unwrap().update(cx, |root, cx| {
+                    let now = crate::held_hints::now(cx);
+                    f(root, now);
+                    cx.notify();
+                });
+            })
+            .unwrap();
+        rec.cx.run_until_parked();
+    };
+    frame(&mut rec, &mut overlay, &mut elapsed, pointer, held, 900);
+    // ⌘T goes down and stays down.
+    held = true;
+    frame(&mut rec, &mut overlay, &mut elapsed, pointer, held, 230);
+    let center = gpui::point(px(pointer.0), px(pointer.1));
+    {
+        let now = start + Duration::from_millis(u64::from(elapsed));
+        rec.cx.update(|cx| crate::held_hints::HeldHintsState::freeze_clock(Some(now), cx));
+    }
+    with_root(&mut rec, &mut |root, now| {
+        root.radial.shortcut_down(now);
+        let (items, place) = root.ring_items();
+        let center = crate::radial_launcher::place(
+            Some(center),
+            size(px(WINDOW.0), px(WINDOW.1)),
+        );
+        root.radial.open(Ring::new(center, items, place, now), now);
+    });
+    let ring_center = rec.cx.update(|cx| {
+        root_entity(window, cx).read(cx).radial.ring().map(|ring| ring.center).unwrap()
+    });
+    pointer = (f32::from(ring_center.x), f32::from(ring_center.y));
+    for _ in 0..6 {
+        frame(&mut rec, &mut overlay, &mut elapsed, pointer, held, 33);
+    }
+    frame(&mut rec, &mut overlay, &mut elapsed, pointer, held, 250);
+    // Glide toward a target, a frame every 33 ms, easing out.
+    let glide = |rec: &mut Recorder,
+                     overlay: &mut Vec<(f32, f32, bool)>,
+                     elapsed: &mut u32,
+                     pointer: &mut (f32, f32),
+                     to: (f32, f32),
+                     steps: u32| {
+        let from = *pointer;
+        for step in 1..=steps {
+            let t = step as f32 / steps as f32;
+            let t = 1.0 - (1.0 - t).powi(3);
+            *pointer = (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t);
+            let now = start + Duration::from_millis(u64::from(*elapsed));
+            let position = gpui::point(px(pointer.0), px(pointer.1));
+            rec.cx
+                .update_window(window, |view, _, cx| {
+                    view.downcast::<RootView>().unwrap().update(cx, |root, cx| {
+                        root.radial.pointer_moved(position, now);
+                        cx.notify();
+                    });
+                })
+                .unwrap();
+            rec.cx.run_until_parked();
+            frame(rec, overlay, elapsed, *pointer, true, 33);
+        }
+    };
+    let (cx0, cy0) = (f32::from(ring_center.x), f32::from(ring_center.y));
+    // Up and right: Codex.
+    glide(&mut rec, &mut overlay, &mut elapsed, &mut pointer, (cx0 + 62.0, cy0 - 70.0), 10);
+    frame(&mut rec, &mut overlay, &mut elapsed, pointer, held, 450);
+    // Round to six o'clock: Terminal.
+    glide(&mut rec, &mut overlay, &mut elapsed, &mut pointer, (cx0 + 70.0, cy0 + 20.0), 6);
+    glide(&mut rec, &mut overlay, &mut elapsed, &mut pointer, (cx0 + 6.0, cy0 + 92.0), 8);
+    frame(&mut rec, &mut overlay, &mut elapsed, pointer, held, 450);
+    // Let go: Terminal starts.
+    held = false;
+    {
+        let now = start + Duration::from_millis(u64::from(elapsed));
+        rec.cx.update(|cx| crate::held_hints::HeldHintsState::freeze_clock(Some(now), cx));
+    }
+    let mut launched = None;
+    with_root(&mut rec, &mut |root, now| {
+        if let PressEffect::Launch(item) = root.radial.released(now) {
+            launched = Some(item);
+        }
+    });
+    assert!(
+        launched.is_some_and(|item| item.kind.is_terminal()),
+        "the flick ends on Terminal"
+    );
+    {
+        let mut shell = template.clone();
+        shell.id = SessionId::new("s_ring_shell");
+        shell.kind = AgentKind::SHELL;
+        shell.title = "dirijor".into();
+        shell.status = SessionStatus::Idle;
+        shell.parent = None;
+        shell.archived_at = None;
+        shell.pinned = false;
+        shell.needs_input = None;
+        shell.pull_requests = None;
+        shell.git_branch = None;
+        runtime.store.write().unwrap().upsert_session(shell);
+    }
+    rec.cx
+        .update_window(window, |view, _, cx| {
+            view.downcast::<RootView>().unwrap().update(cx, |root, cx| {
+                root.window_store
+                    .write()
+                    .expect("window store")
+                    .select(SessionId::new("s_ring_shell"));
+                cx.notify();
+            });
+        })
+        .unwrap();
+    rec.cx.run_until_parked();
+    rec.settle();
+    seed(rec.cx, "\n~/Projects/dirijor main ❯ ");
+    for _ in 0..4 {
+        frame(&mut rec, &mut overlay, &mut elapsed, pointer, held, 33);
+    }
+    frame(&mut rec, &mut overlay, &mut elapsed, pointer, held, 1800);
+    rec.cx.update(|cx| crate::held_hints::HeldHintsState::freeze_clock(None, cx));
+    rec.finish();
+    let lines: String = overlay
+        .iter()
+        .map(|(x, y, held)| format!("{x:.1} {y:.1} {}\n", u8::from(*held)))
+        .collect();
+    std::fs::write(dir.join("overlay.txt"), lines).unwrap();
+}
+
+fn root_entity(window: AnyWindowHandle, cx: &mut App) -> Entity<RootView> {
+    window
+        .update(cx, |view, _, _| view.downcast::<RootView>().unwrap())
+        .unwrap()
+}
+
 #[test]
 #[ignore = "writes What's New clip frames to the DIRI_VISUAL_OUTPUT directory"]
 fn render_whats_new_clips() {
@@ -658,10 +910,11 @@ fn render_whats_new_clips() {
     });
     diri_ui::set_mark_rasterizer(crate::macos::brand_raster::raster_mark);
     type Record = fn(&mut HeadlessAppContext, PathBuf, bool);
-    let clips: [(&str, Record); 3] = [
+    let clips: [(&str, Record); 4] = [
         ("notes", record_notes),
         ("todos", record_todos),
         ("search", record_search),
+        ("launch-ring", record_launch_ring),
     ];
     for (name, record) in clips {
         if only.as_deref().is_some_and(|only| only != name) {
@@ -705,7 +958,10 @@ fn render_whats_new_screenshots() {
                     prefs.sidebar_visible = true;
                     prefs.terminal_theme = theme(light).into();
                     prefs.window_material = crate::store::WindowMaterial::Opaque;
-                    prefs.whats_new_seen_version = "0.0.1".into();
+                    // `DIRI_WHATS_NEW_SEEN=<version>`: the release the user last
+                    // saw, so the sheet holds only what is new to them.
+                    prefs.whats_new_seen_version =
+                        std::env::var("DIRI_WHATS_NEW_SEEN").unwrap_or_else(|_| "0.0.1".into());
                 })
                 .unwrap();
         }
@@ -760,6 +1016,18 @@ fn render_whats_new_screenshots() {
             rec.cx.run_until_parked();
         }
         shot(&mut rec, "sheet-2");
+        rec.cx
+            .update_window(window, |view, window, cx| {
+                let root = view.downcast::<RootView>().unwrap();
+                let sheet = root.read(cx).whats_new.clone().unwrap();
+                sheet.update(cx, |sheet, cx| sheet.go(2, window, cx));
+            })
+            .unwrap();
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(50));
+            rec.cx.run_until_parked();
+        }
+        shot(&mut rec, "sheet-3");
         rec.finish();
     }
     crate::whats_new::set_current_version_for_test(None);

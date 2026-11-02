@@ -212,6 +212,8 @@
   "sidebar.new_agent.manage_agents": "Gestionar agentes…",
   "sidebar.new_agent.note": "Nota",
   "sidebar.new_agent.parent_folder": "Carpeta superior",
+  "sidebar.new_agent.radial_default": "Predeterminado",
+  "sidebar.new_agent.radial_new_in": "Nuevo en",
   "sidebar.new_agent.repo": "repositorio",
   "sidebar.new_agent.repo_missing": "{repo} no está en {place} — se abre en {folder}",
   "sidebar.new_agent.setup": "Configurar…",

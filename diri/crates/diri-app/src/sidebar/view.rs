@@ -5509,9 +5509,13 @@ impl Sidebar {
         // launches, so it is the row most opens are looking for. Terminal is
         // set apart below them; it is the escape hatch, not an Agent.
         let options = lead_with_default(options, &default_kind);
-        let (agents, terminals): (Vec<_>, Vec<_>) = options
-            .into_iter()
-            .partition(|option| option.kind != ProtoAgentKind::SHELL);
+        // Note is not an Agent either: it sits with Terminal under the rule,
+        // the same pair the hold-⌘T ring puts at six o'clock.
+        let (agents, mut terminals): (Vec<_>, Vec<_>) =
+            options.into_iter().partition(|option| {
+                option.kind != ProtoAgentKind::SHELL && option.kind != ProtoAgentKind::NOTE
+            });
+        terminals.sort_by_key(|option| option.kind == ProtoAgentKind::NOTE);
         let mut index = 0;
         for option in agents {
             content = content.child(self.new_agent_option_row(

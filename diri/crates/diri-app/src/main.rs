@@ -81,6 +81,7 @@ mod project_hue;
 pub mod query_editor;
 pub mod quick_open;
 pub mod quote;
+mod radial_launcher;
 mod recovery;
 pub mod review_prompt;
 mod right_panel;

@@ -3,6 +3,7 @@ pub mod browser;
 pub mod dock_menu;
 pub(crate) mod floating_panel;
 pub(crate) mod global_shortcut;
+pub(crate) mod key_release;
 pub(crate) mod shortcut_capture;
 // Tests never touch the real login items; see `schedules_page::login`.
 #[cfg(not(test))]
