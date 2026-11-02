@@ -1157,3 +1157,7 @@ cSystemFont, sans-serif; font-size: 20px; line-height: 1.5; font-weight: 500; le
 .clip-ember { --ember-h: 300px; width: calc(100% + 240px); }
 @media (max-width: 600px) { .clip-ember { --ember-h: 200px; width: 100vw; } }
 .feature-detail .clip-ember { --ember-h: 210px; }
+
+/* The headline reads like the closing call: white claim, the second half in ember coral; the detail line warms toward peach. */
+.intro-heading h1 span { display: block; color: #dc9387; }
+.intro-heading p { color: #b8a7ad; }
