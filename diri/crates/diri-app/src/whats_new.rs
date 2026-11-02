@@ -67,6 +67,18 @@ macro_rules! clip {
     };
 }
 
+/// A clip recorded in the dark theme only (the diri.sh feature clips), shown
+/// in both appearances. One copy in the binary.
+macro_rules! dark_clip {
+    ($name:literal) => {{
+        const BYTES: &[u8] = include_bytes!(concat!("../assets/whats-new/", $name, ".webp"));
+        Clip {
+            dark: BYTES,
+            light: BYTES,
+        }
+    }};
+}
+
 /// Newest first. A release's highlights appear once for anyone updating from
 /// an earlier version; add an entry when a release has something worth a
 /// clip, and record it with `scripts/whats-new-clips.sh`.
@@ -78,6 +90,18 @@ pub(crate) const RELEASES: &[Release] = &[
             title: "Hold ⌘T for anything new",
             summary: "Hold ⌘T and a ring opens under the pointer: flick toward an agent, Terminal or Note and let go. A tap still starts your default agent.",
             clip: clip!("launch-ring"),
+            action: None,
+        },
+        Highlight {
+            title: "Talk with your agent",
+            summary: "When an agent finishes, Diri reads what matters aloud. Answer out loud and end with “send to agent”. Everything stays on this Mac.",
+            clip: dark_clip!("voice"),
+            action: Some(("Read Replies Aloud", CommandId::ToggleReadAloud)),
+        },
+        Highlight {
+            title: "Agents use your Mac, side by side",
+            summary: "Agents open apps in the background, each with its own cursor, and ten can work at once without touching your mouse or keyboard.",
+            clip: dark_clip!("computer"),
             action: None,
         }],
     },

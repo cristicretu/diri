@@ -958,7 +958,10 @@ fn render_whats_new_screenshots() {
                     prefs.sidebar_visible = true;
                     prefs.terminal_theme = theme(light).into();
                     prefs.window_material = crate::store::WindowMaterial::Opaque;
-                    prefs.whats_new_seen_version = "0.0.1".into();
+                    // `DIRI_WHATS_NEW_SEEN=<version>`: the release the user last
+                    // saw, so the sheet holds only what is new to them.
+                    prefs.whats_new_seen_version =
+                        std::env::var("DIRI_WHATS_NEW_SEEN").unwrap_or_else(|_| "0.0.1".into());
                 })
                 .unwrap();
         }
@@ -1013,6 +1016,18 @@ fn render_whats_new_screenshots() {
             rec.cx.run_until_parked();
         }
         shot(&mut rec, "sheet-2");
+        rec.cx
+            .update_window(window, |view, window, cx| {
+                let root = view.downcast::<RootView>().unwrap();
+                let sheet = root.read(cx).whats_new.clone().unwrap();
+                sheet.update(cx, |sheet, cx| sheet.go(2, window, cx));
+            })
+            .unwrap();
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(50));
+            rec.cx.run_until_parked();
+        }
+        shot(&mut rec, "sheet-3");
         rec.finish();
     }
     crate::whats_new::set_current_version_for_test(None);
