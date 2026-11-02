@@ -322,6 +322,14 @@
     "hash": "4c9bc17f79d23e17"
   },
   {
+    "key": "whats-new-0-11-0",
+    "url": "/whats-new/0.11.0/",
+    "eyebrow": "Release · October 30, 2026",
+    "title": "diri 0.11.0",
+    "subtitle": "Scripting, splits you can read, and nothing lost under load",
+    "hash": "3e924f9b439100fe"
+  },
+  {
     "key": "whats-new-0-10-0",
     "url": "/whats-new/0.10.0/",
     "eyebrow": "Release · October 18, 2026",
@@ -341,9 +349,9 @@
     "key": "whats-new",
     "url": "/whats-new/",
     "eyebrow": "What's new",
-    "title": "diri 0.10.0",
-    "subtitle": "Voice, Mac apps, and current model prices",
-    "hash": "41d8af8c30e4c55d"
+    "title": "diri 0.11.0",
+    "subtitle": "Scripting, splits you can read, and nothing lost under load",
+    "hash": "a12d887a6b8a16d3"
   },
   {
     "key": "guides-agent-teams",

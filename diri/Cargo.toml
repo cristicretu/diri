@@ -116,3 +116,12 @@ vte = { path = "vendor/vte" }
 # default; only the compiler-side helpers stay unstripped.
 [profile.release.build-override]
 strip = "none"
+
+# The Remote Helper is a packaged artifact even in debug builds: remote tests
+# bootstrap target/debug/diri-remote through the same 64 MiB artifact gate a
+# release uses. Linux embeds DWARF in the executable (macOS leaves it in the
+# object files), so a cold Linux debug build produced a ~68 MB Helper and
+# every remote e2e test failed with "packaged Helper exceeds 64 MiB". Symbols
+# stay, so backtraces still name functions.
+[profile.dev.package.diri-remote]
+strip = "debuginfo"

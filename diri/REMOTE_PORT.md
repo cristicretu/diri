@@ -624,6 +624,16 @@ SSH stdin/stdout <-> remote Unix socket <-> Holder
 When an SSH channel disconnects, the Bridge exits. If host policy permits
 detached user processes, the Holder and Agent continue independently.
 
+The Holder socket lives under `$XDG_RUNTIME_DIR/diri` when that is set and
+under `${TMPDIR:-/tmp}/diri-remote-<uid>` otherwise, named by a hash of the
+Session ID. sshd does not give every session the same environment, so the
+Engine's fixed attach command checks which root actually holds the Session's
+socket and adjusts `XDG_RUNTIME_DIR` before it execs the Bridge. This works for
+every Helper build, including Holders already running. The Engine's reconnect
+backoff resets only after a Bridge reaches a live Holder. Spawning `ssh` does not
+count as progress, so an unreachable Holder backs off to 30 s and does not
+respawn its Bridge in a tight loop.
+
 Application exit follows explicit lifecycle rules:
 
 - with no active sessions and no other control responsibility, the app asks the

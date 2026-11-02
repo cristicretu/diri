@@ -589,17 +589,15 @@ isolation: isolate;
 @media (max-width: 600px) { .app-sidebar { display: none; } }
 @media (max-width: 600px) { .pane-tool { display: none; } }
 
-/* One sky for the whole hero: dark where the text sits, a warm horizon behind the window, dark again below. */
-.page-sky { position: absolute; z-index: -1; top: 0; left: 0; right: 0; height: 1500px; pointer-events: none; overflow: hidden;
-  background:
-    radial-gradient(48% 30% at 50% 66%, #f6cdb2d9, transparent 72%),
-    radial-gradient(34% 30% at 12% 62%, #dc9387cc, transparent 70%),
-    radial-gradient(34% 30% at 90% 56%, #a8c2e8a6, transparent 66%),
-    radial-gradient(44% 30% at 72% 84%, #7d6db6d0, transparent 70%),
-    radial-gradient(40% 26% at 26% 86%, #b77fa8b0, transparent 70%),
-    linear-gradient(180deg, #191724 0%, #1f1b2e 16%, #3c2f55 30%, #8a6f9a 46%, #c99aa6 60%, #6e5d96 76%, #2a2440 90%, #191724 100%);
-  -webkit-mask-image: linear-gradient(#000 82%, transparent); mask-image: linear-gradient(#000 82%, transparent); }
-.page-sky::before { content: ''; position: absolute; inset: 0; opacity: .2; mix-blend-mode: soft-light; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E"); }
+/* The hero is dark; the only light is the glyph fire rising from under the window. */
+.page-sky { position: absolute; z-index: -1; top: 0; left: 0; right: 0; height: 1500px; pointer-events: none; overflow: hidden; }
+/* Glyph fire rising out of the warm horizon. Anchored in CSS to the hero window's bottom edge (no JS placement, so no load shift): the window hides the white-hot bed and the flames lick up its sides. */
+.product { position: relative; }
+.glyph-ember { --ember-h: min(720px, 62vw); position: absolute; z-index: -1; left: 50%; bottom: 0; width: 100vw; height: var(--ember-h); translate: -50% 0; pointer-events: none;
+  }
+.glyph-ember canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+/* Bloom: ember.js blurs the heat field on its cell grid and draws one pixel per cell; the browser's smooth upscale does the rest. No CSS filters or masks: those re-run over the full canvas every frame. */
+.ember-haze { image-rendering: auto; }
 .desktop-stage { padding: 0; background: none; box-shadow: none; border-radius: 0; overflow: visible; }
 .desktop-stage::before, .desktop-stage::after { content: none; }
 @media (max-width: 850px) { .page-sky { height: 1300px; } }
@@ -690,7 +688,7 @@ isolation: isolate;
 /* Hero actions: one primary download, one quiet door to everything else. No fine print under the fold. */
 .button-mark { width: 15px; height: 15px; margin-top: -2px; filter: brightness(0) saturate(100%) invert(10%) sepia(10%) saturate(800%) hue-rotate(270deg); }
 .download-options { position: relative; }
-x: 5; top: calc(100% + 8px); left: 50%; translate: -50% 0; min-width: 280px; display: flex; flex-direction: column; gap: 2px; padding: 6px; text-align: left; background: #26243af7; border: 1px solid #ffffff1f; border-radius: 12px; box-shadow: 0 20px 50px -12px #0009; font-size: 13px; animation: panel-in 160ms var(--ease) both; }
+.download-menu { position: absolute; z-index: 5; top: calc(100% + 8px); left: 50%; translate: -50% 0; min-width: 280px; display: flex; flex-direction: column; gap: 2px; padding: 6px; text-align: left; background: #26243af7; border: 1px solid #ffffff1f; border-radius: 12px; box-shadow: 0 20px 50px -12px #0009; font-size: 13px; animation: panel-in 160ms var(--ease) both; }
 .download-menu a, .download-upcoming, .download-menu-head { display: flex; align-items: center; gap: 9px; min-height: 34px; padding: 0 10px; border-radius: 7px; color: var(--rp-text); }
 .download-menu-head { justify-content: space-between; color: var(--rp-subtle); border-bottom: 1px solid #ffffff12; border-radius: 0; margin-bottom: 4px; padding-bottom: 2px; }
 .download-menu-head a { min-height: 0; padding: 0; color: var(--rp-iris); }
@@ -1132,3 +1130,39 @@ cSystemFont, sans-serif; font-size: 20px; line-height: 1.5; font-weight: 500; le
   .brew-line code { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
   .brew-copy { flex: none; }
 }
+
+/* The rest of the page carries the hero's fire: ember-lit windows and accents, and the page ends on a second, quieter fire.
+   Palette (from ember.js): iris #7d6db6, rose #b77fa8, coral #dc9387, peach #f6cdb2. */
+.feature-clip { box-shadow: 0 1px 0 #f6cdb214 inset, 0 40px 80px -40px #000, 0 50px 90px -60px #dc938755; }
+.also dt .icon { color: #dc9387; }
+.faq-list details[open] summary .icon { color: #f6cdb2; }
+.faq-list details:first-child { border-top-color: transparent; border-image: linear-gradient(90deg, #dc938740, #7d6db626 55%, #ffffff0f) 1; }
+.site-footer::before { background: linear-gradient(90deg, transparent, #dc938733 30%, #7d6db626 70%, transparent); }
+
+/* Closing: the same call as the hero, centered, with flames rising from under it into the footer line. */
+.closing { position: relative; flex-direction: column; justify-content: flex-start; gap: 22px; margin: 24px 0 0; padding: 32px 0 280px; border-top: 0; text-align: center; }
+.closing h2 { font-size: clamp(30px, 3.4vw, 40px); line-height: 1.1; font-weight: 600; letter-spacing: -.03em; text-wrap: balance; }
+.closing h2 span { display: block; color: #dc9387; }
+.closing .brew-line { margin-top: -6px; }
+.closing .brew-pill { background: #191724; }
+.closing-ember { --ember-h: 480px; }
+@media (max-width: 600px) {
+  .closing { align-items: center; margin-top: 72px; padding: 48px 0 200px; }
+  .closing h2 { font-size: 28px; }
+  .closing-ember { --ember-h: 300px; }
+}
+
+/* Each feature window rests on its own smaller, dimmer fire, like the hero's: same palette, fading at the sides. */
+.clip-stage { position: relative; }
+.clip-ember { --ember-h: 300px; width: calc(100% + 240px); }
+@media (max-width: 600px) { .clip-ember { --ember-h: 200px; width: 100vw; } }
+.feature-detail .clip-ember { --ember-h: 210px; }
+
+/* The headline reads like the closing call: white claim, the second half in ember coral; the detail line warms toward peach. */
+.intro-heading h1 span { display: block; color: #dc9387; }
+.intro-heading p { color: #b8a7ad; }
+
+/* Other platforms: the same dark glass as the windows, warmed by the fire's palette. */
+.download-menu { min-width: 300px; background: #1d1a29f5; border-color: #f6cdb21f; box-shadow: 0 1px 0 #f6cdb214 inset, 0 24px 60px -16px #000c, 0 30px 70px -40px #dc938740; -webkit-backdrop-filter: blur(18px); backdrop-filter: blur(18px); }
+.download-menu-head a { color: #dc9387; }
+.download-menu a:not(.download-menu-head a) { color: #e9e4f2; }

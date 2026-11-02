@@ -901,6 +901,10 @@ impl ResidentTerminal {
         }
         let returned = self.element.scroll_to_live(usize::from(self.last_size.1));
         let solid = self.element.note_user_input();
+        self.element.note_power_input(&bytes);
+        if let Some(key) = diri_term::power_mode::PowerKey::from_bytes(&bytes) {
+            crate::power_sounds::note_key(key);
+        }
         self.attachment.input(bytes);
         returned || solid
     }
@@ -1483,7 +1487,10 @@ impl TerminalPane {
             let element = element
                 .font(mono)
                 .focus_handle(self.focus.clone())
-                .on_text_input(move |text| ime_attachment.input(text.as_bytes().to_vec()));
+                .on_text_input(move |text| {
+                    crate::power_sounds::note_key(diri_term::power_mode::PowerKey::Type);
+                    ime_attachment.input(text.as_bytes().to_vec());
+                });
             controller.observe(&element);
             let blank_id = id.clone();
             let blank_check = cx.spawn(async move |this, cx| {
@@ -5255,11 +5262,16 @@ impl TerminalPane {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.reset_qol_session(&session.id);
-        let (hide_pointer, cursor_preferences) = {
+        let (hide_pointer, cursor_preferences, power_mode) = {
             let store = self.runtime.store.read().expect("store");
             let prefs = store.preferences();
-            (prefs.terminal_hide_pointer, prefs.cursor_preferences())
+            (
+                prefs.terminal_hide_pointer,
+                prefs.cursor_preferences(),
+                prefs.terminal_power_mode && !cx.reduce_motion(),
+            )
         };
+        crate::power_sounds::set_enabled(power_mode);
         if self.focus.is_focused(window) {
             cx.set_cursor_hide_mode(if hide_pointer {
                 gpui::CursorHideMode::OnTyping
@@ -5320,6 +5332,7 @@ impl TerminalPane {
             .focus_handle(self.focus.clone())
             .reduce_motion(cx.reduce_motion())
             .cursor_preferences(cursor_preferences)
+            .power_mode(power_mode)
             .hovered_reference(self.qol.hit.clone())
             .padding_extend(grid_surface_padding());
         let element = if self.qol.copy_mode.is_some()

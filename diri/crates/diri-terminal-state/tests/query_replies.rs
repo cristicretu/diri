@@ -79,7 +79,6 @@ fn xtversion_reports_the_terminal_name_and_version() {
 }
 
 #[test]
-#[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
 fn kitty_keyboard_query_answers_and_flags_stack() {
     let mut screen = local();
     assert_eq!(reply(&mut screen, "\x1b[?u"), "\x1b[?0u");
@@ -288,7 +287,6 @@ fn color_scheme_query_and_reports_follow_the_appearance() {
 }
 
 #[test]
-#[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
 fn in_band_resize_reports_on_enable_and_on_every_resize() {
     let (cell_width, cell_height) = DEFAULT_CELL_PIXELS;
     let report = |cols: usize, rows: usize| {
@@ -377,7 +375,6 @@ fn replies_keep_query_order_with_device_attributes_last() {
 }
 
 #[test]
-#[cfg_attr(feature = "core-v2-screen", ignore = "reflow lands in step 5")]
 fn a_remote_holder_answers_none_of_the_new_queries() {
     let mut screen = holder();
     for query in [

@@ -23,6 +23,8 @@ use crate::commands::{self, CommandId};
 pub const SELECT_TAB: &str = "select-tab";
 pub const SHOW_SESSION: &str = "show-session";
 pub const SET_THEME: &str = "set-theme";
+/// Answers the window's keymap: `dirijor keymap`.
+pub const LIST_KEYS: &str = "list-keys";
 
 /// How a command is offered to callers outside the window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,14 +150,27 @@ pub fn catalog() -> Vec<AppActionSpec> {
             risk: ActionRisk::Safe,
             shortcut: None,
         },
+        AppActionSpec {
+            name: LIST_KEYS.into(),
+            title: "List Key Bindings".into(),
+            description: "Answer every key binding: its keys, what it runs, and where it came from (default, recorded in Settings, or the script's file:line), with the script's key modes.".into(),
+            category: commands::ShortcutCategory::Application.english_label().into(),
+            args: AppActionSpec::no_args(),
+            risk: ActionRisk::Safe,
+            shortcut: None,
+        },
     ]);
     actions
 }
 
+/// What the app publishes: [`catalog`] plus the script's palette commands
+/// as `script.NAME` actions.
 pub fn publish_params() -> AppActionsPublishParams {
+    let mut actions = catalog();
+    actions.extend(crate::scripting::action_specs());
     AppActionsPublishParams {
         build: env!("CARGO_PKG_VERSION").into(),
-        actions: catalog(),
+        actions,
     }
 }
 
@@ -183,7 +198,8 @@ pub fn title(name: &str) -> Option<String> {
     match name {
         SELECT_TAB | SHOW_SESSION => Some(crate::i18n::t("agent_notice.show_tab").to_owned()),
         SET_THEME => Some(crate::i18n::t("palette.color_theme").to_owned()),
-        _ => None,
+        LIST_KEYS => Some(crate::i18n::t("app_action.list_keys").to_owned()),
+        name => crate::scripting::action_title(name),
     }
 }
 
@@ -198,6 +214,8 @@ pub enum Resolved {
     ArchiveSession(SessionId),
     ShowSession(SessionId),
     SetTheme(String),
+    /// Answer the keymap (`list-keys`).
+    ListKeys,
 }
 
 /// Checks a request against this build's catalog. The Engine already did,
@@ -241,6 +259,7 @@ pub fn resolve(request: &AppPerformRequest) -> Result<Resolved, ControlError> {
             })
         }
         SHOW_SESSION => Resolved::ShowSession(session.expect("required by the schema")),
+        LIST_KEYS => Resolved::ListKeys,
         SET_THEME => Resolved::SetTheme(request.args["theme"].as_str().unwrap_or("").into()),
         name => {
             let id = commands::COMMANDS
@@ -306,8 +325,8 @@ mod tests {
             .iter()
             .filter(|command| exposure(command.id) != Exposure::Hidden)
             .count();
-        // The registry's commands plus the three value-taking actions.
-        assert_eq!(total, exported + 3);
+        // The registry's commands plus the four value-taking actions.
+        assert_eq!(total, exported + 4);
         assert!(total >= 90, "{total} actions");
         for action in &actions {
             assert!(!action.title.is_empty(), "{}", action.name);

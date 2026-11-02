@@ -1,8 +1,9 @@
 # Terminal core v2
 
-Status: design and prototype. The prototype is `diri-terminal-state/src/core_v2`
-behind the off-by-default `core-v2` feature. Neither the Engine nor the Remote
-Helper uses it.
+Status: shipping. Since 0.11.0, stable and nightly builds of the app, the Engine
+and the Remote Helper run on core v2 (`diri-terminal-state/core-v2-screen`, step
+8). The cargo feature stays off by default, so plain `cargo` builds and tests use
+the previous core unless they enable it.
 
 ## Why
 
@@ -246,6 +247,18 @@ Each PR lands on its own, behind the single `core-v2` cargo feature of `diri-ter
      - a random mix of 90 sequence families, run 3,000 times in local runs and 24 times in CI;
      - the adversarial corpus of #927 when present, fed the same reads to both cores.
 3. **Link table and the Unicode gap.** The grapheme arena has landed in the prototype. Add the link table, and close the Unicode gap: history-on Unicode is 0.46× the reference.
+   - Status: closed (#980). Core-only, checked against the golden and cell for cell, history at 4 MiB, cycles per byte, v2 vs the reference:
+
+     | workload | v2 | reference |
+     |---|---:|---:|
+     | Unicode | 4.02 | 4.21 |
+     | ASCII | 6.09 | 6.40 |
+     | CSI | 14.1 | 19.5 |
+
+     - v2 runs are 7 interleaved rounds. Reference runs are 9 runs of `+terminal-stream`, cycles minus the median of the warm empty-file runs, at load 9–13.
+     - The last 1.5% on Unicode came from CJK prose: punctuation every few ideographs sent most 16-character runs to the mixed token path.
+     - History tokens now give two-byte codes to 100 pages through a page table: U+3000..U+33FF, U+4E00..U+9FFF, U+AC00..U+B8FF and U+FF00..U+FFFF, where they had covered U+4E00..U+B1FF.
+     - That gave 6% fewer Unicode instructions, and kitten Unicode keeps 61,872 rows (the current core keeps 53,648).
 4. **Boundary adapter.** Split into three PRs.
    - **4a, the event layer.** Status: done on `core/v2-step4`.
      - Ported: titles and the title stack, OSC 4/10/11/12 colors and their resets, OSC 52 store and load, every reply (DA1, DA2, DSR, DECRQM, XTWINOPS, XTVERSION, XTGETTCAP, DECRQSS), the kitty keyboard stack (swapped with the screens), the cursor style, the bell, and the events modes send.
@@ -262,9 +275,9 @@ Each PR lands on its own, behind the single `core-v2` cargo feature of `diri-ter
        - Damage is the rows with `RowMeta::dirty` plus the cursor rows; it is full when rows moved (a row appended, history cleared, a screen swap). No content sources: moved rows are hashed again.
        - Checkpoint writes convert back to page cells. A packed history page is thawed for the edit and packed again before rows move or history is bounded.
        - Resize to another size panics ("resize needs reflow, step 5"); the tests that resize are ignored with the switch on.
-       - Rows kept at the budget: on repetitive output (numbered log lines) v2 keeps a third to a half of the current core's rows in 4 MiB, because it stores a byte per ASCII cell where the current core LZ-compresses each row. The four depth tests are gated to the current core; step 6 owns that gap.
+       - Rows kept at the budget: see step 6 (v2 now keeps at least the current core's rows).
 5. **Reflow.** Page rewrap plus deferred cold reflow. Run the resize tests, and the #921 narrowing test on both cores.
-   - Status: rewrap done on `core/v2-step5`; deferred cold reflow is not.
+   - Status: rewrap done on `core/v2-step5`, resize at capacity (#902) on `core/v2-step5b`; deferred cold reflow is not.
      - `core_v2/resize.rs` is a port of `Term::resize` and `Grid::resize`. Each screen's rows stream oldest first through the current core's algorithm, as current-core rows, so `Row::shrink`, `is_clear` and `Cell::is_empty` are the vendored functions. The rows are written into new pages of the new size.
      - Packed history is unpacked a page at a time by the read cache, and the new pages pack as they fill. A resize keeps only the screen and a few rows decoded, but it costs O(history): every resize rewrites all of it.
      - What it covers:
@@ -278,19 +291,55 @@ Each PR lands on its own, behind the single `core-v2` cargo feature of `diri-ter
        - The comparison covers cells, cursor, history and origin after every step, and the saved cursors, the other screen, tab stops and the scroll region through probes at the end.
        - Every `HeadlessScreen` resize test runs with `core-v2-screen` on, and so does diri-term's suite.
      - **One deliberate difference.** At one column, the current core never finishes narrowing a wide character: each round pushes another row. v2 leaves the character in the column and wraps its spacer to the next row. The differential tests use at least two columns whenever wide characters are present.
-     - Still gated with the switch on:
-       - `a_raised_history_limit_follows_history_back_down`, with the four depth tests: v2 keeps fewer rows at the budget (step 6).
-       - The cold-paging test (#958).
-       - Moved-row fingerprints (no content sources).
-6. **Cold-page packing and the budget.** Prototyped here: it measures 4.7× and 3.7× the Engine (ASCII and Unicode) at budget, and is deterministic under the split tests.
-   - Remaining: close the 1.5% gap in rows kept against today's Engine.
-   - Then wire packing through the `HeadlessScreen` adapter, and pass the regenerated full-history golden (#921).
+     - The tests step 5 left gated (`a_raised_history_limit_follows_history_back_down` and the four depth tests, the cold-paging test, moved-row fingerprints) run with the switch on since step 6.
+     - **Resize at capacity (#902), on `core/v2-step5b`.** `HeadlessScreen::resize` raises the row limit to `RESIZE_ROW_ALLOWANCE`× the base for the re-wrap and then holds the rows it produced; v2 runs that through the same `Emulator::set_history_limit`. The gap was in `Pages::set_history_limit`: whole pages are trimmed, so the oldest page can hold rows the old limit already hid, and raising the limit brought them back (17 extra rows in `a_column_change_at_capacity_keeps_hard_line_history`, an origin off by one in small layouts). A limit change now pins the floor at the rows history shows, so a raised limit only makes room, as the current core's does. The rewrap stays immediate: with the raised limit in place it keeps every retained line with the current core's row count, cells and origin, so deferring cold reflow is a cost question, not a correctness one. `a_resize_at_capacity_keeps_every_retained_line` and `a_column_change_at_capacity_keeps_hard_line_history` run with the switch on, as do the tests ignored with "reflow lands in step 5" and the cold-paging resize test; `core_v2::tests::a_resize_at_capacity_keeps_history_like_the_current_core` compares narrowing, widening and line changes at capacity (raised limit, held limit, `settle`'s lowering, output after) with the current core on packed and dense pages.
+6. **History parity** (`core/v2-history`). The rule: v2 keeps at least as many history rows as the current core in the same 4 MiB of live bytes.
+   - **LZ under budget pressure.** Sealed pages are packed as tokens. When history passes its budget, the oldest pages not yet considered are compressed with the current core's LZ codec (`grid::compact::lz`), before any page is dropped. An `LzPolicy` compresses every page while pages shrink by a third, and otherwise probes a 1 KiB sample of every 8th page. Text that barely repeats (the kitten ASCII and Unicode captures) therefore costs about 1% more instructions, not a full LZ pass. What is compressed depends only on the sequence of sealed pages, so the history kept is the same for any read split, and with or without paging.
+   - **Packed layout.** A packed page is its row metadata, then the style ids of its style changes as their own stream, then the row tokens, then its style table. A page keeps no table outside its bytes, so a styled page costs what its text and styles compress to. Ids and characters repeat at different rates (a colour per cell, text shifting between rows); kept apart, both repeat, and LZ finds them. A capture coloured cell by cell keeps 119,921 rows on v2 against 106,769 on the current core.
+   - **Cold paging (#958).** Packed pages older than the newest `keep_rows` history rows move to the `ColdStore` (`Pages::page_out`, through `Emulator::page_out_history`). A stored page counts its full length against the budget, reads load it into the one-page cache, a store failure reads as blank rows, and a page is released with its screen.
+   - **Moved-row fingerprints.** `Emulator::moved_line_sources` reports, for each screen line, the line its cells came from when rows only moved by appends. Dirty and new rows report `CONTENT_CHANGED`. `fingerprints_after_scrolling_match_the_cells` now runs on v2 and checks this is exact.
+   - **Golden on v2.** `vt_workloads` with `core-v2-screen` requires at least the golden's rows and compares the newest of them exactly. `core_v2_bench` compares every row v2 keeps, cell for cell.
 7. **Inline images and checkpoints** on v2, with the existing image and checkpoint tests.
+   - Engine-path parity with the current core (#978 and #982). These read paths had cost v2 more than the current core:
+     - Settling a read that changed nothing no longer hashes the cursor rows. Every v2 write marks its row dirty; the cursor rows are reported only after a recolor.
+     - With nothing moved, the dirty scan walks the screen pages' metadata slices, and the moved-line sources are a kept identity.
+     - Image deletes read link targets through `Emulator::each_link_target` instead of converting every screen row.
+   - Result, `vt_workloads` golden-checked, 5 interleaved rounds at load about 9, median MB/s:
+
+     | workload | v2 | current core |
+     |---|---:|---:|
+     | images | 6,181 | 6,089 |
+     | long escape codes | 26,123 | 25,706 |
+
+     Instructions per 100 feeds: images 1.343G vs 1.351G, long escapes 0.522G vs 0.528G.
+   - **Row reads without conversion** (`core/v2-perf`). Settling fingerprinted each damaged row through `Emulator::row`, which on v2 built a `Vec` of current-core cells (24 bytes each, plus an `Arc` for every cluster, link or underline color). On ASCII, fingerprinting took about a third of a 64 KiB feed, and the conversion most of that (`sample`).
+     - Two hooks on `Emulator`, `fingerprint_row` and `wire_row`, have default bodies that read `row()` as before. The current core uses the defaults, so its code is unchanged: the fold moved into `RowHasher`, which `fingerprint_cells` drives over the same slice.
+     - v2 overrides both and reads the page in place. The style word, or the wire cell minus its character, is derived once per run of equal style ids and flag bits. Cells with a link, a cluster or an underline color go through `PageCell`, a borrowed view that reads like the converted cell, into the same fold.
+     - Both results equal the default reading. `page_views_read_as_converted_rows` checks this at every row width, for wire cells and the annotation report, packed history included.
+     - `wire_row` serves `grid_update`, `full_snapshot`, the history exports and scrollback cells. Text, find and link exports still convert rows; they are off the hot path.
+     - `vt_workloads`, golden-checked, 5 interleaved rounds at load 2.5–7, median of per-run medians in MB/s, kitten captures:
+
+       | workload | v2 before | v2 after | current core |
+       |---|---:|---:|---:|
+       | ASCII | 474 | 590 | 167 |
+       | Unicode | 594 | 740 | 195 |
+       | unique Unicode | 74 | 133 | 54 |
+       | CSI | 278 | 288 | 219 |
+       | images | 5,609 | 5,655 | 5,531 |
+       | long escape codes | 26,482 | 27,221 | 26,561 |
+
+       The current core before and after is within noise everywhere (ASCII 169 vs 167, images 5,529 vs 5,531).
+     - Holder→Engine `vtbench`, kitten captures, interleaved runs at load 2–5, median of the runs' medians in MB/s, v2 vs the current core: ASCII 232 vs 162, Unicode 231 vs 195, unique Unicode 137 vs 56, CSI 218 vs 202. Images (226 vs 231) and long escape codes (217 vs 219) are bound by the PTY (drain 216–258), and their ranges overlap across 6 runs each. The Engine process is over 95% idle in both, and `vt_workloads` at 1 KiB reads runs v2 1.3× (images) and 1.6× (long escapes) faster, so what remains is not the parse or the read path.
 7b. **The Engine and the Remote Helper on v2.** Status: done on `core/v2-helper`.
    - With `diri-terminal-state/core-v2-screen` on, the Remote Helper's whole suite passes (`diri-remote`), and so does the Engine's: attach, mirrors, checkpoints and sessions.
    - The one exception is paging idle history out to the cold store (#958), which is step 6.
    - CI's Linux x86_64 job runs both suites with the switch on.
 8. **Switch.** Enable `core-v2` for the Engine and the Remote Helper after a soak on the nightly channel. Holder→Engine vtbench before/after; `PERF.md` gates unchanged or better.
+   - **Nightly, on.** `DIRI_TERMINAL_CORE=v2` makes `scripts/package.sh` and `scripts/build-remote-helpers.sh` build the app, the Engine and the Helper with `diri-terminal-state/core-v2-screen`. `scripts/nightly-macos.sh` sets `v2`.
+   - **Stable, on (0.11.0).** `v2` is now the default of `scripts/package.sh` (which passes its choice to the Helper catalog), `scripts/build-remote-helpers.sh` and `scripts/package-linux.sh`, so `release.sh` and the Nightly workflow's signed Linux packages ship v2. `DIRI_TERMINAL_CORE=v1` remains an explicit override that rebuilds everything on the previous core. The Windows workflow pins `v1` for now: its app is built without the feature and its catalog check expects the plain Build ID.
+   - A v2 Helper gets the Build ID `<source>-core-v2`, so it never shares an install path on a remote host with a previous-core Helper of the same tree. A `v1` rebuild keeps the plain `<source>` Build ID. The Linux package's bundled Helper follows the same rule (`<commit>-core-v2`), and the Nightly Linux package job checks it with `diri-remote probe`.
+   - `nightly.yml`: the unsigned package job builds with `v2` and checks the Helper catalog's Build ID; the Remote Helper matrix also builds and probes a v2 Helper on every target; the `core-v2` job runs `scripts/core-v2-gate.sh`: the golden on both cores, diri-term's screenshots on both (every PNG byte-identical), and the Holder→Engine vtbench with rounds interleaved. vtbench runs are checked against a reference parse; their numbers are reported, not asserted.
+   - **No runtime kill switch.** The core is chosen at compile time (`type Emu`, static dispatch, no per-call branch). Choosing it at run time (`DIRI_CORE=v1`) needs an enum emulator over both cores that implements the `Emulator` trait by `match`, with enum row and cell views. The runtime cost is small (one predictable branch per row or run, no memory), but the binary carries both cores and every suite has to run under both selections; that is about a day of work and doubles CI time for the terminal crates. Falling back is a rebuild with `DIRI_TERMINAL_CORE=v1`, or the previous release.
 9. **Remove** the old grid, compact history and the unused vendored selection/search/vi-mode code.
 
 ## Risks

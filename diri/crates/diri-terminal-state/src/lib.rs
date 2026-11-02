@@ -39,6 +39,7 @@ pub use program_status::{
     QUERY_REPLY as PROGRAM_STATUS_QUERY_REPLY,
 };
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
@@ -76,7 +77,7 @@ const DEFAULT_CURSOR: alacritty_terminal::vte::ansi::CursorStyle =
 
 /// Cell flags whose drawing needs a [`StyleSpan`]: every underline kind but
 /// the plain one, and overline. A plain underline needs one only for a color.
-const SPAN_FLAGS: Flags = Flags::DOUBLE_UNDERLINE
+pub(crate) const SPAN_FLAGS: Flags = Flags::DOUBLE_UNDERLINE
     .union(Flags::UNDERCURL)
     .union(Flags::DOTTED_UNDERLINE)
     .union(Flags::DASHED_UNDERLINE)
@@ -474,7 +475,7 @@ impl Dimensions for Geometry {
 /// its latest value, and replies are bounded by [`MAX_PENDING_EVENTS`] per
 /// parse, a backstop that no program answering its own queries reaches.
 #[derive(Clone)]
-struct Collector(Arc<Mutex<Inbox>>);
+struct Collector(Arc<Mutex<Inbox>>, Arc<AtomicBool>);
 
 #[derive(Default)]
 struct Inbox {
@@ -505,7 +506,10 @@ impl EventListener for Collector {
                     inbox.events.push(event);
                 }
             }
-            // Bells, mouse-cursor, blink and other notices: nothing reads them.
+            // A flag, not a queue: a burst of bells is one ring, and setting
+            // it never takes the inbox lock.
+            Event::Bell => self.1.store(true, Ordering::Relaxed),
+            // Mouse-cursor, blink and other notices: nothing reads them.
             _ => {}
         }
     }
@@ -521,6 +525,9 @@ pub struct HeadlessScreen {
     term: Emu,
     parser: Processor,
     events: Arc<Mutex<Inbox>>,
+    /// Set when a program rings the bell (BEL outside a string); see
+    /// [`HeadlessScreen::take_bell`].
+    bell: Arc<AtomicBool>,
     /// Drained events, kept to reuse the allocation.
     drained_events: Vec<Event>,
     geometry: Geometry,
@@ -652,12 +659,18 @@ impl HeadlessScreen {
             default_cursor_style: DEFAULT_CURSOR,
             ..Config::default()
         };
-        let term = Emu::create(config, &geometry, Collector(Arc::clone(&events)));
+        let bell = Arc::new(AtomicBool::new(false));
+        let term = Emu::create(
+            config,
+            &geometry,
+            Collector(Arc::clone(&events), Arc::clone(&bell)),
+        );
         let mut screen = Self {
             keyboard_enhancements_known: true,
             term,
             parser: Processor::new(),
             events,
+            bell,
             drained_events: Vec::new(),
             geometry,
             title: None,
@@ -950,6 +963,12 @@ impl HeadlessScreen {
     /// program cleared them, the terminal was reset, or the program ended.
     pub fn program_status_removal(&self) -> Option<ProgramRemoval> {
         self.notifications.as_ref()?.program.removal()
+    }
+
+    /// Whether a program rang the bell since the last call. One relaxed
+    /// atomic swap, cheap enough to call after every feed.
+    pub fn take_bell(&self) -> bool {
+        self.bell.swap(false, Ordering::Relaxed)
     }
 
     pub fn take_notifications(&mut self) -> Vec<TerminalNotification> {
@@ -1528,29 +1547,20 @@ impl HeadlessScreen {
             // Links, combining marks, underline colors and decoration flags
             // are the only sources of row metadata. Noting them in the one
             // pass over the cells spares a plain row a second pass.
-            let mut annotated = false;
-            let source = self.term.row(line);
-            let source = source.cells();
             // Two loops rather than a branch per cell: this is the
             // publication hot path, and the common case has no overrides.
-            if let Some(colors) = overrides {
-                for (x, previous) in row.iter_mut().enumerate() {
-                    let source = &source[x];
-                    annotated |= source.has_extra() | source.cell_flags().intersects(SPAN_FLAGS);
-                    let mut cell = wire_cell(source);
+            let annotated = if let Some(colors) = overrides {
+                self.term.wire_row(line, row, |previous, mut cell| {
                     apply_palette(&mut cell, colors);
                     row_changed |= *previous != cell;
                     *previous = cell;
-                }
+                })
             } else {
-                for (x, previous) in row.iter_mut().enumerate() {
-                    let source = &source[x];
-                    annotated |= source.has_extra() | source.cell_flags().intersects(SPAN_FLAGS);
-                    let cell = wire_cell(source);
+                self.term.wire_row(line, row, |previous, cell| {
                     row_changed |= *previous != cell;
                     *previous = cell;
-                }
-            }
+                })
+            };
             let metadata = if annotated {
                 self.row_metadata(line)
             } else {
@@ -1585,9 +1595,22 @@ impl HeadlessScreen {
         }
     }
 
+    /// Whether the screen has rows [`Self::grid_update`] has not handed out
+    /// yet: output since the last update, or a new geometry. While it does,
+    /// a [`Self::full_snapshot`] differs from the diff baseline, and a client
+    /// seeded from it is not repaired by the next diff alone, which skips
+    /// every row that has returned to what the last update sent.
+    #[must_use]
+    pub fn has_unpublished_rows(&self) -> bool {
+        self.last_grid_cols != self.geometry.cols
+            || self.last_grid_rows != self.geometry.rows
+            || self.pending_damage_rows.contains(&true)
+    }
+
     /// A full-screen snapshot that does NOT disturb the diff baseline. Used
     /// to seed a fresh sink (or repair one that fell behind) without breaking
-    /// other sinks' diffs.
+    /// other sinks' diffs. When [`Self::has_unpublished_rows`], the caller
+    /// must make the next publication full.
     pub fn full_snapshot(&self) -> GridUpdate {
         let cols = self.geometry.cols;
         let rows = self.geometry.rows;
@@ -1595,15 +1618,10 @@ impl HeadlessScreen {
         let mut all = Vec::with_capacity(rows);
         for y in 0..rows {
             let line = Line(y as i32);
-            let mut row = Vec::with_capacity(cols);
-            let source = self.term.row(line);
-            let source = source.cells();
-            let mut annotated = false;
-            for x in 0..cols {
-                let source = &source[x];
-                annotated |= source.has_extra() | source.cell_flags().intersects(SPAN_FLAGS);
-                row.push(wire_cell(source));
-            }
+            let mut row = vec![GridCell::BLANK; cols];
+            let annotated = self
+                .term
+                .wire_row(line, &mut row, |slot, cell| *slot = cell);
             if let Some(colors) = overrides {
                 row.iter_mut().for_each(|cell| apply_palette(cell, colors));
             }
@@ -1646,12 +1664,9 @@ impl HeadlessScreen {
         let mut rows = Vec::with_capacity(exported);
         for index in 0..exported {
             let line = Line(index as i32 - exported as i32);
-            let mut row = Vec::with_capacity(cols);
-            let source = self.term.row(line);
-            let source = source.cells();
-            for cell in &source[..cols] {
-                row.push(wire_cell(cell));
-            }
+            let mut row = vec![GridCell::BLANK; cols];
+            self.term
+                .wire_row(line, &mut row, |slot, cell| *slot = cell);
             rows.push(row);
             self.finish_history_read_batch(index + 1, index + 1 == exported);
         }
@@ -1678,9 +1693,9 @@ impl HeadlessScreen {
         for index in 0..history {
             let line = Line(index as i32 - history as i32);
             row.clear();
-            let source = self.term.row(line);
-            let source = source.cells();
-            row.extend((0..cols).map(|x| wire_cell(&source[x])));
+            row.resize(cols, GridCell::BLANK);
+            self.term
+                .wire_row(line, &mut row, |slot, cell| *slot = cell);
             // A row is at most the terminal width, far below the codec's
             // u16 cell limit, so encoding cannot fail.
             let _ = diri_proto::grid::GridRowCodec::append_row(&row, &mut payload);
@@ -2088,16 +2103,13 @@ impl HeadlessScreen {
         let overrides = palette_overrides(self.host_replies, &self.term).cloned();
         for index in start..end {
             let line = Line(index as i32 - history as i32);
-            let mut row = Vec::with_capacity(cols);
-            let source = self.term.row(line);
-            let source = source.cells();
-            for cell in &source[..cols] {
-                let mut cell = wire_cell(cell);
+            let mut row = vec![GridCell::BLANK; cols];
+            self.term.wire_row(line, &mut row, |slot, mut cell| {
                 if let Some(colors) = &overrides {
                     apply_palette(&mut cell, colors);
                 }
-                row.push(cell);
-            }
+                *slot = cell;
+            });
             rows.push(row);
             metadata.push(self.row_metadata_with_budget(
                 line,
@@ -2144,9 +2156,10 @@ impl HeadlessScreen {
                 break;
             };
             remaining -= bytes;
-            let source = self.term.row(line);
-            let source = source.cells();
-            rows.push((0..cols).map(|x| wire_cell(&source[x])).collect());
+            let mut row = vec![GridCell::BLANK; cols];
+            self.term
+                .wire_row(line, &mut row, |slot, cell| *slot = cell);
+            rows.push(row);
             metadata.push(annotations);
         }
         if rows.len() < visible {
@@ -2555,7 +2568,8 @@ impl HeadlessScreen {
         #[cfg(test)]
         self.fingerprinted_rows
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        fingerprint_cells(&self.term.row(Line(row as i32)), self.geometry.cols)
+        self.term
+            .fingerprint_row(Line(row as i32), self.geometry.cols)
     }
 
     fn rebuild_content_cache(&mut self) {
@@ -2733,7 +2747,7 @@ fn text_char(c: char) -> char {
     if c < ' ' { ' ' } else { c }
 }
 
-fn wire_cell<C: CellView>(cell: &C) -> GridCell {
+pub(crate) fn wire_cell<C: CellView>(cell: &C) -> GridCell {
     let flags = cell.cell_flags();
     let c = cell.ch();
     let scalar = if flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
@@ -2861,43 +2875,107 @@ fn row_metadata_budgeted<R: RowView>(
 
 /// A row's text fingerprint and filled cells; see
 /// [`HeadlessScreen::fingerprint_row`].
-fn fingerprint_cells<R: RowView>(source: &R, cols: usize) -> (u64, usize) {
+pub(crate) fn fingerprint_cells<R: RowView>(source: &R, cols: usize) -> (u64, usize) {
     let all = source.cells();
     let width = cols.min(all.len());
     // Default cells after the content add only their count, so a short
     // line in a wide row hashes its text, not the blank rest of the row.
     let content = source.content_width().min(width);
-    let cells = &all[..content];
-    let mut state = RowHashState::default();
-    let mut lanes = [
-        0xcbf2_9ce4_8422_2325u64,
-        0x8422_2325_cbf2_9ce4,
-        0x243f_6a88_85a3_08d3,
-        0x1319_8a2e_0370_7344,
-    ];
-    let (chunks, remainder) = cells.as_chunks::<4>();
-    let mut column = 0;
-    for chunk in chunks {
-        let words = [
-            state.word(column, &chunk[0]),
-            state.word(column + 1, &chunk[1]),
-            state.word(column + 2, &chunk[2]),
-            state.word(column + 3, &chunk[3]),
-        ];
-        lanes[0] = fold_mix(lanes[0], words[0]);
-        lanes[1] = fold_mix(lanes[1], words[1]);
-        lanes[2] = fold_mix(lanes[2], words[2]);
-        lanes[3] = fold_mix(lanes[3], words[3]);
-        column += 4;
+    let mut hasher = RowHasher::new();
+    hasher.feed(&all[..content]);
+    hasher.finish(width, content)
+}
+
+/// The fold behind [`fingerprint_cells`], fed a row's content cells in
+/// order. Every slice but the last must hold a multiple of four cells, so
+/// each cell lands in the lane of its column whatever the slicing: an
+/// emulator that reads its cells as views (core v2) feeds them a chunk at
+/// a time and gets the same fingerprint.
+pub(crate) struct RowHasher<L> {
+    state: RowHashState<L>,
+    lanes: [u64; 4],
+    column: usize,
+}
+
+impl<L: LinkView> RowHasher<L> {
+    #[inline(always)]
+    pub(crate) fn new() -> Self {
+        Self {
+            state: RowHashState::default(),
+            lanes: [
+                0xcbf2_9ce4_8422_2325u64,
+                0x8422_2325_cbf2_9ce4,
+                0x243f_6a88_85a3_08d3,
+                0x1319_8a2e_0370_7344,
+            ],
+            column: 0,
+        }
     }
-    for (offset, cell) in remainder.iter().enumerate() {
-        lanes[offset] = fold_mix(lanes[offset], state.word(column + offset, cell));
+
+    #[inline(always)]
+    pub(crate) fn feed<C: CellView<Link = L>>(&mut self, cells: &[C]) {
+        let Self {
+            state,
+            lanes,
+            column,
+        } = self;
+        let (chunks, remainder) = cells.as_chunks::<4>();
+        for chunk in chunks {
+            let words = [
+                state.word(*column, &chunk[0]),
+                state.word(*column + 1, &chunk[1]),
+                state.word(*column + 2, &chunk[2]),
+                state.word(*column + 3, &chunk[3]),
+            ];
+            lanes[0] = fold_mix(lanes[0], words[0]);
+            lanes[1] = fold_mix(lanes[1], words[1]);
+            lanes[2] = fold_mix(lanes[2], words[2]);
+            lanes[3] = fold_mix(lanes[3], words[3]);
+            *column += 4;
+        }
+        for (offset, cell) in remainder.iter().enumerate() {
+            lanes[offset] = fold_mix(lanes[offset], state.word(*column + offset, cell));
+        }
+        *column += remainder.len();
     }
-    let mut digest = fold_mix(state.marks, (width as u64) << 32 | content as u64);
-    for lane in lanes {
-        digest = fold_mix(digest, lane);
+
+    /// Folds the next cell, as [`Self::feed`] does.
+    #[cfg(feature = "core-v2-screen")]
+    #[inline]
+    pub(crate) fn cell<C: CellView<Link = L>>(&mut self, cell: &C) {
+        let word = self.state.word(self.column, cell);
+        let lane = &mut self.lanes[self.column & 3];
+        *lane = fold_mix(*lane, word);
+        self.column += 1;
     }
-    (digest, state.filled)
+
+    /// Folds the next cell as [`Self::cell`] would, for a cell with no
+    /// link, combining marks or underline color whose character is `ch`
+    /// and whose [`style_word`] is `style_hash`.
+    #[cfg(feature = "core-v2-screen")]
+    #[inline(always)]
+    pub(crate) fn plain(&mut self, ch: char, style_hash: u64) {
+        let state = &mut self.state;
+        if state.previous_link.is_some() {
+            state.marks = fold_mix(state.marks, self.column as u64 | 1 << 63);
+            state.previous_link = None;
+        }
+        state.filled += usize::from(ch != ' ' && ch != '\0');
+        let lane = &mut self.lanes[self.column & 3];
+        *lane = fold_mix(*lane, u64::from(ch) ^ style_hash);
+        self.column += 1;
+    }
+
+    /// The fingerprint of a row `width` cells wide whose first `content`
+    /// cells were fed, and its filled cells.
+    #[inline(always)]
+    pub(crate) fn finish(self, width: usize, content: usize) -> (u64, usize) {
+        let mut digest = fold_mix(self.state.marks, (width as u64) << 32 | content as u64);
+        for lane in self.lanes {
+            digest = fold_mix(digest, lane);
+        }
+        (digest, self.state.filled)
+    }
 }
 
 /// The last color index cells are painted with: 0–255, then the default
@@ -3162,7 +3240,7 @@ fn raw_style_key<C: CellView>(cell: &C) -> u128 {
 
 /// Hash of a cell's wire style bits and both wire colors.
 #[inline]
-fn style_word(flags: Flags, fg: Color, bg: Color) -> u64 {
+pub(crate) fn style_word(flags: Flags, fg: Color, bg: Color) -> u64 {
     let colors = u64::from(wire_color(fg).packed()) | u64::from(wire_color(bg).packed()) << 32;
     // The wire collapses underline kinds into one style bit and carries the
     // kind and overline in a span: hash the raw flags that reach the screen.
@@ -3323,7 +3401,30 @@ fn only_csi_escapes(bytes: &[u8]) -> bool {
         let t = word ^ (ONES * u64::from(byte));
         !(((t & LOW).wrapping_add(LOW)) | t | LOW)
     };
-    let mut at = 0;
+    // Plain text has no ESC at all: skip to the first one.
+    let Some(mut at) = memchr::memchr(0x1b, bytes) else {
+        return true;
+    };
+    // Sixteen bytes per step: an ESC whose next byte is not `[`.
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        while at + 17 <= bytes.len() {
+            // SAFETY: NEON is baseline on aarch64; `at + 17 <= len` bounds
+            // both 16-byte loads.
+            let bad = unsafe {
+                let here = vld1q_u8(bytes.as_ptr().add(at));
+                let next = vld1q_u8(bytes.as_ptr().add(at + 1));
+                let esc = vceqq_u8(here, vdupq_n_u8(0x1b));
+                let csi = vceqq_u8(next, vdupq_n_u8(b'['));
+                vmaxvq_u8(vbicq_u8(esc, csi))
+            };
+            if bad != 0 {
+                return false;
+            }
+            at += 16;
+        }
+    }
     while at + 9 <= bytes.len() {
         let word = u64::from_le_bytes(bytes[at..at + 8].try_into().expect("eight bytes"));
         let next = u64::from_le_bytes(bytes[at + 1..at + 9].try_into().expect("eight bytes"));
@@ -3473,7 +3574,7 @@ mod tests {
             seed ^= seed << 13;
             seed ^= seed >> 7;
             seed ^= seed << 17;
-            let length = (seed % 40) as usize;
+            let length = (seed % 80) as usize;
             let bytes: Vec<u8> = (0..length)
                 .map(|index| b"\x1b\x1b[[]_a\x9b"[(seed >> (index % 56)) as usize % 8])
                 .collect();
@@ -3725,8 +3826,8 @@ mod tests {
     }
 
     #[test]
-    // Reusing moved rows' fingerprints needs the current core's content
-    // sources; core v2 reports none and hashes damaged rows again.
+    // Core v2 reports rows a region scroll moved as changed (it tracks
+    // only rows moved by appends), so it hashes one row more here.
     #[cfg(not(feature = "core-v2-screen"))]
     fn scrolling_fingerprints_only_rows_that_changed() {
         let mut screen = HeadlessScreen::new(40, 10);
@@ -3988,6 +4089,17 @@ mod tests {
         // A repeat of the same value still counts as a report.
         screen.feed(b"\x1b]9;4;1\x07");
         assert_eq!(screen.progress_reports(), reports + 1);
+    }
+
+    #[test]
+    fn a_bell_is_one_flag_and_a_string_terminator_is_not_a_bell() {
+        let mut screen = HeadlessScreen::new(20, 4);
+        assert!(!screen.take_bell());
+        screen.feed(b"\x1b]0;title\x07\x1b]9;4;1;5\x07");
+        assert!(!screen.take_bell(), "BEL ending an OSC is not a ring");
+        screen.feed(b"a\x07b\x07\x07");
+        assert!(screen.take_bell());
+        assert!(!screen.take_bell(), "taken once per burst");
     }
 
     #[test]
@@ -4495,7 +4607,7 @@ mod tests {
     }
 
     /// Line numbers still held anywhere in history or on the screen.
-    #[cfg(all(feature = "compact-history", not(feature = "core-v2-screen")))]
+    #[cfg(feature = "compact-history")]
     fn retained_ids(screen: &mut HeadlessScreen) -> Vec<usize> {
         screen
             .link_source(usize::MAX)
@@ -4511,10 +4623,6 @@ mod tests {
     /// could not bring them back. A reference multiplexer keeps every line.
     #[cfg(feature = "compact-history")]
     #[test]
-    // Core v2 keeps fewer rows of these repetitive lines in the 4 MiB
-    // budget (a byte per ASCII cell; the current core LZ-compresses each
-    // row), so the depth asserted here is the current core's.
-    #[cfg(not(feature = "core-v2-screen"))]
     fn a_resize_at_capacity_keeps_every_retained_line() {
         let lines = HISTORY_ROW_CEILING + 20_000;
         for (width, label) in [(70, "unwrapped"), (120, "wrapped")] {
@@ -4542,11 +4650,6 @@ mod tests {
     /// widening returns the limit to its base.
     #[cfg(feature = "compact-history")]
     #[test]
-    // Core v2 keeps fewer rows of these repetitive lines in the 4 MiB
-    // budget (a byte per ASCII cell; the current core LZ-compresses each
-    // row), so narrowing never re-wraps them past the base limit, which
-    // this asserts first.
-    #[cfg(not(feature = "core-v2-screen"))]
     fn a_raised_history_limit_follows_history_back_down() {
         let burst = HISTORY_ROW_CEILING;
         let mut screen = HeadlessScreen::new(80, 24);
@@ -4586,10 +4689,6 @@ mod tests {
     /// debug builds tests and development apps run).
     #[cfg(feature = "compact-history")]
     #[test]
-    // Core v2 keeps fewer rows of these repetitive lines in the 4 MiB
-    // budget (a byte per ASCII cell; the current core LZ-compresses each
-    // row), so the depth asserted here is the current core's.
-    #[cfg(not(feature = "core-v2-screen"))]
     fn lines_after_narrowing_a_full_history_cost_what_they_did_before() {
         fn per_line(screen: &mut HeadlessScreen, next: &mut usize) -> std::time::Duration {
             let mut batches: Vec<_> = (0..5)
@@ -5052,10 +5151,6 @@ mod tests {
 
     #[cfg(feature = "compact-history")]
     #[test]
-    // Core v2 keeps fewer rows of these repetitive lines in the 4 MiB
-    // budget (a byte per ASCII cell; the current core LZ-compresses each
-    // row), so the depth asserted here is the current core's.
-    #[cfg(not(feature = "core-v2-screen"))]
     fn a_column_change_at_capacity_keeps_hard_line_history() {
         let mut screen = HeadlessScreen::new(80, 24);
         // Past the row ceiling, history recycles its oldest row per line and
@@ -5080,10 +5175,6 @@ mod tests {
 
     #[cfg(feature = "compact-history")]
     #[test]
-    // Core v2 keeps fewer rows of these repetitive lines in the 4 MiB
-    // budget (a byte per ASCII cell; the current core LZ-compresses each
-    // row), so the depth asserted here is the current core's.
-    #[cfg(not(feature = "core-v2-screen"))]
     fn find_and_fetch_work_at_depth() {
         let mut screen = HeadlessScreen::new(80, 24);
         let lines = 100_000;

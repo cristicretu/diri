@@ -10,6 +10,7 @@
 pub(crate) mod backlinks;
 pub(crate) mod chip;
 pub(crate) mod editor_view;
+pub(crate) mod find;
 pub(crate) mod graph;
 #[cfg(test)]
 mod links_tests;

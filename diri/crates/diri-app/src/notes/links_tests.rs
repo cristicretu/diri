@@ -147,7 +147,8 @@ fn the_graph_shows_the_neighbourhood_or_every_note_and_settles(cx: &mut gpui::Te
 }
 
 /// Renders a note's links offscreen (no window on screen):
-/// `DIRI_VISUAL_OUTPUT=<png>`, `DIRI_VISUAL_NOTE_LINKS=backlinks|graph|all|menu|slash`,
+/// `DIRI_VISUAL_OUTPUT=<png>`, `DIRI_VISUAL_NOTE_LINKS=backlinks|graph|all|menu|slash|find`
+/// (`DIRI_VISUAL_NOTE_FIND=<query>` sets what `find` searches for),
 /// `DIRI_VISUAL_DARK=1` for the dark palette.
 #[cfg(target_os = "macos")]
 #[test]
@@ -264,6 +265,15 @@ fn render_note_links_screenshot() {
                     if let Some(editor) = pane.editor_for_test() {
                         editor.update(cx, |view, cx| {
                             view.open_menu_for_screenshot(scene == "slash", window, cx)
+                        });
+                    }
+                }
+                "find" => {
+                    if let Some(editor) = pane.editor_for_test() {
+                        let query = std::env::var("DIRI_VISUAL_NOTE_FIND")
+                            .unwrap_or_else(|_| "launch plan".into());
+                        editor.update(cx, |view, cx| {
+                            view.open_find_for_screenshot(&query, window, cx)
                         });
                     }
                 }

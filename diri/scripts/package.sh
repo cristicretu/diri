@@ -63,6 +63,27 @@ verify_universal() {
 
 cd "${workspace_dir}"
 
+# Releases and nightlies build the app, the Engine and the remote Helper on
+# terminal core v2 (docs/core-v2.md, step 8). DIRI_TERMINAL_CORE=v1 rebuilds
+# them on the previous core; the Helper catalog inherits the same choice.
+terminal_core="${DIRI_TERMINAL_CORE:-v2}"
+case "${terminal_core}" in
+    v1|v2) ;;
+    *) echo "error: DIRI_TERMINAL_CORE must be v1 or v2" >&2; exit 1 ;;
+esac
+
+# Install the pinned toolchain once, here, if rustup has to: the background
+# Helper build and the foreground cargo below would otherwise both auto-install
+# it at once, and the loser fails with "the 'cargo' binary ... is not
+# applicable to the toolchain". This RUSTUP_HOME may not be the one a CI step
+# added targets to, so add the ones this script builds for here (a no-op when
+# they are already installed).
+cargo --version >/dev/null
+if command -v rustup >/dev/null 2>&1; then
+    rustup target add aarch64-apple-darwin x86_64-apple-darwin \
+        aarch64-unknown-linux-musl x86_64-unknown-linux-musl >/dev/null
+fi
+
 # The remote Helper catalog shares nothing with the macOS products, so it builds
 # alongside them in its own target dir (one target dir admits one cargo at a
 # time) and is copied into the bundle once cargo-packager has made it.
@@ -72,6 +93,7 @@ rm -rf "${remote_helpers_stage}"
 mkdir -p "${target_dir}"
 echo "==> Building three-platform Rust remote Helper catalog (in the background)"
 CARGO_TARGET_DIR="${target_dir}/remote-helpers-build" \
+DIRI_TERMINAL_CORE="${terminal_core}" \
 DIRI_SIGN_IDENTITY="${DIRI_SIGN_IDENTITY:-}" \
     "${script_dir}/build-remote-helpers.sh" "${remote_helpers_stage}" \
     > "${remote_helpers_log}" 2>&1 &
@@ -84,8 +106,13 @@ trap 'kill "${remote_helpers_pid}" 2>/dev/null || true' EXIT
 # features across them, which would change the shipped Engine and CLI (serde_json
 # preserve_order, for one) relative to building each alone.
 mac_targets=(--target aarch64-apple-darwin --target x86_64-apple-darwin)
+# Only the packages that depend on diri-terminal-state take the feature.
+core_features=()
+if [[ "${terminal_core}" == "v2" ]]; then
+    core_features=(--features diri-terminal-state/core-v2-screen)
+fi
 echo "==> Building diri (Apple silicon + Intel)"
-cargo build --release --package diri-app --bin diri "${mac_targets[@]}"
+cargo build --release --package diri-app --bin diri ${core_features[@]+"${core_features[@]}"} "${mac_targets[@]}"
 cargo build --release --package dirijor-mcp --bin dirijor --bin dirijor-mcp "${mac_targets[@]}"
 
 echo "==> Creating universal executable"
@@ -143,7 +170,7 @@ cp "${universal_mcp_binary}" "${app_bin_dir}/dirijor-mcp"
 # Helper catalog below is consumed by this executable directly.
 echo "==> Building the authoritative Rust Engine (universal)"
 cargo build --release --package diri-engine --bin dirijord-rs --bin diri-holder \
-    --bin diri-ssh-askpass --bin diri-wake-helper "${mac_targets[@]}"
+    --bin diri-ssh-askpass --bin diri-wake-helper ${core_features[@]+"${core_features[@]}"} "${mac_targets[@]}"
 lipo -create \
     "${target_dir}/aarch64-apple-darwin/release/dirijord-rs" \
     "${target_dir}/x86_64-apple-darwin/release/dirijord-rs" \

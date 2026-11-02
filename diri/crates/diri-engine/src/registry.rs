@@ -1233,6 +1233,15 @@ impl Registry {
         self.sessions.get(id)?.take_clipboard()
     }
 
+    /// The sessions whose program rang the bell since the last call.
+    pub fn take_bells(&self) -> Vec<String> {
+        self.sessions
+            .iter()
+            .filter(|(_, session)| session.take_bell())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     pub fn changed_since(
         &mut self,
         published: &mut HashMap<String, u64>,

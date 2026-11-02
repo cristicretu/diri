@@ -913,7 +913,7 @@ pub(super) const ROOT: Command = Command {
         ),
         cmd(
             "script",
-            "[FILE]",
+            "[FILE] [KEY=VALUE ...]",
             "Run a Lua script against Diri, a line of Lua, or a prompt",
             Complete::Path,
             &[
@@ -926,7 +926,29 @@ pub(super) const ROOT: Command = Command {
                     "SECONDS",
                     "Stop a script that listens after this long",
                 ),
+                flag(
+                    "--check",
+                    "Load the file without calling Diri; exit 1 on an error",
+                ),
+                option("--args", "JSON", "diri.args as a JSON object, or @FILE"),
+                option(
+                    "--session",
+                    "ID",
+                    "diri.session_id (default $DIRIJOR_SESSION_ID)",
+                ),
+                option(
+                    "--allow-exec",
+                    "PROGRAM",
+                    "Let diri.exec run this program without asking",
+                ),
             ],
+        ),
+        cmd(
+            "keymap",
+            "",
+            "Every key binding, what it runs and the file:line that bound it",
+            Complete::Nothing,
+            &[JSON],
         ),
         cmd("help", "[COMMAND]", "Print usage", Complete::Nothing, &[]),
         internal(cmd("hook", "EVENT", "Agent hook", Complete::Nothing, &[])),

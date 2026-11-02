@@ -602,3 +602,10 @@ instead of one `Arc<[u8]>` each, so freeing them (oldest first, by eviction
 or page-out) unmaps whole chunks instead of leaving allocator pages pinned by
 neighbouring rows. The encoder's output buffer is handed back to its scratch
 after the copy. A cloned history starts its own chunk.
+
+## History LZ codec, public for core v2
+
+`grid::compact::lz` is now `pub` (`#[doc(hidden)]`), with `compress_into` and
+`decompress` public, so terminal core v2 compresses its sealed history pages
+with the same codec instead of keeping a second copy (`diri-terminal-state`,
+`core_v2/page.rs`). Visibility only; the codec is unchanged.

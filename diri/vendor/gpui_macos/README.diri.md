@@ -99,7 +99,11 @@ same superview that is an accessibility element and reports itself focused,
 which is how Diri's terminal text area (`diri-app/src/macos/terminal_accessibility.rs`)
 receives VoiceOver's keyboard focus. With no such sibling it calls NSView's
 implementation, so upstream behavior is unchanged. It runs only when an
-accessibility client asks. `diri-app`'s `terminal_accessibility_appkit` test
+accessibility client asks. Only siblings that are accessibility elements are asked
+whether they are focused, and the scan never re-enters itself: AppKit's default
+`AXFocused` asks the window for its focused element, which lands back in this
+method, and without the guard every floating panel opened while an
+accessibility client was active overflowed the stack. `diri-app`'s `terminal_accessibility_appkit` test
 installs this exact method on a plain view and checks the window's focused
 element.
 

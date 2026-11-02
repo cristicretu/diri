@@ -6,7 +6,8 @@
 //! limit rejects it identically until the layout or the sessions change.
 use super::*;
 use diri_proto::workspace::{
-    WORKSPACE_SCHEMA_VERSION, WorkspaceMutation, WorkspaceMutationParams, WorkspaceSnapshot,
+    LayoutNode, WORKSPACE_SCHEMA_VERSION, WorkspaceMutation, WorkspaceMutationParams,
+    WorkspaceSnapshot,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -192,6 +193,26 @@ impl SessionStore {
 
     pub fn workspace_catalog(&self) -> &WorkspaceCatalog {
         &self.workspaces
+    }
+
+    /// The id of the pane that shows `session`, when a tab shows it in one.
+    pub fn pane_of(&self, session: &SessionId) -> Option<String> {
+        fn find(node: &LayoutNode, session: &SessionId) -> Option<String> {
+            match node {
+                LayoutNode::Pane { id, session_id } => {
+                    (session_id == session).then(|| id.0.clone())
+                }
+                LayoutNode::Split { first, second, .. } => {
+                    find(first, session).or_else(|| find(second, session))
+                }
+            }
+        }
+        self.workspaces
+            .snapshot()?
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.tabs)
+            .find_map(|tab| find(&tab.layout, session))
     }
 
     pub(super) fn workspace_request_is_current(&self, generation: u64) -> bool {

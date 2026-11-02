@@ -3,7 +3,8 @@
 //!
 //! - [`Runtime`] is one sandboxed Lua state. It installs the `diri` table:
 //!   `diri.on`, `diri.call`, `diri.action`, `diri.keymap`, `diri.command`,
-//!   `diri.notify`, timers, and one function per Engine method generated
+//!   `diri.notify`, timers, coroutine waits (`diri.sleep`, `diri.wait`),
+//!   granted processes (`diri.exec`), and one function per Engine method generated
 //!   from the method catalog's JSON Schemas ([`api`]).
 //! - A [`Host`] is what the runtime talks to: the Engine socket, plus the
 //!   app's toasts and log when it runs inside Diri, or stdout when it runs
@@ -18,11 +19,12 @@ pub mod api;
 pub mod driver;
 pub mod engine;
 pub mod events;
+pub mod keys;
 mod runtime;
 
 pub use runtime::{
-    Binding, BindingTarget, Command, Host, HostError, Layer, Level, LoadError, Notice, Options,
-    Runtime,
+    Binding, BindingTarget, COMMAND_PREFIX, Command, GrantRequest, Host, HostError, Layer, Level,
+    LoadError, Mode, Notice, Options, Reply, Runtime, Summary, Waker,
 };
 
 /// The file Diri loads at launch, if it exists.

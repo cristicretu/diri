@@ -537,7 +537,14 @@ pub fn spawn_registry_watcher(
             // every pass, all under the registry lock.
             let mut published: HashMap<String, u64> = HashMap::new();
             while !stop.load(Ordering::SeqCst) {
-                let (mut changed, cursor_requests, native_title_requests, completed, relaunches) = {
+                let (
+                    mut changed,
+                    cursor_requests,
+                    native_title_requests,
+                    completed,
+                    relaunches,
+                    bells,
+                ) = {
                     let Ok(mut registry) = registry.lock() else {
                         break;
                     };
@@ -547,8 +554,17 @@ pub fn spawn_registry_watcher(
                         registry.native_title_refresh_requests(),
                         registry.take_completed_publications(),
                         registry.take_relaunch_requests(),
+                        registry.take_bells(),
                     )
                 };
+                // A burst of bells within one tick is one event.
+                for id in bells {
+                    events.publish(
+                        diri_proto::EventName::SESSION_BELL,
+                        json!({"sessionId": id}),
+                        Some(&id),
+                    );
+                }
                 // The control server owns launch specs; it acts on these.
                 for id in relaunches {
                     events.publish(RELAUNCH_REQUESTED, json!({}), Some(&id));

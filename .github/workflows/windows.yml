@@ -54,6 +54,9 @@ jobs:
         env:
           DIRI_REMOTE_TARGETS: ${{ matrix.target }}
           DIRI_REMOTE_BUILD_ID: ${{ github.sha }}
+          # The Windows app is built on the previous terminal core, and its
+          # catalog check expects the plain Build ID; keep its Helpers there.
+          DIRI_TERMINAL_CORE: v1
         run: scripts/build-remote-helpers.sh "$PWD/target/windows-helper"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

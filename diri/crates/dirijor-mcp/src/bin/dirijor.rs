@@ -122,6 +122,7 @@ fn run(arguments: &[String]) -> Result<(), CliError> {
         "do" => api::perform(arguments.get(1..).unwrap_or_default()),
         "api" => api::api(arguments.get(1..).unwrap_or_default()),
         "script" => lua::run(arguments.get(1..).unwrap_or_default()),
+        "keymap" => lua::keymap(arguments.get(1..).unwrap_or_default()),
         "forward" => Err(CliError::failure(
             "companion TCP forwarding is not part of the Rust Engine",
         )),

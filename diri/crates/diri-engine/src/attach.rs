@@ -2412,6 +2412,164 @@ mod tests {
             .unwrap();
     }
 
+    /// Switching to a session seeds the new attach from the screen as it is,
+    /// but later publications diff against what the last attach was sent.
+    /// A screen that changed while nobody was attached (a TUI caught
+    /// mid-repaint, erased and not yet redrawn) and then returned to those
+    /// rows left them blank on the new attach: only the rows that differed
+    /// from the old publication ever arrived, until a resize repainted all.
+    #[cfg(unix)]
+    #[test]
+    fn a_seed_taken_mid_repaint_is_completed_by_the_next_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let (engine, _) =
+            crate::detect::ManifestEngine::load_dir(&crate::detect::bundled_manifest_dir())
+                .unwrap();
+        let engine = Arc::new(engine);
+        let record: diri_proto::SessionRecord = serde_json::from_value(serde_json::json!({
+            "id":"s", "kind":diri_proto::AgentKind::new("generic"), "cwd":temp.path(),
+            "projectID":"p", "title":"fixture", "titleSource":diri_proto::TitleSource::Placeholder,
+            "status":diri_proto::SessionStatus::Idle, "resumability":diri_proto::Resumability::Live,
+            "createdAt":0.0,"updatedAt":0.0,"pinned":false
+        }))
+        .unwrap();
+        let wait_for = |name: &str| format!("while [ ! -f {name} ]; do sleep 0.01; done; ");
+        let script = format!(
+            "printf 'starting'; {}\
+             printf '\\rfirst row\\r\\nsecond row\\r\\nthird row\\r\\nstatus one'; {}\
+             printf '\\033[2J\\033[H'; {}\
+             printf 'first row\\r\\nsecond row\\r\\nthird row\\r\\nstatus two'; read line",
+            wait_for("draw"),
+            wait_for("erase"),
+            wait_for("redraw"),
+        );
+        let mut registry = Registry::new(Arc::clone(&engine), temp.path().join("state.json"));
+        registry
+            .spawn(
+                crate::session::SessionSpec {
+                    id: "s".into(),
+                    pty: crate::pty::PtySpec::new(
+                        vec!["/bin/sh".into(), "-c".into(), script],
+                        temp.path(),
+                    )
+                    .size(40, 6),
+                    manifest_id: "generic".into(),
+                    authority: crate::session::authority_for("generic", &engine),
+                    logs_dir: temp.path().join("logs"),
+                    holder: None,
+                    remote: None,
+                    defer_launch: false,
+                },
+                record,
+            )
+            .unwrap();
+        let registry = Arc::new(Mutex::new(registry));
+        let hub = AttachHub::new();
+        let screen = || registry.lock().unwrap().get("s").unwrap().screen_lines();
+        let settle = |done: &dyn Fn(&[String]) -> bool| {
+            let started = Instant::now();
+            while !done(&screen()) {
+                assert!(started.elapsed() < Duration::from_secs(5), "{:?}", screen());
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        // A pane: the seed, then every grid frame applied to its own rows.
+        let open = || {
+            let (writer, reader) = UnixStream::pair().unwrap();
+            reader
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .unwrap();
+            let hub = hub.clone();
+            let registry = Arc::clone(&registry);
+            let worker = std::thread::spawn(move || {
+                hub.serve(
+                    &registry,
+                    "s",
+                    writer.try_clone().unwrap(),
+                    Vec::new(),
+                    Arc::new(Mutex::new(writer)),
+                );
+            });
+            (reader, FrameCodec::new(), Vec::<String>::new(), worker)
+        };
+        let pump = |reader: &mut UnixStream, codec: &mut FrameCodec, rows: &mut Vec<String>| {
+            let mut bytes = [0; 65536];
+            while let Ok(count) = reader.read(&mut bytes) {
+                if count == 0 {
+                    break;
+                }
+                for frame in codec.feed(&bytes[..count]).unwrap() {
+                    let Some(grid) = frame.grid_payload().unwrap() else {
+                        continue;
+                    };
+                    if grid.is_full_snapshot {
+                        *rows = vec![String::new(); usize::from(grid.rows)];
+                    }
+                    for row in grid.changed_rows {
+                        rows[usize::from(row.y)] = row
+                            .cells
+                            .iter()
+                            .map(|cell| char::from_u32(cell.scalar).unwrap_or(' '))
+                            .collect::<String>()
+                            .trim_end()
+                            .to_owned();
+                    }
+                }
+            }
+        };
+        let trimmed = |lines: Vec<String>| -> Vec<String> {
+            let mut lines: Vec<String> = lines
+                .into_iter()
+                .map(|line| line.trim_end().to_owned())
+                .collect();
+            lines.resize(6, String::new());
+            lines
+        };
+
+        // The session is on screen and its pane has been sent every row.
+        settle(&|lines| lines.iter().any(|line| line.contains("starting")));
+        let (mut first, mut codec, mut rows, worker) = open();
+        pump(&mut first, &mut codec, &mut rows);
+        std::fs::write(temp.path().join("draw"), b"").unwrap();
+        let started = Instant::now();
+        while rows.iter().all(|row| !row.contains("status one")) {
+            assert!(started.elapsed() < Duration::from_secs(5));
+            pump(&mut first, &mut codec, &mut rows);
+        }
+        // Switch away, and the program starts a repaint nobody sees.
+        drop(first);
+        worker.join().unwrap();
+        std::fs::write(temp.path().join("erase"), b"").unwrap();
+        settle(&|lines| lines.iter().all(|line| line.trim().is_empty()));
+
+        // Switch back mid-repaint, then the repaint lands.
+        let (mut second, mut codec, mut rows, worker) = open();
+        pump(&mut second, &mut codec, &mut rows);
+        std::fs::write(temp.path().join("redraw"), b"").unwrap();
+        settle(&|lines| lines.iter().any(|line| line.contains("status two")));
+        let started = Instant::now();
+        loop {
+            pump(&mut second, &mut codec, &mut rows);
+            if rows == trimmed(screen()) {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "the pane must show the Engine's screen after a switch\n\
+                 pane:   {rows:?}\nengine: {:?}",
+                trimmed(screen())
+            );
+        }
+
+        let _ = second.shutdown(std::net::Shutdown::Both);
+        worker.join().unwrap();
+        registry
+            .lock()
+            .unwrap()
+            .remove("s", &temp.path().join("logs"))
+            .unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn partial_writes_keep_exact_frame_boundaries_and_release_retained_bytes() {

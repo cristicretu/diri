@@ -215,7 +215,7 @@ impl RemoteSessionClient {
         ensure_available(&self.writer.lock().expect("remote writer"))?;
         self.inline_images.store(false, Ordering::SeqCst);
         self.query_replies.store(false, Ordering::SeqCst);
-        let mut channel = self.manager.attach(&self.helper)?;
+        let mut channel = self.manager.attach(&self.helper, &self.session_id)?;
         let setup = (|| {
             let mut required_capabilities = REQUIRED_CAPABILITIES.to_vec();
             if self.helper.protocol.minor

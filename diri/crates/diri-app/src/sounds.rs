@@ -192,7 +192,7 @@ fn smoothstep(value: f64) -> f64 {
     value * value * (3.0 - 2.0 * value)
 }
 
-fn wav_container(samples: &[i16]) -> Vec<u8> {
+pub(crate) fn wav_container(samples: &[i16]) -> Vec<u8> {
     let data_size = u32::try_from(samples.len() * 2).expect("status sound fits in a WAV");
     let mut wav = Vec::with_capacity(44 + data_size as usize);
     wav.extend_from_slice(b"RIFF");

@@ -501,6 +501,10 @@ struct Shared {
     /// erase is already in `screen`. The pump publishes when it ends; anyone
     /// else waking clients meanwhile would show them the erased screen.
     awaiting_redraw: AtomicBool,
+    /// A client was seeded from rows the diff baseline does not hold yet.
+    /// The next publication is full, so rows that return to what the last
+    /// publication sent (a repaint the seed caught erased) reach it too.
+    full_publication_due: AtomicBool,
     grid_wake: GridWake,
     /// The manifest this session runs, for telemetry.
     agent: String,
@@ -524,6 +528,9 @@ struct Shared {
     /// The exit status a `returnToLoginShell` wrapper reported for its agent,
     /// which the PTY's own exit never carries: the login shell outlives it.
     agent_exit: Mutex<Option<i32>>,
+    /// A program rang the bell since the Registry watcher last looked. A
+    /// flag, so it never bumps the record or wakes anything by itself.
+    bell: AtomicBool,
     /// The manifest's `relaunchNotice`, for a wrapped agent that declares one.
     relaunch_notice: Option<String>,
     /// The wrapped agent exited asking to be started again; the Registry
@@ -2658,6 +2665,11 @@ impl Session {
             .take_notifications()
     }
 
+    /// Whether a program rang the bell since the last call.
+    pub fn take_bell(&self) -> bool {
+        self.shared.bell.swap(false, Ordering::Relaxed)
+    }
+
     /// The newest OSC 52 clipboard write since the last call, decoded.
     pub fn take_clipboard(&self) -> Option<String> {
         let data = self
@@ -2841,6 +2853,13 @@ impl Session {
             }
             .unwrap_or_else(|| {
                 let screen = self.shared.screen.lock().expect("screen");
+                // Set under the screen lock, so the publication that next
+                // takes it cannot have diffed these rows already.
+                if screen.has_unpublished_rows() {
+                    self.shared
+                        .full_publication_due
+                        .store(true, Ordering::SeqCst);
+                }
                 (
                     screen.full_snapshot(),
                     (
@@ -2971,7 +2990,11 @@ impl Session {
             None
         } else {
             *signature = current;
-            Some(screen.grid_update(false))
+            let full = self
+                .shared
+                .full_publication_due
+                .swap(false, Ordering::SeqCst);
+            Some(screen.grid_update(full))
         };
         drop(screen);
         TerminalPublication {
@@ -3954,6 +3977,7 @@ fn new_shared(
         held_screen_offset: AtomicU64::new(0),
         held_parsed_bytes: AtomicU64::new(0),
         awaiting_redraw: AtomicBool::new(false),
+        full_publication_due: AtomicBool::new(false),
         grid_wake: GridWake::for_agent(&spec.manifest_id),
         agent: spec.manifest_id.clone(),
         launched_at,
@@ -3963,6 +3987,7 @@ fn new_shared(
         remote_stopping: AtomicBool::new(false),
         exit_recorded: AtomicBool::new(false),
         agent_exit: Mutex::new(None),
+        bell: AtomicBool::new(false),
         relaunch_notice: engine
             .manifest(&spec.manifest_id)
             .and_then(|manifest| manifest.agent.as_ref())
@@ -4707,8 +4732,13 @@ fn pump_remote(
     client: Arc<RemoteSessionClient>,
     manifest_id: String,
 ) {
-    let mut reconnect_delay = Duration::from_millis(50);
+    let mut reconnect_delay = REMOTE_RECONNECT_MIN;
     let mut reconnects = 0_u32;
+    // Attempts since a Bridge last reached a live Holder. Spawning `ssh` is
+    // not progress: a Bridge that cannot reach its socket exits before any
+    // Hello, and resetting the delay on every spawn made that a tight loop of
+    // several `ssh` processes a second per Session.
+    let mut unreachable = 0_u32;
     while !shared.stop.load(Ordering::SeqCst) && !shared.exited.load(Ordering::SeqCst) {
         let output_offset = shared.remote_output_offset.load(Ordering::SeqCst);
         let grid_sequence = shared
@@ -4727,14 +4757,14 @@ fn pump_remote(
         else {
             set_remote_reconnecting(&shared);
             reconnects = reconnects.saturating_add(1);
+            unreachable = unreachable.saturating_add(1);
             if reconnects.is_multiple_of(3) && remote_inspection_exited(&shared, &client) {
                 break;
             }
             wait_for_remote_retry(&shared, reconnect_delay);
-            reconnect_delay = (reconnect_delay * 2).min(Duration::from_secs(2));
+            reconnect_delay = next_remote_reconnect_delay(reconnect_delay, unreachable);
             continue;
         };
-        reconnect_delay = Duration::from_millis(50);
         let disposition = pump_remote_connection(
             &shared,
             &engine,
@@ -4760,13 +4790,19 @@ fn pump_remote(
         match settle_during_stop(&shared, disposition) {
             RemoteConnectionDisposition::Continue => continue,
             RemoteConnectionDisposition::Reconnect => {
+                if remote_connected(&shared) {
+                    reconnect_delay = REMOTE_RECONNECT_MIN;
+                    unreachable = 0;
+                } else {
+                    unreachable = unreachable.saturating_add(1);
+                }
                 set_remote_reconnecting(&shared);
                 reconnects = reconnects.saturating_add(1);
                 if reconnects.is_multiple_of(3) && remote_inspection_exited(&shared, &client) {
                     break;
                 }
                 wait_for_remote_retry(&shared, reconnect_delay);
-                reconnect_delay = (reconnect_delay * 2).min(Duration::from_secs(2));
+                reconnect_delay = next_remote_reconnect_delay(reconnect_delay, unreachable);
             }
             RemoteConnectionDisposition::Exited | RemoteConnectionDisposition::Stopped => break,
             RemoteConnectionDisposition::Fatal => {
@@ -5162,7 +5198,6 @@ fn handle_remote_message(
             {
                 RemoteConnectionDisposition::Fatal
             } else {
-                set_remote_connection(shared, diri_proto::RemoteConnectionState::Connected);
                 RemoteConnectionDisposition::Continue
             }
         }
@@ -5174,7 +5209,6 @@ fn handle_remote_message(
                 diri_telemetry::count("remote.delta_gaps", 1);
                 RemoteConnectionDisposition::Reconnect
             } else {
-                set_remote_connection(shared, diri_proto::RemoteConnectionState::Connected);
                 RemoteConnectionDisposition::Continue
             }
         }
@@ -5302,6 +5336,9 @@ fn apply_remote_output(
         if screen.has_notifications() {
             shared.bump_state_version();
         }
+        if screen.take_bell() {
+            shared.bell.store(true, Ordering::Relaxed);
+        }
         // The Holder answers its program's queries from its own emulator;
         // this mirror's would otherwise pile up unread for the session's
         // lifetime. A Holder from before `query-replies-v1` leaves the
@@ -5395,6 +5432,9 @@ fn apply_remote_snapshot(
         remote.revision = remote.revision.saturating_add(1);
         remote.pending = Some(snapshot.grid.clone());
     }
+    // Live before anything shows the seed: a reader that sees this grid must
+    // also see its keyboard state, which is withheld while not Connected.
+    set_remote_connection(shared, diri_proto::RemoteConnectionState::Connected);
     shared.grid_wake.notify();
     restore_remote_status_screen(
         shared,
@@ -5449,6 +5489,7 @@ fn apply_remote_resume(
         };
         full
     };
+    set_remote_connection(shared, diri_proto::RemoteConnectionState::Connected);
     shared.grid_wake.notify();
     // Replayed output was logged, not parsed: seed the status screen from the
     // resumed grid exactly as a snapshot would.
@@ -5621,6 +5662,35 @@ fn mark_remote_transport_failed(shared: &Shared) {
     set_remote_connection(shared, diri_proto::RemoteConnectionState::Failed);
     // The last PID/grid remain observable. Neither transport failure nor an
     // uncertain write supplies an Agent exit code or permission to replay input.
+}
+
+const REMOTE_RECONNECT_MIN: Duration = Duration::from_millis(50);
+/// Ceiling while a Holder answered recently: a dropped link comes back fast.
+const REMOTE_RECONNECT_MAX: Duration = Duration::from_secs(2);
+/// Ceiling once that many attempts in a row never reached the Holder.
+const REMOTE_UNREACHABLE_MAX: Duration = Duration::from_secs(30);
+const REMOTE_UNREACHABLE_ATTEMPTS: u32 = 8;
+
+fn next_remote_reconnect_delay(current: Duration, unreachable: u32) -> Duration {
+    let ceiling = if unreachable >= REMOTE_UNREACHABLE_ATTEMPTS {
+        REMOTE_UNREACHABLE_MAX
+    } else {
+        REMOTE_RECONNECT_MAX
+    };
+    (current * 2).min(ceiling)
+}
+
+/// Whether the current Bridge reached a live Holder: a snapshot or an
+/// accepted resume marks the mirror Connected.
+fn remote_connected(shared: &Shared) -> bool {
+    shared
+        .remote_grid
+        .lock()
+        .expect("remote grid")
+        .as_ref()
+        .is_some_and(|remote| {
+            remote.connection.state == diri_proto::RemoteConnectionState::Connected
+        })
 }
 
 /// A lost Bridge is a reconnect, unless the session already ended or is
@@ -6018,6 +6088,9 @@ fn feed_output_batch(
             screen.feed(&buffer[..count]);
             if screen.has_notifications() {
                 shared.bump_state_version();
+            }
+            if screen.take_bell() {
+                shared.bell.store(true, Ordering::Relaxed);
             }
             if let Some(status) = screen.take_agent_exit() {
                 note_agent_exit(shared, status, &mut screen);
@@ -7242,6 +7315,9 @@ fn held_turn(state: Box<HeldPump>, mut resumed: bool, may_park: bool) -> HeldTur
                 }
                 if screen.has_notifications() {
                     shared.bump_state_version();
+                }
+                if screen.take_bell() {
+                    shared.bell.store(true, Ordering::Relaxed);
                 }
                 if let Some(status) = screen.take_agent_exit() {
                     note_agent_exit(&shared, status, &mut screen);
@@ -10442,5 +10518,23 @@ mod relaunch_notice_tests {
             $ codex\r\nToken usage: total=1\r\nTo continue this session, run codex resume 1\r\n\
             $ \r\nbye\r\n";
         assert!(!shows_relaunch_notice(&screen(80, text), NOTICE));
+    }
+}
+
+#[cfg(test)]
+mod remote_reconnect_delay_tests {
+    use super::*;
+
+    #[test]
+    fn unreachable_holders_back_off_past_the_live_ceiling() {
+        let mut delay = REMOTE_RECONNECT_MIN;
+        for attempt in 1..REMOTE_UNREACHABLE_ATTEMPTS {
+            delay = next_remote_reconnect_delay(delay, attempt);
+        }
+        assert_eq!(delay, REMOTE_RECONNECT_MAX);
+        for attempt in REMOTE_UNREACHABLE_ATTEMPTS..REMOTE_UNREACHABLE_ATTEMPTS + 8 {
+            delay = next_remote_reconnect_delay(delay, attempt);
+        }
+        assert_eq!(delay, REMOTE_UNREACHABLE_MAX);
     }
 }

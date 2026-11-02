@@ -92,13 +92,16 @@ mod tests {
             classify(&key("f5"), None),
             RecorderKey::Record("f5".into())
         );
+        // The platform's own chord (⌘ on macOS, Ctrl elsewhere), recorded
+        // exactly as gpui spells it there.
+        let chord = |source: &str| key(&crate::commands::test_chords(source));
         assert_eq!(
-            classify(&key("cmd-backspace"), None),
-            RecorderKey::Record("cmd-backspace".into())
+            classify(&chord("cmd-backspace"), None),
+            RecorderKey::Record(chord("cmd-backspace").unparse())
         );
         assert_eq!(
-            classify(&key("cmd-enter"), Some(&clash(true))),
-            RecorderKey::Record("cmd-enter".into())
+            classify(&chord("cmd-enter"), Some(&clash(true))),
+            RecorderKey::Record(chord("cmd-enter").unparse())
         );
     }
 

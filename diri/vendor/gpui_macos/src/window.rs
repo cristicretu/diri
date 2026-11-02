@@ -2072,25 +2072,47 @@ extern "C" fn dealloc_window(this: &Object, _: Sel) {
 /// focused. A sibling view the host app placed beside it to stand for focused
 /// content (Diri's terminal text area) is reported instead; with none, the
 /// upstream behavior is unchanged. Runs only when an accessibility client asks.
+///
+/// Only an accessibility element is asked whether it is focused, and the scan
+/// is not re-entered: AppKit's default `isAccessibilityFocused` asks the
+/// window for its focused element, which lands back here, and recursing until
+/// the stack overflowed crashed every floating panel's first `makeFirstResponder`.
 extern "C" fn accessibility_focused_ui_element(this: &Object, _: Sel) -> id {
+    thread_local! {
+        static SCANNING: Cell<bool> = const { Cell::new(false) };
+    }
     unsafe {
         let superview: id = msg_send![this, superview];
-        if superview != nil {
-            let subviews: id = msg_send![superview, subviews];
-            let count: usize = msg_send![subviews, count];
-            for index in 0..count {
-                let view: id = msg_send![subviews, objectAtIndex: index];
-                if std::ptr::eq(view.cast_const(), std::ptr::from_ref(this).cast()) {
-                    continue;
-                }
-                let element: BOOL = msg_send![view, isAccessibilityElement];
-                let focused: BOOL = msg_send![view, isAccessibilityFocused];
-                if element == YES && focused == YES {
-                    return view;
-                }
+        if superview != nil && !SCANNING.replace(true) {
+            let found = focused_sibling(this, superview);
+            SCANNING.set(false);
+            if found != nil {
+                return found;
             }
         }
         msg_send![super(this, class!(NSView)), accessibilityFocusedUIElement]
+    }
+}
+
+unsafe fn focused_sibling(this: &Object, superview: id) -> id {
+    unsafe {
+        let subviews: id = msg_send![superview, subviews];
+        let count: usize = msg_send![subviews, count];
+        for index in 0..count {
+            let view: id = msg_send![subviews, objectAtIndex: index];
+            if std::ptr::eq(view.cast_const(), std::ptr::from_ref(this).cast()) {
+                continue;
+            }
+            let element: BOOL = msg_send![view, isAccessibilityElement];
+            if element != YES {
+                continue;
+            }
+            let focused: BOOL = msg_send![view, isAccessibilityFocused];
+            if focused == YES {
+                return view;
+            }
+        }
+        nil
     }
 }
 

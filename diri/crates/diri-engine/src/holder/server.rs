@@ -3123,8 +3123,12 @@ mod tests {
         });
 
         client.signal(libc::SIGCONT).expect("wake");
-        wait_until("helper continued", || {
-            process_state(helper).is_some_and(|state| !state.starts_with('T'))
+        // Linux reports the leader's death at once, so its exit sweep can
+        // beat the wake and SIGKILL the frozen helper instead (the case
+        // `a_leader_dying_while_hibernated_takes_its_frozen_tree_with_it`
+        // covers). Either way nothing is left stopped, which is the rule.
+        wait_until("helper continued or swept", || {
+            process_state(helper).is_none_or(|state| !state.starts_with('T'))
         });
 
         // The leader's death may already have ended the session (Linux

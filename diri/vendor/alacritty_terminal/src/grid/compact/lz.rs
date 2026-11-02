@@ -93,7 +93,7 @@ fn match_length(input: &[u8], earlier: usize, later: usize) -> usize {
 }
 
 #[cfg(test)]
-pub(super) fn compress(input: &[u8]) -> Vec<u8> {
+pub fn compress(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     compress_into(input, &mut out);
     out
@@ -105,7 +105,7 @@ pub(super) fn compress(input: &[u8]) -> Vec<u8> {
 /// `1 << SKIP_SHIFT` misses), so text without repeats costs a fraction of a
 /// probe per byte. A match found after a skip is first extended backwards,
 /// which recovers the bytes the skip stepped over.
-pub(super) fn compress_into(input: &[u8], out: &mut Vec<u8>) {
+pub fn compress_into(input: &[u8], out: &mut Vec<u8>) {
     out.clear();
     out.reserve(input.len() / 2 + 16);
     put_varint(out, input.len());
@@ -180,7 +180,7 @@ impl Cursor<'_> {
     }
 }
 
-pub(super) fn decompress(bytes: &[u8]) -> Vec<u8> {
+pub fn decompress(bytes: &[u8]) -> Vec<u8> {
     let mut cursor = Cursor { bytes, at: 0 };
     let mut raw_len = 0usize;
     let mut shift = 0;
