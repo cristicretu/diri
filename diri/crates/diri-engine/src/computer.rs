@@ -102,10 +102,13 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "get_window_state",
     "health_report",
     "list_apps",
+    "list_displays",
     "list_sessions",
+    "list_surfaces",
     "list_windows",
     "parse_visual_regions",
     "verify_state",
+    "wait",
     "zoom",
 ];
 
