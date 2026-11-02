@@ -745,7 +745,7 @@ fn record_launch_ring(cx: &mut HeadlessAppContext, dir: PathBuf, light: bool) {
     let mut rec = Recorder::new(cx, window, dir.clone());
     // One frame: freeze the app clock at the clip's own time, capture, log
     // where the pointer and keys are.
-    let mut frame = |rec: &mut Recorder, overlay: &mut Vec<(f32, f32, bool)>,
+    let frame = |rec: &mut Recorder, overlay: &mut Vec<(f32, f32, bool)>,
                      elapsed: &mut u32, pointer: (f32, f32), held: bool, hold: u32| {
         let now = start + Duration::from_millis(u64::from(*elapsed));
         rec.cx.update(|cx| crate::held_hints::HeldHintsState::freeze_clock(Some(now), cx));
@@ -754,7 +754,6 @@ fn record_launch_ring(cx: &mut HeadlessAppContext, dir: PathBuf, light: bool) {
         *elapsed += hold;
     };
     let with_root = |rec: &mut Recorder, f: &mut dyn FnMut(&mut RootView, std::time::Instant)| {
-        let now = start;
         rec.cx
             .update_window(window, |view, _, cx| {
                 view.downcast::<RootView>().unwrap().update(cx, |root, cx| {
@@ -764,15 +763,12 @@ fn record_launch_ring(cx: &mut HeadlessAppContext, dir: PathBuf, light: bool) {
                 });
             })
             .unwrap();
-        let _ = now;
         rec.cx.run_until_parked();
     };
     frame(&mut rec, &mut overlay, &mut elapsed, pointer, held, 900);
     // ⌘T goes down and stays down.
     held = true;
     frame(&mut rec, &mut overlay, &mut elapsed, pointer, held, 230);
-    let at = std::time::Instant::now();
-    let _ = at;
     let center = gpui::point(px(pointer.0), px(pointer.1));
     {
         let now = start + Duration::from_millis(u64::from(elapsed));
@@ -796,7 +792,7 @@ fn record_launch_ring(cx: &mut HeadlessAppContext, dir: PathBuf, light: bool) {
     }
     frame(&mut rec, &mut overlay, &mut elapsed, pointer, held, 250);
     // Glide toward a target, a frame every 33 ms, easing out.
-    let mut glide = |rec: &mut Recorder,
+    let glide = |rec: &mut Recorder,
                      overlay: &mut Vec<(f32, f32, bool)>,
                      elapsed: &mut u32,
                      pointer: &mut (f32, f32),
