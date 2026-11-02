@@ -594,12 +594,10 @@ isolation: isolate;
 /* Glyph fire rising out of the warm horizon. Anchored in CSS to the hero window's bottom edge (no JS placement, so no load shift): the window hides the white-hot bed and the flames lick up its sides. */
 .product { position: relative; }
 .glyph-ember { --ember-h: min(720px, 62vw); position: absolute; z-index: -1; left: 50%; bottom: calc(var(--ember-h) * -0.06); width: 100vw; height: var(--ember-h); translate: -50% 0; pointer-events: none;
-  background: radial-gradient(60% 34% at 50% 100%, #f6cdb238, #b77fa826 40%, #7d6db614 70%, transparent);
-  -webkit-mask-image: linear-gradient(transparent 4%, #000 44%, #000 96%, transparent); mask-image: linear-gradient(transparent 4%, #000 44%, #000 96%, transparent); }
+  background: radial-gradient(60% 30% at 50% 96%, #f6cdb238, #b77fa826 40%, #7d6db614 70%, transparent); }
 .glyph-ember canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
-/* Bloom: the heat field at one pixel per cell, stretched and blurred on the GPU into a glowing smoke behind the glyphs. */
-.ember-haze { filter: blur(7px) saturate(1.35); }
-.ember-glyphs { filter: brightness(1.15) drop-shadow(0 0 2px #f6cdb2aa) drop-shadow(0 0 10px #b77fa8aa); }
+/* Bloom: ember.js blurs the heat field on its cell grid and draws one pixel per cell; the browser's smooth upscale does the rest. No CSS filters or masks: those re-run over the full canvas every frame. */
+.ember-haze { image-rendering: auto; }
 .desktop-stage { padding: 0; background: none; box-shadow: none; border-radius: 0; overflow: visible; }
 .desktop-stage::before, .desktop-stage::after { content: none; }
 @media (max-width: 850px) { .page-sky { height: 1300px; } }
