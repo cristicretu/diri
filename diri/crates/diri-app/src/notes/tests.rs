@@ -1254,3 +1254,96 @@ fn backlinks_sit_below_the_last_row_of_wrapped_text(cx: &mut gpui::TestAppContex
         row.bottom()
     );
 }
+
+#[gpui::test]
+fn cmd_f_finds_in_the_note_and_steps_through_matches(cx: &mut gpui::TestAppContext) {
+    let (_dir, store, id) = store_with_plan();
+    cx.update(|cx| cx.bind_keys(key_bindings()));
+    let (pane, cx) = pane(cx, store);
+    let session = SessionId::new("s_note");
+    pane.update_in(cx, |pane, window, cx| pane.show(&session, &id, window, cx));
+    let editor = editor(&pane, cx);
+    editor.update_in(cx, |view, window, cx| {
+        window.focus(&view.focus_handle(cx), cx);
+        view.editor.set_caret(diri_notes::edit::Pos::new(0, 0));
+    });
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("cmd-f");
+    editor.update_in(cx, |view, window, cx| {
+        for ch in "NOTE".chars() {
+            view.replace_text_in_range(None, &ch.to_string(), window, cx);
+        }
+    });
+    cx.run_until_parked();
+    let expected = editor.read_with(cx, |view, _| {
+        super::find::find_all(view.editor.blocks(), "note").len()
+    });
+    assert!(expected >= 3, "the plan mentions notes several times");
+    let selected = |cx: &mut gpui::VisualTestContext| {
+        editor.read_with(cx, |view, _| {
+            let sel = view.editor.selection;
+            assert_eq!(sel.start().block, sel.end().block);
+            view.editor.block(sel.start().block).text[sel.start().offset..sel.end().offset]
+                .to_lowercase()
+        })
+    };
+    editor.read_with(cx, |view, _| {
+        let (query, count, current, typing) = view.find_state_for_test().expect("bar open");
+        assert_eq!(query, "NOTE");
+        assert_eq!(count, expected);
+        assert_eq!(current, Some(0));
+        assert!(typing, "the field owns the keyboard");
+        // Typing went to the field, not the note.
+        assert!(!view.editor.block(0).text.contains("NOTE"));
+    });
+    assert_eq!(selected(cx), "note");
+
+    // Return and ⌘G step forward; ⇧⌘G steps back and wraps.
+    cx.simulate_keystrokes("enter");
+    editor.read_with(cx, |view, _| {
+        assert_eq!(view.find_state_for_test().unwrap().2, Some(1));
+    });
+    cx.simulate_keystrokes("cmd-g");
+    editor.read_with(cx, |view, _| {
+        assert_eq!(view.find_state_for_test().unwrap().2, Some(2));
+    });
+    cx.simulate_keystrokes("cmd-shift-g cmd-shift-g cmd-shift-g");
+    editor.read_with(cx, |view, _| {
+        assert_eq!(view.find_state_for_test().unwrap().2, Some(expected - 1));
+    });
+    assert_eq!(selected(cx), "note");
+
+    // Escape closes the bar and leaves the match selected.
+    cx.simulate_keystrokes("escape");
+    editor.read_with(cx, |view, _| {
+        assert!(view.find_state_for_test().is_none());
+        assert!(!view.editor.selection.is_collapsed());
+    });
+    assert_eq!(selected(cx), "note");
+}
+
+#[gpui::test]
+fn find_without_matches_leaves_the_caret(cx: &mut gpui::TestAppContext) {
+    let (_dir, store, id) = store_with_plan();
+    cx.update(|cx| cx.bind_keys(key_bindings()));
+    let (pane, cx) = pane(cx, store);
+    let session = SessionId::new("s_note");
+    pane.update_in(cx, |pane, window, cx| pane.show(&session, &id, window, cx));
+    let editor = editor(&pane, cx);
+    editor.update_in(cx, |view, window, cx| {
+        window.focus(&view.focus_handle(cx), cx);
+        view.editor.set_caret(diri_notes::edit::Pos::new(1, 0));
+    });
+    cx.simulate_keystrokes("cmd-f");
+    editor.update_in(cx, |view, window, cx| {
+        view.replace_text_in_range(None, "zzzz", window, cx);
+    });
+    cx.simulate_keystrokes("enter");
+    editor.read_with(cx, |view, _| {
+        let (_, count, current, _) = view.find_state_for_test().expect("bar open");
+        assert_eq!((count, current), (0, None));
+        assert!(view.editor.selection.is_collapsed());
+        assert_eq!(view.editor.selection.head, diri_notes::edit::Pos::new(1, 0));
+    });
+}
