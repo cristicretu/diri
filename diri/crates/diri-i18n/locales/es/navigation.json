@@ -154,6 +154,8 @@
   "notes.block.todo": "Pendiente",
   "notes.block.turn_into": "Convertir en",
   "notes.cancel": "Cancelar",
+  "notes.error.closed_moved": "«{title}» se movió o eliminó fuera de diri antes de guardar sus últimos cambios.",
+  "notes.error.closed_save": "No se pudo guardar «{title}»: {error}",
   "notes.error.link": "No se pudo enlazar esa mención: {error}",
   "notes.error.moved_outside": "El archivo de esta nota se movió o eliminó fuera de diri; tu texto sigue aquí.",
   "notes.error.save": "No se pudo guardar esta nota: {error}",

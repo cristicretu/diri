@@ -27,6 +27,8 @@ mod site_clips;
 #[cfg(test)]
 mod terminal_import_tests;
 #[cfg(test)]
+mod bold_hint_tests;
+#[cfg(test)]
 mod whats_new_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod window_navigation_tests;
@@ -409,6 +411,8 @@ pub struct RootView {
     /// The session that held keyboard focus when Settings opened, so closing
     /// Settings can return there instead of leaving the hidden page focused.
     settings_return_terminal: Option<Entity<TerminalPane>>,
+    /// The ⌘B-bolds-in-a-note hint showed in this window since launch.
+    bold_hint_shown: bool,
     settings_was_open: bool,
     preview: bool,
     preview_scenario: PreviewScenario,
@@ -1612,6 +1616,7 @@ impl RootView {
             last_quote_surface: QuoteSurface::default(),
             sidebar_revealed_for_settings: false,
             settings_return_terminal: None,
+            bold_hint_shown: false,
             settings_was_open: false,
             preview,
             preview_scenario,
@@ -1938,8 +1943,53 @@ impl RootView {
                 self.toast.dismiss();
                 self.undo_terminal_import(cx);
             }
+            ToastCommand::DismissBoldHint => {
+                self.toast.dismiss();
+                let result = self
+                    .window_store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .update_preferences(|prefs| prefs.bold_hint_dismissed = true);
+                if result.is_ok() {
+                    self.services.store.publish_local_change();
+                }
+            }
         }
         cx.notify();
+    }
+
+    /// ⌘B bolded in a note, where it is not Toggle Sidebar. Says once per
+    /// launch how to reach the sidebar from a note, until "Don't show
+    /// again". Silent when the shortcuts were changed so the hint would not
+    /// be true: ⌘B no longer the sidebar's, or ⌃⌘S no longer reaching it.
+    fn bold_shortcut_used(&mut self, cx: &mut Context<Self>) {
+        if self.bold_hint_shown {
+            return;
+        }
+        let dismissed = self
+            .window_store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .bold_hint_dismissed;
+        let reaches = |key: &str| {
+            gpui::Keystroke::parse(key)
+                .is_ok_and(|key| commands::matches_keystroke(CommandId::ToggleSidebar, &key))
+        };
+        if dismissed || !reaches("cmd-b") || !reaches("ctrl-cmd-s") {
+            return;
+        }
+        self.bold_hint_shown = true;
+        self.show_feedback(
+            "bold_hint",
+            Toast::info(crate::i18n::t("toast.bold_hint"))
+                .detail(crate::i18n::t("toast.bold_hint_detail"))
+                .action(
+                    crate::i18n::t("toast.bold_hint_never"),
+                    ToastCommand::DismissBoldHint,
+                ),
+            cx,
+        );
     }
 
     /// ⌥⌘S: turns "Talk with your agent" on or off for every agent without
@@ -6172,6 +6222,11 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &FocusSidebar, window, cx| {
                 this.run_command(CommandId::FocusSidebar, window, cx);
             }))
+            .on_action(cx.listener(
+                |this, _: &crate::notes::editor_view::BoldShortcutUsed, _, cx| {
+                    this.bold_shortcut_used(cx);
+                },
+            ))
             .on_action(cx.listener(|this, _: &ToggleInspector, window, cx| {
                 this.run_command(CommandId::ToggleInspector, window, cx);
             }))
@@ -12345,7 +12400,7 @@ mod tests {
                                 let len = view.editor.block(cell).text.len();
                                 view.editor.set_caret(Pos::new(cell, len));
                                 window.focus(&view.focus_handle(cx), cx);
-                                view.open_table_menu(cx);
+                                view.open_table_menu(None, cx);
                             } else {
                                 view.editor.set_caret(Pos::new(0, 0));
                             }

@@ -37,6 +37,8 @@ pub enum ToastCommand {
     CopyDetails(String),
     /// Put back the terminal settings an import replaced.
     UndoTerminalImport,
+    /// Never show the ⌘B-in-a-note hint again.
+    DismissBoldHint,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

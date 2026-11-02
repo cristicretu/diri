@@ -490,3 +490,36 @@ fn start_on_a_todo_that_mentions_a_session_prompts_that_session(cx: &mut gpui::T
         "the to-do now tracks the session it asked"
     );
 }
+
+/// Closing a note's tab lets go of its editor: reopening it from Search
+/// notes makes a new Session and reads the file again. Typing not yet saved
+/// is written on the way out.
+#[gpui::test]
+fn closing_a_note_releases_its_editor(cx: &mut gpui::TestAppContext) {
+    let fixture = launch_loop("# Launch plan\n\n- [ ] Ship it\n");
+    let (pane, editor, cx) = open(cx, &fixture);
+    editor.update_in(cx, |view, window, cx| {
+        use gpui::EntityInputHandler as _;
+        let last = view.editor.blocks().len() - 1;
+        view.editor.set_caret(diri_notes::edit::Pos::new(last, 0));
+        view.replace_text_in_range(None, "typed before closing", window, cx);
+    });
+    assert!(
+        !pane.update(cx, |pane, cx| pane.release_closed(cx)),
+        "a listed note stays open"
+    );
+    let weak = editor.downgrade();
+    drop(editor);
+    fixture
+        .runtime
+        .store
+        .write()
+        .unwrap()
+        .remove_session_record(&SessionId::new(NOTE_SESSION));
+    assert!(pane.update(cx, |pane, cx| pane.release_closed(cx)));
+    cx.run_until_parked();
+    assert!(pane.read_with(cx, |pane, _| pane.editor_for_test().is_none()));
+    assert!(weak.upgrade().is_none(), "the editor was dropped");
+    let text = std::fs::read_to_string(fixture.store.path_for(&fixture.id).unwrap()).unwrap();
+    assert!(text.contains("typed before closing"), "{text}");
+}

@@ -716,6 +716,10 @@ pub struct Prefs {
     /// session in front of the user.
     #[serde(default)]
     pub talk_dictation: bool,
+    /// "Don't show again" on the hint that ⌘B bolds in a note and ⌃⌘S
+    /// toggles the sidebar.
+    #[serde(default)]
+    pub bold_hint_dismissed: bool,
     /// The system voice for readings, by identifier; empty picks the best
     /// installed voice for each reply's language; `command` pipes readings
     /// to [`Self::talk_voice_command`].
@@ -983,6 +987,7 @@ impl Default for Prefs {
             talk_with_agent: false,
             agents_name_sessions: true,
             talk_dictation: false,
+            bold_hint_dismissed: false,
             talk_voice: String::new(),
             talk_voice_command: String::new(),
             talk_answer: TalkAnswer::default(),
