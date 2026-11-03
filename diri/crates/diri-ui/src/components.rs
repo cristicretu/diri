@@ -438,6 +438,22 @@ impl RenderOnce for HairlineDivider {
     }
 }
 
+/// The dark rim around a Comfortable island: a 1 pt stroke hugging the
+/// island's outside edge. Place it as a sibling of the island inside a
+/// `relative()` parent that does not clip, since the island itself clips
+/// its children to its own bounds.
+pub fn island_rim(colors: SemanticColors) -> gpui::Div {
+    div()
+        .absolute()
+        .top(px(-1.0))
+        .left(px(-1.0))
+        .right(px(-1.0))
+        .bottom(px(-1.0))
+        .rounded(px(Radius::CARD + 1.0))
+        .border_1()
+        .border_color(colors.island_rim())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

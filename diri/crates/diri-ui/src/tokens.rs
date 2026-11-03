@@ -395,6 +395,15 @@ impl SemanticColors {
         self.primary.alpha(alpha)
     }
 
+    /// Rim drawn one point outside a Comfortable island. Dark against the
+    /// chrome around it, so the island reads as a surface resting on that
+    /// chrome rather than a window cut through it. It is a stroke, never a
+    /// shadow: a shadow paints under the island too and would darken a
+    /// translucent (glass) fill.
+    pub const fn island_rim(self) -> Rgba {
+        self.between(rgba_f32(0.0, 0.0, 0.0, 0.42), rgba_f32(0.0, 0.0, 0.0, 0.12))
+    }
+
     /// Outline of floating chrome. Under glass it is the same hairline that
     /// edges a selected sidebar pill, so menus and rows share one stroke.
     pub const fn floating_stroke(self) -> Rgba {

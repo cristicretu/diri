@@ -5328,7 +5328,20 @@ impl RootView {
             .min_w(px(0.0))
             .p(px(gap))
             .bg(terminal.sidebar_surface())
-            .child(card)
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .flex()
+                    .h_full()
+                    .min_w(px(0.0))
+                    .child(card)
+                    // A workspace's panes carry their own rims, and with tabs
+                    // on the chrome the island is the body, not this card.
+                    .when(card_island && !strip_on_chrome, |island| {
+                        island.child(diri_ui::island_rim(terminal))
+                    }),
+            )
             .into_any_element()
     }
 
@@ -6725,14 +6738,16 @@ impl Render for RootView {
                             .cached(StyleRefinement::default().size_full()),
                     )
                     .when(islands, |panel| {
-                        panel.child(
-                            div()
-                                .absolute()
-                                .inset_0()
-                                .rounded(px(Radius::CARD))
-                                .border_1()
-                                .border_color(crate::right_panel::panel_divider(colors)),
-                        )
+                        panel
+                            .child(
+                                div()
+                                    .absolute()
+                                    .inset_0()
+                                    .rounded(px(Radius::CARD))
+                                    .border_1()
+                                    .border_color(crate::right_panel::panel_divider(colors)),
+                            )
+                            .child(diri_ui::island_rim(colors))
                     });
                 root = root.child(
                     div()
