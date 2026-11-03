@@ -26,7 +26,7 @@ pub use brand::{
 };
 pub use components::{
     AlertChip, FloatingSurface, GlassMenuRow, GlassPill, HairlineDivider, HoverMarquee,
-    LoadingIndicator, RowFill, StateChip, island_edge, island_rim,
+    LoadingIndicator, RowFill, StateChip, chrome_frame, island_edge, island_rim,
 };
 pub use frame_loop::FrameLoop;
 pub use hover_trail::HoverTrail;

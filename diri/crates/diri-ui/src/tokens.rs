@@ -383,22 +383,27 @@ impl SemanticColors {
         }
     }
 
-    /// A surface's coverage when it sits on Comfortable's chrome. Every
-    /// island rests on that chrome, so its denser smoke would otherwise
-    /// compound into the island and close it up: thin the island's own tint
-    /// so the desktop shows through it exactly as much as over the authored
-    /// sidebar tint, `(1 - a') (1 - dense) = (1 - a) (1 - authored)`.
-    fn over_island_chrome(self, alpha: f32) -> f32 {
+    /// The terminal's glass coverage in Comfortable. Islands no longer sit
+    /// on the chrome (it is painted around them), so only the window fill is
+    /// beneath; dark palettes thin the terminal further so the desktop reads
+    /// through it, about 20% in Blended against 3% before. Light palettes
+    /// keep their solid page for legibility.
+    fn island_terminal(self, alpha: f32) -> f32 {
         if !self.island_chrome {
             return alpha;
         }
-        let authored = self.sidebar_glass_alpha(false);
-        let dense = self.sidebar_glass_alpha(true);
-        if dense >= 1.0 {
-            return alpha;
-        }
-        (1.0 - (1.0 - alpha) * (1.0 - authored) / (1.0 - dense)).clamp(0.0, 1.0)
+        alpha
+            * self
+                .between(
+                    rgba_f32(0.0, 0.0, 0.0, Self::ISLAND_TERMINAL_DENSITY),
+                    rgba_f32(0.0, 0.0, 0.0, 1.0),
+                )
+                .a
     }
+
+    /// Share of the terminal's authored glass tint a dark Comfortable island
+    /// keeps.
+    pub const ISLAND_TERMINAL_DENSITY: f32 = 0.73;
 
     /// The window's own fill: the base every panel composes over. Under glass
     /// it is a tint of the theme background so the blurred desktop reads in
@@ -415,9 +420,7 @@ impl SemanticColors {
     pub fn work_surface(self) -> Rgba {
         match self.material {
             Material::Opaque => self.background,
-            Material::Glass => self
-                .background
-                .alpha(self.over_island_chrome(self.glass_alpha(0.55, 0.70))),
+            Material::Glass => self.background.alpha(self.glass_alpha(0.55, 0.70)),
         }
     }
 
@@ -430,7 +433,7 @@ impl SemanticColors {
             Material::Opaque => self.background,
             Material::Glass => self
                 .background
-                .alpha(self.over_island_chrome(self.glass_alpha(11.0 / 12.0, 1.0))),
+                .alpha(self.island_terminal(self.glass_alpha(11.0 / 12.0, 1.0))),
         }
     }
 

@@ -1252,6 +1252,44 @@ impl Render for WorkspaceWorkbench {
             .map(|state| (Some(state.source.clone()), state.pane_target.clone()))
             .unwrap_or_default();
         let drag_source = drag_source.flatten();
+        // Comfortable's chrome between the panes, painted first and with
+        // every pane cut out of it, so its smoked glass never sits under a
+        // terminal. The card around the workbench leaves this region to us.
+        if islands {
+            let holes: Vec<_> = geometry
+                .panes
+                .iter()
+                .map(|pane| match (&self.morph, morph_t) {
+                    (Some(morph), Some(t)) => {
+                        morph.from.get(&pane.identity.pane).map_or(pane.bounds, |from| {
+                            crate::pane_drag::lerp_rect(
+                                *from,
+                                pane.bounds,
+                                crate::pane_drag::ease_out(t),
+                            )
+                        })
+                    }
+                    _ => pane.bounds,
+                })
+                .collect();
+            root = root.child(diri_ui::chrome_frame(
+                colors.sidebar_surface(),
+                move |bounds| {
+                    holes
+                        .iter()
+                        .map(|rect| {
+                            (
+                                gpui::Bounds::new(
+                                    bounds.origin + gpui::point(px(rect.x), px(rect.y)),
+                                    gpui::size(px(rect.width), px(rect.height)),
+                                ),
+                                Radius::CARD,
+                            )
+                        })
+                        .collect()
+                },
+            ));
+        }
         // Painted after the panes so a compact seam's grab area, which
         // overlaps the panes either side, wins hit tests over them. While
         // panes travel, the dividers wait at their new places unseen.

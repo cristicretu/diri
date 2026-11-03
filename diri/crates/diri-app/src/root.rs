@@ -5352,15 +5352,28 @@ impl RootView {
         }
         // The chrome around the island paints the sidebar's material, so the
         // card reads as lifted off the same surface the navigation sits on.
+        // Painted around the card, never under it: the card (or, in a
+        // workspace, the workbench that paints between its panes) is a hole.
+        let chrome_fill = terminal.sidebar_surface();
+        let hole_radius = if card_island { Radius::CARD } else { 0.0 };
+        let tabs_seam = if strip_on_chrome { self.tabs_seam } else { 0.0 };
         div()
             .id("island-chrome")
             .debug_selector(|| "island-chrome".into())
+            .relative()
             .flex_1()
             .flex()
             .h_full()
             .min_w(px(0.0))
             .p(px(gap))
-            .bg(terminal.sidebar_surface())
+            .child(diri_ui::chrome_frame(chrome_fill, move |bounds| {
+                let mut hole = bounds.inset(px(gap));
+                // With tabs on the chrome the strip stays on the chrome and
+                // only the body below it is an island.
+                hole.origin.y += px(tabs_seam);
+                hole.size.height -= px(tabs_seam);
+                vec![(hole, hole_radius)]
+            }))
             .child(
                 div()
                     .relative()
@@ -6789,7 +6802,20 @@ impl Render for RootView {
                         .w(px(inspector_seam))
                         .overflow_hidden()
                         .when(settings_over_glass, |panel| panel.invisible())
-                        .when(islands, |chrome| chrome.bg(colors.sidebar_surface()))
+                        // Chrome around the panel island, never under it.
+                        .when(islands, |chrome| {
+                            let panel_w = (inspector_panel_width - gap).max(0.0);
+                            chrome.child(diri_ui::chrome_frame(
+                                colors.sidebar_surface(),
+                                move |bounds| {
+                                    let mut hole = bounds;
+                                    hole.origin.y += px(gap);
+                                    hole.size.width = px(panel_w);
+                                    hole.size.height -= px(2.0 * gap);
+                                    vec![(hole, Radius::CARD)]
+                                },
+                            ))
+                        })
                         // The panel paints the terminal's own fill, so this
                         // hairline is all that separates the two surfaces.
                         .when(!islands, |edge| {

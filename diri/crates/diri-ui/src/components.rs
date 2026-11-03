@@ -493,6 +493,75 @@ pub fn island_edge(colors: SemanticColors, strength: f32) -> gpui::Div {
         })
 }
 
+/// Comfortable's chrome as one filled shape with the islands cut out of
+/// it. The chrome's smoked glass then never sits under an island, so the
+/// desktop reads through a terminal as much as the terminal's own tint
+/// allows. `holes` maps the element's bounds to the islands' rounded rects
+/// (window coordinates, corner radius); the path fills even-odd.
+pub fn chrome_frame(
+    color: Rgba,
+    holes: impl Fn(gpui::Bounds<gpui::Pixels>) -> Vec<(gpui::Bounds<gpui::Pixels>, f32)> + 'static,
+) -> impl IntoElement {
+    gpui::canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            if color.a <= 0.0 {
+                return;
+            }
+            let mut path = gpui::PathBuilder::fill();
+            rounded_rect(&mut path, bounds, 0.0);
+            for (hole, radius) in holes(bounds) {
+                if hole.size.width > px(0.0) && hole.size.height > px(0.0) {
+                    rounded_rect(&mut path, hole, radius);
+                }
+            }
+            if let Ok(path) = path.build() {
+                window.paint_path(path, color);
+            }
+        },
+    )
+    .absolute()
+    .inset_0()
+}
+
+fn rounded_rect(path: &mut gpui::PathBuilder, bounds: gpui::Bounds<gpui::Pixels>, radius: f32) {
+    let (left, top) = (f32::from(bounds.left()), f32::from(bounds.top()));
+    let (right, bottom) = (f32::from(bounds.right()), f32::from(bounds.bottom()));
+    let r = radius
+        .min((right - left) / 2.0)
+        .min((bottom - top) / 2.0)
+        .max(0.0);
+    // Cubic quarter circles: control points at 0.5523 of the radius.
+    let k = r * (1.0 - 0.552_284_8);
+    let p = |x: f32, y: f32| point(px(x), px(y));
+    path.move_to(p(left + r, top));
+    path.line_to(p(right - r, top));
+    if r > 0.0 {
+        path.cubic_bezier_to(p(right, top + r), p(right - k, top), p(right, top + k));
+    }
+    path.line_to(p(right, bottom - r));
+    if r > 0.0 {
+        path.cubic_bezier_to(
+            p(right - r, bottom),
+            p(right, bottom - k),
+            p(right - k, bottom),
+        );
+    }
+    path.line_to(p(left + r, bottom));
+    if r > 0.0 {
+        path.cubic_bezier_to(
+            p(left, bottom - r),
+            p(left + k, bottom),
+            p(left, bottom - k),
+        );
+    }
+    path.line_to(p(left, top + r));
+    if r > 0.0 {
+        path.cubic_bezier_to(p(left + r, top), p(left, top + k), p(left + k, top));
+    }
+    path.close();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
