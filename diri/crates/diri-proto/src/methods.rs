@@ -80,6 +80,8 @@ impl Method {
     pub const SESSION_ARCHIVE: &'static str = "session.archive";
     pub const SESSION_UNARCHIVE: &'static str = "session.unarchive";
     pub const SESSION_REOPEN_LAST: &'static str = "session.reopen_last";
+    /// Closes a note's tab and moves its file to the notes `.trash/`.
+    pub const SESSION_DELETE_NOTE: &'static str = "session.delete_note";
     /// Asks the app to select and show a Session (`SessionIdParams`); the
     /// Engine re-publishes it as the `session.reveal` event.
     pub const SESSION_REVEAL: &'static str = "session.reveal";
@@ -217,6 +219,7 @@ impl Method {
         Self::SESSION_ARCHIVE,
         Self::SESSION_UNARCHIVE,
         Self::SESSION_REOPEN_LAST,
+        Self::SESSION_DELETE_NOTE,
         Self::SESSION_REVEAL,
         Self::SESSION_OPEN_API_REQUEST,
         Self::COMPUTER_ACT,

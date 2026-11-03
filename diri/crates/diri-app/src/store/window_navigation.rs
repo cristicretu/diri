@@ -695,6 +695,15 @@ impl WindowWrite<'_> {
         self.navigation.reconciled_revision = Some(self.revision);
     }
     pub fn remove_sessions(&mut self, ids: Vec<SessionId>) {
+        self.remove_sessions_as(ids, false);
+    }
+
+    /// Deletes notes: their tabs close and their files move to the trash.
+    pub fn delete_notes(&mut self, ids: Vec<SessionId>) {
+        self.remove_sessions_as(ids, true);
+    }
+
+    fn remove_sessions_as(&mut self, ids: Vec<SessionId>, trash_notes: bool) {
         let excluded: HashSet<_> = ids.iter().cloned().collect();
         if self
             .navigation
@@ -720,7 +729,11 @@ impl WindowWrite<'_> {
                 self.focus_neighbor(&excluded);
             }
         }
-        self.canonical.remove_sessions(ids);
+        if trash_notes {
+            self.canonical.delete_notes(ids);
+        } else {
+            self.canonical.remove_sessions(ids);
+        }
         self.reconcile();
     }
     pub fn archive_sessions(&mut self, ids: Vec<SessionId>) {

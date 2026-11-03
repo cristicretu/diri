@@ -10,6 +10,9 @@ Notes are plain Markdown documents that live next to your agents. Write a plan, 
 
 A note is a session. It sits in the sidebar with your agents and terminals, and it sorts, pins, archives and nests the same way. An agent started from a note appears as the note's child. The first line is the title; a note with no title shows as "Untitled".
 
+## Close or delete a note
+Closing a note's tab (<kbd>⌘</kbd><kbd>W</kbd> or the sidebar ✕) only hides it: the file stays, and [Search](#search) still finds it and reopens it. To delete a note, open it and run **Delete Note** from the command palette. Its tab closes and its file moves to `.trash/` (see [Where notes live](#where-notes-live)). <kbd>⇧</kbd><kbd>⌘</kbd><kbd>T</kbd> brings back a note you just closed or deleted.
+
 ## Write
 Type <kbd>/</kbd> for the block menu or <kbd>@</kbd> to mention something. Markdown shortcuts also work as you type.
 
@@ -89,7 +92,7 @@ dirijor note path                               # print the notes folder
 Run `dirijor note help` for every subcommand and flag, including `add --pin --open`, `edit --old --new`, `replace-section` and `link`.
 
 ## Search
-Press <kbd>⇧</kbd><kbd>⌘</kbd><kbd>F</kbd> for **Search notes**. It searches titles and the whole body, including to-dos, table cells and mention labels, across live and archived notes. Every word you type must appear. Archived notes show dimmed, and opening one unarchives it. The command palette also shows up to three matching notes while you type.
+Press <kbd>⇧</kbd><kbd>⌘</kbd><kbd>F</kbd> for **Search notes**. It searches titles and the whole body, including to-dos, table cells and mention labels, across live, closed and archived notes. Every word you type must appear. Archived notes show dimmed, and opening one unarchives it. The command palette also shows up to three matching notes while you type.
 
 ## Version history
 diri keeps earlier versions of every note. With a note open, run **Version History…** from the command palette. Pick a version to preview it, then **Restore This Version…**. The text you replace stays in history.

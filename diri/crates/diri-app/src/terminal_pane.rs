@@ -3205,6 +3205,14 @@ impl TerminalPane {
         (!note).then_some(id)
     }
 
+    /// Writes the shown note's unsaved typing now, so a delete that moves
+    /// its file to the trash carries every keystroke.
+    pub(crate) fn flush_note(&mut self, cx: &mut Context<Self>) {
+        if let Some(pane) = &self.note {
+            pane.update(cx, |pane, cx| pane.save(cx));
+        }
+    }
+
     fn note_pane(
         &mut self,
         window: &mut Window,
