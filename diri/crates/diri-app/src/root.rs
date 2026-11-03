@@ -4998,13 +4998,10 @@ impl RootView {
         // borderless sidebar title bar even though both are 42 points tall.
         // The sidebar owns the shared divider; only draw our left edge when
         // it is hidden. Bottom corners stay square against the window edge.
-        let card_outline = if islands {
-            div()
-                .absolute()
-                .inset_0()
-                .rounded(px(Radius::CARD))
-                .when(card_island, |outline| outline.border_1())
-                .border_color(terminal.primary.alpha(0.10))
+        let card_outline = if card_island {
+            diri_ui::island_edge(terminal, 0.10)
+        } else if islands {
+            div().absolute().inset_0()
         } else {
             div()
                 .absolute()
@@ -6778,14 +6775,10 @@ impl Render for RootView {
                     )
                     .when(islands, |panel| {
                         panel
-                            .child(
-                                div()
-                                    .absolute()
-                                    .inset_0()
-                                    .rounded(px(Radius::CARD))
-                                    .border_1()
-                                    .border_color(crate::right_panel::panel_divider(colors)),
-                            )
+                            .child(diri_ui::island_edge(
+                                colors,
+                                crate::right_panel::panel_divider(colors).a,
+                            ))
                             .child(diri_ui::island_rim(colors))
                     });
                 root = root.child(

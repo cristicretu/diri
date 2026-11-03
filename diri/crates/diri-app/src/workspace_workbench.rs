@@ -1550,7 +1550,10 @@ impl Render for WorkspaceWorkbench {
                 geometry.panes.len() == 1 || focused,
                 islands.then_some(Radius::CARD),
             );
-            if focused || islands {
+            let edge_strength = if focused { 0.16 } else { 0.10 };
+            if islands {
+                surface = surface.child(diri_ui::island_edge(colors, edge_strength));
+            } else if focused {
                 surface = surface.child(
                     div()
                         .absolute()
@@ -1558,9 +1561,8 @@ impl Render for WorkspaceWorkbench {
                         .left(px(0.0))
                         .right(px(0.0))
                         .bottom(px(0.0))
-                        .when(islands, |edge| edge.rounded(px(Radius::CARD)))
                         .border_1()
-                        .border_color(colors.primary.alpha(if focused { 0.16 } else { 0.10 })),
+                        .border_color(colors.primary.alpha(edge_strength)),
                 );
             }
             surface = surface.child(controls);

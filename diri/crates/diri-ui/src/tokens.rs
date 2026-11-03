@@ -260,6 +260,11 @@ impl SemanticColors {
         self
     }
 
+    /// How far the palette is from dark (0) to light (1).
+    pub const fn lightness(self) -> f32 {
+        self.lightness
+    }
+
     /// `dark` or `light` exactly at the ends, so a settled theme paints the
     /// authored constant; in proportion in between.
     const fn between(self, dark: Rgba, light: Rgba) -> Rgba {
@@ -277,6 +282,28 @@ impl SemanticColors {
             dark.a + (light.a - dark.a) * t,
         )
     }
+
+    /// Comfortable's chrome: in dark palettes the sidebar and the frame
+    /// around the islands sit below the theme background, so each island
+    /// reads as the raised layer rather than a hole in a lighter frame.
+    /// Light palettes already shade their chrome below the white card, so
+    /// they keep the authored surface; a fade travels between the two.
+    pub const fn with_island_chrome(mut self) -> Self {
+        let authored = self.sidebar_surface;
+        let base = self.background;
+        let sunk = rgba_f32(
+            base.r * Self::ISLAND_CHROME_DEPTH,
+            base.g * Self::ISLAND_CHROME_DEPTH,
+            base.b * Self::ISLAND_CHROME_DEPTH,
+            authored.a,
+        );
+        self.sidebar_surface = self.between(sunk, authored);
+        self
+    }
+
+    /// How far below the card the dark Comfortable chrome sits, measured
+    /// from Rex: a frame near 7% grey around a card near 13%.
+    pub const ISLAND_CHROME_DEPTH: f32 = 0.58;
 
     /// Chooses how translucent every surface paints. Glass only changes the
     /// alphas: hues stay with the selected theme.

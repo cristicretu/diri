@@ -98,7 +98,8 @@ const QUOTA_REFRESH_AFTER: i64 = 180;
 // slots are fixed-width so revealing hover affordances never moves the title
 // or disclosure control out from under the pointer.
 const SIDEBAR_NAV_ROW_HEIGHT: f32 = 30.0;
-const SIDEBAR_ROW_RADIUS: f32 = 10.0;
+// Rows round fully, so a selected single-line row is a capsule.
+const SIDEBAR_ROW_RADIUS: f32 = SIDEBAR_NAV_ROW_HEIGHT / 2.0;
 const SIDEBAR_ACTION_SLOT: f32 = 24.0;
 /// How long a project section takes to slide into its new slot after a live
 /// reorder. Short enough that a fast drag never feels held back, long enough
@@ -3989,10 +3990,10 @@ impl Sidebar {
             .bg(fill_color)
             .when_some(self.pane_drop_fill(&id, cx), |row, fill| row.bg(fill))
             .border_1()
+            // The selected pill is a filled capsule with no hairline: the
+            // fill alone lifts it off the sidebar, as Rex's rows do.
             .border_color(if marked {
                 Palette::CLAY.alpha(0.78)
-            } else if selected {
-                look.pill_stroke(colors)
             } else {
                 colors.primary.alpha(0.0)
             })
@@ -4975,13 +4976,22 @@ impl Sidebar {
                 None => ("—".to_owned(), t("sidebar.usage.unavailable").to_owned()),
             }
         });
+        // Comfortable's sidebar is one undivided surface, as Rex's is; the
+        // border stays (clear) so the footer keeps its height in both.
+        let islands = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .pane_density
+            .islands();
         div()
             .flex_none()
             .px(px(Space::INSET))
             .pt(px(4.0))
             .pb(px(7.0))
             .border_t_1()
-            .border_color(colors.primary.alpha(0.06))
+            .border_color(colors.primary.alpha(if islands { 0.0 } else { 0.06 }))
             .children(
                 self.update_pill(colors, cx)
                     .or_else(|| self.whats_new_pill(colors, cx)),
