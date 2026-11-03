@@ -13734,8 +13734,10 @@ mod tests {
         }
         let sidebar_toggle = cx.debug_bounds("sidebar-toggle").unwrap();
         assert_eq!(area_at(cx, sidebar_toggle.center()), None);
+        // The toggle now leads the row, right after the window icon; the
+        // empty run between it and Search still moves the window.
         assert_eq!(
-            area_at(cx, point(px(60.0), px(20.0))),
+            area_at(cx, point(sidebar_toggle.right() + px(24.0), px(20.0))),
             Some(WindowControlArea::Drag),
             "the sidebar's empty title row moves the window"
         );

@@ -20,7 +20,7 @@ static FRAMES: [&str; 8] = [
     "icons/working-7.svg",
 ];
 
-/// One working-mark frame lasts this long: eight frames, one lap a second.
+/// One working-mark frame lasts this long: eight frames, one sweep a second.
 const FRAME_INTERVAL: Duration = Duration::from_millis(125);
 
 pub(crate) fn activity_mark(state: StatusState, colors: SemanticColors) -> AnyElement {
@@ -33,11 +33,13 @@ pub(crate) fn activity_mark(state: StatusState, colors: SemanticColors) -> AnyEl
         .justify_center();
     match state {
         StatusState::Working => slot
+            // Rex's working state: three dots with a light sweeping across
+            // them, in the row's secondary ink.
             .child(FrameLoop::new(
                 &FRAMES,
                 FRAME_INTERVAL,
                 14.0,
-                colors.primary,
+                colors.secondary,
             ))
             .into_any_element(),
         StatusState::NeedsInput { destructive } => slot

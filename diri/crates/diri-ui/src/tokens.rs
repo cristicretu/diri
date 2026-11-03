@@ -153,6 +153,9 @@ pub struct SemanticColors {
     /// the middle, and the values that differ by appearance travel with it
     /// instead of switching sides on one frame.
     lightness: f32,
+    /// Comfortable's chrome (see [`Self::with_island_chrome`]): under glass
+    /// the sidebar and frame carry a dense smoked tint.
+    island_chrome: bool,
 }
 
 impl SemanticColors {
@@ -170,6 +173,7 @@ impl SemanticColors {
             transparency: 1.0,
             clear: false,
             lightness: 1.0,
+            island_chrome: false,
         }
     }
 
@@ -187,6 +191,7 @@ impl SemanticColors {
             transparency: 1.0,
             clear: false,
             lightness: 0.0,
+            island_chrome: false,
         }
     }
 
@@ -245,6 +250,7 @@ impl SemanticColors {
                 Appearance::Dark => 0.0,
                 Appearance::Light => 1.0,
             },
+            island_chrome: false,
         }
     }
 
@@ -298,6 +304,7 @@ impl SemanticColors {
             authored.a,
         );
         self.sidebar_surface = self.between(sunk, authored);
+        self.island_chrome = true;
         self
     }
 
@@ -366,6 +373,33 @@ impl SemanticColors {
         (1.0 - (1.0 - shipped) * self.transparency).clamp(0.0, 1.0)
     }
 
+    /// Sidebar glass coverage: the authored tint, or Comfortable's smoked
+    /// chrome (see [`Self::with_island_chrome`]).
+    fn sidebar_glass_alpha(self, island_chrome: bool) -> f32 {
+        if island_chrome {
+            self.glass_alpha(0.78, 0.66)
+        } else {
+            self.glass_alpha(0.35, 0.48)
+        }
+    }
+
+    /// A surface's coverage when it sits on Comfortable's chrome. Every
+    /// island rests on that chrome, so its denser smoke would otherwise
+    /// compound into the island and close it up: thin the island's own tint
+    /// so the desktop shows through it exactly as much as over the authored
+    /// sidebar tint, `(1 - a') (1 - dense) = (1 - a) (1 - authored)`.
+    fn over_island_chrome(self, alpha: f32) -> f32 {
+        if !self.island_chrome {
+            return alpha;
+        }
+        let authored = self.sidebar_glass_alpha(false);
+        let dense = self.sidebar_glass_alpha(true);
+        if dense >= 1.0 {
+            return alpha;
+        }
+        (1.0 - (1.0 - alpha) * (1.0 - authored) / (1.0 - dense)).clamp(0.0, 1.0)
+    }
+
     /// The window's own fill: the base every panel composes over. Under glass
     /// it is a tint of the theme background so the blurred desktop reads in
     /// the theme's hue everywhere, including behind the rounded card corners.
@@ -381,7 +415,9 @@ impl SemanticColors {
     pub fn work_surface(self) -> Rgba {
         match self.material {
             Material::Opaque => self.background,
-            Material::Glass => self.background.alpha(self.glass_alpha(0.55, 0.70)),
+            Material::Glass => self
+                .background
+                .alpha(self.over_island_chrome(self.glass_alpha(0.55, 0.70))),
         }
     }
 
@@ -392,7 +428,9 @@ impl SemanticColors {
     pub fn terminal_surface(self) -> Rgba {
         match self.material {
             Material::Opaque => self.background,
-            Material::Glass => self.background.alpha(self.glass_alpha(11.0 / 12.0, 1.0)),
+            Material::Glass => self
+                .background
+                .alpha(self.over_island_chrome(self.glass_alpha(11.0 / 12.0, 1.0))),
         }
     }
 
@@ -483,7 +521,12 @@ impl SemanticColors {
     pub fn sidebar_surface(self) -> Rgba {
         match self.material {
             Material::Opaque => self.sidebar_surface,
-            Material::Glass => self.sidebar_surface.alpha(self.glass_alpha(0.35, 0.48)),
+            // Comfortable smokes its chrome the way Rex does, so the
+            // desktop reads as a soft hue behind the islands rather than as
+            // wallpaper under the sidebar labels.
+            Material::Glass => self
+                .sidebar_surface
+                .alpha(self.sidebar_glass_alpha(self.island_chrome)),
         }
     }
 }
