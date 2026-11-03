@@ -4998,13 +4998,10 @@ impl RootView {
         // borderless sidebar title bar even though both are 42 points tall.
         // The sidebar owns the shared divider; only draw our left edge when
         // it is hidden. Bottom corners stay square against the window edge.
-        let card_outline = if islands {
-            div()
-                .absolute()
-                .inset_0()
-                .rounded(px(Radius::CARD))
-                .when(card_island, |outline| outline.border_1())
-                .border_color(terminal.primary.alpha(0.10))
+        let card_outline = if card_island {
+            diri_ui::island_edge(terminal, 0.10)
+        } else if islands {
+            div().absolute().inset_0()
         } else {
             div()
                 .absolute()
@@ -5355,15 +5352,28 @@ impl RootView {
         }
         // The chrome around the island paints the sidebar's material, so the
         // card reads as lifted off the same surface the navigation sits on.
+        // Painted around the card, never under it: the card (or, in a
+        // workspace, the workbench that paints between its panes) is a hole.
+        let chrome_fill = terminal.sidebar_surface();
+        let hole_radius = if card_island { Radius::CARD } else { 0.0 };
+        let tabs_seam = if strip_on_chrome { self.tabs_seam } else { 0.0 };
         div()
             .id("island-chrome")
             .debug_selector(|| "island-chrome".into())
+            .relative()
             .flex_1()
             .flex()
             .h_full()
             .min_w(px(0.0))
             .p(px(gap))
-            .bg(terminal.sidebar_surface())
+            .child(diri_ui::chrome_frame(chrome_fill, move |bounds| {
+                let mut hole = bounds.inset(px(gap));
+                // With tabs on the chrome the strip stays on the chrome and
+                // only the body below it is an island.
+                hole.origin.y += px(tabs_seam);
+                hole.size.height -= px(tabs_seam);
+                vec![(hole, hole_radius)]
+            }))
             .child(
                 div()
                     .relative()
@@ -6778,14 +6788,10 @@ impl Render for RootView {
                     )
                     .when(islands, |panel| {
                         panel
-                            .child(
-                                div()
-                                    .absolute()
-                                    .inset_0()
-                                    .rounded(px(Radius::CARD))
-                                    .border_1()
-                                    .border_color(crate::right_panel::panel_divider(colors)),
-                            )
+                            .child(diri_ui::island_edge(
+                                colors,
+                                crate::right_panel::panel_divider(colors).a,
+                            ))
                             .child(diri_ui::island_rim(colors))
                     });
                 root = root.child(
@@ -6796,7 +6802,20 @@ impl Render for RootView {
                         .w(px(inspector_seam))
                         .overflow_hidden()
                         .when(settings_over_glass, |panel| panel.invisible())
-                        .when(islands, |chrome| chrome.bg(colors.sidebar_surface()))
+                        // Chrome around the panel island, never under it.
+                        .when(islands, |chrome| {
+                            let panel_w = (inspector_panel_width - gap).max(0.0);
+                            chrome.child(diri_ui::chrome_frame(
+                                colors.sidebar_surface(),
+                                move |bounds| {
+                                    let mut hole = bounds;
+                                    hole.origin.y += px(gap);
+                                    hole.size.width = px(panel_w);
+                                    hole.size.height -= px(2.0 * gap);
+                                    vec![(hole, Radius::CARD)]
+                                },
+                            ))
+                        })
                         // The panel paints the terminal's own fill, so this
                         // hairline is all that separates the two surfaces.
                         .when(!islands, |edge| {
@@ -13741,8 +13760,10 @@ mod tests {
         }
         let sidebar_toggle = cx.debug_bounds("sidebar-toggle").unwrap();
         assert_eq!(area_at(cx, sidebar_toggle.center()), None);
+        // The toggle now leads the row, right after the window icon; the
+        // empty run between it and Search still moves the window.
         assert_eq!(
-            area_at(cx, point(px(60.0), px(20.0))),
+            area_at(cx, point(sidebar_toggle.right() + px(24.0), px(20.0))),
             Some(WindowControlArea::Drag),
             "the sidebar's empty title row moves the window"
         );

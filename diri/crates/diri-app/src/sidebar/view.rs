@@ -2210,6 +2210,12 @@ impl Sidebar {
                 colors,
             )
         };
+        // The toggle sits just past the traffic lights, at the window x the
+        // terminal header uses for its Show Sidebar control, so it never
+        // moves when the sidebar opens or closes (as in Rex).
+        let toggle_x = crate::window_chrome::leading_lane()
+            + Metrics::TOOLBAR_EDGE_INSET
+            + Metrics::TOOLBAR_ITEM_GAP;
         div()
             .titlebar_drag_area()
             .opacity(self.title_opacity)
@@ -2217,13 +2223,12 @@ impl Sidebar {
             .flex_none()
             .flex()
             .items_center()
-            .justify_end()
+            .pl(px(toggle_x))
             // The last toolbar control centres on the rows' trailing column.
             .pr(px(
                 TRAILING_COLUMN_CENTER - Metrics::TOOLBAR_CONTROL_SIZE / 2.0
             ))
             .gap(px(Metrics::TOOLBAR_COMPACT_GAP))
-            .child(primary_button)
             .child(crate::held_hints::below(
                 icon_button(
                     "sidebar-toggle",
@@ -2247,6 +2252,8 @@ impl Sidebar {
                 held_hint,
                 colors,
             ))
+            .child(div().flex_1())
+            .child(primary_button)
             .into_any_element()
     }
 
@@ -2941,12 +2948,11 @@ impl Sidebar {
                         let id = id.clone();
                         move || format!("PROJECT_DISCLOSURE_{}", id.0)
                     })
-                    .child(disclosure_tile(
-                        collapsed,
-                        // The header is where a project's hue is learned.
-                        self.hues.color(&id, colors).unwrap_or(colors.secondary),
-                        colors,
-                    )),
+                    // A plain label, as Rex's project headers are: the fold
+                    // chevron has no tile and shows only while the pointer is
+                    // on the header or the project is folded. Its slot stays,
+                    // so hovering never reflows the row.
+                    .child(project_fold_mark(collapsed, collapsed || is_hovered, colors)),
             )
             .child(
                 div()
@@ -2955,9 +2961,9 @@ impl Sidebar {
                     .whitespace_nowrap()
                     .overflow_hidden()
                     .text_ellipsis()
-                    .text_size(px(Typo::ROW_EMPHASIZED.size))
-                    .font_weight(Typo::ROW_EMPHASIZED.weight)
-                    .text_color(colors.primary.alpha(0.90))
+                    .text_size(px(Typo::SECTION_HEADER.size))
+                    .font_weight(Typo::SECTION_HEADER.weight)
+                    .text_color(colors.primary.alpha(0.55))
                     .when(is_hovered, |title| {
                         title.pr(px(PROJECT_ACTION_STRIP - SIDEBAR_ACTION_OUTSET))
                     })
@@ -4930,8 +4936,21 @@ impl Sidebar {
             .update_preferences(|prefs| prefs.whats_new_seen_version = version);
     }
 
-    fn account_footer(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+    /// One quiet row of icons, as Rex's footer is: filter, then Activity
+    /// and the account avatar on the trailing edge. The account's name lives
+    /// in its tooltip and menu; an open filter takes the avatar's room.
+    fn account_footer(
+        &self,
+        colors: SemanticColors,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let hovered = self.ui.hovered_control == Some("account");
+        let sessions_footer = self.settings_nav.is_none();
+        let pending = sessions_footer && {
+            let store = self.store.read().expect("session store lock poisoned");
+            self.activity_pending(&store)
+        };
         let account_label = local_account_label(self.preview);
         let indicator = self
             .store
@@ -4975,109 +4994,135 @@ impl Sidebar {
                 None => ("—".to_owned(), t("sidebar.usage.unavailable").to_owned()),
             }
         });
+        // Comfortable's sidebar is one undivided surface, as Rex's is; the
+        // border stays (clear) so the footer keeps its height in both.
+        let islands = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .pane_density
+            .islands();
         div()
             .flex_none()
             .px(px(Space::INSET))
             .pt(px(4.0))
             .pb(px(7.0))
             .border_t_1()
-            .border_color(colors.primary.alpha(0.06))
+            .border_color(colors.primary.alpha(if islands { 0.0 } else { 0.06 }))
             .children(
                 self.update_pill(colors, cx)
                     .or_else(|| self.whats_new_pill(colors, cx)),
             )
             .child(
                 div()
-                    .id("account")
-                    .debug_selector(|| "account".into())
-                    .px(px(Space::ROW_H))
                     .h(px(SIDEBAR_NAV_ROW_HEIGHT))
                     .flex()
                     .items_center()
-                    .gap(px(8.0))
-                    .rounded(px(SIDEBAR_ROW_RADIUS))
-                    .bg(Fill::hover(colors, hovered))
-                    .cursor_pointer()
-                    .on_hover(cx.listener(|this, is_hovered: &bool, _, cx| {
-                        this.ui.hovered_control = is_hovered.then_some("account");
-                        cx.notify();
-                    }))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.ui.popover = if this.ui.popover == Some(Popover::Account) {
-                            None
-                        } else {
-                            Some(Popover::Account)
-                        };
-                        if !this.preview && this.ui.popover == Some(Popover::Account) {
-                            cx.emit(SidebarEvent::RefreshUsageLimits);
-                            cx.emit(SidebarEvent::AccountAction(AccountRequest::Refresh));
-                        }
-                        cx.notify();
-                    }))
-                    // The avatar takes the leading column and the name the
-                    // title column, like every row above it.
-                    .child(account_avatar(&account_label, LEADING_SLOT, colors))
-                    .child(
-                        div()
-                            .min_w(px(0.0))
-                            .flex_1()
-                            .whitespace_nowrap()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .text_size(px(Typo::ROW.size))
-                            .text_color(colors.text(diri_ui::TextTone::Label))
-                            .child(account_label),
-                    )
-                    .when_some(cost, |row, cost| {
-                        row.child(div().debug_selector(|| "sidebar-cost".into()).child(
-                            self.number_flows.show_font(
-                                "sidebar-today",
-                                cost,
-                                UsageFormat::money(cost),
-                                Typo::META_MONO.size,
-                                colors.tertiary,
-                                FontWeight::NORMAL,
-                                Some(SharedString::from(crate::fonts::mono_family())),
-                            ),
-                        ))
+                    .gap(px(4.0))
+                    // Who you are and what you spent lead; the list tools
+                    // (filter, Activity) trail. An open filter takes the
+                    // account's room.
+                    .when(!self.filter_open || !sessions_footer, |row| {
+                        row.child(self.account_button(account_label, hovered, colors, cx))
+                            .child(self.footer_usage(cost, quota, colors))
                     })
-                    .when_some(quota, |row, (label, tooltip)| {
-                        row.child(
-                            div()
-                                .id("sidebar-quota")
-                                .debug_selector(|| "sidebar-quota".into())
-                                .flex_none()
-                                .font_family(crate::fonts::mono_family())
-                                .text_size(px(Typo::META_MONO.size))
-                                .text_color(colors.tertiary)
-                                .aria_label(tooltip.clone())
-                                .child(label)
-                                .warm_tooltip(move |_, cx| {
-                                    cx.new(|_| {
-                                        crate::palette_chrome::PaletteTooltip(
-                                            tooltip.clone(),
-                                            colors,
-                                        )
-                                    })
-                                    .into()
-                                }),
-                        )
-                    })
-                    .child(
-                        div()
-                            .size(px(SIDEBAR_TRAILING_SLOT))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(sf_symbol_weighted(
-                                "chevron.up.chevron.down",
-                                8.5,
-                                SymbolWeight::Semibold,
-                                colors.tertiary,
-                            )),
-                    ),
+                    .child(div().flex_1())
+                    .when(sessions_footer, |row| {
+                        row.child(self.filter_control(colors, window, cx))
+                            .child(self.activity_toggle(pending, colors, cx))
+                    }),
             )
+            .into_any_element()
+    }
+
+    /// The footer's usage readout (today's cost or remaining quota), set
+    /// beside the trailing icons when the preference shows one.
+    fn footer_usage(
+        &self,
+        cost: Option<f64>,
+        quota: Option<(String, String)>,
+        colors: SemanticColors,
+    ) -> gpui::Div {
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .when_some(cost, |row, cost| {
+                row.child(div().debug_selector(|| "sidebar-cost".into()).child(
+                    self.number_flows.show_font(
+                        "sidebar-today",
+                        cost,
+                        UsageFormat::money(cost),
+                        Typo::META_MONO.size,
+                        colors.tertiary,
+                        FontWeight::NORMAL,
+                        Some(SharedString::from(crate::fonts::mono_family())),
+                    ),
+                ))
+            })
+            .when_some(quota, |row, (label, tooltip)| {
+                row.child(
+                    div()
+                        .id("sidebar-quota")
+                        .debug_selector(|| "sidebar-quota".into())
+                        .flex_none()
+                        .font_family(crate::fonts::mono_family())
+                        .text_size(px(Typo::META_MONO.size))
+                        .text_color(colors.tertiary)
+                        .aria_label(tooltip.clone())
+                        .child(label)
+                        .warm_tooltip(move |_, cx| {
+                            cx.new(|_| crate::palette_chrome::PaletteTooltip(tooltip.clone(), colors))
+                                .into()
+                        }),
+                )
+            })
+    }
+
+    fn account_button(
+        &self,
+        account_label: String,
+        hovered: bool,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let name: SharedString = account_label.clone().into();
+        let tooltip = account_label.clone();
+        div()
+            .id("account")
+            .debug_selector(|| "account".into())
+            .role(Role::Button)
+            .aria_label(name.clone())
+            .size(px(26.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(SIDEBAR_ROW_RADIUS))
+            .bg(Fill::hover(colors, hovered))
+            .cursor_pointer()
+            .warm_tooltip(move |_, cx| {
+                cx.new(|_| crate::palette_chrome::PaletteTooltip(tooltip.clone(), colors))
+                    .into()
+            })
+            .on_hover(cx.listener(|this, is_hovered: &bool, _, cx| {
+                this.ui.hovered_control = is_hovered.then_some("account");
+                cx.notify();
+            }))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.ui.popover = if this.ui.popover == Some(Popover::Account) {
+                    None
+                } else {
+                    Some(Popover::Account)
+                };
+                if !this.preview && this.ui.popover == Some(Popover::Account) {
+                    cx.emit(SidebarEvent::RefreshUsageLimits);
+                    cx.emit(SidebarEvent::AccountAction(AccountRequest::Refresh));
+                }
+                cx.notify();
+            }))
+            .child(account_avatar(&account_label, LEADING_SLOT, colors))
             .into_any_element()
     }
 
@@ -8869,24 +8914,7 @@ impl Sidebar {
         if let Some(feedback) = self.external_drop_feedback(colors, cx) {
             root = root.child(feedback);
         }
-        if self.settings_nav.is_none() {
-            let pending = {
-                let store = self.store.read().expect("session store lock poisoned");
-                self.activity_pending(&store)
-            };
-            root = root.child(
-                div()
-                    .mx(px(Space::INSET))
-                    .mb(px(6.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(4.0))
-                    .child(self.filter_control(colors, window, cx))
-                    .child(div().flex_1())
-                    .child(self.activity_toggle(pending, colors, cx)),
-            );
-        }
-        root = root.child(self.account_footer(colors, cx));
+        root = root.child(self.account_footer(colors, window, cx));
         if self.number_flows.running() {
             self.request_motion_frame(window, cx);
         }
@@ -9238,6 +9266,27 @@ fn trailing_remote_mark(colors: SemanticColors) -> AnyElement {
 /// session rows and the fold still reads as a folder tile, not a stray glyph.
 fn project_disclosure(collapsed: bool, colors: SemanticColors) -> AnyElement {
     disclosure_tile(collapsed, colors.secondary, colors)
+}
+
+/// Fold chevron of a project header: a bare glyph in the 18 pt lead slot.
+fn project_fold_mark(collapsed: bool, visible: bool, colors: SemanticColors) -> AnyElement {
+    div()
+        .flex_none()
+        .size(px(18.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(sf_symbol_weighted(
+            if collapsed {
+                "chevron.right"
+            } else {
+                "chevron.down"
+            },
+            9.0,
+            SymbolWeight::Bold,
+            colors.tertiary.alpha(if visible { colors.tertiary.a } else { 0.0 }),
+        ))
+        .into_any_element()
 }
 
 fn disclosure_tile(collapsed: bool, ink: gpui::Rgba, colors: SemanticColors) -> AnyElement {
@@ -14584,11 +14633,11 @@ mod tests {
             SidebarPopoverHarness { sidebar }
         });
 
+        // The account is an icon in the footer row now, not a row of its own.
         for selector in [
             "new-agent",
             "PROJECT_preview-dirijor",
             "SESSION_preview-codex",
-            "account",
         ] {
             let bounds = cx.debug_bounds(selector).expect(selector);
             assert_eq!(

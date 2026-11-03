@@ -136,12 +136,17 @@ pub(crate) fn sidebar_colors_in(store: &SessionStore) -> SemanticColors {
 /// The application palette under the store's interface style (its palette
 /// preview included): hue source, window material and glass density.
 fn styled_colors(store: &SessionStore, sidebar_tones: bool) -> SemanticColors {
-    style_colors(
+    let colors = style_colors(
         terminal_theme_in(store),
         store.interface_style(),
         store.preferences().window_transparency,
         sidebar_tones,
-    )
+    );
+    if store.preferences().pane_density.islands() {
+        colors.with_island_chrome()
+    } else {
+        colors
+    }
 }
 
 pub(crate) fn style_colors(

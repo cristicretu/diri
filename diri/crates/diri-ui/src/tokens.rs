@@ -153,6 +153,9 @@ pub struct SemanticColors {
     /// the middle, and the values that differ by appearance travel with it
     /// instead of switching sides on one frame.
     lightness: f32,
+    /// Comfortable's chrome (see [`Self::with_island_chrome`]): under glass
+    /// the sidebar and frame carry a dense smoked tint.
+    island_chrome: bool,
 }
 
 impl SemanticColors {
@@ -170,6 +173,7 @@ impl SemanticColors {
             transparency: 1.0,
             clear: false,
             lightness: 1.0,
+            island_chrome: false,
         }
     }
 
@@ -187,6 +191,7 @@ impl SemanticColors {
             transparency: 1.0,
             clear: false,
             lightness: 0.0,
+            island_chrome: false,
         }
     }
 
@@ -245,6 +250,7 @@ impl SemanticColors {
                 Appearance::Dark => 0.0,
                 Appearance::Light => 1.0,
             },
+            island_chrome: false,
         }
     }
 
@@ -258,6 +264,11 @@ impl SemanticColors {
             Appearance::Light
         };
         self
+    }
+
+    /// How far the palette is from dark (0) to light (1).
+    pub const fn lightness(self) -> f32 {
+        self.lightness
     }
 
     /// `dark` or `light` exactly at the ends, so a settled theme paints the
@@ -277,6 +288,29 @@ impl SemanticColors {
             dark.a + (light.a - dark.a) * t,
         )
     }
+
+    /// Comfortable's chrome: in dark palettes the sidebar and the frame
+    /// around the islands sit below the theme background, so each island
+    /// reads as the raised layer rather than a hole in a lighter frame.
+    /// Light palettes already shade their chrome below the white card, so
+    /// they keep the authored surface; a fade travels between the two.
+    pub const fn with_island_chrome(mut self) -> Self {
+        let authored = self.sidebar_surface;
+        let base = self.background;
+        let sunk = rgba_f32(
+            base.r * Self::ISLAND_CHROME_DEPTH,
+            base.g * Self::ISLAND_CHROME_DEPTH,
+            base.b * Self::ISLAND_CHROME_DEPTH,
+            authored.a,
+        );
+        self.sidebar_surface = self.between(sunk, authored);
+        self.island_chrome = true;
+        self
+    }
+
+    /// How far below the card the dark Comfortable chrome sits, measured
+    /// from Rex: a frame near 7% grey around a card near 13%.
+    pub const ISLAND_CHROME_DEPTH: f32 = 0.58;
 
     /// Chooses how translucent every surface paints. Glass only changes the
     /// alphas: hues stay with the selected theme.
@@ -339,6 +373,38 @@ impl SemanticColors {
         (1.0 - (1.0 - shipped) * self.transparency).clamp(0.0, 1.0)
     }
 
+    /// Sidebar glass coverage: the authored tint, or Comfortable's smoked
+    /// chrome (see [`Self::with_island_chrome`]).
+    fn sidebar_glass_alpha(self, island_chrome: bool) -> f32 {
+        if island_chrome {
+            self.glass_alpha(0.78, 0.66)
+        } else {
+            self.glass_alpha(0.35, 0.48)
+        }
+    }
+
+    /// The terminal's glass coverage in Comfortable. Islands no longer sit
+    /// on the chrome (it is painted around them), so only the window fill is
+    /// beneath; dark palettes thin the terminal further so the desktop reads
+    /// through it, about 13% in Blended against 3% before. Light palettes
+    /// keep their solid page for legibility.
+    fn island_terminal(self, alpha: f32) -> f32 {
+        if !self.island_chrome {
+            return alpha;
+        }
+        alpha
+            * self
+                .between(
+                    rgba_f32(0.0, 0.0, 0.0, Self::ISLAND_TERMINAL_DENSITY),
+                    rgba_f32(0.0, 0.0, 0.0, 1.0),
+                )
+                .a
+    }
+
+    /// Share of the terminal's authored glass tint a dark Comfortable island
+    /// keeps.
+    pub const ISLAND_TERMINAL_DENSITY: f32 = 0.85;
+
     /// The window's own fill: the base every panel composes over. Under glass
     /// it is a tint of the theme background so the blurred desktop reads in
     /// the theme's hue everywhere, including behind the rounded card corners.
@@ -365,7 +431,9 @@ impl SemanticColors {
     pub fn terminal_surface(self) -> Rgba {
         match self.material {
             Material::Opaque => self.background,
-            Material::Glass => self.background.alpha(self.glass_alpha(11.0 / 12.0, 1.0)),
+            Material::Glass => self
+                .background
+                .alpha(self.island_terminal(self.glass_alpha(11.0 / 12.0, 1.0))),
         }
     }
 
@@ -456,7 +524,12 @@ impl SemanticColors {
     pub fn sidebar_surface(self) -> Rgba {
         match self.material {
             Material::Opaque => self.sidebar_surface,
-            Material::Glass => self.sidebar_surface.alpha(self.glass_alpha(0.35, 0.48)),
+            // Comfortable smokes its chrome the way Rex does, so the
+            // desktop reads as a soft hue behind the islands rather than as
+            // wallpaper under the sidebar labels.
+            Material::Glass => self
+                .sidebar_surface
+                .alpha(self.sidebar_glass_alpha(self.island_chrome)),
         }
     }
 }

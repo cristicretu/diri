@@ -2,6 +2,8 @@ use super::*;
 
 /// The Activity toggle's width plus its gap from the filter field.
 const ACTIVITY_TOGGLE_ROOM: f32 = 30.0;
+/// The closed filter: one icon button, the height of a row.
+const CLOSED_WIDTH: f32 = 30.0;
 
 impl Sidebar {
     pub(super) fn handle_filter_key(
@@ -138,10 +140,22 @@ impl Sidebar {
                     })),
             );
         } else {
+            // Closed, the filter is its magnifier alone; the label is for
+            // assistive technology and the tooltip.
             control = control
                 .role(Role::Button)
                 .aria_label(t("sidebar.filter.agents"))
-                .child(t("sidebar.filter.agents"));
+                .px(px(0.0))
+                .justify_center()
+                .warm_tooltip(move |_, cx| {
+                    cx.new(|_| {
+                        crate::palette_chrome::PaletteTooltip(
+                            t("sidebar.filter.agents").to_owned(),
+                            colors,
+                        )
+                    })
+                    .into()
+                });
         }
         // The Activity toggle keeps its place at the row's end.
         let expanded = (self.ui.width - Space::INSET * 2.0 - ACTIVITY_TOGGLE_ROOM).max(0.0);
@@ -151,15 +165,18 @@ impl Sidebar {
                     format!("sidebar-filter-open-{}", self.filter_generation),
                     Animation::new(Duration::from_millis(180)),
                     move |control, progress| {
-                        control.w(px(
-                            128.0 + (expanded - 128.0) * Motion::SETTLE.settle(progress)
-                        ))
+                        control.w(px(CLOSED_WIDTH
+                            + (expanded - CLOSED_WIDTH) * Motion::SETTLE.settle(progress)))
                     },
                 )
                 .into_any_element()
         } else {
             control
-                .w(px(if self.filter_open { expanded } else { 128.0 }))
+                .w(px(if self.filter_open {
+                    expanded
+                } else {
+                    CLOSED_WIDTH
+                }))
                 .into_any_element()
         }
     }
