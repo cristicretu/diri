@@ -1564,14 +1564,26 @@ impl Render for WorkspaceWorkbench {
                 );
             }
             surface = surface.child(controls);
+            // The pane clips to its own bounds, so its rim rides along as an
+            // unclipped sibling over the same rect.
+            let rim = islands.then(|| {
+                div()
+                    .absolute()
+                    .left(px(shown.x))
+                    .top(px(shown.y))
+                    .w(px(shown.width))
+                    .h(px(shown.height))
+                    .when(lifted, |rim| rim.opacity(0.45))
+                    .child(diri_ui::island_rim(colors))
+            });
             if self
                 .morph
                 .as_ref()
                 .is_some_and(|morph| morph.moved == pane.identity.pane)
             {
-                on_top = Some(surface);
+                on_top = Some(div().absolute().inset_0().children(rim).child(surface));
             } else {
-                root = root.child(surface);
+                root = root.children(rim).child(surface);
             }
         }
         root = root.children(on_top);
