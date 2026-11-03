@@ -471,6 +471,12 @@ function diri.session.unarchive(params, opts) end
 ---@return table # SessionRecord
 function diri.session.reopen_last(params, opts) end
 
+---Close a note's tab and move its file to the notes trash.
+---@param params {sessionID: string}
+---@param opts? {timeout?: number}
+---@return table # {}
+function diri.session.delete_note(params, opts) end
+
 ---Ask the app to show a session without taking focus.
 ---@param params {sessionID: string}
 ---@param opts? {timeout?: number}
@@ -998,6 +1004,10 @@ function diri.actions.note_version_history(args) end
 ---See how the open note links to your other notes
 ---@param args? table
 function diri.actions.note_graph(args) end
+
+---Close the open note and move it to the trash
+---@param args? table
+function diri.actions.note_delete(args) end
 
 ---Open the Git worktrees overview
 ---@param args? table

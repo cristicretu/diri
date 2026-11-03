@@ -1032,6 +1032,7 @@ impl ControlServer {
                         | Method::SESSION_READ_SCROLLBACK_CELLS
                         | Method::SESSION_KILL
                         | Method::SESSION_REMOVE
+                        | Method::SESSION_DELETE_NOTE
                         | Method::SESSION_ARCHIVE
                         | Method::SESSION_RESUME
                         | Method::SESSION_PROCESS_INFO
@@ -1358,6 +1359,7 @@ impl ControlServer {
             Method::SESSION_READ_SCROLLBACK_CELLS => self.session_read_scrollback_cells(params),
             Method::SESSION_KILL => self.session_kill(params),
             Method::SESSION_REMOVE => self.session_remove(params),
+            Method::SESSION_DELETE_NOTE => self.session_delete_note(params),
             Method::SESSION_RENAME => self.session_rename(params),
             Method::SESSION_MARK_SEEN => self.session_mark_seen(params),
             Method::SESSION_MARK_UNREAD => self.session_mark_unread(params),
@@ -3640,6 +3642,37 @@ impl ControlServer {
                 json!({"revision": snapshot.revision}),
                 None,
             );
+        }
+        Ok(json!({}))
+    }
+
+    /// Deleting a note: its tab closes like `session.remove` and its file
+    /// moves to the notes `.trash/`, so Search notes no longer finds it.
+    /// Reopening the closed session (⇧⌘T) brings the file back.
+    fn session_delete_note(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::SessionIdParams = decode(params.clone())?;
+        let note_id = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            let record = registry
+                .record(&p.session_id.0)
+                .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+            if !record.is_note() {
+                return Err(ControlError::bad_request(format!(
+                    "session {} is not a note",
+                    p.session_id.0
+                )));
+            }
+            record.note_id
+        };
+        let store = self.note_store()?;
+        self.session_remove(params)?;
+        if let Some(note_id) = note_id {
+            match store.trash(&note_id) {
+                Ok(_) => {}
+                // Already gone (deleted by hand): nothing left to trash.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io_control_error(error)),
+            }
         }
         Ok(json!({}))
     }
@@ -8389,6 +8422,37 @@ mod tests {
             Some(json!({ "sessionID": record.id.0 })),
         ));
         assert!(store.load(&note_id).is_ok(), "a closed note stays findable");
+        let reopened = ok_of(call(&server, "session.reopen_last", None));
+        assert_eq!(reopened["id"], record.id.0.as_str());
+        assert_eq!(store.load(&note_id).unwrap().doc.title, "Launch plan");
+
+        // Deleting the note closes its tab and moves the file to `.trash/`;
+        // reopening the closed session brings both back.
+        ok_of(call(
+            &server,
+            "session.delete_note",
+            Some(json!({ "sessionID": record.id.0 })),
+        ));
+        assert!(
+            store.load(&note_id).is_err(),
+            "a deleted note leaves search"
+        );
+        assert!(
+            temp.path()
+                .join("notes/.trash")
+                .join(format!("{note_id}.md"))
+                .exists(),
+            "a deleted note waits in the trash"
+        );
+        assert!(
+            !registry
+                .lock()
+                .expect("registry")
+                .records()
+                .iter()
+                .any(|r| r.id == record.id),
+            "a deleted note's tab closes"
+        );
         let reopened = ok_of(call(&server, "session.reopen_last", None));
         assert_eq!(reopened["id"], record.id.0.as_str());
         assert_eq!(store.load(&note_id).unwrap().doc.title, "Launch plan");

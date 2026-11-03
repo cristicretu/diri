@@ -642,6 +642,12 @@ impl DaemonClient {
             .await
     }
 
+    /// Closes a note's tab and moves its file to the notes trash.
+    pub async fn delete_note(&self, session_id: &SessionId) -> Result<(), ClientError> {
+        self.empty(Method::SESSION_DELETE_NOTE, &session_params(session_id))
+            .await
+    }
+
     pub async fn rename(&self, session_id: &SessionId, title: String) -> Result<(), ClientError> {
         self.empty(
             Method::SESSION_RENAME,

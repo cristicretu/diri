@@ -451,6 +451,12 @@ mod catalog {
                 "Reopen the most recently closed session."
             ),
             entry!(
+                Method::SESSION_DELETE_NOTE,
+                SessionIdParams,
+                "{}",
+                "Close a note's tab and move its file to the notes trash."
+            ),
+            entry!(
                 Method::SESSION_REVEAL,
                 SessionIdParams,
                 "{}",

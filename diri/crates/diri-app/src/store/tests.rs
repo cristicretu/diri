@@ -5093,3 +5093,31 @@ fn a_flood_of_app_actions_is_bounded_and_the_dropped_ones_are_answered() {
         .collect();
     assert_eq!(refused, vec![1, 2, 3, 4]);
 }
+
+#[test]
+fn deleting_a_note_trashes_it_and_closing_does_not() {
+    let shell = session("shell", "p", 1.0);
+    let mut note = session("plan", "p", 2.0);
+    note.kind = AgentKind::NOTE;
+    let mut kept = session("kept", "p", 3.0);
+    kept.kind = AgentKind::NOTE;
+    let (mut store, mut effects) = hydrated(
+        vec![shell, note, kept],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+
+    // Delete trashes notes only; a non-note in the batch just closes.
+    store.delete_notes(vec![id("plan"), id("shell")]);
+    let emitted = drain(&mut effects);
+    assert!(emitted.contains(&StoreEffect::DeleteNote(id("plan"))));
+    assert!(emitted.contains(&StoreEffect::Remove(id("shell"))));
+    assert!(!emitted.contains(&StoreEffect::Remove(id("plan"))));
+
+    // Closing a note's tab keeps its file.
+    store.remove_sessions(vec![id("kept")]);
+    let emitted = drain(&mut effects);
+    assert!(emitted.contains(&StoreEffect::Remove(id("kept"))));
+    assert!(!emitted.contains(&StoreEffect::DeleteNote(id("kept"))));
+}

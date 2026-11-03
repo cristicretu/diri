@@ -643,6 +643,7 @@ pub fn actions_for_default_host(
     {
         result.push(registered_action(CommandId::NoteVersionHistory));
         result.push(registered_action(CommandId::NoteGraph));
+        result.push(registered_action(CommandId::DeleteNote));
     }
 
     // Terminal housekeeping for the selected session's terminal.

@@ -2946,6 +2946,7 @@ impl RootView {
             }
             CommandId::QuoteSelection => self.quote_selection(false, window, cx),
             CommandId::QuoteSelectionToSession => self.quote_selection(true, window, cx),
+            CommandId::DeleteNote => self.delete_selected_note(cx),
             CommandId::ArchiveSelectedSession => {
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.archive_selected(cx));
@@ -3859,6 +3860,41 @@ impl RootView {
             .read()
             .expect("session store lock poisoned");
         store.switcher_state().is_visible() || store.overview_state().is_visible()
+    }
+
+    /// Deletes the selected note: its tab closes and its file moves to the
+    /// notes trash, where ⇧⌘T (reopen closed session) finds it again.
+    fn delete_selected_note(&mut self, cx: &mut Context<Self>) {
+        let selected_note = self
+            .window_store
+            .read()
+            .expect("session store lock poisoned")
+            .selected_session()
+            .is_some_and(|session| session.is_note());
+        if !selected_note {
+            return;
+        }
+        let focused = self
+            .workspace_workbench
+            .as_ref()
+            .and_then(|workbench| workbench.read(cx).focused_terminal());
+        for pane in self.terminal.clone().into_iter().chain(focused) {
+            pane.update(cx, |pane, cx| pane.flush_note(cx));
+        }
+        let mut store = self
+            .window_store
+            .write()
+            .expect("session store lock poisoned");
+        let Some(id) = store
+            .selected_session()
+            .filter(|session| session.is_note())
+            .map(|session| session.id.clone())
+        else {
+            return;
+        };
+        store.delete_notes(vec![id]);
+        drop(store);
+        cx.notify();
     }
 
     /// Cmd+W: close the selected session with the sidebar ✕ semantics.
@@ -6538,6 +6574,9 @@ impl Render for RootView {
                     this.run_command(CommandId::QuoteSelectionToSession, window, cx);
                 }),
             )
+            .on_action(cx.listener(|this, _: &crate::commands::DeleteNote, window, cx| {
+                this.run_command(CommandId::DeleteNote, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &ArchiveSelectedSession, window, cx| {
                 this.run_command(CommandId::ArchiveSelectedSession, window, cx);
             }))

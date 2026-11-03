@@ -73,6 +73,7 @@ Call one as `diri.call("session.list")` or through its generated function, `diri
 | `diri.session.archive` | `sessionID` | `{}` | Stop a session and move it to the archive. |
 | `diri.session.unarchive` | `sessionID` | `{}` | Restore an archived session's record. |
 | `diri.session.reopen_last` |  | `SessionRecord` | Reopen the most recently closed session. |
+| `diri.session.delete_note` | `sessionID` | `{}` | Close a note's tab and move its file to the notes trash. |
 | `diri.session.reveal` | `sessionID` | `{}` | Ask the app to show a session without taking focus. |
 | `diri.session.open_api_request` | `sessionID, request` | `{}` | Open a prefilled HTTP request in a session's API tab. |
 | `diri.computer.act` | `sessionID, tool, args?` | `Value` | One Cua Driver step under the caller's own cursor. |
@@ -197,6 +198,7 @@ Run one with `diri.action("split-pane-right")` or `diri.actions.split_pane_right
 | `search-notes` |  | ⇧⌘F | Find any note, live or archived |
 | `note-version-history` |  |  | See and restore earlier versions of the open note |
 | `note-graph` |  |  | See how the open note links to your other notes |
+| `note-delete` |  |  | Close the open note and move it to the trash **Destructive.** |
 | `worktrees` |  | ⌥⌘W | Open the Git worktrees overview |
 | `settings` |  | ⌘, | Open or close Diri settings |
 | `toggle-sidebar` |  | ⌘B | Show or hide the sidebar with vertical tabs, or the top bar with horizontal tabs |

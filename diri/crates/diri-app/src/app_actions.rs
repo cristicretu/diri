@@ -52,7 +52,7 @@ pub fn exposure(id: CommandId) -> Exposure {
         ImportTerminalSetup => Exposure::Hidden,
         // Bringing Diri forward or hiding it moves the person's focus.
         HideApp | ShowApp => Exposure::Hidden,
-        Quit | CloseWindow | CloseSession | ArchiveSelectedSession | RemoveFocusedPane
+        Quit | CloseWindow | CloseSession | ArchiveSelectedSession | DeleteNote | RemoveFocusedPane
         | CheckForUpdates | ClearScrollback | ResetTerminal => Exposure::Destructive,
         NewWindow | ReopenSession | OpenLauncher | NewDefaultSession | NewTerminal
         | NewCodexSession | ToggleCommandPalette | ToggleQuickOpen | ToggleHistory

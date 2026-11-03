@@ -109,6 +109,7 @@ actions!(
         SearchNotes,
         NoteVersionHistory,
         NoteGraph,
+        DeleteNote,
         OpenSettings,
         // Palette destination: open Settings even when it is already visible.
         // OpenSettings retains the Cmd+, toggle behavior.
@@ -243,6 +244,7 @@ pub enum CommandId {
     SearchNotes,
     NoteVersionHistory,
     NoteGraph,
+    DeleteNote,
     OpenSettings,
     ToggleSidebar,
     ToggleTabOrientation,
@@ -892,6 +894,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         "command.note_graph.palette_title",
         "point.3.filled.connected.trianglepath.dotted",
         "note graph links backlinks connections map related notes"
+    ),
+    spec!(
+        DeleteNote,
+        "note-delete",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.delete_note.palette_title",
+        "trash",
+        "note delete remove trash discard"
     ),
     spec!(
         OpenWorktrees,
@@ -1702,6 +1714,7 @@ impl CommandSpec {
             CommandId::SearchNotes => KeyBinding::new(key, SearchNotes, context),
             CommandId::NoteVersionHistory => KeyBinding::new(key, NoteVersionHistory, context),
             CommandId::NoteGraph => KeyBinding::new(key, NoteGraph, context),
+            CommandId::DeleteNote => KeyBinding::new(key, DeleteNote, context),
             CommandId::OpenSettings => KeyBinding::new(key, OpenSettings, context),
             CommandId::ToggleSidebar => KeyBinding::new(key, ToggleSidebar, context),
             CommandId::ToggleTabOrientation => KeyBinding::new(key, ToggleTabOrientation, context),
@@ -2480,6 +2493,11 @@ impl CommandId {
                 description: t("command.note_graph.description"),
                 category: Navigation,
             },
+            Self::DeleteNote => ShortcutMetadata {
+                title: t("command.delete_note.title"),
+                description: t("command.delete_note.description"),
+                category: Navigation,
+            },
             Self::OpenWorktrees => ShortcutMetadata {
                 title: t("command.open_worktrees.title"),
                 description: t("command.open_worktrees.description"),
@@ -2817,6 +2835,7 @@ impl CommandId {
             Self::SearchNotes => Box::new(SearchNotes),
             Self::NoteVersionHistory => Box::new(NoteVersionHistory),
             Self::NoteGraph => Box::new(NoteGraph),
+            Self::DeleteNote => Box::new(DeleteNote),
             Self::OpenSettings => Box::new(OpenSettings),
             Self::ToggleSidebar => Box::new(ToggleSidebar),
             Self::ToggleTabOrientation => Box::new(ToggleTabOrientation),

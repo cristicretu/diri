@@ -273,6 +273,7 @@ pub fn is_lifecycle_method(method: &str) -> bool {
             | Method::SESSION_FORK
             | Method::SESSION_RESUME_FROM_HISTORY
             | Method::SESSION_REOPEN_LAST
+            | Method::SESSION_DELETE_NOTE
             | Method::SESSION_MIGRATE
             | Method::SESSION_CONTINUE_ACCOUNT
             | Method::SESSION_RECONNECT

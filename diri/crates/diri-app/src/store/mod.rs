@@ -184,6 +184,8 @@ pub enum StoreEffect {
     MarkSeen(SessionId),
     MarkUnread(SessionId),
     Remove(SessionId),
+    /// Closes a note's tab like `Remove` and moves its file to the trash.
+    DeleteNote(SessionId),
     Resume {
         id: SessionId,
         automatic: bool,
@@ -2817,6 +2819,16 @@ impl SessionStore {
     }
 
     pub fn remove_sessions(&mut self, ids: Vec<SessionId>) {
+        self.remove_sessions_as(ids, false);
+    }
+
+    /// Deletes notes: closes their tabs like [`Self::remove_sessions`] and
+    /// moves their files to the notes trash. Non-note ids just close.
+    pub fn delete_notes(&mut self, ids: Vec<SessionId>) {
+        self.remove_sessions_as(ids, true);
+    }
+
+    fn remove_sessions_as(&mut self, ids: Vec<SessionId>, trash_notes: bool) {
         let ids = self.closure_set(ids);
         let excluded: HashSet<_> = ids.iter().cloned().collect();
         if self
@@ -2833,7 +2845,12 @@ impl SessionStore {
             }
             // Hide now; `session.removed` (or a resync) settles the record.
             self.closing.insert(id.clone());
-            self.emit(StoreEffect::Remove(id));
+            let note = self.sessions.get(&id).is_some_and(|session| session.is_note());
+            self.emit(if trash_notes && note {
+                StoreEffect::DeleteNote(id)
+            } else {
+                StoreEffect::Remove(id)
+            });
         }
         self.invalidate_projection();
         self.reconcile_navigation();
@@ -4428,6 +4445,7 @@ async fn run_effects(
             _ = workspace_tasks.join_next(), if !workspace_tasks.is_empty() => continue,
         };
         let action_context = action_context(&effect);
+        let trash_note = matches!(&effect, StoreEffect::DeleteNote(_));
         let force_snapshot = matches!(
             &effect,
             StoreEffect::SetActive(true) | StoreEffect::PublishSnapshot
@@ -4472,8 +4490,12 @@ async fn run_effects(
             }
             StoreEffect::MarkSeen(id) => client.mark_seen(&id).await,
             StoreEffect::MarkUnread(id) => client.mark_unread(&id).await,
-            StoreEffect::Remove(id) => {
-                let result = client.remove(&id).await;
+            StoreEffect::Remove(id) | StoreEffect::DeleteNote(id) => {
+                let result = if trash_note {
+                    client.delete_note(&id).await
+                } else {
+                    client.remove(&id).await
+                };
                 if let Err(error) = &result
                     && store
                         .write()
@@ -4920,6 +4942,7 @@ struct ActionContext {
 fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
     let (title, retry) = match effect {
         StoreEffect::Remove(_) => ("Close session failed", None),
+        StoreEffect::DeleteNote(_) => ("Delete note failed", None),
         StoreEffect::Resume {
             automatic: true, ..
         } => ("Automatic resume failed", None),
