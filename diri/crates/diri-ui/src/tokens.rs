@@ -386,7 +386,7 @@ impl SemanticColors {
     /// The terminal's glass coverage in Comfortable. Islands no longer sit
     /// on the chrome (it is painted around them), so only the window fill is
     /// beneath; dark palettes thin the terminal further so the desktop reads
-    /// through it, about 20% in Blended against 3% before. Light palettes
+    /// through it, about 13% in Blended against 3% before. Light palettes
     /// keep their solid page for legibility.
     fn island_terminal(self, alpha: f32) -> f32 {
         if !self.island_chrome {
@@ -403,7 +403,7 @@ impl SemanticColors {
 
     /// Share of the terminal's authored glass tint a dark Comfortable island
     /// keeps.
-    pub const ISLAND_TERMINAL_DENSITY: f32 = 0.73;
+    pub const ISLAND_TERMINAL_DENSITY: f32 = 0.85;
 
     /// The window's own fill: the base every panel composes over. Under glass
     /// it is a tint of the theme background so the blurred desktop reads in
