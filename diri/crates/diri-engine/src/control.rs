@@ -292,6 +292,15 @@ impl ControlServer {
     }
 
     /// Configure private power endpoints before starting the scheduler.
+    /// How long a file-triggered schedule waits for a new file's size to
+    /// hold before handing it to an agent (tests shorten it).
+    pub fn with_file_trigger_settle(mut self, settle: Duration) -> Self {
+        Arc::get_mut(&mut self.scheduler)
+            .expect("scheduler not started")
+            .settle_ms = settle.as_millis() as i64;
+        self
+    }
+
     pub fn with_schedule_power(mut self, config: crate::wake::PowerConfig) -> Self {
         Arc::get_mut(&mut self.scheduler)
             .expect("scheduler not started")

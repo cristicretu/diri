@@ -59,6 +59,7 @@ fn database(path: &Path) -> Result<Connection, ControlError> {
     CREATE TABLE IF NOT EXISTS schedule_power_v1 (used INTEGER NOT NULL);",
     )
     .map_err(storage_error)?;
+    files::ensure_tables(&db)?;
     Ok(db)
 }
 
@@ -136,6 +137,7 @@ fn validate(spec: &mut ScheduleSpec, now: i64) -> Result<Option<i64>, ControlErr
             "the catch-up window is at most 7 days",
         ));
     }
+    files::validate_trigger(spec)?;
     if let ScheduleWhen::Once { at } = &spec.when
         && spec.enabled
         && (at.0 as i64) < now - schedule::ON_TIME_SLACK_MS
@@ -203,6 +205,12 @@ pub(super) struct Scheduler {
     state: Mutex<RunnerState>,
     wake: Condvar,
     enabled: AtomicUsize,
+    /// The file-trigger thread's inbox, once it runs.
+    files: Mutex<Option<std::sync::mpsc::Sender<files::FileMessage>>>,
+    /// File triggers whose run is still being started (one at a time each).
+    file_runs: Mutex<std::collections::HashSet<String>>,
+    /// How long a new file's size must hold before it fires.
+    pub(super) settle_ms: i64,
     active: Mutex<Vec<ActiveRun>>,
     started_ms: i64,
     /// The most recent sleep the runner observed, as wall-clock bounds.
@@ -226,6 +234,9 @@ impl Default for Scheduler {
             state: Mutex::default(),
             wake: Condvar::new(),
             enabled: AtomicUsize::new(0),
+            files: Mutex::default(),
+            file_runs: Mutex::default(),
+            settle_ms: crate::file_trigger::DEFAULT_SETTLE_MS,
             active: Mutex::default(),
             started_ms: now_ms(),
             last_sleep: Mutex::default(),
@@ -242,7 +253,8 @@ impl Default for Scheduler {
 }
 
 impl Scheduler {
-    /// Enabled schedules keep an otherwise idle Engine alive.
+    /// Enabled schedules, file triggers included, keep an otherwise idle
+    /// Engine alive.
     pub(super) fn enabled_count(&self) -> usize {
         self.enabled.load(Ordering::Acquire)
     }
@@ -252,6 +264,11 @@ impl Scheduler {
             state.dirty = true;
         }
         self.wake.notify_all();
+        if let Ok(files) = self.files.lock()
+            && let Some(sender) = files.as_ref()
+        {
+            let _ = sender.send(files::FileMessage::Reload);
+        }
     }
 
     fn late_reason(&self, due_ms: i64) -> Option<LateReason> {
@@ -279,7 +296,14 @@ impl Scheduler {
                 ))
             })
             .collect();
-        self.enabled.store(pending.len(), Ordering::Release);
+        let watching = records
+            .iter()
+            .filter(|record| {
+                record.spec.enabled && matches!(record.spec.when, ScheduleWhen::Files { .. })
+            })
+            .count();
+        self.enabled
+            .store(pending.len() + watching, Ordering::Release);
         if let Ok(mut state) = self.state.lock() {
             state.pending = pending;
             state.loaded = true;
@@ -484,6 +508,7 @@ impl super::ControlServer {
         let mut spec: ScheduleSpec = super::decode(params)?;
         let now = now_ms();
         let next_due = validate(&mut spec, now)?;
+        let baseline = files::baseline(&spec.when)?;
         let record = ScheduleRecord {
             id: random_id(),
             spec,
@@ -506,6 +531,9 @@ impl super::ControlServer {
             ));
         }
         save(&tx, &record)?;
+        if let Some(baseline) = &baseline {
+            files::save_handled(&tx, &record.id, baseline)?;
+        }
         tx.commit().map_err(storage_error)?;
         self.publish_schedule(&record.id);
         self.scheduler.poke();
@@ -516,11 +544,24 @@ impl super::ControlServer {
         let ScheduleUpdateParams { id, mut spec } = super::decode(params)?;
         let now = now_ms();
         let next_due = validate(&mut spec, now)?;
+        let baseline = files::baseline(&spec.when)?;
         let mut db = database(&self.schedules_path())?;
         let tx = db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage_error)?;
         let mut record = load(&tx, &id)?;
+        // A file trigger keeps its handled set across an edit of anything but
+        // what it watches; a new folder, filter, or re-enabling starts from
+        // the folder as it is now, so nothing already there floods in.
+        match &baseline {
+            Some(baseline)
+                if record.spec.when != spec.when || !record.spec.enabled || !spec.enabled =>
+            {
+                files::save_handled(&tx, &id, baseline)?
+            }
+            Some(_) => {}
+            None => files::forget_handled(&tx, &id)?,
+        }
         // Re-arming from now: an edit never replays occurrences it skipped.
         record.spec = spec;
         record.next_due = next_due.map(|due| DateMillis(due as f64));
@@ -538,6 +579,7 @@ impl super::ControlServer {
         let removed = db
             .execute("DELETE FROM schedules_v1 WHERE id=?1", [&id])
             .map_err(storage_error)?;
+        files::forget_handled(&db, &id)?;
         if removed == 0 {
             return Err(ControlError::not_found("schedule"));
         }
@@ -565,6 +607,7 @@ impl super::ControlServer {
                 collapsed: 0,
                 session_id: None,
                 error: None,
+                files: Vec::new(),
             },
         );
         record.revision += 1;
@@ -584,6 +627,7 @@ impl super::ControlServer {
         let _ = std::thread::Builder::new()
             .name("diri-scheduler".into())
             .spawn(move || server.run_scheduler());
+        self.spawn_file_triggers();
     }
 
     fn run_scheduler(self: Arc<Self>) {
@@ -846,6 +890,7 @@ impl super::ControlServer {
                     session_id: None,
                     error: (evaluation.outcome == ScheduleOutcome::Failed)
                         .then(|| "the schedule's cron expression is invalid".to_string()),
+                    files: Vec::new(),
                 },
             );
             record.next_due = evaluation.next_due_ms.map(|due| DateMillis(due as f64));
@@ -953,6 +998,9 @@ impl super::ControlServer {
                     );
                 }
                 server.record_run_result(&record.id, fired_ms, session_id, result.err());
+                if let Ok(mut runs) = server.scheduler.file_runs.lock() {
+                    runs.remove(&record.id);
+                }
                 if asserting {
                     server
                         .scheduler
@@ -1172,11 +1220,38 @@ mod tests {
                     collapsed: 0,
                     session_id: None,
                     error: None,
+                    files: Vec::new(),
                 },
             );
         }
         assert_eq!(record.runs.len(), MAX_SCHEDULE_RUNS);
         assert_eq!(record.runs[0].due_at.0, 5.0);
+    }
+
+    #[test]
+    fn an_enabled_file_trigger_counts_as_live_work() {
+        let scheduler = Scheduler::default();
+        let mut record = ScheduleRecord {
+            id: "sched_files".into(),
+            spec: spec(ScheduleWhen::Files {
+                folder: "/tmp".into(),
+                glob: None,
+                recursive: false,
+            }),
+            created_at: DateMillis(0.0),
+            revision: 0,
+            next_due: None,
+            runs: Vec::new(),
+        };
+        scheduler.refresh(std::slice::from_ref(&record));
+        assert_eq!(scheduler.enabled_count(), 1, "keeps the Engine up");
+        assert!(
+            scheduler.state.lock().unwrap().pending.is_empty(),
+            "no timer"
+        );
+        record.spec.enabled = false;
+        scheduler.refresh(&[record]);
+        assert_eq!(scheduler.enabled_count(), 0);
     }
 
     #[test]
@@ -1217,6 +1292,9 @@ mod tests {
         assert_eq!(all, vec![record]);
     }
 }
+
+#[path = "schedule_files.rs"]
+mod files;
 
 #[cfg(all(test, unix))]
 #[path = "schedules_wake_tests.rs"]

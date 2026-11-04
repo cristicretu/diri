@@ -10,16 +10,36 @@ impl Bridge {
             optional_string(args, "cron"),
             optional_number(args, "at_ms"),
             optional_number(args, "in_minutes"),
+            optional_string(args, "watch_folder"),
         ) {
-            (Some(expr), None, None) => json!({ "kind": "cron", "expr": expr }),
-            (None, Some(at), None) => json!({ "kind": "once", "at": at }),
-            (None, None, Some(minutes)) if minutes >= 0.0 => {
+            (Some(expr), None, None, None) => json!({ "kind": "cron", "expr": expr }),
+            (None, Some(at), None, None) => json!({ "kind": "once", "at": at }),
+            (None, None, Some(minutes), None) if minutes >= 0.0 => {
                 json!({ "kind": "once", "at": now_ms() + minutes * 60_000.0 })
             }
+            (None, None, None, Some(folder)) => {
+                let mut when = json!({ "kind": "files", "folder": folder });
+                if let Some(glob) = optional_string(args, "glob") {
+                    when["glob"] = json!(glob);
+                }
+                if optional_bool(args, "recursive").unwrap_or(false) {
+                    when["recursive"] = json!(true);
+                }
+                when
+            }
             _ => {
-                return Err("give exactly one of cron, at_ms, or in_minutes (>= 0)".to_owned());
+                return Err(
+                    "give exactly one of cron, at_ms, in_minutes (>= 0), or watch_folder"
+                        .to_owned(),
+                );
             }
         };
+        if when["kind"] != "files"
+            && (optional_string(args, "glob").is_some()
+                || optional_bool(args, "recursive").is_some())
+        {
+            return Err("glob and recursive only apply with watch_folder".to_owned());
+        }
         let catch_up_ms = match optional_number(args, "catch_up_hours") {
             Some(hours) if (0.0..=MAX_CATCH_UP_HOURS).contains(&hours) => {
                 Some((hours * 3_600_000.0) as u64)

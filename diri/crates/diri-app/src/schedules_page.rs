@@ -1,8 +1,9 @@
 //! Settings > Schedules: agent runs the Engine starts at a set time.
 //!
 //! The Engine owns every schedule; this page only lists them, creates simple
-//! ones (once, daily, weekdays, hourly at a time), and toggles, runs, or
-//! deletes them. Agents create richer cron schedules through MCP.
+//! ones (once, daily, weekdays, hourly at a time, or whenever new files
+//! arrive in a folder), and toggles, runs, or deletes them. Agents create
+//! richer cron schedules through MCP.
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -42,10 +43,18 @@ pub(crate) enum Repeat {
     Daily,
     Weekdays,
     Hourly,
+    /// A file trigger: runs whenever new files arrive in a watched folder.
+    NewFiles,
 }
 
 impl Repeat {
-    const ALL: [Self; 4] = [Self::Once, Self::Daily, Self::Weekdays, Self::Hourly];
+    const ALL: [Self; 5] = [
+        Self::Once,
+        Self::Daily,
+        Self::Weekdays,
+        Self::Hourly,
+        Self::NewFiles,
+    ];
 
     fn label(self) -> &'static str {
         t(match self {
@@ -53,6 +62,7 @@ impl Repeat {
             Self::Daily => "settings.schedules.repeat_daily",
             Self::Weekdays => "settings.schedules.repeat_weekdays",
             Self::Hourly => "settings.schedules.repeat_hourly",
+            Self::NewFiles => "settings.schedules.repeat_files",
         })
     }
 }
@@ -61,6 +71,7 @@ impl Repeat {
 enum Field {
     Prompt,
     Time,
+    Glob,
 }
 
 struct Draft {
@@ -69,6 +80,11 @@ struct Draft {
     repeat: Repeat,
     agent: Option<AgentKind>,
     folder: Option<PathBuf>,
+    /// File trigger: the folder watched for new files, an optional name
+    /// pattern, and whether subfolders count.
+    watch: Option<PathBuf>,
+    glob: QueryEditor,
+    recursive: bool,
     catch_up: bool,
     keep_awake: bool,
     wake_mac: bool,
@@ -87,6 +103,9 @@ impl Draft {
             repeat: Repeat::Weekdays,
             agent,
             folder,
+            watch: None,
+            glob: QueryEditor::default(),
+            recursive: false,
             catch_up: true,
             keep_awake: false,
             wake_mac: false,
@@ -100,6 +119,17 @@ impl Draft {
         match self.field {
             Field::Prompt => &mut self.prompt,
             Field::Time => &mut self.time,
+            Field::Glob => &mut self.glob,
+        }
+    }
+
+    /// The field Tab moves to after the prompt: the time, or for a file
+    /// trigger (which has no time) the name pattern.
+    fn second_field(&self) -> Field {
+        if self.repeat == Repeat::NewFiles {
+            Field::Glob
+        } else {
+            Field::Time
         }
     }
 }
@@ -188,6 +218,23 @@ impl SchedulesPage {
             refresh_task: None,
             _events: events_task,
         }
+    }
+
+    /// The Settings trigger editor as a fixture: a file trigger being drafted.
+    #[cfg(test)]
+    pub(crate) fn seed_file_trigger_draft(&mut self, now_ms: f64) {
+        self.seed_preview(now_ms, false);
+        let mut draft = Draft::new(
+            Some(AgentKind::CLAUDE_CODE),
+            Some(PathBuf::from("/Users/example/code/app")),
+        );
+        draft
+            .prompt
+            .insert("Reproduce each bug report and open an issue with the steps");
+        draft.repeat = Repeat::NewFiles;
+        draft.watch = Some(PathBuf::from("/Users/example/Inbox/bugs"));
+        draft.glob.insert("*.png, *.txt");
+        self.draft = Some(draft);
     }
 
     #[cfg(test)]
@@ -403,11 +450,24 @@ impl SchedulesPage {
     }
 
     fn choose_folder(&mut self, cx: &mut Context<Self>) {
+        self.choose_directory(false, cx);
+    }
+
+    /// Picks the agent's working folder, or with `watch` the folder a file
+    /// trigger watches.
+    fn choose_directory(&mut self, watch: bool, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some(t("settings.schedules.choose_prompt").into()),
+            prompt: Some(
+                t(if watch {
+                    "settings.schedules.watch_prompt"
+                } else {
+                    "settings.schedules.choose_prompt"
+                })
+                .into(),
+            ),
         });
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(paths))) = paths.await else {
@@ -415,7 +475,11 @@ impl SchedulesPage {
             };
             let _ = this.update(cx, |this, cx| {
                 if let (Some(draft), Some(path)) = (this.draft.as_mut(), paths.into_iter().next()) {
-                    draft.folder = Some(path);
+                    if watch {
+                        draft.watch = Some(path);
+                    } else {
+                        draft.folder = Some(path);
+                    }
                 }
                 cx.notify();
             });
@@ -436,6 +500,11 @@ impl SchedulesPage {
             draft.repeat,
             draft.agent.clone(),
             draft.folder.as_ref(),
+            plan::FileTrigger {
+                watch: draft.watch.as_ref(),
+                glob: draft.glob.text(),
+                recursive: draft.recursive,
+            },
             draft.catch_up,
             draft.keep_awake,
             draft.wake_mac,
@@ -510,8 +579,8 @@ impl SchedulesPage {
             }
             "tab" => {
                 draft.field = match draft.field {
-                    Field::Prompt => Field::Time,
-                    Field::Time => Field::Prompt,
+                    Field::Prompt => draft.second_field(),
+                    Field::Time | Field::Glob => Field::Prompt,
                 };
                 true
             }
@@ -598,6 +667,15 @@ pub(crate) mod plan {
         (hour < 24 && minute < 60).then_some((hour, minute))
     }
 
+    /// The form's file-trigger fields, used when the repeat is
+    /// [`Repeat::NewFiles`].
+    #[derive(Clone, Copy, Default)]
+    pub(crate) struct FileTrigger<'a> {
+        pub(crate) watch: Option<&'a PathBuf>,
+        pub(crate) glob: &'a str,
+        pub(crate) recursive: bool,
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spec(
         prompt: &str,
@@ -605,6 +683,7 @@ pub(crate) mod plan {
         repeat: Repeat,
         agent: Option<AgentKind>,
         folder: Option<&PathBuf>,
+        files: FileTrigger<'_>,
         catch_up: bool,
         keep_awake: bool,
         wake_mac: bool,
@@ -616,8 +695,23 @@ pub(crate) mod plan {
         }
         let folder = folder.ok_or(t("settings.schedules.error_folder"))?;
         let agent = agent.ok_or(t("settings.schedules.error_agent"))?;
-        let (hour, minute) = parse_time(time).ok_or(t("settings.schedules.error_time"))?;
+        let (hour, minute) = if repeat == Repeat::NewFiles {
+            (0, 0)
+        } else {
+            parse_time(time).ok_or(t("settings.schedules.error_time"))?
+        };
         let when = match repeat {
+            Repeat::NewFiles => ScheduleWhen::Files {
+                folder: files
+                    .watch
+                    .ok_or(t("settings.schedules.error_watch"))?
+                    .to_string_lossy()
+                    .into_owned(),
+                glob: Some(files.glob.trim())
+                    .filter(|glob| !glob.is_empty())
+                    .map(str::to_owned),
+                recursive: files.recursive,
+            },
             Repeat::Once => ScheduleWhen::Once {
                 at: DateMillis(
                     local::next_at(hour, minute, now_ms)
@@ -663,7 +757,8 @@ pub(crate) mod plan {
                 0
             },
             keep_awake,
-            wake_mac,
+            // A file trigger has no time to wake the Mac for.
+            wake_mac: wake_mac && repeat != Repeat::NewFiles,
             enabled: true,
         })
     }
@@ -677,6 +772,30 @@ pub(crate) mod plan {
     /// "Weekdays at 09:00", "Every hour at :15", or the cron itself.
     pub(crate) fn describe_when(when: &ScheduleWhen) -> String {
         match when {
+            ScheduleWhen::Files {
+                folder,
+                glob,
+                recursive,
+            } => {
+                let folder = home_relative(folder);
+                match (glob.as_deref(), recursive) {
+                    (Some(glob), false) => tf(
+                        "settings.schedules.when_files_glob",
+                        &[("glob", &glob), ("folder", &folder)],
+                    ),
+                    (Some(glob), true) => tf(
+                        "settings.schedules.when_files_glob_recursive",
+                        &[("glob", &glob), ("folder", &folder)],
+                    ),
+                    (None, false) => {
+                        tf("settings.schedules.when_files", &[("folder", &folder)])
+                    }
+                    (None, true) => tf(
+                        "settings.schedules.when_files_recursive",
+                        &[("folder", &folder)],
+                    ),
+                }
+            }
             ScheduleWhen::Once { at } => tf(
                 "settings.schedules.when_once",
                 &[("time", &local::describe(at.0, None))],
@@ -731,6 +850,31 @@ pub(crate) mod plan {
     pub(crate) fn describe_run(run: &ScheduleRun, now_ms: f64) -> (String, RunTone) {
         let due = local::describe(run.due_at.0, Some(now_ms));
         let fired = local::describe(run.fired_at.0, Some(now_ms));
+        if !run.files.is_empty() && run.outcome != ScheduleOutcome::Failed {
+            let handed = match run.files.as_slice() {
+                [file] => {
+                    let name = std::path::Path::new(file)
+                        .file_name()
+                        .map_or_else(|| file.clone(), |name| name.to_string_lossy().into_owned());
+                    tf(
+                        "settings.schedules.run_files_one",
+                        &[("file", &name), ("fired", &fired)],
+                    )
+                }
+                files => tf(
+                    "settings.schedules.run_files_other",
+                    &[("count", &files.len()), ("fired", &fired)],
+                ),
+            };
+            return if run.late_reason == Some(LateReason::NotRunning) {
+                (
+                    tf("settings.schedules.run_files_caught_up", &[("run", &handed)]),
+                    RunTone::Quiet,
+                )
+            } else {
+                (handed, RunTone::Quiet)
+            };
+        }
         let reason = match run.late_reason {
             Some(LateReason::Asleep) => t("settings.schedules.reason_asleep"),
             Some(LateReason::NotRunning) => t("settings.schedules.reason_not_running"),
@@ -997,6 +1141,7 @@ mod preview {
             Repeat::Daily,
             Some(kind),
             Some(&PathBuf::from("/Users/example/code/app")),
+            plan::FileTrigger::default(),
             true,
             false,
             false,
@@ -1020,8 +1165,36 @@ mod preview {
             collapsed,
             session_id: None,
             error: None,
+            files: Vec::new(),
         };
         vec![
+            ScheduleRecord {
+                id: "sched_files".into(),
+                spec: ScheduleSpec {
+                    title: "Reproduce bug reports from the inbox".into(),
+                    when: ScheduleWhen::Files {
+                        folder: "/Users/example/Inbox/bugs".into(),
+                        glob: Some("*.png, *.txt".into()),
+                        recursive: false,
+                    },
+                    spawn: spawn("Reproduce each bug report", AgentKind::CLAUDE_CODE),
+                    catch_up_window_ms: DEFAULT_CATCH_UP_WINDOW_MS,
+                    keep_awake: false,
+                    wake_mac: false,
+                    enabled: true,
+                },
+                created_at: DateMillis(now - 26.0 * hour),
+                revision: 7,
+                next_due: None,
+                runs: vec![ScheduleRun {
+                    files: vec![
+                        "/Users/example/Inbox/bugs/checkout-crash.png".into(),
+                        "/Users/example/Inbox/bugs/checkout-crash.txt".into(),
+                        "/Users/example/Inbox/bugs/login-loop.png".into(),
+                    ],
+                    ..run(now - 840_000.0, now - 838_000.0, ScheduleOutcome::OnTime, None, 0)
+                }],
+            },
             ScheduleRecord {
                 id: "sched_1".into(),
                 spec: ScheduleSpec {
@@ -1226,7 +1399,9 @@ impl SchedulesPage {
             detail.push_str(" · ");
             detail.push_str(t("settings.schedules.keeps_awake"));
         }
+        let watching = matches!(record.spec.when, ScheduleWhen::Files { .. });
         let next = match (&record.next_due, record.spec.enabled) {
+            (_, true) if watching => Some(t("settings.schedules.watching").to_owned()),
             (Some(next), true) => Some(tf(
                 "settings.schedules.next",
                 &[("time", &local::describe(next.0, Some(now)))],
@@ -1281,15 +1456,18 @@ impl SchedulesPage {
         }
         let run_id = id.clone();
         let delete_id = id.clone();
-        actions = actions
-            .child(
+        // A file trigger's runs are its files; a bare "run now" has none.
+        if !watching {
+            actions = actions.child(
                 button(
                     SharedString::from(format!("schedule-run-{id}")),
                     t("settings.schedules.run_now"),
                     colors,
                 )
                 .on_click(cx.listener(move |this, _, _, cx| this.run_now(run_id.clone(), cx))),
-            )
+            );
+        }
+        actions = actions
             .child(
                 button(
                     SharedString::from(format!("schedule-delete-{id}")),
@@ -1481,6 +1659,12 @@ impl SchedulesPage {
         let catch_up = draft.catch_up;
         let keep_awake = draft.keep_awake;
         let wake_mac = draft.wake_mac;
+        let files = draft.repeat == Repeat::NewFiles;
+        let recursive = draft.recursive;
+        let watch = draft
+            .watch
+            .as_ref()
+            .map(|folder| home_relative(&folder.to_string_lossy()));
         let toggle = |id: &'static str,
                       label: &'static str,
                       detail: &'static str,
@@ -1557,53 +1741,124 @@ impl SchedulesPage {
                     .child(label(t("settings.schedules.when")))
                     .child(repeats)
                     .child(div().flex_1())
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(colors.secondary)
-                            .child(if draft.repeat == Repeat::Hourly {
-                                t("settings.schedules.minute")
-                            } else {
-                                t("settings.schedules.at")
-                            }),
-                    )
-                    .child(self.field(
-                        "schedule-time",
-                        Field::Time,
-                        &draft.time,
-                        "09:00",
-                        Some(72.0),
-                        cx,
-                    )),
+                    .when(!files, |row| {
+                        row.child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(colors.secondary)
+                                .child(if draft.repeat == Repeat::Hourly {
+                                    t("settings.schedules.minute")
+                                } else {
+                                    t("settings.schedules.at")
+                                }),
+                        )
+                        .child(self.field(
+                            "schedule-time",
+                            Field::Time,
+                            &draft.time,
+                            "09:00",
+                            Some(72.0),
+                            cx,
+                        ))
+                    }),
             )
-            .child(divider(colors))
-            .child(toggle(
-                "schedule-catch-up",
-                t("settings.schedules.catch_up"),
-                t("settings.schedules.catch_up_detail"),
-                catch_up,
-                cx,
-                |draft| draft.catch_up = !draft.catch_up,
-            ))
-            .child(divider(colors))
-            .child(toggle(
-                "schedule-keep-awake",
-                t("settings.schedules.keep_awake"),
-                t("settings.schedules.keep_awake_detail"),
-                keep_awake,
-                cx,
-                |draft| draft.keep_awake = !draft.keep_awake,
-            ))
-            .child(divider(colors))
-            .child(toggle(
-                "schedule-wake-mac",
-                t("settings.schedules.wake_mac"),
-                t("settings.schedules.wake_mac_detail"),
-                wake_mac,
-                cx,
-                |draft| draft.wake_mac = !draft.wake_mac,
-            ));
-        if wake_mac && self.wake_helper.status != login::Status::Enabled {
+            .child(divider(colors));
+        if files {
+            form = form
+                .child(
+                    row()
+                        .child(label(t("settings.schedules.watch")))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_size(px(13.0))
+                                .text_color(if watch.is_some() {
+                                    colors.primary
+                                } else {
+                                    colors.tertiary
+                                })
+                                .child(watch.unwrap_or_else(|| {
+                                    t("settings.schedules.watch_none").into()
+                                })),
+                        )
+                        .child(
+                            button("schedule-watch", t("settings.schedules.choose"), colors)
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.choose_directory(true, cx)),
+                                ),
+                        ),
+                )
+                .child(divider(colors))
+                .child(
+                    row()
+                        .child(label(t("settings.schedules.only")))
+                        .child(self.field(
+                            "schedule-glob",
+                            Field::Glob,
+                            &draft.glob,
+                            t("settings.schedules.glob_placeholder"),
+                            None,
+                            cx,
+                        )),
+                )
+                .child(divider(colors))
+                .child(toggle(
+                    "schedule-subfolders",
+                    t("settings.schedules.subfolders"),
+                    t("settings.schedules.subfolders_detail"),
+                    recursive,
+                    cx,
+                    |draft| draft.recursive = !draft.recursive,
+                ))
+                .child(divider(colors))
+                .child(toggle(
+                    "schedule-keep-awake",
+                    t("settings.schedules.keep_awake"),
+                    t("settings.schedules.keep_awake_detail"),
+                    keep_awake,
+                    cx,
+                    |draft| draft.keep_awake = !draft.keep_awake,
+                ))
+                .child(
+                    div()
+                        .px(px(12.0))
+                        .py(px(8.0))
+                        .text_size(px(12.0))
+                        .text_color(colors.tertiary)
+                        .child(t("settings.schedules.files_detail")),
+                );
+        } else {
+            form = form
+                .child(toggle(
+                    "schedule-catch-up",
+                    t("settings.schedules.catch_up"),
+                    t("settings.schedules.catch_up_detail"),
+                    catch_up,
+                    cx,
+                    |draft| draft.catch_up = !draft.catch_up,
+                ))
+                .child(divider(colors))
+                .child(toggle(
+                    "schedule-keep-awake",
+                    t("settings.schedules.keep_awake"),
+                    t("settings.schedules.keep_awake_detail"),
+                    keep_awake,
+                    cx,
+                    |draft| draft.keep_awake = !draft.keep_awake,
+                ))
+                .child(divider(colors))
+                .child(toggle(
+                    "schedule-wake-mac",
+                    t("settings.schedules.wake_mac"),
+                    t("settings.schedules.wake_mac_detail"),
+                    wake_mac,
+                    cx,
+                    |draft| draft.wake_mac = !draft.wake_mac,
+                ));
+        }
+        if wake_mac && !files && self.wake_helper.status != login::Status::Enabled {
             form = form.child(
                 div()
                     .px(px(12.0))
@@ -1846,6 +2101,7 @@ mod tests {
                 repeat,
                 Some(AgentKind::CLAUDE_CODE),
                 Some(&folder),
+                FileTrigger::default(),
                 true,
                 false,
                 false,
@@ -1892,6 +2148,7 @@ mod tests {
                 Repeat::Daily,
                 agent.clone(),
                 Some(&folder),
+                FileTrigger::default(),
                 true,
                 false,
                 false,
@@ -1906,6 +2163,7 @@ mod tests {
                 Repeat::Daily,
                 agent.clone(),
                 None,
+                FileTrigger::default(),
                 true,
                 false,
                 false,
@@ -1920,6 +2178,7 @@ mod tests {
                 Repeat::Daily,
                 None,
                 Some(&folder),
+                FileTrigger::default(),
                 true,
                 false,
                 false,
@@ -1934,6 +2193,7 @@ mod tests {
                 Repeat::Daily,
                 agent,
                 Some(&folder),
+                FileTrigger::default(),
                 true,
                 false,
                 false,
@@ -1972,6 +2232,7 @@ mod tests {
             collapsed: 2,
             session_id: None,
             error: None,
+            files: Vec::new(),
         };
         let (text, tone) = describe_run(&run, now);
         assert_eq!(tone, RunTone::Attention);
@@ -1981,5 +2242,86 @@ mod tests {
         );
         assert!(text.contains("Mac was asleep"), "{text}");
         assert!(text.contains("2 earlier missed runs"), "{text}");
+    }
+
+    #[test]
+    fn the_form_builds_a_file_trigger() {
+        let folder = PathBuf::from("/tmp");
+        let inbox = PathBuf::from("/Users/me/Inbox");
+        let build = |watch: Option<&PathBuf>, glob: &str| {
+            spec(
+                "triage",
+                "",
+                Repeat::NewFiles,
+                Some(AgentKind::CLAUDE_CODE),
+                Some(&folder),
+                FileTrigger {
+                    watch,
+                    glob,
+                    recursive: true,
+                },
+                true,
+                false,
+                true,
+                0.0,
+            )
+        };
+        let trigger = build(Some(&inbox), " *.png ").unwrap();
+        assert_eq!(
+            trigger.when,
+            ScheduleWhen::Files {
+                folder: "/Users/me/Inbox".into(),
+                glob: Some("*.png".into()),
+                recursive: true,
+            }
+        );
+        assert!(!trigger.wake_mac, "a file trigger never wakes the Mac");
+        let ScheduleWhen::Files { glob, .. } = build(Some(&inbox), "  ").unwrap().when else {
+            panic!("files");
+        };
+        assert_eq!(glob, None, "an empty pattern means every file");
+        assert_eq!(
+            build(None, "").unwrap_err(),
+            "Choose a folder to watch for new files."
+        );
+    }
+
+    #[test]
+    fn file_triggers_and_their_runs_read_as_words() {
+        let files = |glob: Option<&str>, recursive| ScheduleWhen::Files {
+            folder: "/srv/inbox".into(),
+            glob: glob.map(str::to_owned),
+            recursive,
+        };
+        assert_eq!(
+            describe_when(&files(None, false)),
+            "When files arrive in /srv/inbox"
+        );
+        assert_eq!(
+            describe_when(&files(Some("*.png"), true)),
+            "When *.png arrives in /srv/inbox or its subfolders"
+        );
+        let now = super::local::next_at(9, 0, 0.0).unwrap() + 3_600_000.0;
+        let mut run = ScheduleRun {
+            due_at: DateMillis(now - 3_600_000.0),
+            fired_at: DateMillis(now - 3_600_000.0),
+            outcome: ScheduleOutcome::OnTime,
+            late_reason: None,
+            collapsed: 0,
+            session_id: None,
+            error: None,
+            files: vec!["/srv/inbox/crash.png".into()],
+        };
+        assert_eq!(
+            describe_run(&run, now),
+            ("Handed over crash.png today at 09:00".into(), RunTone::Quiet)
+        );
+        run.files.push("/srv/inbox/log.txt".into());
+        run.outcome = ScheduleOutcome::Late;
+        run.late_reason = Some(LateReason::NotRunning);
+        assert_eq!(
+            describe_run(&run, now).0,
+            "Handed over 2 files today at 09:00, picked up when diri started"
+        );
     }
 }

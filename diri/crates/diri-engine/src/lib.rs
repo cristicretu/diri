@@ -46,6 +46,7 @@ pub mod dev_build;
 pub mod directories;
 pub mod events;
 #[doc(hidden)]
+pub mod file_trigger;
 pub mod find_history;
 pub mod git;
 pub mod governor;

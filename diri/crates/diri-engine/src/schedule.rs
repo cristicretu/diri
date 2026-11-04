@@ -171,8 +171,13 @@ fn value(text: &str, min: u32, names: &[&str]) -> Result<u32, String> {
 
 /// Validates `when` and returns its first occurrence strictly after `now_ms`.
 /// A one-shot in the past is still returned so catch-up can decide its fate.
+/// A file trigger has no due time; its folder is validated by the caller.
 pub fn first_due(when: &ScheduleWhen, now_ms: i64) -> Result<Option<i64>, String> {
     match when {
+        ScheduleWhen::Files { glob, .. } => {
+            crate::file_trigger::Glob::parse(glob.as_deref().unwrap_or(""))?;
+            Ok(None)
+        }
         ScheduleWhen::Once { at } => Ok(Some(at.0 as i64)),
         ScheduleWhen::Cron { expr } => {
             let cron = Cron::parse(expr)?;
@@ -206,6 +211,8 @@ pub fn evaluate(
         return None;
     }
     let (latest, collapsed, next_due_ms) = match when {
+        // Fired by its folder, never by the clock.
+        ScheduleWhen::Files { .. } => return None,
         ScheduleWhen::Once { .. } => (next_due_ms, 0, None),
         ScheduleWhen::Cron { expr } => {
             let Ok(cron) = Cron::parse(expr) else {
