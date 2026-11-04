@@ -725,6 +725,10 @@ impl NotePane {
         }
         open.saved = source;
         open.front = theirs.front;
+        // An outside write can retitle the note (an agent's edit_note on the
+        // # line); the sidebar row follows without waiting for our next save.
+        let title = open.editor.read(cx).editor.document().title;
+        self.sync_title(&title, cx);
     }
 
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
