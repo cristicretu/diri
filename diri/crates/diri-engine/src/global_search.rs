@@ -183,7 +183,10 @@ fn scan_screens<S: SearchScreen>(
             let Some(mut scan) = queue.lock().expect("search queue").pop_front() else {
                 return;
             };
-            if Instant::now() < deadline {
+            // A session not yet started always gets one run, even past the
+            // deadline: it has no cursor yet, so skipping it would drop it
+            // from the results without a resume cursor to come back for it.
+            if scan.before.is_none() || Instant::now() < deadline {
                 let source = &screens[scan.index].1;
                 scan_turn(&mut scan, || source.screen(), query, max_lines, deadline);
             }
@@ -785,6 +788,36 @@ mod tests {
         assert!(pages > 2);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].text, "rare needle");
+    }
+
+    #[test]
+    fn a_deadline_already_past_still_gives_every_session_its_first_run() {
+        // A loaded machine can spend the whole budget before a worker pops
+        // the second session; it must still be searched or get a cursor.
+        let mut lines: Vec<String> = (0..40_000).map(|i| format!("plain output {i}")).collect();
+        lines[10] = "rare needle".into();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let screens = vec![
+            (SessionId("big".into()), terminal(&refs)),
+            (SessionId("small".into()), terminal(&["rare needle too"])),
+        ];
+        let past = Instant::now() - Duration::from_secs(1);
+        let scans = scan_screens(&screens, vec![(0, None), (1, None)], "needle", 2, past);
+        let small = scans
+            .iter()
+            .find(|scan| scan.index == 1)
+            .expect("small scanned");
+        assert!(small.done);
+        assert_eq!(small.lines.len(), 1);
+        let big = scans
+            .iter()
+            .find(|scan| scan.index == 0)
+            .expect("big scanned");
+        assert!(!big.done);
+        assert!(
+            big.before.is_some(),
+            "an unfinished session keeps a resume cursor"
+        );
     }
 
     #[test]
