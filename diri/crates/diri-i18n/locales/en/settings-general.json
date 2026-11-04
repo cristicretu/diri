@@ -31,6 +31,8 @@
   "settings.general.dock_badge_detail": "Count sessions you haven’t looked at, or every unread notification.",
   "settings.general.dock_badge_notifications": "Notifications",
   "settings.general.dock_badge_sessions": "Sessions",
+  "settings.general.fold_sessions": "Fold working and settled sessions",
+  "settings.general.fold_sessions_detail": "Keep the sessions that need you at the top of each project. Working and seen idle sessions fold into Working and Settled.",
   "settings.general.include_hint": "One pattern per line, saved to ~/.diri-include. Hidden folders stay skipped unless they match. Wildcards follow gitignore rules, including nested folders.",
   "settings.general.interface_language": "Interface language",
   "settings.general.interface_language_detail": "Menus, settings and labels. Agent output and terminal text stay as they are.",

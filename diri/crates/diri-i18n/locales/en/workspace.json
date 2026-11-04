@@ -198,6 +198,8 @@
   "sidebar.filter.sessions": "Filter session labels",
   "sidebar.filter.tabs": "Filter tab labels",
   "sidebar.filter_empty": "No sessions match this filter",
+  "sidebar.fold.settled": "Settled",
+  "sidebar.fold.working": "Working",
   "sidebar.hide": "Hide sidebar",
   "sidebar.new_agent": "New Agent",
   "sidebar.new_agent.also_cmd_t": "Also where ⌘T opens",

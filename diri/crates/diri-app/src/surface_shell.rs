@@ -4722,6 +4722,22 @@ impl UtilitySurfaces {
                         ))
                         .child(setting_divider(colors))
                         .child(toggle_row(
+                            t("settings.general.fold_sessions"),
+                            t("settings.general.fold_sessions_detail"),
+                            self.prefs.sidebar_fold_sessions,
+                            "toggle-fold-sessions",
+                            colors,
+                            cx,
+                            |this, cx| {
+                                let enabled = !this.prefs.sidebar_fold_sessions;
+                                this.update_prefs(move |prefs| {
+                                    prefs.sidebar_fold_sessions = enabled;
+                                });
+                                cx.notify();
+                            },
+                        ))
+                        .child(setting_divider(colors))
+                        .child(toggle_row(
                             t("settings.general.chimes"),
                             t("settings.general.chimes_detail"),
                             self.prefs.status_sounds,

@@ -529,6 +529,7 @@ Sessions are grouped by project folder. Sessions started by another agent nest u
 
 | Task | How |
 | --- | --- |
+| Keep only what needs you on top | Turn on **Settings → General → Fold working and settled sessions**. In each project, working sessions fold under **Working** and idle sessions you have seen fold under **Settled**. A session comes back up when it finishes, fails or asks for something |
 | Rename | Double-click the row, <kbd>⌘</kbd><kbd>R</kbd>, or **Rename…** |
 | Pin | **Pin Session** in the row's menu |
 | Reorder | Drag between rows, or <kbd>⌃</kbd><kbd>⌘</kbd><kbd>↑</kbd> / <kbd>↓</kbd> |

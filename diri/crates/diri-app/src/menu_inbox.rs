@@ -201,6 +201,8 @@ mod tests {
             sessions: visible,
             active,
             archived: Vec::new(),
+            working: Vec::new(),
+            settled: Vec::new(),
             pinned: false,
         }
     }

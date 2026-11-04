@@ -31,6 +31,8 @@
   "settings.general.dock_badge_detail": "统计你尚未查看的会话，或每条未读通知。",
   "settings.general.dock_badge_notifications": "通知",
   "settings.general.dock_badge_sessions": "会话",
+  "settings.general.fold_sessions": "折叠工作中和已处理的会话",
+  "settings.general.fold_sessions_detail": "在每个项目顶部只保留需要你的会话。工作中和已看过的空闲会话折叠到“工作中”和“已处理”。",
   "settings.general.include_hint": "每行一个模式，保存到 ~/.diri-include。隐藏文件夹默认跳过，除非与模式匹配。通配符遵循 gitignore 规则，包括嵌套文件夹。",
   "settings.general.interface_language": "界面语言",
   "settings.general.interface_language_detail": "菜单、设置与界面文字。智能体输出与终端内容保持原样。",

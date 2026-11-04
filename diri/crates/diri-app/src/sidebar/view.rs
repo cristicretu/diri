@@ -2,6 +2,7 @@ mod accounts;
 mod activity;
 mod arrivals;
 mod filter;
+mod folds;
 mod hover_linger;
 mod hover_status;
 #[cfg(test)]
@@ -766,6 +767,9 @@ pub struct Sidebar {
     body_generation: u64,
     project_disclosures: HashMap<ProjectId, (Disclosure, Vec<crate::store::SidebarRow>)>,
     archive_disclosures: HashMap<ProjectId, Disclosure>,
+    /// Working and Settled folds the user opened. They start closed.
+    expanded_folds: HashSet<(ProjectId, folds::FoldKind)>,
+    fold_disclosures: HashMap<(ProjectId, folds::FoldKind), Disclosure>,
     recency_disclosure: Option<Disclosure>,
     disclosure_animating: bool,
     /// The last paint asked the display link for another frame of a row or
@@ -976,6 +980,8 @@ impl Sidebar {
             body_generation: 0,
             project_disclosures: HashMap::new(),
             archive_disclosures: HashMap::new(),
+            expanded_folds: HashSet::new(),
+            fold_disclosures: HashMap::new(),
             recency_disclosure: None,
             disclosure_animating: false,
             disclosure_tick: false,
@@ -1680,7 +1686,9 @@ impl Sidebar {
         }
         let today = local_day_ordinal(wall_clock_millis()).unwrap_or(0);
         match grouping {
-            SidebarGrouping::Project => focus_rows(&projection, &expanded_archives),
+            SidebarGrouping::Project => {
+                focus_rows(&projection, &expanded_archives, &self.expanded_folds)
+            }
             SidebarGrouping::Recency => recency_focus_rows(
                 &projection,
                 recency_archives_expanded,
@@ -3089,6 +3097,12 @@ impl Sidebar {
         section = section.child(header);
         self.row_window.advance(SIDEBAR_NAV_ROW_HEIGHT);
 
+        // Folds and the archive each count as one row of the body.
+        let body_extras = usize::from(!group.archived.is_empty())
+            + folds::FoldKind::ALL
+                .into_iter()
+                .filter(|kind| !kind.rows(group).is_empty())
+                .count();
         // Keep the last visible rows only for the close animation. The Store
         // remains authoritative for keyboard navigation and selection.
         let now = Instant::now();
@@ -3097,11 +3111,7 @@ impl Sidebar {
             .entry(id.clone())
             .or_insert_with(|| {
                 (
-                    Disclosure::new(
-                        !collapsed,
-                        group.sessions.len() + usize::from(!group.archived.is_empty()),
-                        now,
-                    ),
+                    Disclosure::new(!collapsed, group.sessions.len() + body_extras, now),
                     Vec::new(),
                 )
             });
@@ -3124,12 +3134,7 @@ impl Sidebar {
             .project_disclosures
             .get_mut(&id)
             .expect("inserted above");
-        let frame = motion.update(
-            !collapsed,
-            count + usize::from(!group.archived.is_empty()),
-            now,
-            cx.reduce_motion(),
-        );
+        let frame = motion.update(!collapsed, count + body_extras, now, cx.reduce_motion());
         self.disclosure_animating |= frame.animating;
         if collapsed && !frame.animating {
             retained.clear();
@@ -3190,6 +3195,18 @@ impl Sidebar {
                     row: rendered,
                     height,
                     margin,
+                });
+            }
+            for kind in folds::FoldKind::ALL {
+                if kind.rows(group).is_empty() {
+                    continue;
+                }
+                self.row_window.advance(2.0);
+                let (fold, height) = self.session_fold(group, kind, !collapsed, colors, window, cx);
+                children.push(Slot::Built {
+                    row: fold,
+                    height,
+                    margin: 2.0,
                 });
             }
             if !group.archived.is_empty() {
@@ -8143,11 +8160,16 @@ impl Sidebar {
 fn focus_rows(
     projection: &crate::store::SidebarProjection,
     expanded_archives: &[ProjectId],
+    expanded_folds: &HashSet<(ProjectId, folds::FoldKind)>,
 ) -> Vec<FocusRow> {
     let mut result = Vec::new();
     for group in &projection.projects {
         let mut ancestors: Vec<SessionId> = Vec::new();
-        for row in &group.sessions {
+        let folded = folds::FoldKind::ALL.into_iter().flat_map(|kind| {
+            let open = expanded_folds.contains(&(group.project.id.clone(), kind));
+            kind.rows(group).iter().filter(move |_| open)
+        });
+        for row in group.sessions.iter().chain(folded) {
             let depth = usize::from(row.depth);
             ancestors.truncate(depth);
             let parent = depth
@@ -8626,6 +8648,12 @@ impl Sidebar {
                     .iter()
                     .any(|group| &group.project.id == id && !group.archived.is_empty())
         });
+        self.fold_disclosures.retain(|(id, kind), _| {
+            projection
+                .projects
+                .iter()
+                .any(|group| &group.project.id == id && !kind.rows(group).is_empty())
+        });
         if grouping != SidebarGrouping::Recency
             || projection
                 .projects
@@ -8636,7 +8664,9 @@ impl Sidebar {
         }
         let today = local_day_ordinal(wall_clock_millis()).unwrap_or(0);
         let focus_rows = match grouping {
-            SidebarGrouping::Project => focus_rows(&projection, &expanded_archives),
+            SidebarGrouping::Project => {
+                focus_rows(&projection, &expanded_archives, &self.expanded_folds)
+            }
             SidebarGrouping::Recency => recency_focus_rows(
                 &projection,
                 recency_archives_expanded,
@@ -10671,6 +10701,123 @@ mod tests {
             "a waiting row keeps its second line"
         );
         assert_eq!(row_bounds(&sidebar, cx, "preview-codex").size.height, px(30.0));
+    }
+
+    /// With folds on, each project keeps only what needs you at the top.
+    /// Working and seen idle trees fold away, closed, under Working and
+    /// Settled; a subtree with anything that needs you stays up whole, as
+    /// does the selected one. Opening a fold shows and focuses its rows, and
+    /// turning the setting off restores the list.
+    #[gpui::test]
+    fn folds_keep_only_what_needs_you_at_the_top(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        let ids = |rows: &[crate::store::SidebarRow]| -> Vec<String> {
+            rows.iter().map(|row| row.id().0.clone()).collect()
+        };
+        let groups = |cx: &mut VisualTestContext| {
+            sidebar.update(cx, |sidebar, _| {
+                let mut store = sidebar.store.write().expect("store");
+                let projection = sidebar.visible_projection(&mut store);
+                projection
+                    .projects
+                    .iter()
+                    .map(|group| {
+                        (
+                            group.project.id.0.clone(),
+                            (ids(&group.sessions), ids(&group.working), ids(&group.settled)),
+                        )
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+        };
+        sidebar.update(cx, |sidebar, cx| {
+            let mut store = sidebar.store.write().expect("store");
+            store
+                .toggle_project_collapsed(ProjectId::new("preview-anara"))
+                .unwrap();
+            drop(store);
+            sidebar.store_changed(cx);
+        });
+        cx.run_until_parked();
+        let unfolded = groups(cx);
+
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar
+                .store
+                .write()
+                .expect("store")
+                .update_preferences(|prefs| prefs.sidebar_fold_sessions = true)
+                .unwrap();
+            sidebar.store_changed(cx);
+        });
+        cx.run_until_parked();
+        let folded = groups(cx);
+        let (top, working, settled) = &folded["preview-dirijor"];
+        assert_eq!(top[..2], ["preview-claude", "preview-codex"], "{top:?}");
+        assert!(
+            top.contains(&"preview-spawned-review".to_owned()),
+            "a working child stays with its selected parent: {top:?}"
+        );
+        assert!(working.is_empty(), "{working:?}");
+        assert_eq!(settled, &["preview-shell"]);
+        let (top, working, settled) = &folded["preview-anara"];
+        assert_eq!(top, &["preview-question"]);
+        assert_eq!(working, &["preview-gemini"]);
+        assert!(settled.is_empty());
+        let (top, _, settled) = &folded["preview-settings-kit"];
+        assert!(top.is_empty());
+        assert_eq!(settled, &["preview-sleeping"]);
+
+        // Let the unfolded project finish opening (its disclosure runs on
+        // the wall clock) before anything is measured or clicked.
+        std::thread::sleep(Duration::from_millis(400));
+        for _ in 0..2 {
+            sidebar.update(cx, |sidebar, cx| sidebar.store_changed(cx));
+            cx.run_until_parked();
+        }
+        // Folds start closed: their headers show, their rows do not.
+        let header = cx
+            .debug_bounds("FOLD_working:preview-anara")
+            .expect("the Working fold has a header");
+        assert!(cx.debug_bounds("FOLD_settled:preview-dirijor").is_some());
+        let painted = |cx: &VisualTestContext, id: &str| {
+            sidebar.read_with(cx, |sidebar, _| {
+                sidebar.row_bounds.borrow().contains_key(&SessionId::new(id))
+            })
+        };
+        assert!(!painted(cx, "preview-gemini"));
+        assert!(painted(cx, "preview-question"));
+        let focusable = |cx: &mut VisualTestContext, id: &str| {
+            sidebar.read_with(cx, |sidebar, _| {
+                sidebar.focus_rows_snapshot().0.iter().any(|row| row.id.0 == id)
+            })
+        };
+        assert!(!focusable(cx, "preview-gemini"));
+
+        cx.simulate_click(header.center(), Modifiers::default());
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(400));
+        sidebar.update(cx, |sidebar, cx| sidebar.store_changed(cx));
+        cx.run_until_parked();
+        assert!(
+            sidebar.read_with(cx, |sidebar, _| sidebar
+                .fold_expanded(&ProjectId::new("preview-anara"), folds::FoldKind::Working)),
+            "the click opens the fold"
+        );
+        assert!(painted(cx, "preview-gemini"), "an open fold shows its rows");
+        assert!(focusable(cx, "preview-gemini"));
+
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar
+                .store
+                .write()
+                .expect("store")
+                .update_preferences(|prefs| prefs.sidebar_fold_sessions = false)
+                .unwrap();
+            sidebar.store_changed(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(groups(cx), unfolded);
     }
 
     /// A question keeps its row's title and opens a second line under it:
@@ -13349,6 +13496,28 @@ mod tests {
                     if std::env::var_os("DIRI_VISUAL_ACTIVITY").is_some() {
                         sidebar.activity_filter = true;
                         sidebar.age_now = Some(1_750_000_000_000);
+                    }
+                    // `DIRI_VISUAL_FOLDS=1` turns on the Working and Settled
+                    // folds; `DIRI_VISUAL_FOLDS=open` opens every one.
+                    if let Ok(folds) = std::env::var("DIRI_VISUAL_FOLDS") {
+                        let _ = sidebar
+                            .store
+                            .write()
+                            .unwrap()
+                            .update_preferences(|prefs| {
+                                prefs.sidebar_fold_sessions = true;
+                                // Open Anara, so its Working fold shows.
+                                prefs
+                                    .sidebar_collapsed_projects
+                                    .retain(|project| project.0 != "preview-anara");
+                            });
+                        if folds == "open" {
+                            for project in ["preview-dirijor", "preview-anara", "preview-settings-kit"] {
+                                for kind in folds::FoldKind::ALL {
+                                    sidebar.expanded_folds.insert((ProjectId::new(project), kind));
+                                }
+                            }
+                        }
                     }
 
                     if std::env::var_os("DIRI_VISUAL_HOVER_PROJECT").is_some() {
