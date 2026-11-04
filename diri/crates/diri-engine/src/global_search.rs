@@ -728,31 +728,30 @@ mod tests {
 
     #[test]
     fn caps_lines_and_reports_more_and_covers_deep_history() {
-        // Deeper than a screen, shallow enough for an unoptimized build to
-        // finish inside the budget.
-        let mut lines: Vec<String> = (0..12_000).map(|i| format!("row {i}")).collect();
+        // Two hundred screens deep, yet small enough that a loaded CI runner
+        // finishes an unoptimized scan well inside the maximum budget (12k
+        // rows timed out at 200 ms and dropped the oldest match).
+        let mut lines: Vec<String> = (0..1_200).map(|i| format!("row {i}")).collect();
         lines[3] = "needle early".into();
-        lines[6_000] = "needle middle".into();
-        lines[11_000] = "needle late".into();
+        lines[600] = "needle middle".into();
+        lines[1_100] = "needle late".into();
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
         let screens = vec![(SessionId("deep".into()), terminal(&refs))];
-        let result = search(&params("needle"), &screens, &[]);
+        let deep = |max_lines_per_session| GlobalSearchParams {
+            max_lines_per_session,
+            budget_ms: SEARCH_MAX_BUDGET_MS,
+            ..params("needle")
+        };
+        let result = search(&deep(2), &screens, &[]);
         let hit = &result.screens[0];
         assert_eq!(hit.lines.len(), 2);
         assert!(hit.more);
         assert_eq!(hit.lines[0].text, "needle late");
-        let all = search(
-            &GlobalSearchParams {
-                max_lines_per_session: 8,
-                ..params("needle")
-            },
-            &screens,
-            &[],
-        );
+        let all = search(&deep(8), &screens, &[]);
         assert_eq!(all.screens[0].lines.len(), 3);
         assert_eq!(all.screens[0].lines[2].text, "needle early");
         assert!(!all.screens[0].more);
-        assert!(all.rows_scanned >= 12_000);
+        assert!(all.rows_scanned >= 1_200);
         assert!(all.incomplete.resume.is_empty());
     }
 

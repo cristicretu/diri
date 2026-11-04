@@ -740,7 +740,7 @@ impl NavigationOverlay {
 
 /// Seeds the page for the headless screenshots: `scene` is `empty` (who
 /// needs you), `screen` (a scrollback hit, previewed) or `chat` (a reply).
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(super) fn seed_for_screenshot(overlay: &mut NavigationOverlay, scene: &str, cx: &mut Context<NavigationOverlay>) {
     use diri_proto::search::SearchLine;
     overlay.prepare_page(Overlay::Search, cx);
