@@ -386,6 +386,8 @@ pub struct RootView {
     notification_panel_open: bool,
     /// The system alert asking whether to close sessions, while it is up.
     close_prompt: Option<Task<()>>,
+    /// The question for an Agent's destructive app action, while it is up.
+    agent_action_prompt: Option<Task<()>>,
     /// The What's New sheet, while open.
     whats_new: Option<Entity<crate::whats_new::WhatsNewSheet>>,
     terminal_import: Option<Entity<crate::terminal_import::sheet::TerminalImportSheet>>,
@@ -1637,6 +1639,7 @@ impl RootView {
             quote_target_picker: None,
             notification_panel_open: false,
             close_prompt: None,
+            agent_action_prompt: None,
             whats_new: None,
             terminal_import: None,
             main_viewport: gpui::Size::default(),

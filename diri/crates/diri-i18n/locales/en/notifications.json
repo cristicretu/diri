@@ -1,4 +1,8 @@
 {
+  "agent_confirm.allow": "Allow",
+  "agent_confirm.deny": "Don't Allow",
+  "agent_confirm.message": "This closes or removes something. Allow it only if you asked {agent} for it.",
+  "agent_confirm.title": "{agent} wants to run {action}",
   "agent_notice.app_action": "Run an app action",
   "agent_notice.change_workspaces": "Edit workspaces",
   "agent_notice.close_pane": "Close pane",
