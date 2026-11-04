@@ -413,6 +413,9 @@ impl NotePane {
             resave: false,
             _subscription: subscription,
         });
+        // The file may have been retitled while no editor watched it (an
+        // agent's own file tools, a revived closed tab): the row follows now.
+        self.sync_title(&note.doc.title, cx);
         self.backlinks = Some((footer, footer_subscription));
         self.push_mentions(cx);
         self.push_work(cx);
