@@ -371,6 +371,7 @@ fn append_management_actions(
                             | CommandId::CompactDensity
                             | CommandId::OpenSettings
                             | CommandId::ToggleHistory
+                            | CommandId::GlobalSearch
                             | CommandId::ToggleNotifications
                             | CommandId::ToggleActivity
                             | CommandId::ToggleReadAloud
@@ -721,6 +722,7 @@ pub fn actions_for_default_host(
         registered_action(CommandId::VerticalTabs),
         registered_action(CommandId::OpenSettings),
         registered_action(CommandId::ToggleHistory),
+        registered_action(CommandId::GlobalSearch),
         registered_action(CommandId::ToggleNotifications),
         registered_action(CommandId::ToggleActivity),
         registered_action(CommandId::ToggleReadAloud),
@@ -1412,6 +1414,7 @@ mod tests {
                 "vertical-tabs",
                 "settings",
                 "history",
+                "global-search",
                 "toggle-notifications",
                 "toggle-activity",
                 "toggle-read-aloud",

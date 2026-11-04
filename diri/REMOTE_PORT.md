@@ -1074,6 +1074,21 @@ to the Engine or add a Helper search protocol; neither is part of this baseline.
 The parser change alters the Helper Build ID only; live Holders keep their
 binary and no frame or on-disk format changes.
 
+Global search (November 2026) adds the local control method `search.global`:
+one bounded request that scans every session's grid the Engine already holds,
+newest row first, a run of 128 rows per screen-lock hold, sessions advancing in
+turns on a few scoped threads, until a time budget; what it did not reach comes
+back as per-session cursors the client may resume. It keeps no index and no
+state between requests. It also matches messages of live local Claude Code and
+Codex conversations through a bounded per-file transcript cache that is
+dropped three minutes after the last search. Remote sessions are searched only
+on the visible screen the Engine mirrors and their hits say so: their history
+lives on the host, and reaching it would mean paging every row over SSH or a
+Helper search request. Neither is added: there is no Helper protocol,
+capability, frame, or on-disk format change. The row search lives in the shared
+parser crate but only the Engine calls it, so a Helper Build ID change from it
+is incidental, as with the parser change above.
+
 The shared terminal parser additionally retains OSC 8 targets, soft-wrap facts,
 wide-cell continuation facts, combining characters, and OSC 133 A prompt-start
 marks. These are terminal screen facts; the Holder does not infer commands,

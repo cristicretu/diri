@@ -1344,6 +1344,18 @@ impl ScrollbackReader {
     }
 }
 
+impl crate::global_search::SearchScreen for ScrollbackReader {
+    fn screen(&self) -> std::sync::MutexGuard<'_, HeadlessScreen> {
+        self.shared.screen.lock().expect("screen")
+    }
+
+    /// A remote session's Engine-side screen mirrors only what is visible;
+    /// its history is on the host (see `find_history`).
+    fn screen_only(&self) -> bool {
+        self.remote.is_some()
+    }
+}
+
 /// Rows one remote scrollback request may carry (`ScrollbackRequest::validate`).
 const REMOTE_FIND_CHUNK_ROWS: i64 = 1024;
 /// Chunk reads allowed per capture: enough for the largest capture plus a few

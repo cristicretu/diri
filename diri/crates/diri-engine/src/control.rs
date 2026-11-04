@@ -1029,6 +1029,7 @@ impl ControlServer {
                         | Method::TASK_CANCEL
                         | Method::SESSION_CAPTURE_FIND
                         | Method::SESSION_FIND_HISTORY
+                        | Method::SEARCH_GLOBAL
                         | Method::SESSION_READ_SCROLLBACK_CELLS
                         | Method::SESSION_KILL
                         | Method::SESSION_REMOVE
@@ -1355,6 +1356,7 @@ impl ControlServer {
             Method::SESSION_CLEAR_SCROLLBACK => self.session_clear_scrollback(params),
             Method::SESSION_CAPTURE_FIND => self.session_capture_find(params),
             Method::SESSION_FIND_HISTORY => self.session_find_history(params),
+            Method::SEARCH_GLOBAL => self.search_global(params),
             Method::SESSION_READ_SCROLLBACK => self.session_read_scrollback(params),
             Method::SESSION_READ_SCROLLBACK_CELLS => self.session_read_scrollback_cells(params),
             Method::SESSION_KILL => self.session_kill(params),
@@ -3453,6 +3455,27 @@ impl ControlServer {
         encode(&crate::find_history::find_history_page(&p, || {
             screen.borrow_mut()
         })?)
+    }
+
+    /// `search.global`: the registry is held only to list sessions and take
+    /// their screen handles; the scan runs after it is released.
+    fn search_global(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::search::GlobalSearchParams = decode(params)?;
+        let (screens, records) = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            let mut records = registry.records();
+            records.retain(|record| !record.is_note() && !record.is_archived());
+            records.sort_by(|left, right| right.updated_at.0.total_cmp(&left.updated_at.0));
+            let screens: Vec<_> = records
+                .iter()
+                .filter_map(|record| {
+                    let session = registry.get(&record.id.0)?;
+                    Some((record.id.clone(), session.scrollback_reader()))
+                })
+                .collect();
+            (screens, records)
+        };
+        encode(&crate::global_search::search(&p, &screens, &records))
     }
 
     fn session_read_scrollback(

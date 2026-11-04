@@ -174,6 +174,7 @@ diri.workspace = {}
 diri.session = {}
 diri.task = {}
 diri.schedule = {}
+diri.search = {}
 diri.computer = {}
 diri.host = {}
 diri.activity = {}
@@ -398,6 +399,12 @@ function diri.session.capture_find(params, opts) end
 ---@param opts? {timeout?: number}
 ---@return table # FindHistoryResult
 function diri.session.find_history(params, opts) end
+
+---One bounded search over every session's screen, history and live Claude/Codex conversation.
+---@param params {query: string, maxSessions: integer, maxLinesPerSession: integer, budgetMs: integer, screens?: boolean, transcripts?: boolean, resume?: any[]}
+---@param opts? {timeout?: number}
+---@return table # GlobalSearchResult
+function diri.search.global(params, opts) end
 
 ---The terminal history as text.
 ---@param params {sessionID: string}
@@ -852,6 +859,10 @@ function diri.actions.quick_open(args) end
 ---Open or close conversation history
 ---@param args? table
 function diri.actions.history(args) end
+
+---Find any session, screen line, scrollback or chat message
+---@param args? table
+function diri.actions.global_search(args) end
 
 ---Open or close the session overview
 ---@param args? table

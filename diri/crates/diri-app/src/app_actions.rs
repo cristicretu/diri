@@ -56,6 +56,7 @@ pub fn exposure(id: CommandId) -> Exposure {
         | CheckForUpdates | ClearScrollback | ResetTerminal => Exposure::Destructive,
         NewWindow | ReopenSession | OpenLauncher | NewDefaultSession | NewTerminal
         | NewCodexSession | ToggleCommandPalette | ToggleQuickOpen | ToggleHistory
+        | GlobalSearch
         | ToggleNotifications | ToggleOverview | ToggleTabPeek
         | FocusPaneLeft | FocusPaneRight | FocusPaneUp | FocusPaneDown | SplitPaneRight
         | SplitPaneBelow | FocusPreviousPane | FocusNextPane | EqualizePanes

@@ -379,6 +379,12 @@ mod catalog {
                 "One bounded page of a search over a session's whole history, by stable row."
             ),
             entry!(
+                Method::SEARCH_GLOBAL,
+                crate::search::GlobalSearchParams,
+                "GlobalSearchResult",
+                "One bounded search over every session's screen, history and live Claude/Codex conversation."
+            ),
+            entry!(
                 Method::SESSION_READ_SCROLLBACK,
                 SessionIdParams,
                 "ReadScrollbackResult",

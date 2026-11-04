@@ -2242,6 +2242,7 @@ impl TerminalPane {
                 }
                 let visible = self.selected_id().as_ref() == Some(&id);
                 let mut next = None;
+                let mut revealed = false;
                 if let Some(resident) = self.residents.get_mut(&id)
                     && let Some(completion) = resident.find_scheduler.finish_scan(&request)
                 {
@@ -2249,12 +2250,22 @@ impl TerminalPane {
                         && let Some(find) = resident.find.as_mut()
                         && resident.element.apply_find_result(find, result)
                     {
+                        // A global-search jump lands on the newest match.
+                        revealed = find.take_reveal()
+                            && matches!(
+                                resident.element.find_previous(find),
+                                Some(NavigationTarget::History { .. })
+                            );
                         resident.element.sync_find_highlights(find);
                         if visible {
                             cx.notify();
                         }
                     }
                     next = completion.into_next_request();
+                }
+                if revealed && let Some(resident) = self.residents.get(&id) {
+                    let rows = usize::from(resident.last_size.1);
+                    self.pump_scrollback_fetch(&id, rows);
                 }
                 self.pump_older_find(&id);
                 if let Some(next) = next {
@@ -3325,6 +3336,38 @@ impl TerminalPane {
         self.schedule_query_search(id, window, cx);
         window.focus(&self.focus, cx);
         cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// Opens Find on `id` with `query` and moves to its newest match once
+    /// the first results arrive: a jump from global search.
+    fn reveal_find(
+        &mut self,
+        id: SessionId,
+        query: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_path_picker();
+        let now = self.started_at.elapsed();
+        let Some(resident) = self.residents.get_mut(&id) else {
+            return;
+        };
+        resident.find_composition.cancel(&mut resident.find_query);
+        if resident.find.take().is_some() {
+            resident.element.clear_find_source();
+            resident.find_scheduler.cancel();
+        }
+        resident.element.set_find_highlights(Vec::new());
+        resident.element.set_text_input_enabled(false);
+        resident.find_query.clear();
+        resident.find_query.insert(&query);
+        let mut find = TerminalFindModel::retained();
+        find.reveal_newest();
+        find.set_query(query, now);
+        resident.find = Some(find);
+        self.schedule_query_search(id, window, cx);
+        window.focus(&self.focus, cx);
         cx.notify();
     }
 
@@ -6013,6 +6056,11 @@ impl Render for TerminalPane {
         #[cfg(test)]
         {
             self.render_count += 1;
+        }
+        if let Some(id) = self.selected_id().filter(|id| self.residents.contains_key(id))
+            && let Some(query) = crate::find_reveal::take_for(&id)
+        {
+            self.reveal_find(id, query, window, cx);
         }
         if let Some((session, note_id)) = self.displayed_note() {
             let pane = self.note_pane(window, cx);

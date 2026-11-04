@@ -61,6 +61,7 @@ Call one as `diri.call("session.list")` or through its generated function, `diri
 | `diri.session.list_dir` | `sessionID, path?, includeFiles?, prefix?, limit?` | `SessionListDirResult` | List a directory as the session sees it, local or remote, relative to its working directory. |
 | `diri.session.capture_find` | `sessionID` | `CaptureFindResult` | Screen plus history as text, for find. |
 | `diri.session.find_history` | `sessionID, query, maxMatches, budgetMs, beforeRow?, cols?` | `FindHistoryResult` | One bounded page of a search over a session's whole history, by stable row. |
+| `diri.search.global` | `query, maxSessions, maxLinesPerSession, budgetMs, screens?, transcripts?, resume?` | `GlobalSearchResult` | One bounded search over every session's screen, history and live Claude/Codex conversation. |
 | `diri.session.read_scrollback` | `sessionID` | `ReadScrollbackResult` | The terminal history as text. |
 | `diri.session.read_scrollback_cells` | `sessionID, firstRow, maxRows, styles?` | `ScrollbackCells` | A window of history rows with styles. |
 | `diri.session.read_diff` | `sessionID, base?` | `SessionDiff` | The git diff of a session's working tree. |
@@ -160,6 +161,7 @@ Run one with `diri.action("split-pane-right")` or `diri.actions.split_pane_right
 | `command-palette` |  | ⌘K | Search all available commands |
 | `quick-open` |  | ⌘P | Find and open a project folder |
 | `history` |  | ⇧⌘H | Open or close conversation history |
+| `global-search` |  | ⇧⌘A | Find any session, screen line, scrollback or chat message |
 | `session-overview` |  | ⇧⌘O | Open or close the session overview |
 | `tab-peek` |  | ⌃⇧Space | Preview sessions across projects without changing work |
 | `focus-pane-left` |  | ⌥⌘← | Move focus to the nearest pane in this direction |

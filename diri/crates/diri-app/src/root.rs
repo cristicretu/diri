@@ -77,7 +77,7 @@ use crate::commands::{
     SESSION_NAVIGATION_CONTEXT, SearchNotes, SelectLastSession, SelectNextAttentionSession,
     SelectNextSession, SelectPreviousSession, SelectSession1, SelectSession2, SelectSession3,
     SelectSession4, SelectSession5, SelectSession6, SelectSession7, SelectSession8, ShowTodos,
-    ShowWhatsNew, ToggleAuxiliaryTerminal, ToggleCommandPalette, ToggleHistory, ToggleInspector,
+    ShowWhatsNew, ToggleAuxiliaryTerminal, ToggleCommandPalette, ToggleHistory, ToggleInspector, GlobalSearch,
     ToggleOverview, ToggleQuickOpen, ToggleSidebar, ToggleTabPeek,
 };
 use crate::commands::{
@@ -2641,6 +2641,7 @@ impl RootView {
         {
             let global_overlay_command = [
                 CommandId::ToggleHistory,
+                CommandId::GlobalSearch,
                 CommandId::SearchNotes,
                 CommandId::OpenSettings,
                 CommandId::ToggleCommandPalette,
@@ -2767,6 +2768,13 @@ impl RootView {
                 if let Some(navigation) = &self.navigation {
                     navigation.update(cx, |navigation, cx| {
                         navigation.toggle_history(&ToggleHistory, window, cx)
+                    });
+                }
+            }
+            CommandId::GlobalSearch => {
+                if let Some(navigation) = &self.navigation {
+                    navigation.update(cx, |navigation, cx| {
+                        navigation.toggle_global_search(&GlobalSearch, window, cx)
                     });
                 }
             }
@@ -6343,6 +6351,9 @@ impl Render for RootView {
             ))
             .on_action(cx.listener(|this, _: &ToggleHistory, window, cx| {
                 this.run_command(CommandId::ToggleHistory, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &GlobalSearch, window, cx| {
+                this.run_command(CommandId::GlobalSearch, window, cx);
             }))
             .on_action(
                 cx.listener(|this, _: &crate::commands::FocusPaneLeft, window, cx| {
