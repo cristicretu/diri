@@ -694,6 +694,9 @@ Notes are plain Markdown documents that live next to your agents. Write a plan, 
 
 A note is a session. It sits in the sidebar with your agents and terminals, and it sorts, pins, archives and nests the same way. An agent started from a note appears as the note's child. The first line is the title; a note with no title shows as "Untitled".
 
+## Close or delete a note
+Closing a note's tab (<kbd>⌘</kbd><kbd>W</kbd> or the sidebar ✕) only hides it: the file stays, and [Search](#search) still finds it and reopens it. To delete a note, open it and run **Delete Note** from the command palette. Its tab closes and its file moves to `.trash/` (see [Where notes live](#where-notes-live)). <kbd>⇧</kbd><kbd>⌘</kbd><kbd>T</kbd> brings back a note you just closed or deleted.
+
 ## Write
 Type <kbd>/</kbd> for the block menu or <kbd>@</kbd> to mention something. Markdown shortcuts also work as you type.
 
@@ -773,7 +776,7 @@ dirijor note path                               # print the notes folder
 Run `dirijor note help` for every subcommand and flag, including `add --pin --open`, `edit --old --new`, `replace-section` and `link`.
 
 ## Search
-Press <kbd>⇧</kbd><kbd>⌘</kbd><kbd>F</kbd> for **Search notes**. It searches titles and the whole body, including to-dos, table cells and mention labels, across live and archived notes. Every word you type must appear. Archived notes show dimmed, and opening one unarchives it. The command palette also shows up to three matching notes while you type.
+Press <kbd>⇧</kbd><kbd>⌘</kbd><kbd>F</kbd> for **Search notes**. It searches titles and the whole body, including to-dos, table cells and mention labels, across live, closed and archived notes. Every word you type must appear. Archived notes show dimmed, and opening one unarchives it. The command palette also shows up to three matching notes while you type.
 
 ## Version history
 diri keeps earlier versions of every note. With a note open, run **Version History…** from the command palette. Pick a version to preview it, then **Restore This Version…**. The text you replace stays in history.
@@ -1592,7 +1595,7 @@ Read or change ~/.diri-include, the gitignore-style extra folders Quick Open (Cm
 
 ### `schedule_agent`
 
-Schedule an agent run owned by Diri, not by this session: it survives this session closing and Diri restarting. Use it whenever the user wants something done later, at a time, or repeatedly, instead of your own cron/loop tools. How runs work: at each due time Diri opens a NEW top-level session of `kind` in `cwd` and sends `prompt`. That session cannot see this conversation, so write a self-contained prompt: the goal, the repo and relevant context, what to produce, and where the result goes (open a PR, write a file, post a summary). For code changes pass worktree:true and base "origin/main" so each run starts clean. Give a short `name`. When: exactly one of cron (five fields, the Mac's local time, e.g. "0 9 * * 1-5" weekdays 09:00), in_minutes (relative one-off), or at_ms (epoch ms). Missed runs: if the Mac was asleep or Diri was closed, the newest missed run fires once when it is back, within catch_up_hours (default 12); older ones are recorded as missed. wake_mac:true (use when the user wants it to run even if the Mac is asleep): Diri wakes the Mac 2 minutes early (lid must be open), keeps it awake while the agent works, then puts it back to sleep if nobody used it. It needs the one-time "Allow diri to wake the Mac" approval in Settings > Schedules; if list_schedules reports wakeHelperError, tell the user to turn it on. After creating, confirm in words from the returned nextDue, e.g. "weekdays at 09:00, next run Monday; it will wake the Mac".
+Schedule an agent run owned by Diri, not by this session: it survives this session closing and Diri restarting. Use it whenever the user wants something done later, at a time, or repeatedly, instead of your own cron/loop tools. How runs work: at each due time Diri opens a NEW top-level session of `kind` in `cwd` and sends `prompt`. That session cannot see this conversation, so write a self-contained prompt: the goal, the repo and relevant context, what to produce, and where the result goes (open a PR, write a file, post a summary). For code changes pass worktree:true and base "origin/main" so each run starts clean. Give a short `name`. When: exactly one of cron (five fields, the Mac's local time, e.g. "0 9 * * 1-5" weekdays 09:00), in_minutes (relative one-off), at_ms (epoch ms), or watch_folder (a file trigger: each time new files are created in or moved into that folder, one run gets the prompt plus their absolute paths; files already there, edits, hidden files and partial downloads never fire; optional glob like "*.png" and recursive:true for the whole tree; files that arrived while Diri was closed fire once when it is back). Missed runs: if the Mac was asleep or Diri was closed, the newest missed run fires once when it is back, within catch_up_hours (default 12); older ones are recorded as missed. wake_mac:true (use when the user wants it to run even if the Mac is asleep): Diri wakes the Mac 2 minutes early (lid must be open), keeps it awake while the agent works, then puts it back to sleep if nobody used it. It needs the one-time "Allow diri to wake the Mac" approval in Settings > Schedules; if list_schedules reports wakeHelperError, tell the user to turn it on. After creating, confirm in words from the returned nextDue, e.g. "weekdays at 09:00, next run Monday; it will wake the Mac".
 
 | Argument | Type | Notes |
 | --- | --- | --- |
@@ -1604,10 +1607,13 @@ Schedule an agent run owned by Diri, not by this session: it survives this sessi
 | `branch` | string |  |
 | `catch_up_hours` | number | A run missed by up to this long still fires late; 0 never catches up. Default 12. |
 | `cron` | string |  |
+| `glob` | string | With watch_folder: only file names matching this pattern, e.g. "*.png" or "*.{csv,xlsx}"; several separated by commas. Case-insensitive. |
 | `in_minutes` | number |  |
 | `keep_awake` | boolean | Keep an awake Mac from idle-sleeping shortly before each run and while it works. Cannot wake a sleeping Mac. |
 | `name` | string |  |
+| `recursive` | boolean | With watch_folder: also watch subfolders. Default: top level only. |
 | `wake_mac` | boolean | Wake a sleeping Mac (lid open) 2 minutes before each run, keep it awake while the run works, then let it sleep again. Needs the one-time wake approval in Settings > Schedules; list_schedules reports if it is missing. |
+| `watch_folder` | string | File trigger: absolute path (or ~/...) of a folder you own to watch for new files. Not / or the home folder itself. |
 | `worktree` | boolean | Start each run in a fresh worktree. |
 
 ### `list_schedules`

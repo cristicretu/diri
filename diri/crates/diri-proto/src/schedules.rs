@@ -21,7 +21,28 @@ pub enum ScheduleWhen {
     /// Standard five-field cron (`minute hour day-of-month month
     /// day-of-week`) evaluated in the Mac's local time zone.
     Cron { expr: String },
+    /// Fires when new files appear in `folder`: created there or moved in,
+    /// never edits, deletions, hidden files or partial downloads. Files that
+    /// arrive together become one run listing every path (at most
+    /// [`MAX_FILES_PER_RUN`]); files that arrived while diri was not running
+    /// fire once on the next start. Additive: an Engine that predates
+    /// this kind skips the stored record (it never decodes as another kind)
+    /// and rejects creating one.
+    Files {
+        /// Absolute path of an existing directory owned by the user.
+        folder: String,
+        /// Only file names matching this glob (`*`, `?`, `{png,jpg}`; several
+        /// patterns separated by commas). Case-insensitive. Absent: all files.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        glob: Option<String>,
+        /// Watch the whole tree instead of only the folder's top level.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        recursive: bool,
+    },
 }
+
+/// Most files one file-triggered run lists; the rest go to the next run.
+pub const MAX_FILES_PER_RUN: usize = 25;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -94,6 +115,9 @@ pub struct ScheduleRun {
     pub session_id: Option<SessionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Absolute paths a file-triggered run handed to its session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -213,6 +237,7 @@ mod tests {
                 collapsed: 2,
                 session_id: None,
                 error: None,
+                files: Vec::new(),
             }],
         };
         let value = serde_json::to_value(&record).unwrap();
@@ -221,5 +246,37 @@ mod tests {
         assert_eq!(value["catchUpWindowMs"], 5);
         let back: ScheduleRecord = serde_json::from_value(value).unwrap();
         assert_eq!(back, record);
+    }
+
+    #[test]
+    fn file_trigger_wire_shape_is_additive() {
+        let when: ScheduleWhen = serde_json::from_value(serde_json::json!({
+            "kind": "files", "folder": "/Users/me/Inbox"
+        }))
+        .unwrap();
+        assert_eq!(
+            when,
+            ScheduleWhen::Files {
+                folder: "/Users/me/Inbox".into(),
+                glob: None,
+                recursive: false,
+            }
+        );
+        let value = serde_json::to_value(ScheduleWhen::Files {
+            folder: "/in".into(),
+            glob: Some("*.png".into()),
+            recursive: true,
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"kind": "files", "folder": "/in", "glob": "*.png", "recursive": true})
+        );
+        // Runs recorded before file triggers existed still decode.
+        let run: ScheduleRun = serde_json::from_value(serde_json::json!({
+            "dueAt": 1.0, "firedAt": 2.0, "outcome": "onTime"
+        }))
+        .unwrap();
+        assert!(run.files.is_empty());
     }
 }

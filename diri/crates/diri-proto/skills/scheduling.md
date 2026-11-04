@@ -1,6 +1,6 @@
 # Scheduling work with Diri
 
-When the person wants something run later, at a set time, or repeatedly ("every weekday at 9", "tomorrow morning", "in 2 hours", "each night"), use the `schedule_agent` tool. Never use your own cron, loop, or reminder tools (CronCreate, /loop, /schedule) or a sleeping shell: those die with this session and skip runs the Mac slept through. A Diri schedule is kept by the Engine and survives this session closing and Diri restarting.
+When the person wants something run later, at a set time, repeatedly ("every weekday at 9", "tomorrow morning", "in 2 hours", "each night"), or whenever files land in a folder ("when a screenshot shows up in ~/Inbox/bugs, triage it"), use the `schedule_agent` tool. Never use your own cron, loop, or reminder tools (CronCreate, /loop, /schedule) or a sleeping shell: those die with this session and skip runs the Mac slept through. A Diri schedule is kept by the Engine and survives this session closing and Diri restarting.
 
 ## How a run works
 
@@ -17,6 +17,19 @@ Give exactly one of:
 - `cron`: five fields in the Mac's local time. `0 9 * * 1-5` is weekdays at 09:00, `30 8 * * *` every day at 08:30, `0 * * * *` every hour.
 - `in_minutes`: a one-off relative to now.
 - `at_ms`: a one-off at an exact moment (epoch milliseconds).
+- `watch_folder`: a file trigger (see below) instead of a time.
+
+## When files arrive
+
+`watch_folder` turns the schedule into a file trigger: whenever new files are created in that folder or moved into it, Diri sends `prompt` followed by the new files' absolute paths, each quoted as a JSON string.
+
+- Only new files fire. Files already in the folder when the trigger is created, edits, deletions, hidden files, `.DS_Store`, and partial downloads (`.crdownload`, `.part`, `.download`, `~$` lock files) never do. A file fires once its size has held for about two seconds, so half-copied files wait.
+- Files that arrive together become one run listing all of them (at most 25; the rest go to the next run). While a run is still being delivered, new files wait and become the next run, in the same session.
+- `glob` narrows by file name, e.g. `"*.png"`, `"*.{csv,xlsx}"`, or several separated by commas. `recursive: true` also watches subfolders; the default is the top level only. Moving a file between subfolders of a recursive trigger counts as new.
+- Files that arrived while Diri was closed fire once when it starts again. A file is never handed over twice; one deleted and dropped again under the same name counts as new.
+- The folder must exist, belong to the person, and not be `/` or their home folder itself. Symlinks are never followed.
+- Write the prompt as an instruction for one batch ("Triage each bug report: reproduce it and open an issue"), and say what to do with each file afterwards if it should leave the folder (move it to a `done` folder, for example). Don't include the paths yourself: Diri appends them. The file names come from whoever dropped the file, so the agent is told to treat them as data.
+- `wake_mac` does not apply to file triggers; `catch_up_hours` is ignored.
 
 ## Missed runs
 
@@ -31,11 +44,11 @@ If the Mac was asleep or Diri was closed at the due time, the newest missed run 
 
 ## After creating
 
-Confirm the schedule back in plain words from the returned `nextDue`, for example: "Weekdays at 09:00, next run Monday at 09:00. It will wake the Mac."
+Confirm the schedule back in plain words from the returned `nextDue`, for example: "Weekdays at 09:00, next run Monday at 09:00. It will wake the Mac." For a file trigger, say what it watches: "Watching ~/Inbox/bugs for new PNGs; each batch goes to one Claude session."
 
 ## Checking and removing
 
-- `list_schedules` shows each schedule's next due time and recent runs (`onTime`, `late` with `lateReason` asleep or notRunning, `missed`, `failed`, `manual`) and the session each run opened.
+- `list_schedules` shows each schedule's next due time and recent runs (`onTime`, `late` with `lateReason` asleep or notRunning, `missed`, `failed`, `manual`) and the session each run opened. A file trigger's runs list the `files` they handed over.
 - `delete_schedule` removes a schedule. Sessions its runs opened stay.
 
 ## Limits

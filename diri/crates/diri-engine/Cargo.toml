@@ -31,6 +31,10 @@ getrandom.workspace = true
 # Already in the graph through diri-terminal-state and the vendored parser;
 # the Engine pump scans every output byte for the Holder exit marker with it.
 memchr = "2.8"
+# File-triggered schedules (src/control/schedule_files.rs) watch folders with
+# FSEvents on macOS and inotify on Linux. Already in the workspace graph for
+# the app's code viewer; no polling fallback is used.
+notify.workspace = true
 plist.workspace = true
 regex.workspace = true
 rusqlite.workspace = true

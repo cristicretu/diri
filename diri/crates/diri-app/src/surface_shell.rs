@@ -12548,10 +12548,13 @@ mod tests {
                 }
                 if tab == SettingsTab::Schedules {
                     surfaces.schedules.update(cx, |schedules, _| {
-                        schedules.seed_preview(
-                            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as f64,
-                            std::env::var("DIRI_VISUAL_SCHEDULE_DRAFT").is_ok_and(|value| !value.is_empty()),
-                        )
+                        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as f64;
+                        // `files` drafts a file trigger; any other value a timed schedule.
+                        match std::env::var("DIRI_VISUAL_SCHEDULE_DRAFT").as_deref() {
+                            Ok("files") => schedules.seed_file_trigger_draft(now),
+                            Ok(value) => schedules.seed_preview(now, !value.is_empty()),
+                            Err(_) => schedules.seed_preview(now, false),
+                        }
                     });
                 }
                 if tab == SettingsTab::Skills {
