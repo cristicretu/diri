@@ -1,5 +1,6 @@
 mod history_page;
 mod notes_page;
+mod search_page;
 #[cfg(test)]
 mod page_tests;
 
@@ -106,6 +107,7 @@ enum Overlay {
     QuickOpen,
     History,
     Notes,
+    Search,
     Settings,
     Themes,
     InterfaceStyles,
@@ -184,6 +186,7 @@ pub struct NavigationOverlay {
     history_matches: Vec<usize>,
     history_resuming: Option<String>,
     notes: notes_page::NotesPage,
+    search: search_page::SearchPage,
     back_stack: Vec<PageState>,
     page_generation: u64,
     page_direction: f32,
@@ -320,6 +323,7 @@ impl NavigationOverlay {
             history_matches: Vec::new(),
             history_resuming: None,
             notes: notes_page::NotesPage::default(),
+            search: search_page::SearchPage::default(),
             back_stack: Vec::new(),
             page_generation: 0,
             page_direction: 1.0,
@@ -383,6 +387,7 @@ impl NavigationOverlay {
             history_matches: Vec::new(),
             history_resuming: None,
             notes: notes_page::NotesPage::default(),
+            search: search_page::SearchPage::default(),
             back_stack: Vec::new(),
             page_generation: 0,
             page_direction: 1.0,
@@ -565,6 +570,7 @@ impl NavigationOverlay {
         self.history_matches = Vec::new();
         self.history_search = crate::history::HistorySearch::default();
         self.notes.hits = Vec::new();
+        self.close_search();
         self.ranked_items = Vec::new();
         self.quick_snapshot = QuickOpenSnapshot::default();
         self.directory_index.release_entries();
@@ -837,6 +843,7 @@ impl NavigationOverlay {
             }
             Some(Overlay::History) => self.filter_history(),
             Some(Overlay::Notes) => self.filter_notes(),
+            Some(Overlay::Search) => self.search_query_changed(cx),
             Some(Overlay::Themes) => {
                 self.filter_themes();
                 self.preview_highlighted_theme(cx);
@@ -894,6 +901,7 @@ impl NavigationOverlay {
             }
             Some(Overlay::History) => self.history_matches.len(),
             Some(Overlay::Notes) => self.notes.hits.len(),
+            Some(Overlay::Search) => self.search.rows.len(),
             Some(Overlay::Settings) => self.settings_items().len(),
             Some(Overlay::Themes) => self.theme_matches.len(),
             Some(Overlay::InterfaceStyles) => self.style_matches().len(),
@@ -1040,10 +1048,10 @@ impl NavigationOverlay {
     }
 
     fn footer_height(&self) -> f32 {
-        if self.overlay == Some(Overlay::CommandPalette) {
-            FOOTER_HEIGHT
-        } else {
-            0.0
+        match self.overlay {
+            Some(Overlay::CommandPalette) => FOOTER_HEIGHT,
+            Some(Overlay::Search) => search_page::PREVIEW_HEIGHT,
+            _ => 0.0,
         }
     }
 
@@ -1106,6 +1114,7 @@ impl NavigationOverlay {
                 }
             }
             Some(Overlay::Notes) => self.open_highlighted_note(secondary, window, cx),
+            Some(Overlay::Search) => self.open_highlighted_search_row(window, cx),
             Some(Overlay::Settings) => match self.settings_items().get(self.highlight).copied() {
                 Some(0) => self.push_page(Overlay::Themes, window, cx),
                 Some(_) => {
@@ -1182,6 +1191,14 @@ impl NavigationOverlay {
             }
             PaletteCommand::Action(CommandId::SearchNotes) => {
                 self.push_page(Overlay::Notes, window, cx)
+            }
+            PaletteCommand::Action(CommandId::GlobalSearch) => {
+                // What was typed in ⌘K is what to search for.
+                let query = self.query.text().to_owned();
+                self.push_page(Overlay::Search, window, cx);
+                if self.query.insert(&query) {
+                    self.query_changed(cx);
+                }
             }
             PaletteCommand::OpenNote { note_id, block } => {
                 self.open_note(note_id, block, window, cx)
@@ -1273,7 +1290,32 @@ impl NavigationOverlay {
     /// to run on every keystroke — a few hundred candidates against one
     /// matcher — and never run per frame.
     fn refresh_command_items(&mut self) {
-        let (actions, sessions, fingerprint) = {
+        let (actions, sessions, fingerprint) = self.palette_catalog();
+        self.palette_context_fingerprint = fingerprint;
+        let query = FuzzyQuery::new(self.query.text());
+        let searching = !self.query.text().trim().is_empty();
+        let mut ranked_actions = palette::rank_actions(actions, &query, &mut self.matcher);
+        if !searching {
+            // Keep the landing page focused. Every advanced action remains
+            // searchable, including target-specific Agent/project shortcuts.
+            ranked_actions.retain(|ranked| landing_action_order(&ranked.item).is_some());
+            ranked_actions.sort_by_key(|ranked| landing_action_order(&ranked.item));
+        }
+        self.ranked_actions = ranked_actions;
+        self.ranked_sessions = palette::rank_sessions(sessions, &query, &mut self.matcher);
+        if !searching {
+            self.ranked_sessions.truncate(CHAT_PREVIEW_LIMIT);
+        }
+        // Notes the query finds, above the commands: their Sessions (when
+        // live and matched by title) are already in the chat rows.
+        let notes = self.palette_note_actions(&self.ranked_sessions.clone());
+        self.ranked_actions.splice(0..0, notes);
+    }
+
+    /// Every command the palette offers in this window right now, the
+    /// sessions it lists, and the fingerprint of what they depend on.
+    fn palette_catalog(&self) -> (Vec<PaletteAction>, Vec<SessionRecord>, u64) {
+        {
             let mut store = self.store.write().expect("session store lock poisoned");
             let projects: Vec<_> = store
                 .sidebar_projection()
@@ -1363,26 +1405,7 @@ impl NavigationOverlay {
                 store.selected_session(),
             );
             (actions, store.ordered_sessions(), fingerprint)
-        };
-        self.palette_context_fingerprint = fingerprint;
-        let query = FuzzyQuery::new(self.query.text());
-        let searching = !self.query.text().trim().is_empty();
-        let mut ranked_actions = palette::rank_actions(actions, &query, &mut self.matcher);
-        if !searching {
-            // Keep the landing page focused. Every advanced action remains
-            // searchable, including target-specific Agent/project shortcuts.
-            ranked_actions.retain(|ranked| landing_action_order(&ranked.item).is_some());
-            ranked_actions.sort_by_key(|ranked| landing_action_order(&ranked.item));
         }
-        self.ranked_actions = ranked_actions;
-        self.ranked_sessions = palette::rank_sessions(sessions, &query, &mut self.matcher);
-        if !searching {
-            self.ranked_sessions.truncate(CHAT_PREVIEW_LIMIT);
-        }
-        // Notes the query finds, above the commands: their Sessions (when
-        // live and matched by title) are already in the chat rows.
-        let notes = self.palette_note_actions(&self.ranked_sessions.clone());
-        self.ranked_actions.splice(0..0, notes);
     }
 
     fn current_quick_item(&self) -> Option<QuickOpenItem> {
@@ -1514,6 +1537,7 @@ impl NavigationOverlay {
                 self.reread_notes(cx);
                 self.filter_notes();
             }
+            Overlay::Search => self.open_search(cx),
             Overlay::Settings => {}
             Overlay::Themes => {
                 self.filter_themes();
@@ -1731,6 +1755,7 @@ impl NavigationOverlay {
             Some(Overlay::History) => 7,
             // Six two-line note rows.
             Some(Overlay::Notes) => 9,
+            Some(Overlay::Search) => 5,
             _ => 9,
         }
     }
@@ -1738,6 +1763,7 @@ impl NavigationOverlay {
     fn row_height(&self) -> f32 {
         match self.overlay {
             Some(Overlay::History | Overlay::Notes) => ROW_HEIGHT,
+            Some(Overlay::Search) => search_page::SEARCH_ROW_HEIGHT,
             _ => COMPACT_ROW_HEIGHT,
         }
     }
@@ -1763,7 +1789,13 @@ impl NavigationOverlay {
             .max(px(0.0))
             .min(px(self.page_list_height()));
         let previous_list_height = layout.list_height.min(px(self.previous_list_height));
-        let footer = (footer_height > 0.0).then(|| self.render_footer(colors, cx));
+        let footer = (footer_height > 0.0).then(|| {
+            if self.overlay == Some(Overlay::Search) {
+                self.render_search_preview(colors)
+            } else {
+                self.render_footer(colors, cx)
+            }
+        });
         let count = self.visible_count();
         let entity = cx.entity();
         let page = self.overlay.expect("open palette");
@@ -1772,6 +1804,7 @@ impl NavigationOverlay {
             Overlay::QuickOpen => "nav.placeholder.quick_open",
             Overlay::History => "nav.placeholder.history",
             Overlay::Notes => "nav.placeholder.notes",
+            Overlay::Search => "nav.placeholder.search",
             Overlay::Settings => "nav.placeholder.settings",
             Overlay::Themes => "nav.placeholder.themes",
             Overlay::InterfaceStyles => "nav.placeholder.interface_styles",
@@ -1884,6 +1917,20 @@ impl NavigationOverlay {
                                 }),
                         )
                     })
+                    .when(page == Overlay::Search && self.search_is_busy(), |header| {
+                        header.child(
+                            div()
+                                .size(px(24.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(LoadingIndicator::new(
+                                    "search-streaming",
+                                    12.0,
+                                    colors.secondary,
+                                )),
+                        )
+                    })
                     .when(!self.query.is_empty(), |header| {
                         header.child(
                             div()
@@ -1981,6 +2028,8 @@ impl NavigationOverlay {
                                     t("nav.finding_chats")
                                 } else if page == Overlay::Notes {
                                     self.notes_empty_label(cx)
+                                } else if page == Overlay::Search {
+                                    self.search_empty_label()
                                 } else if page == Overlay::QuickOpen
                                     && self.directory_index.is_scanning()
                                 {
@@ -2267,6 +2316,9 @@ impl NavigationOverlay {
         }
         if self.overlay == Some(Overlay::Notes) {
             return self.render_note_row(index, cx);
+        }
+        if self.overlay == Some(Overlay::Search) {
+            return self.render_search_row(index, cx);
         }
         let row = match self.overlay {
             Some(Overlay::CommandPalette) => {
@@ -2794,6 +2846,7 @@ fn opens_page(command: &PaletteCommand) -> bool {
             | PaletteCommand::Action(
                 CommandId::ToggleQuickOpen
                     | CommandId::ToggleHistory
+                    | CommandId::GlobalSearch
                     | CommandId::SearchNotes
                     | CommandId::OpenSettings
             )
@@ -3463,6 +3516,12 @@ mod tests {
                                     .collect(),
                             );
                         }
+                        // DIRI_VISUAL_SEARCH=empty|screen|chat picks the scene.
+                        Ok("search") => super::search_page::seed_for_screenshot(
+                            &mut overlay,
+                            &std::env::var("DIRI_VISUAL_SEARCH").unwrap_or_default(),
+                            cx,
+                        ),
                         Ok("settings") => overlay.overlay = Some(Overlay::Settings),
                         Ok("themes") => {
                             overlay.overlay = Some(Overlay::Themes);

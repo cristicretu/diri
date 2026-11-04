@@ -979,6 +979,15 @@ impl DaemonClient {
         self.typed(Method::SESSION_FIND_HISTORY, params).await
     }
 
+    /// One bounded search over every session's screen, history and live
+    /// conversation.
+    pub async fn search_global(
+        &self,
+        params: &diri_proto::search::GlobalSearchParams,
+    ) -> Result<diri_proto::search::GlobalSearchResult, ClientError> {
+        self.typed(Method::SEARCH_GLOBAL, params).await
+    }
+
     pub async fn read_scrollback(
         &self,
         session_id: &SessionId,

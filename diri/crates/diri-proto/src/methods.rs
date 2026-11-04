@@ -64,6 +64,9 @@ impl Method {
     /// [`crate::find::FindHistoryParams`].
     pub const SESSION_FIND_HISTORY: &'static str = "session.find_history";
     pub const SESSION_READ_SCROLLBACK: &'static str = "session.read_scrollback";
+    /// One bounded search over every session's screen, history and live
+    /// conversation; see [`crate::search::GlobalSearchParams`].
+    pub const SEARCH_GLOBAL: &'static str = "search.global";
     pub const SESSION_READ_SCROLLBACK_CELLS: &'static str = "session.read_scrollback_cells";
     pub const SESSION_READ_DIFF: &'static str = "session.read_diff";
     /// One chunk of an inline image a terminal placed. A remote session's is
@@ -207,6 +210,7 @@ impl Method {
         Self::SESSION_LIST_DIR,
         Self::SESSION_CAPTURE_FIND,
         Self::SESSION_FIND_HISTORY,
+        Self::SEARCH_GLOBAL,
         Self::SESSION_READ_SCROLLBACK,
         Self::SESSION_READ_SCROLLBACK_CELLS,
         Self::SESSION_READ_DIFF,

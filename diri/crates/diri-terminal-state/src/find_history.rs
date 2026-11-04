@@ -87,15 +87,36 @@ impl HeadlessScreen {
         search: &mut HistorySearch,
         out: &mut Vec<[i64; 3]>,
     ) {
-        let cols = self.geometry.cols;
-        let line = Line(index as i32 - history as i32);
-        let row = self.term.row(line);
-        let cells = row.cells();
         let HistorySearch {
             needle,
             text,
             columns,
         } = search;
+        self.row_chars(index, history, text, columns);
+        let row = index as i64;
+        needle.for_each_match(text, |start, end| {
+            out.push([
+                row,
+                i64::from(columns[start][0]),
+                i64::from(columns[end - 1][1]),
+            ]);
+        });
+    }
+
+    /// Absolute row `index` as matchable text: one `char` per cell (control
+    /// characters as spaces, wide-cell spacers skipped, combining marks
+    /// after their base), each with the columns it covers.
+    fn row_chars(
+        &self,
+        index: usize,
+        history: usize,
+        text: &mut Vec<char>,
+        columns: &mut Vec<[u16; 2]>,
+    ) {
+        let cols = self.geometry.cols;
+        let line = Line(index as i32 - history as i32);
+        let row = self.term.row(line);
+        let cells = row.cells();
         text.clear();
         columns.clear();
         for (x, cell) in cells.iter().enumerate().take(cols) {
@@ -119,15 +140,142 @@ impl HeadlessScreen {
                 }
             }
         }
-        let row = index as i64;
-        needle.for_each_match(text, |start, end| {
-            out.push([
-                row,
-                i64::from(columns[start][0]),
-                i64::from(columns[end - 1][1]),
-            ]);
+    }
+
+    /// Global search over this terminal: like [`Self::find_rows_before`],
+    /// but a row matches only when every word of the query is on it, and
+    /// each hit carries the row's text. Stops at the first row boundary at
+    /// which `out` holds `stop_at` hits; returns the lowest row searched.
+    pub fn find_lines_before(
+        &mut self,
+        before: usize,
+        max_rows: usize,
+        search: &mut LineSearch,
+        stop_at: usize,
+        out: &mut Vec<LineHit>,
+    ) -> usize {
+        let history = self.term.history_rows();
+        let before = before.min(history + self.geometry.rows);
+        let start = before.saturating_sub(max_rows);
+        let mut next = before;
+        let mut searched = 0;
+        while next > start {
+            if out.len() >= stop_at {
+                break;
+            }
+            next -= 1;
+            self.search_line(next, history, search, out);
+            searched += 1;
+            self.finish_history_read_batch(searched, next == start || out.len() >= stop_at);
+        }
+        if searched > 0 {
+            self.finish_history_read_batch(searched, true);
+        }
+        next
+    }
+
+    /// Text of absolute rows `rows` (clamped to what the terminal holds),
+    /// trailing blanks trimmed: the context a search hit is previewed with.
+    pub fn absolute_rows_text(&mut self, rows: std::ops::Range<usize>) -> Vec<String> {
+        let history = self.term.history_rows();
+        let end = rows.end.min(history + self.geometry.rows);
+        let mut lines = Vec::with_capacity(end.saturating_sub(rows.start));
+        let mut text = Vec::new();
+        let mut columns = Vec::new();
+        for index in rows.start..end {
+            self.row_chars(index, history, &mut text, &mut columns);
+            let line: String = text.iter().collect();
+            lines.push(line.trim_end().to_owned());
+        }
+        self.finish_history_read_batch(lines.len(), true);
+        lines
+    }
+
+    fn search_line(
+        &self,
+        index: usize,
+        history: usize,
+        search: &mut LineSearch,
+        out: &mut Vec<LineHit>,
+    ) {
+        let LineSearch {
+            needles,
+            text,
+            columns,
+            ranges,
+        } = search;
+        self.row_chars(index, history, text, columns);
+        ranges.clear();
+        for needle in needles.iter() {
+            let before = ranges.len();
+            needle.for_each_match(text, |start, end| {
+                ranges.push([start as u32, end as u32]);
+            });
+            if ranges.len() == before {
+                return;
+            }
+        }
+        ranges.sort_unstable();
+        // Two words can match overlapping text ("build", "ld o").
+        ranges.dedup_by(|next, kept| {
+            let overlaps = next[0] <= kept[1];
+            if overlaps {
+                kept[1] = kept[1].max(next[1]);
+            }
+            overlaps
+        });
+        // Trailing blanks are not text; a match never ends in them because
+        // a query word has no whitespace.
+        let len = text
+            .iter()
+            .rposition(|ch| *ch != ' ')
+            .map_or(0, |last| last + 1);
+        out.push(LineHit {
+            row: index,
+            text: text[..len].iter().collect(),
+            ranges: ranges.clone(),
         });
     }
+}
+
+/// A query for global search: every whitespace-separated word must be on
+/// the same row, each matched as Find matches it (literal, smart-case).
+#[derive(Debug)]
+pub struct LineSearch {
+    /// Longest first: the rarest word rejects most rows before the others
+    /// are tried.
+    needles: Vec<FindNeedle>,
+    text: Vec<char>,
+    columns: Vec<[u16; 2]>,
+    ranges: Vec<[u32; 2]>,
+}
+
+impl LineSearch {
+    /// `None` for a query with no words.
+    #[must_use]
+    pub fn new(query: &str) -> Option<Self> {
+        let mut words: Vec<&str> = query.split_whitespace().collect();
+        words.sort_by_key(|word| std::cmp::Reverse(word.chars().count()));
+        words.dedup();
+        let needles: Vec<FindNeedle> = words.into_iter().filter_map(FindNeedle::new).collect();
+        (!needles.is_empty()).then(|| Self {
+            needles,
+            text: Vec::new(),
+            columns: Vec::new(),
+            ranges: Vec::new(),
+        })
+    }
+}
+
+/// A row on which every query word matched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LineHit {
+    /// Absolute row: counted from the oldest row the terminal holds.
+    pub row: usize,
+    /// The row's text, trailing blanks trimmed.
+    pub text: String,
+    /// Matched `char` ranges into `text`, ascending.
+    pub ranges: Vec<[u32; 2]>,
 }
 
 #[cfg(test)]
@@ -200,6 +348,26 @@ mod tests {
             let found = search_all(&mut screen, query);
             assert_eq!(found, vec![[0, start, end]], "query {query:?}");
         }
+    }
+
+    #[test]
+    fn line_search_needs_every_word_on_one_row_and_returns_its_text() {
+        let mut screen = HeadlessScreen::new(40, 4);
+        screen.feed(b"error: build failed\r\nbuild ok\r\nan Error in build\r\n");
+        let mut search = LineSearch::new("  build  error ").unwrap();
+        let mut out = Vec::new();
+        let total = screen.total_rows();
+        let next = screen.find_lines_before(total, usize::MAX, &mut search, usize::MAX, &mut out);
+        assert_eq!(next, 0);
+        let texts: Vec<_> = out.iter().map(|hit| hit.text.as_str()).collect();
+        assert_eq!(texts, ["an Error in build", "error: build failed"]);
+        assert_eq!(out[0].ranges, [[3, 8], [12, 17]]);
+        assert_eq!(out[1].row, 0);
+        assert_eq!(
+            screen.absolute_rows_text(0..2),
+            ["error: build failed", "build ok"]
+        );
+        assert!(LineSearch::new("   ").is_none());
     }
 
     #[test]

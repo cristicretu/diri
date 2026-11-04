@@ -145,6 +145,9 @@ pub struct TerminalFindModel {
     older: Option<older::OlderSearch>,
     /// Identifies the older search a page reply belongs to.
     older_id: u64,
+    /// Opened by a jump to a search hit: the first results go to the newest
+    /// match instead of waiting for Return.
+    reveal: bool,
 }
 
 /// The selected match, by identity rather than index, so it stays selected
@@ -406,6 +409,26 @@ impl TerminalFindModel {
     #[must_use]
     pub const fn is_alt_screen(&self) -> bool {
         self.is_alt_screen
+    }
+
+    /// Asks the host to move to the newest match once the first results are
+    /// in (see [`Self::take_reveal`]): a jump from global search, whose hit
+    /// is the newest line holding the query.
+    pub fn reveal_newest(&mut self) {
+        self.reveal = true;
+    }
+
+    /// True once, after results with a match arrive for a model asked to
+    /// [`Self::reveal_newest`]. The selection is then placed so that one step
+    /// backwards (the host's `find_previous`) lands on the newest match,
+    /// which also scrolls the view there.
+    pub fn take_reveal(&mut self) -> bool {
+        if !self.reveal || self.match_count() == 0 {
+            return false;
+        }
+        self.reveal = false;
+        self.current_index = 0;
+        true
     }
 
     /// Replaces the query and invalidates results that belong to the previous
@@ -817,6 +840,28 @@ mod tests {
                 .is_rescan
         );
         assert!(model.take_due_search(Duration::from_secs(1)).is_none());
+    }
+
+    #[test]
+    fn a_revealing_model_steps_back_onto_its_newest_match_once() {
+        let mut viewport = ScrollbackViewport::default();
+        let live = live_buffer(&["needle one", "", "needle two"], 12);
+        let mut model = TerminalFindModel::default();
+        model.reveal_newest();
+        // No results yet: nothing to reveal.
+        assert!(!model.take_reveal());
+        search(
+            &mut model,
+            "needle",
+            snapshot(Vec::new(), false),
+            &live,
+            &mut viewport,
+        );
+        assert_eq!(model.matches().len(), 2);
+        assert!(model.take_reveal());
+        model.navigate_with_live(true, &mut viewport, &live);
+        assert_eq!(model.current_index(), 1, "the newest match");
+        assert!(!model.take_reveal(), "only once");
     }
 
     #[test]

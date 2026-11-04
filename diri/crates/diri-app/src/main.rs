@@ -28,6 +28,7 @@ mod empty_workbench;
 mod external_drop;
 mod file_links;
 mod file_tree;
+mod find_reveal;
 mod floating;
 pub mod fonts;
 pub mod fuzzy;

@@ -29,7 +29,7 @@ pub use alacritty_terminal::grid::compact::PayloadResidency;
 /// verification only).
 #[cfg(feature = "bench-verify")]
 pub use alacritty_terminal::vte::observe as osc_observe;
-pub use find_history::HistorySearch;
+pub use find_history::{HistorySearch, LineHit, LineSearch};
 pub use inline_images::{
     DEFAULT_CELL_PIXELS, STORE_BUDGET_BYTES as INLINE_IMAGE_BUDGET_BYTES, StoredImage,
 };

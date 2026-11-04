@@ -667,7 +667,7 @@ fn every_static_palette_action_dispatches_once_by_mouse_and_keyboard(cx: &mut Te
             None,
             &Default::default(),
         );
-        all.retain(|row| matches!(row.command, PaletteCommand::Action(id) if !matches!(id, CommandId::ToggleHistory | CommandId::SearchNotes | CommandId::ToggleQuickOpen | CommandId::OpenSettings)));
+        all.retain(|row| matches!(row.command, PaletteCommand::Action(id) if !matches!(id, CommandId::ToggleHistory | CommandId::GlobalSearch | CommandId::SearchNotes | CommandId::ToggleQuickOpen | CommandId::OpenSettings)));
         all
     };
     assert_eq!(

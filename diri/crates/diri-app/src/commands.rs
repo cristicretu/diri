@@ -68,6 +68,7 @@ actions!(
         ToggleCommandPalette,
         ToggleQuickOpen,
         ToggleHistory,
+        GlobalSearch,
         ToggleNotifications,
         ToggleActivity,
         ToggleOverview,
@@ -203,6 +204,7 @@ pub enum CommandId {
     ToggleCommandPalette,
     ToggleQuickOpen,
     ToggleHistory,
+    GlobalSearch,
     ToggleNotifications,
     ToggleActivity,
     ToggleOverview,
@@ -514,6 +516,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         "command.toggle_history.palette_title",
         "clock.fill",
         "history conversations past resume"
+    ),
+    spec!(
+        GlobalSearch,
+        "global-search",
+        Some("cmd-shift-a"),
+        Some("⇧⌘A"),
+        Some(APP_CONTEXT),
+        "command.global_search.palette_title",
+        "magnifyingglass",
+        "search everything find anywhere scrollback screen output error traceback transcript conversation reply grep"
     ),
     spec!(
         ToggleOverview,
@@ -1672,6 +1684,7 @@ impl CommandSpec {
             CommandId::ToggleCommandPalette => KeyBinding::new(key, ToggleCommandPalette, context),
             CommandId::ToggleQuickOpen => KeyBinding::new(key, ToggleQuickOpen, context),
             CommandId::ToggleHistory => KeyBinding::new(key, ToggleHistory, context),
+            CommandId::GlobalSearch => KeyBinding::new(key, GlobalSearch, context),
             CommandId::ToggleNotifications => KeyBinding::new(key, ToggleNotifications, context),
             CommandId::ToggleActivity => KeyBinding::new(key, ToggleActivity, context),
             CommandId::ToggleOverview => KeyBinding::new(key, ToggleOverview, context),
@@ -2298,6 +2311,11 @@ impl CommandId {
                 description: t("command.quote_selection_to_session.description"),
                 category: Sessions,
             },
+            Self::GlobalSearch => ShortcutMetadata {
+                title: t("command.global_search.title"),
+                description: t("command.global_search.description"),
+                category: Navigation,
+            },
             Self::ToggleHistory => ShortcutMetadata {
                 title: t("command.toggle_history.title"),
                 description: t("command.toggle_history.description"),
@@ -2793,6 +2811,7 @@ impl CommandId {
             Self::ToggleCommandPalette => Box::new(ToggleCommandPalette),
             Self::ToggleQuickOpen => Box::new(ToggleQuickOpen),
             Self::ToggleHistory => Box::new(ToggleHistory),
+            Self::GlobalSearch => Box::new(GlobalSearch),
             Self::ToggleNotifications => Box::new(ToggleNotifications),
             Self::ToggleActivity => Box::new(ToggleActivity),
             Self::ToggleOverview => Box::new(ToggleOverview),
