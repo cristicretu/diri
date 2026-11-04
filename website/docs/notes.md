@@ -70,10 +70,11 @@ diri's MCP server gives agents tools for notes. Agents are asked to add short en
 | `edit_note` | Replace an exact piece of text |
 | `replace_section` | Replace everything under one heading |
 | `create_note` | Write a new note; it appears under the agent in the sidebar |
+| `delete_note` | Move a note the agent created to the trash (restorable) |
 | `start_from_note` | Start another agent from a note or one of its to-dos |
 | `note_history` | List or read earlier versions (read-only) |
 
-A report from a to-do's own agent lands as a bullet under that to-do. Anything else goes into an `## Updates` section, created if missing, with the agent's chip and a timestamp. An agent started from a note may only write to that note or to notes that mention it.
+A report from a to-do's own agent lands as a bullet under that to-do. Anything else goes into an `## Updates` section, created if missing, with the agent's chip and a timestamp. An agent started from a note may only write to that note or to notes that mention it. An agent may delete only notes it or its sub-agents created, never yours.
 
 ### From the command line
 The `dirijor note` command does the same from any shell:

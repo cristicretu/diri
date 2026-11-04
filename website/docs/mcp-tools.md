@@ -495,6 +495,14 @@ Write a new Diri note for the person, e.g. an explanation ("how sign-in works") 
 | `open` | boolean |  |
 | `project` | string |  |
 
+### `delete_note`
+
+Delete a Diri note you or your sub-agents created with create_note, when the person asks or the note was yours to clean up: its tab closes and its file moves to the notes trash, where the person can restore it. Notes the person wrote, or other agents created, are theirs to delete: you cannot. note is an id, a title, part of a title, or a note Session id.
+
+| Argument | Type | Notes |
+| --- | --- | --- |
+| `note` | string | **Required.** |
+
 ### `start_from_note`
 
 Start an agent on a Diri note or one of its to-dos. The note becomes the agent's parent in the sidebar, the agent gets the note as its brief (plus the sessions it mentions), and its chip is added to the to-do. kind defaults to your own kind. separate_copy gives it its own copy of the project folder (projects under git only) so its changes stay apart until merged. prompt adds your own instructions. task:true tracks it like submit_task.

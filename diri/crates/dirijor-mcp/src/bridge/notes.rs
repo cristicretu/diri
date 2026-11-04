@@ -843,6 +843,42 @@ impl Bridge {
         })
     }
 
+    /// Moves a note the caller created to the notes trash and closes its
+    /// tab, like the person's Delete Note; reopening the closed tab (⇧⌘T)
+    /// brings it back.
+    pub(super) fn delete_note(&self, args: &Value) -> Result<Value, String> {
+        let store = self.note_store()?;
+        let snapshot = self.snapshot()?;
+        let meta = self.resolve_note(
+            &store,
+            &required_string(args, "note")?,
+            Some(&snapshot.sessions),
+        )?;
+        let note_session = note_sessions(&snapshot.sessions)
+            .get(meta.id.as_str())
+            .map(|record| record.id.clone());
+        McpPolicy::new(
+            &snapshot.sessions,
+            &snapshot.projects,
+            self.caller.as_deref(),
+        )?
+        .authorize(WriteAction::DeleteNote {
+            note_session: note_session.as_ref().map(|id| id.0.as_str()),
+        })?;
+        let session = note_session.ok_or("this note has no Session to delete")?;
+        self.request(
+            Method::SESSION_DELETE_NOTE,
+            json!({ "sessionID": session.0 }),
+            DEFAULT_TIMEOUT,
+        )?;
+        Ok(json!({
+            "note": meta.id,
+            "title": meta.display_title(),
+            "deleted": true,
+            "restore": "The file is in the notes .trash/ folder: the person can bring it back with Reopen Closed Tab (⇧⌘T) or by moving it back.",
+        }))
+    }
+
     /// Replaces everything under one heading of a note.
     pub(super) fn replace_section(&self, args: &Value) -> Result<Value, String> {
         let heading = required_string(args, "heading")?;
@@ -1602,6 +1638,64 @@ mod tests {
         ]);
         fixture.notes = notes;
         (fixture, note_id)
+    }
+
+    /// An agent deletes only notes it or its sub-agents created; the
+    /// person's notes, its parent's, and Session-less files are refused
+    /// before anything is trashed.
+    #[test]
+    fn delete_note_trashes_only_notes_the_caller_line_created() {
+        let notes = tempfile::tempdir().unwrap();
+        let store = NoteStore::open(notes.path()).unwrap();
+        let create = |title: &str| {
+            store
+                .create(Document::new(title, Vec::new()), None)
+                .unwrap()
+                .0
+        };
+        let (mine, by_child, by_root, persons, orphan) = (
+            create("Mine"),
+            create("By child"),
+            create("By root"),
+            create("Persons"),
+            create("Orphan"),
+        );
+        let (mut fixture, calls) = Fixture::scripted(
+            vec![
+                super::super::tests::record("root", None),
+                super::super::tests::record("mid", Some("root")),
+                super::super::tests::record("child", Some("mid")),
+                note_session("s_mine", &mine, Some("mid")),
+                note_session("s_child", &by_child, Some("child")),
+                note_session("s_root", &by_root, Some("root")),
+                note_session("s_persons", &persons, None),
+            ],
+            |method| (method == Method::SESSION_DELETE_NOTE).then(|| json!({})),
+        );
+        fixture.notes = notes;
+        let deletes = || {
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|method| *method == Method::SESSION_DELETE_NOTE)
+                .count()
+        };
+        let bridge = fixture.bridge("mid");
+        for refused in [&by_root, &persons, &orphan] {
+            let error = bridge
+                .call("delete_note", &json!({"note": refused}))
+                .unwrap_err();
+            assert!(error.contains("delete_note denied"), "{error}");
+        }
+        assert_eq!(deletes(), 0);
+        let deleted = bridge.call("delete_note", &json!({"note": mine})).unwrap();
+        assert_eq!(deleted["deleted"], true);
+        assert!(deleted["restore"].as_str().unwrap().contains(".trash"));
+        bridge
+            .call("delete_note", &json!({"note": by_child}))
+            .unwrap();
+        assert_eq!(deletes(), 2);
     }
 
     #[test]

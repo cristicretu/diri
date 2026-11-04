@@ -12,7 +12,7 @@ use diri_proto::{Project, SessionRecord, SessionStatus};
 
 use super::{Lineage, Relation};
 
-pub(super) const WRITE_POLICY: &str = "Reads are open across all sessions. Root agents may write within their project and message direct children on any host; delegated agents may write only to their parent and direct children. Every write requires a live Diri session identity. Cross-lineage messages are attributed. Agents cannot target themselves. Root agents may release, hibernate, wake, resume, fork, or integrate sessions in their project and their direct children on any project or host; delegated agents only their direct children. Split-pane layout follows the same reach, plus the caller's own pane and splitting beside its parent. Delegation depth and live children per session are capped (DIRIJOR_MAX_SPAWN_DEPTH, default 3; DIRIJOR_MAX_LIVE_CHILDREN, default 16).";
+pub(super) const WRITE_POLICY: &str = "Reads are open across all sessions. Root agents may write within their project and message direct children on any host; delegated agents may write only to their parent and direct children. Every write requires a live Diri session identity. Cross-lineage messages are attributed. Agents cannot target themselves. Agents may delete only notes they or their sub-agents created. Root agents may release, hibernate, wake, resume, fork, or integrate sessions in their project and their direct children on any project or host; delegated agents only their direct children. Split-pane layout follows the same reach, plus the caller's own pane and splitting beside its parent. Delegation depth and live children per session are capped (DIRIJOR_MAX_SPAWN_DEPTH, default 3; DIRIJOR_MAX_LIVE_CHILDREN, default 16).";
 
 const DEFAULT_MAX_SPAWN_DEPTH: usize = 3;
 const DEFAULT_MAX_LIVE_CHILDREN: usize = 16;
@@ -66,6 +66,11 @@ pub(super) enum WriteAction<'a> {
     },
     /// A new note under the caller (it runs nothing, so nothing is capped).
     CreateNote,
+    /// Move a note to the notes trash. `note_session` is the note's own
+    /// Session, when it has one.
+    DeleteNote {
+        note_session: Option<&'a str>,
+    },
     /// Start an agent whose parent is this note Session.
     StartFromNote {
         note_session: &'a str,
@@ -260,6 +265,30 @@ impl<'a> McpPolicy<'a> {
                 Relation::Unrelated
             }
             WriteAction::CreateNote => Relation::Unrelated,
+            WriteAction::DeleteNote { note_session } => {
+                // Notes are the user's: an agent may trash only a note it or
+                // one of its descendants created, which create_note files
+                // under that agent's Session. A note with no Session has no
+                // known creator.
+                let own = note_session
+                    .and_then(|id| self.lineage.record(id))
+                    .and_then(|note| note.parent.as_ref())
+                    .is_some_and(|parent| {
+                        parent.0 == self.caller.id.0
+                            || self
+                                .lineage
+                                .descendants(&self.caller.id.0)
+                                .iter()
+                                .any(|record| record.id == *parent)
+                    });
+                if !own {
+                    return Err(
+                        "delete_note denied: an agent may delete only notes it or its sub-agents created; ask the person to delete this one (Delete Note in the command palette)"
+                            .into(),
+                    );
+                }
+                Relation::Unrelated
+            }
             WriteAction::StartFromNote { note_session } => {
                 let (note, _) = self.target(note_session)?;
                 if !note.is_note() {

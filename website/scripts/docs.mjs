@@ -36,7 +36,7 @@ const TOOL_GROUPS = [
   ['Code and worktrees', ['get_diff', 'integrate', 'create_worktree', 'list_worktrees', 'remove_worktree', 'get_artifacts', 'quick_open_include']],
   ['Schedules', ['schedule_agent', 'list_schedules', 'delete_schedule']],
   ['Browser', ['browser', 'test_run']],
-  ['Notes', ['list_notes', 'read_note', 'write_note', 'edit_note', 'replace_section', 'create_note', 'start_from_note', 'note_history']],
+  ['Notes', ['list_notes', 'read_note', 'write_note', 'edit_note', 'replace_section', 'create_note', 'delete_note', 'start_from_note', 'note_history']],
 ];
 
 function schemaType(schema = {}) {

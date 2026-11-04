@@ -168,6 +168,7 @@ impl Bridge {
             "write_note" => self.write_note(arguments),
             "edit_note" => self.edit_note(arguments),
             "replace_section" => self.replace_section(arguments),
+            "delete_note" => self.delete_note(arguments),
             "create_note" => self.create_note(arguments),
             "start_from_note" => self.start_from_note(arguments),
             "note_history" => self.note_history(arguments),
