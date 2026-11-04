@@ -891,6 +891,10 @@ pub struct Prefs {
     /// cursor rests on it. Missing files pick this up as on.
     #[serde(default = "sidebar_lineage_highlights_default")]
     pub sidebar_lineage_highlights: bool,
+    /// Fold each project's working sessions, and the idle ones you have
+    /// already seen, under collapsed Working and Settled rows, so the
+    /// sessions that need you stand alone at the top.
+    pub sidebar_fold_sessions: bool,
     pub tab_orientation: TabOrientation,
     /// Visibility of the top tab strip, independent of the vertical sidebar.
     pub horizontal_tabs_visible: bool,
@@ -1042,6 +1046,7 @@ impl Default for Prefs {
             sidebar_width: 248.0,
             sidebar_grouping: SidebarGrouping::Project,
             sidebar_lineage_highlights: true,
+            sidebar_fold_sessions: false,
             tab_orientation: TabOrientation::Vertical,
             horizontal_tabs_visible: true,
             active_workspace: None,
@@ -1782,6 +1787,7 @@ mod tests {
         let fresh: Prefs = serde_json::from_str("{}").expect("missing preferences use defaults");
         assert!(!fresh.sidebar_visible);
         assert!(fresh.sidebar_lineage_highlights);
+        assert!(!fresh.sidebar_fold_sessions);
         assert!(!fresh.inspector_open);
         assert_eq!(fresh.sidebar_grouping, SidebarGrouping::Project);
         assert_eq!(fresh.sidebar_ordering, SidebarOrdering::Custom);

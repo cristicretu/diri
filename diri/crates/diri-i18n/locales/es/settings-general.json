@@ -31,6 +31,8 @@
   "settings.general.dock_badge_detail": "Cuenta las sesiones que no has visto o cada notificación sin leer.",
   "settings.general.dock_badge_notifications": "Notificaciones",
   "settings.general.dock_badge_sessions": "Sesiones",
+  "settings.general.fold_sessions": "Plegar sesiones en curso y resueltas",
+  "settings.general.fold_sessions_detail": "Mantén arriba en cada proyecto las sesiones que te necesitan. Las que trabajan y las inactivas ya vistas se pliegan en En curso y Resueltas.",
   "settings.general.include_hint": "Un patrón por línea, guardado en ~/.diri-include. Las carpetas ocultas se omiten salvo que coincidan. Los comodines siguen las reglas de gitignore, incluidas las carpetas anidadas.",
   "settings.general.interface_language": "Idioma de la interfaz",
   "settings.general.interface_language_detail": "Menús, ajustes y etiquetas. La salida de los agentes y el texto del terminal no cambian.",

@@ -198,6 +198,8 @@
   "sidebar.filter.sessions": "Filtrar etiquetas de sesión",
   "sidebar.filter.tabs": "Filtrar etiquetas de pestaña",
   "sidebar.filter_empty": "Ninguna sesión coincide con este filtro",
+  "sidebar.fold.settled": "Resueltas",
+  "sidebar.fold.working": "En curso",
   "sidebar.hide": "Ocultar barra lateral",
   "sidebar.new_agent": "Nuevo agente",
   "sidebar.new_agent.also_cmd_t": "También donde abre ⌘T",

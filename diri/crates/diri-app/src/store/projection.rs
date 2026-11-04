@@ -68,6 +68,11 @@ pub struct SidebarProject {
     /// what is folded away. Rollups and selection ranges read this.
     pub active: Vec<Arc<SessionRecord>>,
     pub archived: Vec<Arc<SessionRecord>>,
+    /// Session trees the sidebar folds under Working and Settled. The store
+    /// leaves both empty; the sidebar moves rows here from `sessions` when
+    /// Settings → General → Fold working and settled sessions is on.
+    pub working: Vec<SidebarRow>,
+    pub settled: Vec<SidebarRow>,
     pub pinned: bool,
 }
 
@@ -170,6 +175,8 @@ pub(super) fn build_projection(
                 sessions,
                 active,
                 archived,
+                working: Vec::new(),
+                settled: Vec::new(),
             },
         ));
     }

@@ -198,6 +198,8 @@
   "sidebar.filter.sessions": "筛选会话名称",
   "sidebar.filter.tabs": "筛选标签页名称",
   "sidebar.filter_empty": "没有符合筛选条件的会话",
+  "sidebar.fold.settled": "已处理",
+  "sidebar.fold.working": "工作中",
   "sidebar.hide": "隐藏边栏",
   "sidebar.new_agent": "新建智能体",
   "sidebar.new_agent.also_cmd_t": "⌘T 也会在这里打开",

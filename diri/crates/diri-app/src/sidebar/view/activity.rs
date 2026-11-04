@@ -45,6 +45,9 @@ impl Sidebar {
         let projection =
             super::super::filter::filter_projection(store.sidebar_projection(), self.filter_query.text());
         if !self.activity_filter {
+            if self.folds_enabled(store) {
+                return super::folds::fold_projection(projection, store);
+            }
             return projection;
         }
         let selected = store.selected_session_id().cloned();
