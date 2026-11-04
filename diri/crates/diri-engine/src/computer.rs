@@ -84,7 +84,22 @@ const HIDDEN_TOOLS: &[&str] = &[
     "install_ffmpeg",
     "replay_trajectory",
     "page",
+    // A script's calls can't be checked against the background rule before
+    // it runs; run_steps batches the same actions as data.
+    "run_script",
 ];
+
+/// Tools whose only job is to take the person's focus.
+const FOCUS_TOOLS: &[&str] = &["bring_to_front", "activate_app"];
+
+/// Tools whose background route can still lend the target key focus for a
+/// moment: a pixel click makes the target window key without raising it, and
+/// a keystroke the person types in that instant lands in the target.
+const POINTER_TOOLS: &[&str] = &["click", "double_click", "right_click", "drag"];
+/// How long the person's keyboard must have been quiet before a pointer
+/// action goes ahead, and the longest an action waits for that.
+const TYPING_QUIET: Duration = Duration::from_millis(400);
+const TYPING_WAIT_CAP: Duration = Duration::from_secs(10);
 
 /// Tools that only look. Everything else may change an app, so a `pid` it
 /// names must be leased to the caller.
@@ -141,6 +156,9 @@ pub const APP_BUSY: &str = "computer_app_busy";
 pub const UNKNOWN_TOOL: &str = "computer_unknown_tool";
 /// A `run_steps` batch longer than other Agents should wait for.
 pub const BATCH_TOO_LONG: &str = "computer_batch_too_long";
+/// The call would take the person's focus, keyboard or pointer. Diri runs
+/// computer use in the background only.
+pub const FOREGROUND_DENIED: &str = "computer_foreground_denied";
 /// The driver process failed, timed out, or answered out of protocol.
 pub const DRIVER_ERROR: &str = "computer_driver";
 
@@ -446,6 +464,9 @@ impl ComputerUse {
                 ));
             }
         };
+        if let Some(reason) = takes_focus(tool, &args) {
+            return Err(ComputerError::new(FOREGROUND_DENIED, reason));
+        }
         if tool == "run_steps"
             && let Some(steps) = args.get("steps").and_then(Value::as_array)
             && steps.len() > MAX_BATCH_STEPS
@@ -494,6 +515,9 @@ impl ComputerUse {
         };
         args.insert("session".into(), Value::String(name));
         bound_screenshot(tool, &mut args);
+        if !READ_ONLY_TOOLS.contains(&tool) && moves_pointer(tool, &args) {
+            wait_for_typing_pause(keyboard_idle, std::thread::sleep);
+        }
 
         let result = self
             .request(
@@ -935,6 +959,121 @@ fn needs_permission(result: &Value) -> bool {
     ]
     .iter()
     .any(|needle| code == *needle || text.contains(needle))
+}
+
+/// Why a call would take the person's focus, keyboard or pointer, if it would:
+/// a foreground rung, desktop scope (the frontmost app, the real pointer),
+/// or a tool that fronts a window. `run_steps` nests actions, so every level
+/// is checked. Reads never take focus.
+fn takes_focus(tool: &str, args: &Map<String, Value>) -> Option<String> {
+    fn walk(value: &Value) -> Option<&'static str> {
+        match value {
+            Value::Object(map) => {
+                if map.get("delivery_mode").and_then(Value::as_str) == Some("foreground") {
+                    return Some("delivery_mode \"foreground\"");
+                }
+                if map.get("scope").and_then(Value::as_str) == Some("desktop")
+                    || map.get("kind").and_then(Value::as_str) == Some("desktop")
+                {
+                    return Some("desktop scope");
+                }
+                if let Some(name) = map.get("tool").and_then(Value::as_str)
+                    && let Some(found) = FOCUS_TOOLS.iter().find(|focus| **focus == name)
+                {
+                    return Some(found);
+                }
+                if let Some(found) = FOCUS_TOOLS.iter().find(|focus| map.contains_key(**focus)) {
+                    return Some(found);
+                }
+                map.values().find_map(walk)
+            }
+            Value::Array(items) => items.iter().find_map(walk),
+            _ => None,
+        }
+    }
+    if READ_ONLY_TOOLS.contains(&tool) {
+        return None;
+    }
+    let what = FOCUS_TOOLS
+        .iter()
+        .find(|focus| **focus == tool)
+        .copied()
+        .or_else(|| walk(&Value::Object(args.clone())))?;
+    Some(format!(
+        "{what} would take the person's focus, keyboard or pointer, and Diri runs computer use \
+         in the background only. Use the background route: an element_token from \
+         get_window_state, or pixel x,y with pid and window_id. If the background route can't \
+         reach the control, stop and tell the person what you need them to do."
+    ))
+}
+
+/// Whether a call may take the pixel route that lends the target key focus
+/// for a moment: a pointer tool, or pixel `x`,`y` anywhere (`type_text` and
+/// `hotkey` pixel-click a field first), batches included.
+fn moves_pointer(tool: &str, args: &Map<String, Value>) -> bool {
+    fn walk(value: &Value) -> bool {
+        match value {
+            Value::Object(map) => {
+                (map.contains_key("x") && map.contains_key("y"))
+                    || map
+                        .get("tool")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| POINTER_TOOLS.contains(&name))
+                    || POINTER_TOOLS.iter().any(|name| map.contains_key(*name))
+                    || map.values().any(walk)
+            }
+            Value::Array(items) => items.iter().any(walk),
+            _ => false,
+        }
+    }
+    POINTER_TOOLS.contains(&tool) || walk(&Value::Object(args.clone()))
+}
+
+/// Holds a pointer action until the person has stopped typing for
+/// `TYPING_QUIET`, at most `TYPING_WAIT_CAP`, so the target's moment of key
+/// focus never catches their keystrokes. Costs nothing while they aren't
+/// typing; `idle` is `None` where the keyboard can't be read.
+fn wait_for_typing_pause(
+    idle: impl Fn() -> Option<Duration>,
+    mut sleep: impl FnMut(Duration),
+) -> Duration {
+    let mut waited = Duration::ZERO;
+    while waited < TYPING_WAIT_CAP {
+        let Some(quiet) = idle() else { break };
+        if quiet >= TYPING_QUIET {
+            break;
+        }
+        let nap = (TYPING_QUIET - quiet).min(TYPING_WAIT_CAP - waited);
+        sleep(nap);
+        waited += nap;
+    }
+    waited
+}
+
+/// Time since the last physical key press or modifier change. The driver's
+/// background input is posted to a process, not the HID system, so it never
+/// counts as the person typing. No permission is needed to read this.
+#[cfg(target_os = "macos")]
+fn keyboard_idle() -> Option<Duration> {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventSourceSecondsSinceLastEventType(state: i32, event_type: u32) -> f64;
+    }
+    const HID_SYSTEM_STATE: i32 = 1;
+    const KEY_DOWN: u32 = 10;
+    const FLAGS_CHANGED: u32 = 12;
+    // SAFETY: a pure query with plain-value arguments.
+    let seconds = unsafe {
+        CGEventSourceSecondsSinceLastEventType(HID_SYSTEM_STATE, KEY_DOWN).min(
+            CGEventSourceSecondsSinceLastEventType(HID_SYSTEM_STATE, FLAGS_CHANGED),
+        )
+    };
+    (seconds.is_finite() && seconds >= 0.0).then(|| Duration::from_secs_f64(seconds))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keyboard_idle() -> Option<Duration> {
+    None
 }
 
 /// Every integer `pid` anywhere in the arguments: `run_steps` nests actions.

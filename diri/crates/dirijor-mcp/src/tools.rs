@@ -602,7 +602,10 @@ accessibility rows [N] plus a screenshot; (3) act with element_token \"<snapshot
 type_text {text}, set_value, set_state {state: checked|expanded|focused...}, clear_value, press_key \
 {key}, hotkey {keys}, scroll) or with pixel x,y from that screenshot; (4) re-read with \
 get_window_state {since:\"latest\"} and check the change before going on. run_steps runs several \
-actions in one call; wait blocks until an element, window or dialog appears or goes. A failed \
+actions in one call; wait blocks until an element, window or dialog appears or goes. Everything \
+stays in the background while the person keeps working: delivery_mode \"foreground\", scope \
+\"desktop\", bring_to_front and activate_app are refused with computer_foreground_denied, even when \
+a driver hint recommends them; if no background route reaches a control, tell the person instead. A failed \
 action's disposition.retry says whether retrying is safe; a stale_element_token means read again. Act only on apps you launched or the person pointed you \
 to: an app another agent is driving returns computer_app_busy. computer_unavailable or \
 computer_permissions means only the person can finish setup (Diri Settings › Agents › Computer use): \
