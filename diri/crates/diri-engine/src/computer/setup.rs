@@ -50,6 +50,11 @@ const ARCHIVE_SHA256: &str = "2ed85cfc5b11046604dcf9a621f83d5fc2fbf62204716d4fa9
 const DRIVER_TEAM_ID: &str = "A56RVNJ69X";
 const DOWNLOAD_TIMEOUT_SECS: &str = "300";
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(8);
+/// A failed automatic update is tried again after this long, not on every call.
+const AUTO_UPDATE_RETRY: Duration = Duration::from_secs(10 * 60);
+/// How long an Agent's call waits for an automatic update before going ahead
+/// on the driver it has.
+const AUTO_UPDATE_WAIT: Duration = Duration::from_secs(90);
 /// The tail of the setup's output kept for "Show log".
 const MAX_LOG_BYTES: usize = 32 * 1024;
 
@@ -76,6 +81,8 @@ impl Default for Download {
 #[derive(Default)]
 pub(super) struct SetupState {
     installing: bool,
+    /// When Diri last updated an outdated driver on its own.
+    auto_attempt: Option<Instant>,
     error: Option<String>,
     log: Option<String>,
 }
@@ -84,6 +91,7 @@ impl ComputerUse {
     /// What Settings shows. `probe` starts the daemon when it is not
     /// running, so the grants can be read.
     pub fn status(&self, probe: bool) -> diri_proto::ComputerStatus {
+        self.update_if_outdated();
         let mut status = diri_proto::ComputerStatus {
             supported: cfg!(target_os = "macos") || self.shared.binary.is_some(),
             tested_version: TESTED_VERSION.to_owned(),
@@ -146,6 +154,7 @@ impl ComputerUse {
             }
             *setup = SetupState {
                 installing: true,
+                auto_attempt: setup.auto_attempt,
                 ..SetupState::default()
             };
         }
@@ -173,6 +182,57 @@ impl ComputerUse {
             let mut setup = self.setup_state();
             setup.installing = false;
             setup.error = Some("Diri could not start the download.".into());
+        }
+    }
+
+    /// Replaces a driver set up for an older Diri without asking: the person
+    /// already chose computer use, and the release this Diri pins is checked
+    /// (SHA-256, signature, version) exactly as a first setup is. macOS keeps
+    /// the grants, which belong to Diri, not to the driver binary. Returns
+    /// whether an update is running.
+    pub(super) fn update_if_outdated(&self) -> bool {
+        if self.overridden() || std::env::var_os("DIRI_CUA_DRIVER").is_some() {
+            return false;
+        }
+        let Some(binary) = installed(&self.shared.root) else {
+            return false;
+        };
+        // Setup installs into a directory named for the version, so this
+        // needs no process launch on every call.
+        let outdated = binary
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .is_some_and(|version| older_than(version, TESTED_VERSION));
+        if !outdated {
+            return false;
+        }
+        {
+            let mut setup = self.setup_state();
+            if setup.installing {
+                return true;
+            }
+            if setup
+                .auto_attempt
+                .is_some_and(|at| at.elapsed() < AUTO_UPDATE_RETRY)
+            {
+                return false;
+            }
+            setup.auto_attempt = Some(Instant::now());
+        }
+        self.install();
+        true
+    }
+
+    /// Lets an Agent's call ride out an automatic update, so it runs on the
+    /// new driver rather than having its daemon replaced mid-call.
+    pub(super) fn finish_update(&self) {
+        if !self.update_if_outdated() {
+            return;
+        }
+        let deadline = Instant::now() + AUTO_UPDATE_WAIT;
+        while self.setup_state().installing && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
 

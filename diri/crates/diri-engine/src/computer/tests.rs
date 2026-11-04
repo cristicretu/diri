@@ -606,7 +606,6 @@ fn setup_downloads_verifies_and_installs_in_the_background() {
             team: None,
         },
     );
-    assert!(computer.status(false).outdated);
 
     let started = computer
         .setup(diri_proto::ComputerSetupAction::Install)
@@ -645,6 +644,80 @@ fn setup_downloads_verifies_and_installs_in_the_background() {
         .collect();
     assert_eq!(leftovers, vec![std::ffi::OsString::from(TESTED_VERSION)]);
     assert!(done.install_log.unwrap().contains("sha256"));
+}
+
+#[test]
+fn an_outdated_driver_updates_itself_without_a_click() {
+    let temp = tempfile::tempdir().unwrap();
+    let (url, sha256) = fake_release(temp.path());
+    let download = Download {
+        url,
+        sha256,
+        team: None,
+    };
+    let old_driver = |root: &Path| {
+        std::fs::create_dir_all(root.join("0.35.0")).unwrap();
+        let old = fake_driver(&root.join("0.35.0"));
+        std::fs::write(old.with_extension("version"), "0.35.0").unwrap();
+    };
+
+    // Settings asking for the status is enough to start it.
+    let root = temp.path().join("settings");
+    old_driver(&root);
+    let computer = ComputerUse::with_paths(
+        None,
+        root.clone(),
+        temp.path().join("s.sock"),
+        download.clone(),
+    );
+    assert!(computer.status(false).installing);
+    let done = wait_for(|| {
+        let status = computer.status(false);
+        (!status.installing).then_some(status)
+    });
+    assert_eq!(done.install_error, None, "{:?}", done.install_log);
+    assert_eq!(done.version.as_deref(), Some(TESTED_VERSION));
+    assert!(!done.outdated);
+
+    // An Agent's call waits for the update instead of using the old driver.
+    let root = temp.path().join("agent");
+    old_driver(&root);
+    let computer =
+        ComputerUse::with_paths(None, root.clone(), temp.path().join("a.sock"), download);
+    let _ = computer.act(&caller("s1", "Agent"), "tools", json!({}), &|_: &str| true);
+    assert!(root.join(TESTED_VERSION).join("cua-driver").is_file());
+    assert!(!root.join("0.35.0").exists());
+
+    // Nothing to update: nothing starts.
+    assert!(!computer.update_if_outdated());
+}
+
+#[test]
+fn a_failed_automatic_update_is_not_retried_on_every_call() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("computer-use");
+    std::fs::create_dir_all(root.join("0.35.0")).unwrap();
+    let old = fake_driver(&root.join("0.35.0"));
+    std::fs::write(old.with_extension("version"), "0.35.0").unwrap();
+    let computer = ComputerUse::with_paths(
+        None,
+        root.clone(),
+        temp.path().join("d.sock"),
+        Download {
+            url: format!("file://{}", temp.path().join("missing.tar.gz").display()),
+            sha256: "0".repeat(64),
+            team: None,
+        },
+    );
+    assert!(computer.update_if_outdated());
+    let failed = wait_for(|| {
+        let status = computer.status(false);
+        (!status.installing).then_some(status)
+    });
+    assert!(failed.install_error.is_some());
+    // The old driver keeps working, and calls don't each start a download.
+    assert!(!computer.update_if_outdated());
+    assert!(root.join("0.35.0").join("cua-driver").is_file());
 }
 
 #[test]
