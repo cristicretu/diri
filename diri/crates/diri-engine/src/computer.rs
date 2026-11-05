@@ -440,6 +440,9 @@ impl ComputerUse {
         if let Some(reason) = self.unavailable_reason() {
             return Err(ComputerError::new(UNAVAILABLE, reason));
         }
+        // A Diri release that pins a newer driver updates the one set up
+        // before, without the person pressing Update.
+        self.finish_update();
         if tool == "tools" {
             return self.catalog_summary(args.get("name").and_then(Value::as_str));
         }
