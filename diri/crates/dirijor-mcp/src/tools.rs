@@ -445,6 +445,11 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
             json!({"type":"object","properties":{"note":{"type":"string","minLength":1},"heading":{"type":"string","minLength":1},"markdown":{"type":"string","maxLength":65536}},"required":["note","heading","markdown"]}),
         ),
         ToolDefinition::new(
+            "delete_note",
+            "Delete a Diri note you or your sub-agents created with create_note, when the person asks or the note was yours to clean up: its tab closes and its file moves to the notes trash, where the person can restore it. Notes the person wrote, or other agents created, are theirs to delete: you cannot. note is an id, a title, part of a title, or a note Session id.",
+            json!({"type":"object","properties":{"note":{"type":"string","minLength":1}},"required":["note"]}),
+        ),
+        ToolDefinition::new(
             "create_note",
             "Write a new Diri note for the person, e.g. an explanation (\"how sign-in works\") or a write-up. markdown is rich Markdown: headings, lists, to-dos, links, quotes, code. Link the notes it builds on or relates to by writing [[Note title]]: each becomes a link to that note (linked_notes lists them; unlinked_titles matched no single note), and the linked note shows this one among its backlinks. It appears under you in the sidebar, in your project (or project, a folder); open:true shows it to the person right away. Use this for anything longer than a write_note entry.",
             json!({"type":"object","properties":{"title":{"type":"string","minLength":1,"maxLength":200},"markdown":{"type":"string","maxLength":65536},"project":{"type":"string","minLength":1},"open":{"type":"boolean"}},"required":["title"]}),
@@ -875,6 +880,7 @@ mod tests {
             "note_history",
             "edit_note",
             "replace_section",
+            "delete_note",
             "note_links",
         ] {
             let text = describe(name).to_lowercase();

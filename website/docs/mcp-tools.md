@@ -495,6 +495,14 @@ Write a new Diri note for the person, e.g. an explanation ("how sign-in works") 
 | `open` | boolean |  |
 | `project` | string |  |
 
+### `delete_note`
+
+Delete a Diri note you or your sub-agents created with create_note, when the person asks or the note was yours to clean up: its tab closes and its file moves to the notes trash, where the person can restore it. Notes the person wrote, or other agents created, are theirs to delete: you cannot. note is an id, a title, part of a title, or a note Session id.
+
+| Argument | Type | Notes |
+| --- | --- | --- |
+| `note` | string | **Required.** |
+
 ### `start_from_note`
 
 Start an agent on a Diri note or one of its to-dos. The note becomes the agent's parent in the sidebar, the agent gets the note as its brief (plus the sessions it mentions), and its chip is added to the to-do. kind defaults to your own kind. separate_copy gives it its own copy of the project folder (projects under git only) so its changes stay apart until merged. prompt adds your own instructions. task:true tracks it like submit_task.
@@ -533,7 +541,7 @@ Read one of Diri's skills: the detailed rules for a Diri capability, as Markdown
 
 ### `computer`
 
-Use this Mac's apps the way a person would, in the background: any native app (Simulator, TextEdit, Xcode, Finder, the app you are building) and browser pages. The person's cursor, keyboard and focus stay theirs; your actions show as your own labelled cursor. Pass tool and args. Loop: (1) launch_app {bundle_id or name, creates_new_application_instance:true} returns your own pid and windows (or list_windows {pid}); (2) get_window_state {pid, window_id} returns accessibility rows [N] plus a screenshot; (3) act with element_token "<snapshot_id>:N" (click, type_text {text}, set_value, set_state {state: checked/expanded/focused...}, clear_value, press_key {key}, hotkey {keys}, scroll) or with pixel x,y from that screenshot; (4) re-read with get_window_state {since:"latest"} and check the change before going on. run_steps runs several actions in one call; wait blocks until an element, window or dialog appears or goes. A failed action's disposition.retry says whether retrying is safe; a stale_element_token means read again. Act only on apps you launched or the person pointed you to: an app another agent is driving returns computer_app_busy. computer_unavailable or computer_permissions means only the person can finish setup (Diri Settings › Agents › Computer use): tell them, and don't try to install or grant anything yourself. tool "tools" lists every tool.
+Use this Mac's apps the way a person would, in the background: any native app (Simulator, TextEdit, Xcode, Finder, the app you are building) and browser pages. The person's cursor, keyboard and focus stay theirs; your actions show as your own labelled cursor. Pass tool and args. Loop: (1) launch_app {bundle_id or name, creates_new_application_instance:true} returns your own pid and windows (or list_windows {pid}); (2) get_window_state {pid, window_id} returns accessibility rows [N] plus a screenshot; (3) act with element_token "<snapshot_id>:N" (click, type_text {text}, set_value, set_state {state: checked/expanded/focused...}, clear_value, press_key {key}, hotkey {keys}, scroll) or with pixel x,y from that screenshot; (4) re-read with get_window_state {since:"latest"} and check the change before going on. run_steps runs several actions in one call; wait blocks until an element, window or dialog appears or goes. Everything stays in the background while the person keeps working: delivery_mode "foreground", scope "desktop", bring_to_front and activate_app are refused with computer_foreground_denied, even when a driver hint recommends them; if no background route reaches a control, tell the person instead. A failed action's disposition.retry says whether retrying is safe; a stale_element_token means read again. Act only on apps you launched or the person pointed you to: an app another agent is driving returns computer_app_busy. computer_unavailable or computer_permissions means only the person can finish setup (Diri Settings › Agents › Computer use): tell them, and don't try to install or grant anything yourself. tool "tools" lists every tool.
 
 | Argument | Type | Notes |
 | --- | --- | --- |
