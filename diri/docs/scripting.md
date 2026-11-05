@@ -319,7 +319,9 @@ key=value`, `dirijor actions` and an Agent's `perform_action` reach it. The
 command's function receives the arguments as `ctx.args`, and what it
 returns (after any waits) is the action's result. `desc` becomes the
 action's description, and `destructive = true` publishes it as destructive,
-so an Agent needs the same permission it needs to close a tab. The catalog
+so an Agent needs the same permission it needs to close a tab, and Diri asks
+the person before running it for an Agent (its tools or `dirijor do` inside
+an Agent's tab; a shell tab is the person). The catalog
 is published again whenever the script's commands change; a script that
 runs one of its own commands by name runs it directly, not through the
 window. Reload Scripts is a regular command, so it is also an action:

@@ -15,8 +15,109 @@ use serde_json::{Value, json};
 impl RootView {
     pub(super) fn perform_app_actions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for request in self.window_store.take_app_performs() {
-            let id = request.request_id;
-            if crate::scripting::is_script_action(&request.action) {
+            match self.agent_confirmation(&request) {
+                Some((title, message)) => {
+                    self.confirm_agent_action(request, &title, &message, window, cx);
+                }
+                None => self.run_app_perform(request, window, cx),
+            }
+        }
+    }
+
+    /// The question for a destructive action an Agent asked for (an
+    /// Agent's `dirijor do`, or a session-scoped one through its tools):
+    /// the person approves it first. The person's own requests, a shell's
+    /// and a note's carry no Agent, so they run as asked.
+    fn agent_confirmation(&self, request: &AppPerformRequest) -> Option<(String, String)> {
+        let actor = request.actor.as_ref()?;
+        if !crate::app_actions::is_destructive(&request.action) {
+            return None;
+        }
+        let store = self.window_store.read().expect("store");
+        let agent = store
+            .sessions()
+            .get(actor)
+            .filter(|session| {
+                !session.is_note() && session.effective_kind() != &AgentKind::SHELL
+            })
+            .map(|session| crate::switcher::display_title_str(session).to_owned())?;
+        let action = crate::app_actions::title(&request.action)
+            .unwrap_or_else(|| request.action.clone());
+        Some((
+            crate::i18n::tf(
+                "agent_confirm.title",
+                &[("agent", &agent), ("action", &action)],
+            ),
+            crate::i18n::tf("agent_confirm.message", &[("agent", &agent)]),
+        ))
+    }
+
+    /// Asks the person, then runs the action or answers that they declined.
+    /// One question at a time: another waits for none, it is refused.
+    fn confirm_agent_action(
+        &mut self,
+        request: AppPerformRequest,
+        title: &str,
+        message: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = request.request_id;
+        if self.agent_action_prompt.is_some() {
+            self.window_store.write().expect("store").reply_app_perform(
+                id,
+                Err(ControlError::new(
+                    "action_declined",
+                    "the person is already answering another agent's request; try again later",
+                )),
+            );
+            return;
+        }
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            title,
+            Some(message),
+            &[
+                gpui::PromptButton::ok(crate::i18n::t("agent_confirm.allow")),
+                gpui::PromptButton::cancel(crate::i18n::t("agent_confirm.deny")),
+            ],
+            cx,
+        );
+        // Past the Engine's deadline the Agent was already told the app timed
+        // out, so a late Allow must not run the action behind its back.
+        let deadline = request
+            .timeout_ms
+            .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
+        self.agent_action_prompt = Some(cx.spawn_in(window, async move |this, cx| {
+            let allowed = answer.await.ok() == Some(0);
+            let expired = deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
+            let _ = crate::floating::update_in_owner(&this, cx, |root, window, cx| {
+                root.agent_action_prompt = None;
+                if expired {
+                    // Nobody is waiting for the answer any more.
+                } else if allowed {
+                    root.run_app_perform(request, window, cx);
+                } else {
+                    root.window_store.write().expect("store").reply_app_perform(
+                        id,
+                        Err(ControlError::new(
+                            "action_declined",
+                            "the person declined this action",
+                        )),
+                    );
+                }
+            });
+        }));
+    }
+
+    fn run_app_perform(
+        &mut self,
+        request: AppPerformRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = request.request_id;
+        if crate::scripting::is_script_action(&request.action) {
                 // A script command answers when its function returns, on
                 // the script thread; the window does not wait for it.
                 match crate::scripting::perform(&request) {
@@ -43,14 +144,13 @@ impl RootView {
                         .expect("store")
                         .reply_app_perform(id, Err(error)),
                 }
-                continue;
+                return;
             }
             let result = self.perform_app_action(&request, window, cx);
             self.window_store
                 .write()
                 .expect("store")
                 .reply_app_perform(id, result);
-        }
     }
 
     /// Publishes the window's actions again: the script's commands changed.
@@ -150,6 +250,7 @@ impl RootView {
 mod tests {
     use super::*;
     use crate::root::tests::test_services;
+    use crate::sidebar::SidebarPreviewFixture;
     use serde_json::json;
 
     fn request(id: u64, action: &str, args: Value) -> AppPerformRequest {
@@ -158,6 +259,7 @@ mod tests {
             action: action.into(),
             args,
             actor: None,
+            timeout_ms: None,
         }
     }
 
@@ -221,5 +323,113 @@ mod tests {
                     .has_pending_ui_request()
             );
         });
+    }
+
+    /// A destructive action an Agent asks for waits for the person: Allow
+    /// runs it, Don't Allow refuses it, and an answer after the Engine gave
+    /// up runs nothing. The same request from a shell tab or with no actor
+    /// (the person, a script) runs without asking, and a safe one never asks.
+    #[gpui::test]
+    fn an_agents_destructive_action_asks_the_person_first(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::alerts::enable);
+        let (runtime, mut effects) = crate::store::StoreRuntime::inert_with_effects();
+        let mut services = Arc::try_unwrap(test_services())
+            .ok()
+            .expect("fresh test services");
+        services.store = Arc::new(runtime);
+        let services = Arc::new(services);
+        let runtime = services.store.clone();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.hydrate(fixture.list);
+            let base = store
+                .sessions()
+                .values()
+                .next()
+                .expect("a preview session")
+                .as_ref()
+                .clone();
+            for (id, kind) in [("s_agent", AgentKind::CLAUDE_CODE), ("s_shell", AgentKind::SHELL)] {
+                let mut record = base.clone();
+                record.id = SessionId::new(id);
+                record.kind = kind;
+                record.note_id = None;
+                record.archived_at = None;
+                store.upsert_session(record);
+            }
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Typical, window, cx)
+        });
+        let window_store = root.read_with(cx, |root, _| root.window_store.clone());
+        let mut next = 0;
+        let mut perform = |action: &str,
+                           actor: Option<&str>,
+                           timeout_ms: Option<u64>,
+                           cx: &mut gpui::VisualTestContext| {
+            next += 1;
+            let mut params = json!({"requestId": next, "action": action});
+            if let Some(actor) = actor {
+                params["actor"] = json!(actor);
+            }
+            if let Some(timeout_ms) = timeout_ms {
+                params["timeoutMs"] = json!(timeout_ms);
+            }
+            window_store
+                .write()
+                .unwrap()
+                .handle_event(diri_client::EventEnvelope {
+                    name: diri_proto::EventName::APP_PERFORM_REQUESTED.into(),
+                    params,
+                    seq: 0,
+                });
+            root.update_in(cx, |root, window, cx| root.perform_app_actions(window, cx));
+            cx.run_until_parked();
+        };
+
+        // The window's answers to the Engine, by request id.
+        let mut replies = || {
+            let mut replies = Vec::new();
+            while let Ok(effect) = effects.try_recv() {
+                if let crate::store::StoreEffect::AppReply(reply) = effect {
+                    replies.push((reply.request_id, reply.error.map(|error| error.code)));
+                }
+            }
+            replies
+        };
+        let declined = Some("action_declined".to_string());
+
+        perform("note-delete", Some("s_agent"), Some(30_000), cx);
+        assert!(cx.has_pending_prompt(), "the person is asked first");
+        assert!(replies().is_empty(), "nothing runs before the answer");
+        cx.simulate_prompt_answer("Don't Allow");
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt());
+        assert!(root.read_with(cx, |root, _| root.agent_action_prompt.is_none()));
+        assert_eq!(replies(), vec![(1, declined.clone())]);
+
+        perform("note-delete", Some("s_agent"), Some(30_000), cx);
+        cx.simulate_prompt_answer("Allow");
+        cx.run_until_parked();
+        let allowed = replies();
+        assert_eq!(allowed.len(), 1);
+        assert_eq!(allowed[0].0, 2);
+        assert_ne!(allowed[0].1, declined, "Allow runs the action");
+
+        // The Engine stopped waiting before the person answered: the Agent
+        // was told the app timed out, so a late Allow runs nothing.
+        perform("note-delete", Some("s_agent"), Some(0), cx);
+        cx.simulate_prompt_answer("Allow");
+        cx.run_until_parked();
+        assert!(replies().is_empty(), "a late Allow runs nothing");
+        assert!(root.read_with(cx, |root, _| root.agent_action_prompt.is_none()));
+
+        perform("note-delete", Some("s_shell"), None, cx);
+        assert!(!cx.has_pending_prompt(), "a shell tab is the person");
+        perform("note-delete", None, None, cx);
+        assert!(!cx.has_pending_prompt(), "no actor is the person or a script");
+        perform("toggle-sidebar", Some("s_agent"), None, cx);
+        assert!(!cx.has_pending_prompt(), "a safe action never asks");
     }
 }

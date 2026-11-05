@@ -157,6 +157,11 @@ pub struct AppPerformRequest {
     pub args: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor: Option<SessionId>,
+    /// How long the Engine waits for the answer. After it passes, the asker
+    /// has already been told the app timed out, so the app must not run
+    /// the action on a late approval. Absent from older Engines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 /// `app.reply`: the app's answer to one [`AppPerformRequest`]. Exactly one

@@ -204,6 +204,15 @@ pub fn title(name: &str) -> Option<String> {
     }
 }
 
+/// Whether `name` closes or removes something (a command or a script
+/// command marked destructive): an Agent's request for it waits for the
+/// person.
+pub fn is_destructive(name: &str) -> bool {
+    catalog()
+        .iter()
+        .any(|spec| spec.name == name && spec.risk == ActionRisk::Destructive)
+}
+
 /// What a request asks the window to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Resolved {
@@ -311,6 +320,7 @@ mod tests {
             action: action.into(),
             args,
             actor: None,
+            timeout_ms: None,
         }
     }
 

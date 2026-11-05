@@ -144,6 +144,7 @@ fn a_script_key_and_command_reach_the_script_thread(cx: &mut TestAppContext) {
         action: "script.say-hi".into(),
         args: json!({"n": 1}),
         actor: Some(SessionId::new("agent-1")),
+        timeout_ms: None,
     })
     .unwrap();
     match rx.try_recv() {
@@ -166,6 +167,7 @@ fn a_script_key_and_command_reach_the_script_thread(cx: &mut TestAppContext) {
             action: "script.gone".into(),
             args: json!({}),
             actor: None,
+            timeout_ms: None,
         })
         .unwrap_err()
         .code,

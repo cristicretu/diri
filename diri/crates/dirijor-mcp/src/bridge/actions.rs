@@ -20,6 +20,8 @@ use super::{Bridge, DEFAULT_TIMEOUT, McpPolicy, WriteAction};
 /// receives the Engine's structured timeout rather than a client one.
 const PERFORM_TIMEOUT: Duration =
     Duration::from_millis(diri_proto::app_actions::DEFAULT_TIMEOUT_MS + 5_000);
+const CONFIRM_TIMEOUT: Duration =
+    Duration::from_millis(diri_proto::app_actions::MAX_TIMEOUT_MS + 5_000);
 
 impl Bridge {
     fn app_actions(&self) -> Result<AppActionsListResult, String> {
@@ -86,11 +88,16 @@ impl Bridge {
                 format!("unknown_action: the app has no action {name:?}; call list_actions")
             })?;
         authorize(&policy, spec, &args)?;
-        let result = self.request(
-            Method::APP_PERFORM,
-            json!({"action": name, "args": args}),
-            PERFORM_TIMEOUT,
-        )?;
+        // A destructive action waits for the person to approve it.
+        let (params, timeout) = if spec.risk == ActionRisk::Destructive {
+            (
+                json!({"action": name, "args": args, "timeoutMs": diri_proto::app_actions::MAX_TIMEOUT_MS}),
+                CONFIRM_TIMEOUT,
+            )
+        } else {
+            (json!({"action": name, "args": args}), PERFORM_TIMEOUT)
+        };
+        let result = self.request(Method::APP_PERFORM, params, timeout)?;
         Ok(
             json!({"ok": true, "action": name, "result": result.get("result").cloned().unwrap_or(Value::Null)}),
         )

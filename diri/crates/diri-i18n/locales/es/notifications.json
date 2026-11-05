@@ -1,4 +1,8 @@
 {
+  "agent_confirm.allow": "Permitir",
+  "agent_confirm.deny": "No permitir",
+  "agent_confirm.message": "Esto cierra o elimina algo. Permítelo solo si se lo pediste a {agent}.",
+  "agent_confirm.title": "{agent} quiere ejecutar {action}",
   "agent_notice.app_action": "Ejecutar una acción",
   "agent_notice.change_workspaces": "Editar espacios de trabajo",
   "agent_notice.close_pane": "Cerrar panel",

@@ -4,11 +4,13 @@
 use super::*;
 use diri_proto::api::{ApiDescribeResult, ApiListResult, ApiTextResult};
 use diri_proto::app_actions::{
-    ActionRisk, AppActionSpec, AppActionsListResult, DEFAULT_TIMEOUT_MS,
+    ActionRisk, AppActionSpec, AppActionsListResult, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 const PERFORM_TIMEOUT: Duration = Duration::from_millis(DEFAULT_TIMEOUT_MS + 5_000);
+/// An Agent's destructive action waits for the person to approve it.
+const CONFIRM_TIMEOUT: Duration = Duration::from_millis(MAX_TIMEOUT_MS + 5_000);
 
 pub(super) const HELP: &str = "App actions and API:\n  \
 dirijor actions [QUERY] [--json]          the Diri window's actions and their arguments\n  \
@@ -100,11 +102,18 @@ pub(super) fn perform(arguments: &[String]) -> Result<(), CliError> {
             .ok_or_else(|| CliError::failure(format!("expected KEY=VALUE, got {argument:?}")))?;
         args[key] = serde_json::from_str(value).unwrap_or_else(|_| json!(value));
     }
-    let result = request(
-        Method::APP_PERFORM,
-        json!({"action": action, "args": args}),
-        PERFORM_TIMEOUT,
-    )?;
+    let mut params = json!({"action": action, "args": args});
+    let mut timeout = PERFORM_TIMEOUT;
+    if let Some(actor) = agent_actor() {
+        // Run inside an Agent: the app names it, and asks the person before
+        // a destructive action, which may take them a while.
+        params[diri_proto::agent_action::ACTOR_FIELD] = json!(actor);
+        if is_destructive(action) {
+            params["timeoutMs"] = json!(MAX_TIMEOUT_MS);
+            timeout = CONFIRM_TIMEOUT;
+        }
+    }
+    let result = request(Method::APP_PERFORM, params, timeout)?;
     let result = result.get("result").cloned().unwrap_or(Value::Null);
     if has_flag(arguments, "--json") {
         print_json(&result);
@@ -115,6 +124,41 @@ pub(super) fn perform(arguments: &[String]) -> Result<(), CliError> {
         );
     }
     Ok(())
+}
+
+/// The Agent session this command runs inside, if any. A shell tab or a
+/// note is the person, so it names no actor. When the session cannot be
+/// looked up, the id is sent anyway: the app checks its kind again before
+/// asking, so a failed lookup never skips the person's approval.
+fn agent_actor() -> Option<String> {
+    let own = std::env::var("DIRIJOR_SESSION_ID")
+        .ok()
+        .filter(|id| !id.is_empty())?;
+    let Ok(sessions) = sessions() else {
+        return Some(own);
+    };
+    match sessions.into_iter().find(|record| record.id.0 == own) {
+        Some(record)
+            if record.is_note() || record.effective_kind() == &diri_proto::AgentKind::SHELL =>
+        {
+            None
+        }
+        _ => Some(own),
+    }
+}
+
+/// Whether the app publishes `action` as destructive; unknown (or an app
+/// that cannot be asked) counts as destructive so the wait is long enough.
+fn is_destructive(action: &str) -> bool {
+    typed::<AppActionsListResult>(Method::APP_ACTIONS_LIST, json!({}))
+        .map(|catalog| {
+            catalog
+                .actions
+                .iter()
+                .find(|spec| spec.name == action)
+                .is_none_or(|spec| spec.risk == ActionRisk::Destructive)
+        })
+        .unwrap_or(true)
 }
 
 pub(super) fn api(arguments: &[String]) -> Result<(), CliError> {

@@ -1,4 +1,8 @@
 {
+  "agent_confirm.allow": "允许",
+  "agent_confirm.deny": "不允许",
+  "agent_confirm.message": "此操作会关闭或移除内容。仅当你让 {agent} 这样做时才允许。",
+  "agent_confirm.title": "{agent} 想要运行 {action}",
   "agent_notice.app_action": "运行应用操作",
   "agent_notice.change_workspaces": "编辑工作区",
   "agent_notice.close_pane": "关闭窗格",
