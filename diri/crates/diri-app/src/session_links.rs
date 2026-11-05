@@ -765,6 +765,9 @@ impl TerminalPane {
         self.focus.focus(window, cx);
         cx.notify();
     }
+    pub(super) fn session_links_focused(&self, window: &Window) -> bool {
+        self.session_links.focus.is_focused(window)
+    }
     /// Closes the popover of a pane that left the screen, leaving focus
     /// where the pane that replaced it put it.
     pub(crate) fn dismiss_session_links(&mut self, cx: &mut Context<Self>) {
@@ -780,6 +783,16 @@ impl TerminalPane {
     #[cfg(test)]
     pub(crate) fn open_session_links_for_test(&mut self) {
         self.session_links.open = true;
+    }
+    #[cfg(test)]
+    pub(crate) fn focus_session_links_for_test(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.session_links.open = true;
+        self.session_links.focus.focus(window, cx);
+        cx.notify();
     }
     fn links_back(&mut self, cx: &mut Context<Self>) {
         self.session_links.pull_request = None;
