@@ -180,10 +180,10 @@ impl Sidebar {
     }
 }
 
-/// What the Activity toggle tells you. Both states say where the other
-/// sessions are, so a row leaving the list never reads as a session ending:
-/// the "off" text matters most, since a click clears the tooltip and the "on"
-/// text only shows if the pointer moves over the button again.
+/// What the Activity toggle does on click. Both states say idle sessions are
+/// hidden, not closed, so a row leaving the list never reads as a session
+/// ending: the "off" text matters most, since a click clears the tooltip and
+/// the "on" text only shows if the pointer moves over the button again.
 fn activity_toggle_label(on: bool) -> &'static str {
     if on {
         t("sidebar.activity_tooltip_on")
@@ -236,14 +236,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_toggle_says_what_it_does_and_where_the_other_sessions_are() {
+    fn the_toggle_says_idle_sessions_are_hidden_not_closed() {
         assert_eq!(
             activity_toggle_label(false),
-            "Show only active sessions. The others stay idle in the background"
+            "Hide idle sessions. They stay open"
         );
         assert_eq!(
             activity_toggle_label(true),
-            "Only active sessions are shown. The others are idle in the background. Click to show all"
+            "Show all sessions. Idle ones are hidden, not closed"
         );
     }
 
