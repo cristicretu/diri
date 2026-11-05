@@ -413,6 +413,9 @@ impl NotePane {
             resave: false,
             _subscription: subscription,
         });
+        // The file may have been retitled while no editor watched it (an
+        // agent's own file tools, a revived closed tab): the row follows now.
+        self.sync_title(&note.doc.title, cx);
         self.backlinks = Some((footer, footer_subscription));
         self.push_mentions(cx);
         self.push_work(cx);
@@ -725,6 +728,10 @@ impl NotePane {
         }
         open.saved = source;
         open.front = theirs.front;
+        // An outside write can retitle the note (an agent's edit_note on the
+        // # line); the sidebar row follows without waiting for our next save.
+        let title = open.editor.read(cx).editor.document().title;
+        self.sync_title(&title, cx);
     }
 
     fn schedule_save(&mut self, cx: &mut Context<Self>) {

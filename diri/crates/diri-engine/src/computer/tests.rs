@@ -147,7 +147,7 @@ fn summaries_end_at_the_first_sentence() {
 /// catalog, and echoes each call's request line back as structured content.
 const FAKE_DRIVER: &str = r#"#!/bin/sh
 case "$1" in
-  --version) printf 'cua-driver %s\n' "$(cat "$0.version" 2>/dev/null || echo 0.38.2)"; exit 0 ;;
+  --version) printf 'cua-driver %s\n' "$(cat "$0.version" 2>/dev/null || echo 0.38.3)"; exit 0 ;;
   call)
     [ "$2" = check_permissions ] || exit 2
     cat "$0.grants" 2>/dev/null || printf '{"accessibility":true,"screen_recording":true}\n'
@@ -316,6 +316,47 @@ fn agents_share_one_driver_with_their_own_badges_and_apps() {
             .unwrap_err()
             .code,
         BATCH_TOO_LONG
+    );
+    // Anything that would take the person's focus is refused before the
+    // driver sees it, nested batches and scripts included.
+    for (tool, args) in [
+        (
+            "click",
+            json!({"pid": 4242, "window_id": 1, "x": 5, "y": 5, "delivery_mode": "foreground"}),
+        ),
+        ("type_text", json!({"text": "hi", "scope": "desktop"})),
+        ("bring_to_front", json!({"pid": 4242, "window_id": 1})),
+        (
+            "run_steps",
+            json!({"steps": [{"tool": "press_key", "args": {"pid": 4242, "key": "a", "delivery_mode": "foreground"}}]}),
+        ),
+        (
+            "run_steps",
+            json!({"steps": [{"bring_to_front": {"pid": 4242}}]}),
+        ),
+        (
+            "run_steps",
+            json!({"delivery_mode": "foreground", "steps": [{"click": {"pid": 4242}}]}),
+        ),
+    ] {
+        let refused = computer.act(&codex, tool, args.clone(), &live).unwrap_err();
+        assert_eq!(
+            refused.code, FOREGROUND_DENIED,
+            "{tool} {args}: {refused:?}"
+        );
+        assert!(refused.message.contains("background only"));
+    }
+    assert_eq!(
+        computer
+            .act(
+                &codex,
+                "run_script",
+                json!({"script": "cua.click({})"}),
+                &live
+            )
+            .unwrap_err()
+            .code,
+        UNKNOWN_TOOL
     );
     // A driver error reaches the Agent as a driver error.
     let failed = computer
@@ -565,7 +606,6 @@ fn setup_downloads_verifies_and_installs_in_the_background() {
             team: None,
         },
     );
-    assert!(computer.status(false).outdated);
 
     let started = computer
         .setup(diri_proto::ComputerSetupAction::Install)
@@ -604,6 +644,80 @@ fn setup_downloads_verifies_and_installs_in_the_background() {
         .collect();
     assert_eq!(leftovers, vec![std::ffi::OsString::from(TESTED_VERSION)]);
     assert!(done.install_log.unwrap().contains("sha256"));
+}
+
+#[test]
+fn an_outdated_driver_updates_itself_without_a_click() {
+    let temp = tempfile::tempdir().unwrap();
+    let (url, sha256) = fake_release(temp.path());
+    let download = Download {
+        url,
+        sha256,
+        team: None,
+    };
+    let old_driver = |root: &Path| {
+        std::fs::create_dir_all(root.join("0.35.0")).unwrap();
+        let old = fake_driver(&root.join("0.35.0"));
+        std::fs::write(old.with_extension("version"), "0.35.0").unwrap();
+    };
+
+    // Settings asking for the status is enough to start it.
+    let root = temp.path().join("settings");
+    old_driver(&root);
+    let computer = ComputerUse::with_paths(
+        None,
+        root.clone(),
+        temp.path().join("s.sock"),
+        download.clone(),
+    );
+    assert!(computer.status(false).installing);
+    let done = wait_for(|| {
+        let status = computer.status(false);
+        (!status.installing).then_some(status)
+    });
+    assert_eq!(done.install_error, None, "{:?}", done.install_log);
+    assert_eq!(done.version.as_deref(), Some(TESTED_VERSION));
+    assert!(!done.outdated);
+
+    // An Agent's call waits for the update instead of using the old driver.
+    let root = temp.path().join("agent");
+    old_driver(&root);
+    let computer =
+        ComputerUse::with_paths(None, root.clone(), temp.path().join("a.sock"), download);
+    let _ = computer.act(&caller("s1", "Agent"), "tools", json!({}), &|_: &str| true);
+    assert!(root.join(TESTED_VERSION).join("cua-driver").is_file());
+    assert!(!root.join("0.35.0").exists());
+
+    // Nothing to update: nothing starts.
+    assert!(!computer.update_if_outdated());
+}
+
+#[test]
+fn a_failed_automatic_update_is_not_retried_on_every_call() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("computer-use");
+    std::fs::create_dir_all(root.join("0.35.0")).unwrap();
+    let old = fake_driver(&root.join("0.35.0"));
+    std::fs::write(old.with_extension("version"), "0.35.0").unwrap();
+    let computer = ComputerUse::with_paths(
+        None,
+        root.clone(),
+        temp.path().join("d.sock"),
+        Download {
+            url: format!("file://{}", temp.path().join("missing.tar.gz").display()),
+            sha256: "0".repeat(64),
+            team: None,
+        },
+    );
+    assert!(computer.update_if_outdated());
+    let failed = wait_for(|| {
+        let status = computer.status(false);
+        (!status.installing).then_some(status)
+    });
+    assert!(failed.install_error.is_some());
+    // The old driver keeps working, and calls don't each start a download.
+    assert!(!computer.update_if_outdated());
+    assert!(root.join("0.35.0").join("cua-driver").is_file());
 }
 
 #[test]
@@ -838,4 +952,106 @@ fn wait_for_long<T>(mut probe: impl FnMut() -> Option<T>) -> T {
         assert!(Instant::now() < deadline, "timed out");
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+#[test]
+fn only_focus_taking_calls_are_refused() {
+    let map = |value: Value| value.as_object().cloned().unwrap();
+    for (tool, args) in [
+        ("click", json!({"element_token": "s1:3"})),
+        ("click", json!({"pid": 1, "window_id": 2, "x": 3, "y": 4})),
+        (
+            "type_text",
+            json!({"pid": 1, "text": "x", "delivery_mode": "background"}),
+        ),
+        (
+            "scroll",
+            json!({"pid": 1, "window_id": 2, "scope": "window"}),
+        ),
+        // Reads never take focus, even of the whole desktop.
+        ("get_desktop_state", json!({"scope": "desktop"})),
+        (
+            "run_steps",
+            json!({"steps": [{"click": {"pid": 1}}, {"tool": "type_text", "args": {"pid": 1, "text": "x"}}]}),
+        ),
+    ] {
+        assert_eq!(takes_focus(tool, &map(args.clone())), None, "{tool} {args}");
+    }
+    for (tool, args) in [
+        ("activate_app", json!({"pid": 1})),
+        ("move_cursor", json!({"x": 1, "y": 1, "scope": "desktop"})),
+        ("drag", json!({"target": {"kind": "desktop"}})),
+        (
+            "set_window_state",
+            json!({"pid": 1, "window_id": 2, "action": "zoom", "delivery_mode": "foreground"}),
+        ),
+    ] {
+        assert!(
+            takes_focus(tool, &map(args.clone())).is_some(),
+            "{tool} {args}"
+        );
+    }
+}
+
+#[test]
+fn pixel_actions_are_recognised_in_batches() {
+    let map = |value: Value| value.as_object().cloned().unwrap();
+    assert!(moves_pointer(
+        "click",
+        &map(json!({"element_token": "s1:3"}))
+    ));
+    assert!(moves_pointer(
+        "type_text",
+        &map(json!({"pid": 1, "x": 3, "y": 4, "text": "x"}))
+    ));
+    assert!(moves_pointer(
+        "run_steps",
+        &map(json!({"steps": [{"tool": "drag", "args": {}}]}))
+    ));
+    assert!(moves_pointer(
+        "run_steps",
+        &map(json!({"steps": [{"double_click": {"pid": 1}}]}))
+    ));
+    assert!(!moves_pointer(
+        "type_text",
+        &map(json!({"element_token": "s1:3", "text": "x"}))
+    ));
+    assert!(!moves_pointer(
+        "press_key",
+        &map(json!({"pid": 1, "key": "return"}))
+    ));
+}
+
+#[test]
+fn pointer_actions_wait_for_a_typing_pause() {
+    use std::cell::Cell;
+    // Not typing: no wait at all.
+    let slept = Cell::new(Duration::ZERO);
+    let waited = wait_for_typing_pause(
+        || Some(Duration::from_secs(3)),
+        |nap| slept.set(slept.get() + nap),
+    );
+    assert_eq!((waited, slept.get()), (Duration::ZERO, Duration::ZERO));
+
+    // Typing: wait out the rest of the quiet window, then go. Idle time grows
+    // with the sleeps, as it would on a real clock.
+    let clock = Cell::new(Duration::from_millis(100));
+    let waited = wait_for_typing_pause(|| Some(clock.get()), |nap| clock.set(clock.get() + nap));
+    assert_eq!(waited, TYPING_QUIET - Duration::from_millis(100));
+
+    // Typing without pause: give up at the cap instead of starving the Agent.
+    let waited = wait_for_typing_pause(|| Some(Duration::ZERO), |_| {});
+    assert_eq!(waited, TYPING_WAIT_CAP);
+
+    // No keyboard to read: go at once.
+    assert_eq!(
+        wait_for_typing_pause(|| None, |_| panic!("slept")),
+        Duration::ZERO
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn the_keyboard_idle_time_is_readable_without_a_grant() {
+    assert!(keyboard_idle().is_some());
 }
