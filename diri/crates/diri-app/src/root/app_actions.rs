@@ -83,11 +83,19 @@ impl RootView {
             ],
             cx,
         );
+        // Past the Engine's deadline the Agent was already told the app timed
+        // out, so a late Allow must not run the action behind its back.
+        let deadline = request
+            .timeout_ms
+            .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
         self.agent_action_prompt = Some(cx.spawn_in(window, async move |this, cx| {
             let allowed = answer.await.ok() == Some(0);
+            let expired = deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
             let _ = crate::floating::update_in_owner(&this, cx, |root, window, cx| {
                 root.agent_action_prompt = None;
-                if allowed {
+                if expired {
+                    // Nobody is waiting for the answer any more.
+                } else if allowed {
                     root.run_app_perform(request, window, cx);
                 } else {
                     root.window_store.write().expect("store").reply_app_perform(
@@ -251,6 +259,7 @@ mod tests {
             action: action.into(),
             args,
             actor: None,
+            timeout_ms: None,
         }
     }
 
@@ -315,13 +324,20 @@ mod tests {
             );
         });
     }
-    /// A destructive action an Agent asks for waits for the person: Don't
-    /// Allow refuses it. The same request from a shell tab or with no actor
+
+    /// A destructive action an Agent asks for waits for the person: Allow
+    /// runs it, Don't Allow refuses it, and an answer after the Engine gave
+    /// up runs nothing. The same request from a shell tab or with no actor
     /// (the person, a script) runs without asking, and a safe one never asks.
     #[gpui::test]
     fn an_agents_destructive_action_asks_the_person_first(cx: &mut gpui::TestAppContext) {
         cx.update(crate::alerts::enable);
-        let services = test_services();
+        let (runtime, mut effects) = crate::store::StoreRuntime::inert_with_effects();
+        let mut services = Arc::try_unwrap(test_services())
+            .ok()
+            .expect("fresh test services");
+        services.store = Arc::new(runtime);
+        let services = Arc::new(services);
         let runtime = services.store.clone();
         let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
         {
@@ -348,11 +364,17 @@ mod tests {
         });
         let window_store = root.read_with(cx, |root, _| root.window_store.clone());
         let mut next = 0;
-        let mut perform = |action: &str, actor: Option<&str>, cx: &mut gpui::VisualTestContext| {
+        let mut perform = |action: &str,
+                           actor: Option<&str>,
+                           timeout_ms: Option<u64>,
+                           cx: &mut gpui::VisualTestContext| {
             next += 1;
             let mut params = json!({"requestId": next, "action": action});
             if let Some(actor) = actor {
                 params["actor"] = json!(actor);
+            }
+            if let Some(timeout_ms) = timeout_ms {
+                params["timeoutMs"] = json!(timeout_ms);
             }
             window_store
                 .write()
@@ -366,18 +388,48 @@ mod tests {
             cx.run_until_parked();
         };
 
-        perform("note-delete", Some("s_agent"), cx);
+        // The window's answers to the Engine, by request id.
+        let mut replies = || {
+            let mut replies = Vec::new();
+            while let Ok(effect) = effects.try_recv() {
+                if let crate::store::StoreEffect::AppReply(reply) = effect {
+                    replies.push((reply.request_id, reply.error.map(|error| error.code)));
+                }
+            }
+            replies
+        };
+        let declined = Some("action_declined".to_string());
+
+        perform("note-delete", Some("s_agent"), Some(30_000), cx);
         assert!(cx.has_pending_prompt(), "the person is asked first");
+        assert!(replies().is_empty(), "nothing runs before the answer");
         cx.simulate_prompt_answer("Don't Allow");
         cx.run_until_parked();
         assert!(!cx.has_pending_prompt());
         assert!(root.read_with(cx, |root, _| root.agent_action_prompt.is_none()));
+        assert_eq!(replies(), vec![(1, declined.clone())]);
 
-        perform("note-delete", Some("s_shell"), cx);
+        perform("note-delete", Some("s_agent"), Some(30_000), cx);
+        cx.simulate_prompt_answer("Allow");
+        cx.run_until_parked();
+        let allowed = replies();
+        assert_eq!(allowed.len(), 1);
+        assert_eq!(allowed[0].0, 2);
+        assert_ne!(allowed[0].1, declined, "Allow runs the action");
+
+        // The Engine stopped waiting before the person answered: the Agent
+        // was told the app timed out, so a late Allow runs nothing.
+        perform("note-delete", Some("s_agent"), Some(0), cx);
+        cx.simulate_prompt_answer("Allow");
+        cx.run_until_parked();
+        assert!(replies().is_empty(), "a late Allow runs nothing");
+        assert!(root.read_with(cx, |root, _| root.agent_action_prompt.is_none()));
+
+        perform("note-delete", Some("s_shell"), None, cx);
         assert!(!cx.has_pending_prompt(), "a shell tab is the person");
-        perform("note-delete", None, cx);
+        perform("note-delete", None, None, cx);
         assert!(!cx.has_pending_prompt(), "no actor is the person or a script");
-        perform("toggle-sidebar", Some("s_agent"), cx);
+        perform("toggle-sidebar", Some("s_agent"), None, cx);
         assert!(!cx.has_pending_prompt(), "a safe action never asks");
     }
 }

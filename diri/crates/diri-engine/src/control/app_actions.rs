@@ -169,6 +169,7 @@ impl AppActionHub {
             action: p.action.clone(),
             args: p.args,
             actor: p.actor,
+            timeout_ms: Some(timeout.as_millis() as u64),
         };
         let sent = serde_json::to_value(&request)
             .map_err(|error| ControlError::internal(error.to_string()))

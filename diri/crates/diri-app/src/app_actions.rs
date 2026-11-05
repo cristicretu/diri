@@ -320,6 +320,7 @@ mod tests {
             action: action.into(),
             args,
             actor: None,
+            timeout_ms: None,
         }
     }
 

@@ -108,8 +108,10 @@ pub(super) fn perform(arguments: &[String]) -> Result<(), CliError> {
         // Run inside an Agent: the app names it, and asks the person before
         // a destructive action, which may take them a while.
         params[diri_proto::agent_action::ACTOR_FIELD] = json!(actor);
-        params["timeoutMs"] = json!(MAX_TIMEOUT_MS);
-        timeout = CONFIRM_TIMEOUT;
+        if is_destructive(action) {
+            params["timeoutMs"] = json!(MAX_TIMEOUT_MS);
+            timeout = CONFIRM_TIMEOUT;
+        }
     }
     let result = request(Method::APP_PERFORM, params, timeout)?;
     let result = result.get("result").cloned().unwrap_or(Value::Null);
@@ -125,19 +127,38 @@ pub(super) fn perform(arguments: &[String]) -> Result<(), CliError> {
 }
 
 /// The Agent session this command runs inside, if any. A shell tab or a
-/// note is the person, so it names no actor.
+/// note is the person, so it names no actor. When the session cannot be
+/// looked up, the id is sent anyway: the app checks its kind again before
+/// asking, so a failed lookup never skips the person's approval.
 fn agent_actor() -> Option<String> {
     let own = std::env::var("DIRIJOR_SESSION_ID")
         .ok()
         .filter(|id| !id.is_empty())?;
-    sessions()
-        .ok()?
-        .into_iter()
-        .find(|record| record.id.0 == own)
-        .filter(|record| {
-            !record.is_note() && record.effective_kind() != &diri_proto::AgentKind::SHELL
+    let Ok(sessions) = sessions() else {
+        return Some(own);
+    };
+    match sessions.into_iter().find(|record| record.id.0 == own) {
+        Some(record)
+            if record.is_note() || record.effective_kind() == &diri_proto::AgentKind::SHELL =>
+        {
+            None
+        }
+        _ => Some(own),
+    }
+}
+
+/// Whether the app publishes `action` as destructive; unknown (or an app
+/// that cannot be asked) counts as destructive so the wait is long enough.
+fn is_destructive(action: &str) -> bool {
+    typed::<AppActionsListResult>(Method::APP_ACTIONS_LIST, json!({}))
+        .map(|catalog| {
+            catalog
+                .actions
+                .iter()
+                .find(|spec| spec.name == action)
+                .is_none_or(|spec| spec.risk == ActionRisk::Destructive)
         })
-        .map(|record| record.id.0)
+        .unwrap_or(true)
 }
 
 pub(super) fn api(arguments: &[String]) -> Result<(), CliError> {
