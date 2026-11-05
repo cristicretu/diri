@@ -36,13 +36,15 @@ use super::{ComputerUse, Shared};
 /// keyboard actions on different apps in parallel, a proxy that answers
 /// tool calls as they finish, and the safety checks and commands ported from
 /// agent-desktop (token identity, actionability waits, retry disposition,
-/// set_state, wait, surfaces, close_app, window state, displays). Source:
-/// github.com/cristicretu/cua, tag cua-driver-rs-v0.38.2-diri.
-pub const TESTED_VERSION: &str = "0.38.2";
+/// set_state, wait, surfaces, close_app, window state, displays), and
+/// background typing into iPhone Mirroring (real key codes after a real
+/// background tap). Source: github.com/cristicretu/cua, tag
+/// cua-driver-rs-v0.38.3-diri.
+pub const TESTED_VERSION: &str = "0.38.3";
 const ARCHIVE_URL: &str = "https://github.com/cristicretu/cua/releases/download/\
-     cua-driver-rs-v0.38.2-diri/cua-driver-rs-0.38.2-diri-darwin-universal-binary.tar.gz";
+     cua-driver-rs-v0.38.3-diri/cua-driver-rs-0.38.3-diri-darwin-universal-binary.tar.gz";
 /// From the release's SHA256SUMS.
-const ARCHIVE_SHA256: &str = "6394981357179766ebe4f0a89354694db1c511caeff6685f85f718efbf49debe";
+const ARCHIVE_SHA256: &str = "2ed85cfc5b11046604dcf9a621f83d5fc2fbf62204716d4fa9ee82d3e472eb58";
 /// The Developer ID team that signs Diri's driver build. A binary signed by
 /// anyone else is not used.
 const DRIVER_TEAM_ID: &str = "A56RVNJ69X";
