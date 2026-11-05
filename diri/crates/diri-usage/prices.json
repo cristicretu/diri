@@ -97,6 +97,7 @@
   "gpt-5.6-terra": {"input": 2.0, "output": 12.0, "cache_read": 0.2, "cache_write_5m": 2.5},
   "gpt-6-astra": {"input": 10.0, "output": 50.0, "cache_read": 1.0, "cache_write_5m": 12.5},
   "gpt-6-astra-law": {"input": 10.0, "output": 50.0, "cache_read": 1.0},
+  "gpt-6-cyber": {"input": 20.0, "output": 100.0, "cache_read": 2.0, "cache_write_5m": 25.0},
   "gpt-6-luna": {"input": 0.1, "output": 0.5, "cache_read": 0.01, "cache_write_5m": 0.125},
   "gpt-6-rosalind": {"input": 15.0, "output": 75.0, "cache_read": 1.5, "cache_write_5m": 18.75},
   "gpt-6-sol": {"input": 2.0, "output": 10.0, "cache_read": 0.2, "cache_write_5m": 2.5},
