@@ -909,7 +909,7 @@ impl Bridge {
         let caller = self.require_caller()?.to_owned();
         let catalog = store.list().unwrap_or_default();
         let mut wiki = WikiRewrite::default();
-        let (_, edited) = store
+        let (note, edited) = store
             .update(&meta.id, &Author::Session(caller), |note| {
                 let before = block_texts(note);
                 let edited = change(note)
@@ -921,6 +921,9 @@ impl Bridge {
                 std::io::ErrorKind::InvalidInput => e.to_string(),
                 _ => format!("cannot change note {}: {e}", meta.id),
             })?;
+        if note.doc.title != meta.title {
+            self.retitle_note_session(&snapshot, &meta.id, &note.doc.title);
+        }
         let version = store
             .history()
             .list(&meta.id)
@@ -940,6 +943,29 @@ impl Bridge {
             );
         }
         Ok(result)
+    }
+
+    /// The sidebar row is the note Session's title; an edit that changed the
+    /// note's # line renames it, as the app does when the person retitles
+    /// it. A note that is not open has no editor to do this. Best effort:
+    /// the edit itself has landed.
+    fn retitle_note_session(&self, snapshot: &SessionListResult, note_id: &str, title: &str) {
+        let Some(record) = note_sessions(&snapshot.sessions).get(note_id).copied() else {
+            return;
+        };
+        let title = title.trim();
+        let title = if title.is_empty() { "Untitled" } else { title };
+        if record.title == title {
+            return;
+        }
+        let Ok(params) = serde_json::to_value(diri_proto::SessionRenameParams {
+            session_id: record.id.clone(),
+            title: title.to_owned(),
+            by: None,
+        }) else {
+            return;
+        };
+        let _ = self.request(Method::SESSION_RENAME, params, DEFAULT_TIMEOUT);
     }
 
     fn authorize_note_write(
@@ -1696,6 +1722,53 @@ mod tests {
             .call("delete_note", &json!({"note": by_child}))
             .unwrap();
         assert_eq!(deletes(), 2);
+    }
+
+    /// An agent's edit to the # line renames the note's sidebar row, even
+    /// while no editor has the note open; other edits leave the row alone.
+    #[test]
+    fn retitling_a_note_renames_its_session() {
+        let notes = tempfile::tempdir().unwrap();
+        let (note_id, _) = NoteStore::open(notes.path())
+            .unwrap()
+            .create(Document::new("Resize PRD", Vec::new()), Some("/elsewhere"))
+            .unwrap();
+        let (mut fixture, calls) = Fixture::scripted(
+            vec![
+                note_session("s_note", &note_id, None),
+                super::super::tests::record("child", Some("s_note")),
+            ],
+            |method| (method == Method::SESSION_RENAME).then(|| json!({})),
+        );
+        fixture.notes = notes;
+        let bridge = fixture.bridge("child");
+        let renames = || {
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|method| *method == Method::SESSION_RENAME)
+                .count()
+        };
+
+        bridge
+            .call("write_note", &json!({"note": "origin", "append": "Notes."}))
+            .unwrap();
+        assert_eq!(renames(), 0);
+        bridge
+            .call(
+                "edit_note",
+                &json!({"note": "origin", "old_string": "# Resize PRD", "new_string": "# Resize spec"}),
+            )
+            .unwrap();
+        assert_eq!(renames(), 1);
+        bridge
+            .call(
+                "edit_note",
+                &json!({"note": "origin", "old_string": "Notes.", "new_string": "Notes!"}),
+            )
+            .unwrap();
+        assert_eq!(renames(), 1);
     }
 
     #[test]

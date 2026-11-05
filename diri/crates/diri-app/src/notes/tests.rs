@@ -1213,6 +1213,66 @@ fn edits_and_direct_file_changes_land_while_the_person_types(cx: &mut gpui::Test
     );
 }
 
+/// An agent renaming the open note (edit_note on its # line) retitles the
+/// sidebar row at once. Regression: the row kept the old title until the
+/// person typed in the note and it saved.
+#[gpui::test]
+fn an_outside_rename_retitles_the_open_note(cx: &mut gpui::TestAppContext) {
+    let (_dir, store, id) = store_with_plan();
+    let (pane, cx) = pane(cx, store.clone());
+    let session = SessionId::new("s_note");
+    pane.update_in(cx, |pane, window, cx| pane.show(&session, &id, window, cx));
+    let synced = |pane: &Entity<NotePane>, cx: &mut gpui::VisualTestContext| {
+        pane.read_with(cx, |pane, _| match &pane.state {
+            PaneState::Open(open) => open.synced_title.clone(),
+            _ => panic!("note is not open"),
+        })
+    };
+    assert_ne!(synced(&pane, cx), "Notes beta plan");
+
+    store
+        .update(
+            &id,
+            &diri_notes::history::Author::Session("s_agent".into()),
+            |note| {
+                diri_notes::text_edit::edit(
+                    note,
+                    "# Notes launch plan",
+                    "# Notes beta plan",
+                    false,
+                )
+                .map(|_| ())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+            },
+        )
+        .unwrap();
+    pane.update(cx, |pane, cx| pane.reconcile(cx));
+    assert_eq!(synced(&pane, cx), "Notes beta plan");
+}
+
+/// A note retitled by hand while no editor showed it (an agent's own file
+/// tools, then Search notes revives its closed tab) takes the file's title
+/// as soon as it is shown.
+#[gpui::test]
+fn showing_a_note_retitles_it_from_the_file(cx: &mut gpui::TestAppContext) {
+    let (_dir, store, id) = store_with_plan();
+    let path = store.path_for(&id).unwrap();
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        on_disk.replace("# Notes launch plan", "# Notes beta plan"),
+    )
+    .unwrap();
+    let (pane, cx) = pane(cx, store.clone());
+    let session = SessionId::new("s_note");
+    pane.update_in(cx, |pane, window, cx| pane.show(&session, &id, window, cx));
+    let synced = pane.read_with(cx, |pane, _| match &pane.state {
+        PaneState::Open(open) => open.synced_title.clone(),
+        _ => panic!("note is not open"),
+    });
+    assert_eq!(synced, "Notes beta plan");
+}
+
 /// The backlinks start below the note's last row, however much its text
 /// wraps. Regression: the page took its height from text measured wider than
 /// it is drawn, so on a long note of wrapped list items the backlinks painted

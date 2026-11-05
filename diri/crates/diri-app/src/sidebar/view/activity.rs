@@ -122,17 +122,12 @@ impl Sidebar {
     ) -> AnyElement {
         let on = self.activity_filter;
         let hovered = self.ui.hovered_control == Some("sidebar-activity");
-        let tooltip = crate::commands::command(CommandId::ToggleActivity)
-            .shortcut_label()
-            .map_or_else(
-                || t("sidebar.activity").to_owned(),
-                |shortcut| format!("{}  {shortcut}", t("sidebar.activity")),
-            );
+        let label = activity_toggle_label(on);
         div()
             .id("sidebar-activity")
             .debug_selector(|| "sidebar-activity".into())
             .role(Role::Button)
-            .aria_label(t("sidebar.activity"))
+            .aria_label(label)
             .relative()
             .size(px(26.0))
             .flex_none()
@@ -144,10 +139,7 @@ impl Sidebar {
             .when(on || hovered, |button| {
                 button.bg(colors.primary.alpha(if on { 0.09 } else { 0.05 }))
             })
-            .warm_tooltip(move |_, cx| {
-                cx.new(|_| crate::palette_chrome::PaletteTooltip(tooltip.clone(), colors))
-                    .into()
-            })
+            .shortcut_tooltip(label, Some(CommandId::ToggleActivity), colors)
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                 this.ui.hovered_control = hovered.then_some("sidebar-activity");
                 cx.notify();
@@ -185,6 +177,18 @@ impl Sidebar {
             !session.is_archived()
                 && matches!(status_state(session, false), StatusState::NeedsInput { .. })
         })
+    }
+}
+
+/// What the Activity toggle does on click. Both states say idle sessions are
+/// hidden, not closed, so a row leaving the list never reads as a session
+/// ending: the "off" text matters most, since a click clears the tooltip and
+/// the "on" text only shows if the pointer moves over the button again.
+fn activity_toggle_label(on: bool) -> &'static str {
+    if on {
+        t("sidebar.activity_tooltip_on")
+    } else {
+        t("sidebar.activity_tooltip_off")
     }
 }
 
@@ -230,6 +234,18 @@ pub(super) fn has_activity(state: StatusState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_toggle_says_idle_sessions_are_hidden_not_closed() {
+        assert_eq!(
+            activity_toggle_label(false),
+            "Hide idle sessions. They stay open"
+        );
+        assert_eq!(
+            activity_toggle_label(true),
+            "Show all sessions. Idle ones are hidden, not closed"
+        );
+    }
 
     #[test]
     fn only_working_waiting_and_unseen_rows_count_as_activity() {
