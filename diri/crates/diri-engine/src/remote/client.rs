@@ -24,6 +24,8 @@ use super::bootstrap::RemoteTarget;
 use super::manager::{InstalledHelper, RemoteManager};
 
 const MAX_QUEUED_INPUT: usize = 1024 * 1024;
+/// Header bytes allowed per extra frame when one write is split into several.
+const FRAME_OVERHEAD_ALLOWANCE: usize = 64;
 const OFFSET_PERSIST_INTERVAL: u64 = 1024 * 1024;
 /// One image chunk is at most 256 KiB; this allows a slow link (about
 /// 200 kbit/s) to deliver it behind ordinary output.
@@ -434,10 +436,8 @@ impl RemoteSessionClient {
             let bytes = std::mem::take(&mut writer.queued_input);
             // Reconnect input was accepted before this lease. If the queue
             // cannot accept it, retain it without duplicating a sent prefix.
-            if let Err(error) = write_message(
-                &mut writer,
-                &RemoteMessage::Terminal(Frame::input(bytes.clone())),
-            ) {
+            let messages = terminal_input_messages(self.helper.protocol, &bytes, false);
+            if let Err(error) = write_messages(&mut writer, &messages) {
                 if error.kind() == io::ErrorKind::WouldBlock {
                     writer.queued_input = bytes;
                 }
@@ -520,8 +520,15 @@ impl RemoteSessionClient {
         if writer.uncertain_effect {
             return Err(io::Error::other("remote input delivery is uncertain"));
         }
-        let frame = terminal_input_frame(self.helper.protocol, bytes, mouse);
-        if let Err(error) = write_message(&mut writer, &RemoteMessage::Terminal(frame)) {
+        if bytes.len() > MAX_QUEUED_INPUT {
+            // Never fits, however far the queue drains: not worth a retry.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "input is larger than the remote input queue",
+            ));
+        }
+        let messages = terminal_input_messages(self.helper.protocol, bytes, mouse);
+        if let Err(error) = write_messages(&mut writer, &messages) {
             if matches!(
                 error.kind(),
                 io::ErrorKind::WouldBlock | io::ErrorKind::InvalidInput
@@ -992,6 +999,12 @@ fn is_stop_unsupported(error: &io::Error) -> bool {
 }
 
 fn write_message(writer: &mut WriterState, message: &RemoteMessage) -> io::Result<()> {
+    write_messages(writer, std::slice::from_ref(message))
+}
+
+/// Queues `messages` all or none, in order, then flushes. Each carries its
+/// own header, so the bound allows a little per frame on top of the input.
+fn write_messages(writer: &mut WriterState, messages: &[RemoteMessage]) -> io::Result<()> {
     ensure_available(writer)?;
     if writer.input.is_none() {
         return Err(io::Error::new(
@@ -999,19 +1012,39 @@ fn write_message(writer: &mut WriterState, message: &RemoteMessage) -> io::Resul
             "SSH channel is closed",
         ));
     }
-    let bytes = RemoteCodec::encode(message)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let encoded = messages
+        .iter()
+        .map(|message| {
+            RemoteCodec::encode(message)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let total = encoded.iter().map(Vec::len).sum::<usize>();
     if writer
         .pending_bytes
         .saturating_add(writer.queued_input.len())
-        .saturating_add(bytes.len())
-        > MAX_QUEUED_INPUT + 4096
+        .saturating_add(total)
+        > MAX_QUEUED_INPUT + 4096 + messages.len().saturating_sub(1) * FRAME_OVERHEAD_ALLOWANCE
     {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             "remote input queue is full",
         ));
     }
+    for (message, bytes) in messages.iter().zip(encoded) {
+        enqueue_frame(writer, message, bytes);
+    }
+    let result = flush_pending(writer);
+    if !writer.pending.is_empty()
+        && let Some(wake) = &mut writer.wake
+    {
+        // A full wake pipe already means the pump will observe this queue.
+        let _ = wake.write(&[1]);
+    }
+    result
+}
+
+fn enqueue_frame(writer: &mut WriterState, message: &RemoteMessage, bytes: Vec<u8>) {
     let (replay_input, resize, effect) = match message {
         RemoteMessage::Terminal(frame)
             if frame.frame_type == diri_proto::frames::FrameType::Input =>
@@ -1036,14 +1069,6 @@ fn write_message(writer: &mut WriterState, message: &RemoteMessage) -> io::Resul
         resize,
         effect,
     });
-    let result = flush_pending(writer);
-    if !writer.pending.is_empty()
-        && let Some(wake) = &mut writer.wake
-    {
-        // A full wake pipe already means the pump will observe this queue.
-        let _ = wake.write(&[1]);
-    }
-    result
 }
 
 fn flush_pending(writer: &mut WriterState) -> io::Result<()> {
@@ -1066,6 +1091,21 @@ fn flush_pending(writer: &mut WriterState) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `bytes` as consecutive input frames of at most
+/// [`MAX_INPUT_FRAME_BYTES`](diri_proto::remote_pty::MAX_INPUT_FRAME_BYTES):
+/// the Holder writes them to the PTY back to back, exactly as one frame, but
+/// none of them alone can overrun its pending-input bound.
+fn terminal_input_messages(
+    protocol: ProtocolVersion,
+    bytes: &[u8],
+    mouse: bool,
+) -> Vec<RemoteMessage> {
+    bytes
+        .chunks(diri_proto::remote_pty::MAX_INPUT_FRAME_BYTES)
+        .map(|chunk| RemoteMessage::Terminal(terminal_input_frame(protocol, chunk, mouse)))
+        .collect()
 }
 
 fn terminal_input_frame(protocol: ProtocolVersion, bytes: &[u8], mouse: bool) -> Frame {
@@ -1816,6 +1856,56 @@ pub(crate) mod tests {
         }
         assert_eq!(RemoteCodec::new().feed(&bytes).unwrap(), messages);
         assert_eq!(writer.pending_bytes, 0);
+    }
+
+    /// A paste goes out as frames no larger than the shared input-frame
+    /// bound, in order, admitted all or none against the local queue.
+    #[cfg(unix)]
+    #[test]
+    fn large_paste_is_split_into_bounded_frames_admitted_together() {
+        use diri_proto::remote_pty::MAX_INPUT_FRAME_BYTES;
+        use std::io::Read as _;
+        let (mut writer, mut output) = pipe_writer();
+        let paste: Vec<u8> = (0..MAX_QUEUED_INPUT)
+            .map(|index| b'a' + (index % 26) as u8)
+            .collect();
+        let messages = terminal_input_messages(ProtocolVersion::CURRENT, &paste, false);
+        assert_eq!(messages.len(), MAX_QUEUED_INPUT / MAX_INPUT_FRAME_BYTES);
+        write_messages(&mut writer, &messages).unwrap();
+        let queued = writer.pending_bytes;
+
+        // A second paste of the same size cannot fit beside the first: none
+        // of it is queued.
+        assert_eq!(
+            write_messages(&mut writer, &messages).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(writer.pending_bytes, queued);
+
+        let mut bytes = Vec::new();
+        loop {
+            let mut chunk = [0; 64 * 1024];
+            while let Ok(count) = output.read(&mut chunk) {
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            if writer.pending.is_empty() {
+                break;
+            }
+            flush_pending(&mut writer).unwrap();
+        }
+        let mut delivered = Vec::new();
+        for message in RemoteCodec::new().feed(&bytes).unwrap() {
+            let RemoteMessage::Terminal(frame) = message else {
+                panic!("only input frames were sent");
+            };
+            assert_eq!(frame.frame_type, diri_proto::frames::FrameType::Input);
+            assert!(frame.payload.len() <= MAX_INPUT_FRAME_BYTES);
+            delivered.extend_from_slice(&frame.payload);
+        }
+        assert_eq!(delivered, paste);
     }
 
     #[cfg(unix)]

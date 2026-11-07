@@ -802,6 +802,23 @@ for reconnect. Queue overflow rejects the new operation before accepting bytes;
 the binary attach closes on input errors rather than silently swallowing them.
 Pending frames retain their exact written prefix. Input received during the
 Hello handshake stays behind the reconnect batch until control is granted.
+One write goes out as consecutive `Input`/`Mouse` frames of at most
+`MAX_INPUT_FRAME_BYTES` (64 KiB, `diri-proto` `remote_pty`), queued all or
+none; a write larger than the whole queue is rejected as invalid input.
+
+The Holder applies backpressure instead of failing a paste: once 1 MiB of input
+waits for a program that is not reading its terminal, it stops reading the
+controller socket until the PTY drains, so further input waits in the socket,
+Bridge and SSH channel and finally the Engine queue above. Frames already
+decoded are always accepted (older Engines send single frames up to 1 MiB), up
+to a hard bound of 1 MiB plus one maximum frame. A controller request that
+fails without harming the session — input refused because the enhanced
+keyboard state is unknown, an image request over the outbound bound, a
+scrollback page that cannot be encoded, or that hard input bound — is answered
+with a non-fatal structured `Error` and the connection keeps being served;
+every Engine already continues on non-fatal errors. A `ScrollbackResponse`
+carries at most `max_scrollback_response_rows(cols)` rows (8 MiB of encoded
+rows), so wide terminals get shorter pages instead of an unencodable frame.
 Wholly unwritten input may
 be replayed after reconnect; a partially written effect is never replayed and
 an uncertain asynchronous delivery fails the session transport explicitly.
@@ -2127,8 +2144,8 @@ Holder closes the Bridge on the unknown frame kind. An unsolicited
 from a controller that did not negotiate the capability. It also removes image
 anchors from that controller's snapshots, diffs and scrollback, so an older
 Engine sees plain blanks instead of links it cannot resolve. A request made
-while the controller's outbound queue is over its bound is refused and the
-Bridge reconnects. A slow-client reseed discards queued image bytes like any
+while the controller's outbound queue is over its bound is refused with a
+non-fatal `image_unavailable` error; the connection stays up. A slow-client reseed discards queued image bytes like any
 other publication, but the stored image stays readable. PTY reads never wait
 on a read.
 
