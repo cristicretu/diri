@@ -349,10 +349,10 @@ impl CodeEditor {
         self.h_offset = px(0.0);
         self.marked = None;
         self.composing = None;
-        self.completion = None;
+        self.close_completion();
         self.hover = None;
         self.hover_pending = None;
-        self.signature = None;
+        self.close_signature();
         self.save_error = None;
         self.conflict = false;
         self.word_counts = None;
@@ -579,6 +579,20 @@ impl CodeEditor {
         self.restart_blink(cx);
     }
 
+    /// Closes the completion menu with its lookup, so a lookup still
+    /// running cannot reopen what Escape or a keystroke closed. Returns
+    /// whether the menu was open.
+    pub(crate) fn close_completion(&mut self) -> bool {
+        self._completion_task = None;
+        self.completion.take().is_some()
+    }
+
+    /// Closes signature help with its lookup; see [`Self::close_completion`].
+    pub(crate) fn close_signature(&mut self) -> bool {
+        self._signature_task = None;
+        self.signature.take().is_some()
+    }
+
     /// Completion and signature help follow the caret; leaving their word
     /// or call closes them.
     fn dismiss_transient_for_caret(&mut self) {
@@ -586,10 +600,10 @@ impl CodeEditor {
         if let Some(completion) = &self.completion
             && !(completion.word.start..=completion.word.end).contains(&head)
         {
-            self.completion = None;
+            self.close_completion();
         }
         if self.signature.is_some() && self.call_at_caret().is_none() {
-            self.signature = None;
+            self.close_signature();
         }
     }
 
@@ -719,10 +733,7 @@ impl CodeEditor {
 
     /// Escape: one cursor again, and nothing floating over the code.
     pub(crate) fn escape(&mut self, cx: &mut Context<Self>) {
-        if self.completion.take().is_some()
-            || self.signature.take().is_some()
-            || self.hover.take().is_some()
-        {
+        if self.close_completion() || self.close_signature() || self.hover.take().is_some() {
             cx.notify();
             return;
         }
@@ -1041,12 +1052,12 @@ impl CodeEditor {
         if super::buffer::is_word_char(ch) {
             self.update_completion(false, cx);
         } else {
-            self.completion = None;
+            self.close_completion();
         }
         if matches!(ch, '(' | ',') {
             self.update_signature(cx);
         } else if ch == ')' {
-            self.signature = None;
+            self.close_signature();
         }
     }
 
@@ -1152,7 +1163,7 @@ impl CodeEditor {
         let mut carets = carets;
         let lead = carets.remove(primary_index);
         carets.push(lead);
-        self.completion = None;
+        self.close_completion();
         self.apply_with(edits, carets, false, cx);
     }
 
@@ -1803,7 +1814,7 @@ impl CodeEditor {
     /// this file now, workspace symbols when the index answers.
     pub(crate) fn update_completion(&mut self, explicit: bool, cx: &mut Context<Self>) {
         let Some(word) = self.word_before_caret() else {
-            self.completion = None;
+            self.close_completion();
             cx.notify();
             return;
         };
@@ -1814,7 +1825,7 @@ impl CodeEditor {
         if (prefix.chars().count() < 2 && !explicit)
             || prefix.starts_with(|ch: char| ch.is_ascii_digit())
         {
-            self.completion = None;
+            self.close_completion();
             cx.notify();
             return;
         }
@@ -1897,6 +1908,7 @@ impl CodeEditor {
     }
 
     pub(crate) fn accept_completion(&mut self, cx: &mut Context<Self>) -> bool {
+        self._completion_task = None;
         let Some(completion) = self.completion.take() else {
             return false;
         };
@@ -1939,7 +1951,7 @@ impl CodeEditor {
     /// Looks up the callee's declaration for signature help.
     pub(crate) fn update_signature(&mut self, cx: &mut Context<Self>) {
         let Some((name, argument)) = self.call_at_caret() else {
-            self.signature = None;
+            self.close_signature();
             cx.notify();
             return;
         };

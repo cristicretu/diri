@@ -381,16 +381,19 @@ impl CodeEditor {
         let Some(at) = self.offset_at(event.position) else {
             return;
         };
-        let Some(doc) = &self.doc else {
+        if self.doc.is_none() {
             return;
-        };
+        }
         if event.modifiers.platform {
             self.set_selections(vec![Selection::caret(at)], cx);
             self.go_to_definition(at, cx);
             return;
         }
-        self.completion = None;
+        self.close_completion();
         self.hover = None;
+        let Some(doc) = &self.doc else {
+            return;
+        };
         let chosen = match event.click_count {
             2 => vec![Selection::span(doc.buffer.word_at(at))],
             3.. => {

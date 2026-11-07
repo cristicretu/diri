@@ -393,3 +393,30 @@ fn the_editor_holds_a_large_file_and_jumps_into_it(cx: &mut TestAppContext) {
         60_000
     );
 }
+
+#[gpui::test]
+fn escape_closes_completion_and_its_lookup_for_good(cx: &mut TestAppContext) {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("lib.rs"), "fn alphabet() {}\n").unwrap();
+    let intelligence = std::sync::Arc::new(
+        crate::code_intelligence::CodeIntelligence::for_session(
+            &workspace.path().canonicalize().unwrap(),
+        )
+        .unwrap(),
+    );
+    let (editor, cx) = editor("let alpha = 1;\nal", cx);
+    editor.update(cx, |editor, _| editor.set_intelligence(Some(intelligence)));
+    select(&editor, vec![Selection::caret(17)], cx);
+    // Typing opens the menu and starts the workspace symbol lookup; Escape
+    // lands before the lookup does.
+    editor.update(cx, |editor, cx| {
+        editor.type_text("p", cx);
+        assert!(editor.completion.is_some());
+        editor.escape(cx);
+    });
+    cx.run_until_parked();
+    assert!(
+        editor.read_with(cx, |editor, _| editor.completion.is_none()),
+        "the lookup finishing must not reopen a dismissed menu"
+    );
+}
