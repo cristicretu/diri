@@ -51,6 +51,31 @@ pub enum EditorEvent {
     Reload,
     /// The file was written.
     Saved,
+    /// A save finished after its document was switched away; the Files
+    /// surface applies it to that document wherever it now lives (a draft).
+    SavedAway(SavedAway),
+}
+
+/// A finished save whose document is no longer the one shown.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedAway {
+    pub document: DocumentId,
+    pub absolute_path: PathBuf,
+    /// The buffer version that was written; edits made after it stay dirty.
+    pub version: u64,
+    pub modified: Option<SystemTime>,
+}
+
+/// One document's identity for its lifetime. Buffer versions are per buffer
+/// and collide across documents, so async results key on this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DocumentId(u64);
+
+impl DocumentId {
+    pub(crate) fn fresh() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
 }
 
 /// One row the editor draws, all the same height.
@@ -63,6 +88,7 @@ pub(crate) enum Row {
 
 /// A file's editing state; it outlives the view while another file is shown.
 pub struct Document {
+    pub(crate) id: DocumentId,
     pub relative_path: PathBuf,
     pub absolute_path: PathBuf,
     pub language: SourceLanguage,
@@ -85,6 +111,7 @@ impl Document {
             )
         });
         Self {
+            id: DocumentId::fresh(),
             relative_path: snapshot.relative_path.clone(),
             absolute_path: snapshot.absolute_path.clone(),
             language: snapshot.language,
@@ -104,6 +131,19 @@ impl Document {
 
     pub fn text(&self) -> &str {
         self.buffer.text()
+    }
+
+    /// Applies a save that finished while this document was not shown.
+    /// Returns false when `saved` was for another document.
+    pub(crate) fn apply_saved_away(&mut self, saved: &SavedAway) -> bool {
+        if saved.document != self.id {
+            return false;
+        }
+        self.modified = saved.modified;
+        if self.buffer.version() == saved.version {
+            self.history.mark_saved();
+        }
+        true
     }
 }
 
@@ -1692,21 +1732,34 @@ impl CodeEditor {
         let text = doc.buffer.text().to_string();
         let expected = doc.modified;
         let version = doc.buffer.version();
+        let document = doc.id;
+        let absolute_path = doc.absolute_path.clone();
         self._save_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move { intelligence.save_file(&relative, &text, expected, force) })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                let saved = SavedAway {
+                    document,
+                    absolute_path,
+                    version,
+                    modified: result.as_ref().ok().copied().flatten(),
+                };
+                if this.doc.as_ref().is_none_or(|doc| doc.id != document) {
+                    // The saved document was switched away: its outcome
+                    // belongs to it, not to whatever is shown now.
+                    if result.is_ok() {
+                        cx.emit(EditorEvent::SavedAway(saved));
+                    }
+                    return;
+                }
                 match result {
-                    Ok(modified) => {
+                    Ok(_) => {
                         this.conflict = false;
                         this.save_error = None;
                         if let Some(doc) = this.doc.as_mut() {
-                            doc.modified = modified;
-                            if doc.buffer.version() == version {
-                                doc.history.mark_saved();
-                            }
+                            doc.apply_saved_away(&saved);
                         }
                         let dirty = this.is_dirty();
                         if dirty != this.was_dirty {

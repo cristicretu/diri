@@ -13,6 +13,7 @@ use crate::code_intelligence::SourceLanguage;
 
 fn document(text: &str, language: SourceLanguage) -> Document {
     Document {
+        id: super::editor::DocumentId::fresh(),
         relative_path: "src/sample.rs".into(),
         absolute_path: "/tmp/src/sample.rs".into(),
         language,
