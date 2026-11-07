@@ -416,6 +416,58 @@ pub fn sweep_finished_jobs(prefix: &str, age: Duration) {
     }
 }
 
+/// Whether `pid` is the running process of a job labelled `<prefix>…` in
+/// this process's launchd domain; `None` when `launchctl list` fails.
+#[must_use]
+pub fn is_job_process(prefix: &str, pid: u32) -> Option<bool> {
+    let output = Command::new(LAUNCHCTL)
+        .arg("list")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| job_runs_pid(&String::from_utf8_lossy(&output.stdout), prefix, pid))
+}
+
+fn job_runs_pid(list: &str, prefix: &str, pid: u32) -> bool {
+    let pid = pid.to_string();
+    list.lines().any(|line| {
+        let mut columns = line.split('\t');
+        columns.next().map(str::trim) == Some(pid.as_str())
+            && columns
+                .nth(1)
+                .is_some_and(|label| label.trim().starts_with(prefix))
+    })
+}
+
+/// The launchd session this process runs in (`launchctl managername`):
+/// `aqua` for the logged-in GUI, where `open` and the pasteboard work;
+/// `none` once that session is gone.
+#[must_use]
+pub fn session_type() -> &'static str {
+    let Ok(output) = Command::new(LAUNCHCTL)
+        .arg("managername")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return "unknown";
+    };
+    if !output.status.success() {
+        return "none";
+    }
+    match String::from_utf8_lossy(&output.stdout).trim() {
+        "Aqua" => "aqua",
+        "Background" => "background",
+        "LoginWindow" => "loginwindow",
+        "StandardIO" => "standardio",
+        _ => "other",
+    }
+}
+
 /// A label suffix that orders by creation: the current time in hex millis.
 #[must_use]
 pub fn label_suffix() -> String {
@@ -963,6 +1015,15 @@ mod tests {
             finished_jobs(&list, "p.", now, Duration::from_secs(120)),
             vec![format!("p.{old}")]
         );
+    }
+
+    #[test]
+    fn a_pid_counts_only_as_its_own_prefixed_job() {
+        let list = "PID\tStatus\tLabel\n-\t0\tp.1\n42\t0\tp.2\n7\t0\tq.1\n420\t0\tp.3\n";
+        assert!(job_runs_pid(list, "p.", 42));
+        assert!(!job_runs_pid(list, "p.", 7));
+        assert!(!job_runs_pid(list, "p.", 4));
+        assert!(!job_runs_pid(list, "p.", 1));
     }
 
     #[test]

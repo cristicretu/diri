@@ -58,6 +58,8 @@ impl HolderLauncher {
         let _lock = LaunchLock::acquire(&manager_paths.launch_lock())?;
 
         let manager = HolderManagerClient::new(manager_paths.socket());
+        #[cfg(target_os = "macos")]
+        retire_direct_manager(executable_path, &manager_paths, &manager);
         if !manager.is_alive() {
             start_manager(executable_path, &manager_paths.directory, &manager)?;
         }
@@ -204,6 +206,54 @@ pub(crate) fn mark_launchd_unavailable(directory: &Path, executable: &Path) {
     if let Err(error) = written {
         eprintln!("diri: record {}: {error}", path.display());
     }
+}
+
+/// The last manager pid [`retire_direct_manager`] looked at, so each manager
+/// costs one `launchctl list`, not one per launch.
+#[cfg(target_os = "macos")]
+static CHECKED_MANAGER: std::sync::Mutex<Option<i32>> = std::sync::Mutex::new(None);
+
+/// Stops new sessions going to a live manager that is not a launchd job
+/// while launchd works. Must hold the launch lock.
+///
+/// A manager the Engine spawned itself (launchd once failed, or an older
+/// diri) outlives updates and keeps the Engine's launchd session for good.
+/// Once that GUI session is gone (a logout), every Agent it starts can no
+/// longer open a browser or use the pasteboard (`launchctl managername`:
+/// "Could not get manager name"), which breaks every OAuth login. Its Agents
+/// are its own children too, so they share its app coalition.
+///
+/// Unlinking its socket and pid file makes it unreachable for launches: it
+/// keeps serving its sessions over their own sockets and exits once they
+/// end, without touching its successor's endpoint (it only removes files
+/// that still name its pid).
+#[cfg(target_os = "macos")]
+fn retire_direct_manager(
+    executable_path: &Path,
+    paths: &HolderManagerPaths,
+    manager: &HolderManagerClient,
+) {
+    if super::agent_launcher().is_none() || launchd_unavailable(&paths.directory, executable_path) {
+        return;
+    }
+    let Ok(pid) = manager.ping() else {
+        return;
+    };
+    {
+        let mut checked = CHECKED_MANAGER.lock().expect("checked manager");
+        if *checked == Some(pid) {
+            return;
+        }
+        *checked = Some(pid);
+    }
+    // A launchd job, or launchd could not be asked: keep it.
+    if diri_pty::detached::is_job_process(MANAGER_LABEL_PREFIX, pid as u32) != Some(false) {
+        return;
+    }
+    let _ = std::fs::remove_file(paths.socket());
+    let _ = std::fs::remove_file(paths.pid_file());
+    eprintln!("diri-engine: retired holder manager {pid}: not a launchd job");
+    diri_telemetry::event!("holder.manager_retired", pid = pid);
 }
 
 /// How a manager was started.

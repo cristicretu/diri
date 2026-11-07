@@ -178,6 +178,14 @@ impl HolderManagerServer {
                 })
                 .map_err(|error| HolderError::io("spawn engine watch", error))?;
         }
+        // `session`: whether its Agents can reach the GUI (browser, pasteboard).
+        #[cfg(target_os = "macos")]
+        diri_telemetry::event!(
+            "holder.manager_start",
+            guard = guard.is_some(),
+            session = diri_pty::detached::session_type(),
+        );
+        #[cfg(not(target_os = "macos"))]
         diri_telemetry::event!("holder.manager_start", guard = guard.is_some());
 
         write_pid_file(&self.paths.pid_file())?;
