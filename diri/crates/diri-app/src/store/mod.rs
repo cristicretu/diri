@@ -314,12 +314,20 @@ pub struct ActionFailure {
     pub detail: String,
     pub retrying: bool,
     retry: Option<RetryAction>,
+    /// The effect kind that failed, so only that action's later success
+    /// clears it (and its Retry). `None` for failures reported in place.
+    owner: Option<&'static str>,
 }
 
 impl ActionFailure {
     #[must_use]
     pub fn can_retry(&self) -> bool {
         self.retry.is_some()
+    }
+
+    fn owned_by(&self, context: &ActionContext) -> bool {
+        self.owner == Some(context.title)
+            && (context.retry.is_none() || self.retry == context.retry)
     }
 
     #[cfg(test)]
@@ -337,6 +345,7 @@ impl ActionFailure {
                 id: SessionId::new("fixture"),
                 title: "fixture".to_owned(),
             }),
+            owner: None,
         }
     }
 }
@@ -1498,6 +1507,7 @@ impl SessionStore {
             detail,
             retrying: false,
             retry: None,
+            owner: None,
         });
     }
 
@@ -1508,8 +1518,20 @@ impl SessionStore {
             detail,
             retrying: false,
             retry: None,
+            owner: None,
         });
         self.emit(StoreEffect::UiChanged);
+    }
+
+    /// Clears the shown failure only when `title`'s action produced it.
+    fn clear_action_failure_of(&mut self, title: &'static str) {
+        if self
+            .last_action_failure
+            .as_ref()
+            .is_some_and(|failure| failure.owner == Some(title))
+        {
+            self.last_action_failure = None;
+        }
     }
 
     pub fn dismiss_action_failure(&mut self) {
@@ -1524,6 +1546,9 @@ impl SessionStore {
         let Some(retry) = failure.retry.clone() else {
             return;
         };
+        if failure.retrying {
+            return;
+        }
         failure.retrying = true;
         self.emit(retry.effect());
     }
@@ -1909,6 +1934,33 @@ impl SessionStore {
 
     pub fn has_hydrated_sessions(&self) -> bool {
         self.session_list_hydrated
+    }
+
+    /// The one transition for a connection change. The session list and the
+    /// daemon identity belong to one connection, so every change (including
+    /// a reconnect whose intermediate states the watch skipped) forgets both
+    /// until this connection's `hello` and `hydrate` supply them again;
+    /// until then a missing session is unknown, not ended.
+    pub(crate) fn apply_connection_state(&mut self, state: ConnectionState) {
+        self.session_list_hydrated = false;
+        match state {
+            ConnectionState::Connecting => {
+                self.daemon_state = DaemonState::Connecting;
+                self.daemon_identity = None;
+                self.workspace_connection_changed(false);
+            }
+            ConnectionState::Disconnected(error) => {
+                self.daemon_state = DaemonState::Unreachable(error);
+                self.daemon_identity = None;
+                self.workspace_connection_changed(false);
+            }
+            ConnectionState::Connected(identity) => {
+                self.daemon_state = DaemonState::Connected;
+                self.daemon_identity = Some(identity);
+                self.last_action_failure = None;
+                self.workspace_connection_changed(true);
+            }
+        }
     }
 
     pub fn hydrate(&mut self, result: SessionListResult) {
@@ -3157,6 +3209,8 @@ impl SessionStore {
                 detail,
                 retrying: false,
                 retry: None,
+                // A later successful launch answers it.
+                owner: Some(CREATE_SESSION_FAILED),
             });
             self.request_agent_catalog(target_host, force);
             return false;
@@ -3328,7 +3382,7 @@ impl SessionStore {
         let Some(session) = self.sessions.get(source).cloned() else {
             return false;
         };
-        self.last_action_failure = None;
+        self.clear_action_failure_of(OPEN_TERMINAL_FAILED);
         self.emit(StoreEffect::SpawnPane {
             pane,
             params: SessionSpawnParams { keep_open: None,
@@ -3369,13 +3423,13 @@ impl SessionStore {
                 .insert((parent, slot), existing.id.clone());
             return false;
         }
-        let Some(session) = self.sessions.get(&parent) else {
+        let Some(session) = self.sessions.get(&parent).cloned() else {
             return false;
         };
         if !self.auxiliary_pending.insert((parent.clone(), slot)) {
             return true;
         }
-        self.last_action_failure = None;
+        self.clear_action_failure_of(OPEN_TERMINAL_FAILED);
         self.emit(StoreEffect::SpawnAuxiliary {
             slot,
             params: SessionSpawnParams { keep_open: None,
@@ -4173,26 +4227,17 @@ impl StoreRuntime {
                 }
                 waiting_for_deferred_start = false;
                 match state {
-                    ConnectionState::Connecting => {
-                        let mut store = state_store.write().expect("session store lock poisoned");
-                        store.daemon_state = DaemonState::Connecting;
-                        store.workspace_connection_changed(false);
+                    ConnectionState::Connecting | ConnectionState::Disconnected(_) => {
+                        state_store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .apply_connection_state(state);
                     }
-                    ConnectionState::Disconnected(error) => {
-                        let mut store = state_store.write().expect("session store lock poisoned");
-                        store.daemon_state = DaemonState::Unreachable(error);
-                        store.daemon_identity = None;
-                        store.workspace_connection_changed(false);
-                    }
-                    ConnectionState::Connected(identity) => {
-                        {
-                            let mut store =
-                                state_store.write().expect("session store lock poisoned");
-                            store.daemon_state = DaemonState::Connected;
-                            store.daemon_identity = Some(identity);
-                            store.last_action_failure = None;
-                            store.workspace_connection_changed(true);
-                        }
+                    ConnectionState::Connected(_) => {
+                        state_store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .apply_connection_state(state);
                         if let Ok(catalog) = state_client.hosts().await {
                             state_store
                                 .write()
@@ -4912,15 +4957,11 @@ async fn run_effects(
         };
         let mut store = store.write().expect("session store lock poisoned");
         if let Some(context) = action_context {
-            store.last_action_failure = match &result {
-                Ok(()) => None,
-                Err(error) => Some(ActionFailure {
-                    title: context.title.to_owned(),
-                    detail: error.to_string(),
-                    retrying: false,
-                    retry: context.retry,
-                }),
-            };
+            settle_action_failure(
+                &mut store.last_action_failure,
+                context,
+                result.as_ref().map(|_| ()).map_err(ToString::to_string),
+            );
         }
         let active = store.app_is_active;
         let activation_snapshot = force_snapshot.then(|| store.snapshot());
@@ -4937,6 +4978,37 @@ async fn run_effects(
 struct ActionContext {
     title: &'static str,
     retry: Option<RetryAction>,
+}
+
+const OPEN_TERMINAL_FAILED: &str = "Open terminal failed";
+const CREATE_SESSION_FAILED: &str = "Create session failed";
+
+/// One action finished: a failure replaces the shown one; a success clears
+/// only the failure that action owns, never another action's (or its Retry).
+fn settle_action_failure(
+    slot: &mut Option<ActionFailure>,
+    context: ActionContext,
+    result: Result<(), String>,
+) {
+    match result {
+        Ok(()) => {
+            if slot
+                .as_ref()
+                .is_some_and(|failure| failure.owned_by(&context))
+            {
+                *slot = None;
+            }
+        }
+        Err(detail) => {
+            *slot = Some(ActionFailure {
+                title: context.title.to_owned(),
+                detail,
+                retrying: false,
+                retry: context.retry,
+                owner: Some(context.title),
+            });
+        }
+    }
 }
 
 fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
@@ -4958,11 +5030,9 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
                 title: title.clone(),
             }),
         ),
-        StoreEffect::Spawn(_) | StoreEffect::StartWorkItem { .. } => {
-            ("Create session failed", None)
-        }
+        StoreEffect::Spawn(_) | StoreEffect::StartWorkItem { .. } => (CREATE_SESSION_FAILED, None),
         StoreEffect::SpawnAuxiliary { .. } | StoreEffect::SpawnPane { .. } => {
-            ("Open terminal failed", None)
+            (OPEN_TERMINAL_FAILED, None)
         }
         StoreEffect::Migrate { .. } => ("Move session failed", None),
         StoreEffect::ReparentWorktree(_) => ("Move session to worktree failed", None),
