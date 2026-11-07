@@ -107,6 +107,16 @@ pub fn launch(request: LaunchRequest, executable: &std::path::Path) -> io::Resul
             persistence: state.persistence,
         });
     }
+    // A Holder still owns this Session, but its socket is not under this
+    // command's runtime root (sshd gave the launching SSH session a different
+    // `XDG_RUNTIME_DIR`) or it is between bind and unlink. Resetting here
+    // would delete the live Holder's state, credentials and output log and
+    // start a second Agent beside it; only a dead Session may be reset.
+    if crate::state::holder_lock_held(&paths.lock)? {
+        return Err(
+            diri_proto::remote_pty::RemoteManagementFailure::HolderUnavailable.into_io_error(),
+        );
+    }
     reset_dead_session(&paths)?;
     initialize_auth(&paths, &request.session_token)?;
 
