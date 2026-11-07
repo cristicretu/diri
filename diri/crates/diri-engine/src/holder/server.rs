@@ -310,9 +310,13 @@ impl HolderServer {
         // interleave two writers into one output log and stack a second child.
         // If a live holder already serves this socket, defer to it — bail
         // before touching the log or spawning anything.
-        if HolderClient::new(&spec.socket_path).is_alive() {
+        // A Holder the probe could not reach may still be serving: refuse
+        // that too, unless nothing listens on the socket.
+        let liveness =
+            HolderClient::new(&spec.socket_path).settled_liveness(super::client::DOUBLE_RUN_SETTLE);
+        if !liveness.may_replace() {
             return Err(HolderError::Launch(format!(
-                "a live holder already serves {}; refusing to double-run",
+                "a holder may already serve {} ({liveness:?}); refusing to double-run",
                 spec.socket_path
             )));
         }
