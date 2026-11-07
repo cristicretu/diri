@@ -97,6 +97,14 @@ pub enum HolderError {
     Rejected(String),
     /// A holder or manager could not be started.
     Launch(String),
+    /// Input stopped reaching the PTY. Exactly the first `written` of `total`
+    /// bytes were delivered to the child, so a caller retries only the tail
+    /// (or nothing) instead of duplicating or silently losing a prefix.
+    PartialWrite {
+        written: u64,
+        total: u64,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for HolderError {
@@ -106,6 +114,14 @@ impl std::fmt::Display for HolderError {
             Self::Transport(message) => write!(f, "holder transport: {message}"),
             Self::Rejected(message) => write!(f, "holder rejected: {message}"),
             Self::Launch(message) => write!(f, "holder launch: {message}"),
+            Self::PartialWrite {
+                written,
+                total,
+                reason,
+            } => write!(
+                f,
+                "holder write: {reason} after delivering {written} of {total} bytes"
+            ),
         }
     }
 }

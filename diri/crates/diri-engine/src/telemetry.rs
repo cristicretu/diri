@@ -193,6 +193,7 @@ pub fn holder_error_kind(error: &crate::holder::HolderError) -> &'static str {
         HolderError::Transport(_) => "transport",
         HolderError::Rejected(_) => "rejected",
         HolderError::Launch(_) => "launch",
+        HolderError::PartialWrite { .. } => "partial_write",
     }
 }
 
