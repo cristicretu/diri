@@ -165,22 +165,25 @@ pub fn prepare(
         )?;
         wip_committed = true;
     }
-    // A snapshot tip means dirty state should travel as dirty state — whether
+    // A snapshot means dirty state should travel as dirty state — whether
     // the commit was made just above or by an earlier run that failed later
-    // (idempotent retry).
-    let (source_tip, tip_subject) = source_tip(source_host, &root)?;
-    let carry_dirty = tip_subject.starts_with(HANDOFF_SUBJECT_PREFIX);
+    // (idempotent retry). An earlier run's snapshot need not be the tip: the
+    // agent kept working and may have committed on top of it, and only the
+    // commits below the oldest unpublished snapshot are safe to push.
+    let (source_tip, _) = source_tip(source_host, &root)?;
+    let snapshot = oldest_unpublished_snapshot(source_host, &root, &source_tip)?;
+    let carry_dirty = snapshot.is_some();
 
     // Push only real commits; the snapshot stays behind on the source. When
     // the branch already matches origin this is a no-op, and a genuinely
     // diverged origin still fails loudly here, before anything mutates. The
     // push names the commit read above rather than `HEAD`: the agent is still
     // alive and a commit it makes meanwhile must neither publish the snapshot
-    // nor reach the target behind `reconcile`'s back.
-    let published = if carry_dirty {
-        format!("{source_tip}~1")
-    } else {
-        source_tip.clone()
+    // nor reach the target behind `reconcile`'s back. Commits above a
+    // snapshot travel with it, as dirty state.
+    let published = match &snapshot {
+        Some(snapshot) => format!("{snapshot}~1"),
+        None => source_tip.clone(),
     };
     require(
         source_host,
@@ -277,6 +280,32 @@ fn source_tip(
     )?;
     let (id, subject) = tip.split_once(' ').unwrap_or((tip.as_str(), ""));
     Ok((id.to_string(), subject.to_string()))
+}
+
+/// The oldest handoff snapshot commit reachable from `tip` that origin has
+/// never seen, or `None`. Everything at and above it is source-only state.
+fn oldest_unpublished_snapshot(
+    source_host: Option<&HostEntry>,
+    source_root: &str,
+    tip: &str,
+) -> Result<Option<String>, MigrateError> {
+    let log = require(
+        source_host,
+        &format!(
+            "git -C {} log --format='%H %s' {} --not --remotes=origin",
+            shell_quote(source_root),
+            shell_quote(tip)
+        ),
+        "could not read the source branch's unpublished commits",
+        Duration::from_secs(30),
+    )?;
+    // Newest first, so the last match is the oldest.
+    Ok(log
+        .lines()
+        .rev()
+        .filter_map(|line| line.split_once(' '))
+        .find(|(_, subject)| subject.starts_with(HANDOFF_SUBJECT_PREFIX))
+        .map(|(id, _)| id.to_string()))
 }
 
 /// Phase 1b — runs once the source agent is confirmed stopped, so the source
@@ -1190,6 +1219,35 @@ mod tests {
             "late file v2\n"
         );
         assert!(!source.join("notes.md").exists());
+    }
+
+    /// A run whose push failed left its snapshot behind; the agent then
+    /// committed on top of it. The retry must not publish the snapshot as a
+    /// real commit underneath the agent's.
+    #[test]
+    fn a_retry_never_publishes_a_snapshot_buried_under_a_new_commit() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (source, target) = seeded_repos(temp.path());
+        std::fs::write(source.join("file.txt"), "snapshot edit\n").unwrap();
+        git(&source, &["add", "-A"]);
+        git(
+            &source,
+            &["commit", "-q", "-m", &wip_commit_message("forge")],
+        );
+        std::fs::write(source.join("agent.txt"), "agent work\n").unwrap();
+        git(&source, &["add", "-A"]);
+        git(&source, &["commit", "-q", "-m", "agent commit"]);
+
+        let prepared = prepare_local(&source, &target).expect("retry");
+        assert!(prepared.carried_dirty);
+        let published = git_out(&source, &["log", "--format=%s", "origin/main"]);
+        assert!(
+            !published.contains(HANDOFF_SUBJECT_PREFIX),
+            "origin saw the snapshot: {published}"
+        );
+        for name in ["file.txt", "agent.txt"] {
+            assert_same_file(&source, &target, name);
+        }
     }
 
     #[cfg(unix)]
