@@ -52,38 +52,85 @@ pub struct RowMeta {
 
 #[derive(Default)]
 pub struct StyleTable {
+    /// By id; a slot past 0 that holds the default style is free (the
+    /// default always interns to 0, so no live id names it).
     table: Vec<Style>,
     /// Boxed: packed pages drop it, and a page's size counts in the budget
     /// (a bare `HashMap` adds 40 bytes to every packed page).
     #[allow(clippy::box_collection)]
     index: Option<Box<HashMap<Style, u16>>>,
+    /// Free slots, reused before the table grows.
+    free: Vec<u16>,
+    /// Bumped whenever ids are reclaimed: an id cached outside the page
+    /// (the pen's) is valid only for the generation it was interned in.
+    generation: u32,
 }
 
+/// Ids are u16 and the style bits of a cell hold no more.
+const MAX_STYLES: usize = 1 << 16;
+
 impl StyleTable {
+    /// The id of `style`, or `None` when every id is taken: the page then
+    /// reclaims the ids no cell names ([`Page::intern_style`]).
     #[inline(always)]
-    pub fn intern(&mut self, style: &Style) -> u16 {
+    fn intern(&mut self, style: &Style) -> Option<u16> {
         debug_assert_eq!(style.is_default(), *style == Style::default());
         if style.is_default() {
-            return 0;
+            return Some(0);
         }
         self.intern_other(style)
     }
 
     #[inline(never)]
-    fn intern_other(&mut self, style: &Style) -> u16 {
+    fn intern_other(&mut self, style: &Style) -> Option<u16> {
         if self.table.is_empty() {
             self.table.push(Style::default());
         }
         let index = self.index.get_or_insert_with(Default::default);
         if let Some(&id) = index.get(style) {
-            return id;
+            return Some(id);
         }
-        // Callers intern only for a cell or row fill they write, so a page
-        // holds at most rows * (cols + 1) styles, far below 65,535.
-        let id = self.table.len() as u16;
-        self.table.push(*style);
+        // A page is written in place for as long as it is on screen (an
+        // alternate-screen animation), so the styles it has ever held are
+        // unbounded: never wrap an id, hand out a free one or fail.
+        let id = match self.free.pop() {
+            Some(id) => {
+                self.table[id as usize] = *style;
+                id
+            }
+            None => {
+                let id = u16::try_from(self.table.len()).ok()?;
+                self.table.push(*style);
+                id
+            }
+        };
         index.insert(*style, id);
-        id
+        Some(id)
+    }
+
+    /// Ids that can still be handed out without reclaiming.
+    fn available(&self) -> usize {
+        self.free.len() + MAX_STYLES - self.table.len().max(1)
+    }
+
+    /// Frees every id past 0 not marked in `live` (one bit per id).
+    fn reclaim(&mut self, live: &[u64]) {
+        let index = self.index.get_or_insert_with(Default::default);
+        self.free.clear();
+        for id in (1..self.table.len()).rev() {
+            if live[id / 64] & 1 << (id % 64) == 0 {
+                let style = std::mem::take(&mut self.table[id]);
+                if index.get(&style) == Some(&(id as u16)) {
+                    index.remove(&style);
+                }
+                self.free.push(id as u16);
+            }
+        }
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    pub fn generation(&self) -> u32 {
+        self.generation
     }
 
     #[inline]
@@ -111,23 +158,30 @@ impl StyleTable {
 
     fn clear(&mut self) {
         self.table.clear();
+        self.free.clear();
         if let Some(index) = &mut self.index {
             index.clear();
         }
     }
 
-    /// Rebuilds the index of a frozen table, so a thawed page interns
-    /// without duplicating its styles.
+    /// Rebuilds the index and free list of a frozen table, so a thawed
+    /// page interns without duplicating its styles.
     fn thaw(&mut self) {
         let index = self.index.get_or_insert_with(Default::default);
         index.clear();
-        for (id, style) in self.table.iter().enumerate().skip(1) {
-            index.entry(*style).or_insert(id as u16);
+        self.free.clear();
+        for (id, style) in self.table.iter().enumerate().skip(1).rev() {
+            if style.is_default() {
+                self.free.push(id as u16);
+            } else {
+                index.entry(*style).or_insert(id as u16);
+            }
         }
     }
 
     fn heap_bytes(&self) -> usize {
         self.table.capacity() * std::mem::size_of::<Style>()
+            + self.free.capacity() * std::mem::size_of::<u16>()
     }
 }
 
@@ -1599,6 +1653,64 @@ impl Page {
         self.packed.is_some()
     }
 
+    /// The id of `style` in this hot page's table. When every id is
+    /// taken, the ids no row fill or cell below its row's occupancy names
+    /// are reclaimed first; ids are never wrapped. An id returned earlier
+    /// stays valid until the next call that reclaims, so a caller interning
+    /// several styles before writing any reserves them first
+    /// ([`Page::reserve_styles`]), and an id cached outside the page is
+    /// keyed by [`Page::style_epoch`].
+    #[inline(always)]
+    pub fn intern_style(&mut self, style: &Style) -> u16 {
+        match self.styles.intern(style) {
+            Some(id) => id,
+            None => self.intern_style_reclaiming(style),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn intern_style_reclaiming(&mut self, style: &Style) -> u16 {
+        self.reclaim_styles();
+        self.styles.intern(style).unwrap_or_else(|| {
+            // Every id is live: a page of more than 65,535 cells, each in
+            // its own style. Degrade to the default rather than alias.
+            debug_assert!(false, "style table full of live styles");
+            0
+        })
+    }
+
+    /// Makes sure `n` new styles can be interned before ids are reclaimed.
+    pub fn reserve_styles(&mut self, n: usize) {
+        if self.styles.available() < n {
+            self.reclaim_styles();
+        }
+    }
+
+    /// Changes whenever the page is reinitialised or its style ids are
+    /// reclaimed: a style id cached with it is valid while it is equal.
+    #[inline(always)]
+    pub fn style_epoch(&self) -> u64 {
+        self.serial ^ (self.styles.generation as u64) << 48
+    }
+
+    /// Frees the style ids no row fill or written cell of this hot page
+    /// names. Live ids keep their numbers, so no cell is rewritten.
+    fn reclaim_styles(&mut self) {
+        let mut live = vec![0u64; MAX_STYLES / 64];
+        let cols = self.cells.len().checked_div(self.meta.len()).unwrap_or(0);
+        for (row, meta) in self.meta[..self.len].iter().enumerate() {
+            let fill = meta.fill as usize;
+            live[fill / 64] |= 1 << (fill % 64);
+            let start = row * cols;
+            for cell in &self.cells[start..start + (meta.occ as usize).min(cols)] {
+                let id = cell.style() as usize;
+                live[id / 64] |= 1 << (id % 64);
+            }
+        }
+        self.styles.reclaim(&live);
+    }
+
     /// Adds `c` to the cluster of the cell at `index` (a hot page).
     pub fn push_zerowidth(&mut self, index: usize, c: char) {
         if self.clusters.full() {
@@ -2274,7 +2386,7 @@ impl Pages {
             self.pages.push_back(page);
         }
         let page = self.pages.back_mut().expect("a tail page");
-        let fill = page.styles.intern(fill);
+        let fill = page.intern_style(fill);
         let row = page.len;
         page.meta[row] = RowMeta {
             occ: 0,
@@ -2568,7 +2680,7 @@ impl Pages {
         );
         page.styles = StyleTable {
             table: styles,
-            index: None,
+            ..StyleTable::default()
         };
         page.cells = cells;
         page.meta = meta;
