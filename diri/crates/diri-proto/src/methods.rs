@@ -773,6 +773,21 @@ pub struct SessionListResult {
     pub projects: Vec<Project>,
 }
 
+/// `session.list` as a current Engine answers it: the list plus the event
+/// sequence it reflects. The list and the event stream travel independently,
+/// so a reply generated before a `session.removed` (or a newer
+/// `session.updated`) can arrive after it; a client lets every session event
+/// with `seq > event_seq` win over the list. The field is additive: an older
+/// Engine omits it, and `SessionListResult` readers ignore it.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct StampedSessionListResult {
+    #[serde(flatten)]
+    pub list: SessionListResult,
+    /// The highest published event seq whose effect the list includes.
+    #[serde(default, rename = "eventSeq", skip_serializing_if = "Option::is_none")]
+    pub event_seq: Option<u64>,
+}
+
 pub type SessionListParams = EmptyParams;
 pub type StateSnapshotResult = SessionListResult;
 pub type StateSnapshotParams = EmptyParams;
@@ -1059,6 +1074,21 @@ pub struct ResizeParams {
 }
 
 pub type ResizeResult = EmptyResult;
+
+/// Bounds a client-supplied terminal size (spawn `initialCols`/`initialRows`,
+/// `session.resize`, an attach `Resize` frame) to the Remote Helper's limits,
+/// so one oversized request cannot make the Engine allocate billions of
+/// cells and abort every session. Columns are capped first, then rows to fit
+/// both the row limit and the cell budget; `min` (at least 1) floors both.
+#[must_use]
+pub fn clamp_terminal_size(cols: i64, rows: i64, min: u16) -> (u16, u16) {
+    use crate::remote_pty::{MAX_TERMINAL_CELLS, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS};
+    let min = min.max(1);
+    let cols = cols.clamp(i64::from(min), i64::from(MAX_TERMINAL_COLS));
+    let max_rows = (MAX_TERMINAL_CELLS / cols as usize).min(usize::from(MAX_TERMINAL_ROWS));
+    let rows = rows.clamp(i64::from(min), max_rows as i64);
+    (cols as u16, rows as u16)
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ClientRole {
@@ -1856,3 +1886,27 @@ pub struct HostUsageParams {
     pub host: String,
 }
 pub type HostUsageResult = crate::remote_pty::TranscriptUsageResult;
+
+#[cfg(test)]
+mod terminal_size_tests {
+    use super::clamp_terminal_size;
+    use crate::remote_pty::{MAX_TERMINAL_CELLS, validate_terminal_dimensions};
+
+    #[test]
+    fn clamp_terminal_size_bounds_every_input_to_the_helper_limits() {
+        assert_eq!(clamp_terminal_size(80, 24, 2), (80, 24));
+        assert_eq!(clamp_terminal_size(0, -5, 2), (2, 2));
+        assert_eq!(clamp_terminal_size(0, 0, 0), (1, 1));
+        for (cols, rows) in [
+            (65_535, 65_535),
+            (i64::MAX, i64::MAX),
+            (4096, 4096),
+            (1000, 2000),
+            (2, i64::MAX),
+        ] {
+            let (c, r) = clamp_terminal_size(cols, rows, 2);
+            validate_terminal_dimensions(c, r).expect("clamped size is a valid Helper size");
+            assert!(usize::from(c) * usize::from(r) <= MAX_TERMINAL_CELLS);
+        }
+    }
+}

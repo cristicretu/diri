@@ -653,3 +653,31 @@ where
     let decoded: T = serde_json::from_slice(&encoded).unwrap();
     assert_eq!(value, &decoded);
 }
+
+#[test]
+fn stamped_session_list_is_additive_on_the_wire() {
+    use diri_proto::StampedSessionListResult;
+    let list: SessionListResult = fixture_ok(FIXTURES[1]);
+    let stamped = StampedSessionListResult {
+        list: list.clone(),
+        event_seq: Some(42),
+    };
+    let wire = serde_json::to_value(&stamped).unwrap();
+    assert_eq!(wire["eventSeq"], json!(42));
+    // The stamp sits beside `sessions`/`projects`, so plain readers still decode.
+    let plain: SessionListResult = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(plain, list);
+    let back: StampedSessionListResult = serde_json::from_value(wire).unwrap();
+    assert_eq!(back, stamped);
+    // An older Engine sends no stamp.
+    let old: StampedSessionListResult =
+        serde_json::from_value(serde_json::to_value(&list).unwrap()).unwrap();
+    assert_eq!(old.event_seq, None);
+    assert_eq!(old.list, list);
+    assert!(
+        serde_json::to_value(&old)
+            .unwrap()
+            .get("eventSeq")
+            .is_none()
+    );
+}

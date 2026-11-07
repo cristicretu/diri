@@ -1116,17 +1116,77 @@ impl Prefs {
     /// [`Self::migrate_hibernation_defaults`] the old value to move.
     pub const HIBERNATION_DEFAULTS_REVISION: u32 = 1;
 
+    /// Reads the preferences file. Contents never stop diri from launching:
+    /// a field this build cannot read (a value written by a newer diri, a
+    /// wrong type) takes its default and the rest are kept, and a file that
+    /// is not a JSON object at all is set aside as
+    /// `prefs.json.corrupt-<unix seconds>` and defaults load. Only an I/O
+    /// error other than a missing file is returned.
     pub fn load(path: &Path) -> io::Result<Self> {
-        match fs::read(path) {
-            Ok(bytes) => {
-                let mut prefs: Self = serde_json::from_slice(&bytes)
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                prefs.migrate_hibernation_defaults();
-                prefs.normalize();
-                Ok(prefs)
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) => return Err(error),
+        };
+        let mut prefs = match Self::from_json_lenient(&bytes) {
+            Ok((prefs, dropped)) => {
+                if !dropped.is_empty() {
+                    eprintln!(
+                        "diri: preferences {} could not be read and use their defaults",
+                        dropped.join(", ")
+                    );
+                }
+                prefs
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(error),
+            Err(error) => {
+                match set_aside_corrupt(path) {
+                    Ok(kept) => eprintln!(
+                        "diri: preferences file is unreadable ({error}); moved it to {} and \
+                         started from defaults",
+                        kept.display()
+                    ),
+                    Err(rename) => eprintln!(
+                        "diri: preferences file is unreadable ({error}) and could not be moved \
+                         aside ({rename}); started from defaults"
+                    ),
+                }
+                return Ok(Self::default());
+            }
+        };
+        prefs.migrate_hibernation_defaults();
+        prefs.normalize();
+        Ok(prefs)
+    }
+
+    /// Deserializes saved preferences field by field when the whole file does
+    /// not read: every top-level field that fails on its own is dropped, so it
+    /// takes its default, and the names of the dropped fields are returned.
+    /// Fails only when the bytes are not a JSON object.
+    fn from_json_lenient(bytes: &[u8]) -> Result<(Self, Vec<String>), serde_json::Error> {
+        let strict = match serde_json::from_slice::<Self>(bytes) {
+            Ok(prefs) => return Ok((prefs, Vec::new())),
+            Err(error) => error,
+        };
+        let Ok(serde_json::Value::Object(mut fields)) = serde_json::from_slice(bytes) else {
+            return Err(strict);
+        };
+        let dropped: Vec<String> = fields
+            .iter()
+            .filter(|(key, value)| {
+                let mut alone = serde_json::Map::new();
+                alone.insert((*key).clone(), (*value).clone());
+                serde_json::from_value::<Self>(serde_json::Value::Object(alone)).is_err()
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &dropped {
+            fields.remove(key);
+        }
+        match serde_json::from_value(serde_json::Value::Object(fields)) {
+            Ok(prefs) => Ok((prefs, dropped)),
+            // Fields that read alone but not together (an alias beside its
+            // field): nothing better than defaults is left.
+            Err(_) => Err(strict),
         }
     }
 
@@ -1326,6 +1386,20 @@ impl Prefs {
         }
         self.launch_recipes.normalize();
     }
+}
+
+/// Renames an unreadable preferences file to `<name>.corrupt-<unix seconds>`
+/// beside it, so the user's settings survive for inspection while defaults
+/// load, and returns the new path.
+fn set_aside_corrupt(path: &Path) -> io::Result<PathBuf> {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".corrupt-{seconds}"));
+    let kept = path.with_file_name(name);
+    fs::rename(path, &kept)?;
+    Ok(kept)
 }
 
 #[cfg(test)]
@@ -1903,5 +1977,71 @@ mod tests {
             !future.automatic_updates,
             "the rest of the file still loads"
         );
+    }
+
+    #[test]
+    fn prefs_from_a_newer_build_keep_every_field_this_build_can_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.json");
+        fs::write(
+            &path,
+            r#"{
+                "dockBadge": "everything",
+                "talkAnswer": "telepathy",
+                "windowMaterial": "frosted",
+                "inspectorTab": "timeline",
+                "sidebarGrouping": "host",
+                "tabOrientation": "diagonal",
+                "sidebarOrdering": "alphabetical",
+                "windowPlacement": {"mode": "stage", "x": 0, "y": 0, "width": 1200, "height": 800},
+                "terminalFontSize": "large",
+                "terminalTheme": "vesper",
+                "sidebarWidth": 300,
+                "startAtLogin": true
+            }"#,
+        )
+        .unwrap();
+
+        let prefs = Prefs::load(&path).expect("a newer file never stops diri launching");
+
+        let defaults = Prefs::default();
+        assert_eq!(prefs.dock_badge, defaults.dock_badge);
+        assert_eq!(prefs.talk_answer, defaults.talk_answer);
+        assert_eq!(prefs.window_material, defaults.window_material);
+        assert_eq!(prefs.inspector_tab, defaults.inspector_tab);
+        assert_eq!(prefs.sidebar_grouping, defaults.sidebar_grouping);
+        assert_eq!(prefs.tab_orientation, defaults.tab_orientation);
+        assert_eq!(prefs.sidebar_ordering, defaults.sidebar_ordering);
+        assert_eq!(prefs.window_placement, None);
+        assert_eq!(prefs.terminal_font_size, defaults.terminal_font_size);
+        assert_eq!(prefs.terminal_theme, "vesper");
+        assert_eq!(prefs.sidebar_width, 300.0);
+        assert!(prefs.start_at_login);
+        assert!(path.exists(), "a readable file stays where it is");
+    }
+
+    #[test]
+    fn unreadable_prefs_are_set_aside_and_defaults_load() {
+        for contents in [&b"{\"terminalTheme\": \"ves"[..], b"", b"[1, 2]", b"\xff\xfe"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("prefs.json");
+            fs::write(&path, contents).unwrap();
+
+            let prefs = Prefs::load(&path).expect("an unreadable file never stops diri launching");
+
+            assert_eq!(prefs, Prefs::default());
+            assert!(!path.exists(), "the unreadable file is moved out of the way");
+            let kept: Vec<_> = fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            assert_eq!(kept.len(), 1);
+            let name = kept[0].file_name().unwrap().to_string_lossy().into_owned();
+            assert!(name.starts_with("prefs.json.corrupt-"), "{name}");
+            assert_eq!(fs::read(&kept[0]).unwrap(), contents, "the user's bytes survive");
+
+            prefs.save(&path).unwrap();
+            assert_eq!(Prefs::load(&path).unwrap(), prefs);
+        }
     }
 }

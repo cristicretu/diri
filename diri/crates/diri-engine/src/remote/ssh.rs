@@ -145,6 +145,14 @@ impl SshTransport {
         command: HelperCommand,
     ) -> Result<CommandSpec, BootstrapError> {
         validate_component("build id", build_id)?;
+        // A Session command without the socket-root prelude can miss its live
+        // Holder; those go through `helper_session_command` only.
+        if command.is_session_scoped() {
+            return Err(BootstrapError::InvalidComponent {
+                field: "session-less command",
+                value: command.as_str().into(),
+            });
+        }
         let remote_command = format!(
             "set -eu; [ -d \"$HOME/.cache\" ] && [ ! -L \"$HOME/.cache\" ] || exit 73; exec \"$HOME/.cache/diri/bin/protocol-{}/{}/diri-remote\" {}",
             diri_proto::remote_pty::PROTOCOL_MAJOR,
@@ -158,24 +166,32 @@ impl SshTransport {
         })
     }
 
-    /// Attaches to one Session's Holder socket.
+    /// Runs one Session-scoped Helper command (launch, inspect, kill, attach).
     ///
     /// A Helper puts Holder sockets under `$XDG_RUNTIME_DIR/diri` when that is
     /// set and under `${TMPDIR:-/tmp}/diri-remote-<uid>` otherwise, so the
     /// root follows the environment of whichever SSH session ran the command,
     /// and sshd does not give every session the same one. A Holder launched
-    /// without `XDG_RUNTIME_DIR` is unreachable from a Bridge that has it: the
-    /// Bridge exits before any Hello, on every attempt. The prelude points the
-    /// Bridge at whichever root actually holds this Session's socket. Every
-    /// Helper build agrees on the hashed name, so this also reaches Holders
-    /// that are already running.
-    pub fn helper_attach_command(
+    /// without `XDG_RUNTIME_DIR` is unreachable from a command that has it: a
+    /// Bridge exits before any Hello, a kill reports the Holder gone while the
+    /// Agent keeps running, and a relaunch used to reset the live session. The
+    /// prelude points every command for this Session at whichever root
+    /// actually holds its socket. Every Helper build agrees on the hashed
+    /// name, so this also reaches Holders that are already running.
+    pub fn helper_session_command(
         &self,
         build_id: &str,
+        command: HelperCommand,
         session_id: &str,
     ) -> Result<CommandSpec, BootstrapError> {
         validate_component("build id", build_id)?;
         validate_component("session id", session_id)?;
+        if !command.is_session_scoped() {
+            return Err(BootstrapError::InvalidComponent {
+                field: "session command",
+                value: command.as_str().into(),
+            });
+        }
         Ok(self.channel(&format!(
             "set -eu; [ -d \"$HOME/.cache\" ] && [ ! -L \"$HOME/.cache\" ] || exit 73; \
              u=$(id -u); s={socket}; t=\"${{TMPDIR:-/tmp}}/diri-remote-$u/$s\"; \
@@ -185,8 +201,17 @@ impl SshTransport {
              exec \"$HOME/.cache/diri/bin/protocol-{major}/{build_id}/diri-remote\" {command}",
             socket = holder_socket_name(session_id),
             major = diri_proto::remote_pty::PROTOCOL_MAJOR,
-            command = HelperCommand::Attach.as_str(),
+            command = command.as_str(),
         )))
+    }
+
+    /// Attaches to one Session's Holder socket; see `helper_session_command`.
+    pub fn helper_attach_command(
+        &self,
+        build_id: &str,
+        session_id: &str,
+    ) -> Result<CommandSpec, BootstrapError> {
+        self.helper_session_command(build_id, HelperCommand::Attach, session_id)
     }
 
     /// Probes the exact Helper and, only when that probe exits successfully,
@@ -395,6 +420,15 @@ impl HelperCommand {
             Self::Usage => "usage",
             Self::Persistence => "persistence",
         }
+    }
+
+    /// Commands that address one Session's Holder socket and therefore must
+    /// resolve the same socket root as the Holder that owns it.
+    const fn is_session_scoped(self) -> bool {
+        matches!(
+            self,
+            Self::Launch | Self::Attach | Self::Inspect | Self::Kill
+        )
     }
 
     /// Read-only management commands that may run behind a probe in one
@@ -639,6 +673,42 @@ mod tests {
         assert_eq!(
             holder_socket_name("s_abab2a31abd7"),
             "e14565ad01a4d152241fc060d3422a0f.sock"
+        );
+    }
+
+    #[test]
+    fn every_session_command_resolves_the_holders_socket_root() {
+        let transport = SshTransport::new(&host(), "/tmp/control");
+        let attach = words(
+            &transport
+                .helper_attach_command("build-123", "s_1")
+                .expect("attach"),
+        );
+        let attach = attach.last().expect("remote");
+        assert!(attach.contains(&holder_socket_name("s_1")));
+        for command in [
+            HelperCommand::Launch,
+            HelperCommand::Inspect,
+            HelperCommand::Kill,
+        ] {
+            let spec = transport
+                .helper_session_command("build-123", command, "s_1")
+                .expect("session command");
+            let remote = words(&spec).last().expect("remote").clone();
+            // The same prelude as attach; only the Helper command differs.
+            assert_eq!(remote.replace(command.as_str(), "attach"), *attach);
+            // Without the session there is no prelude, so it is refused.
+            assert!(transport.helper_command("build-123", command).is_err());
+        }
+        assert!(
+            transport
+                .helper_session_command("build-123", HelperCommand::Kill, "../s")
+                .is_err()
+        );
+        assert!(
+            transport
+                .helper_session_command("build-123", HelperCommand::Gc, "s_1")
+                .is_err()
         );
     }
 

@@ -248,6 +248,7 @@ fn main() {
     let mut server = ControlServer::new(Arc::clone(&registry), DirijorPaths::socket(&home))
         .with_logs_dir(&logs_dir)
         .with_config_dir(&config_dir)
+        .with_state_dir(&state_dir)
         .with_remote_bindings_dir(&state_dir)
         .with_notes_dir(app_support.join("notes"))
         .with_holder(holder)
