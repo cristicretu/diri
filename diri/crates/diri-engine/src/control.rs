@@ -1774,10 +1774,7 @@ impl ControlServer {
         // instead of waiting out the pane's first report. Only a spawn with
         // neither waits, up to the launch fallback, for its pane.
         let launch_size = match (p.initial_cols, p.initial_rows) {
-            (Some(cols), Some(rows)) => Some((
-                cols.clamp(2, u16::MAX as i64) as u16,
-                rows.clamp(2, u16::MAX as i64) as u16,
-            )),
+            (Some(cols), Some(rows)) => Some(diri_proto::clamp_terminal_size(cols, rows, 2)),
             _ => registry.last_client_size(),
         };
         if let Some((cols, rows)) = launch_size {
@@ -2303,8 +2300,7 @@ impl ControlServer {
             spec
         };
         if let (Some(cols), Some(rows)) = (p.initial_cols, p.initial_rows) {
-            pty.cols = cols.clamp(2, u16::MAX as i64) as u16;
-            pty.rows = rows.clamp(2, u16::MAX as i64) as u16;
+            (pty.cols, pty.rows) = diri_proto::clamp_terminal_size(cols, rows, 2);
         }
 
         if let Some(profile) = &mut account_profile {
@@ -3149,8 +3145,7 @@ impl ControlServer {
 
     fn session_resize(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::ResizeParams = decode(params)?;
-        let cols = u16::try_from(p.cols.clamp(2, u16::MAX as i64)).expect("clamped");
-        let rows = u16::try_from(p.rows.clamp(2, u16::MAX as i64)).expect("clamped");
+        let (cols, rows) = diri_proto::clamp_terminal_size(p.cols, p.rows, 2);
         let reflow = {
             let registry = self.registry.lock().map_err(poisoned)?;
             let session = registry

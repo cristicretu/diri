@@ -937,6 +937,7 @@ impl AttachHub {
             let Some((cols, rows)) = frame.resize_payload() else {
                 return true;
             };
+            let (cols, rows) = diri_proto::clamp_terminal_size(i64::from(cols), i64::from(rows), 2);
             // Reflow outside the Registry lock: it can take tens of
             // milliseconds over long history, and every session's input
             // and publication needs that lock.
@@ -944,11 +945,11 @@ impl AttachHub {
                 let Ok(mut guard) = registry.lock() else {
                     return false;
                 };
-                guard.note_client_size(cols.max(2), rows.max(2));
+                guard.note_client_size(cols, rows);
                 let Some(session) = guard.get(session_id) else {
                     return true;
                 };
-                session.resize_pty(cols.max(2), rows.max(2))
+                session.resize_pty(cols, rows)
             };
             if let Ok(Some(reflow)) = reflow {
                 // DECSET 2048 programs read their new size in-band.
