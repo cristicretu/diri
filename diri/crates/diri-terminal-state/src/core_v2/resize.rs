@@ -148,7 +148,7 @@ pub(super) fn store(pages: &mut Pages, p: usize, r: usize, x: usize, cell: &Grid
         underline: cell.underline_color(),
         flags: flags.bits() & STYLE_FLAGS,
     };
-    let id = page.styles.intern(&style);
+    let id = page.intern_style(&style);
     let mut bits = (cell.c as u64 & CP) | (id as u64) << STYLE_SHIFT;
     for (flag, bit) in [
         (Flags::WIDE_CHAR, WIDE),
@@ -192,12 +192,13 @@ fn store_row(pages: &mut Pages, line: usize, cells: &[GridCell]) {
         .rposition(|cell| *cell != default)
         .map_or(0, |i| i + 1);
     let page = pages.page_mut(p);
+    let fill = page.intern_style(&Style::default());
     let meta = &mut page.meta[r];
     meta.occ = 0;
     meta.lead = 0;
     meta.wrapped = false;
     meta.dirty = true;
-    meta.fill = page.styles.intern(&Style::default());
+    meta.fill = fill;
     page.text.reset(r);
     for (x, cell) in cells[..end].iter().enumerate() {
         store(pages, p, r, x, cell);

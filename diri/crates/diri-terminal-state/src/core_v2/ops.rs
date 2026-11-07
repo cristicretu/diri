@@ -143,7 +143,7 @@ impl Core {
         let erased = self.pen.erased();
         let cols = self.cols;
         let page = self.pages.page_mut(p);
-        let id = page.styles.intern(&erased);
+        let id = page.intern_style(&erased);
         let meta = &mut page.meta[r];
         if right == cols && (left == 0 || meta.fill == id) {
             if left == 0 {
@@ -245,7 +245,7 @@ impl Core {
         let (p, _) = self.pages.locate(line);
         let bg = if blank {
             let erased = self.pen.erased();
-            Some(Cell::blank(self.pages.page_mut(p).styles.intern(&erased)))
+            Some(Cell::blank(self.pages.page_mut(p).intern_style(&erased)))
         } else {
             None
         };
@@ -273,7 +273,7 @@ impl Core {
         let end = (start + count).min(cols - 1);
         let (p, _) = self.pages.locate(self.line);
         let erased = self.pen.erased();
-        let bg = Cell::blank(self.pages.page_mut(p).styles.intern(&erased));
+        let bg = Cell::blank(self.pages.page_mut(p).intern_style(&erased));
         self.with_row_cells(self.line, |row| {
             for offset in 0..cols - end {
                 row.swap(start + offset, end + offset);
@@ -314,11 +314,13 @@ impl Core {
             }
         }
         let target = self.pages.page_mut(dp);
+        // The ids are written only after all are interned.
+        target.reserve_styles(styles.len() + 1);
         let ids: HashMap<u16, u16> = styles
             .into_iter()
-            .map(|(id, style)| (id, target.styles.intern(&style)))
+            .map(|(id, style)| (id, target.intern_style(&style)))
             .collect();
-        let fill = target.styles.intern(&fill);
+        let fill = target.intern_style(&fill);
         for (x, cell) in cells.iter().enumerate() {
             let bits = cell.0 & !(STYLE | CLUSTER | GRAPHEME | HYPERLINK);
             target.cells[dr * cols + x] = Cell(bits | (ids[&cell.style()] as u64) << STYLE_SHIFT);
