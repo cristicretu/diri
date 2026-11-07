@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -17,11 +19,17 @@ pub struct CodexAppServer {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
+    /// Set once the pipe can no longer carry requests (closed, a failed
+    /// write, an unparseable line); the manager then spawns a replacement.
+    broken: bool,
+    /// `account/login/completed` notifications seen while reading replies,
+    /// by login id: `Err` carries the provider's error.
+    login_results: HashMap<String, Result<(), String>>,
 }
 
 impl CodexAppServer {
-    pub async fn spawn(config_home: &Path) -> NodeResult<Self> {
-        let mut child = Command::new("codex")
+    pub async fn spawn(program: &OsStr, config_home: &Path) -> NodeResult<Self> {
+        let mut child = Command::new(program)
             .args(["app-server", "--stdio"])
             .env("CODEX_HOME", config_home)
             .stdin(Stdio::piped())
@@ -43,6 +51,8 @@ impl CodexAppServer {
             stdin,
             stdout: BufReader::new(stdout),
             next_id: 0,
+            broken: false,
+            login_results: HashMap::new(),
         };
         server
             .request(
@@ -88,6 +98,42 @@ impl CodexAppServer {
         self.request(method, params).await
     }
 
+    /// Whether this app-server can still answer: not exited and its pipe
+    /// intact.
+    pub fn is_alive(&mut self) -> bool {
+        !self.broken && matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// The outcome Codex reported for `login_id`, if it has finished.
+    pub fn take_login_result(&mut self, login_id: &str) -> Option<Result<(), String>> {
+        self.login_results.remove(login_id)
+    }
+
+    #[cfg(test)]
+    pub fn kill_for_test(&mut self) {
+        let _ = self.child.start_kill();
+    }
+
+    fn note_notification(&mut self, value: &Value) {
+        if value.get("method").and_then(Value::as_str) != Some("account/login/completed") {
+            return;
+        }
+        let params = value.get("params").unwrap_or(&Value::Null);
+        let Some(login_id) = params.get("loginId").and_then(Value::as_str) else {
+            return;
+        };
+        let result = if params.get("success").and_then(Value::as_bool) == Some(true) {
+            Ok(())
+        } else {
+            Err(params
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("Codex login failed")
+                .to_owned())
+        };
+        self.login_results.insert(login_id.to_owned(), result);
+    }
+
     async fn notify(&mut self, method: &str, params: Value) -> NodeResult<()> {
         let message = if params.is_null() {
             json!({"method": method})
@@ -98,6 +144,14 @@ impl CodexAppServer {
     }
 
     async fn request(&mut self, method: &str, params: Value) -> NodeResult<Value> {
+        let result = self.exchange(method, params).await;
+        if matches!(result, Err(NodeError::Io(_) | NodeError::Json(_))) {
+            self.broken = true;
+        }
+        result
+    }
+
+    async fn exchange(&mut self, method: &str, params: Value) -> NodeResult<Value> {
         if let Some(status) = self.child.try_wait()? {
             return Err(NodeError::Provider(format!(
                 "Codex app-server exited with {status}"
@@ -110,16 +164,26 @@ impl CodexAppServer {
 
         let response = async {
             loop {
-                let Some(line) = read_bounded_provider_line(&mut self.stdout).await? else {
+                let line = match read_bounded_provider_line(&mut self.stdout).await {
+                    Ok(line) => line,
+                    Err(error) => {
+                        // A partly read line leaves the stream unframed.
+                        self.broken = true;
+                        return Err(error);
+                    }
+                };
+                let Some(line) = line else {
+                    self.broken = true;
                     return Err(NodeError::Provider(
                         "Codex app-server closed its output".into(),
                     ));
                 };
                 let value: Value = serde_json::from_slice(&line)?;
                 if value.get("id").and_then(Value::as_u64) != Some(id) {
-                    // Notifications are deliberately consumed here. The node
+                    // Notifications are otherwise consumed here. The node
                     // records authoritative usage separately and clients ask
                     // for snapshots, so provider event shape stays private.
+                    self.note_notification(&value);
                     continue;
                 }
                 if let Some(error) = value.get("error") {

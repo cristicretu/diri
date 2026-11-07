@@ -231,6 +231,40 @@ pub struct LoginChallenge {
     pub error: Option<String>,
 }
 
+/// Where a login stands. On the wire this is still `complete`, `success` and
+/// `error`; [`LoginChallenge::outcome`] and [`LoginChallenge::set_outcome`]
+/// are the only way the node reads or writes them, so the three never
+/// disagree (a failure always carries its error, a pending login none).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LoginOutcome {
+    Pending,
+    Succeeded,
+    Failed(String),
+}
+
+impl LoginChallenge {
+    #[must_use]
+    pub fn outcome(&self) -> LoginOutcome {
+        match (self.complete, self.success) {
+            (false, _) => LoginOutcome::Pending,
+            (true, true) => LoginOutcome::Succeeded,
+            (true, false) => LoginOutcome::Failed(
+                self.error
+                    .clone()
+                    .unwrap_or_else(|| "login failed".to_owned()),
+            ),
+        }
+    }
+
+    pub fn set_outcome(&mut self, outcome: LoginOutcome) {
+        (self.complete, self.success, self.error) = match outcome {
+            LoginOutcome::Pending => (false, false, None),
+            LoginOutcome::Succeeded => (true, true, None),
+            LoginOutcome::Failed(error) => (true, false, Some(error)),
+        };
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginSessionParams {

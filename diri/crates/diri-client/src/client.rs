@@ -11,7 +11,7 @@ use diri_proto::model::{Project, SessionId, SessionRecord, WorktreeInfo};
 use diri_proto::paths::DirijorPaths;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::connection::ActiveConnection;
@@ -111,6 +111,11 @@ pub(crate) struct ClientCore {
     state_tx: watch::Sender<ConnectionState>,
     event_tx: broadcast::Sender<EventEnvelope>,
     want_events: AtomicBool,
+    /// Wakes the connection lifecycle to subscribe once `want_events` is
+    /// set. The lifecycle is the only place a connected client subscribes,
+    /// so interest registered at any moment is never lost: a stored permit
+    /// survives until the lifecycle next waits.
+    events_wanted: Notify,
     event_cursor: StdMutex<EventCursor>,
     event_subscription: Mutex<()>,
     identity_failure_tx: watch::Sender<u64>,
@@ -299,6 +304,17 @@ impl ClientCore {
         Ok(hello)
     }
 
+    fn want_events(&self) {
+        self.want_events.store(true, Ordering::Release);
+        self.events_wanted.notify_one();
+    }
+
+    /// Interest is registered but this connection is not subscribed.
+    fn events_unsubscribed(&self) -> bool {
+        self.want_events.load(Ordering::Acquire)
+            && !self.event_cursor.lock().expect("event cursor").subscribed
+    }
+
     async fn subscribe_to_events(&self) -> Result<EventsSubscribeResult, ClientError> {
         // All callers wait for the actual acknowledgement. An old request
         // cannot reset the subscription state of its replacement connection.
@@ -437,6 +453,7 @@ impl DaemonClient {
                 state_tx,
                 event_tx,
                 want_events: AtomicBool::new(false),
+                events_wanted: Notify::new(),
                 event_cursor: StdMutex::new(EventCursor::default()),
                 event_subscription: Mutex::new(()),
                 identity_failure_tx,
@@ -513,23 +530,12 @@ impl DaemonClient {
         self.core.retry_tx.send_replace(next);
     }
 
+    /// Registers interest in Engine events. The connection lifecycle
+    /// subscribes: on this connection if one is up, else on the next one,
+    /// and again after any failed attempt. Safe off any runtime.
     pub fn events(&self) -> broadcast::Receiver<EventEnvelope> {
-        self.core.want_events.store(true, Ordering::Release);
         let receiver = self.core.event_tx.subscribe();
-        if self.core.state_tx.borrow().is_connected() {
-            // Connected implies `connect` stored its runtime. Without one, the
-            // lifecycle subscribes on its next connection because
-            // `want_events` is set.
-            let runtime = tokio::runtime::Handle::try_current()
-                .ok()
-                .or_else(|| self.runtime.lock().expect("runtime mutex poisoned").clone());
-            if let Some(runtime) = runtime {
-                let core = Arc::clone(&self.core);
-                runtime.spawn(async move {
-                    let _ = core.subscribe_to_events().await;
-                });
-            }
-        }
+        self.core.want_events();
         receiver
     }
 
@@ -537,8 +543,8 @@ impl DaemonClient {
     pub async fn subscribe_events(
         &self,
     ) -> Result<broadcast::Receiver<EventEnvelope>, ClientError> {
-        self.core.want_events.store(true, Ordering::Release);
         let receiver = self.core.event_tx.subscribe();
+        self.core.want_events();
         if self.core.state_tx.borrow().is_connected() {
             self.core.subscribe_to_events().await?;
         }
@@ -1615,26 +1621,35 @@ async fn run_once(
         };
     }
 
-    if core.want_events.load(Ordering::Acquire) {
-        let subscribed = tokio::select! {
-            result = core.subscribe_to_events() => result.map(|_| ()),
-            error = connection.closed() => Err(error),
-            _ = identity_failures.changed() => Err(ClientError::protocol("Engine identity rejected")),
-            _ = shutdown.changed() => Err(ClientError::disconnected("client shut down")),
-        };
-        if let Err(error) = subscribed {
-            return AttemptOutcome {
-                error,
-                established: true,
-            };
-        }
-    }
-    recorder.connected(&hello);
-    core.set_state(ConnectionState::Connected(hello));
-
+    let mut connected = Some(hello);
     loop {
+        // Interest registered before this connection subscribes before it
+        // reports Connected; interest registered later (even while the line
+        // above was running) wakes `events_wanted` and is subscribed here.
+        // A failed subscription drops the connection, and the reconnect
+        // subscribes again.
+        if core.events_unsubscribed() {
+            let subscribed = tokio::select! {
+                result = core.subscribe_to_events() => result.map(|_| ()),
+                error = connection.closed() => Err(error),
+                _ = identity_failures.changed() => Err(ClientError::protocol("Engine identity rejected")),
+                _ = shutdown.changed() => Err(ClientError::disconnected("client shut down")),
+            };
+            if let Err(error) = subscribed {
+                return AttemptOutcome {
+                    error,
+                    established: true,
+                };
+            }
+        }
+        if let Some(hello) = connected.take() {
+            recorder.connected(&hello);
+            core.set_state(ConnectionState::Connected(hello));
+            continue;
+        }
         tokio::select! {
             () = tokio::time::sleep(HEARTBEAT_INTERVAL) => {}
+            () = core.events_wanted.notified() => continue,
             error = connection.closed() => {
                 return AttemptOutcome { error, established: true };
             }
@@ -1712,6 +1727,8 @@ mod tests {
     struct FakeEngine {
         socket: PathBuf,
         instance: Arc<StdMutex<Option<String>>>,
+        /// Subscriptions still to refuse (recorded, answered with an error).
+        refusals: Arc<AtomicU64>,
         subscriptions: Mutex<mpsc::UnboundedReceiver<EventsSubscribeParams>>,
         close: mpsc::UnboundedSender<()>,
         _temp: tempfile::TempDir,
@@ -1728,6 +1745,8 @@ mod tests {
             let (subscription_tx, subscription_rx) = mpsc::unbounded_channel();
             let (close_tx, mut close_rx) = mpsc::unbounded_channel::<()>();
             let identity = Arc::clone(&instance);
+            let refusals = Arc::new(AtomicU64::new(0));
+            let refuse = Arc::clone(&refusals);
             let server = tokio::spawn(async move {
                 loop {
                     let Ok((stream, _)) = listener.accept().await else {
@@ -1769,6 +1788,26 @@ mod tests {
                                     serde_json::from_value(params.expect("params"))
                                         .expect("params");
                                 let _ = subscription_tx.send(params);
+                                if refuse
+                                    .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                                        left.checked_sub(1)
+                                    })
+                                    .is_ok()
+                                {
+                                    out.push(ControlMessage::Response {
+                                        id,
+                                        result: Err(ControlError::bad_request("busy")),
+                                    });
+                                    for message in out {
+                                        let bytes = encode_line(&message).expect("encode");
+                                        let _ = tokio::io::AsyncWriteExt::write_all(
+                                            &mut write_half,
+                                            &bytes,
+                                        )
+                                        .await;
+                                    }
+                                    continue;
+                                }
                                 out.push(ControlMessage::Response {
                                     id,
                                     result: Ok(serde_json::json!({ "subscribed": true })),
@@ -1801,6 +1840,7 @@ mod tests {
             Self {
                 socket,
                 instance,
+                refusals,
                 subscriptions: Mutex::new(subscription_rx),
                 close: close_tx,
                 _temp: temp,
@@ -1871,6 +1911,45 @@ mod tests {
             .wait_until_connected(Duration::from_secs(5))
             .await
             .expect("reconnected");
+    }
+
+    /// Interest registered on a connected client used to spawn one
+    /// subscription and drop its error; a refused subscription left the
+    /// client connected and silent forever. The lifecycle now retries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_subscription_is_retried() {
+        let engine = FakeEngine::start(Some("engine-a"), 2);
+        engine.refusals.store(1, Ordering::Release);
+        let client = DaemonClient::with_socket_path(&engine.socket);
+        client.connect();
+        client
+            .wait_until_connected(Duration::from_secs(5))
+            .await
+            .expect("connected");
+
+        let mut events = client.events();
+        engine.next_subscription().await;
+        engine.next_subscription().await;
+        drain_events(&mut events, 2).await;
+        client.shutdown().await;
+    }
+
+    /// Interest registered while a connection is between its subscription
+    /// check and reporting Connected is still subscribed on that connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interest_registered_during_connect_is_never_missed() {
+        for _ in 0..50 {
+            let engine = FakeEngine::start(Some("engine-a"), 1);
+            let client = Arc::new(DaemonClient::with_socket_path(&engine.socket));
+            client.connect();
+            let racer = Arc::clone(&client);
+            let mut events = tokio::task::spawn_blocking(move || racer.events())
+                .await
+                .expect("events");
+            engine.next_subscription().await;
+            drain_events(&mut events, 1).await;
+            client.shutdown().await;
+        }
     }
 
     /// A Dock reopen builds views on the main thread, outside any runtime.

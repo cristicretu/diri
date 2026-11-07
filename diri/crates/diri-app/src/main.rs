@@ -173,6 +173,19 @@ pub mod store;
 const MIN_WINDOW_WIDTH: f32 = 900.0;
 const MIN_WINDOW_HEIGHT: f32 = 560.0;
 const USAGE_REFRESH_DEBOUNCE: Duration = Duration::from_secs(2);
+/// A transcript written to without pause (a long streaming turn) would push
+/// the debounce forever; the refresh runs at most this long after the
+/// first invalidation it covers.
+const USAGE_REFRESH_MAX_WAIT: Duration = Duration::from_secs(10);
+
+/// When the debounced usage refresh runs: a quiet period after the latest
+/// invalidation, but never later than the max wait after the first.
+fn usage_refresh_due(
+    now: tokio::time::Instant,
+    pending_since: tokio::time::Instant,
+) -> tokio::time::Instant {
+    (now + USAGE_REFRESH_DEBOUNCE).min(pending_since + USAGE_REFRESH_MAX_WAIT)
+}
 const USAGE_RECONCILE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 /// Install native application menus without exposing actions that the current
@@ -775,6 +788,7 @@ async fn run_usage_updates(
     let mut invalidated = HashSet::<PathBuf>::new();
     let mut reconcile = false;
     let mut refresh_due: Option<tokio::time::Instant> = None;
+    let mut pending_since: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {
             _ = cursor_interval.tick() => {
@@ -802,7 +816,8 @@ async fn run_usage_updates(
                         reconcile = true;
                     }
                 }
-                refresh_due = Some(tokio::time::Instant::now() + USAGE_REFRESH_DEBOUNCE);
+                let now = tokio::time::Instant::now();
+                refresh_due = Some(usage_refresh_due(now, *pending_since.get_or_insert(now)));
             }
             _ = async {
                 if let Some(deadline) = refresh_due {
@@ -812,6 +827,7 @@ async fn run_usage_updates(
                 }
             } => {
                 refresh_due = None;
+                pending_since = None;
                 let paths = (!reconcile).then(|| invalidated.drain().collect::<Vec<_>>());
                 invalidated.clear();
                 reconcile = false;
@@ -835,6 +851,7 @@ async fn run_usage_updates(
                 invalidated.clear();
                 reconcile = false;
                 refresh_due = None;
+                pending_since = None;
             }
         }
     }
@@ -1188,6 +1205,26 @@ fn load_system_fonts(cx: &mut App) {
 #[cfg(test)]
 mod usage_refresh_tests {
     use super::*;
+
+    #[test]
+    fn a_steady_stream_of_invalidations_cannot_postpone_the_refresh_forever() {
+        let start = tokio::time::Instant::now();
+        let mut due = start;
+        // An invalidation every second for a minute.
+        for second in 0..60 {
+            let now = start + Duration::from_secs(second);
+            if now >= due && second > 0 {
+                break;
+            }
+            due = usage_refresh_due(now, start);
+        }
+        assert!(due <= start + USAGE_REFRESH_MAX_WAIT);
+        assert_eq!(
+            usage_refresh_due(start, start),
+            start + USAGE_REFRESH_DEBOUNCE,
+            "a single invalidation still waits only the quiet period"
+        );
+    }
 
     #[tokio::test]
     async fn cursor_regression_slow_fetch_does_not_block_local_updates() {

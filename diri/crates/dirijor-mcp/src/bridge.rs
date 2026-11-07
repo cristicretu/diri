@@ -448,7 +448,7 @@ impl Bridge {
 
     fn wait_for_agent(&self, arguments: &Value) -> Result<Value, String> {
         let id = required_string(arguments, "session_id")?;
-        let until = optional_string(arguments, "until").unwrap_or_else(|| "done".into());
+        let until = WaitUntil::parse(arguments, WaitUntil::Done)?;
         let timeout =
             Duration::from_secs_f64(optional_number(arguments, "timeout_s").unwrap_or(600.0));
         let since = optional_number(arguments, "since_ms");
@@ -472,16 +472,10 @@ impl Bridge {
             }
             Ok(record)
         };
-        let matches = |record: &SessionRecord| match until.as_str() {
-            "done" | "idle" => turn_done_since(record, since, saw_working.get()),
-            "needs_me" => matches!(record.status, SessionStatus::NeedsInput(_)),
-            "exited" => matches!(record.status, SessionStatus::Exited(_)),
-            _ => false, // validated before dispatch
-        };
         let terminal = |record: &Option<SessionRecord>| {
-            record.as_ref().is_none_or(|record| {
-                matches(record) || matches!(record.status, SessionStatus::Exited(_))
-            })
+            record
+                .as_ref()
+                .is_none_or(|record| until.reached(record, since, saw_working.get()))
         };
         let mut latest = refresh().map_err(render_failure)?;
         if latest.is_none() {
@@ -512,7 +506,12 @@ impl Bridge {
         Ok(json!({
             "session":latest,
             "timedOut":!terminal(&latest),
-            "matched":latest.as_ref().is_some_and(matches),
+            // An exit ends every wait but only matches `until: exited`.
+            "matched":latest.as_ref().is_some_and(|record| {
+                until.reached(record, since, saw_working.get())
+                    && (until == WaitUntil::Exited
+                        || !matches!(record.status, SessionStatus::Exited(_)))
+            }),
             "removed":latest.is_none(),
         }))
     }
@@ -856,7 +855,7 @@ impl Bridge {
             }));
         }
         let wanted: HashSet<String> = targets.iter().map(|record| record.id.0.clone()).collect();
-        let mode = optional_string(arguments, "until").unwrap_or_else(|| "settled".into());
+        let mode = WaitUntil::parse(arguments, WaitUntil::Settled)?;
         let since = optional_number(arguments, "since_ms");
         let worked = std::cell::RefCell::new(HashSet::<String>::new());
         let reassess = || -> Result<(Vec<SessionRecord>, bool), ControlFailure> {
@@ -873,7 +872,7 @@ impl Bridge {
             }
             let settled = latest
                 .iter()
-                .all(|record| reached_since(&mode, record, since, worked.contains(&record.id.0)));
+                .all(|record| mode.reached(record, since, worked.contains(&record.id.0)));
             Ok((latest, settled))
         };
         let (mut latest, mut settled) = reassess().map_err(render_failure)?;
@@ -901,7 +900,7 @@ impl Bridge {
             "settled": settled,
             "timed_out": !settled,
             "children": latest.iter().map(|record| detailed(record, Relation::Child)).collect::<Vec<_>>(),
-            "waited_for": mode,
+            "waited_for": mode.label(),
             "removed": wanted.iter().filter(|id| !latest.iter().any(|record| record.id.0 == **id)).collect::<Vec<_>>(),
         }))
     }
@@ -1239,7 +1238,10 @@ fn resolve_agent_kind(readiness: &AgentReadinessResult, requested: &str) -> Agen
         .unwrap_or_else(|| AgentKind::generic(requested))
 }
 
-fn status_label(status: &SessionStatus) -> &'static str {
+/// The wire label of a session status, shared by the MCP tools and the
+/// `dirijor` CLI.
+#[must_use]
+pub fn status_label(status: &SessionStatus) -> &'static str {
     match status {
         SessionStatus::Starting => "starting",
         SessionStatus::Idle => "idle",
@@ -1492,24 +1494,56 @@ fn turn_done_since(record: &SessionRecord, since: Option<f64>, saw_working: bool
         })
 }
 
-fn reached_since(mode: &str, record: &SessionRecord, since: Option<f64>, worked: bool) -> bool {
-    match (mode, &record.status) {
-        (_, SessionStatus::Exited(_)) => true,
-        ("exited", _) => false,
-        (_, SessionStatus::Idle) => turn_done_since(record, since, worked),
-        ("done", _) => false,
-        (_, status) => reached(mode, status),
-    }
+/// What a session wait returns on, parsed once from the `until` argument.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WaitUntil {
+    /// A finished turn, a request for input, or an exit.
+    Settled,
+    /// A finished turn (or an exit). Accepts `idle` as an alias.
+    Done,
+    /// A request for input (or an exit).
+    NeedsMe,
+    /// An exit only.
+    Exited,
 }
 
-fn reached(mode: &str, status: &SessionStatus) -> bool {
-    match mode {
-        "exited" => matches!(status, SessionStatus::Exited(_)),
-        "done" => matches!(status, SessionStatus::Idle | SessionStatus::Exited(_)),
-        _ => matches!(
-            status,
-            SessionStatus::Idle | SessionStatus::NeedsInput(_) | SessionStatus::Exited(_)
-        ),
+impl WaitUntil {
+    fn parse(arguments: &Value, default: Self) -> Result<Self, String> {
+        let Some(until) = optional_string(arguments, "until") else {
+            return Ok(default);
+        };
+        match until.as_str() {
+            "settled" => Ok(Self::Settled),
+            "done" | "idle" => Ok(Self::Done),
+            "needs_me" => Ok(Self::NeedsMe),
+            "exited" => Ok(Self::Exited),
+            other => Err(format!(
+                "until must be settled, done, needs_me or exited, not `{other}`"
+            )),
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Settled => "settled",
+            Self::Done => "done",
+            Self::NeedsMe => "needs_me",
+            Self::Exited => "exited",
+        }
+    }
+
+    /// Whether `record` satisfies this wait. An exit ends every wait: the
+    /// session can no longer reach anything else. `worked` is whether this
+    /// wait saw the session working (see [`turn_done_since`]).
+    fn reached(self, record: &SessionRecord, since: Option<f64>, worked: bool) -> bool {
+        match (self, &record.status) {
+            (_, SessionStatus::Exited(_)) => true,
+            (Self::Settled | Self::NeedsMe, SessionStatus::NeedsInput(_)) => true,
+            (Self::Settled | Self::Done, SessionStatus::Idle) => {
+                turn_done_since(record, since, worked)
+            }
+            _ => false,
+        }
     }
 }
 
@@ -1659,16 +1693,50 @@ mod tests {
     }
 
     #[test]
-    fn settled_counts_input_and_exit_but_done_does_not_count_input() {
-        assert!(reached(
-            "settled",
-            &SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Question)
-        ));
-        assert!(!reached(
-            "done",
-            &SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Question)
-        ));
-        assert!(reached("done", &SessionStatus::Idle));
+    fn each_wait_mode_reaches_only_its_own_states() {
+        use diri_proto::NeedsInputKind;
+        let with = |status: SessionStatus| {
+            let mut record = record("child", None);
+            record.status = status;
+            record
+        };
+        let idle = with(SessionStatus::Idle);
+        let input = with(SessionStatus::NeedsInput(NeedsInputKind::Question));
+        let working = with(SessionStatus::Working);
+        let exited = with(SessionStatus::Exited(diri_proto::ExitInfo::restart(false)));
+        let reaches = |mode: WaitUntil, record: &SessionRecord| mode.reached(record, None, false);
+        assert!(reaches(WaitUntil::Settled, &idle));
+        assert!(reaches(WaitUntil::Settled, &input));
+        assert!(reaches(WaitUntil::Done, &idle));
+        assert!(!reaches(WaitUntil::Done, &input));
+        // A finished turn is not a request for input.
+        assert!(!reaches(WaitUntil::NeedsMe, &idle));
+        assert!(reaches(WaitUntil::NeedsMe, &input));
+        assert!(!reaches(WaitUntil::Exited, &idle));
+        for mode in [
+            WaitUntil::Settled,
+            WaitUntil::Done,
+            WaitUntil::NeedsMe,
+            WaitUntil::Exited,
+        ] {
+            assert!(!reaches(mode, &working), "{mode:?}");
+            assert!(reaches(mode, &exited), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn wait_modes_parse_once_with_their_accepted_spellings() {
+        let parse = |until: &str| WaitUntil::parse(&json!({"until": until}), WaitUntil::Settled);
+        assert_eq!(parse("idle"), Ok(WaitUntil::Done));
+        assert_eq!(parse("done"), Ok(WaitUntil::Done));
+        assert_eq!(parse("needs_me"), Ok(WaitUntil::NeedsMe));
+        assert_eq!(parse("exited"), Ok(WaitUntil::Exited));
+        assert_eq!(parse("settled"), Ok(WaitUntil::Settled));
+        assert!(parse("soon").is_err());
+        assert_eq!(
+            WaitUntil::parse(&json!({}), WaitUntil::Done),
+            Ok(WaitUntil::Done)
+        );
     }
 
     #[test]

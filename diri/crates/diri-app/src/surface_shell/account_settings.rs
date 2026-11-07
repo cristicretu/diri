@@ -864,7 +864,7 @@ impl UtilitySurfaces {
         self.accounts.renaming = Some((profile.id.clone(), text_editor(&profile.label)));
         self.accounts.editor = None;
         self.accounts.error = None;
-        self.settings_search_active = false;
+        self.active_field.release(SettingsField::Search);
         self.focus.focus(window, cx);
         cx.notify();
     }
@@ -933,7 +933,7 @@ impl UtilitySurfaces {
             path_active: false,
         });
         self.accounts.error = None;
-        self.settings_search_active = false;
+        self.active_field.release(SettingsField::Search);
         self.focus.focus(window, cx);
         cx.notify();
     }
@@ -974,7 +974,7 @@ impl UtilitySurfaces {
     ) -> bool {
         if self.surface != Surface::Settings
             || self.settings_tab != SettingsTab::Accounts
-            || self.settings_search_active
+            || self.active_field.is(SettingsField::Search)
         {
             return false;
         }

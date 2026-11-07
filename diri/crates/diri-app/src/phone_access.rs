@@ -123,6 +123,52 @@ impl Drop for PhoneAccess {
     }
 }
 
+/// Ownership of the one in-flight [`PhoneAccess::start`]. Every Enable or
+/// restart takes a fresh ticket and every stop (Turn off, the identity toggle,
+/// a pairing-code restart) revokes it, so a start that finishes after its
+/// rule changed is recognised as stale and its gateway dropped (which turns
+/// it off) instead of being installed with the old admission rule.
+#[derive(Debug, Default)]
+pub struct PhoneStartSlot {
+    next: u64,
+    pending: Option<u64>,
+}
+
+/// One start's claim on the [`PhoneStartSlot`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub struct PhoneStartTicket(u64);
+
+impl PhoneStartSlot {
+    /// Claims the slot for a new start, revoking any earlier one.
+    pub fn begin(&mut self) -> PhoneStartTicket {
+        self.next += 1;
+        self.pending = Some(self.next);
+        PhoneStartTicket(self.next)
+    }
+
+    /// Revokes the in-flight start, if any. Returns whether one was pending.
+    pub fn cancel(&mut self) -> bool {
+        self.pending.take().is_some()
+    }
+
+    #[cfg(test)]
+    pub fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Settles `ticket`; `true` only when it still owns the slot, i.e. its
+    /// result may be installed. A stale result must be dropped.
+    pub fn finish(&mut self, ticket: PhoneStartTicket) -> bool {
+        if self.pending == Some(ticket.0) {
+            self.pending = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 async fn tailscale_address() -> Result<Ipv4Addr, String> {
     match check_tailscale().await {
         TailscaleSetup::Ready(address) => Ok(address),
@@ -219,6 +265,30 @@ fn address_from_status(status: &serde_json::Value) -> Option<Ipv4Addr> {
 
 #[cfg(test)]
 mod tests {
+    use super::PhoneStartSlot;
+
+    #[test]
+    fn a_start_revoked_while_in_flight_is_stale() {
+        let mut slot = PhoneStartSlot::default();
+        let first = slot.begin();
+        assert!(slot.cancel(), "identity toggle revokes the pending start");
+        assert!(
+            !slot.finish(first),
+            "the old rule's gateway must not install"
+        );
+        assert!(!slot.is_pending());
+    }
+
+    #[test]
+    fn only_the_latest_start_may_install() {
+        let mut slot = PhoneStartSlot::default();
+        let first = slot.begin();
+        let second = slot.begin();
+        assert!(!slot.finish(first));
+        assert!(slot.finish(second));
+        assert!(!slot.finish(second), "a ticket settles once");
+    }
+
     use super::*;
     #[test]
     fn setup_distinguishes_actionable_states_without_exposing_status_data() {

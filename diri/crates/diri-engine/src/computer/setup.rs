@@ -80,6 +80,23 @@ impl Default for Download {
     }
 }
 
+/// Ends `installing` however the download thread leaves. A download that
+/// panicked left it set, and Settings showed "installing" (and refused a
+/// retry) until the Engine restarted.
+struct InstallRunning<'a>(&'a ComputerUse);
+
+impl Drop for InstallRunning<'_> {
+    fn drop(&mut self) {
+        let mut setup = self.0.setup_state();
+        if setup.installing {
+            setup.installing = false;
+            setup
+                .error
+                .get_or_insert_with(|| "The download stopped unexpectedly.".into());
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct SetupState {
     installing: bool,
@@ -168,6 +185,7 @@ impl ComputerUse {
                     return;
                 };
                 let computer = ComputerUse { shared };
+                let _running = InstallRunning(&computer);
                 let mut log = String::new();
                 let outcome = computer.download(&mut log);
                 if outcome.is_ok() {

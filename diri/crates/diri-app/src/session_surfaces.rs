@@ -306,9 +306,7 @@ impl Render for SessionSurfaces {
         self.settle_zoom_images(overview_visible, window);
         if !overview_visible && !self.zoom.zoom.is_active() {
             // Previews refresh on every open; drop them once nothing shows them.
-            self.screen_requests.clear();
-            self.screens.clear();
-            self.screen_grids.clear();
+            self.forget_screens();
             self.zoom.forget_cards();
         }
         if overview_visible && !self.overview_was_visible {
@@ -770,8 +768,7 @@ impl SessionSurfaces {
                         .hover(|s| s.bg(colors.primary.alpha(0.07)))
                         .child("Refresh")
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.screen_requests.clear();
-                            this.screens.clear();
+                            this.forget_screens();
                             cx.notify();
                         })),
                 )
@@ -1638,6 +1635,13 @@ impl SessionSurfaces {
 
     /// Screens are fetched while the grid is up, and from the first touch of
     /// a pinch so the page's card is ready before it is visible.
+    /// Drops every preview, its grid and any request for one, together.
+    fn forget_screens(&mut self) {
+        self.screen_requests.clear();
+        self.screens.clear();
+        self.screen_grids.clear();
+    }
+
     fn overview_wants_screens(&self) -> bool {
         self.store.read().unwrap().overview_state().is_visible() || self.zoom.zoom.is_active()
     }
@@ -1721,9 +1725,12 @@ impl SessionSurfaces {
             let _ = this.update(cx, |this, cx| {
                 this.screen_requests.remove(&task_id);
                 if this.overview_wants_screens() {
-                    if let Some(grid) = grid {
-                        this.screen_grids.insert(task_id.clone(), grid);
-                    }
+                    // A preview and its grid are replaced together, so a
+                    // text-only answer never sits under an older grid.
+                    match grid {
+                        Some(grid) => this.screen_grids.insert(task_id.clone(), grid),
+                        None => this.screen_grids.remove(&task_id),
+                    };
                     this.screens.insert(task_id, preview);
                 }
                 cx.notify();
