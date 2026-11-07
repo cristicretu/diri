@@ -125,7 +125,7 @@ impl Api {
     }
 
     async fn health(&self) -> Response {
-        let state = format!("{:?}", *self.client.connection_state().borrow());
+        let state = self.client.connection_state().borrow().label();
         Response::json(&json!({
             "ok": true,
             "host": self.host_label,
