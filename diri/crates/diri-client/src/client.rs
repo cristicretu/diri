@@ -1781,7 +1781,7 @@ mod tests {
                                         .expect("params");
                                 let _ = subscription_tx.send(params);
                                 if refuse
-                                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                                    .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
                                         left.checked_sub(1)
                                     })
                                     .is_ok()
