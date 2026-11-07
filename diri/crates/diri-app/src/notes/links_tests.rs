@@ -147,8 +147,9 @@ fn the_graph_shows_the_neighbourhood_or_every_note_and_settles(cx: &mut gpui::Te
 }
 
 /// Renders a note's links offscreen (no window on screen):
-/// `DIRI_VISUAL_OUTPUT=<png>`, `DIRI_VISUAL_NOTE_LINKS=backlinks|graph|all|menu|slash|find`
-/// (`DIRI_VISUAL_NOTE_FIND=<query>` sets what `find` searches for),
+/// `DIRI_VISUAL_OUTPUT=<png>`, `DIRI_VISUAL_NOTE_LINKS=backlinks|graph|all|menu|slash|find|diagram`
+/// (`DIRI_VISUAL_NOTE_FIND=<query>` sets what `find` searches for; `diagram`
+/// puts the caret in the note's first Mermaid block, showing its source),
 /// `DIRI_VISUAL_DARK=1` for the dark palette.
 #[cfg(target_os = "macos")]
 #[test]
@@ -266,6 +267,11 @@ fn render_note_links_screenshot() {
                         editor.update(cx, |view, cx| {
                             view.open_menu_for_screenshot(scene == "slash", window, cx)
                         });
+                    }
+                }
+                "diagram" => {
+                    if let Some(editor) = pane.editor_for_test() {
+                        editor.update(cx, |view, cx| view.edit_diagram_for_screenshot(window, cx));
                     }
                 }
                 "find" => {

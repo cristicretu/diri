@@ -45,6 +45,9 @@ use block_handle::{BLOCK_MENU, BlockDrag, BlockMenu};
 #[path = "find_bar.rs"]
 mod find_bar;
 use find_bar::{FIND_EDITOR_CONTEXT, FindBar};
+#[path = "diagram.rs"]
+mod diagram;
+use diagram::{Diagrams, Drawing, Look};
 
 pub(crate) const EDITOR_CONTEXT: &str = "DiriNoteEditor";
 /// The editor's context while the ⌘K link panel owns the keyboard: none of
@@ -449,6 +452,14 @@ const SLASH_ITEMS: &[SlashItem] = &[
         keywords: "code snippet monospace",
     },
     SlashItem {
+        label: "Diagram",
+        icon: "network",
+        keys: None,
+        action: SlashAction::Turn(Turn::Diagram),
+        group: 2,
+        keywords: "diagram mermaid flowchart chart graph sequence pie gantt mindmap",
+    },
+    SlashItem {
         label: "Callout",
         icon: "info.circle",
         keys: None,
@@ -513,6 +524,7 @@ pub(super) fn block_label(label: &'static str) -> &'static str {
         "Numbered list" => "notes.block.numbered_list",
         "Quote" => "notes.block.quote",
         "Code" => "notes.block.code",
+        "Diagram" => "notes.block.diagram",
         "Callout" => "notes.block.callout",
         "Divider" => "notes.block.divider",
         "Table" => "notes.block.table",
@@ -604,6 +616,8 @@ pub(crate) struct NoteEditorView {
     /// final size before it loads.
     image_sizes:
         std::cell::RefCell<std::collections::HashMap<std::path::PathBuf, Option<(u32, u32)>>>,
+    /// Each Mermaid block's drawing.
+    diagrams: Diagrams,
     /// Each block's rendered height by id, measured the last time it was on
     /// screen: what an off-screen block's spacer is sized from.
     row_heights: RowHeights,
@@ -665,6 +679,7 @@ impl NoteEditorView {
             assets: None,
             image_rects: Rc::default(),
             image_sizes: Default::default(),
+            diagrams: Diagrams::default(),
             row_heights: Rc::default(),
             caret_bounds: None,
             ticked: Vec::new(),
@@ -740,6 +755,24 @@ impl NoteEditorView {
     #[cfg(test)]
     pub(crate) fn open_table_menu_from_keys_for_test(&mut self, cx: &mut Context<Self>) {
         self.open_table_menu(None, cx);
+    }
+
+    /// Puts the caret at the end of the note's first diagram, as a click
+    /// on it would, for the screenshot fixture.
+    #[cfg(test)]
+    pub(crate) fn edit_diagram_for_screenshot(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.editor.blocks().iter().position(|b| b.is_diagram()) else {
+            return;
+        };
+        window.focus(&self.focus, cx);
+        let end = self.editor.block(index).text.len();
+        self.editor.set_caret(Pos::new(index, end));
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn diagram_drawn_for_test(&self, id: u64) -> bool {
+        self.diagrams.is_drawn(id)
     }
 
     #[cfg(test)]
@@ -2554,6 +2587,23 @@ fn look(kind: BlockKind) -> BlockLook {
     }
 }
 
+/// The space between a diagram and its card's edge.
+const DIAGRAM_PAD: f32 = 16.0;
+/// Diagrams never grow taller than this; wider ones fit the column.
+const DIAGRAM_MAX_HEIGHT: f32 = 640.0;
+/// A diagram's card while its first drawing is on its way.
+const DIAGRAM_PENDING_HEIGHT: f32 = 96.0;
+
+/// A diagram's size in the note: its natural size in points, shrunk to fit
+/// the card and the height cap, aspect kept. Never enlarged: its labels
+/// are already at reading size.
+fn diagram_fit(width: f32, height: f32) -> (f32, f32) {
+    let column = MEASURE - 2.0 * DIAGRAM_PAD - 2.0;
+    let (w, h) = (width.max(1.0), height.max(1.0));
+    let scale = (column / w).min(DIAGRAM_MAX_HEIGHT / h).min(1.0);
+    ((w * scale).max(1.0), (h * scale).max(1.0))
+}
+
 /// Pictures never grow taller than this; wider ones fit the column.
 const IMAGE_MAX_HEIGHT: f32 = 480.0;
 /// The ring around an image: padding plus border on each side.
@@ -2769,6 +2819,7 @@ impl Render for NoteEditorView {
         // and the anchor's blocks are always laid out so motion, autoscroll
         // and menus have their geometry.
         let (rendered, estimates) = self.visible_blocks(&hidden);
+        let diagram_looks = self.diagram_looks(&rendered, cx);
         let heights = Rc::clone(&self.row_heights);
         let content = {
             use std::hash::{Hash as _, Hasher as _};
@@ -2959,8 +3010,8 @@ impl Render for NoteEditorView {
                         )
                         .child(content.italic()),
                 ),
-                BlockKind::Code => row.child(
-                    div()
+                BlockKind::Code => {
+                    let code = div()
                         .flex_1()
                         .min_w_0()
                         .rounded(px(8.0))
@@ -2969,8 +3020,21 @@ impl Render for NoteEditorView {
                         .border_color(colors.primary.alpha(0.06))
                         .px(px(14.0))
                         .py(px(10.0))
-                        .child(content),
-                ),
+                        .child(content);
+                    match diagram_looks.get(&block.id) {
+                        Some(look) => {
+                            let selection = self.editor.selection;
+                            let (lo, hi) = if selection.anchor.block <= selection.head.block {
+                                (selection.anchor.block, selection.head.block)
+                            } else {
+                                (selection.head.block, selection.anchor.block)
+                            };
+                            let editing = focused && (lo..=hi).contains(&index);
+                            row.child(self.diagram_row(index, look, editing, code))
+                        }
+                        None => row.child(code),
+                    }
+                }
                 BlockKind::Divider => row.child(
                     div()
                         .relative()
@@ -3671,6 +3735,164 @@ impl NoteEditorView {
                     .child(content.opacity(0.0)),
             )
             .into_any_element()
+    }
+
+    /// What each Mermaid block laid out this frame shows, by block id.
+    /// Starts drawing, off the main thread, every source not drawn yet.
+    fn diagram_looks(
+        &mut self,
+        rendered: &[bool],
+        cx: &mut Context<Self>,
+    ) -> std::collections::HashMap<u64, Look> {
+        let dark = self.colors.appearance == diri_ui::Appearance::Dark;
+        let blocks = self.editor.blocks();
+        let live: std::collections::HashSet<u64> = blocks
+            .iter()
+            .filter(|b| b.is_diagram())
+            .map(|b| b.id)
+            .collect();
+        self.diagrams.retain(|id| live.contains(&id));
+        let mut looks = std::collections::HashMap::new();
+        let mut starts = Vec::new();
+        for (index, block) in blocks.iter().enumerate() {
+            if !block.is_diagram() || !rendered.get(index).copied().unwrap_or(false) {
+                continue;
+            }
+            let (look, start) = self.diagrams.look(block.id, &block.text, dark);
+            if let Some(key) = start {
+                starts.push((block.id, key, block.text.clone()));
+            }
+            looks.insert(block.id, look);
+        }
+        for (id, key, source) in starts {
+            cx.spawn(async move |this, cx| {
+                let drawn = cx
+                    .background_spawn(async move { diagram::draw(&source, dark) })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.diagrams.landed(id, key, drawn) {
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+        looks
+    }
+
+    /// A Mermaid block: its drawing, or while the caret is in it, its
+    /// source with the drawing below. Clicking the drawing puts the caret
+    /// in the source. Source that does not draw shows with the reason.
+    fn diagram_row(
+        &self,
+        index: usize,
+        look: &Look,
+        editing: bool,
+        code: gpui::Div,
+    ) -> gpui::AnyElement {
+        let colors = self.colors;
+        let stack = || div().flex_1().min_w_0().flex().flex_col().gap(px(8.0));
+        match look {
+            Look::Drawn(drawing) if editing => stack()
+                .child(code)
+                .child(self.diagram_card(index, Some(drawing), 1.0))
+                .into_any_element(),
+            Look::Pending if editing => stack().child(code).into_any_element(),
+            Look::Drawn(_) | Look::Pending => {
+                let drawing = match look {
+                    Look::Drawn(drawing) => Some(drawing),
+                    _ => None,
+                };
+                // The source stays laid out under the drawing, unseen, so
+                // the block keeps the text geometry the caret moves by.
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_w_0()
+                    .child(self.diagram_card(index, drawing, 1.0))
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .overflow_hidden()
+                            .opacity(0.0)
+                            .child(code),
+                    )
+                    .into_any_element()
+            }
+            Look::Failed(message, last) => {
+                let reason = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .text_size(px(12.0))
+                    .line_height(px(16.0))
+                    .text_color(colors.secondary)
+                    .child(crate::icons::sf_symbol(
+                        "exclamationmark.triangle",
+                        12.0,
+                        Ink::on_surface(Ink::ATTENTION, colors),
+                    ))
+                    .child(SharedString::from(crate::i18n::tf(
+                        "notes.diagram.error",
+                        &[("reason", message)],
+                    )));
+                let stack = stack().child(code).child(reason);
+                match last {
+                    // Mid-edit, the last good drawing stays in view, faded.
+                    Some(drawing) if editing => stack
+                        .child(self.diagram_card(index, Some(drawing), 0.45))
+                        .into_any_element(),
+                    _ => stack.into_any_element(),
+                }
+            }
+        }
+    }
+
+    /// A drawn diagram on a quiet card, centered and shrunk to the column.
+    /// Its bounds join the pictures', so a click on it lands in its block.
+    fn diagram_card(&self, index: usize, drawing: Option<&Drawing>, opacity: f32) -> gpui::Div {
+        use gpui::StyledImage as _;
+        let colors = self.colors;
+        let card = div()
+            .relative()
+            .flex()
+            .flex_row()
+            .justify_center()
+            .w_full()
+            .min_w_0()
+            .p(px(DIAGRAM_PAD))
+            .rounded(px(8.0))
+            .bg(colors.primary.alpha(0.025))
+            .border_1()
+            .border_color(colors.primary.alpha(0.06))
+            .cursor_pointer();
+        let card = match drawing {
+            Some(drawing) => {
+                let (width, height) = diagram_fit(drawing.width, drawing.height);
+                card.child(
+                    gpui::img(drawing.image.clone())
+                        .w(px(width))
+                        .max_w_full()
+                        .h(px(height))
+                        .object_fit(gpui::ObjectFit::Contain)
+                        .opacity(opacity),
+                )
+            }
+            None => card.h(px(DIAGRAM_PENDING_HEIGHT)),
+        };
+        let rects = Rc::clone(&self.image_rects);
+        let id = self.editor.block(index).id;
+        card.child(
+            canvas(
+                move |bounds, _, _| rects.borrow_mut().push((index, bounds)),
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .inset_0(),
+        )
+        .debug_selector(move || format!("note-diagram-{id}"))
     }
 
     /// Clicking a callout's glyph steps it to the next tone.

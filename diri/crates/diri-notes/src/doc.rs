@@ -211,9 +211,15 @@ pub struct Block {
     pub marks: Vec<Mark>,
     /// An image's path or URL; empty for every other kind.
     pub src: String,
+    /// A code block's info string: what follows its opening fence, such as
+    /// `mermaid` or `rust`. Empty for every other kind.
+    pub info: String,
 }
 
 pub const MAX_INDENT: u8 = 6;
+
+/// The info string that makes a code block a diagram.
+pub const DIAGRAM_LANG: &str = "mermaid";
 
 impl Block {
     pub fn new(id: BlockId, kind: BlockKind, text: impl Into<String>) -> Self {
@@ -224,12 +230,35 @@ impl Block {
             text: text.into(),
             marks: Vec::new(),
             src: String::new(),
+            info: String::new(),
         }
     }
 
     /// A table cell holding `text`.
     pub fn cell(id: BlockId, cell: Cell, text: impl Into<String>) -> Self {
         Self::new(id, BlockKind::Cell(cell), text)
+    }
+
+    /// A code block; `info` is its fence's info string (`mermaid`, `rust`).
+    pub fn code(id: BlockId, info: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            info: info.into(),
+            ..Self::new(id, BlockKind::Code, text)
+        }
+    }
+
+    /// A code block's language: the first word of its info string.
+    pub fn lang(&self) -> &str {
+        if self.kind != BlockKind::Code {
+            return "";
+        }
+        self.info.split_whitespace().next().unwrap_or("")
+    }
+
+    /// A code block fenced as `mermaid`, which the editor draws as its
+    /// diagram.
+    pub fn is_diagram(&self) -> bool {
+        self.lang().eq_ignore_ascii_case(DIAGRAM_LANG)
     }
 
     /// An image block: `src` is a path relative to the notes folder or a URL.
@@ -409,6 +438,7 @@ impl Block {
             text: tail_text,
             marks: tail_marks,
             src: String::new(),
+            info: String::new(),
         };
         tail.normalize();
         tail
@@ -441,6 +471,9 @@ impl Block {
         }
         if kind != BlockKind::Image {
             self.src.clear();
+        }
+        if kind != BlockKind::Code {
+            self.info.clear();
         }
     }
 
@@ -582,6 +615,7 @@ impl Document {
                     && a.text == b.text
                     && a.marks == b.marks
                     && a.src == b.src
+                    && a.info == b.info
             })
     }
 }

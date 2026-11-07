@@ -73,6 +73,9 @@ gpui.workspace = true
 gpui_platform.workspace = true
 image = { workspace = true, features = ["ico", "png", "webp"] }
 libc = "0.2"
+# Mermaid diagrams in notes: a pure-Rust parser/layout that emits SVG, which
+# gpui already rasterizes with resvg. No browser, Node.js or network.
+mermaid-rs-renderer = { version = "0.3.1", default-features = false }
 nucleo-matcher.workspace = true
 notify.workspace = true
 # Read-only parsers for other terminals' configs (Settings › Import). Both

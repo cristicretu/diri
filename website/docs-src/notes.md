@@ -28,6 +28,8 @@ Type <kbd>/</kbd> for the block menu or <kbd>@</kbd> to mention something. Markd
 
 The `/` menu adds **Callout**, **Table** and **Image**. Callouts are stored as GitHub alerts such as `> [!NOTE]`. Tables are GFM tables; <kbd>⌃</kbd><kbd>↵</kbd> opens the table menu for inserting rows and columns, alignment and deleting. Pasted or dropped images are saved next to the note, up to 25 MB each.
 
+**Diagram** adds a [Mermaid](https://mermaid.js.org) diagram: a code block fenced ` ```mermaid `, drawn in place as flowcharts, sequence, class, state, ER, pie, Gantt, mindmap and git graphs. Click a diagram to edit its source, with the drawing updating below it as you type. Notes written by agents or pasted from elsewhere draw their ` ```mermaid ` blocks the same way.
+
 Tick a to-do with <kbd>⌘</kbd><kbd>↵</kbd>. Move a block with <kbd>⌥</kbd><kbd>⇧</kbd><kbd>↑</kbd> / <kbd>↓</kbd>. The full list is in [Keyboard shortcuts](/docs/keyboard-shortcuts/#notes).
 
 ### Mentions and links

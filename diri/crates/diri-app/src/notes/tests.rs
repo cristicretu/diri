@@ -733,6 +733,57 @@ fn a_callout_glyph_cycles_its_tone(cx: &mut gpui::TestAppContext) {
     );
 }
 
+#[gpui::test]
+fn a_mermaid_block_draws_and_a_click_opens_its_source(cx: &mut gpui::TestAppContext) {
+    use diri_notes::edit::{DIAGRAM_STARTER, Pos};
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Arc::new(NoteStore::open(dir.path().join("notes")).expect("store"));
+    let (_, doc) =
+        markdown::parse("# Flow\n\nIntro\n\n```mermaid\nflowchart LR\n  A --> B\n```\n");
+    let (id, _) = store.create(doc, None).expect("create");
+    let (pane, cx) = pane(cx, store.clone());
+    let session = SessionId::new("s_note");
+    pane.update_in(cx, |pane, window, cx| pane.show(&session, &id, window, cx));
+    let editor = editor(&pane, cx);
+    let diagram = editor.read_with(cx, |view, _| {
+        let block = view.editor.block(2);
+        assert!(block.is_diagram());
+        block.id
+    });
+    // The drawing lands off the main thread; the next frame shows it.
+    cx.run_until_parked();
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    assert!(editor.read_with(cx, |view, _| view.diagram_drawn_for_test(diagram)));
+    let selector: &'static str = format!("note-diagram-{diagram}").leak();
+    let card = cx.debug_bounds(selector).expect("the drawing is on screen");
+
+    // A click on the drawing puts the caret in its source.
+    cx.simulate_click(card.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    editor.read_with(cx, |view, _| assert_eq!(view.editor.selection.head.block, 2));
+
+    // `/diagram` on an empty line starts a drawable one.
+    editor.update_in(cx, |view, window, cx| {
+        view.editor.set_caret(Pos::new(1, "Intro".len()));
+        view.newline(&editor_view::Newline, window, cx);
+        view.replace_text_in_range(None, "/", window, cx);
+        for ch in "diagram".chars() {
+            view.replace_text_in_range(None, &ch.to_string(), window, cx);
+        }
+        view.newline(&editor_view::Newline, window, cx);
+        assert!(view.editor.block(2).is_diagram());
+        assert_eq!(view.editor.block(2).text, DIAGRAM_STARTER);
+    });
+    pane.update(cx, |pane, cx| pane.save(cx));
+    let text = std::fs::read_to_string(store.path_for(&id).unwrap()).unwrap();
+    assert!(
+        text.contains(&format!("Intro\n\n```mermaid\n{DIAGRAM_STARTER}\n```")),
+        "{text}"
+    );
+    assert!(text.contains("```mermaid\nflowchart LR\n  A --> B\n```"), "{text}");
+}
+
 /// A long, realistic note: sections of paragraphs with bold and links,
 /// to-dos, bullets with children, quotes, a code block, mention and tool
 /// chips, repeated to `blocks` blocks.
