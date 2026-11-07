@@ -3021,10 +3021,16 @@ impl ControlServer {
     fn session_list(&self) -> Result<JsonValue, ControlError> {
         let registry = self.registry.lock().map_err(poisoned)?;
         let mut sessions = registry.records();
+        // Read under the registry lock, after the records: every registry
+        // change happens under this lock and is published after it, so each
+        // event with seq <= this stamp is already in the list, and the app
+        // lets later session events win over it (StampedSessionListResult).
+        let event_seq = self.events.current_seq();
         fit_session_list(&mut sessions);
         serde_json::to_value(json!({
             "sessions": sessions,
             "projects": registry.projects_raw(),
+            "eventSeq": event_seq,
         }))
         .map_err(|error| ControlError::internal(error.to_string()))
     }
@@ -10211,6 +10217,17 @@ mod tests {
         let result = ok_of(call(&server, "session.list", None));
         assert!(result["sessions"].is_array());
         assert!(result["projects"].is_array());
+        // Stamped with the event seq the list reflects, so a reply that
+        // races a later session.removed cannot resurrect that session.
+        assert_eq!(result["eventSeq"], json!(server.events.current_seq()));
+        server
+            .events
+            .publish("session.removed", json!({"id": "s_x"}), Some("s_x"));
+        let later = ok_of(call(&server, "session.list", None));
+        assert_eq!(
+            later["eventSeq"].as_u64(),
+            Some(result["eventSeq"].as_u64().unwrap() + 1)
+        );
         // state.snapshot is the same view under another name.
         let snapshot = ok_of(call(&server, "state.snapshot", None));
         assert!(snapshot["sessions"].is_array());
