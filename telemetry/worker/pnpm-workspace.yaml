@@ -9,3 +9,7 @@ allowBuilds:
 # wrangler/miniflare ship >= 0.35.4.
 overrides:
   sharp: ^0.35.4
+  # The same miniflare (pinned exactly by @cloudflare/vitest-pool-workers
+  # 0.22.0 and 0.23.0) pins undici 7.29.0, which has open advisories fixed in
+  # 7.30.1. Drop this once the pool's miniflare ships undici >= 7.30.1.
+  undici: ^7.30.1

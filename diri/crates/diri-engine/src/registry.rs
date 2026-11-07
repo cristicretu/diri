@@ -37,12 +37,16 @@ pub struct PersistedState {
 #[derive(Deserialize)]
 struct LoadedState {
     #[serde(default)]
+    version: Option<serde_json::Value>,
+    #[serde(default)]
     projects: Vec<serde_json::Value>,
     #[serde(default)]
     sessions: Vec<serde_json::Value>,
 }
 
 impl PersistedState {
+    /// Bumped only for a change an older build must not write over. Additive
+    /// fields never bump it: [`RecordResidue`] carries them through.
     const VERSION: i64 = 1;
 
     #[cfg(test)]
@@ -51,6 +55,55 @@ impl PersistedState {
             version: Self::VERSION,
             projects,
             sessions,
+        }
+    }
+}
+
+/// What this build lost decoding one session record: its object as read and
+/// as this build re-encodes it. Kept only for records where the two differ,
+/// typically fields (top-level or nested, such as inside `accountProfile`)
+/// written by a newer build, so a downgrade cannot drop them on its next
+/// persist. Lives beside the Registry, never in [`SessionRecord`], so nothing
+/// reaches the control protocol.
+#[derive(Debug)]
+struct RecordResidue {
+    raw: serde_json::Map<String, serde_json::Value>,
+    known: serde_json::Map<String, serde_json::Value>,
+}
+
+impl RecordResidue {
+    /// `None` when re-encoding the decoded record reproduces `raw` exactly.
+    fn of(raw: &serde_json::Value, record: &SessionRecord) -> Option<Self> {
+        let serde_json::Value::Object(raw) = raw else {
+            return None;
+        };
+        let serde_json::Value::Object(known) = serde_json::to_value(record).ok()? else {
+            return None;
+        };
+        (raw != &known).then(|| Self {
+            raw: raw.clone(),
+            known,
+        })
+    }
+
+    /// Folds what this build cannot represent back into `current`, the
+    /// record as it is about to be written. A field this build does not know
+    /// is kept unless `current` now sets it; a known field whose value is
+    /// unchanged since load is written as originally read, which keeps
+    /// unknown fields nested inside it. A known field this build changed or
+    /// cleared is written as it is now, so nested unknowns tied to the old
+    /// value (another account's profile) never attach to the new one.
+    fn merge_into(&self, current: &mut serde_json::Map<String, serde_json::Value>) {
+        for (key, raw) in &self.raw {
+            match (self.known.get(key), current.get(key)) {
+                (None, None) => {
+                    current.insert(key.clone(), raw.clone());
+                }
+                (Some(known), Some(now)) if known == now && known != raw => {
+                    current.insert(key.clone(), raw.clone());
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -70,7 +123,18 @@ impl Serialize for PersistedRecords<'_> {
         for id in ids {
             let mut record = registry.records[id].clone();
             registry.fold_live(&mut record);
-            sequence.serialize_element(&record)?;
+            match registry.record_residue.get(id) {
+                None => sequence.serialize_element(&record)?,
+                Some(residue) => {
+                    let serde_json::Value::Object(mut value) =
+                        serde_json::to_value(&record).map_err(serde::ser::Error::custom)?
+                    else {
+                        return Err(serde::ser::Error::custom("record is not an object"));
+                    };
+                    residue.merge_into(&mut value);
+                    sequence.serialize_element(&value)?;
+                }
+            }
         }
         for record in &registry.unreadable_records {
             sequence.serialize_element(record)?;
@@ -105,6 +169,10 @@ pub struct Registry {
     /// Sessions the user closed, newest last — the "reopen closed tab" stack.
     recently_closed: Vec<SessionRecord>,
     state_file: JsonStateFile,
+    /// Test-only fault injection: the next `persist_now` fails as a full
+    /// disk would, after any lifecycle work before it already ran.
+    #[cfg(test)]
+    fail_next_persist: bool,
     /// Owner-only directory of immutable completed-terminal artifacts.
     completed_dir: PathBuf,
     /// Runs already bound on disk, so the watcher writes each binding once.
@@ -128,6 +196,13 @@ pub struct Registry {
     /// so a downgrade or an older build running side by side can never
     /// delete them; the build that understands them picks them up again.
     unreadable_records: Vec<serde_json::Value>,
+    /// Fields of readable records that this build could not decode, by
+    /// session id; merged back on every persist. See [`RecordResidue`].
+    record_residue: HashMap<String, RecordResidue>,
+    /// The state file's `version` when a newer build wrote it. Its format may
+    /// not be additive, so this build serves what it read but never writes
+    /// the file: every persist fails with `ErrorKind::Unsupported`.
+    newer_state_version: Option<i64>,
     cursor_title_refresh_at: Option<std::time::Instant>,
     native_title_refresh_at: Option<std::time::Instant>,
     /// Attach connections showing a completed run's retained terminal, by
@@ -240,6 +315,8 @@ impl Registry {
             projects: Vec::new(),
             recently_closed: Vec::new(),
             state_file: JsonStateFile::new(state_path),
+            #[cfg(test)]
+            fail_next_persist: false,
             completed_dir,
             bound_runs: HashMap::new(),
             pending_publications: Vec::new(),
@@ -248,6 +325,8 @@ impl Registry {
             last_persist: None,
             persist_sequence: 0,
             unreadable_records: Vec::new(),
+            record_residue: HashMap::new(),
+            newer_state_version: None,
             completed_views: HashMap::new(),
             cursor_title_refresh_at: None,
             native_title_refresh_at: None,
@@ -297,11 +376,29 @@ impl Registry {
         };
         match serde_json::from_value::<LoadedState>(serde_json::Value::Object(document)) {
             Ok(state) => {
+                self.newer_state_version = state
+                    .version
+                    .as_ref()
+                    .and_then(serde_json::Value::as_i64)
+                    .filter(|version| *version > PersistedState::VERSION);
+                if let Some(version) = self.newer_state_version {
+                    eprintln!(
+                        "diri-engine: state file version {version} is newer than this build's {}; \
+                         serving it read-only",
+                        PersistedState::VERSION
+                    );
+                }
                 let mut sessions = Vec::with_capacity(state.sessions.len());
                 self.unreadable_records.clear();
+                self.record_residue.clear();
                 for raw in state.sessions {
                     match serde_json::from_value::<SessionRecord>(raw.clone()) {
-                        Ok(record) => sessions.push(record),
+                        Ok(record) => {
+                            if let Some(residue) = RecordResidue::of(&raw, &record) {
+                                self.record_residue.insert(record.id.0.clone(), residue);
+                            }
+                            sessions.push(record);
+                        }
                         Err(error) => {
                             let id = raw.get("id").and_then(|id| id.as_str()).unwrap_or("?");
                             eprintln!(
@@ -370,14 +467,14 @@ impl Registry {
                                 !stray_worktree_projects.contains(id) || owned.contains(id)
                             })
                     });
-                    self.persist_now()?;
+                    self.persist_repair()?;
                 }
                 if let Some(home) = home {
                     repaired.extend(self.identify_unbound_codex(home));
                 }
                 self.seed_completed_runs();
                 if !repaired.is_empty() {
-                    self.persist_now()?;
+                    self.persist_repair()?;
                     for id in repaired {
                         self.write_recovery_capsule(&self.records[&id])?;
                     }
@@ -395,6 +492,15 @@ impl Registry {
                 ))
             }
         }
+    }
+
+    /// Persists a load-time repair. A read-only (newer) state file keeps the
+    /// repair in memory only: loading must still succeed.
+    fn persist_repair(&mut self) -> std::io::Result<()> {
+        if self.newer_state_version.is_some() {
+            return Ok(());
+        }
+        self.persist_now()
     }
 
     /// Moves an unreadable state file aside without replacing an earlier
@@ -460,6 +566,10 @@ impl Registry {
     /// after the file is fsynced and renamed into place, or after confirming
     /// the file already holds byte-identical sections.
     pub(crate) fn persist_now(&mut self) -> std::io::Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_persist) {
+            return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        }
         self.prepare_persist()?.commit()?;
         self.dirty = false;
         self.last_persist = Some(std::time::Instant::now());
@@ -481,6 +591,16 @@ impl Registry {
     /// Serializes the Registry's owned sections straight to JSON text: no
     /// intermediate value tree and no copy of the whole record table.
     fn prepare_persist(&mut self) -> std::io::Result<PersistBatch> {
+        if let Some(version) = self.newer_state_version {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!(
+                    "state file version {version} is newer than this build's {}; \
+                     not writing it",
+                    PersistedState::VERSION
+                ),
+            ));
+        }
         let sessions = serde_json::value::to_raw_value(&PersistedRecords(self))?;
         let projects = serde_json::value::to_raw_value(&self.projects)?;
         let version = serde_json::value::to_raw_value(&PersistedState::VERSION)?;
@@ -1553,7 +1673,10 @@ impl Registry {
         if plan.terminate_live_session && self.sessions.contains_key(id) {
             self.terminate(id, std::time::Duration::from_millis(500))?;
         }
-        self.records.remove(id);
+        // `terminate` killed the tree and stamped the exit on the stored
+        // record; the pre-terminate clone still claims a live status with no
+        // Session behind it, so a rollback (and reopen) must use this one.
+        let record = self.records.remove(id).unwrap_or(record);
         if plan.retain_for_reopen {
             self.recently_closed.push(record.clone());
             if self.recently_closed.len() > 10 {
@@ -2239,12 +2362,15 @@ impl Registry {
         if plan.terminate_live_session && self.sessions.contains_key(id) {
             self.terminate(id, std::time::Duration::from_millis(500))?;
         }
+        // Once `terminate` ran, the stored record carries the exit; rolling
+        // back to `original` would re-list a dead session as live.
+        let rollback = self.records.get(id).cloned().unwrap_or(original);
         self.records.insert(
             id.to_owned(),
             plan.replacement.expect("archive keeps the record"),
         );
         if let Err(error) = self.persist_now() {
-            self.records.insert(id.to_owned(), original);
+            self.records.insert(id.to_owned(), rollback);
             return Err(error);
         }
         Ok(())
@@ -3718,6 +3844,75 @@ mod tests {
         assert!(!registry.dirty, "failed edit must not be flushed later");
     }
 
+    /// Spawns a live, long-running session whose record claims `Working`.
+    #[cfg(unix)]
+    fn spawn_live(registry: &mut Registry, id: &str, root: &Path) {
+        let mut live = record(id);
+        live.status = SessionStatus::Working;
+        live.cwd = root.to_string_lossy().into_owned();
+        registry
+            .spawn(
+                SessionSpec {
+                    id: id.into(),
+                    pty: crate::pty::PtySpec::new(
+                        vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+                        root,
+                    ),
+                    manifest_id: AgentKind::SHELL_ID.into(),
+                    authority: crate::status::Authority::ProcessOnly,
+                    logs_dir: root.join("logs"),
+                    holder: None,
+                    remote: None,
+                    defer_launch: false,
+                },
+                live,
+            )
+            .expect("spawn");
+        assert!(registry.sessions.contains_key(id));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_persist_after_terminate_rolls_back_to_the_exited_record() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().canonicalize().expect("root");
+        let mut registry = Registry::new(engine(), root.join("state.json"));
+
+        spawn_live(&mut registry, "removed", &root);
+        registry.fail_next_persist = true;
+        registry
+            .remove("removed", &root.join("logs"))
+            .expect_err("injected persist failure");
+        assert!(
+            !registry.sessions.contains_key("removed"),
+            "tree was killed"
+        );
+        let restored = registry.records.get("removed").expect("rolled back");
+        assert!(
+            matches!(restored.status, SessionStatus::Exited(_)),
+            "remove rollback re-listed a dead session as {:?}",
+            restored.status
+        );
+        assert!(registry.recently_closed.is_empty());
+
+        spawn_live(&mut registry, "archived", &root);
+        registry.fail_next_persist = true;
+        registry
+            .archive("archived")
+            .expect_err("injected persist failure");
+        assert!(
+            !registry.sessions.contains_key("archived"),
+            "tree was killed"
+        );
+        let restored = registry.records.get("archived").expect("rolled back");
+        assert!(
+            matches!(restored.status, SessionStatus::Exited(_)),
+            "archive rollback re-listed a dead session as {:?}",
+            restored.status
+        );
+        assert_eq!(restored.archived_at, None, "the archive itself was undone");
+    }
+
     #[test]
     fn destructive_lifecycle_edits_stop_before_unwritable_state() {
         let temp = tempfile::tempdir().expect("temp");
@@ -4169,6 +4364,116 @@ mod tests {
         assert!(
             sessions.contains(&future),
             "the unreadable record must survive the write verbatim"
+        );
+    }
+
+    #[test]
+    fn unknown_record_fields_survive_a_downgrade_round_trip() {
+        // A nightly writes fields this (stable) build does not know, at the
+        // top level and inside `accountProfile`. Loading and persisting the
+        // record, even after editing it, must not drop them.
+        let temp = tempfile::tempdir().expect("temp");
+        let state_file = temp.path().join("state.json");
+        let profile = diri_proto::AgentAccountProfile {
+            id: "work".into(),
+            label: "Work".into(),
+            agent: "claude-code".into(),
+            host: None,
+            config_home: "/home/me/.claude-work".into(),
+            is_default: false,
+            login_store: None,
+        };
+        let mut original = record("s_newer");
+        original.account_profile = Some(profile.clone());
+        let mut raw = serde_json::to_value(&original).expect("encode");
+        raw["futureTopLevel"] = serde_json::json!({ "kept": true });
+        raw["accountProfile"]["futureScope"] = serde_json::json!("org:acme");
+        std::fs::write(
+            &state_file,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "projects": [],
+                "sessions": [raw],
+            }))
+            .expect("encode state"),
+        )
+        .expect("write");
+        let read_back = |path: &Path| -> serde_json::Value {
+            let state: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).expect("read")).expect("json");
+            state["sessions"][0].clone()
+        };
+
+        let mut registry = Registry::new(engine(), &state_file);
+        assert_eq!(registry.load().expect("load"), 1);
+        let mut edited = registry.record("s_newer").expect("record");
+        edited.title = "renamed".into();
+        registry.insert_record(edited.clone());
+        registry.persist_now().expect("persist");
+        let written = read_back(&state_file);
+        assert_eq!(written["title"], "renamed", "this build's edit is written");
+        assert_eq!(
+            written["futureTopLevel"],
+            serde_json::json!({ "kept": true })
+        );
+        assert_eq!(written["accountProfile"]["futureScope"], "org:acme");
+        assert_eq!(written["accountProfile"]["id"], "work");
+
+        // A second build generation (load what we wrote) keeps them too.
+        drop(registry);
+        let mut registry = Registry::new(engine(), &state_file);
+        registry.load().expect("reload");
+        registry.persist_now().expect("persist again");
+        let written = read_back(&state_file);
+        assert_eq!(
+            written["futureTopLevel"],
+            serde_json::json!({ "kept": true })
+        );
+        assert_eq!(written["accountProfile"]["futureScope"], "org:acme");
+
+        // Switching the account replaces the profile: the old profile's
+        // unknown field must not attach to the new one.
+        edited.account_profile = Some(diri_proto::AgentAccountProfile {
+            id: "personal".into(),
+            config_home: "/home/me/.claude".into(),
+            ..profile
+        });
+        registry.insert_record(edited);
+        registry.persist_now().expect("persist switch");
+        let written = read_back(&state_file);
+        assert_eq!(written["accountProfile"]["id"], "personal");
+        assert!(written["accountProfile"].get("futureScope").is_none());
+        assert_eq!(
+            written["futureTopLevel"],
+            serde_json::json!({ "kept": true })
+        );
+    }
+
+    #[test]
+    fn a_state_file_from_a_newer_format_is_served_read_only() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state_file = temp.path().join("state.json");
+        let body = serde_json::to_vec(&serde_json::json!({
+            "version": PersistedState::VERSION + 1,
+            "projects": [],
+            "sessions": [serde_json::to_value(record("s_kept")).expect("encode")],
+        }))
+        .expect("encode state");
+        std::fs::write(&state_file, &body).expect("write");
+
+        let mut registry = Registry::new(engine(), &state_file);
+        assert_eq!(registry.load().expect("a newer file still loads"), 1);
+        assert!(registry.record("s_kept").is_some());
+        registry.insert_record(record("s_new"));
+        let error = registry.persist_now().expect_err("must refuse to write");
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        registry.persist_deferred();
+        assert!(registry.take_dirty_batch().is_none());
+        drop(registry);
+        assert_eq!(
+            std::fs::read(&state_file).expect("read"),
+            body,
+            "the newer file must be left byte for byte"
         );
     }
 

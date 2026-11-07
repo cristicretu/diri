@@ -60,7 +60,7 @@ mod pty_read;
 #[cfg(unix)]
 pub(crate) mod reactor;
 
-pub use client::{HolderClient, HolderManagerClient, HolderOutputStream};
+pub use client::{HolderClient, HolderLiveness, HolderManagerClient, HolderOutputStream};
 
 /// Delays for polling something that is about to become ready.
 ///

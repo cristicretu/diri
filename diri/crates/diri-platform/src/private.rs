@@ -79,9 +79,17 @@ pub fn write(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
 }
 
 /// Writes `contents` to `temporary` owner-only, then renames it over `path`.
-/// The temporary is removed again when any step fails.
+/// The temporary is flushed to disk before the rename, so a crash or power
+/// loss leaves either the old file or the whole new one, never a truncated
+/// file under the final name. The temporary is removed again when any step
+/// fails.
 pub fn replace_via(temporary: &Path, path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
-    let result = write(temporary, contents).and_then(|()| std::fs::rename(temporary, path));
+    let result = create(temporary)
+        .and_then(|mut file| {
+            file.write_all(contents.as_ref())?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(temporary, path));
     if result.is_err() {
         let _ = std::fs::remove_file(temporary);
     }
@@ -101,8 +109,8 @@ pub fn replace_streamed(
             write(&mut stream)?;
             stream
                 .into_inner()
-                .map_err(io::IntoInnerError::into_error)?;
-            Ok(())
+                .map_err(io::IntoInnerError::into_error)?
+                .sync_all()
         })
         .and_then(|()| std::fs::rename(temporary, path));
     if result.is_err() {

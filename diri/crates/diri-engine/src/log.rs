@@ -461,11 +461,30 @@ impl OutputLog {
         if self.read_only {
             return Ok(());
         }
+        // `append` has already advanced the stream tail past `data`.
+        let start = self.tail_offset - data.len() as u64;
+        if self.write_handle.is_none() {
+            // An earlier write failed part-way, or a rewrite could not reopen
+            // the file: what is on disk no longer ends where the stream does.
+            // Start a fresh file at this chunk, as a rotation would, so the
+            // file's tail is the stream's tail again and readers never see
+            // later bytes at the wrong offsets.
+            self.rewrite(start, None)?;
+        }
         let Some(handle) = self.write_handle.as_mut() else {
-            return Ok(());
+            return Err(io::Error::other("output log has no write handle"));
         };
-        handle.write_all(data)?;
+        if let Err(error) = handle.write_all(data) {
+            // Some unknown prefix of `data` may have landed. The next append
+            // resynchronises rather than writing after a torn chunk.
+            self.write_handle = None;
+            return Err(error);
+        }
         self.file_bytes += data.len();
+        debug_assert_eq!(
+            self.file_base_offset + self.file_bytes as u64,
+            self.tail_offset
+        );
 
         if self.last_sync.elapsed() > SYNC_INTERVAL {
             handle.sync_all()?;
@@ -481,7 +500,6 @@ impl OutputLog {
     /// Rewrites the spill file keeping only the newest half, bumping the base
     /// offset so stream offsets stay monotonic across the rewrite.
     fn truncate_to_half(&mut self) -> io::Result<()> {
-        self.invalidate_read_handle();
         // Every rewrite copies what it keeps, so how much is kept sets the
         // write amplification of the whole log: keeping half meant copying a
         // byte for every byte ever appended. Keeping a quarter makes the
@@ -492,31 +510,56 @@ impl OutputLog {
 
         let mut read = File::open(&self.path)?;
         read.seek(SeekFrom::Start((HEADER_SIZE + drop_bytes) as u64))?;
-        self.write_handle = None;
-
         let new_base = self.file_base_offset + drop_bytes as u64;
+        self.rewrite(new_base, Some(read))?;
+        self.sync_points.retain(|&s| s >= new_base);
+        Ok(())
+    }
+
+    /// Atomically replaces the spill file with one based at `base`, holding
+    /// whatever `source` still has to read, and reopens the write handle.
+    ///
+    /// Until the rename lands nothing changes: a failure removes the temp
+    /// file and keeps the current file and handle, so the writer carries on
+    /// appending to a file that is merely over capacity. Only after the
+    /// rename does the old handle go, since it now points at an unlinked
+    /// inode.
+    fn rewrite(&mut self, base: u64, source: Option<File>) -> io::Result<()> {
         let tmp = self.path.with_extension("tmp");
         // Streamed rather than staged through one big buffer: this runs on the
         // PTY pump, and a burst of output is exactly when it fires.
-        let kept_len = {
+        let written = (|| -> io::Result<usize> {
             let file = create_private(&tmp)?;
             let mut writer = io::BufWriter::with_capacity(256 << 10, file);
             writer.write_all(&MAGIC.to_be_bytes())?;
             writer.write_all(&VERSION.to_be_bytes())?;
-            writer.write_all(&new_base.to_be_bytes())?;
-            let copied = io::copy(
-                &mut io::BufReader::with_capacity(256 << 10, read),
-                &mut writer,
-            )?;
+            writer.write_all(&base.to_be_bytes())?;
+            let copied = match source {
+                Some(read) => io::copy(
+                    &mut io::BufReader::with_capacity(256 << 10, read),
+                    &mut writer,
+                )?,
+                None => 0,
+            };
             writer.flush()?;
-            copied as usize
+            Ok(copied as usize)
+        })()
+        .and_then(|copied| fs::rename(&tmp, &self.path).map(|()| copied));
+        let kept_len = match written {
+            Ok(kept_len) => kept_len,
+            Err(error) => {
+                let _ = fs::remove_file(&tmp);
+                return Err(error);
+            }
         };
-        fs::rename(&tmp, &self.path)?;
 
-        self.file_base_offset = new_base;
+        self.invalidate_read_handle();
+        self.file_base_offset = base;
         self.file_bytes = kept_len;
+        // The renamed file is complete and consistent; if it cannot be
+        // reopened, the next append starts over rather than writing nowhere.
+        self.write_handle = None;
         self.write_handle = Some(open_for_append(&self.path)?);
-        self.sync_points.retain(|&s| s >= new_base);
         Ok(())
     }
 
@@ -959,5 +1002,89 @@ mod tests {
         let (offset, data) = log.read(99, 16);
         assert_eq!(offset, 3, "clamped to the tail");
         assert!(data.is_empty());
+    }
+
+    /// What a reader opening the file now sees, versus the writer's tail.
+    fn disk_tail(root: &Path, session: &str) -> u64 {
+        OutputLog::reader(root, session)
+            .expect("reader")
+            .tail_offset()
+    }
+
+    #[test]
+    fn a_failed_rewrite_keeps_writing_to_the_existing_file() {
+        let root = dir();
+        // Ring 0, like the Holder: the file is the only copy of the stream.
+        let mut log = OutputLog::open(root.path(), "s", 0, 64, false).expect("open");
+        // The rewrite's temp file cannot be created while a directory
+        // squats on its path — standing in for ENOSPC/EIO mid-rewrite.
+        let tmp = root.path().join("s.tmp");
+        fs::create_dir(&tmp).expect("squat tmp path");
+
+        log.append(&[b'a'; 60]).expect("under capacity");
+        assert!(
+            log.append(&[b'b'; 10]).is_err(),
+            "a failed rewrite is reported, not swallowed"
+        );
+        assert_eq!(log.tail_offset(), 70);
+        assert_eq!(disk_tail(root.path(), "s"), 70, "the chunk still landed");
+
+        // Appends keep reaching disk (over capacity) and keep reporting the
+        // failed rewrite until it can succeed.
+        assert!(log.append(b"marker").is_err());
+        assert_eq!(disk_tail(root.path(), "s"), 76);
+        let mut reader = OutputLog::reader(root.path(), "s").expect("reader");
+        let (offset, data) = reader.read(70, 6);
+        assert_eq!((offset, data.as_slice()), (70, b"marker".as_slice()));
+
+        fs::remove_dir(&tmp).expect("unsquat");
+        log.append(b"!").expect("rewrite succeeds once it can");
+        assert_eq!(log.tail_offset(), 77);
+        assert_eq!(disk_tail(root.path(), "s"), 77);
+        let mut reader = OutputLog::reader(root.path(), "s").expect("reader");
+        assert_eq!(reader.oldest_readable_offset(), 77 - 8, "kept an eighth");
+        let (offset, data) = reader.read(70, 7);
+        assert_eq!((offset, data.as_slice()), (70, b"marker!".as_slice()));
+        assert!(!tmp.exists(), "no temp file left behind");
+    }
+
+    #[test]
+    fn a_torn_write_resynchronises_the_file_at_the_stream_tail() {
+        let root = dir();
+        let mut log = OutputLog::open(root.path(), "s", 0, 1 << 20, false).expect("open");
+        log.append(b"hello").expect("append");
+        // What a failed `write_all` leaves: the handle gone, the file's end
+        // no longer known to match the stream.
+        log.write_handle = None;
+        log.tail_offset += 3; // the torn chunk's bytes are part of the stream
+
+        log.append(b"marker").expect("resynchronised append");
+        assert_eq!(log.tail_offset(), 14);
+        assert_eq!(
+            disk_tail(root.path(), "s"),
+            14,
+            "file tail matches the stream tail, not 3 bytes short"
+        );
+        let mut reader = OutputLog::reader(root.path(), "s").expect("reader");
+        assert_eq!(reader.oldest_readable_offset(), 8);
+        let (offset, data) = reader.read(0, 64);
+        assert_eq!((offset, data.as_slice()), (8, b"marker".as_slice()));
+    }
+
+    #[test]
+    fn a_writer_that_cannot_resynchronise_reports_every_append() {
+        let root = dir();
+        let mut log = OutputLog::open(root.path(), "s", 0, 1 << 20, false).expect("open");
+        log.append(b"hello").expect("append");
+        log.write_handle = None;
+        fs::create_dir(root.path().join("s.tmp")).expect("squat tmp path");
+
+        assert!(log.append(b"x").is_err());
+        assert!(log.append(b"y").is_err(), "no silent Ok without a handle");
+        assert_eq!(log.tail_offset(), 7, "the stream keeps its offsets");
+
+        fs::remove_dir(root.path().join("s.tmp")).expect("unsquat");
+        log.append(b"z").expect("recovers");
+        assert_eq!(disk_tail(root.path(), "s"), 8);
     }
 }

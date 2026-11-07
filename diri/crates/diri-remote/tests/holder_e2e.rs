@@ -2341,3 +2341,102 @@ fn an_erase_waits_for_its_redraw_instead_of_the_leading_edge() {
          (redraw gap, publication received): {outcomes:?}"
     );
 }
+
+/// Pastes larger than the Holder's pending-input bound, sent while the
+/// program is not reading its terminal, wait for it instead of failing the
+/// session: the Holder stops reading its controller until the PTY drains,
+/// and every byte arrives once, in order. Each paste is one frame, as older
+/// Engines send them. Before, the second paste overflowed the queue and the
+/// Holder closed the controller with a fatal `protocol_error`, which the
+/// Engine turns into a Failed session.
+#[test]
+fn large_pastes_into_a_busy_program_backpressure_instead_of_failing() {
+    const PASTE: usize = 700 * 1024;
+    let temporary = tempfile::tempdir_in("/tmp").unwrap();
+    let state_dir = temporary.path().join("state");
+    let gate = temporary.path().join("gate");
+    let received = temporary.path().join("received");
+    let launch: LaunchResult = run_json(
+        "launch",
+        &state_dir,
+        Some(&LaunchRequest {
+            session_id: test_session_id("paste-backpressure"),
+            session_token: token(),
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!(
+                    "stty raw -echo; printf 'ready\\r\\n'; while [ ! -e '{gate}' ]; do sleep 0.05; done; head -c {total} > '{received}'; printf 'pasted\\r\\n'; exec sleep 60",
+                    gate = gate.display(),
+                    total = 3 * PASTE,
+                    received = received.display(),
+                ),
+            ],
+            cwd: "/".into(),
+            environment: vec![],
+            cols: 80,
+            rows: 24,
+            persistence: PersistenceCapability::NonPersistent,
+            keyboard_enhancements: false,
+        }),
+    );
+    let mut attach = Attach::open(&state_dir, hello(&launch, Some(0), "paste-client"));
+    attach.receive_until(Duration::from_secs(5), |message| {
+        message_contains(message, "ready") && !matches!(message, RemoteMessage::Terminal(_))
+    });
+
+    // The program starts reading only after all three pastes were sent; the
+    // third blocks this writer until it does, so the gate opens from aside.
+    let opener = {
+        let gate = gate.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            std::fs::write(gate, b"").expect("open gate");
+        })
+    };
+    for byte in *b"abc" {
+        attach.send(RemoteMessage::Terminal(Frame::input(vec![byte; PASTE])));
+    }
+    opener.join().expect("gate thread");
+
+    let messages = attach.receive_until(Duration::from_secs(20), |message| {
+        message_contains(message, "pasted") && !matches!(message, RemoteMessage::Terminal(_))
+    });
+    let fatal = messages.iter().find_map(|message| match message {
+        RemoteMessage::Error(error) => Some(error.clone()),
+        _ => None,
+    });
+    let inspection: SessionInspection = run_json(
+        "inspect",
+        &state_dir,
+        Some(&SessionSelector {
+            session_id: launch.session_id.clone(),
+            session_token: token(),
+            expected_incarnation: Some(launch.session_incarnation.clone()),
+        }),
+    );
+    let _: SessionInspection = run_json(
+        "kill",
+        &state_dir,
+        Some(&SessionSelector {
+            session_id: launch.session_id,
+            session_token: token(),
+            expected_incarnation: Some(launch.session_incarnation),
+        }),
+    );
+    assert_eq!(fatal, None, "no error may reach the controller");
+    assert!(matches!(
+        inspection.process_state,
+        RemoteProcessState::Running { .. }
+    ));
+    let bytes = std::fs::read(&received).expect("received pastes");
+    assert_eq!(bytes.len(), 3 * PASTE);
+    for (index, byte) in b"abc".iter().copied().enumerate() {
+        assert!(
+            bytes[index * PASTE..(index + 1) * PASTE]
+                .iter()
+                .all(|&value| value == byte),
+            "paste {index} arrived out of order or altered"
+        );
+    }
+}

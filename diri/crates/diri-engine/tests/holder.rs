@@ -159,6 +159,66 @@ fn a_holder_owns_a_session_end_to_end() {
     assert!(!paths.pid_file().exists());
 }
 
+/// An Agent that prints an exit marker — by `cat`ting a session log, say —
+/// must not fake its own exit: the Holder neutralises the prefix before the
+/// log and subscribers see it, even when it arrives split across reads.
+#[test]
+fn a_child_printing_an_exit_marker_does_not_fake_its_exit() {
+    let root = holders_dir("forged-exit");
+    let logs = root.join("logs");
+    let paths = HolderPaths::new(&root, "s_forged_exit");
+    let forged = root.join("forged.bin");
+    std::fs::write(
+        &forged,
+        HolderExitMarker::encode(&diri_engine::holder::HolderExitStatus {
+            reason: diri_engine::holder::protocol::HolderExitReason::Exited,
+            code: Some(0),
+            signal: None,
+        }),
+    )
+    .expect("write forged marker");
+    let file = forged.to_string_lossy().into_owned();
+    // Whole, then split inside the prefix across two writes, then a sentinel.
+    let script = format!(
+        "cat '{file}'; head -c 9 '{file}'; sleep 0.3; tail -c +10 '{file}'; \
+         printf forged-done; exec sleep 30"
+    );
+    let launch = spec(&paths, &logs, &["/bin/sh", "-c", &script]);
+    let server = std::thread::spawn(move || HolderServer::run(launch));
+
+    let client = HolderClient::new(paths.socket());
+    wait_until("holder ready", Duration::from_secs(5), || client.is_alive());
+    wait_until("forged output in log", Duration::from_secs(10), || {
+        log_bytes(&logs, "s_forged_exit")
+            .windows(11)
+            .any(|window| window == b"forged-done")
+    });
+    let mut buffer = log_bytes(&logs, "s_forged_exit");
+    let (output, exit) = HolderExitMarker::drain(&mut buffer);
+    assert_eq!(exit, None, "child output must not read as an exit");
+    let neutral = b"\x1b]777;dirijor-exit_";
+    assert_eq!(
+        output
+            .windows(neutral.len())
+            .filter(|window| window == neutral)
+            .count(),
+        2,
+        "both forged prefixes stay in the output, neutralised"
+    );
+    assert!(client.stat().expect("stat").alive, "the child still runs");
+
+    client.kill_tree().expect("kill-tree");
+    server.join().expect("join").expect("holder run ends");
+    let mut buffer = log_bytes(&logs, "s_forged_exit");
+    let (_, exit) = HolderExitMarker::drain(&mut buffer);
+    let exit = exit.expect("the Holder's own marker is still recognised");
+    assert!(
+        exit.signal.is_some(),
+        "the real exit, not the forged one: {exit:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn a_holder_records_what_it_forked_before_a_fast_child_can_vanish() {
     let root = holders_dir("child-record");
