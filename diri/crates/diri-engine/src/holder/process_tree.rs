@@ -336,22 +336,42 @@ pub fn kill_verified(sample: &HolderProcessSample) -> bool {
 /// SIGTERM alone the leader outlived every grace and each close waited the
 /// full half second for the SIGKILL.
 pub fn kill_tree(root: i32) {
-    let mut tree = enumerate(root);
+    let tree = begin_kill_tree(root);
+    if !wait_tree_gone(&tree) {
+        escalate_kill_tree(root, tree);
+    }
+}
+
+/// [`kill_tree`]'s first step: the polite signals. Returns the tree they
+/// were sent to.
+pub fn begin_kill_tree(root: i32) -> Vec<HolderProcessSample> {
+    let tree = enumerate(root);
     let _ = signal(root, libc::SIGHUP);
     let _ = signal(root, libc::SIGTERM);
     let _ = signal(root, libc::SIGCONT);
+    tree
+}
 
+/// Waits up to the SIGKILL grace for every process of `tree` to be gone.
+/// A leader is gone only once reaped: on Linux a zombie still has a start
+/// time, so whoever reaps it must not be blocked on this wait.
+pub fn wait_tree_gone(tree: &[HolderProcessSample]) -> bool {
     let deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < deadline {
         if tree
             .iter()
             .all(|sample| start_time(sample.pid) != Some(sample.start_sec))
         {
-            return;
+            return true;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+    false
+}
 
+/// [`kill_tree`]'s last step, after the grace: SIGKILL for the group and
+/// every identity-checked survivor.
+pub fn escalate_kill_tree(root: i32, mut tree: Vec<HolderProcessSample>) {
     tree.extend(enumerate(root));
     signal_group(root, libc::SIGKILL);
     let unique: HashSet<HolderProcessSample> = tree.into_iter().collect();

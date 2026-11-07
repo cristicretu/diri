@@ -464,6 +464,46 @@ fn busy_status(status: &SessionStatus) -> bool {
     !matches!(status, SessionStatus::Idle | SessionStatus::Exited(_))
 }
 
+/// A run's place in the scheduler's in-flight bookkeeping: the spawn
+/// counters and, for a file trigger, its `file_runs` entry. Dropping it
+/// releases all of them, so a run that panics or whose thread never starts
+/// cannot leave its trigger blocked until the Engine restarts.
+struct RunClaim {
+    scheduler: Arc<Scheduler>,
+    schedule_id: String,
+    asserting: bool,
+}
+
+impl RunClaim {
+    fn new(scheduler: Arc<Scheduler>, schedule_id: String, asserting: bool) -> Self {
+        scheduler.spawning.fetch_add(1, Ordering::AcqRel);
+        if asserting {
+            scheduler.asserting_spawns.fetch_add(1, Ordering::AcqRel);
+            scheduler.set_keep_awake(true);
+        }
+        Self {
+            scheduler,
+            schedule_id,
+            asserting,
+        }
+    }
+}
+
+impl Drop for RunClaim {
+    fn drop(&mut self) {
+        if let Ok(mut runs) = self.scheduler.file_runs.lock() {
+            runs.remove(&self.schedule_id);
+        }
+        if self.asserting {
+            self.scheduler
+                .asserting_spawns
+                .fetch_sub(1, Ordering::AcqRel);
+        }
+        self.scheduler.spawning.fetch_sub(1, Ordering::AcqRel);
+        self.scheduler.poke();
+    }
+}
+
 impl ActiveRun {
     fn keep(&mut self, status: Option<SessionStatus>, now: i64) -> bool {
         if status.as_ref().is_some_and(busy_status) {
@@ -920,18 +960,16 @@ impl super::ControlServer {
     /// Spawns the run's session off the runner thread; the spawn can wait on
     /// Git, an account operation, or the agent's first prompt.
     fn start_run(self: &Arc<Self>, record: ScheduleRecord, fired_ms: i64) {
-        self.scheduler.spawning.fetch_add(1, Ordering::AcqRel);
         let asserting = record.spec.keep_awake || record.spec.wake_mac;
-        if asserting {
-            self.scheduler
-                .asserting_spawns
-                .fetch_add(1, Ordering::AcqRel);
-            self.scheduler.set_keep_awake(true);
-        }
+        let claim = RunClaim::new(Arc::clone(&self.scheduler), record.id.clone(), asserting);
         let server = Arc::clone(self);
         let spawned = std::thread::Builder::new()
             .name("diri-scheduled-run".into())
             .spawn(move || {
+                // Released when the run ends, panics, or never starts: a
+                // thread that failed to spawn drops this closure, claim and
+                // all.
+                let _claim = claim;
                 let woke = record
                     .runs
                     .last()
@@ -998,25 +1036,9 @@ impl super::ControlServer {
                     );
                 }
                 server.record_run_result(&record.id, fired_ms, session_id, result.err());
-                if let Ok(mut runs) = server.scheduler.file_runs.lock() {
-                    runs.remove(&record.id);
-                }
-                if asserting {
-                    server
-                        .scheduler
-                        .asserting_spawns
-                        .fetch_sub(1, Ordering::AcqRel);
-                }
-                server.scheduler.spawning.fetch_sub(1, Ordering::AcqRel);
-                server.scheduler.poke();
             });
-        if spawned.is_err() {
-            if asserting {
-                self.scheduler
-                    .asserting_spawns
-                    .fetch_sub(1, Ordering::AcqRel);
-            }
-            self.scheduler.spawning.fetch_sub(1, Ordering::AcqRel);
+        if let Err(error) = spawned {
+            eprintln!("diri-scheduler: run thread failed to start: {error}");
         }
     }
 
@@ -1134,6 +1156,31 @@ impl super::ControlServer {
 mod tests {
     use super::*;
     use diri_proto::AgentKind;
+
+    #[test]
+    fn a_run_that_never_finishes_still_releases_its_file_trigger() {
+        let scheduler = Arc::new(Scheduler::default());
+        for run in [
+            // The run thread could not be spawned: its closure is dropped.
+            Box::new(|claim: RunClaim| drop(claim)) as Box<dyn Fn(RunClaim)>,
+            // The run panicked.
+            Box::new(|claim: RunClaim| {
+                let _ = std::thread::spawn(move || {
+                    let _claim = claim;
+                    panic!("run failed");
+                })
+                .join();
+            }),
+        ] {
+            scheduler.file_runs.lock().unwrap().insert("trigger".into());
+            let claim = RunClaim::new(Arc::clone(&scheduler), "trigger".into(), false);
+            assert_eq!(scheduler.spawning.load(Ordering::Acquire), 1);
+            run(claim);
+            assert!(scheduler.file_runs.lock().unwrap().is_empty());
+            assert_eq!(scheduler.spawning.load(Ordering::Acquire), 0);
+            assert_eq!(scheduler.asserting_spawns.load(Ordering::Acquire), 0);
+        }
+    }
 
     fn spec(when: ScheduleWhen) -> ScheduleSpec {
         ScheduleSpec {

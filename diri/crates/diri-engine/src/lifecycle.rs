@@ -9,6 +9,48 @@ use std::io;
 
 use diri_proto::{DateMillis, ExitInfo, ExitReason, SessionRecord, SessionStatus};
 
+/// The record transitions between incarnations. Every site that ends or
+/// starts an incarnation goes through these, so the facts that describe a
+/// live process tree (needs-input, hibernation, sampled memory and ports)
+/// cannot outlive it. A stale `hibernation` kept a dead record in
+/// `Registry::governed_records`, and the governor sampled its dead pids.
+pub(crate) trait RecordTransitions {
+    /// Nothing runs under the record any more; `exit` is how it ended.
+    fn mark_exited(&mut self, exit: ExitInfo);
+    /// Like [`Self::mark_exited`], but an exit already recorded is the truer
+    /// one and is kept.
+    fn mark_ended(&mut self, exit: ExitInfo);
+    /// A new incarnation is launching under the record.
+    fn mark_starting(&mut self, now: DateMillis);
+}
+
+fn clear_live_facts(record: &mut SessionRecord) {
+    record.needs_input = None;
+    record.hibernation = None;
+    record.memory_bytes = None;
+    record.listening_ports = None;
+}
+
+impl RecordTransitions for SessionRecord {
+    fn mark_exited(&mut self, exit: ExitInfo) {
+        self.status = SessionStatus::Exited(exit);
+        clear_live_facts(self);
+    }
+
+    fn mark_ended(&mut self, exit: ExitInfo) {
+        if !matches!(self.status, SessionStatus::Exited(_)) {
+            self.status = SessionStatus::Exited(exit);
+        }
+        clear_live_facts(self);
+    }
+
+    fn mark_starting(&mut self, now: DateMillis) {
+        self.status = SessionStatus::Starting;
+        clear_live_facts(self);
+        self.updated_at = now;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LifecycleAction {
     Archive,
@@ -35,16 +77,13 @@ impl LifecyclePlan {
                 let mut replacement = record.clone();
                 replacement.archived_at = Some(now);
                 replacement.updated_at = now;
-                if !matches!(replacement.status, SessionStatus::Exited(_)) {
-                    replacement.status = SessionStatus::Exited(ExitInfo {
-                        reason: ExitReason::Archived,
-                        code: None,
-                        signal: None,
-                        system_restart: false,
-                        interrupted: false,
-                    });
-                }
-                replacement.needs_input = None;
+                replacement.mark_ended(ExitInfo {
+                    reason: ExitReason::Archived,
+                    code: None,
+                    signal: None,
+                    system_restart: false,
+                    interrupted: false,
+                });
                 Ok(Self {
                     replacement: Some(replacement),
                     terminate_live_session: true,

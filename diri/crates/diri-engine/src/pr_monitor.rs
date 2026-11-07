@@ -497,13 +497,19 @@ fn fetch_one(
     refresh: &mut HashMap<String, RefreshState>,
     last_thread_attempt: &mut HashMap<String, Instant>,
 ) {
-    refresh.entry(url.to_owned()).or_default().last_attempt = Some(Instant::now());
+    let attempted = Instant::now();
+    refresh.entry(url.to_owned()).or_default().last_attempt = Some(attempted);
     let refresh_threads = threads_due(last_thread_attempt, url);
+    // A failed fetch says nothing about whether the pull request moved: it
+    // neither slows its polling down nor counts as a thread refresh, the
+    // same as a pull request the batch path could not resolve.
+    let Some(status) = fetch(url, gh, refresh_threads) else {
+        return;
+    };
     if refresh_threads {
-        last_thread_attempt.insert(url.to_owned(), Instant::now());
+        last_thread_attempt.insert(url.to_owned(), attempted);
     }
-    let changed = fetch(url, gh, refresh_threads)
-        .is_some_and(|status| store_status(cache, url, status, refresh_threads));
+    let changed = store_status(cache, url, status, refresh_threads);
     refresh
         .entry(url.to_owned())
         .or_default()
@@ -1228,6 +1234,30 @@ fn now() -> DateMillis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_fetch_neither_slows_polling_nor_counts_as_a_thread_refresh() {
+        let url = "https://github.com/o/r/pull/1";
+        let mut cache = HashMap::new();
+        let mut refresh: HashMap<String, RefreshState> = HashMap::new();
+        let mut last_thread_attempt = HashMap::new();
+        for _ in 0..3 {
+            fetch_one(
+                url,
+                PollInterest::Background,
+                "/usr/bin/false",
+                &mut cache,
+                &mut refresh,
+                &mut last_thread_attempt,
+            );
+        }
+        let state = &refresh[url];
+        assert!(state.last_attempt.is_some(), "it waits a normal interval");
+        assert_eq!(state.background_interval, BACKGROUND_REFRESH_INTERVAL);
+        assert!(last_thread_attempt.is_empty(), "threads are still due");
+        assert!(cache.is_empty());
+    }
 
     #[test]
     fn pull_requests_no_record_mentions_are_forgotten() {

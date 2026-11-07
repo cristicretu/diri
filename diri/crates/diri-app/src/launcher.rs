@@ -695,6 +695,14 @@ impl LauncherOverlay {
     }
 
     fn close(&mut self, cx: &mut Context<Self>) {
+        self.close_with(LauncherEvent::Closed, cx);
+    }
+
+    /// The one way the launcher hides. Whatever was armed for the open
+    /// launcher (a recipe waiting on its catalog to launch, a recipe delete
+    /// awaiting its second click) is disarmed, so nothing spawns or deletes
+    /// while it is hidden. `event` says where focus goes next.
+    fn close_with(&mut self, event: LauncherEvent, cx: &mut Context<Self>) {
         if !self.open
             || (self.delivery.is_sending() && matches!(self.mode, LauncherMode::Handoff(_)))
         {
@@ -703,8 +711,9 @@ impl LauncherOverlay {
         self.open = false;
         self.picker = None;
         self.pending_recipe_activation = None;
+        self.pending_recipe_delete = None;
         self.restore_new_prompt();
-        cx.emit(LauncherEvent::Closed);
+        cx.emit(event);
         cx.notify();
     }
 
@@ -1084,6 +1093,12 @@ impl LauncherOverlay {
         let Some(id) = self.pending_recipe_activation.clone() else {
             return;
         };
+        // Never launch from a hidden launcher; `close_with` disarms, and
+        // this keeps any path that hides it some other way from spawning.
+        if !self.open {
+            self.pending_recipe_activation = None;
+            return;
+        }
         let Some(recipe) = self.recipes().into_iter().find(|recipe| recipe.id == id) else {
             self.pending_recipe_activation = None;
             self.fallback_notice = Some(t("launcher.recipe.gone").to_owned());
@@ -2246,10 +2261,7 @@ impl LauncherOverlay {
                 .cursor_pointer()
                 .glass_menu_row(colors, false)
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.open = false;
-                    this.picker = None;
-                    cx.emit(LauncherEvent::ManageAgents(host.clone()));
-                    cx.notify();
+                    this.close_with(LauncherEvent::ManageAgents(host.clone()), cx);
                 }))
                 .child(sf_symbol("gearshape", 11.0, colors.secondary))
                 .child(
@@ -3557,12 +3569,8 @@ impl LauncherOverlay {
                                     .text_color(colors.primary)
                                     .cursor_pointer()
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.open = false;
-                                        this.picker = None;
-                                        cx.emit(LauncherEvent::ManageAgents(
-                                            this.selected_host.clone(),
-                                        ));
-                                        cx.notify();
+                                        let host = this.selected_host.clone();
+                                        this.close_with(LauncherEvent::ManageAgents(host), cx);
                                     }))
                                     .child(t("launcher.set_up_agent")),
                             ),
@@ -4714,6 +4722,38 @@ mod tests {
                 launcher.active_recipe.as_ref().unwrap().agent,
                 AgentKind::CODEX
             );
+        });
+    }
+
+    #[gpui::test]
+    fn every_close_disarms_a_pending_recipe_run_and_delete(cx: &mut TestAppContext) {
+        let services = test_services(Arc::new(StoreRuntime::inert()));
+        let (launcher, cx) =
+            cx.add_window_view(move |_window, cx| LauncherOverlay::new(services, false, cx));
+        launcher.update_in(cx, |launcher, window, cx| {
+            launcher.open(window, cx);
+            launcher.selected_root = "/tmp".into();
+            launcher.selected_harness = AgentKind::CODEX;
+            launcher.prompt.insert_multiline("Review");
+            launcher.save_current_recipe(cx);
+            let recipe = launcher.recipes()[0].clone();
+            launcher.activate_recipe(&recipe.id, window, cx);
+            assert!(launcher.pending_recipe_activation.is_some());
+            launcher.request_recipe_delete(&recipe.id, cx);
+            assert!(launcher.pending_recipe_delete.is_some());
+            // "Manage accounts" hides the launcher for Settings.
+            launcher.manage_accounts(cx);
+            assert!(!launcher.open);
+            assert!(
+                launcher.pending_recipe_activation.is_none(),
+                "a hidden launcher must not launch the recipe when its catalog arrives"
+            );
+            launcher.open(window, cx);
+            assert!(
+                launcher.pending_recipe_delete.is_none(),
+                "a reopened launcher needs a fresh confirmation to delete"
+            );
+            assert_eq!(launcher.recipes().len(), 1);
         });
     }
 

@@ -477,12 +477,10 @@ struct Shared {
     last_interaction: AtomicU64,
     /// URLs scanned off the visible screen (PRs, previews, links).
     artifacts: Mutex<Vec<diri_proto::SessionArtifact>>,
-    /// True while the child tree is SIGSTOPped. Writing into a stopped
+    /// Closed while the child tree is SIGSTOPped. Writing into a stopped
     /// tree's PTY wedges (nobody drains the slave; the buffer fills), so
     /// input is queued instead and flushed right after SIGCONT.
-    hibernated: AtomicBool,
-    /// Input received while hibernated, in arrival order.
-    queued_input: Mutex<Vec<u8>>,
+    input_gate: Mutex<InputGate>,
     /// Bytes acknowledged while a deferred launch was pending that never
     /// reached the child (launch failed, or the post-exec flush did not
     /// finish). Zero when nothing was lost.
@@ -1691,7 +1689,9 @@ impl RemoteStop {
         // Preserve terminate's treatment of an already-ended session (its
         // Holder may also be gone). A failed stop of a live session must keep
         // the original tracked owner so another Agent cannot replace it.
-        let exit = stop_remote(&self.shared, &self.client, grace)?;
+        let exit = stop_remote(&self.shared, &self.client, grace);
+        settle_terminate_request(&self.shared, &exit);
+        let exit = exit?;
         self.shared.stop.store(true, Ordering::SeqCst);
         self.client.close();
         Ok(exit)
@@ -1699,6 +1699,20 @@ impl RemoteStop {
 
     pub(crate) fn matches(&self, session: &Session) -> bool {
         Arc::ptr_eq(&self.shared, &session.shared)
+    }
+}
+
+/// A failed stop leaves the session tracked and live, so a later exit is no
+/// longer one Diri asked for: an outside kill must still read as an
+/// interruption. The exception is a stop that timed out after its signals
+/// were delivered (a Holder still escalating TERM to KILL, a child that has
+/// not been reaped after SIGKILL): the exit that follows is this stop's, and
+/// reading it as an outside kill would offer the stopped session back.
+fn settle_terminate_request<T>(shared: &Shared, result: &std::io::Result<T>) {
+    if let Err(error) = result
+        && error.kind() != std::io::ErrorKind::TimedOut
+    {
+        shared.terminate_requested.store(false, Ordering::SeqCst);
     }
 }
 
@@ -1799,6 +1813,18 @@ fn accept_remote_stop_result(
         }
         Err(error) => shared.exit.lock().expect("exit").ok_or(error),
     }
+}
+
+/// Whether input may reach the PTY. One lock covers the gate and its queue,
+/// so a writer's check-and-enqueue cannot interleave with a wake's drain.
+#[derive(Debug, Default)]
+enum InputGate {
+    #[default]
+    Open,
+    /// The tree is (about to be) SIGSTOPped; input queues in arrival order.
+    Frozen(Vec<u8>),
+    /// A wake is flushing the queue; input arriving meanwhile queues behind it.
+    Draining(Vec<u8>),
 }
 
 /// Deferred-launch state: the agent is not exec'd until its size is known
@@ -2229,6 +2255,9 @@ impl Session {
                     mark_remote_transport_failed(&shared);
                     return;
                 }
+                // The reducer refused every signal since the failure; the
+                // reconnected pump's snapshot must be able to move it again.
+                shared.reducer.lock().expect("reducer").transport_restored();
                 pump_remote(shared, engine, client, manifest_id);
             });
         match worker {
@@ -2284,16 +2313,8 @@ impl Session {
             revision: 0,
             pending: None,
         });
-        if let Some((status, needs_input)) = initial_status
-            && shared
-                .reducer
-                .lock()
-                .expect("reducer")
-                .attention_state()
-                .is_none_or(|state| state.sequence == 0)
-        {
-            *shared.status.lock().expect("status") = status;
-            *shared.needs_input.lock().expect("needs input") = needs_input;
+        if let Some((status, needs_input)) = initial_status {
+            seed_adopted_status(&shared, status, needs_input);
         }
         shared
             .reducer
@@ -2607,17 +2628,8 @@ impl Session {
             spec.pty.rows = rows;
         }
         let session = Self::attach(spec, client, floor, engine, false, Some(stat))?;
-        if let Some((status, needs_input)) = initial_status
-            && session
-                .shared
-                .reducer
-                .lock()
-                .expect("reducer")
-                .attention_state()
-                .is_none_or(|state| state.sequence == 0)
-        {
-            *session.shared.status.lock().expect("status") = status;
-            *session.shared.needs_input.lock().expect("needs input") = needs_input;
+        if let Some((status, needs_input)) = initial_status {
+            seed_adopted_status(&session.shared, status, needs_input);
         }
         Ok(session)
     }
@@ -3312,16 +3324,80 @@ impl Session {
     /// Marks the session hibernated (input queues) or awake. On wake, the
     /// queued input flushes in order — right after the caller's SIGCONT, as
     /// the Swift daemon's wake() did.
+    ///
+    /// Close the gate before SIGSTOP. Input arriving while the queue drains
+    /// queues behind it, and the gate opens only once the queue is empty, so
+    /// queued input always reaches the PTY first and in order.
     pub fn set_hibernated(&self, hibernated: bool) -> std::io::Result<()> {
-        self.shared.hibernated.store(hibernated, Ordering::SeqCst);
+        let gate = || self.shared.input_gate.lock().expect("input gate");
         if hibernated {
+            let mut gate = gate();
+            *gate = match std::mem::take(&mut *gate) {
+                InputGate::Open => InputGate::Frozen(Vec::new()),
+                // A drain in flight stops at its next chunk.
+                InputGate::Frozen(queued) | InputGate::Draining(queued) => {
+                    InputGate::Frozen(queued)
+                }
+            };
             return Ok(());
         }
-        let queued = std::mem::take(&mut *self.shared.queued_input.lock().expect("queued input"));
-        if queued.is_empty() {
-            return Ok(());
+        let mut chunk = {
+            let mut gate = gate();
+            match &mut *gate {
+                // Awake already, or another wake owns the drain.
+                InputGate::Open | InputGate::Draining(_) => return Ok(()),
+                InputGate::Frozen(queued) => {
+                    let chunk = std::mem::take(queued);
+                    *gate = InputGate::Draining(Vec::new());
+                    chunk
+                }
+            }
+        };
+        loop {
+            if !chunk.is_empty()
+                && let Err(error) = self.write_ungated(&chunk)
+            {
+                // Nothing can flush a queue behind a broken transport; input
+                // from now on reports the failure itself.
+                *gate() = InputGate::Open;
+                return Err(error);
+            }
+            let mut gate = gate();
+            match &mut *gate {
+                InputGate::Draining(queued) if queued.is_empty() => {
+                    *gate = InputGate::Open;
+                    return Ok(());
+                }
+                InputGate::Draining(queued) => chunk = std::mem::take(queued),
+                // Frozen again mid-drain: the rest waits for the next wake.
+                InputGate::Frozen(_) | InputGate::Open => return Ok(()),
+            }
         }
-        self.write_raw(&queued)
+    }
+
+    /// Writes past the input gate, still honouring a deferred launch's
+    /// queue, which comes first in [`Self::write_raw_kind`] too.
+    fn write_ungated(&self, bytes: &[u8]) -> std::io::Result<()> {
+        if let Some(deferred) = &self.deferred {
+            match deferred.queue_input(bytes) {
+                DeferredInput::Queued => return Ok(()),
+                DeferredInput::LaunchFailed => return Err(launch_failed_input(bytes)),
+                DeferredInput::Launched => {}
+            }
+        }
+        self.write_transport(bytes, false)
+    }
+
+    /// Queues `bytes` behind a closed gate. Returns false when the caller
+    /// writes them to the PTY itself.
+    fn queue_if_gated(&self, bytes: &[u8]) -> bool {
+        match &mut *self.shared.input_gate.lock().expect("input gate") {
+            InputGate::Open => false,
+            InputGate::Frozen(queued) | InputGate::Draining(queued) => {
+                queued.extend_from_slice(bytes);
+                true
+            }
+        }
     }
 
     /// The agent reported its own end (Claude's `SessionEnd` hook). A moment
@@ -3357,7 +3433,10 @@ impl Session {
     }
 
     pub fn is_hibernated(&self) -> bool {
-        self.shared.hibernated.load(Ordering::SeqCst)
+        matches!(
+            *self.shared.input_gate.lock().expect("input gate"),
+            InputGate::Frozen(_)
+        )
     }
 
     /// Signals the whole child tree. For held sessions the holder walks the
@@ -3396,14 +3475,13 @@ impl Session {
                 DeferredInput::Launched => {}
             }
         }
-        if self.shared.hibernated.load(Ordering::SeqCst) {
-            self.shared
-                .queued_input
-                .lock()
-                .expect("queued input")
-                .extend_from_slice(bytes);
+        if self.queue_if_gated(bytes) {
             return Ok(());
         }
+        self.write_transport(bytes, mouse)
+    }
+
+    fn write_transport(&self, bytes: &[u8], mouse: bool) -> std::io::Result<()> {
         match &self.transport {
             Transport::Direct(pty) => {
                 use std::io::Write;
@@ -3519,14 +3597,9 @@ impl Session {
                 DeferredInput::Launched => {}
             }
         }
-        if self.shared.hibernated.load(Ordering::SeqCst) {
+        if self.queue_if_gated(bytes) {
             // Never write into a stopped tree's PTY (nobody drains the slave;
             // the buffer fills and writes wedge) — queue for the wake flush.
-            self.shared
-                .queued_input
-                .lock()
-                .expect("queued input")
-                .extend_from_slice(bytes);
             self.feed_signal(StatusSignal::UserKeystroke);
             return Ok(());
         }
@@ -3890,6 +3963,12 @@ impl Session {
         self.shared
             .terminate_requested
             .store(true, Ordering::SeqCst);
+        let result = self.stop_incarnation(grace);
+        settle_terminate_request(&self.shared, &result);
+        result
+    }
+
+    fn stop_incarnation(&mut self, grace: Duration) -> std::io::Result<Exit> {
         // Killed before the deferred exec: there is no child. Cancel wakes
         // the launcher (which double-checks under the same lock, killing a
         // child it raced into existence), and the session records a kill.
@@ -3901,8 +3980,9 @@ impl Session {
                 let _ = pump.join();
                 self.shared.held_pump.wait_ended();
             }
-            self.shared.exited.store(true, Ordering::SeqCst);
-            return Ok(Exit::Signal(diri_platform::signals::SIGKILL));
+            let exit = Exit::Signal(diri_platform::signals::SIGKILL);
+            conclude_exit(&self.shared, Some(exit), exit_facts(Some(exit)), false);
+            return Ok(exit);
         }
         let exit = match &self.transport {
             Transport::Direct(pty) => terminate_direct(pty, grace)?,
@@ -4103,8 +4183,7 @@ fn new_shared(
         last_hot: AtomicU64::new(unix_secs()),
         last_interaction: AtomicU64::new(0),
         artifacts: Mutex::new(Vec::new()),
-        hibernated: AtomicBool::new(false),
-        queued_input: Mutex::new(Vec::new()),
+        input_gate: Mutex::new(InputGate::Open),
         lost_launch_input: std::sync::atomic::AtomicU64::new(0),
         child_pid: std::sync::atomic::AtomicI32::new(0),
         remote_grid: Mutex::new(None),
@@ -4369,10 +4448,10 @@ fn apply(shared: &Shared, outcome: &ReducerOutcome) {
     // meaning, so an emitted value always warrants a record/UI refresh.
     changed |= outcome.status_evidence.is_some();
     // Leaving a needs-input state clears the pending detail, so the UI does not
-    // keep showing a prompt that has been answered.
+    // keep showing a prompt that has been answered, or one whose process died.
     if matches!(
         outcome.status_change,
-        Some(SessionStatus::Working) | Some(SessionStatus::Idle)
+        Some(SessionStatus::Working | SessionStatus::Idle | SessionStatus::Exited(_))
     ) {
         let mut current = shared.needs_input.lock().expect("needs input");
         if current.is_some() {
@@ -5730,6 +5809,29 @@ fn apply_remote_delta(shared: &Shared, delta: GridDelta) -> std::io::Result<()> 
     Ok(())
 }
 
+/// Seeds an adopted session from its persisted record when attention state
+/// did not already seed it. The reducer and the published status take the
+/// seed together, under the reducer lock, so a later signal moves the
+/// reducer from the status the user sees, not from a stale `Starting`.
+fn seed_adopted_status(
+    shared: &Shared,
+    status: SessionStatus,
+    needs_input: Option<NeedsInputDetail>,
+) {
+    let mut reducer = shared.reducer.lock().expect("reducer");
+    if reducer
+        .attention_state()
+        .is_some_and(|state| state.sequence != 0)
+    {
+        return;
+    }
+    if !reducer.seed(&status, needs_input.as_ref()) {
+        return;
+    }
+    *shared.status.lock().expect("status") = status;
+    *shared.needs_input.lock().expect("needs input") = needs_input;
+}
+
 fn set_remote_connection(shared: &Shared, state: diri_proto::RemoteConnectionState) {
     // Reuse the existing mirror lock only at lifecycle transitions. Silent
     // sessions create no timer, new SSH operation, or repeated status event.
@@ -5793,17 +5895,7 @@ fn record_remote_exit(shared: &Shared, exit: ProcessExit) {
         (Some(code), None) => Exit::Code(code),
         (None, None) => Exit::Code(-1),
     };
-    *shared.exit.lock().expect("exit") = Some(local);
-    let outcome = shared.reducer.lock().expect("reducer").reduce(
-        StatusSignal::ProcessExit {
-            code: exit.code,
-            signal: exit.signal,
-            interrupted: false,
-        },
-        SystemTime::now(),
-    );
-    apply(shared, &outcome);
-    shared.exited.store(true, Ordering::SeqCst);
+    conclude_exit(shared, Some(local), (exit.code, exit.signal), false);
     set_remote_connection(shared, diri_proto::RemoteConnectionState::Exited);
     record_exit_telemetry(shared);
 }
@@ -6017,23 +6109,8 @@ fn pump(
 
     // The stream ended: reap the child and record how it died.
     let exit = reap_direct(&shared, &pty, &mut reader, &mut buffer);
-    *shared.exit.lock().expect("exit") = exit;
-    let (code, signal) = match exit {
-        Some(Exit::Code(code)) => (Some(code), None),
-        Some(Exit::Signal(signal)) => (None, Some(signal)),
-        None => (None, None),
-    };
     let interrupted = interrupted_exit(&shared, exit);
-    let outcome = shared.reducer.lock().expect("reducer").reduce(
-        StatusSignal::ProcessExit {
-            code,
-            signal,
-            interrupted,
-        },
-        SystemTime::now(),
-    );
-    apply(&shared, &outcome);
-    shared.exited.store(true, Ordering::SeqCst);
+    conclude_exit(&shared, exit, exit_facts(exit), interrupted);
     record_exit_telemetry(&shared);
     let _ = shared.log.lock().expect("log").flush();
 }
@@ -7667,21 +7744,7 @@ fn held_turn(state: Box<HeldPump>, mut resumed: bool, may_park: bool) -> HeldTur
         *shared.completed.lock().expect("completed capture") =
             Some(CompletedCapture { checkpoint, exit });
     }
-    let (code, signal) = match exit {
-        Some(Exit::Code(code)) => (Some(code), None),
-        Some(Exit::Signal(signal)) => (None, Some(signal)),
-        None => (None, None),
-    };
-    let outcome = shared.reducer.lock().expect("reducer").reduce(
-        StatusSignal::ProcessExit {
-            code,
-            signal,
-            interrupted,
-        },
-        SystemTime::now(),
-    );
-    apply(&shared, &outcome);
-    shared.exited.store(true, Ordering::SeqCst);
+    conclude_exit(&shared, exit, exit_facts(exit), interrupted);
     record_exit_telemetry(&shared);
     HeldTurn::Done
 }
@@ -8015,12 +8078,34 @@ fn mark_launch_failed(shared: &Shared, stage: &'static str, error: &crate::holde
     );
     // Already reported as a launch failure, not as an early exit.
     shared.exit_recorded.store(true, Ordering::SeqCst);
-    *shared.exit.lock().expect("exit") = Some(Exit::Code(127));
+    let exit = Some(Exit::Code(127));
+    conclude_exit(shared, exit, exit_facts(exit), false);
+}
+
+/// How a child's exit reads to the reducer.
+fn exit_facts(exit: Option<Exit>) -> (Option<i32>, Option<i32>) {
+    match exit {
+        Some(Exit::Code(code)) => (Some(code), None),
+        Some(Exit::Signal(signal)) => (None, Some(signal)),
+        None => (None, None),
+    }
+}
+
+/// The one exit transition, in the order observers rely on: the exit facts,
+/// the reducer's absorbing Exited status and its projection, and only then
+/// the `exited` flag that `terminate` and the pumps poll.
+fn conclude_exit(
+    shared: &Shared,
+    exit: Option<Exit>,
+    (code, signal): (Option<i32>, Option<i32>),
+    interrupted: bool,
+) {
+    *shared.exit.lock().expect("exit") = exit;
     let outcome = shared.reducer.lock().expect("reducer").reduce(
         StatusSignal::ProcessExit {
-            code: Some(127),
-            signal: None,
-            interrupted: false,
+            code,
+            signal,
+            interrupted,
         },
         SystemTime::now(),
     );
@@ -10846,5 +10931,127 @@ mod deferred_input_loss_tests {
             .and_then(|cause| cause.downcast_ref::<PartialInputDelivery>())
             .expect("a delivery count");
         assert_eq!((partial.delivered, partial.total), (0, 4));
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_transition_tests {
+    use super::*;
+
+    fn engine() -> Arc<ManifestEngine> {
+        let (engine, _) = ManifestEngine::load_dir(&crate::detect::bundled_manifest_dir()).unwrap();
+        Arc::new(engine)
+    }
+
+    fn unreachable_held(temp: &Path, deferred: bool) -> Session {
+        let spec = SessionSpec {
+            id: "held".into(),
+            pty: PtySpec::new(vec!["/bin/sh".into()], "/tmp"),
+            manifest_id: "shell".into(),
+            authority: Authority::ProcessOnly,
+            logs_dir: temp.to_path_buf(),
+            holder: None,
+            remote: None,
+            defer_launch: deferred,
+        };
+        Session {
+            shared: new_shared(
+                &spec,
+                OutputLog::writer(temp, &spec.id).unwrap(),
+                &engine(),
+                true,
+            ),
+            transport: Transport::Held(HolderClient::new(temp.join("unused.sock"))),
+            pump: None,
+            manifest_id: spec.manifest_id.clone(),
+            deferred: deferred.then(|| Arc::new(DeferredLaunch::new())),
+        }
+    }
+
+    #[test]
+    fn a_failed_stop_does_not_claim_the_next_exit() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = unreachable_held(temp.path(), false);
+        assert!(session.terminate(Duration::ZERO).is_err());
+        assert!(
+            !session.shared.terminate_requested.load(Ordering::SeqCst),
+            "an outside kill after a failed stop must still read as an interruption"
+        );
+        assert!(interrupted_exit(
+            &session.shared,
+            Some(Exit::Signal(diri_platform::signals::SIGKILL))
+        ));
+    }
+
+    #[test]
+    fn a_cancelled_deferred_launch_exits_like_any_other_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = unreachable_held(temp.path(), true);
+        let exit = session.terminate(Duration::ZERO).unwrap();
+        assert!(session.shared.exited.load(Ordering::SeqCst));
+        assert_eq!(*session.shared.exit.lock().unwrap(), Some(exit));
+        assert!(matches!(
+            session.status(),
+            SessionStatus::Exited(diri_proto::ExitInfo {
+                interrupted: false,
+                ..
+            })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn input_queued_while_frozen_reaches_the_pty_before_later_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let out = temp.path().join("typed");
+        let spec = SessionSpec {
+            id: "gate".into(),
+            pty: PtySpec::new(
+                vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!("stty -echo; exec cat > '{}'", out.display()),
+                ],
+                "/tmp",
+            )
+            .env("PATH", "/usr/bin:/bin")
+            .size(80, 24),
+            manifest_id: "shell".into(),
+            authority: Authority::ProcessOnly,
+            logs_dir: temp.path().to_path_buf(),
+            holder: None,
+            remote: None,
+            defer_launch: false,
+        };
+        let mut session = Session::spawn(spec, engine()).expect("spawn");
+        session.set_hibernated(true).unwrap();
+        assert!(session.is_hibernated());
+        session.write_input(b"one\n").unwrap();
+        // A wake is mid-drain: input arriving now must queue behind what is
+        // still being flushed, never overtake it.
+        {
+            let mut gate = session.shared.input_gate.lock().unwrap();
+            let InputGate::Frozen(queued) = std::mem::take(&mut *gate) else {
+                panic!("the gate was not frozen");
+            };
+            *gate = InputGate::Draining(queued);
+        }
+        assert!(!session.is_hibernated());
+        session.write_input(b"two\n").unwrap();
+        assert!(!out.exists() || std::fs::read(&out).unwrap().is_empty());
+        // Re-freezing mid-drain keeps everything queued, in order.
+        session.set_hibernated(true).unwrap();
+        session.set_hibernated(false).unwrap();
+        session.write_input(b"three\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let typed = std::fs::read_to_string(&out).unwrap_or_default();
+            if typed == "one\ntwo\nthree\n" {
+                break;
+            }
+            assert!(Instant::now() < deadline, "typed {typed:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        session.terminate(Duration::from_secs(1)).unwrap();
     }
 }

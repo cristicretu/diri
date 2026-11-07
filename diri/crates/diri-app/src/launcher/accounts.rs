@@ -104,10 +104,7 @@ impl LauncherOverlay {
     }
 
     pub(super) fn manage_accounts(&mut self, cx: &mut Context<Self>) {
-        self.open = false;
-        self.picker = None;
-        cx.emit(LauncherEvent::ManageAccounts);
-        cx.notify();
+        self.close_with(LauncherEvent::ManageAccounts, cx);
     }
 
     pub(super) fn show_account_picker(&self) -> bool {
