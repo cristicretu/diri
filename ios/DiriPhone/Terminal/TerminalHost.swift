@@ -1,3 +1,4 @@
+import Network
 import SwiftUI
 import UIKit
 
@@ -14,6 +15,28 @@ final class TerminalRegistry {
     private var order: [String] = []
     /// Terminals kept warm. Each is a few MB of scrollback at most.
     private let keep = 8
+    private var active: String?
+    private let pathMonitor = NWPathMonitor()
+    private var lastPath: (interfaces: [String], satisfied: Bool)?
+
+    private init() {
+        // A network change (Wi-Fi to cellular, a tailnet reconnect) often
+        // leaves the stream's socket open but dead. Reconnect the terminal on
+        // screen at once; resume makes that cost only the rows that changed.
+        pathMonitor.pathUpdateHandler = { path in
+            let interfaces = path.availableInterfaces.map(\.name)
+            let satisfied = path.status == .satisfied
+            Task { @MainActor in TerminalRegistry.shared.pathChanged(interfaces: interfaces, satisfied: satisfied) }
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "diri.terminal.path"))
+    }
+
+    private func pathChanged(interfaces: [String], satisfied: Bool) {
+        defer { lastPath = (interfaces, satisfied) }
+        // The first callback reports the path as it already is.
+        guard let lastPath, satisfied, lastPath.interfaces != interfaces || !lastPath.satisfied else { return }
+        if let active { sessions[active]?.reconnectNow() }
+    }
 
     func session(for id: String, client: DiriClient) -> TerminalSession {
         if let existing = sessions[id] { return existing }
@@ -33,13 +56,17 @@ final class TerminalRegistry {
 
     func existingView(_ id: String) -> TerminalView? { views[id] }
 
+    func existingSession(_ id: String) -> TerminalSession? { sessions[id] }
+
     /// Makes `id` the live terminal: it streams, the others pause.
     func activate(_ id: String) {
+        active = id
         for (other, session) in sessions where other != id { session.stop() }
         sessions[id]?.start()
     }
 
     func deactivateAll() {
+        active = nil
         for session in sessions.values { session.stop() }
     }
 

@@ -641,9 +641,13 @@ async fn handle(stream: TcpStream, peer: SocketAddr, api: Arc<Api>) -> std::io::
                 return Ok(());
             }
             let id = diri_proto::SessionId((*id).to_owned());
+            let resume = request
+                .query
+                .get("resume")
+                .and_then(|raw| terminal::Resume::parse(raw));
             return until_revoked(
                 guard,
-                stream_terminal(&mut reader, &mut write_half, &api, id),
+                stream_terminal(&mut reader, &mut write_half, &api, id, resume),
             )
             .await;
         }
@@ -680,6 +684,9 @@ async fn respond(request: &Request, api: &Api) -> Response {
             "application/manifest+json; charset=utf-8",
             ui::MANIFEST,
         ),
+        ("GET" | "HEAD", "/term.js") => {
+            Response::text(200, "text/javascript; charset=utf-8", ui::TERMINAL_JS)
+        }
         ("GET" | "HEAD", "/icon.svg") => {
             Response::text(200, "image/svg+xml; charset=utf-8", ui::ICON_SVG)
         }
@@ -697,6 +704,7 @@ async fn stream_terminal<R, W>(
     writer: &mut W,
     api: &Api,
     session: diri_proto::SessionId,
+    resume: Option<terminal::Resume>,
 ) -> std::io::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -724,6 +732,7 @@ where
         session,
         events,
         out,
+        resume,
     ));
     let _abort = AbortOnDrop(task);
     let mut scratch = [0_u8; 512];
@@ -1550,6 +1559,614 @@ mod tests {
             assert!(command(&args(&["pair", "devices"])).is_err());
             let revoke = parse(&args(&["revoke", "nPhone", "--label", "x"])).unwrap();
             assert_eq!(revoke.host_label, "x");
+        }
+    }
+
+    /// A fake Engine behind a real gateway, for driving the iPhone app in the
+    /// Simulator (PR screenshots and `DiriPhoneUITests/TerminalFixtureTests`).
+    ///
+    /// Opt-in and long-running: it serves until `quit` is written to the
+    /// control file, or for 30 minutes.
+    ///
+    /// ```sh
+    /// DIRI_PHONE_FIXTURE_DIR=/tmp/phone-fixture \
+    ///   cargo test -p diri-web phone_fixture -- --ignored --nocapture
+    /// ```
+    ///
+    /// It writes `url` (the pairing link, loopback only) into that directory,
+    /// appends every keystroke batch the phone sends to `typed`, and polls
+    /// `control` for commands: `diff ROW TEXT`, `drop` (the Engine side of the
+    /// stream goes away and comes back with one row changed, as after a lost
+    /// connection), `history N`, `quit`. Nothing outlives the test.
+    #[cfg(unix)]
+    mod phone_fixture {
+        use super::*;
+        use diri_proto::Method;
+        use diri_proto::grid::{
+            ChangedRow, GridCell, GridRowCodec, GridUpdate, TermColor, TermStyle,
+        };
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        const COLS: u16 = 64;
+        const ROWS: u16 = 30;
+        static HISTORY: AtomicI64 = AtomicI64::new(1_200);
+
+        type Span<'a> = (&'a str, TermColor, TermColor, TermStyle);
+
+        const D: TermColor = TermColor::Default;
+        const BG: TermColor = TermColor::DefaultInverted;
+        const N: TermStyle = TermStyle::empty();
+
+        fn wide(ch: char) -> bool {
+            matches!(u32::from(ch), 0x1100..=0x115F | 0x2E80..=0xA4CF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF | 0xFF00..=0xFF60 | 0x1F300..=0x1FAFF)
+        }
+
+        fn row(spans: &[Span<'_>]) -> Vec<GridCell> {
+            let mut cells = Vec::new();
+            for (text, fg, bg, style) in spans {
+                for ch in text.chars() {
+                    cells.push(GridCell::new(u32::from(ch), *fg, *bg, *style));
+                    if wide(ch) {
+                        cells.push(GridCell::new(0, *fg, *bg, *style | TermStyle::WIDE_SPACER));
+                    }
+                }
+            }
+            cells.truncate(usize::from(COLS));
+            cells.resize(usize::from(COLS), GridCell::BLANK);
+            cells
+        }
+
+        fn plain(text: &str) -> Vec<GridCell> {
+            row(&[(text, D, BG, N)])
+        }
+
+        /// A Claude Code–like screen: a boxed header, tool calls, a coloured
+        /// diff, CJK and emoji, a permission question and the prompt.
+        fn screen(variant: &str) -> Vec<Vec<GridCell>> {
+            let orange = TermColor::Rgb(0xD9, 0x77, 0x57);
+            let grey = TermColor::Ansi(8);
+            let green = TermColor::Ansi(2);
+            let red = TermColor::Ansi(1);
+            let add_bg = TermColor::Rgb(0x12, 0x3A, 0x1E);
+            let del_bg = TermColor::Rgb(0x4A, 0x16, 0x18);
+            let bar = "─".repeat(usize::from(COLS) - 2);
+            let top = format!("╭{bar}╮");
+            let bottom = format!("╰{bar}╯");
+            let mut rows = vec![
+                row(&[(&top, orange, BG, N)]),
+                row(&[
+                    ("│ ", orange, BG, N),
+                    ("✻ Welcome to Claude Code!", D, BG, TermStyle::BOLD),
+                    (&format!("{:>37}│", ""), orange, BG, N),
+                ]),
+                row(&[(&bottom, orange, BG, N)]),
+                plain(""),
+                row(&[("> ", grey, BG, N), ("fix the flaky resume test", D, BG, N)]),
+                plain(""),
+                row(&[
+                    ("⏺ ", green, BG, N),
+                    ("Read", D, BG, TermStyle::BOLD),
+                    ("(diri-web/src/terminal.rs)", grey, BG, N),
+                ]),
+                row(&[
+                    ("  ⎿  ", grey, BG, N),
+                    ("Read 960 lines", grey, BG, TermStyle::DIM),
+                ]),
+                plain(""),
+                row(&[
+                    ("⏺ ", green, BG, N),
+                    ("Update", D, BG, TermStyle::BOLD),
+                    ("(src/terminal.rs)", grey, BG, N),
+                ]),
+                row(&[
+                    ("  ⎿  Updated ", grey, BG, N),
+                    ("src/terminal.rs", D, BG, TermStyle::BOLD),
+                    (" with 2 additions", grey, BG, N),
+                ]),
+                row(&[
+                    ("      412 ", grey, BG, N),
+                    ("-        if from.cols != self.cols {", red, del_bg, N),
+                ]),
+                row(&[
+                    ("      412 ", grey, BG, N),
+                    ("+        if from.cols != self.cols", green, add_bg, N),
+                ]),
+                row(&[
+                    ("      413 ", grey, BG, N),
+                    ("+            || from.rows != self.rows {", green, add_bg, N),
+                ]),
+                plain(""),
+                row(&[
+                    ("⏺ ", green, BG, N),
+                    ("测试通过 — tests pass ✅ 🎉 ", D, BG, N),
+                    ("(76 passed)", green, BG, TermStyle::ITALIC),
+                ]),
+                row(&[
+                    ("  ", D, BG, N),
+                    ("underline", D, BG, TermStyle::UNDERLINE),
+                    (" ", D, BG, N),
+                    ("strike", D, BG, TermStyle::CROSSED_OUT),
+                    (" ", D, BG, N),
+                    (" inverse ", D, BG, TermStyle::INVERSE),
+                    (" ", D, BG, N),
+                    ("bold", TermColor::Ansi(4), BG, TermStyle::BOLD),
+                ]),
+                plain(""),
+                row(&[(&top, TermColor::Ansi(3), BG, N)]),
+                row(&[
+                    ("│ ", TermColor::Ansi(3), BG, N),
+                    (
+                        "Do you want to run cargo test -p diri-web?",
+                        D,
+                        BG,
+                        TermStyle::BOLD,
+                    ),
+                ]),
+                row(&[
+                    ("│ ", TermColor::Ansi(3), BG, N),
+                    ("❯ 1. Yes", TermColor::Ansi(6), BG, N),
+                ]),
+                row(&[
+                    ("│ ", TermColor::Ansi(3), BG, N),
+                    ("  2. Yes, and don't ask again", D, BG, N),
+                ]),
+                row(&[
+                    ("│ ", TermColor::Ansi(3), BG, N),
+                    ("  3. No, and tell Claude what to do differently", D, BG, N),
+                ]),
+                row(&[(&bottom, TermColor::Ansi(3), BG, N)]),
+                plain(""),
+                row(&[("▌", orange, BG, N), (variant, grey, BG, N)]),
+            ];
+            rows.resize(usize::from(ROWS), plain(""));
+            rows
+        }
+
+        fn grid(full: bool, rows: Vec<(u16, Vec<GridCell>)>) -> GridUpdate {
+            GridUpdate {
+                cols: COLS,
+                rows: ROWS,
+                cursor_col: 2,
+                cursor_row: 25,
+                cursor_visible: true,
+                is_full_snapshot: full,
+                changed_rows: rows
+                    .into_iter()
+                    .map(|(y, cells)| ChangedRow::new(y, cells))
+                    .collect(),
+                cursor_style: Default::default(),
+                history: None,
+            }
+        }
+
+        fn scrollback(params: Option<&serde_json::Value>) -> serde_json::Value {
+            let params = params.cloned().unwrap_or_default();
+            let history = HISTORY.load(Ordering::Relaxed);
+            let total = history + i64::from(ROWS);
+            let first = params["firstRow"].as_i64().unwrap_or(0).clamp(0, total);
+            let end = (first + params["maxRows"].as_i64().unwrap_or(0)).min(total);
+            let rows: Vec<Vec<GridCell>> = (first..end)
+                .map(|n| {
+                    let colour = TermColor::Ansi((n % 6 + 1) as u8);
+                    row(&[
+                        (&format!("{n:>5} "), TermColor::Ansi(8), BG, N),
+                        ("compiling ", colour, BG, N),
+                        (
+                            &format!("crate-{} v0.{}.{}", n % 97, n % 13, n % 7),
+                            D,
+                            BG,
+                            N,
+                        ),
+                    ])
+                })
+                .collect();
+            serde_json::to_value(diri_proto::ReadScrollbackCellsResult {
+                metadata: Vec::new(),
+                payload: GridRowCodec::encode_rows(&rows).unwrap(),
+                first_row: first,
+                row_count: end - first,
+                total_rows: total,
+                live_start_row: history,
+                cols: i64::from(COLS),
+                content_seq: 1,
+            })
+            .unwrap()
+        }
+
+        fn sessions() -> serde_json::Value {
+            let now = 1_798_000_000_000_i64;
+            let record = |id: &str,
+                          kind: serde_json::Value,
+                          title: &str,
+                          status: serde_json::Value,
+                          extra: serde_json::Value| {
+                let mut value = json!({
+                    "id": id, "kind": kind, "cwd": "/Users/me/code/diri", "projectID": "p_diri",
+                    "gitBranch": "phone/terminal", "title": title, "titleSource": 6,
+                    "status": status, "resumability": "live", "createdAt": now, "updatedAt": now,
+                    "pinned": false,
+                });
+                if let (Some(object), Some(more)) = (value.as_object_mut(), extra.as_object()) {
+                    object.extend(more.clone());
+                }
+                value
+            };
+            let needs = json!({
+                "kind": "permission", "source": "screen", "toolName": "Bash",
+                "summary": "Run cargo test -p diri-web?", "promptExcerpt": "Do you want to run cargo test -p diri-web?",
+                "options": ["Yes", "Yes, and don't ask again", "No"], "riskHint": "unknown", "occurredAt": now,
+            });
+            let list = json!([
+                record(
+                    "s_claude",
+                    json!({"claudeCode": {}}),
+                    "Fix the flaky resume test",
+                    json!({"needsInput": {"_0": "permission"}}),
+                    json!({"needsInput": needs})
+                ),
+                record(
+                    "s_codex",
+                    json!({"codex": {}}),
+                    "Port the key row",
+                    json!({"working": {}}),
+                    json!({})
+                ),
+                record(
+                    "s_shell",
+                    json!({"shell": {}}),
+                    "zsh",
+                    json!({"idle": {}}),
+                    json!({})
+                ),
+            ]);
+            for value in list.as_array().unwrap() {
+                serde_json::from_value::<diri_proto::SessionRecord>(value.clone())
+                    .unwrap_or_else(|error| panic!("fixture record: {error}"));
+            }
+            json!({"sessions": list, "projects": [{"id": "p_diri", "name": "diri", "root": "/Users/me/code/diri"}]})
+        }
+
+        async fn seed(stream: &mut diri_platform::ipc::asynchronous::UnixStream, variant: &str) {
+            let rows = screen(variant)
+                .into_iter()
+                .enumerate()
+                .map(|(y, cells)| (y as u16, cells))
+                .collect();
+            stream
+                .write_all(&grid_frame(&grid(true, rows)))
+                .await
+                .unwrap();
+            let modes = diri_proto::frames::Frame::modes_with_bracketed_paste(
+                false,
+                true,
+                diri_proto::terminal::MouseModes::OFF,
+            );
+            stream
+                .write_all(&diri_proto::frames::FrameCodec::encode(&modes).unwrap())
+                .await
+                .unwrap();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "serves a fixture for the iPhone Simulator: DIRI_PHONE_FIXTURE_DIR"]
+        async fn phone_fixture() {
+            let dir = std::path::PathBuf::from(
+                std::env::var("DIRI_PHONE_FIXTURE_DIR").expect("DIRI_PHONE_FIXTURE_DIR"),
+            );
+            std::fs::create_dir_all(&dir).unwrap();
+            let listed = sessions();
+            let mut engine = crate::testing::fake_engine(move |method, params| match method {
+                Method::EVENTS_SUBSCRIBE => json!({"subscribed": true}),
+                Method::SESSION_LIST => listed.clone(),
+                Method::SESSION_READ_SCROLLBACK_CELLS => scrollback(params),
+                _ => json!({}),
+            })
+            .await;
+            let port: u16 = std::env::var("DIRI_PHONE_FIXTURE_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(7391);
+            let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+            let auth = Auth::temporary().unwrap();
+            let url = format!("http://127.0.0.1:{port}/?token={}", auth.token());
+            let api = Arc::new(Api {
+                client: Arc::clone(&engine.client),
+                auth,
+                host_label: "fixture-mac".into(),
+                inputs: Default::default(),
+                tailnet: None,
+            });
+            let server = tokio::spawn(serve_connections(listener, api));
+            std::fs::write(dir.join("url"), &url).unwrap();
+            let control = dir.join("control");
+            std::fs::write(&control, "").unwrap();
+            let typed = dir.join("typed");
+            std::fs::write(&typed, "").unwrap();
+            eprintln!("phone fixture: {url}");
+
+            // Previews by session; the newest wins.
+            let mut previews: std::collections::HashMap<
+                String,
+                diri_platform::ipc::asynchronous::UnixStream,
+            > = Default::default();
+            let mut handled = 0usize;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1800);
+            let mut generation = 0u32;
+            loop {
+                tokio::select! {
+                    Some((id, mut stream)) = engine.previews.recv() => {
+                        seed(&mut stream, &format!(" stream {generation}")).await;
+                        previews.insert(id, stream);
+                    }
+                    Some((method, params)) = engine.calls.recv() => {
+                        if method == Method::SESSION_SEND_TEXT {
+                            let text = params.as_ref().and_then(|p| p["text"].as_str()).unwrap_or_default().to_owned();
+                            let escaped: String = text.chars().flat_map(char::escape_default).collect();
+                            let mut file = std::fs::OpenOptions::new().append(true).open(&typed).unwrap();
+                            std::io::Write::write_all(&mut file, format!("{escaped}\n").as_bytes()).unwrap();
+                        }
+                    }
+                    () = tokio::time::sleep(Duration::from_millis(200)) => {
+                        let commands = std::fs::read_to_string(&control).unwrap_or_default();
+                        let lines: Vec<String> = commands.lines().map(str::to_owned).collect();
+                        for command in lines.iter().skip(handled) {
+                            let mut words = command.splitn(3, ' ');
+                            match (words.next(), words.next(), words.next()) {
+                                (Some("quit"), _, _) => {
+                                    server.abort();
+                                    return;
+                                }
+                                (Some("diff"), Some(y), text) => {
+                                    let y: u16 = y.parse().unwrap_or(0);
+                                    for stream in previews.values_mut() {
+                                        let _ = stream.write_all(&grid_frame(&grid(false, vec![(y, plain(text.unwrap_or("")))]))).await;
+                                    }
+                                }
+                                (Some("history"), Some(n), _) => {
+                                    HISTORY.store(n.parse().unwrap_or(1_200), Ordering::Relaxed);
+                                }
+                                (Some("drop"), _, _) => {
+                                    generation += 1;
+                                    previews.clear();
+                                }
+                                _ => eprintln!("phone fixture: unknown command {command:?}"),
+                            }
+                        }
+                        handled = lines.len();
+                        if tokio::time::Instant::now() > deadline {
+                            server.abort();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The browser terminal end to end in real headless browsers (Chromium
+    /// with touch and phone metrics, then WebKit): render, key row and
+    /// typing, a diff, touch scrolling into paged history, a dropped stream
+    /// that resumes with only the changed row, and exit.
+    ///
+    /// Opt-in: needs `node` and an installed `playwright-core` whose
+    /// browsers are installed, named by `DIRI_WEB_PLAYWRIGHT`:
+    ///
+    /// ```sh
+    /// npm install --prefix /tmp/pw playwright-core && npx --prefix /tmp/pw playwright-core install chromium-headless-shell webkit
+    /// DIRI_WEB_PLAYWRIGHT=/tmp/pw/node_modules/playwright-core \
+    ///   cargo test -p diri-web browser_terminal -- --ignored
+    /// ```
+    ///
+    /// Headless only; nothing opens on screen. Everything it starts (fake
+    /// Engine, gateway, node, browsers) ends with the test.
+    #[cfg(unix)]
+    mod browser_terminal {
+        use super::*;
+        use diri_proto::Method;
+        use diri_proto::grid::{
+            ChangedRow, GridCell, GridRowCodec, GridUpdate, TermColor, TermStyle,
+        };
+        use tokio::io::{AsyncBufReadExt as _, BufReader as TokioBufReader};
+
+        const COLS: u16 = 40;
+        const ROWS: u16 = 10;
+        const HISTORY: i64 = 500;
+
+        fn cells(text: &str, fg: TermColor, style: TermStyle) -> Vec<GridCell> {
+            let mut cells: Vec<GridCell> = text
+                .chars()
+                .map(|ch| GridCell::new(ch as u32, fg, TermColor::DefaultInverted, style))
+                .collect();
+            cells.resize(usize::from(COLS), GridCell::BLANK);
+            cells
+        }
+
+        fn grid(full: bool, rows: &[(u16, &str)]) -> GridUpdate {
+            GridUpdate {
+                cols: COLS,
+                rows: ROWS,
+                cursor_col: 3,
+                cursor_row: 1,
+                cursor_visible: true,
+                is_full_snapshot: full,
+                changed_rows: rows
+                    .iter()
+                    .map(|(y, text)| {
+                        let (fg, style) = if *y == 0 {
+                            (TermColor::Ansi(1), TermStyle::BOLD)
+                        } else {
+                            (TermColor::Default, TermStyle::empty())
+                        };
+                        ChangedRow::new(*y, cells(text, fg, style))
+                    })
+                    .collect(),
+                cursor_style: Default::default(),
+                history: None,
+            }
+        }
+
+        fn scrollback(params: Option<&serde_json::Value>) -> serde_json::Value {
+            let params = params.cloned().unwrap_or_default();
+            let total = HISTORY + i64::from(ROWS);
+            let first = params["firstRow"].as_i64().unwrap_or(0).clamp(0, total);
+            let end = (first + params["maxRows"].as_i64().unwrap_or(0)).min(total);
+            let rows: Vec<Vec<GridCell>> = (first..end)
+                .map(|n| cells(&format!("row {n}"), TermColor::Default, TermStyle::empty()))
+                .collect();
+            serde_json::to_value(diri_proto::ReadScrollbackCellsResult {
+                metadata: Vec::new(),
+                payload: GridRowCodec::encode_rows(&rows).unwrap(),
+                first_row: first,
+                row_count: end - first,
+                total_rows: total,
+                live_start_row: HISTORY,
+                cols: i64::from(COLS),
+                content_seq: 1,
+            })
+            .unwrap()
+        }
+
+        async fn seed(preview: &mut UnixStream, rows: &[(u16, &str)]) {
+            preview
+                .write_all(&grid_frame(&grid(true, rows)))
+                .await
+                .unwrap();
+            let modes = diri_proto::frames::Frame::modes_with_bracketed_paste(
+                false,
+                true,
+                diri_proto::terminal::MouseModes::OFF,
+            );
+            preview
+                .write_all(&diri_proto::frames::FrameCodec::encode(&modes).unwrap())
+                .await
+                .unwrap();
+        }
+
+        use diri_platform::ipc::asynchronous::UnixStream;
+
+        async fn next_preview(engine: &mut crate::testing::FakeEngine) -> UnixStream {
+            tokio::time::timeout(Duration::from_secs(15), engine.previews.recv())
+                .await
+                .expect("the page opened a stream")
+                .expect("engine alive")
+                .1
+        }
+
+        async fn typed(engine: &mut crate::testing::FakeEngine, expected: &str) -> String {
+            let mut text = String::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while text.len() < expected.len() {
+                let Ok(Some((method, params))) =
+                    tokio::time::timeout_at(deadline, engine.calls.recv()).await
+                else {
+                    break;
+                };
+                if method == Method::SESSION_SEND_TEXT {
+                    text.push_str(params.unwrap()["text"].as_str().unwrap());
+                }
+            }
+            text
+        }
+
+        async fn drive(browser: &str, playwright: &str) {
+            let mut engine = crate::testing::fake_engine(|method, params| match method {
+                Method::EVENTS_SUBSCRIBE => json!({"subscribed": true}),
+                Method::SESSION_LIST => json!({"sessions": [], "projects": []}),
+                Method::SESSION_READ_SCROLLBACK_CELLS => scrollback(params),
+                _ => json!({}),
+            })
+            .await;
+            let (address, token, server) = serve_engine(&engine).await;
+            let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/browser/terminal.mjs");
+            let mut node = tokio::process::Command::new("node")
+                .arg(script)
+                .args([format!("http://{address}"), token, browser.to_owned()])
+                .env("DIRI_WEB_PLAYWRIGHT", playwright)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("node runs");
+            let mut replies = node.stdin.take().unwrap();
+            let mut lines = TokioBufReader::new(node.stdout.take().unwrap()).lines();
+            let mut preview = None;
+            loop {
+                let line = tokio::time::timeout(Duration::from_secs(90), lines.next_line())
+                    .await
+                    .unwrap_or_else(|_| panic!("{browser}: the browser script stalled"))
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{browser}: the browser script exited early"));
+                let reply = match line.as_str() {
+                    "pass" => break,
+                    "need seed" => {
+                        let mut stream = next_preview(&mut engine).await;
+                        seed(&mut stream, &[(0, "hello browser"), (1, "line one")]).await;
+                        preview = Some(stream);
+                        "ok".to_owned()
+                    }
+                    "need input" => {
+                        let expected = "\x1b\x03\x1b[Als\r";
+                        let got = typed(&mut engine, expected).await;
+                        if got == expected {
+                            "ok".to_owned()
+                        } else {
+                            format!("fail typed {got:?}, expected {expected:?}")
+                        }
+                    }
+                    "need diff" => {
+                        let stream = preview.as_mut().unwrap();
+                        stream
+                            .write_all(&grid_frame(&grid(false, &[(1, "after diff")])))
+                            .await
+                            .unwrap();
+                        "ok".to_owned()
+                    }
+                    "need drop" => {
+                        // The Engine side of the stream goes away, as on a
+                        // gateway restart or a dropped connection.
+                        drop(preview.take());
+                        let mut stream = next_preview(&mut engine).await;
+                        seed(
+                            &mut stream,
+                            &[(0, "hello browser"), (1, "after diff"), (2, "after resume")],
+                        )
+                        .await;
+                        preview = Some(stream);
+                        "ok".to_owned()
+                    }
+                    "need exit" => {
+                        let exited: diri_proto::ExitInfo =
+                            serde_json::from_value(json!({"reason": "exited", "code": 0})).unwrap();
+                        engine
+                            .events
+                            .send((
+                                diri_proto::EventName::SESSION_UPDATED.into(),
+                                json!({"id": "s_a", "status": diri_proto::SessionStatus::Exited(exited)}),
+                            ))
+                            .await
+                            .unwrap();
+                        "ok".to_owned()
+                    }
+                    other => panic!("{browser}: {other}"),
+                };
+                replies
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            drop(replies);
+            assert!(node.wait().await.unwrap().success());
+            server.abort();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "needs node and playwright-core with browsers: DIRI_WEB_PLAYWRIGHT"]
+        async fn the_browser_terminal_renders_types_scrolls_and_resumes() {
+            let playwright = std::env::var("DIRI_WEB_PLAYWRIGHT")
+                .expect("DIRI_WEB_PLAYWRIGHT names an installed playwright-core");
+            for browser in ["chromium", "webkit"] {
+                drive(browser, &playwright).await;
+            }
         }
     }
 }

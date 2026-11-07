@@ -249,4 +249,63 @@ final class TerminalModelTests: XCTestCase {
         XCTAssertEqual(CellWidth.of("e\u{301}"), 1)
         XCTAssertEqual(CellWidth.of("─│╭"), 3)
     }
+
+    // MARK: Resume
+
+    /// The values `diri-web`'s `line_digest` gives for the same lines (FNV-1a
+    /// over serde_json's bytes, keys sorted): see its test
+    /// `line_digests_match_the_pages_algorithm`.
+    func testLineDigestsMatchTheGatewaysBytes() throws {
+        XCTAssertEqual(TermLine.blank.wireDigest, 218_253_595)
+        let escaped = try JSONDecoder().decode(TermLine.self, from: Data(#"{"runs":[{"a":1,"bg":3,"fg":null,"t":"a\u0001\"é"}],"wrapped":true}"#.utf8))
+        XCTAssertEqual(escaped.wireDigest, 2_123_155_227)
+        let rgb = TermLine(runs: [TermRun("x", fg: .rgb(0xD97757))])
+        XCTAssertEqual(rgb.wireDigest, 469_929_067)
+    }
+
+    func testResumeTokenDescribesTheVisibleRows() {
+        var buffer = TerminalBuffer()
+        XCTAssertNil(buffer.resumeToken, "nothing to resume before a snapshot")
+        buffer.apply(GridSnapshot(cols: 64, rows: 2, seq: 1, historySize: 0, lines: [.blank, .blank]))
+        XCTAssertEqual(buffer.resumeToken, "64x2.d02491b.d02491b")
+    }
+
+    func testAResumeAppliesOnlyItsRowsAndRestartsTheSequence() throws {
+        var buffer = TerminalBuffer()
+        buffer.apply(snapshot(rows: ["one", "two", "three"], history: 5, seq: 900))
+        // A restarted gateway counts from one again; the resume still applies.
+        let frame = try JSONDecoder().decode(GridDiff.self, from: Data(#"""
+        {"cols":20,"rows":3,"seq":2,"historySize":7,"cursor":{"x":1,"y":2,"visible":true,"shape":"block"},
+         "modes":{"altScreen":false,"appCursor":true,"bracketedPaste":false,"mouse":false},
+         "palette":{"fg":"#ffffff","bg":"#000000","ansi":[]},
+         "lines":{"1":{"runs":[{"a":0,"bg":null,"fg":null,"t":"TWO"}],"wrapped":false}}}
+        """#.utf8))
+        let change = try XCTUnwrap(buffer.resume(frame))
+        XCTAssertTrue(change.geometry, "history grew while away")
+        XCTAssertEqual(buffer.screen.map(\.text), ["one", "TWO", "three"])
+        XCTAssertEqual(buffer.historySize, 7)
+        XCTAssertTrue(buffer.modes.appCursor)
+        XCTAssertEqual(buffer.palette.background, 0x000000)
+        // Diffs after it follow the new sequence.
+        guard case .applied = buffer.apply(GridDiff(seq: 3, lines: [0: line("ONE")])) else {
+            return XCTFail("the diff after a resume applies")
+        }
+        XCTAssertEqual(buffer.screen[0].text, "ONE")
+    }
+
+    func testAResumeOfAnotherSizeIsRefused() {
+        var buffer = TerminalBuffer()
+        buffer.apply(snapshot(rows: ["a", "b"]))
+        XCTAssertNil(buffer.resume(GridDiff(seq: 5, lines: [:], cols: 30, rows: 2)))
+        XCTAssertNil(buffer.resume(GridDiff(seq: 5, lines: [:], cols: 20, rows: 3)))
+        XCTAssertNotNil(buffer.resume(GridDiff(seq: 5, lines: [:], cols: 20, rows: 2)))
+    }
+
+    @MainActor
+    func testTheKeyRowMatchesTheBrowsers() {
+        XCTAssertEqual(KeyAccessoryView.keys.map(\.id), [
+            "key-esc", "key-ctrl", "key-tab", "key-left", "key-up", "key-down", "key-right",
+            "key-enter", "key-backtab", "key-ctrl-c", "key-pipe", "key-slash", "key-tilde", "key-dash",
+        ])
+    }
 }
