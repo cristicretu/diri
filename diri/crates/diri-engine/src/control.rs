@@ -220,6 +220,10 @@ pub struct ControlServer {
     accounts: Mutex<crate::accounts::AccountStore>,
     /// `hosts.json`, `agents.json` and `accounts.json` live here.
     config_dir: PathBuf,
+    /// The durable SQLite stores (schedules, tasks, operations, message
+    /// receipts) live here. Never the socket's directory on Linux: that is
+    /// `$XDG_RUNTIME_DIR`, a tmpfs emptied at logout and reboot.
+    state_dir: PathBuf,
     account_operations: std::sync::RwLock<()>,
     session_operations: Mutex<std::collections::HashSet<String>>,
     agent_scans: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>>,
@@ -326,6 +330,7 @@ impl ControlServer {
             .parent()
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
         load_terminal_palette(&config_dir, &registry);
+        let state_dir = config_dir.clone();
         let remote_bindings = remote_binding_store(&config_dir);
         let (agent_catalog, accounts) = agent_config_stores(&config_dir);
         let events = crate::events::EventBus::new();
@@ -366,6 +371,7 @@ impl ControlServer {
             agent_catalog: Arc::new(Mutex::new(agent_catalog)),
             accounts: Mutex::new(accounts),
             config_dir,
+            state_dir,
             account_operations: std::sync::RwLock::new(()),
             session_operations: Mutex::new(std::collections::HashSet::new()),
             agent_scans: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -613,6 +619,24 @@ impl ControlServer {
         self.agent_catalog = Arc::new(Mutex::new(agent_catalog));
         self.accounts = Mutex::new(accounts);
         self
+    }
+
+    /// Where the durable SQLite stores live. Defaults to the socket's
+    /// directory, which is right on macOS (one App Support root) and wrong on
+    /// Linux, where the socket sits in the runtime tmpfs: a reboot would drop
+    /// schedules and tasks and reset the at-most-once operation and message
+    /// receipts.
+    pub fn with_state_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.state_dir = dir.into();
+        self
+    }
+
+    fn durable_store_path(&self, name: &str) -> PathBuf {
+        self.state_dir.join(name)
+    }
+
+    fn message_receipts_path(&self) -> PathBuf {
+        self.durable_store_path(crate::layout_migration::MESSAGE_RECEIPTS_STORE)
     }
 
     /// Where remote session bindings are kept. They must outlive a reboot of
@@ -3040,23 +3064,17 @@ impl ControlServer {
         if registry.get(&p.session_id.0).is_none() {
             return Err(ControlError::not_found(p.session_id.0.clone()));
         }
-        let receipt = message_delivery::deliver(
-            &self
-                .socket_path
-                .with_file_name("message-receipts-v1.sqlite"),
-            &p,
-            || {
-                registry
-                    .wake_session(&p.session_id.0)
-                    .map_err(io_control_error)?;
-                self.publish_updated(&registry, &p.session_id.0);
-                registry
-                    .get(&p.session_id.0)
-                    .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
-                    .send_text(&p.text, p.submit)
-                    .map_err(io_control_error)
-            },
-        );
+        let receipt = message_delivery::deliver(&self.message_receipts_path(), &p, || {
+            registry
+                .wake_session(&p.session_id.0)
+                .map_err(io_control_error)?;
+            self.publish_updated(&registry, &p.session_id.0);
+            registry
+                .get(&p.session_id.0)
+                .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
+                .send_text(&p.text, p.submit)
+                .map_err(io_control_error)
+        });
         if let Ok(receipt) = &receipt {
             diri_telemetry::event!(
                 "message.deliver",
@@ -8154,6 +8172,42 @@ mod tests {
         let registry = Registry::new(engine(), temp.path().join("state.json"));
         let bare = ControlServer::new(Arc::new(Mutex::new(registry)), temp.path().join("socket"));
         assert!(bare.terminal_shell_integration().is_none());
+    }
+
+    #[test]
+    fn durable_stores_live_in_the_state_dir_not_beside_the_socket() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("run/diri");
+        let state = temp.path().join("state/diri");
+        let registry = Registry::new(engine(), state.join("state.json"));
+        let server =
+            ControlServer::new(Arc::new(Mutex::new(registry)), runtime.join("daemon.sock"))
+                .with_state_dir(&state);
+        let stores = [
+            server.schedules_path(),
+            server.tasks_path(),
+            server.operations_path(),
+            server.message_receipts_path(),
+        ];
+        for path in &stores {
+            assert!(
+                !path.starts_with(&runtime),
+                "{} is in the runtime dir",
+                path.display()
+            );
+            assert_eq!(path.parent(), Some(state.as_path()));
+        }
+        let names: Vec<_> = stores
+            .iter()
+            .map(|path| path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, crate::layout_migration::DURABLE_STORES);
+
+        // Without a state dir (macOS's single root, tests) they stay beside
+        // the socket, where existing installs already keep them.
+        let registry = Registry::new(engine(), temp.path().join("state.json"));
+        let bare = ControlServer::new(Arc::new(Mutex::new(registry)), runtime.join("daemon.sock"));
+        assert_eq!(bare.schedules_path(), runtime.join("schedules-v1.sqlite"));
     }
 
     #[test]
