@@ -1914,3 +1914,53 @@ fn only_a_session_with_something_on_the_clock_asks_for_ticks() {
     assert_eq!(*reducer.status(), SessionStatus::Idle);
     assert!(!reducer.wants_tick(), "a finished turn needs no tick");
 }
+
+#[test]
+fn a_restored_transport_lets_the_next_snapshot_move_the_status_again() {
+    let mut reducer = StatusReducer::new(Authority::ScreenPrimary, t0());
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Idle, 1)),
+        now,
+    );
+    reducer.reduce(StatusSignal::TransportUnavailable, now);
+    assert_eq!(*reducer.status(), SessionStatus::Unknown);
+
+    reducer.transport_restored();
+    // The reconnected Holder reseeds the same, unchanged frame.
+    let mut later = now;
+    for _ in 0..4 {
+        later += Duration::from_secs(1);
+        reducer.reduce(
+            StatusSignal::Screen(observation(ManifestState::Working, 1)),
+            later,
+        );
+        reducer.reduce(StatusSignal::Tick, later);
+    }
+    assert_eq!(*reducer.status(), SessionStatus::Working);
+}
+
+#[test]
+fn an_adopted_reducer_takes_the_seeded_status() {
+    let mut reducer = StatusReducer::new(Authority::HooksPrimary, t0());
+    reducer.finish_startup_grace(t0());
+    assert!(reducer.seed(&SessionStatus::Working, None));
+    assert_eq!(*reducer.status(), SessionStatus::Working);
+    // The seeded turn is in flight: its Stop completes it.
+    let now = t0() + Duration::from_secs(1);
+    let outcome = reducer.reduce(hook(ClaudeHook::Stop), now);
+    let outcome = if outcome.status_change.is_none() {
+        reducer.reduce(StatusSignal::Tick, now + Duration::from_millis(100))
+    } else {
+        outcome
+    };
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(outcome.turn_completed);
+    // Seeding applies once, before anything was reduced.
+    assert!(!reducer.seed(&SessionStatus::Working, None));
+    assert_eq!(*reducer.status(), SessionStatus::Idle);
+
+    let mut exited = StatusReducer::new(Authority::ScreenPrimary, t0());
+    assert!(!exited.seed(&SessionStatus::Unknown, None));
+    assert_eq!(*exited.status(), SessionStatus::Starting);
+}

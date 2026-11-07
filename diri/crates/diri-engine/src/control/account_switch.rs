@@ -114,6 +114,11 @@ impl ControlServer {
                             matches!(r.status, diri_proto::SessionStatus::Exited(_))
                         }))
                 {
+                    // An exited corpse still owns its Holder; release it
+                    // before the new incarnation takes the id.
+                    registry
+                        .terminate(&record.id.0, Duration::from_millis(500))
+                        .map_err(io_control_error)?;
                     registry.respawn(spec).map_err(io_control_error)?;
                     if let Some(sleep) = record.hibernation {
                         registry
