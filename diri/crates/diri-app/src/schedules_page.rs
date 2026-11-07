@@ -90,7 +90,10 @@ struct Draft {
     wake_mac: bool,
     field: Field,
     error: Option<String>,
-    saving: bool,
+    /// The create in flight. The draft owns it: Cancel, Escape or a new
+    /// draft drops it, which aborts the request if it has not been sent
+    /// and guarantees its completion never touches another draft.
+    save: Option<Task<()>>,
 }
 
 impl Draft {
@@ -111,8 +114,12 @@ impl Draft {
             wake_mac: false,
             field: Field::Prompt,
             error: None,
-            saving: false,
+            save: None,
         }
+    }
+
+    fn saving(&self) -> bool {
+        self.save.is_some()
     }
 
     fn editor(&mut self) -> &mut QueryEditor {
@@ -131,6 +138,27 @@ impl Draft {
         } else {
             Field::Time
         }
+    }
+}
+
+/// A runtime task aborted when its owner drops it, so a cancelled create
+/// that is still waiting for the Engine never sends.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<T> std::future::Future for AbortOnDrop<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
     }
 }
 
@@ -262,6 +290,12 @@ impl SchedulesPage {
 
     /// Reads both login items off the UI thread.
     fn refresh_login(&mut self, cx: &mut Context<Self>) {
+        // A read in flight answers this one; a change in flight must not be
+        // replaced, or its result and error are lost and the switches
+        // re-enable while launchd is still applying it.
+        if self.login_task.is_some() {
+            return;
+        }
         let read = cx.background_executor().spawn(async {
             (
                 login::status(),
@@ -491,7 +525,7 @@ impl SchedulesPage {
         let Some(draft) = self.draft.as_mut() else {
             return;
         };
-        if draft.saving {
+        if draft.saving() {
             return;
         }
         let spec = match plan::spec(
@@ -517,38 +551,37 @@ impl SchedulesPage {
                 return;
             }
         };
-        draft.saving = true;
         draft.error = None;
         let client = self.client();
-        let runtime = Arc::clone(&self.runtime);
-        cx.spawn(async move |this, cx| {
-            let result = runtime
-                .spawn(async move {
-                    client.wait_until_connected(Duration::from_secs(5)).await?;
-                    client.create_schedule(&spec).await
-                })
-                .await;
+        let request = self.runtime.spawn(async move {
+            client.wait_until_connected(Duration::from_secs(5)).await?;
+            client.create_schedule(&spec).await
+        });
+        let request = AbortOnDrop(request);
+        let save = cx.spawn(async move |this, cx| {
+            let result = request.await;
+            // This task lives in the draft that started it, so the draft
+            // here is that one: a cancelled draft dropped this task.
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(Ok(_)) => this.draft = None,
-                    Ok(Err(error)) => {
-                        if let Some(draft) = this.draft.as_mut() {
-                            draft.saving = false;
-                            draft.error = Some(error.to_string());
-                        }
-                    }
-                    Err(error) => {
-                        if let Some(draft) = this.draft.as_mut() {
-                            draft.saving = false;
-                            draft.error = Some(error.to_string());
-                        }
-                    }
+                    Ok(Err(error)) => this.save_failed(error.to_string()),
+                    Err(error) => this.save_failed(error.to_string()),
                 }
                 this.refresh(cx);
             });
-        })
-        .detach();
+        });
+        if let Some(draft) = self.draft.as_mut() {
+            draft.save = Some(save);
+        }
         cx.notify();
+    }
+
+    fn save_failed(&mut self, error: String) {
+        if let Some(draft) = self.draft.as_mut() {
+            draft.save = None;
+            draft.error = Some(error);
+        }
     }
 
     /// Registers the wake helper. macOS then asks an administrator to allow
@@ -1896,7 +1929,7 @@ impl SchedulesPage {
                 .child(
                     button(
                         "schedule-create",
-                        if draft.saving {
+                        if draft.saving() {
                             t("settings.schedules.creating")
                         } else {
                             t("settings.schedules.create")
@@ -2080,6 +2113,28 @@ impl Render for SchedulesPage {
 mod tests {
     use super::plan::*;
     use super::*;
+
+    #[test]
+    fn a_cancelled_create_never_reaches_the_engine() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()
+            .unwrap();
+        let sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let request = AbortOnDrop(runtime.spawn({
+            let sent = Arc::clone(&sent);
+            async move {
+                // Stands in for waiting on the Engine connection.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                sent.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }));
+        // Cancel / Escape drop the draft, and with it this request.
+        drop(request);
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!sent.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[test]
     fn times_parse_leniently_but_strictly_ranged() {
