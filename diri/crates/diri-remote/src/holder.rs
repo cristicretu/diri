@@ -49,7 +49,15 @@ const INTERACTIVE_GRID_BUDGET: u8 = 2;
 /// bypass it: publishing the erase alone is the flash this hold prevents.
 const REPAINT_HOLD: Duration = Duration::from_millis(16);
 const MAX_OUTBOUND_BYTES: usize = 20 << 20;
+/// Input queued for the PTY past which this Holder stops reading its
+/// controller: a program that is not reading its terminal pushes back through
+/// the attach socket, the Bridge and SSH to the Engine instead of failing the
+/// session. Also the most query replies are queued behind.
 const MAX_PENDING_INPUT_BYTES: usize = 1 << 20;
+/// The hard bound on queued PTY input. Reading stops at
+/// [`MAX_PENDING_INPUT_BYTES`], so at most one more read's worth of frames
+/// (the codec holds at most one partial frame) can arrive on top of it.
+const MAX_BACKLOGGED_INPUT_BYTES: usize = MAX_PENDING_INPUT_BYTES + MAX_FRAME_BYTES + (64 << 10);
 /// How much raw output may accumulate before it is framed for the client.
 const OUTPUT_FRAME_BYTES: usize = 64 << 10;
 const REPLAY_BUDGET_BYTES: usize = 4 << 20;
@@ -618,11 +626,15 @@ impl Holder {
                 });
                 index
             });
+            let input_backlogged = self.input_backlogged();
             let connection_index = self.connection.as_ref().map(|connection| {
                 let index = descriptors.len();
                 descriptors.push(libc::pollfd {
                     fd: connection.stream.as_raw_fd(),
-                    events: libc::POLLIN
+                    // Backpressure: input waits in the socket, not in memory,
+                    // while the program is not reading its terminal. Hangup
+                    // and error are reported regardless and still read.
+                    events: if input_backlogged { 0 } else { libc::POLLIN }
                         | if connection.outbound.is_empty() {
                             0
                         } else {
@@ -966,6 +978,13 @@ impl Holder {
         let mut buffer = [0_u8; 64 * 1024];
         let mut closed = false;
         loop {
+            // Leave further input in the socket until the PTY drains. A peer
+            // that hung up is still read to the end: its remaining bytes are
+            // bounded by the socket buffer, and it would otherwise report
+            // hangup to every poll.
+            if connection.epoch.is_some() && self.input_backlogged() && !peer_hung_up(connection) {
+                break;
+            }
             match connection.stream.read(&mut buffer) {
                 Ok(0) => {
                     closed = true;
@@ -988,6 +1007,18 @@ impl Holder {
                             continue;
                         }
                         if let Err(error) = self.handle_message(connection, message) {
+                            if let Some(recoverable) = Recoverable::of(&error) {
+                                // The request failed, the session did not:
+                                // tell the controller and keep serving it.
+                                // Older Engines log non-fatal errors and
+                                // continue, as for `slow_client_reseed`.
+                                if connection
+                                    .queue_error(recoverable.code, &error.to_string(), false)
+                                    .is_ok()
+                                {
+                                    continue;
+                                }
+                            }
                             let code = if self.stop.is_some()
                                 && error.kind() == io::ErrorKind::NotConnected
                             {
@@ -1048,7 +1079,8 @@ impl Holder {
                     let keyboard = self.screen.input_keyboard_state();
                     ensure_keyboard_controller(keyboard, connection.enhanced_keyboard)?;
                     if keyboard.is_none() {
-                        return Err(io::Error::new(
+                        return Err(Recoverable::error(
+                            "input_rejected",
                             io::ErrorKind::Unsupported,
                             "enhanced keyboard state is unknown",
                         ));
@@ -1167,13 +1199,27 @@ impl Holder {
                 }))
             }
             RemoteMessage::ScrollbackRequest(request) => {
-                let result = self
-                    .screen
-                    .scrollback_cells(request.first_row, request.max_rows);
-                connection.queue(RemoteMessage::ScrollbackResponse(ScrollbackResponse {
-                    request_id: request.request_id,
-                    result,
-                }))
+                // Wide terminals answer with fewer rows, so the response
+                // always fits one frame; `row_count` says how many.
+                let max_rows =
+                    request
+                        .max_rows
+                        .min(diri_proto::remote_pty::max_scrollback_response_rows(
+                            usize::from(self.state.cols),
+                        ));
+                let result = self.screen.scrollback_cells(request.first_row, max_rows);
+                connection
+                    .queue(RemoteMessage::ScrollbackResponse(ScrollbackResponse {
+                        request_id: request.request_id,
+                        result,
+                    }))
+                    .map_err(|error| {
+                        Recoverable::error(
+                            "scrollback_unavailable",
+                            io::ErrorKind::InvalidData,
+                            &error.to_string(),
+                        )
+                    })
             }
             RemoteMessage::TerminalPalette(palette) => {
                 if !connection.query_replies {
@@ -1197,7 +1243,8 @@ impl Holder {
                     ));
                 }
                 if connection.outbound.len() > MAX_OUTBOUND_BYTES {
-                    return Err(io::Error::new(
+                    return Err(Recoverable::error(
+                        "image_unavailable",
                         io::ErrorKind::WouldBlock,
                         "image output queue is full",
                     ));
@@ -1545,8 +1592,11 @@ impl Holder {
         if bytes.is_empty() {
             return Ok(());
         }
-        if self.pending_input.len().saturating_add(bytes.len()) > MAX_PENDING_INPUT_BYTES {
-            return Err(io::Error::new(
+        // Reading stops at the soft bound (see `input_backlogged`), so only
+        // a peer flushing its socket on hangup can reach this one.
+        if self.pending_input.len().saturating_add(bytes.len()) > MAX_BACKLOGGED_INPUT_BYTES {
+            return Err(Recoverable::error(
+                "input_queue_full",
                 io::ErrorKind::WouldBlock,
                 "pending input queue is full",
             ));
@@ -1558,6 +1608,10 @@ impl Holder {
         self.interactive_grid_budget = INTERACTIVE_GRID_BUDGET;
         self.foreground_probe_deadline = Some(Instant::now() + FOREGROUND_PROBE_AFTER_INPUT);
         self.flush_input()
+    }
+
+    fn input_backlogged(&self) -> bool {
+        self.pending_input.len() >= MAX_PENDING_INPUT_BYTES
     }
 
     fn flush_input(&mut self) -> io::Result<()> {
@@ -1915,6 +1969,52 @@ fn resolve_remote_executable(
         io::ErrorKind::NotFound,
         "Agent executable was not found on the captured remote PATH",
     ))
+}
+
+/// A controller request that failed without harming the session: answered
+/// with a non-fatal structured error, and the connection keeps being served.
+/// Anything else a controller sends wrong still closes its connection fatally.
+#[derive(Debug)]
+struct Recoverable {
+    code: &'static str,
+    message: String,
+}
+
+impl Recoverable {
+    fn error(code: &'static str, kind: io::ErrorKind, message: &str) -> io::Error {
+        io::Error::new(
+            kind,
+            Self {
+                code,
+                message: message.to_string(),
+            },
+        )
+    }
+
+    fn of(error: &io::Error) -> Option<&Self> {
+        error.get_ref()?.downcast_ref::<Self>()
+    }
+}
+
+impl std::fmt::Display for Recoverable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Recoverable {}
+
+/// Whether the controller's socket reports hangup or error, which `poll`
+/// raises whether or not reading was asked for.
+fn peer_hung_up(connection: &Connection) -> bool {
+    let mut descriptor = libc::pollfd {
+        fd: connection.stream.as_raw_fd(),
+        events: 0,
+        revents: 0,
+    };
+    // SAFETY: one initialized pollfd for the call's duration; zero timeout.
+    let ready = unsafe { libc::poll(&mut descriptor, 1, 0) };
+    ready > 0 && descriptor.revents & (libc::POLLHUP | libc::POLLERR) != 0
 }
 
 fn ensure_keyboard_controller(

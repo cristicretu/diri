@@ -73,6 +73,31 @@ pub const MAX_LIST_DIR_TIMEOUT_MS: u32 = 2_000;
 pub const MAX_IMAGE_CHUNK_BYTES: usize = 256 * 1024;
 /// An `ImageResponse` frame: one chunk plus its small JSON header.
 pub const MAX_IMAGE_RESPONSE_FRAME_BYTES: usize = MAX_IMAGE_CHUNK_BYTES + 4 * 1024;
+/// The most input bytes one Engine `Input` or `Mouse` frame carries. A
+/// larger write (a big paste) goes out as consecutive frames, so no single
+/// frame comes near a Holder's pending-input bound. Holders still accept the
+/// larger single frames older Engines send.
+pub const MAX_INPUT_FRAME_BYTES: usize = 64 * 1024;
+/// Raw encoded row bytes one `ScrollbackResponse` may carry. Base64 and the
+/// JSON envelope inflate it by about a third, which keeps the frame well
+/// under [`MAX_FRAME_BYTES`] at any terminal width.
+pub const MAX_SCROLLBACK_RESPONSE_ROW_BYTES: usize = MAX_FRAME_BYTES / 2;
+/// The most rows of a `cols`-wide terminal one `ScrollbackResponse` carries
+/// so that it always encodes: at least one, at most what
+/// [`ScrollbackRequest`] may ask for. A wide terminal answers with fewer rows
+/// than requested; the response's `row_count` says how many.
+pub const fn max_scrollback_response_rows(cols: usize) -> i64 {
+    let rows = MAX_SCROLLBACK_RESPONSE_ROW_BYTES / crate::grid::GridRowCodec::max_row_len(cols);
+    if rows == 0 {
+        1
+    } else if rows > MAX_SCROLLBACK_REQUEST_ROWS as usize {
+        MAX_SCROLLBACK_REQUEST_ROWS
+    } else {
+        rows as i64
+    }
+}
+/// The most rows one [`ScrollbackRequest`] may ask for.
+pub const MAX_SCROLLBACK_REQUEST_ROWS: i64 = 1024;
 
 const HEADER_BYTES: usize = 5;
 const FULL_SNAPSHOT_FIXED_BYTES: usize = 9;
@@ -1356,7 +1381,10 @@ pub struct ScrollbackRequest {
 
 impl ScrollbackRequest {
     pub fn validate(&self) -> Result<(), RemoteCodecError> {
-        if self.request_id == 0 || self.first_row < 0 || !(0..=1024).contains(&self.max_rows) {
+        if self.request_id == 0
+            || self.first_row < 0
+            || !(0..=MAX_SCROLLBACK_REQUEST_ROWS).contains(&self.max_rows)
+        {
             Err(RemoteCodecError::InvalidControlPayload {
                 kind: KIND_SCROLLBACK_REQUEST,
                 detail: "scrollback request id/range is invalid".into(),
@@ -2089,6 +2117,52 @@ fn rollback<T>(
 mod tests {
     use super::*;
     use crate::grid::{ChangedRow, GridCell};
+
+    /// A scrollback page of worst-case rows (no two cells alike, so no
+    /// run-length savings) encodes at every terminal width once its rows are
+    /// bounded; the full 1024 rows a request may ask for do not above ~770
+    /// columns.
+    #[test]
+    fn bounded_scrollback_response_encodes_at_every_width() {
+        fn page(cols: usize, rows: i64) -> RemoteMessage {
+            let row: Vec<GridCell> = (0..cols)
+                .map(|col| GridCell {
+                    scalar: 0x4e00 + col as u32,
+                    ..GridCell::BLANK
+                })
+                .collect();
+            let mut payload = Vec::new();
+            for _ in 0..rows {
+                crate::grid::GridRowCodec::append_row(&row, &mut payload).unwrap();
+            }
+            RemoteMessage::ScrollbackResponse(ScrollbackResponse {
+                request_id: 1,
+                result: crate::ReadScrollbackCellsResult {
+                    metadata: Vec::new(),
+                    payload,
+                    first_row: 0,
+                    row_count: rows,
+                    total_rows: rows,
+                    live_start_row: 0,
+                    cols: cols as i64,
+                    content_seq: 0,
+                },
+            })
+        }
+        for cols in [80_usize, 770, 1024, usize::from(MAX_TERMINAL_COLS)] {
+            let rows = max_scrollback_response_rows(cols);
+            assert!((1..=MAX_SCROLLBACK_REQUEST_ROWS).contains(&rows));
+            assert!(
+                RemoteCodec::encode(&page(cols, rows)).is_ok(),
+                "{rows} rows of {cols} columns must fit one frame"
+            );
+        }
+        assert_eq!(
+            max_scrollback_response_rows(80),
+            MAX_SCROLLBACK_REQUEST_ROWS
+        );
+        assert!(RemoteCodec::encode(&page(1024, MAX_SCROLLBACK_REQUEST_ROWS)).is_err());
+    }
 
     #[test]
     fn grid_resume_is_validated_and_answered_only_with_its_capability() {
