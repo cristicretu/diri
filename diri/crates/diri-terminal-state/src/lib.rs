@@ -636,6 +636,18 @@ pub const PAGE_OUT_KEEP_ROWS: usize = 256;
 #[cfg(feature = "compact-history")]
 pub const PAGE_OUT_MIN_BYTES: usize = 64 << 10;
 
+/// The grid a caller asked for, floored at 1×1 and capped at the shared
+/// terminal limits: an unchecked 65535×65535 request would allocate billions
+/// of cells and abort the whole process.
+fn bounded_geometry(cols: usize, rows: usize) -> Geometry {
+    let wide = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+    let (cols, rows) = diri_proto::clamp_terminal_size(wide(cols), wide(rows), 1);
+    Geometry {
+        cols: usize::from(cols),
+        rows: usize::from(rows),
+    }
+}
+
 impl HeadlessScreen {
     pub fn new(cols: usize, rows: usize) -> Self {
         Self::new_with_keyboard_config(cols, rows, false)
@@ -648,10 +660,7 @@ impl HeadlessScreen {
     }
 
     fn new_with_keyboard_config(cols: usize, rows: usize, kitty_keyboard: bool) -> Self {
-        let geometry = Geometry {
-            cols: cols.max(1),
-            rows: rows.max(1),
-        };
+        let geometry = bounded_geometry(cols, rows);
         let events = Arc::new(Mutex::new(Inbox::default()));
         let config = Config {
             kitty_keyboard,
@@ -1246,10 +1255,7 @@ impl HeadlessScreen {
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
-        let geometry = Geometry {
-            cols: cols.max(1),
-            rows: rows.max(1),
-        };
+        let geometry = bounded_geometry(cols, rows);
         if self.geometry.cols == geometry.cols && self.geometry.rows == geometry.rows {
             return;
         }
@@ -3567,6 +3573,27 @@ fn emulator_color(color: TermColor) -> Color {
 
 #[cfg(test)]
 mod tests {
+    /// The parser holds the shared terminal limits itself, whatever a caller
+    /// passes: an unchecked request this size allocates billions of cells.
+    /// Sizes just past the limits keep an unbounded build failing on the
+    /// assertions instead of on memory.
+    #[test]
+    fn construction_and_resize_hold_the_shared_terminal_limits() {
+        use diri_proto::remote_pty::{MAX_TERMINAL_CELLS, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS};
+        let max_cols = usize::from(MAX_TERMINAL_COLS);
+        let max_rows = usize::from(MAX_TERMINAL_ROWS);
+        let mut screen = super::HeadlessScreen::new(max_cols + 1, 2);
+        assert_eq!(screen.size(), (max_cols, 2));
+        screen.resize(10, max_rows + 1);
+        assert_eq!(screen.size(), (10, max_rows));
+        screen.resize(400, 4000);
+        assert_eq!(screen.size(), (400, MAX_TERMINAL_CELLS / 400));
+        screen.resize(0, 0);
+        assert_eq!(screen.size(), (1, 1));
+        let fresh = super::HeadlessScreen::new(10, max_rows + 1);
+        assert_eq!(fresh.size(), (10, max_rows));
+    }
+
     #[test]
     fn only_csi_escapes_matches_a_bytewise_check() {
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;

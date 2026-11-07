@@ -49,6 +49,9 @@ pub struct OutputLog {
     legacy: Option<(u64, usize)>,
     pages: VecDeque<Page>,
     hasher: Sha256,
+    /// Fault injection: every append fails with this error kind.
+    #[cfg(test)]
+    pub(crate) fail_appends: Option<io::ErrorKind>,
 }
 
 impl OutputLog {
@@ -92,6 +95,8 @@ impl OutputLog {
                 legacy: Some((base, len as usize)),
                 pages: VecDeque::new(),
                 hasher: Sha256::new(),
+                #[cfg(test)]
+                fail_appends: None,
             });
         }
         if version != VERSION
@@ -168,6 +173,8 @@ impl OutputLog {
             legacy: None,
             pages: pages.into(),
             hasher,
+            #[cfg(test)]
+            fail_appends: None,
         })
     }
 
@@ -180,6 +187,10 @@ impl OutputLog {
     }
 
     pub fn append(&mut self, mut bytes: &[u8]) -> io::Result<u64> {
+        #[cfg(test)]
+        if let Some(kind) = self.fail_appends {
+            return Err(io::Error::new(kind, "injected output log failure"));
+        }
         if self.legacy.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,

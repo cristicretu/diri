@@ -6,7 +6,7 @@ use diri_client::{ConnectionState, DaemonClient};
 use diri_proto::{
     AgentDescriptor, AgentKind, AgentReadinessItem, AgentReadinessResult, AttentionLevel,
     DateMillis, ExitInfo, ExitReason, Project, ProjectId, Resumability, SessionId,
-    SessionListResult, SessionRecord, SessionStatus, TitleSource,
+    SessionListResult, SessionRecord, SessionStatus, StampedSessionListResult, TitleSource,
 };
 use tempfile::tempdir;
 use tokio::sync::mpsc;
@@ -1645,12 +1645,165 @@ fn a_closing_row_leaves_at_once_and_ignores_further_clicks() {
     store.request_close(vec![id("one")]);
     assert!(drain(&mut effects).is_empty());
 
-    // A resync that still lists the session means the close never landed.
+    // While the remove is unanswered, a list may predate it: the row stays hidden.
+    store.hydrate(SessionListResult {
+        sessions: vec![session("one", "p", 2.0), session("two", "p", 1.0)],
+        projects: vec![project("p", "P")],
+    });
+    assert_eq!(store.ordered_sessions().len(), 1);
+    assert!(store.closing.contains(&id("one")));
+
+    // Once it answered, a resync that still lists the session means the close
+    // never landed.
+    store.finish_remove_request(&id("one"));
     store.hydrate(SessionListResult {
         sessions: vec![session("one", "p", 2.0), session("two", "p", 1.0)],
         projects: vec![project("p", "P")],
     });
     assert_eq!(store.ordered_sessions().len(), 2);
+}
+
+fn stamped(sessions: Vec<SessionRecord>, event_seq: Option<u64>) -> StampedSessionListResult {
+    StampedSessionListResult {
+        list: SessionListResult {
+            sessions,
+            projects: vec![project("p", "P")],
+        },
+        event_seq,
+    }
+}
+
+fn removed_event(value: &str, seq: u64) -> EventEnvelope {
+    EventEnvelope {
+        name: diri_proto::EventName::SESSION_REMOVED.to_owned(),
+        seq,
+        params: serde_json::json!({ "id": value }),
+    }
+}
+
+fn updated_event(record: &SessionRecord, seq: u64) -> EventEnvelope {
+    EventEnvelope {
+        name: diri_proto::EventName::SESSION_UPDATED.to_owned(),
+        seq,
+        params: serde_json::to_value(record).unwrap(),
+    }
+}
+
+#[test]
+fn a_list_generated_before_a_removal_does_not_resurrect_the_session() {
+    let (mut store, _effects) = hydrated(
+        vec![session("one", "p", 2.0), session("two", "p", 1.0)],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    store.begin_session_list();
+    // The removal overtakes the reply the Engine built at seq 4.
+    assert!(store.handle_event(removed_event("one", 5)));
+    store.hydrate_stamped(stamped(
+        vec![session("one", "p", 2.0), session("two", "p", 1.0)],
+        Some(4),
+    ));
+    assert!(!store.sessions().contains_key(&id("one")));
+    assert_eq!(
+        store
+            .ordered_sessions()
+            .iter()
+            .map(|s| s.id.clone())
+            .collect::<Vec<_>>(),
+        vec![id("two")]
+    );
+    assert!(store.session_event_marks.is_empty(), "no list is in flight");
+
+    // Removed before this store ever saw it: still not resurrected.
+    store.begin_session_list();
+    store.handle_event(removed_event("three", 9));
+    store.hydrate_stamped(stamped(
+        vec![session("two", "p", 1.0), session("three", "p", 0.5)],
+        Some(8),
+    ));
+    assert!(!store.sessions().contains_key(&id("three")));
+}
+
+#[test]
+fn a_list_generated_before_a_status_change_does_not_roll_it_back() {
+    let (mut store, _effects) = hydrated(
+        vec![session("one", "p", 2.0)],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    let stale = session("one", "p", 2.0);
+    let mut newer = stale.clone();
+    newer.status = if stale.status == SessionStatus::Working {
+        SessionStatus::Idle
+    } else {
+        SessionStatus::Working
+    };
+    store.begin_session_list();
+    assert!(store.handle_event(updated_event(&newer, 7)));
+    store.hydrate_stamped(stamped(vec![stale.clone()], Some(6)));
+    assert_eq!(store.sessions()[&id("one")].status, newer.status);
+
+    // A list that already includes the event is the authority.
+    store.begin_session_list();
+    store.handle_event(updated_event(&newer, 8));
+    store.hydrate_stamped(stamped(vec![stale.clone()], Some(8)));
+    assert_eq!(store.sessions()[&id("one")].status, stale.status);
+
+    // An unstamped reply (older Engine) is applied as before.
+    store.begin_session_list();
+    store.handle_event(updated_event(&newer, 9));
+    store.hydrate_stamped(stamped(vec![stale.clone()], None));
+    assert_eq!(store.sessions()[&id("one")].status, stale.status);
+}
+
+#[test]
+fn session_events_are_only_marked_while_a_list_is_in_flight() {
+    let (mut store, _effects) = hydrated(
+        vec![session("one", "p", 2.0)],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    // Delivered before the request is sent, so the reply already reflects it.
+    store.handle_event(removed_event("one", 3));
+    assert!(store.session_event_marks.is_empty());
+    store.begin_session_list();
+    store.handle_event(removed_event("two", 4));
+    store.abandon_session_list();
+    assert!(store.session_event_marks.is_empty());
+}
+
+#[test]
+fn a_hydrate_prunes_per_session_state_of_vanished_sessions() {
+    let (mut store, mut effects) = hydrated(
+        vec![session("one", "p", 2.0), session("two", "p", 1.0)],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    store.select(id("two"));
+    store.terminal_residency.touch(id("one"));
+    store.mru_order.push(id("one"));
+    store.sidebar_selection.insert(id("one"));
+    store.sidebar_selection_anchor = Some(id("one"));
+    store.unread_holds.insert(id("one"));
+    store.auto_resuming.insert(id("one"));
+    store.auto_resume_attempted.insert(id("one"));
+    store.migrating.insert(id("one"));
+    drain(&mut effects);
+
+    // "one" left while events were not reaching this store (a gap).
+    store.hydrate(SessionListResult {
+        sessions: vec![session("two", "p", 1.0)],
+        projects: vec![project("p", "P")],
+    });
+    assert!(!store.terminal_residency.contains(&id("one")));
+    assert!(drain(&mut effects).contains(&StoreEffect::DetachAttachment(id("one"))));
+    assert!(!store.mru_order.contains(&id("one")));
+    assert!(!store.sidebar_selection.contains(&id("one")));
+    assert_eq!(store.sidebar_selection_anchor, None);
+    assert!(!store.unread_holds.contains(&id("one")));
+    assert!(!store.auto_resuming.contains(&id("one")));
+    assert!(!store.auto_resume_attempted.contains(&id("one")));
+    assert!(!store.migrating.contains(&id("one")));
 }
 
 #[test]

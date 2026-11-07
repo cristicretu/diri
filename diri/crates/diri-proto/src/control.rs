@@ -28,6 +28,12 @@ pub const BROWSER_UNAVAILABLE: &str = "browser_unavailable";
 /// is spawned, and the Session record is left as it was.
 pub const CWD_MISSING: &str = "cwd_missing";
 
+/// Error code for a reply whose encoded line would exceed
+/// [`MAX_CONTROL_LINE_BYTES`]. The Engine answers the same request id with
+/// this instead of writing a line every client treats as fatal, so the
+/// connection and its other in-flight requests survive.
+pub const REPLY_TOO_LARGE: &str = "reply_too_large";
+
 /// The protocol's untyped JSON payload.
 pub type JsonValue = Value;
 

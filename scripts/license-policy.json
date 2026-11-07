@@ -21,14 +21,14 @@
     {
       "name": "playwright",
       "ecosystem": "npm",
-      "version": "1.64.0",
+      "version": "1.64.1",
       "license": "Apache-2.0",
       "source": "https://github.com/microsoft/playwright"
     },
     {
       "name": "playwright-core",
       "ecosystem": "npm",
-      "version": "1.64.0",
+      "version": "1.64.1",
       "license": "Apache-2.0",
       "source": "https://github.com/microsoft/playwright"
     }

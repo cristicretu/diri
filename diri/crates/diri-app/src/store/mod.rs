@@ -25,6 +25,7 @@ use diri_proto::{
     AgentDescriptor, AgentKind, AgentReadinessResult, AttentionLevel, DateMillis, EventName,
     ExitReason, GovernorConfigureParams, HelloResult, HostEntry, HostsConfig, Project, ProjectId,
     SessionId, SessionListResult, SessionRecord, SessionSpawnParams, SessionStatus,
+    StampedSessionListResult,
     TerminalConfigureParams,
 };
 use tokio::sync::{Notify, broadcast, mpsc};
@@ -457,6 +458,13 @@ pub enum ReadAloudChoice {
     All,
 }
 
+/// The latest session event applied while a `session.list` was in flight.
+#[derive(Clone, Copy, Debug)]
+struct SessionEventMark {
+    seq: u64,
+    removed: bool,
+}
+
 /// Pure application model. Side effects are emitted onto a channel for the daemon adapter.
 pub struct SessionStore {
     workspaces: WorkspaceCatalog,
@@ -483,6 +491,17 @@ pub struct SessionStore {
     /// of half a second; rows hide the moment the close is dispatched so the
     /// click reads as done instead of inviting a second one.
     closing: HashSet<SessionId>,
+    /// The subset of `closing` whose `session.remove` has not answered yet.
+    /// A list can be generated before that removal, so only these survive a
+    /// hydrate; the rest are settled by the list (see `finish_failed_remove`).
+    removes_in_flight: HashSet<SessionId>,
+    /// `session.list` requests sent and not yet hydrated. While any is out,
+    /// session events are marked with their seq so the reply cannot roll
+    /// them back; the marks are cleared when none is out.
+    session_lists_in_flight: usize,
+    /// The latest `session.updated`/`session.removed` seq applied per session
+    /// while a list was in flight. See `hydrate_stamped`.
+    session_event_marks: HashMap<SessionId, SessionEventMark>,
     auto_resuming: HashSet<SessionId>,
     /// Sessions with a `session.migrate` in flight — rows render busy and
     /// migration actions are suppressed until the daemon answers.
@@ -617,6 +636,9 @@ impl SessionStore {
                 sidebar_selection: HashSet::new(),
                 pending_close: None,
                 closing: HashSet::new(),
+                removes_in_flight: HashSet::new(),
+                session_lists_in_flight: 0,
+                session_event_marks: HashMap::new(),
                 auto_resuming: HashSet::new(),
                 migrating: HashSet::new(),
                 syncing_prefs: HashSet::new(),
@@ -1963,23 +1985,95 @@ impl SessionStore {
         }
     }
 
+    /// Notes a `session.list` request about to be sent. Session events
+    /// applied until its reply hydrates are marked by seq, so a reply
+    /// generated before them cannot undo them. Pair with `hydrate_stamped`
+    /// or, when the request fails, `abandon_session_list`.
+    pub fn begin_session_list(&mut self) {
+        self.session_lists_in_flight += 1;
+    }
+
+    /// A `session.list` request begun with `begin_session_list` failed.
+    pub fn abandon_session_list(&mut self) {
+        self.end_session_list();
+    }
+
+    fn end_session_list(&mut self) {
+        self.session_lists_in_flight = self.session_lists_in_flight.saturating_sub(1);
+        if self.session_lists_in_flight == 0 {
+            self.session_event_marks.clear();
+        }
+    }
+
+    fn mark_session_event(&mut self, id: &SessionId, seq: u64, removed: bool) {
+        // Seq 0 is outside the Engine's published seq space (gap markers,
+        // synthetic events); only real seqs can be compared with a stamp.
+        if self.session_lists_in_flight > 0 && seq > 0 {
+            self.session_event_marks
+                .insert(id.clone(), SessionEventMark { seq, removed });
+        }
+    }
+
+    /// Hydrates from a `session.list` reply begun with `begin_session_list`.
+    /// The reply and the event stream travel independently, so session
+    /// events applied with a seq above the reply's stamp happened after it
+    /// and win: a removal stays removed, a newer record is not rolled back.
+    /// An unstamped reply (older Engine) is applied as is.
+    pub fn hydrate_stamped(&mut self, result: StampedSessionListResult) {
+        let mut sessions = Self::index_sessions(result.list.sessions);
+        if let Some(stamp) = result.event_seq {
+            for (id, mark) in &self.session_event_marks {
+                if mark.seq <= stamp {
+                    continue;
+                }
+                if mark.removed {
+                    sessions.remove(id);
+                } else if let Some(record) = self.sessions.get(id) {
+                    sessions.insert(id.clone(), Arc::clone(record));
+                }
+            }
+        }
+        self.end_session_list();
+        self.hydrate_sessions(sessions, result.list.projects);
+    }
+
     pub fn hydrate(&mut self, result: SessionListResult) {
+        self.hydrate_sessions(Self::index_sessions(result.sessions), result.projects);
+    }
+
+    fn index_sessions(sessions: Vec<SessionRecord>) -> HashMap<SessionId, Arc<SessionRecord>> {
+        sessions
+            .into_iter()
+            .map(|session| (session.id.clone(), Arc::new(session)))
+            .collect()
+    }
+
+    fn hydrate_sessions(
+        &mut self,
+        sessions: HashMap<SessionId, Arc<SessionRecord>>,
+        projects: Vec<Project>,
+    ) {
         self.session_list_hydrated = true;
         // A full resync is the authority: anything still listed here outlived
         // its close (daemon restart, failed terminate) and belongs on screen.
-        self.closing.clear();
-        self.sessions = result
-            .sessions
-            .into_iter()
-            .map(|session| (session.id.clone(), Arc::new(session)))
-            .collect();
-        self.project_seniority = result
-            .projects
+        // A close whose request has not answered yet is still in flight, and
+        // the list may predate it, so that row stays hidden.
+        let in_flight = &self.removes_in_flight;
+        self.closing
+            .retain(|id| in_flight.contains(id) && sessions.contains_key(id));
+        let previous = std::mem::replace(&mut self.sessions, sessions);
+        // Sessions that left without a session.removed this store saw: drop
+        // everything kept per session, as `remove_session_record` does.
+        for id in previous.keys() {
+            if !self.sessions.contains_key(id) {
+                self.forget_session_state(id);
+            }
+        }
+        self.project_seniority = projects
             .iter()
             .map(|project| project.id.clone())
             .collect();
-        self.projects = result
-            .projects
+        self.projects = projects
             .into_iter()
             .map(|project| (project.id.clone(), project))
             .collect();
@@ -2189,6 +2283,7 @@ impl SessionStore {
             }
             EventName::SESSION_UPDATED => {
                 if let Ok(session) = serde_json::from_value::<SessionRecord>(event.params) {
+                    self.mark_session_event(&session.id, event.seq, false);
                     if self
                         .sessions
                         .get(&session.id)
@@ -2238,6 +2333,9 @@ impl SessionStore {
                     .or_else(|| event.params.get("sessionID"))
                     .and_then(|value| value.as_str())
                     .map(SessionId::new);
+                if let Some(id) = &id {
+                    self.mark_session_event(id, event.seq, true);
+                }
                 if let Some(id) = id
                     && self.sessions.contains_key(&id)
                 {
@@ -2464,12 +2562,26 @@ impl SessionStore {
         }
         self.sessions.remove(id);
         self.reconcile_notifications();
+        self.forget_session_state(id);
+        self.invalidate_projection();
+        self.sync_sidebar_order();
+        self.reconcile_navigation();
+    }
+
+    /// Drops everything kept per session for `id`, which the Engine no
+    /// longer lists. Shared by `session.removed` and a hydrate that finds
+    /// the session gone, so neither leaves a stale side-table entry.
+    fn forget_session_state(&mut self, id: &SessionId) {
         self.closing.remove(id);
         self.sidebar_selection.remove(id);
+        if self.sidebar_selection_anchor.as_ref() == Some(id) {
+            self.sidebar_selection_anchor = None;
+        }
         self.mru_order.retain(|candidate| candidate != id);
         self.auto_resuming.remove(id);
         self.auto_resume_attempted.remove(id);
         self.migrating.remove(id);
+        self.unread_holds.remove(id);
         // Only the departed parent's bindings. A binding to a departed child
         // stays: it is what keeps slot 0 from adopting an unrelated terminal.
         self.auxiliary_slots.retain(|(parent, _), _| parent != id);
@@ -2477,9 +2589,6 @@ impl SessionStore {
         if self.terminal_residency.remove(id) {
             self.emit(StoreEffect::DetachAttachment(id.clone()));
         }
-        self.invalidate_projection();
-        self.sync_sidebar_order();
-        self.reconcile_navigation();
     }
 
     pub fn select(&mut self, id: SessionId) {
@@ -2897,6 +3006,7 @@ impl SessionStore {
             }
             // Hide now; `session.removed` (or a resync) settles the record.
             self.closing.insert(id.clone());
+            self.removes_in_flight.insert(id.clone());
             let note = self.sessions.get(&id).is_some_and(|session| session.is_note());
             self.emit(if trash_notes && note {
                 StoreEffect::DeleteNote(id)
@@ -2914,6 +3024,12 @@ impl SessionStore {
     /// a session the Engine no longer knows) leaves the outcome unknown, so
     /// the row stays hidden and this reports that the Engine's authoritative
     /// list has to settle it.
+    /// A `session.remove` answered, either way: a later list now settles
+    /// the row instead of the close in flight.
+    fn finish_remove_request(&mut self, id: &SessionId) {
+        self.removes_in_flight.remove(id);
+    }
+
     fn finish_failed_remove(&mut self, id: &SessionId, error: &ClientError) -> bool {
         let rejected =
             matches!(error, ClientError::Control(control) if control.code != "not_found");
@@ -4181,12 +4297,16 @@ impl StoreRuntime {
                 let mut attempts = 0;
                 loop {
                     attempts += 1;
-                    match resync_client.sessions().await {
+                    resync_store
+                        .write()
+                        .expect("session store lock poisoned")
+                        .begin_session_list();
+                    match resync_client.sessions_stamped().await {
                         Ok(list) => {
                             let snapshot = {
                                 let mut store =
                                     resync_store.write().expect("session store lock poisoned");
-                                store.hydrate(list);
+                                store.hydrate_stamped(list);
                                 store.refresh_workspaces();
                                 store.snapshot()
                             };
@@ -4195,11 +4315,21 @@ impl StoreRuntime {
                             break;
                         }
                         Err(_) if attempts < RESYNC_ATTEMPTS => {
+                            resync_store
+                                .write()
+                                .expect("session store lock poisoned")
+                                .abandon_session_list();
                             tokio::time::sleep(RESYNC_RETRY).await;
                         }
                         // Disconnected or persistently failing: the reconnect
                         // path hydrates on its own when the Engine is back.
-                        Err(_) => break,
+                        Err(_) => {
+                            resync_store
+                                .write()
+                                .expect("session store lock poisoned")
+                                .abandon_session_list();
+                            break;
+                        }
                     }
                 }
             }
@@ -4258,11 +4388,22 @@ impl StoreRuntime {
                                 .expect("session store lock poisoned")
                                 .set_agent_catalog(agents);
                         }
-                        if let Ok(list) = state_client.sessions().await {
+                        state_store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .begin_session_list();
+                        let listed = state_client.sessions_stamped().await;
+                        if listed.is_err() {
+                            state_store
+                                .write()
+                                .expect("session store lock poisoned")
+                                .abandon_session_list();
+                        }
+                        if let Ok(list) = listed {
                             let snapshot = {
                                 let mut store =
                                     state_store.write().expect("session store lock poisoned");
-                                store.hydrate(list);
+                                store.hydrate_stamped(list);
                                 store.request_herdr_scan();
                                 // Only a first run shows the welcome that
                                 // offers it; Settings asks on its own.
@@ -4541,12 +4682,15 @@ async fn run_effects(
                 } else {
                     client.remove(&id).await
                 };
-                if let Err(error) = &result
-                    && store
-                        .write()
-                        .expect("session store lock poisoned")
-                        .finish_failed_remove(&id, error)
-                {
+                let resync = {
+                    let mut store = store.write().expect("session store lock poisoned");
+                    store.finish_remove_request(&id);
+                    result
+                        .as_ref()
+                        .err()
+                        .is_some_and(|error| store.finish_failed_remove(&id, error))
+                };
+                if resync {
                     let _ = resync_tx.try_send(());
                 }
                 result

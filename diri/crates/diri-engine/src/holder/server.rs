@@ -35,8 +35,8 @@ use super::protocol::{
     HOLDER_OUTPUT_STREAM_VERSION, HOLDER_STREAM_ACK, HOLDER_STREAM_INPUT,
     HOLDER_STREAM_MAX_PAYLOAD, HOLDER_STREAM_RESIZE, HOLDER_STREAM_RESIZE_PIXELS,
     HOLDER_STREAM_VERSION, HOLDER_STREAM_VERSION_PIXELS, HolderChildRecord, HolderExitMarker,
-    HolderExitReason, HolderExitStatus, HolderLaunchSpec, HolderOperation, HolderRequest,
-    HolderResponse, HolderStat,
+    HolderExitMarkerGuard, HolderExitReason, HolderExitStatus, HolderLaunchSpec, HolderOperation,
+    HolderRequest, HolderResponse, HolderStat,
 };
 use super::reactor;
 use super::socket;
@@ -104,6 +104,11 @@ struct Shared {
     /// forever, so the exit path kills them (see
     /// [`process_tree::kill_stragglers`]).
     frozen: Mutex<Vec<super::protocol::HolderProcessSample>>,
+    /// Rewrites marker prefixes the child prints, so only the exit path can
+    /// put a recognised [`HolderExitMarker`] in the log. One per session
+    /// because a prefix can span reads; only the pump and the exit drain
+    /// after it read the PTY, so it is never contended.
+    marker_guard: Mutex<HolderExitMarkerGuard>,
     /// The manager's guard, told about the session's group and frozen
     /// processes so they die with the manager too.
     guard: Option<Arc<GroupGuard>>,
@@ -305,9 +310,13 @@ impl HolderServer {
         // interleave two writers into one output log and stack a second child.
         // If a live holder already serves this socket, defer to it — bail
         // before touching the log or spawning anything.
-        if HolderClient::new(&spec.socket_path).is_alive() {
+        // A Holder the probe could not reach may still be serving: refuse
+        // that too, unless nothing listens on the socket.
+        let liveness =
+            HolderClient::new(&spec.socket_path).settled_liveness(super::client::DOUBLE_RUN_SETTLE);
+        if !liveness.may_replace() {
             return Err(HolderError::Launch(format!(
-                "a live holder already serves {}; refusing to double-run",
+                "a holder may already serve {} ({liveness:?}); refusing to double-run",
                 spec.socket_path
             )));
         }
@@ -393,6 +402,7 @@ impl HolderServer {
             child_pid,
             child_identity: pty.child_identity(),
             frozen: Mutex::new(Vec::new()),
+            marker_guard: Mutex::new(HolderExitMarkerGuard::default()),
             guard: guard.clone(),
             pty: Mutex::new(pty),
             log: Mutex::new(log),
@@ -1057,6 +1067,7 @@ fn pump_until_quiet(
             }
         }
         if filled > 0 {
+            neutralize_markers(shared, &mut buffer[..filled]);
             // Subscribers first, then durability. A daemon rendering this
             // session should not wait for a disk write to see the bytes, and
             // this ordering is what decouples display latency from filesystem
@@ -1162,15 +1173,51 @@ impl LogLane {
     }
 }
 
+/// Neutralises any exit-marker prefix in bytes read from the PTY, before
+/// anyone else sees them; see [`HolderExitMarkerGuard`].
+fn neutralize_markers(shared: &Shared, chunk: &mut [u8]) {
+    let forged = shared
+        .marker_guard
+        .lock()
+        .expect("marker guard")
+        .neutralize(chunk);
+    if forged > 0 {
+        diri_telemetry::warn_event!(
+            "holder.exit_marker_neutralized",
+            session = diri_telemetry::id(&shared.spec.session_id),
+            count = forged,
+        );
+    }
+}
+
 /// Appends to the log and publishes its new tail for [`current_stat`].
 fn append_log(shared: &Shared, bytes: &[u8]) {
     let mut log = shared.log.lock().expect("log");
-    let _ = log.append(bytes);
+    note_log_append(log.append(bytes).map(drop));
     shared.log_tail.store(log.tail_offset(), Ordering::Release);
     drop(log);
     // One batch per append, and nobody waits unless a resumed subscriber is
     // reading its backlog, so this costs nothing measurable.
     shared.log_grew.notify_all();
+}
+
+/// Reports an output-log write failure once per streak. The bytes stay in the
+/// stream either way; under ENOSPC every chunk fails, and a line per PTY read
+/// would only fill the disk faster.
+fn note_log_append(result: std::io::Result<()>) {
+    static FAILING: AtomicBool = AtomicBool::new(false);
+    match result {
+        Ok(()) => {
+            if FAILING.swap(false, Ordering::Relaxed) {
+                eprintln!("diri-holder: output log appends recovered");
+            }
+        }
+        Err(error) => {
+            if !FAILING.swap(true, Ordering::Relaxed) {
+                eprintln!("diri-holder: output log append failed: {error}");
+            }
+        }
+    }
 }
 
 /// Hands one chunk of PTY output to every attached subscriber.
@@ -1617,7 +1664,10 @@ fn finish_holder(shared: &Shared) -> Option<Box<dyn FnOnce() + Send>> {
         loop {
             match drain.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(count) => append_log(shared, &buffer[..count]),
+                Ok(count) => {
+                    neutralize_markers(shared, &mut buffer[..count]);
+                    append_log(shared, &buffer[..count]);
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break, // WouldBlock: nothing buffered
             }
@@ -1626,8 +1676,14 @@ fn finish_holder(shared: &Shared) -> Option<Box<dyn FnOnce() + Send>> {
 
     {
         let mut log = shared.log.lock().expect("log");
-        let _ = log.append(&HolderExitMarker::encode(&exit));
-        let _ = log.flush();
+        // Never rate-limited: a marker that did not reach disk leaves the
+        // Engine unable to learn how the Agent exited, so say so.
+        if let Err(error) = log.append(&HolderExitMarker::encode(&exit)) {
+            eprintln!("diri-holder: exit marker not written to the output log: {error}");
+        }
+        if let Err(error) = log.flush() {
+            eprintln!("diri-holder: output log flush after exit failed: {error}");
+        }
         shared.log_tail.store(log.tail_offset(), Ordering::Release);
     }
 

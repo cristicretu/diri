@@ -323,6 +323,16 @@ pub struct LinkSpan {
 }
 
 pub const MAX_GRID_METADATA_BYTES: usize = 256 * 1024;
+
+/// Most cells one decoded [`GridUpdate`] may expand to (4096 x 4096). One
+/// 16-byte RLE run names up to 65,535 cells, so without a ceiling enforced
+/// while decoding a ~1 MB payload could ask for tens of GB.
+pub const MAX_DECODED_GRID_CELLS: usize = 1 << 24;
+
+/// Most cells one [`GridRowCodec::decode_rows`] call may expand to when the
+/// caller gives no tighter bound. History reads should prefer
+/// [`GridRowCodec::decode_rows_bounded`] with their own width and row count.
+pub const MAX_DECODED_ROWS_CELLS: usize = 1 << 26;
 pub const MAX_LINK_URI_BYTES: usize = 2048;
 
 impl RowMetadata {
@@ -628,10 +638,23 @@ impl GridUpdate {
         let cursor_row = cursor.u16()?;
         let flags = cursor.u8()?;
         let row_count = cursor.u16()?;
-        let mut changed_rows = Vec::with_capacity(row_count as usize);
+        // Bound before expanding a single run: each changed row is one of the
+        // grid's rows, no wider than the grid, and the whole update stays
+        // under one ceiling however the header is forged.
+        if row_count > rows {
+            return Err(GridCodecError::RowCountExceedsGrid {
+                row_count: usize::from(row_count),
+                rows: usize::from(rows),
+            });
+        }
+        let mut budget = MAX_DECODED_GRID_CELLS;
+        // Every changed row costs at least its y and run count.
+        let mut changed_rows =
+            Vec::with_capacity(usize::from(row_count).min(cursor.remaining() / 4));
         for _ in 0..row_count {
             let y = cursor.u16()?;
-            let cells = GridRowCodec::read_row_from_cursor(&mut cursor)?;
+            let cells =
+                GridRowCodec::read_row_from_cursor(&mut cursor, usize::from(cols), &mut budget)?;
             changed_rows.push(ChangedRow::new(y, cells));
         }
         let history = if flags & HISTORY_FLAG != 0 {
@@ -718,6 +741,13 @@ pub enum GridCodecError {
     TooManyRows(usize),
     TooManyCells(usize),
     DecodedRowTooLong(usize),
+    /// A decoded update declared more changed rows than its grid has.
+    RowCountExceedsGrid {
+        row_count: usize,
+        rows: usize,
+    },
+    /// Decoding would expand past the caller's total cell budget.
+    DecodedCellsExceedLimit,
 }
 
 impl fmt::Display for GridCodecError {
@@ -737,7 +767,13 @@ impl fmt::Display for GridCodecError {
                 write!(f, "row cell count {count} does not fit in u16")
             }
             Self::DecodedRowTooLong(count) => {
-                write!(f, "decoded row exceeds the u16 grid width ({count} cells)")
+                write!(f, "decoded row exceeds the grid width ({count} cells)")
+            }
+            Self::RowCountExceedsGrid { row_count, rows } => {
+                write!(f, "update changes {row_count} rows of a {rows}-row grid")
+            }
+            Self::DecodedCellsExceedLimit => {
+                f.write_str("decoded rows exceed the caller's cell limit")
             }
         }
     }
@@ -799,8 +835,18 @@ impl GridRowCodec {
 
     /// Reads one row, advancing `offset` past its body.
     pub fn read_row(payload: &[u8], offset: &mut usize) -> Result<Vec<GridCell>, GridCodecError> {
+        let mut budget = usize::from(u16::MAX);
+        Self::read_row_bounded(payload, offset, usize::from(u16::MAX), &mut budget)
+    }
+
+    fn read_row_bounded(
+        payload: &[u8],
+        offset: &mut usize,
+        max_cells: usize,
+        budget: &mut usize,
+    ) -> Result<Vec<GridCell>, GridCodecError> {
         let mut cursor = Cursor::at(payload, *offset);
-        let cells = Self::read_row_from_cursor(&mut cursor)?;
+        let cells = Self::read_row_from_cursor(&mut cursor, max_cells, budget)?;
         *offset = cursor.offset;
         Ok(cells)
     }
@@ -819,15 +865,46 @@ impl GridRowCodec {
         payload: &[u8],
         row_count: usize,
     ) -> Result<Vec<Vec<GridCell>>, GridCodecError> {
+        Self::decode_rows_bounded(
+            payload,
+            row_count,
+            usize::from(u16::MAX),
+            MAX_DECODED_ROWS_CELLS,
+        )
+    }
+
+    /// [`Self::decode_rows`] for an untrusted payload: no row may exceed
+    /// `max_row_cells` and all rows together may not exceed `max_cells`,
+    /// checked before each run is expanded.
+    pub fn decode_rows_bounded(
+        payload: &[u8],
+        row_count: usize,
+        max_row_cells: usize,
+        max_cells: usize,
+    ) -> Result<Vec<Vec<GridCell>>, GridCodecError> {
         let mut offset = 0;
-        let mut rows = Vec::with_capacity(row_count);
+        let mut budget = max_cells;
+        // Every encoded row has at least its two-byte run count, so a forged
+        // count cannot reserve more than the payload could hold.
+        let mut rows = Vec::with_capacity(row_count.min(payload.len() / 2));
         for _ in 0..row_count {
-            rows.push(Self::read_row(payload, &mut offset)?);
+            rows.push(Self::read_row_bounded(
+                payload,
+                &mut offset,
+                max_row_cells,
+                &mut budget,
+            )?);
         }
         Ok(rows)
     }
 
-    fn read_row_from_cursor(cursor: &mut Cursor<'_>) -> Result<Vec<GridCell>, GridCodecError> {
+    /// Reads one row of at most `max_cells` cells, charging them to `budget`.
+    fn read_row_from_cursor(
+        cursor: &mut Cursor<'_>,
+        max_cells: usize,
+        budget: &mut usize,
+    ) -> Result<Vec<GridCell>, GridCodecError> {
+        let max_cells = max_cells.min(usize::from(u16::MAX));
         let run_count = cursor.u16()?;
         let mut cells = Vec::new();
         for _ in 0..run_count {
@@ -836,10 +913,14 @@ impl GridRowCodec {
             let fg = TermColor::unpack(cursor.u32()?);
             let bg = TermColor::unpack(cursor.u32()?);
             let style = TermStyle::from_bits_retain(cursor.u16()?);
-            let new_len = cells.len() + usize::from(repeat);
-            if new_len > usize::from(u16::MAX) {
+            let repeat = usize::from(repeat);
+            let new_len = cells.len() + repeat;
+            if new_len > max_cells {
                 return Err(GridCodecError::DecodedRowTooLong(new_len));
             }
+            *budget = budget
+                .checked_sub(repeat)
+                .ok_or(GridCodecError::DecodedCellsExceedLimit)?;
             cells.resize(new_len, GridCell::new(scalar, fg, bg, style));
         }
         Ok(cells)
@@ -854,6 +935,10 @@ struct Cursor<'a> {
 impl<'a> Cursor<'a> {
     fn new(payload: &'a [u8]) -> Self {
         Self::at(payload, 0)
+    }
+
+    fn remaining(&self) -> usize {
+        self.payload.len().saturating_sub(self.offset)
     }
 
     fn at(payload: &'a [u8], offset: usize) -> Self {
@@ -1601,5 +1686,95 @@ mod annotation_tests {
         second.changed_rows[0].metadata = RowMetadata::default();
         first.coalesce(second);
         assert!(first.changed_rows[0].metadata.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod decode_bound_tests {
+    use super::*;
+
+    /// One RLE run of `repeat` blank cells, built by hand so the hostile
+    /// shape is independent of the encoder.
+    fn run(bytes: &mut Vec<u8>, repeat: u16) {
+        put_u16(bytes, repeat);
+        put_u32(bytes, 0);
+        put_u32(bytes, 0);
+        put_u32(bytes, 0);
+        put_u16(bytes, 0);
+    }
+
+    /// A grid update header followed by `row_count` rows, each one run of
+    /// `repeat` cells.
+    fn forged_update(cols: u16, rows: u16, row_count: u16, repeat: u16) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for value in [cols, rows, 0, 0] {
+            put_u16(&mut bytes, value);
+        }
+        bytes.push(2);
+        put_u16(&mut bytes, row_count);
+        for y in 0..row_count {
+            put_u16(&mut bytes, y);
+            put_u16(&mut bytes, 1);
+            run(&mut bytes, repeat);
+        }
+        bytes
+    }
+
+    #[test]
+    fn a_row_wider_than_its_grid_is_rejected_before_it_expands() {
+        // 20 bytes of row claim 65,535 cells of a 4-column grid.
+        let bytes = forged_update(4, 1, 1, u16::MAX);
+        assert_eq!(
+            GridUpdate::decode(&bytes),
+            Err(GridCodecError::DecodedRowTooLong(usize::from(u16::MAX)))
+        );
+        // The honest width still decodes.
+        let update = GridUpdate::decode(&forged_update(4, 1, 1, 4)).expect("4 cells");
+        assert_eq!(update.changed_rows[0].cells.len(), 4);
+    }
+
+    #[test]
+    fn more_changed_rows_than_the_grid_has_are_rejected() {
+        assert_eq!(
+            GridUpdate::decode(&forged_update(4, 2, 3, 4)),
+            Err(GridCodecError::RowCountExceedsGrid {
+                row_count: 3,
+                rows: 2
+            })
+        );
+    }
+
+    #[test]
+    fn a_forged_row_count_cannot_reserve_past_the_payload() {
+        // usize::MAX rows used to reach Vec::with_capacity and abort.
+        let mut payload = Vec::new();
+        put_u16(&mut payload, 0);
+        assert!(matches!(
+            GridRowCodec::decode_rows(&payload, usize::MAX),
+            Err(GridCodecError::UnexpectedEnd { .. })
+        ));
+    }
+
+    #[test]
+    fn bounded_row_decode_enforces_width_and_total_cells() {
+        let mut payload = Vec::new();
+        for _ in 0..3 {
+            put_u16(&mut payload, 1);
+            run(&mut payload, u16::MAX);
+        }
+        assert_eq!(
+            GridRowCodec::decode_rows_bounded(&payload, 3, 80, 3 * 80),
+            Err(GridCodecError::DecodedRowTooLong(usize::from(u16::MAX)))
+        );
+        assert_eq!(
+            GridRowCodec::decode_rows_bounded(&payload, 3, usize::MAX, 2 * usize::from(u16::MAX)),
+            Err(GridCodecError::DecodedCellsExceedLimit)
+        );
+        assert_eq!(
+            GridRowCodec::decode_rows_bounded(&payload, 3, usize::MAX, 3 * usize::from(u16::MAX))
+                .expect("within budget")
+                .len(),
+            3
+        );
     }
 }
