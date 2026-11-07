@@ -140,6 +140,10 @@ impl ResetDiscriminant<Color> for Cell {
     }
 }
 
+/// The most zerowidth characters one cell keeps (see
+/// [`Cell::push_zerowidth`]).
+pub const MAX_ZEROWIDTH: usize = 32;
+
 /// Dynamically allocated cell content.
 ///
 /// This storage is reserved for cell attributes which are rarely set. This allows reducing the
@@ -198,8 +202,15 @@ impl Cell {
     }
 
     /// Write a new zerowidth character to this cell.
+    ///
+    /// A cell keeps at most [`MAX_ZEROWIDTH`] of them; further ones are
+    /// dropped, so a flood of combining marks cannot grow one cell without
+    /// bound.
     #[inline]
     pub fn push_zerowidth(&mut self, character: char) {
+        if self.zerowidth().is_some_and(|z| z.len() >= MAX_ZEROWIDTH) {
+            return;
+        }
         let extra = self.extra.get_or_insert(Default::default());
         Arc::make_mut(extra).zerowidth.push(character);
     }
@@ -340,6 +351,15 @@ mod tests {
 
     use crate::grid::Row;
     use crate::index::Column;
+
+    #[test]
+    fn zerowidth_per_cell_is_capped() {
+        let mut cell = Cell::default();
+        for _ in 0..MAX_ZEROWIDTH + 10 {
+            cell.push_zerowidth('\u{301}');
+        }
+        assert_eq!(cell.zerowidth().map(<[char]>::len), Some(MAX_ZEROWIDTH));
+    }
 
     #[test]
     fn cell_size_is_below_cap() {

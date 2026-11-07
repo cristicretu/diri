@@ -131,6 +131,11 @@ impl StyleTable {
     }
 }
 
+/// The most marks one cell's cluster holds (beyond its base character);
+/// real clusters hold a handful, so past this a run of marks is dropped
+/// instead of growing one cell without bound.
+pub const MAX_CLUSTER_CHARS: usize = 32;
+
 /// The extra codepoints of each cluster in a page: a cell with GRAPHEME
 /// names its span by the index in its CLUSTER bits. Overwritten clusters
 /// leave dead spans; the arena is compacted when it fills.
@@ -1600,20 +1605,39 @@ impl Page {
     }
 
     /// Adds `c` to the cluster of the cell at `index` (a hot page).
+    ///
+    /// A cell keeps at most [`MAX_CLUSTER_CHARS`] marks; further ones are
+    /// dropped, as is a mark the arena has no room for even after
+    /// compacting, so a flood of marks costs neither unbounded memory nor
+    /// a whole-page compaction per mark.
     pub fn push_zerowidth(&mut self, index: usize, c: char) {
+        if self.clusters.of(self.cells[index]).len() >= MAX_CLUSTER_CHARS {
+            return;
+        }
         if self.clusters.full() {
             self.compact_clusters();
+            if self.clusters.full() {
+                return;
+            }
         }
         push_mark(&mut self.cells, &mut self.clusters, index, c);
     }
 
-    /// Rebuilds the arena from the clusters cells still name.
+    /// Rebuilds the arena from the clusters live cells still name: those
+    /// below `occ` of the page's rows. Cells past them are stale (a
+    /// recycled page keeps its old cells), and their cluster bits may name
+    /// clusters of an arena long gone.
     fn compact_clusters(&mut self) {
         let old = std::mem::take(&mut self.clusters);
-        for cell in self.cells.iter_mut() {
-            if cell.has(GRAPHEME) {
-                let k = self.clusters.add(old.of(*cell));
-                cell.0 = (cell.0 & !CLUSTER) | k << CLUSTER_SHIFT;
+        let cols = self.cells.len() / self.meta.len().max(1);
+        for (row, meta) in self.meta[..self.len].iter().enumerate() {
+            let start = row * cols;
+            for cell in &mut self.cells[start..start + meta.occ as usize] {
+                if cell.has(GRAPHEME) {
+                    let k = self.clusters.add(old.of(*cell));
+                    debug_assert!(k <= CLUSTER >> CLUSTER_SHIFT, "cluster index fits");
+                    cell.0 = (cell.0 & !CLUSTER) | k << CLUSTER_SHIFT;
+                }
             }
         }
     }
@@ -2604,5 +2628,46 @@ impl Pages {
                 clusters,
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod cluster_tests {
+    use super::*;
+
+    /// Compacting reads only live cells: a recycled page keeps its old
+    /// cells, whose cluster bits name clusters of an arena long gone.
+    #[test]
+    fn compaction_skips_stale_cells() {
+        let cols = 4;
+        let mut page = Page::new(2, cols, 1, None, false);
+        page.len = 2;
+        page.meta[1].occ = cols as u16;
+        // A cluster index past anything the next arena holds.
+        page.cells[5] = Cell('a' as u64 | GRAPHEME | 0xFFFE << CLUSTER_SHIFT);
+        page.recycle(2);
+        page.len = 1;
+        page.meta[0].occ = 1;
+        page.cells[0] = Cell('e' as u64);
+        // One live cluster of `e`, and an arena full of dead spans.
+        page.push_zerowidth(0, '\u{301}');
+        page.clusters.add(&vec!['x'; 1 << 20]);
+        assert!(page.clusters.full());
+        page.push_zerowidth(0, '\u{302}');
+        assert_eq!(page.clusters.of(page.cells[0]), ['\u{301}', '\u{302}']);
+        assert!(!page.clusters.full());
+    }
+
+    /// A cell keeps at most `MAX_CLUSTER_CHARS` marks.
+    #[test]
+    fn marks_per_cell_are_capped() {
+        let mut page = Page::new(1, 2, 1, None, false);
+        page.len = 1;
+        page.meta[0].occ = 1;
+        page.cells[0] = Cell('e' as u64);
+        for _ in 0..MAX_CLUSTER_CHARS + 10 {
+            page.push_zerowidth(0, '\u{301}');
+        }
+        assert_eq!(page.clusters.of(page.cells[0]).len(), MAX_CLUSTER_CHARS);
     }
 }
