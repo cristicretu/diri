@@ -38,7 +38,7 @@ use diri_terminal_state::GridMirror;
 use crate::detect::ManifestEngine;
 use crate::holder::{
     HolderClient, HolderExitMarker, HolderExitStatus, HolderLaunchSpec, HolderLauncher,
-    HolderPaths, HolderStat,
+    HolderLiveness, HolderPaths, HolderStat,
 };
 use crate::log::OutputLog;
 use crate::pty::{Exit, Pty, PtySpec};
@@ -1668,6 +1668,36 @@ impl RemoteStop {
     }
 }
 
+/// Whether the Agent pid this session bound is provably gone; `None` when no
+/// pid was ever bound.
+fn held_child_gone(shared: &Shared) -> Option<bool> {
+    let pid = shared.child_pid.load(Ordering::SeqCst);
+    if pid <= 0 {
+        return None;
+    }
+    // SAFETY: signal 0 only probes; EPERM still means the pid exists.
+    #[cfg(unix)]
+    let gone = unsafe { libc::kill(pid, 0) } != 0
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    // No cheap pid probe here: fail closed.
+    #[cfg(not(unix))]
+    let gone = false;
+    Some(gone)
+}
+
+/// Whether the pump may treat its Holder as gone. A probe that could not
+/// tell ([`HolderLiveness::Unknown`]: `EMFILE`, a full backlog, a wedged
+/// Holder) is no evidence of death by itself; only an Agent pid that is gone
+/// too corroborates it, the case of a crashed Holder whose stale socket
+/// refuses connections after its guard killed the Agent.
+fn pump_holder_gone(liveness: HolderLiveness, shared: &Shared) -> bool {
+    match liveness {
+        HolderLiveness::Alive => false,
+        HolderLiveness::Dead => true,
+        HolderLiveness::Unknown(_) => held_child_gone(shared).unwrap_or(false),
+    }
+}
+
 /// The exit of a held child whose Holder went away without an exit marker.
 ///
 /// The follower records such a "markerless death" as `exited` with no
@@ -1681,16 +1711,8 @@ fn accept_markerless_exit(shared: &Shared, client: &HolderClient) -> Option<Exit
     if !shared.exited.load(Ordering::SeqCst) || client.is_alive() {
         return None;
     }
-    let pid = shared.child_pid.load(Ordering::SeqCst);
-    // SAFETY: signal 0 only probes; EPERM still means the pid exists.
-    #[cfg(unix)]
-    let gone = pid <= 0
-        || (unsafe { libc::kill(pid, 0) } != 0
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH));
-    // No cheap pid probe here: fail closed unless no pid was ever bound.
-    #[cfg(not(unix))]
-    let gone = pid <= 0;
-    if !gone {
+    // Fail closed unless no pid was ever bound.
+    if !held_child_gone(shared).unwrap_or(true) {
         return None;
     }
     let exit = Exit::Signal(diri_platform::signals::SIGKILL);
@@ -6801,6 +6823,9 @@ fn held_turn(state: Box<HeldPump>, mut resumed: bool, may_park: bool) -> HeldTur
         mut history_paged,
         mut park_for,
     } = *state;
+    // Whether the last liveness probe could not tell, so its incident is
+    // recorded once per run of failures rather than every tick.
+    let mut liveness_unknown = false;
     // Declared after the watcher so it is dropped first: the doorbell is
     // cleared before the kqueue it rings closes. A park forgets it instead,
     // leaving the doorbell set on the kqueue the parked state keeps open.
@@ -7174,7 +7199,19 @@ fn held_turn(state: Box<HeldPump>, mut resumed: bool, may_park: bool) -> HeldTur
             };
             if last_liveness.elapsed() >= liveness_interval {
                 last_liveness = Instant::now();
-                if !client.is_alive() {
+                let liveness = client.liveness();
+                match liveness {
+                    HolderLiveness::Unknown(kind) if !liveness_unknown => {
+                        diri_telemetry::incident!(
+                            "session.holder_liveness_unknown",
+                            session = diri_telemetry::id(&shared.id),
+                            io = diri_telemetry::io_error(&std::io::Error::from(kind)),
+                        );
+                    }
+                    _ => {}
+                }
+                liveness_unknown = matches!(liveness, HolderLiveness::Unknown(_));
+                if pump_holder_gone(liveness, &shared) {
                     // One last look for a marker that raced the probe.
                     let (_, tail) = {
                         let mut log = shared.log.lock().expect("log");
@@ -8399,6 +8436,71 @@ mod quiet_tick_tests {
         // Input or an attach makes it interactive again at once.
         shared.note_hot();
         assert_eq!(shared.quiet_tick(), TICK_INTERVAL);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod holder_liveness_tests {
+    use super::*;
+
+    fn shared_with_child(pid: i32) -> (tempfile::TempDir, Arc<Shared>) {
+        let temp = tempfile::tempdir().unwrap();
+        let (engine, _) = ManifestEngine::load_dir(&crate::detect::bundled_manifest_dir()).unwrap();
+        let spec = SessionSpec {
+            id: "liveness".into(),
+            pty: PtySpec::new(vec!["/bin/sh".into()], "/tmp"),
+            manifest_id: "generic".into(),
+            authority: Authority::ProcessOnly,
+            logs_dir: temp.path().to_path_buf(),
+            holder: None,
+            remote: None,
+            defer_launch: false,
+        };
+        let log = OutputLog::writer(temp.path(), &spec.id).unwrap();
+        let shared = new_shared(&spec, log, &engine, true);
+        shared.child_pid.store(pid, Ordering::SeqCst);
+        (temp, shared)
+    }
+
+    /// The 256-fd incident: a probe failing with EMFILE (or a refused or
+    /// timed-out connect) over a running Agent must not end the session.
+    #[test]
+    fn an_unreachable_holder_over_a_live_agent_is_not_a_death() {
+        let mut agent = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let (_temp, shared) = shared_with_child(agent.id() as i32);
+        for kind in [
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::TimedOut,
+            std::io::Error::from_raw_os_error(libc::EMFILE).kind(),
+        ] {
+            assert!(
+                !pump_holder_gone(HolderLiveness::Unknown(kind), &shared),
+                "{kind:?} is not evidence of death"
+            );
+        }
+        assert!(!pump_holder_gone(HolderLiveness::Alive, &shared));
+        assert!(pump_holder_gone(HolderLiveness::Dead, &shared));
+
+        // A crashed Holder whose guard took the Agent with it: the stale
+        // socket refuses, and the pid is gone too.
+        agent.kill().unwrap();
+        agent.wait().unwrap();
+        assert!(pump_holder_gone(
+            HolderLiveness::Unknown(std::io::ErrorKind::ConnectionRefused),
+            &shared
+        ));
+    }
+
+    #[test]
+    fn an_unknown_probe_without_a_bound_pid_stays_alive() {
+        let (_temp, shared) = shared_with_child(0);
+        assert!(!pump_holder_gone(
+            HolderLiveness::Unknown(std::io::ErrorKind::TimedOut),
+            &shared
+        ));
     }
 }
 

@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use super::client::HolderClient;
+use super::client::{HolderClient, HolderLiveness};
 use super::guard::GroupGuard;
 use super::paths::{HolderManagerPaths, HolderPaths, MANAGER_PROTOCOL_VERSION};
 use super::protocol::{
@@ -271,8 +271,18 @@ impl HolderManagerServer {
                 // A session from an older per-session holder may already own
                 // this socket. Adopt it instead of creating a second
                 // writer/child.
-                if HolderClient::new(&spec.socket_path).is_alive() {
-                    return Ok(HolderManagerResponse::success(std::process::id() as i32));
+                match HolderClient::new(&spec.socket_path)
+                    .settled_liveness(super::client::DOUBLE_RUN_SETTLE)
+                {
+                    HolderLiveness::Alive => {
+                        return Ok(HolderManagerResponse::success(std::process::id() as i32));
+                    }
+                    liveness if !liveness.may_replace() => {
+                        return Err(HolderError::Transport(format!(
+                            "holder liveness unknown ({liveness:?}); refusing to double-run"
+                        )));
+                    }
+                    _ => {}
                 }
 
                 if state.shutting_down.load(Ordering::SeqCst) {
