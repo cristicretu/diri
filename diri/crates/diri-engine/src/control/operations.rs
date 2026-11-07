@@ -6,7 +6,10 @@ use diri_proto::ControlError;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 
-use super::message_delivery::{digest, open};
+use super::message_delivery::{digest, now_secs, open, record_age, release, reserved_count};
+
+const OPERATIONS_TABLE: &str = "spawn_operations_v1";
+const MAX_OPERATIONS: i64 = 100_000;
 
 pub(super) fn identity(value: &str) -> Result<(), ControlError> {
     if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
@@ -27,6 +30,16 @@ pub(super) fn reserve(
     sender: &str,
     id: &str,
     payload: &Value,
+) -> Result<Reservation, ControlError> {
+    reserve_at(path, sender, id, payload, now_secs())
+}
+
+fn reserve_at(
+    path: &Path,
+    sender: &str,
+    id: &str,
+    payload: &Value,
+    now: i64,
 ) -> Result<Reservation, ControlError> {
     identity(sender)?;
     identity(id)?;
@@ -67,12 +80,9 @@ pub(super) fn reserve(
             fresh: false,
         });
     }
-    let count: i64 = tx
-        .query_row("SELECT COUNT(*) FROM spawn_operations_v1", [], |row| {
-            row.get(0)
-        })
-        .map_err(storage_error)?;
-    if count >= 100_000 {
+    if reserved_count(&tx, OPERATIONS_TABLE, MAX_OPERATIONS, now).map_err(storage_error)?
+        >= MAX_OPERATIONS
+    {
         return Err(ControlError::new(
             "operation_storage_full",
             "operation storage is full; nothing was launched",
@@ -84,6 +94,7 @@ pub(super) fn reserve(
         params![key, fingerprint, resource],
     )
     .map_err(storage_error)?;
+    record_age(&tx, OPERATIONS_TABLE, &key, now).map_err(storage_error)?;
     tx.commit().map_err(storage_error)?;
     Ok(Reservation {
         key,
@@ -164,8 +175,20 @@ impl super::ControlServer {
         let record = if reservation.fresh {
             // The durable prelaunch record is visible while SSH runs. Use the
             // lifecycle guard so remove/resume cannot race this original launch.
-            let _operation =
-                super::account_handoff::SessionOperation::for_session(self, &reservation.resource)?;
+            let _operation = match super::account_handoff::SessionOperation::for_session(
+                self,
+                &reservation.resource,
+            ) {
+                Ok(operation) => operation,
+                // Nothing launched yet: free the identity so a retry with
+                // the same operation_id can still spawn.
+                Err(error) => {
+                    let _ = open(&path).and_then(|db| {
+                        release(&db, OPERATIONS_TABLE, &reservation.key).map_err(storage_error)
+                    });
+                    return Err(error);
+                }
+            };
             match self.session_spawn_identified(
                 Some(p.spawn),
                 Some(reservation.resource.clone()),
@@ -231,6 +254,56 @@ mod tests {
             "completed"
         );
         assert!(!String::from_utf8_lossy(&std::fs::read(path).unwrap()).contains("private"));
+    }
+    #[test]
+    fn expired_operations_are_pruned() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("ops.sqlite");
+        let t0 = 1_000_000;
+        let ttl = super::super::message_delivery::RECEIPT_TTL_SECS;
+        let first = reserve_at(&path, "parent", "op1", &json!({}), t0).unwrap();
+        assert!(
+            !reserve_at(&path, "parent", "op1", &json!({}), t0 + ttl - 1)
+                .unwrap()
+                .fresh
+        );
+        reserve_at(&path, "parent", "op2", &json!({}), t0 + ttl + 1).unwrap();
+        let again = reserve_at(&path, "parent", "op1", &json!({}), t0 + ttl + 2).unwrap();
+        assert!(again.fresh);
+        assert_ne!(again.resource, first.resource);
+    }
+    #[test]
+    fn full_operation_storage_recovers_once_operations_expire() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("ops.sqlite");
+        let t0 = 1_000_000;
+        reserve_at(&path, "parent", "op0", &json!({}), t0).unwrap();
+        open(&path).unwrap().execute(
+            "WITH RECURSIVE entries(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM entries WHERE n < ?1)
+             INSERT INTO spawn_operations_v1 SELECT CAST(n AS TEXT), 'f', 's', 'completed' FROM entries",
+            [MAX_OPERATIONS - 1],
+        ).unwrap();
+        assert_eq!(
+            reserve_at(&path, "parent", "op1", &json!({}), t0 + 1)
+                .err()
+                .unwrap()
+                .code,
+            "operation_storage_full"
+        );
+        let ttl = super::super::message_delivery::RECEIPT_TTL_SECS;
+        assert!(
+            reserve_at(&path, "parent", "op1", &json!({}), t0 + ttl + 2)
+                .unwrap()
+                .fresh
+        );
+    }
+    #[test]
+    fn released_operation_identity_can_spawn_again() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("ops.sqlite");
+        let first = reserve(&path, "parent", "op", &json!({})).unwrap();
+        release(&open(&path).unwrap(), OPERATIONS_TABLE, &first.key).unwrap();
+        assert!(reserve(&path, "parent", "op", &json!({})).unwrap().fresh);
     }
     #[test]
     fn object_key_order_does_not_change_the_operation_fingerprint() {

@@ -1021,6 +1021,41 @@ fn a_resize_at_capacity_keeps_history_like_the_current_core() {
     }
 }
 
+/// An alternate-screen truecolor animation redrawn in place interns far
+/// more than 65,535 distinct styles into one page over its life. Ids must
+/// not wrap (cells would read another style or the default): dead styles
+/// are reclaimed and the table stays bounded.
+#[test]
+fn more_than_65535_styles_redrawn_in_place_keep_their_colors() {
+    let (lines, cols) = (4, 8);
+    let mut input = b"\x1b[?1049h".to_vec();
+    for i in 0..70_000u32 {
+        let (row, col) = ((i / cols as u32) % lines as u32 + 1, i % cols as u32 + 1);
+        let (r, g, b) = (i & 0xFF, (i >> 8) & 0xFF, i >> 16);
+        let ch = (b'a' + (i % 26) as u8) as char;
+        input.extend_from_slice(
+            format!("\x1b[{row};{col}H\x1b[38;2;{r};{g};{b};48;2;{b};{g};{r}m{ch}").as_bytes(),
+        );
+        // Erases intern the pen's erased style too.
+        if i % 997 == 0 {
+            input.extend_from_slice(b"\x1b[K");
+        }
+    }
+    let want = reference(lines, cols, 0, &input);
+    for reads in [vec![&input[..]], input.chunks(4093).collect::<Vec<_>>()] {
+        let got = core(lines, cols, 0, &reads, false, None);
+        if let Err(error) = compare(&got, &want) {
+            panic!("{error}");
+        }
+        for p in 0..got.pages.page_count() {
+            assert!(
+                got.pages.page(p).styles.len() <= 1 << 16,
+                "style table bounded"
+            );
+        }
+    }
+}
+
 /// A run of combining marks keeps at most 32 on the cell, in both cores
 /// alike, after a base that presents alone and after one that does not.
 #[test]

@@ -33,7 +33,7 @@ pub struct Core {
     pub col: usize,
     pub wrap_pending: bool,
     pub(super) pen: Style,
-    /// (page serial, interned id) of `pen`.
+    /// (page style epoch, interned id) of `pen`.
     pub(super) pen_cache: (u64, u16),
     pub(super) tabs: Vec<bool>,
     pub(super) clustering: bool,
@@ -148,8 +148,9 @@ impl Core {
     #[inline(always)]
     fn pen_id(&mut self, page: usize) -> u16 {
         let p = self.pages.page_mut(page);
-        if p.serial != self.pen_cache.0 {
-            self.pen_cache = (p.serial, p.styles.intern(&self.pen));
+        if p.style_epoch() != self.pen_cache.0 {
+            let id = p.intern_style(&self.pen);
+            self.pen_cache = (p.style_epoch(), id);
         }
         self.pen_cache.1
     }
@@ -600,8 +601,7 @@ impl Core {
             let (l, c) = (self.line, self.col);
             // The cluster may move to another page: re-intern its style.
             let (p, _) = self.pages.locate(l);
-            let style =
-                (self.pages.page_mut(p).styles.intern(&cluster_style) as u64) << STYLE_SHIFT;
+            let style = (self.pages.page_mut(p).intern_style(&cluster_style) as u64) << STYLE_SHIFT;
             let keep = cluster.0 & (super::cell::CP | super::cell::HYPERLINK);
             self.set(l, c, |_| Cell(keep | style | WIDE | marks));
             if let Some(link) = link {
@@ -1193,7 +1193,7 @@ impl Handler for Core {
         let erased = self.pen.erased();
         let cols = self.cols;
         let page = self.pages.page_mut(p);
-        let id = page.styles.intern(&erased);
+        let id = page.intern_style(&erased);
         let meta = &mut page.meta[r];
         if right == cols && (left == 0 || meta.fill == id) {
             if left == 0 {

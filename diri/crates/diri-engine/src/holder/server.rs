@@ -32,11 +32,11 @@ use super::client::HolderClient;
 use super::guard::GroupGuard;
 use super::process_tree;
 use super::protocol::{
-    HOLDER_OUTPUT_STREAM_VERSION, HOLDER_STREAM_ACK, HOLDER_STREAM_INPUT,
-    HOLDER_STREAM_MAX_PAYLOAD, HOLDER_STREAM_RESIZE, HOLDER_STREAM_RESIZE_PIXELS,
-    HOLDER_STREAM_VERSION, HOLDER_STREAM_VERSION_PIXELS, HolderChildRecord, HolderExitMarker,
-    HolderExitMarkerGuard, HolderExitReason, HolderExitStatus, HolderLaunchSpec, HolderOperation,
-    HolderRequest, HolderResponse, HolderStat,
+    HOLDER_OUTPUT_STREAM_VERSION, HOLDER_STREAM_ACK, HOLDER_STREAM_FAILED, HOLDER_STREAM_INPUT,
+    HOLDER_STREAM_MAX_PAYLOAD, HOLDER_STREAM_PARTIAL, HOLDER_STREAM_RESIZE,
+    HOLDER_STREAM_RESIZE_PIXELS, HOLDER_STREAM_VERSION, HOLDER_STREAM_VERSION_PIXELS,
+    HolderChildRecord, HolderExitMarker, HolderExitMarkerGuard, HolderExitReason, HolderExitStatus,
+    HolderLaunchSpec, HolderOperation, HolderRequest, HolderResponse, HolderStat,
 };
 use super::reactor;
 use super::socket;
@@ -744,8 +744,9 @@ fn serve_client(shared: &Arc<Shared>, mut client: diri_platform::ipc::UnixStream
             }
             HolderResponse::failure("unsupported Holder input stream version")
         }
-        Ok(request) => handle(shared, &request)
-            .unwrap_or_else(|error| HolderResponse::failure(error.to_string())),
+        Ok(request) => {
+            handle(shared, &request).unwrap_or_else(|error| HolderResponse::from_error(&error))
+        }
         Err(error) => HolderResponse::failure(error.to_string()),
     };
     let _ = socket::write_json_line(&mut client, &response);
@@ -1802,7 +1803,7 @@ fn serve_input_stream(shared: &Arc<Shared>, stream: Arc<diri_platform::ipc::Unix
         }
         let length = u32::from_be_bytes(header[1..].try_into().expect("four-byte length")) as usize;
         if length > HOLDER_STREAM_MAX_PAYLOAD {
-            let _ = reader.write_all(&[1]);
+            let _ = reader.write_all(&[HOLDER_STREAM_FAILED]);
             return;
         }
         payload.resize(length, 0);
@@ -1843,8 +1844,16 @@ fn serve_input_stream(shared: &Arc<Shared>, stream: Arc<diri_platform::ipc::Unix
                 "unknown Holder input stream frame".into(),
             )),
         };
-        if result.is_err() {
-            let _ = reader.write_all(&[1]);
+        if let Err(error) = result {
+            let _ = match error {
+                HolderError::PartialWrite { written, .. } => {
+                    let mut ack = [0_u8; 9];
+                    ack[0] = HOLDER_STREAM_PARTIAL;
+                    ack[1..].copy_from_slice(&written.to_be_bytes());
+                    reader.write_all(&ack)
+                }
+                _ => reader.write_all(&[HOLDER_STREAM_FAILED]),
+            };
             return;
         }
         if reader.write_all(&[HOLDER_STREAM_ACK]).is_err() {
@@ -1998,42 +2007,70 @@ fn read_stream_exact(shared: &Shared, stream: &mut impl Read, mut bytes: &mut [u
 /// Writes with the same bounded semantics the Swift holder used: retry
 /// `EINTR`/`EAGAIN`, waiting for the child to drain, but give up if the PTY
 /// stays unwritable for a full second.
+/// How long a write waits for a child that accepts none of it.
+const PTY_WRITE_STALL: Duration = Duration::from_secs(1);
+/// How long a write that already delivered a prefix waits for the child to
+/// take more. Finishing the frame beats reporting a split paste.
+const PTY_WRITE_STALL_PARTIAL: Duration = Duration::from_secs(3);
+
+/// Writes all of `data` to the PTY. A failure is always
+/// [`HolderError::PartialWrite`], naming exactly how many leading bytes the
+/// child did receive (possibly none).
 fn write_pty(shared: &Shared, data: &[u8]) -> HolderResult<()> {
+    let total = data.len() as u64;
+    let partial = |written: usize, reason: String| HolderError::PartialWrite {
+        written: written as u64,
+        total,
+        reason,
+    };
     let pty = shared.pty.lock().expect("pty");
     let writer = pty
         .writer()
-        .map_err(|error| HolderError::io("PTY writer", error))?;
+        .map_err(|error| partial(0, format!("PTY writer: {error}")))?;
     let fd = writer.as_raw_fd();
     // A streaming pump keeps the description blocking; a write must still
     // give up on a child that stopped reading its input.
     let _flags = shared.read_mode.nonblocking_for_write(&pty, fd);
     let mut written = 0;
+    let mut progressed = Instant::now();
     while written < data.len() {
         // SAFETY: plain write(2) on an owned fd with an in-bounds slice.
         let count =
             unsafe { libc::write(fd, data[written..].as_ptr().cast(), data.len() - written) };
         if count > 0 {
             written += count as usize;
+            progressed = Instant::now();
             continue;
         }
         let error = std::io::Error::last_os_error();
         match error.raw_os_error() {
             Some(libc::EINTR) => continue,
             Some(libc::EAGAIN) => {
+                let stall = if written == 0 {
+                    PTY_WRITE_STALL
+                } else {
+                    PTY_WRITE_STALL_PARTIAL
+                };
+                let left = stall.saturating_sub(progressed.elapsed());
                 let mut poll_fd = libc::pollfd {
                     fd,
                     events: libc::POLLOUT,
                     revents: 0,
                 };
                 // SAFETY: one initialized pollfd, millisecond timeout.
-                let ready = unsafe { libc::poll(&mut poll_fd, 1, 1000) };
+                let ready = unsafe { libc::poll(&mut poll_fd, 1, left.as_millis() as libc::c_int) };
+                if ready < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+                {
+                    continue;
+                }
                 if ready <= 0 || poll_fd.revents & libc::POLLOUT == 0 {
-                    return Err(HolderError::Transport(
-                        "PTY remained unwritable for 1 second".into(),
+                    return Err(partial(
+                        written,
+                        format!("PTY remained unwritable for {} ms", stall.as_millis()),
                     ));
                 }
             }
-            _ => return Err(HolderError::io("PTY write", error)),
+            _ => return Err(partial(written, format!("PTY write: {error}"))),
         }
     }
     Ok(())
@@ -2719,6 +2756,56 @@ mod tests {
         wait_until("holder finished", || server.is_finished());
         server.join().expect("join").expect("clean holder exit");
         wait_until("lanes gone", || live_lanes::count("s_lanes") == 0);
+    }
+
+    /// A child that stops reading its input takes only a prefix of a large
+    /// paste. The write used to fail as a whole after a second, hiding that
+    /// prefix: a retry duplicated it, and giving up lost the tail. The
+    /// caller is now told exactly how many bytes the child received.
+    #[test]
+    fn a_stalled_write_reports_exactly_the_prefix_the_child_received() {
+        let root = tempfile::tempdir().unwrap();
+        let received = root.path().join("received");
+        let spec = held(
+            root.path(),
+            "s_partial",
+            &format!(
+                "stty raw -echo; printf 'rea''dy'; sleep 6; exec cat > '{}'",
+                received.display()
+            ),
+        );
+        let client = HolderClient::new(&spec.socket_path);
+        let server = std::thread::spawn(move || HolderServer::run(spec));
+        wait_until("holder ready", || client.is_alive());
+        // From offset 0: "ready" may be printed before the subscription.
+        let mut stream = client
+            .open_output_stream_from(0)
+            .expect("subscribe")
+            .expect("output stream supported");
+        read_until(&mut stream, b"ready", Duration::from_secs(5));
+
+        let paste = vec![b'x'; 256 << 10];
+        let started = Instant::now();
+        let error = client.write(&paste).expect_err("the child is not reading");
+        let HolderError::PartialWrite { written, total, .. } = error else {
+            panic!("expected a partial write, got {error}");
+        };
+        assert_eq!(total, paste.len() as u64);
+        assert!(written > 0 && written < total, "wrote {written} of {total}");
+        // Once a prefix is in, the Holder waits longer than a keystroke's
+        // one second for the rest before it gives up.
+        assert!(started.elapsed() >= PTY_WRITE_STALL_PARTIAL);
+
+        // When the child reads again it finds exactly that prefix.
+        wait_until("child drained its input", || {
+            std::fs::metadata(&received).is_ok_and(|meta| meta.len() >= written)
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(std::fs::metadata(&received).unwrap().len(), written);
+
+        client.kill_tree().expect("kill-tree");
+        wait_until("holder finished", || server.is_finished());
+        let _ = server.join();
     }
 
     /// Reads every byte a subscriber is sent until `until` appears.

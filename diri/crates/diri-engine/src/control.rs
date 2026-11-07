@@ -3092,15 +3092,18 @@ impl ControlServer {
             return Err(ControlError::not_found(p.session_id.0.clone()));
         }
         let receipt = message_delivery::deliver(&self.message_receipts_path(), &p, || {
+            use message_delivery::SendError;
+            // Waking and finding the session write no input: failures
+            // there release the receipt instead of poisoning message_id.
             registry
                 .wake_session(&p.session_id.0)
-                .map_err(io_control_error)?;
+                .map_err(|error| SendError::NotSent(io_control_error(error)))?;
             self.publish_updated(&registry, &p.session_id.0);
             registry
                 .get(&p.session_id.0)
-                .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
+                .ok_or_else(|| SendError::NotSent(ControlError::not_found(p.session_id.0.clone())))?
                 .send_text(&p.text, p.submit)
-                .map_err(io_control_error)
+                .map_err(|_| SendError::Uncertain)
         });
         if let Ok(receipt) = &receipt {
             diri_telemetry::event!(
@@ -6462,6 +6465,19 @@ fn io_control_error(error: std::io::Error) -> ControlError {
         .is_some_and(|cause| cause.is::<crate::session::InputModesUnavailable>())
     {
         return ControlError::new("input_modes_unavailable", error.to_string());
+    }
+    if let Some(partial) = error
+        .get_ref()
+        .and_then(|cause| cause.downcast_ref::<crate::session::PartialInputDelivery>())
+    {
+        // Retrying the whole input would duplicate a delivered prefix, so
+        // the caller is told exactly how much arrived.
+        let code = if partial.delivered == 0 {
+            "input_not_delivered"
+        } else {
+            "input_partially_delivered"
+        };
+        return ControlError::new(code, partial.to_string());
     }
     if error
         .get_ref()
