@@ -512,9 +512,12 @@ impl NotificationFeed {
         }
         ids
     }
+    /// Marks an entry read or unread. A resolved entry never goes back to
+    /// unread: it no longer waits on anyone, so it must not badge again.
     pub fn set_read(&mut self, id: &str, read: bool) -> bool {
         if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id)
             && entry.read != read
+            && (read || !entry.resolved)
         {
             entry.read = read;
             if read {
@@ -650,6 +653,29 @@ mod tests {
             feed.latest_unread(&SessionId::new("a")).map(|entry| entry.id.as_str()),
             Some("a22")
         );
+    }
+
+    #[test]
+    fn a_resolved_entry_cannot_be_marked_unread_again() {
+        let mut feed = NotificationFeed::default();
+        feed.entries = vec![NotificationEntry {
+            id: "n".into(),
+            session_id: SessionId::new("a"),
+            incarnation: 0,
+            kind: NotificationKind::NeedsInput,
+            title: String::new(),
+            body: String::new(),
+            created_at_ms: 0,
+            read: true,
+            resolved: true,
+            blocker: String::new(),
+        }];
+        assert!(!feed.set_read("n", false));
+        assert_eq!(feed.unread_count(), 0, "the badge stays gone");
+        // An unresolved entry still toggles both ways.
+        feed.entries[0].resolved = false;
+        assert!(feed.set_read("n", false));
+        assert_eq!(feed.unread_count(), 1);
     }
 
     #[test]
