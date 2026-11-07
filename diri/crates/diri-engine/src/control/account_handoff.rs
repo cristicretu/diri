@@ -74,6 +74,8 @@ impl ControlServer {
         &self,
         params: Option<Value>,
     ) -> Result<Value, ControlError> {
+        // Every launch holds the account gate (see account_gate.rs).
+        let _launch = self.launch_permit()?;
         let params: ContinueAccountParams = decode(params)?;
         let source = self
             .registry
