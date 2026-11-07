@@ -365,7 +365,9 @@ struct State {
     timers: Vec<Timer>,
     waiters: Vec<Waiter>,
     layer_changed: bool,
-    stopped: bool,
+    /// The exit code of the first `diri.stop(code)`; set once, never
+    /// overwritten. Once set, no further callback or waiter runs.
+    stop: Option<i32>,
     actions: Option<Vec<AppActionSpec>>,
     last_notices: HashMap<String, Instant>,
     /// Programs the person granted `diri.exec`.
@@ -375,7 +377,6 @@ struct State {
     script: String,
     digest: String,
     stopped_at: Option<String>,
-    exit_code: i32,
     /// `on_output` functions of running processes, by exec id.
     outputs: HashMap<u64, Function>,
 }
@@ -793,12 +794,25 @@ impl Runtime {
     }
 
     pub fn stopped(&self) -> bool {
-        self.shared.state.borrow().stopped
+        self.shared.state.borrow().stop.is_some()
     }
 
-    /// The exit code `diri.stop(code)` asked for.
+    /// The exit code the first `diri.stop(code)` asked for.
     pub fn exit_code(&self) -> i32 {
-        self.shared.state.borrow().exit_code
+        self.shared.state.borrow().stop.unwrap_or(0)
+    }
+
+    /// After `diri.stop`, the rest of a batch (handlers for the same event,
+    /// timers due together, woken waiters) does not run. Answers a waiting
+    /// reply so its caller is not left hanging.
+    fn refuse_after_stop(&self, reply: &mut Option<Reply>) -> bool {
+        if !self.stopped() {
+            return false;
+        }
+        if let Some(reply) = reply.take() {
+            reply(Err("the script stopped".into()));
+        }
+        true
     }
 
     /// Reports an error to the person (toast, at most once per 10 s for the
@@ -868,7 +882,10 @@ impl Runtime {
         }
     }
 
-    fn resume_waiter(&self, waiter: Waiter, args: MultiValue) {
+    fn resume_waiter(&self, mut waiter: Waiter, args: MultiValue) {
+        if self.refuse_after_stop(&mut waiter.reply) {
+            return;
+        }
         let step = self.resume(&waiter.thread, args, self.options.callback_budget);
         self.settle(waiter.thread, step, waiter.what, waiter.reply);
     }
@@ -946,7 +963,10 @@ impl Runtime {
         }
     }
 
-    fn call_callback(&self, id: u64, argument: LuaValue, what: &str, reply: Option<Reply>) {
+    fn call_callback(&self, id: u64, argument: LuaValue, what: &str, mut reply: Option<Reply>) {
+        if self.refuse_after_stop(&mut reply) {
+            return;
+        }
         let function = (|| {
             let callbacks: Table = self.lua.named_registry_value(CALLBACKS)?;
             callbacks.get::<Option<Function>>(id)
@@ -1727,9 +1747,12 @@ fn install_timers(lua: &Lua, shared: &Rc<Shared>, diri: &Table) -> mlua::Result<
     diri.raw_set(
         "stop",
         lua.create_function(move |_, code: Option<i32>| {
-            let mut state = stop_shared.state.borrow_mut();
-            state.stopped = true;
-            state.exit_code = code.unwrap_or(0);
+            // The first stop decides the exit code.
+            stop_shared
+                .state
+                .borrow_mut()
+                .stop
+                .get_or_insert(code.unwrap_or(0));
             Ok(())
         })?,
     )

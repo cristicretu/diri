@@ -718,7 +718,7 @@ function connectEvents() {
   source.addEventListener("daemon", (event) => {
     try {
       const data = JSON.parse(event.data);
-      dot.className = "dot " + (data.state.startsWith("Connected") ? "working" : "exited");
+      dot.className = "dot " + (data.state === "connected" ? "working" : "exited");
     } catch (error) { /* the dot simply stays as it was */ }
   });
 }

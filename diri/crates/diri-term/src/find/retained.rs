@@ -349,6 +349,93 @@ mod tests {
         }
     }
 
+    /// Returning to live through the element (typing, Return to live) used
+    /// to leave a paused find pinned, painting the frozen capture at offset
+    /// zero as if it were the live screen.
+    #[test]
+    fn element_return_to_live_releases_a_pinned_find() {
+        let _budget = budget();
+        let mut screen = HeadlessScreen::new(24, 10);
+        for row in 0..210 {
+            let text = if row % 25 == 0 { "needle" } else { "filler" };
+            screen.feed(format!("{text} {row}\r\n").as_bytes());
+        }
+        let mut live = GridBuffer::default();
+        live.apply(screen.full_snapshot());
+        let element = crate::element::TerminalElement::with_buffer(live.clone());
+        let mut model = TerminalFindModel::retained();
+        let reservation = model.reservation().unwrap();
+        let source = RetainedFindSnapshot::decode(capture(&screen, 1), reservation).unwrap();
+        model.set_query("needle", Duration::ZERO);
+        let request = model.take_due_search(SEARCH_DEBOUNCE).unwrap();
+        let result = model
+            .prepare_search(&request, FindSnapshot::from(source.clone()), &live)
+            .unwrap()
+            .run();
+        assert!(element.apply_find_result(&mut model, result));
+        for _ in 0..model.matches().len() {
+            if element.viewport().has_find_source(&source) {
+                break;
+            }
+            element.find_previous(&mut model);
+        }
+        assert!(element.viewport().has_find_source(&source));
+        element.scroll_to_live(10);
+        let viewport = element.viewport();
+        assert!(!viewport.has_find_source(&source));
+        assert!(!viewport.is_reading());
+        assert_eq!(viewport.view_offset(), 0);
+    }
+
+    /// Pinning a find while a column-change relocation fetch was out dropped
+    /// that fetch's reply without clearing its in-flight flag, so after find
+    /// closed every later fetch was refused and the view never settled.
+    #[test]
+    fn a_find_pinned_mid_relocation_does_not_wedge_later_fetches() {
+        let _budget = budget();
+        let rows = 10;
+        let mut screen = HeadlessScreen::new(80, rows);
+        for i in 0..300 {
+            screen.feed(format!("L{i:03} {} needle\r\n", "abcdefghij".repeat(10)).as_bytes());
+        }
+        let mut buffer = GridBuffer::new(80, rows as u16);
+        buffer.apply(screen.grid_update(true));
+        let mut viewport = ScrollbackViewport::default();
+        let settle = |viewport: &mut ScrollbackViewport, screen: &mut HeadlessScreen| {
+            while let Some(request) = viewport.begin_fetch(rows) {
+                let reply = screen.scrollback_cells(request.first_row, request.max_rows);
+                viewport.complete_fetch(reply, rows).unwrap();
+            }
+        };
+        viewport.scroll_by(1, rows);
+        viewport.hold_reading_view(&buffer);
+        settle(&mut viewport, &mut screen);
+        viewport.scroll_by(149, rows);
+        settle(&mut viewport, &mut screen);
+        assert_eq!(viewport.view_offset(), 150);
+
+        screen.resize(40, rows);
+        let update = screen.grid_update(true);
+        viewport.hold_reading_view(&buffer);
+        viewport.note_width_change(&buffer, update.cols);
+        buffer.apply(update);
+        let probe = viewport.begin_fetch(rows).expect("relocation probe");
+
+        let mut model = TerminalFindModel::retained();
+        let reservation = model.reservation().unwrap();
+        let source = RetainedFindSnapshot::decode(capture(&screen, 1), reservation).unwrap();
+        viewport.pin_find_source(source.clone(), source.first_row + 5, rows);
+        let reply = screen.scrollback_cells(probe.first_row, probe.max_rows);
+        viewport.complete_fetch(reply, rows).unwrap();
+        viewport.clear_find_source();
+        assert!(!viewport.relocating());
+
+        viewport.scroll_by(40, rows);
+        viewport.hold_reading_view(&buffer);
+        assert!(viewport.begin_fetch(rows).is_some(), "fetches resume");
+        drop(model);
+    }
+
     #[test]
     fn typing_on_searches_the_held_capture_at_once_until_the_terminal_prints_again() {
         let _budget = budget();

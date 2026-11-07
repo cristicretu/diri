@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use diri_proto::{AgentReadinessResult, Method, SessionListResult, SessionRecord, SessionStatus};
+use dirijor_mcp::bridge::status_label;
 use dirijor_mcp::{Bridge, ControlClient, ControlFailure, default_socket_path};
 use serde_json::{Value, json};
 
@@ -1735,17 +1736,6 @@ fn print_session_table(sessions: &[SessionRecord]) {
             record.effective_kind().id(),
             record.title
         );
-    }
-}
-
-fn status_label(status: &SessionStatus) -> &'static str {
-    match status {
-        SessionStatus::Starting => "starting",
-        SessionStatus::Idle => "idle",
-        SessionStatus::Working => "working",
-        SessionStatus::NeedsInput(_) => "needsInput",
-        SessionStatus::Exited(_) => "exited",
-        SessionStatus::Unknown => "unknown",
     }
 }
 
