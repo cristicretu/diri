@@ -169,6 +169,10 @@ pub struct Registry {
     /// Sessions the user closed, newest last — the "reopen closed tab" stack.
     recently_closed: Vec<SessionRecord>,
     state_file: JsonStateFile,
+    /// Test-only fault injection: the next `persist_now` fails as a full
+    /// disk would, after any lifecycle work before it already ran.
+    #[cfg(test)]
+    fail_next_persist: bool,
     /// Owner-only directory of immutable completed-terminal artifacts.
     completed_dir: PathBuf,
     /// Runs already bound on disk, so the watcher writes each binding once.
@@ -311,6 +315,8 @@ impl Registry {
             projects: Vec::new(),
             recently_closed: Vec::new(),
             state_file: JsonStateFile::new(state_path),
+            #[cfg(test)]
+            fail_next_persist: false,
             completed_dir,
             bound_runs: HashMap::new(),
             pending_publications: Vec::new(),
@@ -560,6 +566,10 @@ impl Registry {
     /// after the file is fsynced and renamed into place, or after confirming
     /// the file already holds byte-identical sections.
     pub(crate) fn persist_now(&mut self) -> std::io::Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_persist) {
+            return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        }
         self.prepare_persist()?.commit()?;
         self.dirty = false;
         self.last_persist = Some(std::time::Instant::now());
@@ -1663,7 +1673,10 @@ impl Registry {
         if plan.terminate_live_session && self.sessions.contains_key(id) {
             self.terminate(id, std::time::Duration::from_millis(500))?;
         }
-        self.records.remove(id);
+        // `terminate` killed the tree and stamped the exit on the stored
+        // record; the pre-terminate clone still claims a live status with no
+        // Session behind it, so a rollback (and reopen) must use this one.
+        let record = self.records.remove(id).unwrap_or(record);
         if plan.retain_for_reopen {
             self.recently_closed.push(record.clone());
             if self.recently_closed.len() > 10 {
@@ -2349,12 +2362,15 @@ impl Registry {
         if plan.terminate_live_session && self.sessions.contains_key(id) {
             self.terminate(id, std::time::Duration::from_millis(500))?;
         }
+        // Once `terminate` ran, the stored record carries the exit; rolling
+        // back to `original` would re-list a dead session as live.
+        let rollback = self.records.get(id).cloned().unwrap_or(original);
         self.records.insert(
             id.to_owned(),
             plan.replacement.expect("archive keeps the record"),
         );
         if let Err(error) = self.persist_now() {
-            self.records.insert(id.to_owned(), original);
+            self.records.insert(id.to_owned(), rollback);
             return Err(error);
         }
         Ok(())
@@ -3826,6 +3842,75 @@ mod tests {
         assert_eq!(current.updated_at, original.updated_at);
         assert_eq!(current.terminal_cwd, original.terminal_cwd);
         assert!(!registry.dirty, "failed edit must not be flushed later");
+    }
+
+    /// Spawns a live, long-running session whose record claims `Working`.
+    #[cfg(unix)]
+    fn spawn_live(registry: &mut Registry, id: &str, root: &Path) {
+        let mut live = record(id);
+        live.status = SessionStatus::Working;
+        live.cwd = root.to_string_lossy().into_owned();
+        registry
+            .spawn(
+                SessionSpec {
+                    id: id.into(),
+                    pty: crate::pty::PtySpec::new(
+                        vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+                        root,
+                    ),
+                    manifest_id: AgentKind::SHELL_ID.into(),
+                    authority: crate::status::Authority::ProcessOnly,
+                    logs_dir: root.join("logs"),
+                    holder: None,
+                    remote: None,
+                    defer_launch: false,
+                },
+                live,
+            )
+            .expect("spawn");
+        assert!(registry.sessions.contains_key(id));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_persist_after_terminate_rolls_back_to_the_exited_record() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().canonicalize().expect("root");
+        let mut registry = Registry::new(engine(), root.join("state.json"));
+
+        spawn_live(&mut registry, "removed", &root);
+        registry.fail_next_persist = true;
+        registry
+            .remove("removed", &root.join("logs"))
+            .expect_err("injected persist failure");
+        assert!(
+            !registry.sessions.contains_key("removed"),
+            "tree was killed"
+        );
+        let restored = registry.records.get("removed").expect("rolled back");
+        assert!(
+            matches!(restored.status, SessionStatus::Exited(_)),
+            "remove rollback re-listed a dead session as {:?}",
+            restored.status
+        );
+        assert!(registry.recently_closed.is_empty());
+
+        spawn_live(&mut registry, "archived", &root);
+        registry.fail_next_persist = true;
+        registry
+            .archive("archived")
+            .expect_err("injected persist failure");
+        assert!(
+            !registry.sessions.contains_key("archived"),
+            "tree was killed"
+        );
+        let restored = registry.records.get("archived").expect("rolled back");
+        assert!(
+            matches!(restored.status, SessionStatus::Exited(_)),
+            "archive rollback re-listed a dead session as {:?}",
+            restored.status
+        );
+        assert_eq!(restored.archived_at, None, "the archive itself was undone");
     }
 
     #[test]
