@@ -830,7 +830,13 @@ impl RemoteManager {
         helper: &InstalledHelper,
         request: &LaunchRequest,
     ) -> io::Result<LaunchResult> {
-        match self.rpc(helper, HelperCommand::Launch, request, UPLOAD_TIMEOUT) {
+        match self.session_rpc(
+            helper,
+            HelperCommand::Launch,
+            &request.session_id,
+            request,
+            UPLOAD_TIMEOUT,
+        ) {
             Ok(result) => Ok(result),
             Err(first) => {
                 // Launch is authenticated and idempotent for a
@@ -839,7 +845,7 @@ impl RemoteManager {
                 // command recovers that exact incarnation without spawning a
                 // duplicate or leaking an unknown Holder.
                 std::thread::sleep(Duration::from_millis(50));
-                self.rpc(helper, HelperCommand::Launch, request, UPLOAD_TIMEOUT)
+                self.session_rpc(helper, HelperCommand::Launch, &request.session_id, request, UPLOAD_TIMEOUT)
                     .map_err(|second| {
                         io::Error::new(
                             second.kind(),
@@ -857,7 +863,13 @@ impl RemoteManager {
         helper: &InstalledHelper,
         selector: &SessionSelector,
     ) -> io::Result<SessionInspection> {
-        self.rpc(helper, HelperCommand::Inspect, selector, RPC_TIMEOUT)
+        self.session_rpc(
+            helper,
+            HelperCommand::Inspect,
+            &selector.session_id,
+            selector,
+            RPC_TIMEOUT,
+        )
     }
 
     /// Lease-free identity facts, verified by the Helper on the owning host.
@@ -912,8 +924,13 @@ impl RemoteManager {
             include_process_facts: true,
             timeout_ms: timeout.as_millis().clamp(1, 1000) as u32,
         };
-        let inspection: SessionInspection =
-            self.rpc(helper, HelperCommand::Inspect, &request, timeout)?;
+        let inspection: SessionInspection = self.session_rpc(
+            helper,
+            HelperCommand::Inspect,
+            &selector.session_id,
+            &request,
+            timeout,
+        )?;
         diri_pty::unix_socket::remaining(deadline)?;
         let identity = identity_from_inspection(&helper.build_id, selector, &inspection)?;
         let facts = inspection.process_facts.ok_or_else(|| {
@@ -976,9 +993,10 @@ impl RemoteManager {
         helper: &InstalledHelper,
         selector: &SessionSelector,
     ) -> io::Result<SessionInspection> {
-        self.rpc(
+        self.session_rpc(
             helper,
             HelperCommand::Inspect,
+            &selector.session_id,
             selector,
             Duration::from_secs(15),
         )
@@ -1008,7 +1026,13 @@ impl RemoteManager {
                 "remote Helper protocol major does not match this Engine",
             ));
         }
-        let inspection = self.rpc(helper, HelperCommand::Kill, selector, RPC_TIMEOUT)?;
+        let inspection = self.session_rpc(
+            helper,
+            HelperCommand::Kill,
+            &selector.session_id,
+            selector,
+            RPC_TIMEOUT,
+        )?;
         validate_stop_inspection(&helper.build_id, selector, &inspection)?;
         Ok(inspection)
     }
@@ -1038,6 +1062,25 @@ impl RemoteManager {
         self.rpc_input(helper, command, input, timeout)
     }
 
+    /// A Session-scoped RPC: its channel resolves the socket root that holds
+    /// this Session's Holder, the same way its attach does.
+    fn session_rpc<T: serde::Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        helper: &InstalledHelper,
+        command: HelperCommand,
+        session_id: &str,
+        request: &T,
+        timeout: Duration,
+    ) -> io::Result<R> {
+        let input = serde_json::to_vec(request)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let spec = helper
+            .transport
+            .helper_session_command(&helper.build_id, command, session_id)
+            .map_err(io::Error::other)?;
+        self.spec_rpc(spec, input, timeout)
+    }
+
     fn rpc_empty<R: serde::de::DeserializeOwned>(
         &self,
         helper: &InstalledHelper,
@@ -1054,15 +1097,20 @@ impl RemoteManager {
         input: Vec<u8>,
         timeout: Duration,
     ) -> io::Result<R> {
-        let output = self.run_ssh(
-            helper
-                .transport
-                .helper_command(&helper.build_id, command)
-                .map_err(io::Error::other)?,
-            input,
-            timeout,
-            MAX_RPC_OUTPUT,
-        )?;
+        let spec = helper
+            .transport
+            .helper_command(&helper.build_id, command)
+            .map_err(io::Error::other)?;
+        self.spec_rpc(spec, input, timeout)
+    }
+
+    fn spec_rpc<R: serde::de::DeserializeOwned>(
+        &self,
+        spec: CommandSpec,
+        input: Vec<u8>,
+        timeout: Duration,
+    ) -> io::Result<R> {
+        let output = self.run_ssh(spec, input, timeout, MAX_RPC_OUTPUT)?;
         let output = require_rpc_success(output)?;
         if output.stdout_truncated {
             return Err(io::Error::new(

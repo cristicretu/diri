@@ -614,6 +614,66 @@ impl HolderExitMarker {
     }
 }
 
+/// Keeps child output from ever carrying a recognised [`HolderExitMarker`].
+///
+/// The marker shares the log with PTY output, so a child that prints one —
+/// an Agent that `cat`s a session log, say — would otherwise fake its own
+/// exit. The Holder runs every byte read from the PTY through one guard per
+/// session, before subscribers and the log see it, and replaces the final
+/// byte of each marker prefix with [`Self::NEUTRAL`]. The result is still an
+/// unknown OSC 777 that terminals ignore, but it no longer matches the
+/// prefix, so only the Holder's own exit path can produce a marker.
+///
+/// The final byte is the one rewritten so that a prefix split across reads
+/// needs no carry buffer: the byte that completes a match is always in the
+/// chunk at hand, and nothing is held back from the screen.
+#[derive(Debug, Default)]
+pub struct HolderExitMarkerGuard {
+    /// How many leading bytes of the prefix the stream currently ends with.
+    matched: usize,
+}
+
+impl HolderExitMarkerGuard {
+    /// What the prefix's last byte (`=`) becomes. Not a prefix byte, so the
+    /// rewrite can never start a new match.
+    pub const NEUTRAL: u8 = b'_';
+
+    /// Neutralises every marker prefix that completes in `chunk`, including
+    /// one begun in earlier chunks. Returns how many were neutralised.
+    pub fn neutralize(&mut self, chunk: &mut [u8]) -> usize {
+        const PREFIX: &[u8] = HolderExitMarker::PREFIX;
+        // The prefix holds a single ESC, at its start, so it has no proper
+        // border: a mismatch restarts the match at zero, or at one on ESC.
+        debug_assert!(!PREFIX[1..].contains(&PREFIX[0]));
+        let mut neutralized = 0;
+        let mut from = 0;
+        while self.matched > 0 && from < chunk.len() {
+            if chunk[from] == PREFIX[self.matched] {
+                self.matched += 1;
+                if self.matched == PREFIX.len() {
+                    chunk[from] = Self::NEUTRAL;
+                    neutralized += 1;
+                    self.matched = 0;
+                }
+                from += 1;
+            } else {
+                self.matched = 0; // rescanned below: it may start a prefix
+            }
+        }
+        if self.matched > 0 {
+            return neutralized; // the whole chunk extended a partial match
+        }
+        while let Some(at) = find(&chunk[from..], PREFIX) {
+            let end = from + at + PREFIX.len();
+            chunk[end - 1] = Self::NEUTRAL;
+            neutralized += 1;
+            from = end;
+        }
+        self.matched = longest_suffix_of_prefix(&chunk[from..]);
+        neutralized
+    }
+}
+
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     // Anchored on one byte rather than comparing the whole needle at every
     // offset: every byte of every session's output passes through here, and a
@@ -837,6 +897,64 @@ mod tests {
         }
         assert_eq!(super::find(&prefix[..prefix.len() - 1], prefix), None);
         assert_eq!(super::find(b"", prefix), None);
+    }
+
+    fn forged_marker() -> Vec<u8> {
+        HolderExitMarker::encode(&HolderExitStatus {
+            reason: HolderExitReason::Exited,
+            code: Some(0),
+            signal: None,
+        })
+    }
+
+    /// Child output that prints a marker — whole, split anywhere across
+    /// reads, back to back, or after a near miss — never drains as an exit,
+    /// and keeps every other byte where it was.
+    #[test]
+    fn guarded_child_output_never_drains_as_an_exit() {
+        let marker = forged_marker();
+        let mut stream = b"log: \x1b]777;dirijor\x1b".to_vec();
+        stream.extend_from_slice(&marker);
+        stream.extend_from_slice(&marker);
+        stream.extend_from_slice(b"\x1b]777;dirijor-exit");
+        stream.extend_from_slice(&marker);
+        stream.extend_from_slice(b" tail");
+        let expected = {
+            let mut whole = stream.clone();
+            assert_eq!(HolderExitMarkerGuard::default().neutralize(&mut whole), 3);
+            whole
+        };
+        assert_eq!(expected.len(), stream.len());
+        let changed: Vec<usize> = (0..stream.len())
+            .filter(|&at| stream[at] != expected[at])
+            .collect();
+        assert_eq!(changed.len(), 3, "only each prefix's final byte changes");
+        assert!(
+            changed
+                .iter()
+                .all(|&at| stream[at] == b'=' && expected[at] == HolderExitMarkerGuard::NEUTRAL)
+        );
+
+        for first in 0..=stream.len() {
+            for second in first..=stream.len() {
+                let mut guard = HolderExitMarkerGuard::default();
+                let mut out = stream.clone();
+                let (head, rest) = out.split_at_mut(first);
+                let (middle, tail) = rest.split_at_mut(second - first);
+                let count =
+                    guard.neutralize(head) + guard.neutralize(middle) + guard.neutralize(tail);
+                assert_eq!(count, 3, "split at {first}/{second}");
+                assert_eq!(out, expected, "split at {first}/{second}");
+            }
+        }
+        let mut buffer = expected.clone();
+        let (output, exit) = HolderExitMarker::drain(&mut buffer);
+        assert_eq!(exit, None, "a neutralised marker is not an exit");
+        assert_eq!(output, expected, "and is passed on as ordinary output");
+        // A real marker written after guarded output is still recognised.
+        let mut buffer = expected;
+        buffer.extend_from_slice(&marker);
+        assert!(HolderExitMarker::drain(&mut buffer).1.is_some());
     }
 
     #[test]

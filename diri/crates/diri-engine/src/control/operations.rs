@@ -122,6 +122,10 @@ pub(super) fn storage_error(_: rusqlite::Error) -> ControlError {
 }
 
 impl super::ControlServer {
+    pub(super) fn operations_path(&self) -> std::path::PathBuf {
+        self.durable_store_path(crate::layout_migration::OPERATIONS_STORE)
+    }
+
     pub(super) fn session_spawn_tracked(
         &self,
         params: Option<Value>,
@@ -151,7 +155,7 @@ impl super::ControlServer {
                 "tracked spawn must belong to its sender or to a note",
             ));
         }
-        let path = self.socket_path.with_file_name("operations-v1.sqlite");
+        let path = self.operations_path();
         // The placement names tab/pane ids resolved just before the call; a
         // retry after the layout changed is still the same operation.
         let mut fingerprint = p.spawn.clone();
