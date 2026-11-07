@@ -627,9 +627,13 @@ detached user processes, the Holder and Agent continue independently.
 The Holder socket lives under `$XDG_RUNTIME_DIR/diri` when that is set and
 under `${TMPDIR:-/tmp}/diri-remote-<uid>` otherwise, named by a hash of the
 Session ID. sshd does not give every session the same environment, so the
-Engine's fixed attach command checks which root actually holds the Session's
-socket and adjusts `XDG_RUNTIME_DIR` before it execs the Bridge. This works for
-every Helper build, including Holders already running. The Engine's reconnect
+Engine's fixed command for every Session-scoped Helper call (launch, inspect,
+kill and attach) checks which root actually holds the Session's socket and
+adjusts `XDG_RUNTIME_DIR` before it execs the Helper; the Engine cannot build
+those commands without it. This works for every Helper build, including Holders
+already running. Launch never resets a Session whose Holder lock is held: when
+the socket is not under its root it fails with `holder_unavailable` instead of
+deleting the live Holder's state and starting a second Agent. The Engine's reconnect
 backoff resets only after a Bridge reaches a live Holder. Spawning `ssh` does not
 count as progress, so an unreachable Holder backs off to 30 s and does not
 respawn its Bridge in a tight loop.
