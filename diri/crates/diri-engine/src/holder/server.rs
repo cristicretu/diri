@@ -1165,12 +1165,31 @@ impl LogLane {
 /// Appends to the log and publishes its new tail for [`current_stat`].
 fn append_log(shared: &Shared, bytes: &[u8]) {
     let mut log = shared.log.lock().expect("log");
-    let _ = log.append(bytes);
+    note_log_append(log.append(bytes).map(drop));
     shared.log_tail.store(log.tail_offset(), Ordering::Release);
     drop(log);
     // One batch per append, and nobody waits unless a resumed subscriber is
     // reading its backlog, so this costs nothing measurable.
     shared.log_grew.notify_all();
+}
+
+/// Reports an output-log write failure once per streak. The bytes stay in the
+/// stream either way; under ENOSPC every chunk fails, and a line per PTY read
+/// would only fill the disk faster.
+fn note_log_append(result: std::io::Result<()>) {
+    static FAILING: AtomicBool = AtomicBool::new(false);
+    match result {
+        Ok(()) => {
+            if FAILING.swap(false, Ordering::Relaxed) {
+                eprintln!("diri-holder: output log appends recovered");
+            }
+        }
+        Err(error) => {
+            if !FAILING.swap(true, Ordering::Relaxed) {
+                eprintln!("diri-holder: output log append failed: {error}");
+            }
+        }
+    }
 }
 
 /// Hands one chunk of PTY output to every attached subscriber.
@@ -1626,8 +1645,14 @@ fn finish_holder(shared: &Shared) -> Option<Box<dyn FnOnce() + Send>> {
 
     {
         let mut log = shared.log.lock().expect("log");
-        let _ = log.append(&HolderExitMarker::encode(&exit));
-        let _ = log.flush();
+        // Never rate-limited: a marker that did not reach disk leaves the
+        // Engine unable to learn how the Agent exited, so say so.
+        if let Err(error) = log.append(&HolderExitMarker::encode(&exit)) {
+            eprintln!("diri-holder: exit marker not written to the output log: {error}");
+        }
+        if let Err(error) = log.flush() {
+            eprintln!("diri-holder: output log flush after exit failed: {error}");
+        }
         shared.log_tail.store(log.tail_offset(), Ordering::Release);
     }
 
