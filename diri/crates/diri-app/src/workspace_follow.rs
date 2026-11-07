@@ -681,7 +681,9 @@ pub(crate) struct FollowController {
     generation: u64,
     task: Option<Task<()>>,
     staleness_task: Option<(PathBuf, Task<()>)>,
-    menu_open: bool,
+    /// The session whose checkout menu is open; another session's chip
+    /// shows closed.
+    menu_open: Option<SessionId>,
 }
 
 impl FollowController {
@@ -860,7 +862,7 @@ pub(crate) fn render_bar<T: FollowHost>(
     } else {
         "Following agent"
     };
-    let menu_open = controller.menu_open && several;
+    let menu_open = controller.menu_open.as_ref() == Some(&session.id) && several;
     let chip = div()
         .id("inspector-worktree-chip")
         .debug_selector(|| "INSPECTOR_WORKTREE_CHIP".to_owned())
@@ -873,11 +875,12 @@ pub(crate) fn render_bar<T: FollowHost>(
         .rounded(px(Radius::BADGE))
         .bg(colors.primary.alpha(if menu_open { 0.09 } else { 0.0 }))
         .when(several, |chip| {
+            let id = session.id.clone();
             chip.cursor_pointer()
                 .hover(move |chip| chip.bg(colors.primary.alpha(0.07)))
-                .on_click(cx.listener(|this: &mut T, _, _, cx| {
+                .on_click(cx.listener(move |this: &mut T, _, _, cx| {
                     let follow = this.follow();
-                    follow.menu_open = !follow.menu_open;
+                    follow.menu_open = if menu_open { None } else { Some(id.clone()) };
                     cx.notify();
                     cx.stop_propagation();
                 }))
@@ -987,7 +990,7 @@ pub(crate) fn render_bar<T: FollowHost>(
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_down_out(cx.listener(|this: &mut T, _, _, cx| {
-                this.follow().menu_open = false;
+                this.follow().menu_open = None;
                 cx.notify();
             }))
             .child(FloatingSurface::new(colors, rows).radius(Radius::FLOATING_MENU))
@@ -1058,7 +1061,7 @@ fn menu_row<T: FollowHost>(
         .on_click(cx.listener(move |this: &mut T, _, _, cx| {
             let follow = this.follow();
             follow.state.set_pin(&session, pin.clone());
-            follow.menu_open = false;
+            follow.menu_open = None;
             this.follow_changed(cx);
             cx.stop_propagation();
         }))

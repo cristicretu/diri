@@ -66,6 +66,34 @@ const HOST_FIELD_HORIZONTAL_PADDING: f32 = 10.0;
 /// actionable and first-time setup keeps its "Use by default" action.
 const HOST_REINSTALL_SUCCESS_VISIBILITY: Duration = Duration::from_secs(3);
 
+/// The one Settings text field that takes typing. Activating a field
+/// deactivates every other, so keys can never edit a field that only
+/// looked inactive.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SettingsField {
+    #[default]
+    None,
+    Search,
+    ShortcutSearch,
+    Include,
+    Roots,
+    VoiceCommand,
+    PrivacyName,
+}
+
+impl SettingsField {
+    fn is(self, field: Self) -> bool {
+        self == field
+    }
+
+    /// Deactivates `field` if it is the active one; another stays active.
+    fn release(&mut self, field: Self) {
+        if *self == field {
+            *self = Self::None;
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Surface {
     #[default]
@@ -576,6 +604,9 @@ pub struct UtilitySurfaces {
     schedules: gpui::Entity<crate::schedules_page::SchedulesPage>,
     accounts: AccountsState,
     phone_access: Option<crate::phone_access::PhoneAccess>,
+    /// The in-flight gateway start, so a stop while it runs makes its
+    /// result stale instead of installing a gateway with the old rule.
+    phone_start: crate::phone_access::PhoneStartSlot,
     phone_loading: bool,
     phone_error: Option<String>,
     phone_setup: Option<crate::phone_access::TailscaleSetup>,
@@ -626,9 +657,9 @@ pub struct UtilitySurfaces {
     settings_scroll: ScrollHandle,
     settings_scroller: diri_ui::ScrollerState,
     settings_search: QueryEditor,
-    settings_search_active: bool,
     shortcut_search: QueryEditor,
-    shortcut_search_active: bool,
+    /// Which settings text field takes typing.
+    active_field: SettingsField,
     shortcut_editor: Option<ShortcutEditor>,
     /// The open theme menu's search; typing goes here while it is open.
     theme_search: QueryEditor,
@@ -640,12 +671,10 @@ pub struct UtilitySurfaces {
     theme_file_status: Option<ThemeFileStatus>,
     include_path: PathBuf,
     include_editor: QueryEditor,
-    include_editor_active: bool,
     include_persisted: String,
     include_save_notice: bool,
     include_save_error: Option<String>,
     roots_editor: QueryEditor,
-    roots_editor_active: bool,
     roots_editor_height: f32,
     include_editor_height: f32,
     editor_resize: Option<(QuickOpenEditor, f32, f32)>,
@@ -838,6 +867,7 @@ impl UtilitySurfaces {
             schedules,
             accounts: AccountsState::default(),
             phone_access: None,
+            phone_start: crate::phone_access::PhoneStartSlot::default(),
             phone_loading: false,
             phone_error: None,
             phone_setup: None,
@@ -877,9 +907,8 @@ impl UtilitySurfaces {
             settings_scroll: ScrollHandle::new(),
             settings_scroller: diri_ui::ScrollerState::new(),
             settings_search: QueryEditor::default(),
-            settings_search_active: false,
             shortcut_search: QueryEditor::default(),
-            shortcut_search_active: false,
+            active_field: SettingsField::None,
             shortcut_editor: None,
             theme_search: QueryEditor::default(),
             system_is_dark: true,
@@ -887,12 +916,10 @@ impl UtilitySurfaces {
             theme_file_status: None,
             include_path,
             include_editor,
-            include_editor_active: false,
             include_persisted,
             include_save_notice: false,
             include_save_error: None,
             roots_editor,
-            roots_editor_active: false,
             roots_editor_height: ROOTS_EDITOR_MIN,
             include_editor_height: INCLUDE_EDITOR_MIN,
             editor_resize: None,
@@ -1316,19 +1343,19 @@ impl UtilitySurfaces {
         self.include_persisted = self.include_editor.text().to_owned();
         self.include_save_notice = false;
         self.include_save_error = None;
-        self.include_editor_active = false;
+        self.active_field.release(SettingsField::Include);
     }
 
     fn reload_roots_editor(&mut self) {
         self.roots_editor = QueryEditor::default();
         self.roots_editor
             .insert_multiline(&self.prefs.quick_open_roots);
-        self.roots_editor_active = false;
+        self.active_field.release(SettingsField::Roots);
     }
 
     fn choose_quick_open_root(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.roots_editor_active = false;
-        self.include_editor_active = false;
+        self.active_field.release(SettingsField::Roots);
+        self.active_field.release(SettingsField::Include);
         window.focus(&self.focus, cx);
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -2017,7 +2044,7 @@ impl UtilitySurfaces {
     fn handle_include_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
         if self.surface != Surface::Settings
             || self.settings_tab != SettingsTab::General
-            || !self.include_editor_active
+            || !self.active_field.is(SettingsField::Include)
         {
             return false;
         }
@@ -2025,8 +2052,8 @@ impl UtilitySurfaces {
         match key.key.as_str() {
             "escape" => {
                 self.persist_include();
-                self.include_editor_active = false;
-                self.roots_editor_active = false;
+                self.active_field.release(SettingsField::Include);
+                self.active_field.release(SettingsField::Roots);
                 cx.notify();
             }
             "enter" => {
@@ -2074,14 +2101,14 @@ impl UtilitySurfaces {
     fn handle_roots_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
         if self.surface != Surface::Settings
             || self.settings_tab != SettingsTab::General
-            || !self.roots_editor_active
+            || !self.active_field.is(SettingsField::Roots)
         {
             return false;
         }
         let key = &event.keystroke;
         match key.key.as_str() {
             "escape" => {
-                self.roots_editor_active = false;
+                self.active_field.release(SettingsField::Roots);
                 cx.notify();
             }
             "enter" => {
@@ -2145,8 +2172,8 @@ impl UtilitySurfaces {
             self.settings_menu = None;
             self.host_editor = None;
             self.agent_path_editor = None;
-            self.include_editor_active = false;
-            self.roots_editor_active = false;
+            self.active_field.release(SettingsField::Include);
+            self.active_field.release(SettingsField::Roots);
             self.nested_root = None;
         }
         cx.notify();
@@ -2174,13 +2201,13 @@ impl UtilitySurfaces {
         self.surface = Surface::Settings;
         self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
         self.settings_search.clear();
-        self.settings_search_active = false;
+        self.active_field.release(SettingsField::Search);
         self.settings_transition_generation = self.settings_transition_generation.wrapping_add(1);
         self.settings_menu = None;
         self.host_editor = None;
         self.agent_path_editor = None;
         self.shortcut_search.clear();
-        self.shortcut_search_active = false;
+        self.active_field.release(SettingsField::ShortcutSearch);
         self.shortcut_editor = None;
         self.reload_include_editor();
         self.reload_roots_editor();
@@ -2232,7 +2259,7 @@ impl UtilitySurfaces {
             tabs: self.visible_settings_tabs(),
             active: self.settings_tab,
             search: self.settings_search.clone(),
-            search_active: self.settings_search_active,
+            search_active: self.active_field.is(SettingsField::Search),
         })
     }
 
@@ -2252,9 +2279,7 @@ impl UtilitySurfaces {
         if self.surface != Surface::Settings {
             return;
         }
-        self.settings_search_active = true;
-        self.include_editor_active = false;
-        self.roots_editor_active = false;
+        self.active_field = SettingsField::Search;
         self.focus.focus(window, cx);
         cx.notify();
     }
@@ -2264,9 +2289,7 @@ impl UtilitySurfaces {
             return;
         }
         self.settings_search.clear();
-        self.settings_search_active = true;
-        self.include_editor_active = false;
-        self.roots_editor_active = false;
+        self.active_field = SettingsField::Search;
         self.focus.focus(window, cx);
         cx.notify();
     }
@@ -2304,7 +2327,7 @@ impl UtilitySurfaces {
             store.request_herdr_scan();
             store.request_terminal_setup_scan();
         }
-        self.settings_search_active = false;
+        self.active_field.release(SettingsField::Search);
         if tab != SettingsTab::Usage {
             self.usage_share_theme_hover = None;
             self.discard_usage_share();
@@ -2312,9 +2335,9 @@ impl UtilitySurfaces {
         self.settings_menu = None;
         self.host_editor = None;
         self.agent_path_editor = None;
-        self.include_editor_active = false;
-        self.roots_editor_active = false;
-        self.shortcut_search_active = false;
+        self.active_field.release(SettingsField::Include);
+        self.active_field.release(SettingsField::Roots);
+        self.active_field.release(SettingsField::ShortcutSearch);
         self.shortcut_editor = None;
         if tab == SettingsTab::Remote {
             self.reload_hosts();
@@ -2346,8 +2369,8 @@ impl UtilitySurfaces {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.settings_search_active = false;
-        self.shortcut_search_active = false;
+        self.active_field.release(SettingsField::Search);
+        self.active_field.release(SettingsField::ShortcutSearch);
         let entity = cx.entity();
         let recording_window = window.window_handle();
         let keystrokes = cx.intercept_keystrokes(move |event, window, cx| {
@@ -2380,8 +2403,8 @@ impl UtilitySurfaces {
 
     fn focus_shortcut_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.shortcut_editor = None;
-        self.settings_search_active = false;
-        self.shortcut_search_active = true;
+        self.active_field.release(SettingsField::Search);
+        self.active_field = SettingsField::ShortcutSearch;
         self.focus.focus(window, cx);
         cx.notify();
     }
@@ -2874,14 +2897,14 @@ impl UtilitySurfaces {
     fn handle_shortcut_search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
         if self.surface != Surface::Settings
             || self.settings_tab != SettingsTab::Shortcuts
-            || !self.shortcut_search_active
+            || !self.active_field.is(SettingsField::ShortcutSearch)
         {
             return false;
         }
         match event.keystroke.key.as_str() {
             "escape" => {
                 if self.shortcut_search.is_empty() {
-                    self.shortcut_search_active = false;
+                    self.active_field.release(SettingsField::ShortcutSearch);
                 } else {
                     self.shortcut_search.clear();
                 }
@@ -2914,13 +2937,13 @@ impl UtilitySurfaces {
     }
 
     fn handle_settings_search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
-        if self.surface != Surface::Settings || !self.settings_search_active {
+        if self.surface != Surface::Settings || !self.active_field.is(SettingsField::Search) {
             return false;
         }
         match event.keystroke.key.as_str() {
             "escape" => {
                 if self.settings_search.is_empty() {
-                    self.settings_search_active = false;
+                    self.active_field.release(SettingsField::Search);
                 } else {
                     self.settings_search.clear();
                 }
@@ -3654,6 +3677,51 @@ impl UtilitySurfaces {
             })
     }
 
+    /// The one way a phone gateway starts: stops the current one, then
+    /// installs the result only if no stop or newer start revoked it while
+    /// it ran. A stale gateway is dropped, which turns it off.
+    fn start_phone_access(
+        &mut self,
+        start: impl std::future::Future<Output = Result<crate::phone_access::PhoneAccess, String>>
+        + Send
+        + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.phone_access = None;
+        let ticket = self.phone_start.begin();
+        self.phone_loading = true;
+        self.phone_error = None;
+        let task = self.runtime.spawn(start);
+        cx.spawn(async move |this, cx| {
+            let result = task
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+            let _ = this.update(cx, |this, cx| {
+                if !this.phone_start.finish(ticket) {
+                    // Revoked while starting: `result` drops here.
+                    return;
+                }
+                this.phone_loading = false;
+                match result {
+                    Ok(access) => this.phone_access = Some(access),
+                    Err(error) => this.phone_error = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Turns the gateway off and revokes any start still in flight.
+    fn stop_phone_access(&mut self) {
+        if self.phone_start.cancel() {
+            self.phone_loading = false;
+        }
+        self.phone_access = None;
+    }
+
     fn phone_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::phone_access::TailscaleSetup;
         let colors = self.settings_colors();
@@ -3768,32 +3836,15 @@ impl UtilitySurfaces {
                                 Some("iphone"),
                                 cx,
                                 |this, _, cx| {
-                                    this.phone_loading = true;
-                                    this.phone_error = None;
                                     let client = Arc::clone(this.store_runtime.client());
                                     let tailnet = this
                                         .prefs
                                         .phone_tailnet_identity
                                         .then(|| Arc::clone(&this.phone_devices));
-                                    let task = this.runtime.spawn(
+                                    this.start_phone_access(
                                         crate::phone_access::PhoneAccess::start(client, tailnet),
+                                        cx,
                                     );
-                                    cx.spawn(async move |this, cx| {
-                                        let result = task
-                                            .await
-                                            .map_err(|error| error.to_string())
-                                            .and_then(|result| result);
-                                        let _ = this.update(cx, |this, cx| {
-                                            this.phone_loading = false;
-                                            match result {
-                                                Ok(access) => this.phone_access = Some(access),
-                                                Err(error) => this.phone_error = Some(error),
-                                            }
-                                            cx.notify();
-                                        });
-                                    })
-                                    .detach();
-                                    cx.notify();
                                 },
                             ),
                             colors,
@@ -3901,38 +3952,18 @@ impl UtilitySurfaces {
                                                 }
                                                 // Stop serving the old code
                                                 // before it is replaced.
-                                                this.phone_access = None;
-                                                this.phone_loading = true;
-                                                this.phone_error = None;
                                                 let client =
                                                     Arc::clone(this.store_runtime.client());
-                                                let task = this.runtime.spawn(async move {
-                                                    crate::phone_access::PhoneAccess::reset_pairing()?;
-                                                    crate::phone_access::PhoneAccess::start(
-                                                        client, None,
-                                                    )
-                                                    .await
-                                                });
-                                                cx.spawn(async move |this, cx| {
-                                                    let result = task
+                                                this.start_phone_access(
+                                                    async move {
+                                                        crate::phone_access::PhoneAccess::reset_pairing()?;
+                                                        crate::phone_access::PhoneAccess::start(
+                                                            client, None,
+                                                        )
                                                         .await
-                                                        .map_err(|error| error.to_string())
-                                                        .and_then(|result| result);
-                                                    let _ = this.update(cx, |this, cx| {
-                                                        this.phone_loading = false;
-                                                        match result {
-                                                            Ok(access) => {
-                                                                this.phone_access = Some(access)
-                                                            }
-                                                            Err(error) => {
-                                                                this.phone_error = Some(error)
-                                                            }
-                                                        }
-                                                        cx.notify();
-                                                    });
-                                                })
-                                                .detach();
-                                                cx.notify();
+                                                    },
+                                                    cx,
+                                                );
                                             },
                                         ))
                                         .child(settings_danger_button(
@@ -3940,7 +3971,7 @@ impl UtilitySurfaces {
                                             "phone-disable",
                                             cx,
                                             |this, cx| {
-                                                this.phone_access = None;
+                                                this.stop_phone_access();
                                                 cx.notify();
                                             },
                                         )),
@@ -3973,9 +4004,9 @@ impl UtilitySurfaces {
             |this, cx| {
                 let enabled = !this.prefs.phone_tailnet_identity;
                 if this.update_prefs(move |prefs| prefs.phone_tailnet_identity = enabled) {
-                    // The running gateway admits the old way; stop it so the
-                    // next Enable uses the new rule.
-                    this.phone_access = None;
+                    // The running (or still starting) gateway admits the
+                    // old way; stop it so the next Enable uses the new rule.
+                    this.stop_phone_access();
                 }
                 cx.notify();
             },
@@ -4794,13 +4825,13 @@ impl UtilitySurfaces {
                                 .bg(colors.primary.alpha(0.055))
                                 .border_1()
                                 .border_color(colors.primary.alpha(
-                                    if self.roots_editor_active { 0.22 } else { 0.0 },
+                                    if self.active_field.is(SettingsField::Roots) { 0.22 } else { 0.0 },
                                 ))
                                 .font_family(crate::fonts::mono_family())
                                 .text_size(px(11.0))
                                 .line_height(px(17.0))
                                 .text_color(if self.roots_editor.is_empty()
-                                    && !self.roots_editor_active
+                                    && !self.active_field.is(SettingsField::Roots)
                                 {
                                     colors.tertiary
                                 } else {
@@ -4810,17 +4841,17 @@ impl UtilitySurfaces {
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _, window, cx| {
-                                        this.roots_editor_active = true;
+                                        this.active_field = SettingsField::Roots;
                                         this.deactivate_privacy_name();
                                         this.deactivate_voice_fields();
-                                        this.include_editor_active = false;
-                                        this.settings_search_active = false;
+                                        this.active_field.release(SettingsField::Include);
+                                        this.active_field.release(SettingsField::Search);
                                         this.focus.focus(window, cx);
                                         cx.stop_propagation();
                                         cx.notify();
                                     }),
                                 )
-                                .child(if self.roots_editor_active {
+                                .child(if self.active_field.is(SettingsField::Roots) {
                                     query_label(&self.roots_editor)
                                 } else if self.roots_editor.is_empty() {
                                     div().child("~/").into_any_element()
@@ -4931,13 +4962,13 @@ impl UtilitySurfaces {
                                 .bg(colors.primary.alpha(0.055))
                                 .border_1()
                                 .border_color(colors.primary.alpha(
-                                    if self.include_editor_active { 0.22 } else { 0.0 },
+                                    if self.active_field.is(SettingsField::Include) { 0.22 } else { 0.0 },
                                 ))
                                 .font_family(crate::fonts::mono_family())
                                 .text_size(px(11.0))
                                 .line_height(px(17.0))
                                 .text_color(if self.include_editor.is_empty()
-                                    && !self.include_editor_active
+                                    && !self.active_field.is(SettingsField::Include)
                                 {
                                     colors.tertiary
                                 } else {
@@ -4947,17 +4978,17 @@ impl UtilitySurfaces {
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _, window, cx| {
-                                        this.include_editor_active = true;
+                                        this.active_field = SettingsField::Include;
                                         this.deactivate_privacy_name();
                                         this.deactivate_voice_fields();
-                                        this.roots_editor_active = false;
-                                        this.settings_search_active = false;
+                                        this.active_field.release(SettingsField::Roots);
+                                        this.active_field.release(SettingsField::Search);
                                         this.focus.focus(window, cx);
                                         cx.stop_propagation();
                                         cx.notify();
                                     }),
                                 )
-                                .child(if self.include_editor_active {
+                                .child(if self.active_field.is(SettingsField::Include) {
                                     query_label(&self.include_editor)
                                 } else if self.include_editor.is_empty() {
                                     div()
@@ -5065,7 +5096,7 @@ impl UtilitySurfaces {
     fn shortcuts_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.settings_colors();
         let query = self.shortcut_search.text();
-        let search_content = if self.shortcut_search_active {
+        let search_content = if self.active_field.is(SettingsField::ShortcutSearch) {
             query_label(&self.shortcut_search)
         } else if self.shortcut_search.is_empty() {
             div()
@@ -5089,11 +5120,13 @@ impl UtilitySurfaces {
             .px(px(10.0))
             .rounded(px(17.0))
             .border_1()
-            .border_color(colors.primary.alpha(if self.shortcut_search_active {
-                0.22
-            } else {
-                0.10
-            }))
+            .border_color(colors.primary.alpha(
+                if self.active_field.is(SettingsField::ShortcutSearch) {
+                    0.22
+                } else {
+                    0.10
+                },
+            ))
             .bg(colors.primary.alpha(0.025))
             .flex()
             .items_center()
@@ -13974,15 +14007,41 @@ mod tests {
         assert!(cx.debug_bounds("SETTINGS_TAB_General").is_none());
         surfaces.read_with(cx, |surfaces, _| {
             assert_eq!(surfaces.settings_search.text(), "ssh");
-            assert!(surfaces.settings_search_active);
+            assert!(surfaces.active_field.is(SettingsField::Search));
         });
 
         cx.simulate_keystrokes("enter");
         surfaces.read_with(cx, |surfaces, _| {
             assert_eq!(surfaces.settings_tab, SettingsTab::Remote);
-            assert!(!surfaces.settings_search_active);
+            assert!(!surfaces.active_field.is(SettingsField::Search));
         });
         assert!(cx.debug_bounds("SETTINGS_NOTE_COPY").is_some());
+    }
+
+    #[gpui::test]
+    fn focusing_settings_search_takes_typing_from_every_other_field(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.select_settings_tab(SettingsTab::Privacy, cx);
+            // As a click in the device name field leaves it.
+            surfaces.active_field = SettingsField::PrivacyName;
+        });
+        let name = surfaces.read_with(cx, |surfaces, _| surfaces.privacy_name_text());
+        let search = cx
+            .debug_bounds("settings-search")
+            .expect("settings search should render in the sidebar");
+        cx.simulate_click(search.center(), Modifiers::default());
+        cx.simulate_input("ssh");
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(surfaces.settings_search.text(), "ssh");
+            assert_eq!(
+                surfaces.privacy_name_text(),
+                name,
+                "typing in search must not also edit the device name"
+            );
+            assert!(surfaces.active_field.is(SettingsField::Search));
+        });
     }
 
     #[gpui::test]

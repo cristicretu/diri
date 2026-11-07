@@ -470,11 +470,12 @@ struct Service {
     updater: Arc<dyn UpdateBackend>,
     state: watch::Sender<UpdateState>,
     automatic: bool,
-    /// Set once a check finds something, cleared when it is superseded.
+    /// The release the feed offers: set once a check finds something,
+    /// cleared when it is superseded. A version picked in Settings is never
+    /// stored here, so automatic updates can only ever stage this one.
     pending: Option<Release>,
-    staged: Option<StagedUpdate>,
     skipped: Option<String>,
-    busy: bool,
+    /// The one record of a staged build, shared with the quit hook.
     ready_install: Arc<Mutex<Option<ReadyInstall>>>,
 }
 
@@ -503,10 +504,8 @@ async fn service(
         state,
         automatic,
         pending: None,
-        staged: None,
         // Persisted in Prefs, so a skip outlives the session that made it.
         skipped: skipped.filter(|version| !version.is_empty()),
-        busy: false,
         ready_install,
     };
 
@@ -536,31 +535,32 @@ impl Service {
     async fn handle(&mut self, command: UpdateCommand) {
         match command {
             UpdateCommand::Check { user_initiated } => self.check(user_initiated).await,
-            UpdateCommand::Download => self.download(true).await,
+            UpdateCommand::Download => {
+                if let Some(release) = self.pending.clone() {
+                    self.download(release, true).await;
+                }
+            }
             UpdateCommand::Install => self.install(true),
             UpdateCommand::Skip => {
                 if let Some(release) = self.pending.take() {
                     self.skipped = Some(release.version);
                 }
-                self.staged = None;
-                self.ready_install.lock().expect("ready update").take();
+                self.unstage();
                 self.publish(UpdatePhase::Idle, false);
             }
             UpdateCommand::Dismiss => {
-                let phase = match self.state.borrow().phase.clone() {
-                    // A staged or offered update survives a dismiss; only the
-                    // transient results clear.
-                    phase @ (UpdatePhase::Available(_)
-                    | UpdatePhase::Downloading { .. }
-                    | UpdatePhase::Ready(_)) => phase,
-                    _ => UpdatePhase::Idle,
-                };
+                // A staged or offered update survives a dismiss; only the
+                // transient results (a failure, up to date) clear.
+                let phase = self.resting_phase();
                 self.publish(phase, false);
             }
             UpdateCommand::SetAutomatic(enabled) => {
                 self.automatic = enabled;
-                if enabled && self.pending.is_some() && self.staged.is_none() {
-                    self.download(true).await;
+                if enabled
+                    && self.staged_release().is_none()
+                    && let Some(release) = self.pending.clone()
+                {
+                    self.download(release, true).await;
                 }
             }
             UpdateCommand::ListReleases => self.list_releases().await,
@@ -571,8 +571,7 @@ impl Service {
                 // offer or a staged build from the old channel must not
                 // install on quit once the user has left that channel.
                 self.pending = None;
-                self.staged = None;
-                self.ready_install.lock().expect("ready update").take();
+                self.unstage();
                 let previous = self.state.borrow().clone();
                 self.state.send_replace(UpdateState {
                     releases: Vec::new(),
@@ -608,15 +607,10 @@ impl Service {
     /// for the automatic path is discarded so quit cannot install the wrong
     /// build.
     async fn install_version(&mut self, version: String) {
-        if self.busy {
-            return;
-        }
-        self.busy = true;
         self.publish(UpdatePhase::Checking, true);
         let updater = Arc::clone(&self.updater);
         let wanted = version.clone();
         let found = tokio::task::spawn_blocking(move || updater.release(&wanted)).await;
-        self.busy = false;
         let release = match found {
             Ok(Ok(Some(release))) => release,
             Ok(Ok(None)) => {
@@ -638,14 +632,14 @@ impl Service {
                 return;
             }
         };
-        self.staged = None;
-        self.ready_install.lock().expect("ready update").take();
-        self.pending = Some(release.clone());
-        self.download(true).await;
+        // The picked build is this command's own target, not the offer:
+        // a failed download must leave nothing that a later automatic
+        // download or quit could stage or install.
+        self.unstage();
+        self.download(release.clone(), true).await;
         if self
-            .staged
-            .as_ref()
-            .is_some_and(|staged| staged.release.version == release.version)
+            .staged_release()
+            .is_some_and(|staged| staged.version == release.version)
         {
             self.install(true);
         }
@@ -655,21 +649,16 @@ impl Service {
         // A staged update is the end of the line until the app restarts;
         // re-checking would only offer what is already on disk. Re-publish it
         // so a manual check still visibly answers rather than doing nothing.
-        if let Some(staged) = &self.staged {
-            self.publish(UpdatePhase::Ready(staged.release.clone()), user_initiated);
+        if let Some(staged) = self.staged_release() {
+            self.publish(UpdatePhase::Ready(staged), user_initiated);
             return;
         }
-        if self.busy {
-            return;
-        }
-        self.busy = true;
         self.publish(UpdatePhase::Checking, user_initiated);
 
         let updater = Arc::clone(&self.updater);
         let skipped = self.skipped.clone();
         let started = std::time::Instant::now();
         let found = tokio::task::spawn_blocking(move || updater.check(skipped.as_deref())).await;
-        self.busy = false;
         self.touch_last_checked();
         record_update(
             "update.check",
@@ -693,11 +682,11 @@ impl Service {
         match found {
             Ok(Ok(Some(release))) => {
                 self.pending = Some(release.clone());
-                self.publish(UpdatePhase::Available(release), user_initiated);
+                self.publish(UpdatePhase::Available(release.clone()), user_initiated);
                 if self.automatic {
                     // Once a release is found, progress and failures are worth
                     // surfacing even though the check itself was background.
-                    self.download(true).await;
+                    self.download(release, true).await;
                 }
             }
             Ok(Ok(None)) => {
@@ -712,24 +701,16 @@ impl Service {
         }
     }
 
-    async fn download(&mut self, user_initiated: bool) {
-        let Some(release) = self.pending.clone() else {
-            return;
-        };
-        // Commands queue while a download runs, and `busy` has cleared by the
-        // time the next one is read: a second Download for the release that
-        // is already staged only answers Ready again. A failed download
-        // stages nothing, so it can still be retried.
-        if let Some(staged) = &self.staged
-            && staged.release.version == release.version
+    async fn download(&mut self, release: Release, user_initiated: bool) {
+        // Commands run one at a time, so a Download queued behind the one
+        // that staged this release only answers Ready again. A failed
+        // download stages nothing, so it can still be retried.
+        if let Some(staged) = self.staged_release()
+            && staged.version == release.version
         {
-            self.publish(UpdatePhase::Ready(staged.release.clone()), user_initiated);
+            self.publish(UpdatePhase::Ready(staged), user_initiated);
             return;
         }
-        if self.busy {
-            return;
-        }
-        self.busy = true;
         self.publish(
             UpdatePhase::Downloading {
                 release: release.clone(),
@@ -763,7 +744,6 @@ impl Service {
                 result = &mut worker => break result,
             }
         };
-        self.busy = false;
         record_update(
             "update.download",
             match &staged {
@@ -784,9 +764,8 @@ impl Service {
             Ok(Ok(staged)) => {
                 *self.ready_install.lock().expect("ready update") = Some(ReadyInstall {
                     updater: Arc::clone(&self.updater),
-                    staged: staged.clone(),
+                    staged,
                 });
-                self.staged = Some(staged);
                 self.publish(UpdatePhase::Ready(release), user_initiated);
             }
             Ok(Err(error)) => self.fail(&error, user_initiated),
@@ -821,15 +800,43 @@ impl Service {
             // RootView watches for Installing and quits; the helper is already
             // waiting for this process to go away.
             Ok(()) => {
-                // Taking the staged update makes the app-quit hook idempotent
-                // after an explicit "Restart to update" click.
-                self.staged = None;
+                // Taking the staged update (above) makes the app-quit hook
+                // idempotent after an explicit "Restart to update" click.
                 self.publish(UpdatePhase::Installing, true);
             }
             Err(error) => {
                 *self.ready_install.lock().expect("ready update") = Some(ready);
                 self.fail(&error, true);
             }
+        }
+    }
+
+    /// The staged build's release, if any; the shared quit-hook slot is the
+    /// only record of it.
+    fn staged_release(&self) -> Option<Release> {
+        self.ready_install
+            .lock()
+            .expect("ready update")
+            .as_ref()
+            .map(|ready| ready.staged.release.clone())
+    }
+
+    fn unstage(&self) {
+        self.ready_install.lock().expect("ready update").take();
+    }
+
+    /// What the updater shows once transient results are dismissed: a
+    /// download in progress, else the staged build, else the offer.
+    fn resting_phase(&self) -> UpdatePhase {
+        if let phase @ UpdatePhase::Downloading { .. } = &self.state.borrow().phase {
+            return phase.clone();
+        }
+        if let Some(staged) = self.staged_release() {
+            UpdatePhase::Ready(staged)
+        } else if let Some(release) = &self.pending {
+            UpdatePhase::Available(release.clone())
+        } else {
+            UpdatePhase::Idle
         }
     }
 
@@ -871,6 +878,9 @@ mod tests {
         downloads: AtomicUsize,
         installs: Mutex<Vec<bool>>,
         channels: Mutex<Vec<UpdateChannel>>,
+        /// Downloads of this version fail.
+        failing_download: Option<&'static str>,
+        failing_install: bool,
     }
 
     impl UpdateBackend for FakeUpdater {
@@ -901,6 +911,9 @@ mod tests {
             on_progress: &mut dyn FnMut(f32),
         ) -> UpdateResult<StagedUpdate> {
             self.downloads.fetch_add(1, Ordering::SeqCst);
+            if self.failing_download == Some(release.version.as_str()) {
+                return Err(UpdateError::Integrity("bad archive".into()));
+            }
             on_progress(1.0);
             Ok(StagedUpdate {
                 release: release.clone(),
@@ -911,6 +924,9 @@ mod tests {
 
         fn install(&self, _staged: &StagedUpdate, relaunch: bool) -> UpdateResult<()> {
             self.installs.lock().expect("installs").push(relaunch);
+            if self.failing_install {
+                return Err(UpdateError::NotWritable("/Applications".into()));
+            }
             Ok(())
         }
 
@@ -1012,6 +1028,8 @@ mod tests {
                 downloads: AtomicUsize::new(0),
                 installs: Mutex::new(Vec::new()),
                 channels: Mutex::new(Vec::new()),
+                failing_download: None,
+                failing_install: false,
             });
             let backend: Arc<dyn UpdateBackend> = updater.clone();
             let (state_tx, mut state_rx) = watch::channel(UpdateState::default());
@@ -1067,6 +1085,8 @@ mod tests {
                 downloads: AtomicUsize::new(0),
                 installs: Mutex::new(Vec::new()),
                 channels: Mutex::new(Vec::new()),
+                failing_download: None,
+                failing_install: false,
             });
             let backend: Arc<dyn UpdateBackend> = updater.clone();
             let (state_tx, mut state_rx) = watch::channel(UpdateState::default());
@@ -1125,6 +1145,8 @@ mod tests {
                 downloads: AtomicUsize::new(0),
                 installs: Mutex::new(Vec::new()),
                 channels: Mutex::new(Vec::new()),
+                failing_download: None,
+                failing_install: false,
             });
             let backend: Arc<dyn UpdateBackend> = updater.clone();
             let (state_tx, mut state_rx) = watch::channel(UpdateState::default());
@@ -1176,6 +1198,8 @@ mod tests {
                 downloads: AtomicUsize::new(0),
                 installs: Mutex::new(Vec::new()),
                 channels: Mutex::new(Vec::new()),
+                failing_download: None,
+                failing_install: false,
             });
             let backend: Arc<dyn UpdateBackend> = updater.clone();
             let (state_tx, mut state_rx) = watch::channel(UpdateState::default());
@@ -1242,6 +1266,8 @@ mod tests {
             downloads: AtomicUsize::new(0),
             installs: Mutex::new(Vec::new()),
             channels: Mutex::new(Vec::new()),
+            failing_download: None,
+            failing_install: false,
         });
         let phase = drain_service(
             updater.clone(),
@@ -1310,6 +1336,8 @@ mod tests {
             downloads: AtomicUsize::new(0),
             installs: Mutex::new(Vec::new()),
             channels: Mutex::new(Vec::new()),
+            failing_download: None,
+            failing_install: false,
         }));
         let phase = drain_service(
             updater.clone(),
@@ -1332,6 +1360,8 @@ mod tests {
             downloads: AtomicUsize::new(0),
             installs: Mutex::new(Vec::new()),
             channels: Mutex::new(Vec::new()),
+            failing_download: None,
+            failing_install: false,
         });
         let backend: Arc<dyn UpdateBackend> = updater.clone();
         let ready_install = Arc::new(Mutex::new(Some(ReadyInstall {
@@ -1372,6 +1402,8 @@ mod tests {
                 downloads: AtomicUsize::new(0),
                 installs: Mutex::new(Vec::new()),
                 channels: Mutex::new(Vec::new()),
+                failing_download: None,
+                failing_install: false,
             });
             let backend: Arc<dyn UpdateBackend> = updater.clone();
             let (state_tx, state_rx) = watch::channel(UpdateState::default());
@@ -1428,6 +1460,8 @@ mod tests {
                 downloads: AtomicUsize::new(0),
                 installs: Mutex::new(Vec::new()),
                 channels: Mutex::new(Vec::new()),
+                failing_download: None,
+                failing_install: false,
             });
             let backend: Arc<dyn UpdateBackend> = updater.clone();
             let (state_tx, mut state_rx) = watch::channel(UpdateState::default());
@@ -1483,6 +1517,100 @@ mod tests {
                 2,
                 "the old channel's staged build is not reused"
             );
+        });
+    }
+
+    fn test_service(updater: FakeUpdater, automatic: bool) -> (Service, Arc<FakeUpdater>) {
+        let updater = Arc::new(updater);
+        let backend: Arc<dyn UpdateBackend> = updater.clone();
+        let (state, _) = watch::channel(UpdateState::default());
+        let service = Service {
+            updater: backend,
+            state,
+            automatic,
+            pending: None,
+            skipped: None,
+            ready_install: Arc::new(Mutex::new(None)),
+        };
+        (service, updater)
+    }
+
+    fn fake(offered: &str) -> FakeUpdater {
+        FakeUpdater {
+            offered: release(offered),
+            downloads: AtomicUsize::new(0),
+            installs: Mutex::new(Vec::new()),
+            channels: Mutex::new(Vec::new()),
+            failing_download: None,
+            failing_install: false,
+        }
+    }
+
+    #[test]
+    fn dismissing_a_failed_install_keeps_the_staged_update() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let (mut service, _) = test_service(
+                FakeUpdater {
+                    failing_install: true,
+                    ..fake("0.5.0")
+                },
+                false,
+            );
+            service
+                .handle(UpdateCommand::Check {
+                    user_initiated: true,
+                })
+                .await;
+            service.handle(UpdateCommand::Download).await;
+            service.handle(UpdateCommand::Install).await;
+            assert!(matches!(
+                service.state.borrow().phase,
+                UpdatePhase::Failed(_)
+            ));
+            service.handle(UpdateCommand::Dismiss).await;
+            assert_eq!(
+                service.state.borrow().phase,
+                UpdatePhase::Ready(release("0.5.0")),
+                "Restart to update stays reachable after the error is dismissed"
+            );
+        });
+    }
+
+    #[test]
+    fn a_failed_picker_download_never_becomes_the_automatic_target() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let (mut service, updater) = test_service(
+                FakeUpdater {
+                    failing_download: Some("0.4.1"),
+                    ..fake("0.5.0")
+                },
+                false,
+            );
+            service
+                .handle(UpdateCommand::Check {
+                    user_initiated: true,
+                })
+                .await;
+            service
+                .handle(UpdateCommand::InstallVersion("0.4.1".into()))
+                .await;
+            assert!(matches!(
+                service.state.borrow().phase,
+                UpdatePhase::Failed(_)
+            ));
+            service.handle(UpdateCommand::SetAutomatic(true)).await;
+            assert_eq!(
+                service.staged_release(),
+                Some(release("0.5.0")),
+                "turning automatic updates on stages the offer, not the picked older build"
+            );
+            assert!(updater.installs.lock().unwrap().is_empty());
         });
     }
 

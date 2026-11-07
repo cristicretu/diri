@@ -1279,13 +1279,39 @@ mod macos {
         Failed,
     }
 
-    static KOKORO_DOWNLOAD: std::sync::Mutex<Option<(String, KokoroState)>> =
-        std::sync::Mutex::new(None);
+    /// Each voice's own download: picking another voice while one downloads
+    /// neither hides the first one's progress nor lets its thread report
+    /// into the second one's state.
+    static KOKORO_DOWNLOADS: std::sync::Mutex<std::collections::BTreeMap<String, KokoroState>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
 
     fn set_download(voice: &str, state: KokoroState) {
-        *KOKORO_DOWNLOAD
+        KOKORO_DOWNLOADS
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some((voice.to_owned(), state));
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(voice.to_owned(), state);
+    }
+
+    fn download_state(voice: &str) -> KokoroState {
+        KOKORO_DOWNLOADS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(voice)
+            .copied()
+            .unwrap_or(KokoroState::Missing)
+    }
+
+    /// Claims `voice`'s download unless one is already running, in one
+    /// step, so two picks cannot start two downloads of the same files.
+    fn claim_download(voice: &str) -> bool {
+        let mut downloads = KOKORO_DOWNLOADS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if matches!(downloads.get(voice), Some(KokoroState::Downloading(_))) {
+            return false;
+        }
+        downloads.insert(voice.to_owned(), KokoroState::Downloading(0));
+        true
     }
 
     /// The state of a "kokoro:<name>" voice; `None` for system voices.
@@ -1294,13 +1320,7 @@ mod macos {
         if kokoro_ready(voice) {
             return Some(KokoroState::Ready);
         }
-        let download = KOKORO_DOWNLOAD
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        Some(match download.as_ref() {
-            Some((current, state)) if current == voice => *state,
-            _ => KokoroState::Missing,
-        })
+        Some(download_state(voice))
     }
 
     /// Starts downloading what a "kokoro:<name>" voice needs, unless it is
@@ -1319,7 +1339,9 @@ mod macos {
             set_download(voice, KokoroState::Failed);
             return;
         };
-        set_download(voice, KokoroState::Downloading(0));
+        if !claim_download(voice) {
+            return;
+        }
         let voice = voice.to_owned();
         thread::spawn(move || {
             let child = Command::new(helper)
@@ -1440,6 +1462,32 @@ mod macos {
                 .URLForApplicationToOpenURL(&url)
                 .is_some()
         })
+    }
+
+    #[cfg(test)]
+    mod download_tests {
+        use super::*;
+
+        #[test]
+        fn each_kokoro_voice_keeps_its_own_download_state() {
+            // Names no real voice uses, so nothing is on disk for them.
+            let (a, b) = ("test_download_a", "test_download_b");
+            assert!(claim_download(a));
+            set_download(a, KokoroState::Downloading(40));
+            assert!(claim_download(b), "another voice starts its own download");
+            assert_eq!(
+                kokoro_state(&format!("{KOKORO_PREFIX}{a}")),
+                Some(KokoroState::Downloading(40)),
+                "picking another voice does not hide this one's progress"
+            );
+            set_download(a, KokoroState::Failed);
+            assert_eq!(
+                kokoro_state(&format!("{KOKORO_PREFIX}{b}")),
+                Some(KokoroState::Downloading(0)),
+                "one voice's thread never reports into another's state"
+            );
+            assert!(!claim_download(b), "a voice downloads once at a time");
+        }
     }
 }
 

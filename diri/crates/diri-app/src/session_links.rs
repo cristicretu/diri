@@ -850,6 +850,12 @@ impl TerminalPane {
         let rows = self.links_rows(&session);
         let has_account = self.links_has_account(&session);
         let action_count = rows.len() + usize::from(has_account);
+        // The rows can shrink under the selection (a PR closed, links
+        // refreshed); Enter must act on a row that is there.
+        self.session_links.selected = self
+            .session_links
+            .selected
+            .min(action_count.saturating_sub(1));
         let searching = self.session_links.pull_request.is_none();
         let query = &self.session_links.query;
         // → drills into a PR only once the caret has nowhere left to go.
