@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::registry::Registry;
+mod account_gate;
 mod account_handoff;
 mod account_overview;
 mod account_switch;
@@ -220,7 +221,7 @@ pub struct ControlServer {
     accounts: Mutex<crate::accounts::AccountStore>,
     /// `hosts.json`, `agents.json` and `accounts.json` live here.
     config_dir: PathBuf,
-    account_operations: std::sync::RwLock<()>,
+    account_gate: account_gate::AccountGate,
     session_operations: Mutex<std::collections::HashSet<String>>,
     agent_scans: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>>,
     hook_reports: hook_queue::HookQueue,
@@ -366,7 +367,7 @@ impl ControlServer {
             agent_catalog: Arc::new(Mutex::new(agent_catalog)),
             accounts: Mutex::new(accounts),
             config_dir,
-            account_operations: std::sync::RwLock::new(()),
+            account_gate: Default::default(),
             session_operations: Mutex::new(std::collections::HashSet::new()),
             agent_scans: Arc::new(Mutex::new(std::collections::HashMap::new())),
             hook_reports: hook_queue::HookQueue::new(),
@@ -1275,28 +1276,32 @@ impl ControlServer {
                 | Method::ACCOUNT_ADOPT
                 | Method::ACCOUNT_ADD
         ) {
-            Some(self.account_operations.try_write().map_err(|_| ControlError::bad_request("An account or session operation is already in progress. Retry when it finishes."))?)
+            Some(self.account_gate.exclusive().ok_or_else(|| ControlError::bad_request("An account or session operation is already in progress. Retry when it finishes."))?)
         } else {
             None
         };
+        // Profile edits, and launches whose spec is resolved before the launch
+        // primitive runs, hold the gate for the whole call. The primitives
+        // (`launch_permit`) enforce it for every other path.
         let _account_use = if matches!(
             method,
             Method::SESSION_SPAWN
+                | Method::SESSION_SPAWN_TRACKED
+                | Method::TASK_SUBMIT
                 | Method::SESSION_RESUME
+                | Method::SESSION_RECONNECT
+                | Method::SESSION_REOPEN_LAST
                 | Method::SESSION_FORK
                 | Method::SESSION_CONTINUE_ACCOUNT
                 | Method::ACCOUNT_PROFILES_SAVE
                 | Method::ACCOUNT_PROFILES_REMOVE
+                | Method::AGENT_CONFIGURE
                 | Method::SESSION_RESUME_FROM_HISTORY
                 | Method::SESSION_MIGRATE
                 | Method::SESSION_WAKE
                 | Method::SESSION_HIBERNATE
         ) {
-            Some(self.account_operations.try_read().map_err(|_| {
-                ControlError::bad_request(
-                    "An account switch is in progress. Retry when it finishes.",
-                )
-            })?)
+            Some(self.launch_permit()?)
         } else {
             None
         };
@@ -1536,6 +1541,8 @@ impl ControlServer {
         reserved_id: Option<String>,
         scheduled: Option<diri_proto::schedules::ScheduledRunInfo>,
     ) -> Result<JsonValue, ControlError> {
+        // Every launch holds the account gate (see account_gate.rs).
+        let _launch = self.launch_permit()?;
         let raw = params.ok_or_else(|| ControlError::bad_request("params are required"))?;
         // Validate before any account, worktree, or remote side effect. Missing
         // argv keeps manifest launch behavior; an explicit malformed argv must
@@ -3034,6 +3041,25 @@ impl ControlServer {
         params: Option<JsonValue>,
     ) -> Result<JsonValue, ControlError> {
         let p: diri_proto::DeliverMessageParams = decode(params)?;
+        // Waking a sleeping session is a lifecycle change: it takes the same
+        // account and session guards as `session.wake`, before any receipt.
+        let asleep = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            registry
+                .record(&p.session_id.0)
+                .is_some_and(|record| record.hibernation.is_some())
+                || registry
+                    .get(&p.session_id.0)
+                    .is_some_and(crate::session::Session::is_hibernated)
+        };
+        let _wake = if asleep {
+            Some((
+                self.launch_permit()?,
+                account_handoff::SessionOperation::for_session(self, &p.session_id.0)?,
+            ))
+        } else {
+            None
+        };
         // Reuse the existing input serialization. No new terminal owner, queue,
         // or lock is introduced. Receipt writes precede all PTY effects.
         let mut registry = self.registry.lock().map_err(poisoned)?;
@@ -3537,6 +3563,31 @@ impl ControlServer {
         encode(&styled(screen.scrollback_cells(p.first_row, p.max_rows)))
     }
 
+    /// Every Agent launch holds this from credential binding until the Agent
+    /// runs, so no launch overlaps an account switch or login. Never waits.
+    fn launch_permit(&self) -> Result<account_gate::LaunchPermit<'_>, ControlError> {
+        self.account_gate.permit().ok_or_else(|| {
+            ControlError::bad_request("An account switch is in progress. Retry when it finishes.")
+        })
+    }
+
+    /// Lifecycle bodies that evict and relaunch a session run only under its
+    /// `SessionOperation`, whichever path reached them.
+    fn require_reserved(&self, id: &str) -> Result<(), ControlError> {
+        if self
+            .session_operations
+            .lock()
+            .map_err(poisoned)?
+            .contains(id)
+        {
+            Ok(())
+        } else {
+            Err(ControlError::internal(format!(
+                "session {id} relaunched without its lifecycle reservation"
+            )))
+        }
+    }
+
     fn spawn_session_unlocked(
         &self,
         spec: crate::session::SessionSpec,
@@ -3551,6 +3602,8 @@ impl ControlServer {
         record: Option<diri_proto::SessionRecord>,
         persist_intent: bool,
     ) -> Result<(), ControlError> {
+        // Every launch holds the account gate (see account_gate.rs).
+        let _launch = self.launch_permit()?;
         let id = spec.id.clone();
         let engine = {
             let mut registry = self.registry.lock().map_err(poisoned)?;
@@ -3587,8 +3640,38 @@ impl ControlServer {
         id: &str,
         grace: Duration,
     ) -> Result<Option<crate::pty::Exit>, ControlError> {
+        self.stop_session_unlocked(id, grace, false)
+            .map(|stopped| stopped.flatten())
+    }
+
+    /// Evicts `id` for a relaunch only while it is not live, checked under
+    /// the same Registry lock that takes its stop handle. `None`: live, kept.
+    fn evict_dead_unlocked(
+        &self,
+        id: &str,
+        grace: Duration,
+    ) -> Result<Option<Option<crate::pty::Exit>>, ControlError> {
+        self.stop_session_unlocked(id, grace, true)
+    }
+
+    fn stop_session_unlocked(
+        &self,
+        id: &str,
+        grace: Duration,
+        only_dead: bool,
+    ) -> Result<Option<Option<crate::pty::Exit>>, ControlError> {
+        let live = |registry: &crate::registry::Registry| {
+            only_dead
+                && registry.get(id).is_some()
+                && !registry.record(id).is_some_and(|record| {
+                    matches!(record.status, diri_proto::SessionStatus::Exited(_))
+                })
+        };
         let stop = {
             let registry = self.registry.lock().map_err(poisoned)?;
+            if live(&registry) {
+                return Ok(None);
+            }
             registry
                 .get(id)
                 .and_then(crate::session::Session::remote_stop)
@@ -3601,12 +3684,15 @@ impl ControlServer {
                 .map_err(poisoned)?
                 .finish_remote_stop(id, &stop, exit);
             drop(session);
-            Ok(Some(exit))
+            Ok(Some(Some(exit)))
         } else {
-            self.registry
-                .lock()
-                .map_err(poisoned)?
+            let mut registry = self.registry.lock().map_err(poisoned)?;
+            if live(&registry) {
+                return Ok(None);
+            }
+            registry
                 .terminate(id, grace)
+                .map(Some)
                 .map_err(io_control_error)
         }
     }
@@ -4148,7 +4234,10 @@ impl ControlServer {
     }
 
     fn session_resume(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        // Every launch holds the account gate (see account_gate.rs).
+        let _launch = self.launch_permit()?;
         let p: diri_proto::SessionIdParams = decode(params)?;
+        self.require_reserved(&p.session_id.0)?;
         let record = {
             let mut registry = self.registry.lock().map_err(poisoned)?;
             let record = registry
@@ -4252,7 +4341,16 @@ impl ControlServer {
         }
         let remote_persistence = spec.remote.as_ref().map(|remote| remote.launch.persistence);
         if remote_persistence.is_some() {
-            self.terminate_session_unlocked(&p.session_id.0, Duration::from_millis(500))?;
+            // Building the remote spec ran SSH without the Registry. Evict
+            // only a dead run: one that came up meanwhile is kept, not killed.
+            if self
+                .evict_dead_unlocked(&p.session_id.0, Duration::from_millis(500))?
+                .is_none()
+            {
+                let mut registry = self.registry.lock().map_err(poisoned)?;
+                crate::telemetry::record_resume(&record, "already_live", None);
+                return self.restored_resume_result(&mut registry, &p.session_id.0);
+            }
             self.spawn_session_unlocked(spec, None)?;
             let mut registry = self.registry.lock().map_err(poisoned)?;
             registry.update_record(&p.session_id.0, |record| {
@@ -4343,6 +4441,8 @@ impl ControlServer {
     /// `source`. The Diri record and provider identity are both new; lineage
     /// points at the source and the source remains untouched.
     fn session_fork(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        // Every launch holds the account gate (see account_gate.rs).
+        let _launch = self.launch_permit()?;
         let p: diri_proto::SessionForkParams = decode(params)?;
         let source = {
             let registry = self.registry.lock().map_err(poisoned)?;
@@ -4646,7 +4746,7 @@ impl ControlServer {
             drop(registry);
             std::thread::sleep(Duration::from_secs(1));
         }
-        let _account = self.account_operations.try_read().map_err(|_| {
+        let _account = self.account_gate.permit().ok_or_else(|| {
             ControlError::new(
                 "busy",
                 "An account switch is in progress. Retry when it finishes.",
@@ -4697,6 +4797,8 @@ impl ControlServer {
         &self,
         params: Option<JsonValue>,
     ) -> Result<JsonValue, ControlError> {
+        // Every launch holds the account gate (see account_gate.rs).
+        let _launch = self.launch_permit()?;
         let p: diri_proto::ResumeFromHistoryParams = decode(params)?;
         let mut registry = self.registry.lock().map_err(poisoned)?;
         let id = next_session_id();
@@ -4920,7 +5022,12 @@ impl ControlServer {
             return serde_json::to_value(&record)
                 .map_err(|error| ControlError::internal(error.to_string()));
         }
-        match self.session_resume(Some(serde_json::json!({ "sessionID": record.id.0 }))) {
+        // Same guards as a `session.resume` request: a deliver/wake or another
+        // lifecycle call on this id must not interleave with the relaunch.
+        let resumed = account_handoff::SessionOperation::for_session(self, &record.id.0).and_then(
+            |_operation| self.session_resume(Some(serde_json::json!({ "sessionID": record.id.0 }))),
+        );
+        match resumed {
             Ok(resumed) => Ok(resumed),
             Err(error) => {
                 eprintln!(
@@ -7749,6 +7856,8 @@ mod tests {
     #[cfg(unix)]
     mod find_capture_tests;
     #[cfg(unix)]
+    mod launch_gate_tests;
+    #[cfg(unix)]
     mod reconnect_tests;
     #[cfg(unix)]
     mod send_key_tests;
@@ -8217,7 +8326,10 @@ mod tests {
         assert_eq!(result["timedOut"], true);
         assert_eq!(result["session"]["remoteConnection"]["state"], "failed");
         let error = server
-            .session_resume(Some(serde_json::json!({"sessionID":"failed-remote"})))
+            .dispatch(
+                Method::SESSION_RESUME,
+                Some(serde_json::json!({"sessionID":"failed-remote"})),
+            )
             .unwrap_err();
         assert_eq!(error.code, "remote_transport_failed");
         let error = io_control_error(std::io::Error::new(
@@ -9447,7 +9559,10 @@ mod tests {
             .unwrap();
         let resumed: diri_proto::SessionRecord = serde_json::from_value(
             server
-                .session_resume(Some(json!({"sessionID": record.id})))
+                .dispatch(
+                    Method::SESSION_RESUME,
+                    Some(json!({"sessionID": record.id})),
+                )
                 .unwrap(),
         )
         .unwrap();
