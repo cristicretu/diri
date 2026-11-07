@@ -1433,22 +1433,28 @@ fn engine_reads_remote_inline_images_from_a_capable_holder() {
         session.screen_lines().join("\n").contains("ready>")
     });
 
-    // The Holder's grid carries the anchors; a fresh signature reads a full
-    // grid once any pending diff has been taken.
+    // The Holder's grid carries the anchors. The prompt above was read from
+    // the Engine's own parser, which the raw output reaches before the
+    // Holder's grid diff does; on a loaded machine the mirror can still be
+    // a frame behind, so wait for it. A fresh signature reads the full grid.
     let mut key = None;
-    for _ in 0..2 {
-        let mut signature = diri_engine::session::GridSignature::default();
-        let grid = session
-            .grid_update_if_changed(&mut signature)
-            .expect("grid");
-        key = key.or_else(|| {
-            grid.changed_rows
-                .iter()
-                .flat_map(|row| &row.metadata.links)
-                .find_map(|link| diri_proto::inline_image::ImageAnchor::parse(&link.uri))
-                .map(|anchor| anchor.key)
-        });
-    }
+    wait_until(
+        "an image anchor in the remote grid",
+        Duration::from_secs(10),
+        || {
+            let mut signature = diri_engine::session::GridSignature::default();
+            key = session
+                .grid_update_if_changed(&mut signature)
+                .and_then(|grid| {
+                    grid.changed_rows
+                        .iter()
+                        .flat_map(|row| &row.metadata.links)
+                        .find_map(|link| diri_proto::inline_image::ImageAnchor::parse(&link.uri))
+                        .map(|anchor| anchor.key)
+                });
+            key.is_some()
+        },
+    );
     let key = key.expect("an image anchor in the remote grid");
 
     let client = session
