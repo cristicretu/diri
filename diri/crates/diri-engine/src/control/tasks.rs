@@ -335,8 +335,8 @@ fn list(path: &Path, p: &TaskListParams) -> Result<Vec<TaskRecord>, ControlError
 }
 
 impl super::ControlServer {
-    fn tasks_path(&self) -> std::path::PathBuf {
-        self.socket_path.with_file_name("tasks-v1.sqlite")
+    pub(super) fn tasks_path(&self) -> std::path::PathBuf {
+        self.durable_store_path(crate::layout_migration::TASKS_STORE)
     }
     pub(super) fn task_submit(&self, params: Option<Value>) -> Result<Value, ControlError> {
         let p: TaskSubmitParams = super::decode(params)?;
