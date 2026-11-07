@@ -35,8 +35,8 @@ use super::protocol::{
     HOLDER_OUTPUT_STREAM_VERSION, HOLDER_STREAM_ACK, HOLDER_STREAM_INPUT,
     HOLDER_STREAM_MAX_PAYLOAD, HOLDER_STREAM_RESIZE, HOLDER_STREAM_RESIZE_PIXELS,
     HOLDER_STREAM_VERSION, HOLDER_STREAM_VERSION_PIXELS, HolderChildRecord, HolderExitMarker,
-    HolderExitReason, HolderExitStatus, HolderLaunchSpec, HolderOperation, HolderRequest,
-    HolderResponse, HolderStat,
+    HolderExitMarkerGuard, HolderExitReason, HolderExitStatus, HolderLaunchSpec, HolderOperation,
+    HolderRequest, HolderResponse, HolderStat,
 };
 use super::reactor;
 use super::socket;
@@ -104,6 +104,11 @@ struct Shared {
     /// forever, so the exit path kills them (see
     /// [`process_tree::kill_stragglers`]).
     frozen: Mutex<Vec<super::protocol::HolderProcessSample>>,
+    /// Rewrites marker prefixes the child prints, so only the exit path can
+    /// put a recognised [`HolderExitMarker`] in the log. One per session
+    /// because a prefix can span reads; only the pump and the exit drain
+    /// after it read the PTY, so it is never contended.
+    marker_guard: Mutex<HolderExitMarkerGuard>,
     /// The manager's guard, told about the session's group and frozen
     /// processes so they die with the manager too.
     guard: Option<Arc<GroupGuard>>,
@@ -393,6 +398,7 @@ impl HolderServer {
             child_pid,
             child_identity: pty.child_identity(),
             frozen: Mutex::new(Vec::new()),
+            marker_guard: Mutex::new(HolderExitMarkerGuard::default()),
             guard: guard.clone(),
             pty: Mutex::new(pty),
             log: Mutex::new(log),
@@ -1057,6 +1063,7 @@ fn pump_until_quiet(
             }
         }
         if filled > 0 {
+            neutralize_markers(shared, &mut buffer[..filled]);
             // Subscribers first, then durability. A daemon rendering this
             // session should not wait for a disk write to see the bytes, and
             // this ordering is what decouples display latency from filesystem
@@ -1159,6 +1166,23 @@ impl LogLane {
         if let Some(writer) = self.writer.take() {
             let _ = writer.join();
         }
+    }
+}
+
+/// Neutralises any exit-marker prefix in bytes read from the PTY, before
+/// anyone else sees them; see [`HolderExitMarkerGuard`].
+fn neutralize_markers(shared: &Shared, chunk: &mut [u8]) {
+    let forged = shared
+        .marker_guard
+        .lock()
+        .expect("marker guard")
+        .neutralize(chunk);
+    if forged > 0 {
+        diri_telemetry::warn_event!(
+            "holder.exit_marker_neutralized",
+            session = diri_telemetry::id(&shared.spec.session_id),
+            count = forged,
+        );
     }
 }
 
@@ -1617,7 +1641,10 @@ fn finish_holder(shared: &Shared) -> Option<Box<dyn FnOnce() + Send>> {
         loop {
             match drain.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(count) => append_log(shared, &buffer[..count]),
+                Ok(count) => {
+                    neutralize_markers(shared, &mut buffer[..count]);
+                    append_log(shared, &buffer[..count]);
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break, // WouldBlock: nothing buffered
             }
