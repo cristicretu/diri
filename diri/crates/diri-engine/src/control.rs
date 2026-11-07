@@ -3066,15 +3066,18 @@ impl ControlServer {
             return Err(ControlError::not_found(p.session_id.0.clone()));
         }
         let receipt = message_delivery::deliver(&self.message_receipts_path(), &p, || {
+            use message_delivery::SendError;
+            // Waking and finding the session write no input: failures
+            // there release the receipt instead of poisoning message_id.
             registry
                 .wake_session(&p.session_id.0)
-                .map_err(io_control_error)?;
+                .map_err(|error| SendError::NotSent(io_control_error(error)))?;
             self.publish_updated(&registry, &p.session_id.0);
             registry
                 .get(&p.session_id.0)
-                .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
+                .ok_or_else(|| SendError::NotSent(ControlError::not_found(p.session_id.0.clone())))?
                 .send_text(&p.text, p.submit)
-                .map_err(io_control_error)
+                .map_err(|_| SendError::Uncertain)
         });
         if let Ok(receipt) = &receipt {
             diri_telemetry::event!(
