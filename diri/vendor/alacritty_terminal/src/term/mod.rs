@@ -1730,7 +1730,7 @@ impl<T> Term<T> {
     {
         // Real clusters hold a handful of codepoints; past this a run of
         // joiners stops growing one cell without bound.
-        const MAX_CLUSTER_CHARS: usize = 32;
+        const MAX_CLUSTER_CHARS: usize = cell::MAX_ZEROWIDTH;
 
         let point = self.grid.cursor.point;
         let mut column = point.column;
