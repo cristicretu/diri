@@ -1722,8 +1722,17 @@ impl TerminalElement {
         mutex_lock(&self.shared.viewport).pin_keyboard(pinned, &read_lock(&self.buffer));
     }
 
+    /// Returns to the live grid, ending a paused find too: a find capture
+    /// left pinned at offset zero painted a frozen screen as if it were live.
     pub fn scroll_to_live(&self, visible_rows: usize) -> bool {
-        self.set_view_offset(0, visible_rows)
+        cancel_scroll_motion(&self.shared);
+        let mut viewport = mutex_lock(&self.shared.viewport);
+        let changed = viewport.scroll_to_live(visible_rows);
+        viewport.hold_reading_view(&read_lock(&self.buffer));
+        if changed && !viewport.is_reading() {
+            mutex_lock(&self.shared.selection).clear();
+        }
+        changed
     }
 
     pub fn adopt_history_geometry(&self, live_start: i64, total: i64, sequence: u64, rows: usize) {

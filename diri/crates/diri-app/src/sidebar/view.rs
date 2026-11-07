@@ -2878,6 +2878,11 @@ impl Sidebar {
                 move |element, dragged, window, cx| {
                     if let DragItem::Project(moved) = &dragged.0 {
                         entity.update(cx, |this, cx| {
+                            // Escape forgot the gesture; GPUI still delivers
+                            // its moves until the button comes up.
+                            if !this.is_live_project_drag(moved) {
+                                return;
+                            }
                             let target = format!("project:{}", id.0);
                             let moved_now = this.pointer_crossed_header(moved, &id, window)
                                 && this.reorder_project(moved, &id, cx.reduce_motion());
@@ -7469,17 +7474,27 @@ impl Sidebar {
             self.shift_tabs(&before, &after, reduce_motion);
         }
         self.ui.order_dirty = false;
-        self.ui.drag = None;
-        self.ui.drag_target = None;
-        self.lift = None;
         if let Some(preview) = self.drag_preview.take() {
             preview.update(cx, |preview, cx| {
                 preview.hidden = true;
                 cx.notify();
             });
         }
+        self.clear_drag_gesture();
         cx.notify();
         true
+    }
+
+    /// Forgets every piece of an ended or cancelled gesture's state.
+    fn clear_drag_gesture(&mut self) {
+        self.insertion_haptic.borrow_mut().reset();
+        self.insertion_line.set(None);
+        self.ui.drag = None;
+        self.ui.drag_target = None;
+        self.ui.project_order_at_drag_start = None;
+        self.ui.session_order_at_drag_start = None;
+        self.drag_preview = None;
+        self.lift = None;
     }
 
     fn begin_drag(&mut self, item: DragItem, preview: Entity<DragPreview>, cx: &mut Context<Self>) {
@@ -7755,6 +7770,12 @@ impl Sidebar {
         }
     }
 
+    /// Whether `moved` is the project of the gesture still in progress, not
+    /// one Escape cancelled while its button is still down.
+    fn is_live_project_drag(&self, moved: &ProjectId) -> bool {
+        matches!(&self.ui.drag, Some(DragItem::Project(live)) if live == moved)
+    }
+
     /// Live header reorder; returns whether the order changed.
     fn reorder_project(
         &mut self,
@@ -7762,6 +7783,9 @@ impl Sidebar {
         target: &ProjectId,
         reduce_motion: bool,
     ) -> bool {
+        if !self.is_live_project_drag(moved) {
+            return false;
+        }
         let before = self.visible_project_order();
         let changed = {
             let mut store = self.store.write().expect("session store lock poisoned");
@@ -7790,14 +7814,7 @@ impl Sidebar {
     /// Ends a drag gesture: clears the visual state and writes any staged
     /// reorder to disk exactly once.
     fn finish_drag(&mut self) {
-        self.insertion_haptic.borrow_mut().reset();
-        self.insertion_line.set(None);
-        self.ui.drag = None;
-        self.ui.drag_target = None;
-        self.ui.project_order_at_drag_start = None;
-        self.ui.session_order_at_drag_start = None;
-        self.drag_preview = None;
-        self.lift = None;
+        self.clear_drag_gesture();
         if self.ui.order_dirty {
             self.ui.order_dirty = false;
             let _ = self
@@ -11879,6 +11896,36 @@ mod tests {
             project_order(&sidebar, cx),
             ["preview-anara", "preview-dirijor", "preview-settings-kit"]
         );
+    }
+
+    #[gpui::test]
+    fn escape_stops_a_project_drag_from_reordering_or_saving(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        let dirijor = cx.debug_bounds("PROJECT_preview-dirijor").unwrap();
+        let anara = cx.debug_bounds("PROJECT_preview-anara").unwrap();
+        let near = point(anara.center().x, anara.top() + px(3.0));
+        let below_midline = point(anara.center().x, anara.bottom() - px(3.0));
+
+        drag_to(cx, dirijor.center(), near);
+        sidebar.update(cx, |sidebar, _| sidebar.insertion_line.set(Some(1.0)));
+        assert!(sidebar.update(cx, |sidebar, cx| sidebar.cancel_active_drag(cx)));
+        assert!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.insertion_line.get().is_none()),
+            "the cancelled gesture leaves no insertion marker behind"
+        );
+        // GPUI keeps the drag alive until mouse-up: crossing a header now
+        // must not reorder, and the release must not save anything.
+        cx.simulate_mouse_move(below_midline, MouseButton::Left, Modifiers::default());
+        assert_eq!(
+            project_order(&sidebar, cx),
+            ["preview-dirijor", "preview-anara", "preview-settings-kit"]
+        );
+        cx.simulate_mouse_up(below_midline, MouseButton::Left, Modifiers::default());
+        assert_eq!(
+            project_order(&sidebar, cx),
+            ["preview-dirijor", "preview-anara", "preview-settings-kit"]
+        );
+        assert!(sidebar.read_with(cx, |sidebar, _| !sidebar.ui.order_dirty));
     }
 
     #[gpui::test]

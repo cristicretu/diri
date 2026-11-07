@@ -235,6 +235,9 @@ impl RootView {
         let read_id = entry.id.clone();
         let mute_session = entry.session_id.clone();
         let read = entry.read;
+        // A resolved entry is settled: it can be marked read, never unread
+        // (that would bring back a badge for something no longer pending).
+        let can_toggle_read = !(read && entry.resolved);
         // Put the chat/task first instead of repeating “Agent finished” on every row.
         let (title, subtitle) = match entry.kind {
             NotificationKind::Done | NotificationKind::NeedsInput if !entry.body.is_empty() => {
@@ -368,36 +371,38 @@ impl RootView {
                                             }),
                                         ),
                                     )
-                                    .child(
-                                        action_button(
-                                            ("notification-read", index),
-                                            if read {
-                                                IconName::Bell
-                                            } else {
-                                                IconName::Check
-                                            },
-                                            if read {
-                                                t("notify.mark_unread")
-                                            } else {
-                                                t("notify.mark_read")
-                                            },
-                                            colors,
+                                    .when(can_toggle_read, |view| {
+                                        view.child(
+                                            action_button(
+                                                ("notification-read", index),
+                                                if read {
+                                                    IconName::Bell
+                                                } else {
+                                                    IconName::Check
+                                                },
+                                                if read {
+                                                    t("notify.mark_unread")
+                                                } else {
+                                                    t("notify.mark_read")
+                                                },
+                                                colors,
+                                            )
+                                            .debug_selector(move || {
+                                                format!("notification-read-{index}")
+                                            })
+                                            .on_click(
+                                                cx.listener(move |this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.window_store
+                                                        .write()
+                                                        .expect("store")
+                                                        .set_notification_read(&read_id, !read);
+                                                    this.clamp_notification_selection();
+                                                    cx.notify();
+                                                }),
+                                            ),
                                         )
-                                        .debug_selector(move || {
-                                            format!("notification-read-{index}")
-                                        })
-                                        .on_click(
-                                            cx.listener(move |this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                this.window_store
-                                                    .write()
-                                                    .expect("store")
-                                                    .set_notification_read(&read_id, !read);
-                                                this.clamp_notification_selection();
-                                                cx.notify();
-                                            }),
-                                        ),
-                                    ),
+                                    }),
                             ),
                     ),
             )

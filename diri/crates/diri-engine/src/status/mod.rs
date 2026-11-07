@@ -449,6 +449,44 @@ impl StatusReducer {
             .unwrap_or(SystemTime::UNIX_EPOCH);
     }
 
+    /// Seeds an adopted session's belief from its persisted record, the way
+    /// [`Self::with_attention_storage`] does from attention state, so the
+    /// reducer and the published status agree. Applies only while nothing
+    /// has been reduced yet (the reducer is still `Starting`); returns
+    /// whether the seed was taken. Starting, Unknown and Exited are not
+    /// beliefs a live adopted process resumes from and are ignored.
+    pub fn seed(&mut self, status: &SessionStatus, needs_input: Option<&NeedsInputDetail>) -> bool {
+        if self.status != SessionStatus::Starting {
+            return false;
+        }
+        match status {
+            SessionStatus::Idle => self.status = SessionStatus::Idle,
+            SessionStatus::Working => {
+                self.status = SessionStatus::Working;
+                self.state.turn_in_flight = true;
+                self.state.hook_turn_in_flight = self.authority == Authority::HooksPrimary;
+            }
+            SessionStatus::NeedsInput(kind) => {
+                self.status = SessionStatus::NeedsInput(*kind);
+                self.state.pending_needs_input = needs_input.cloned();
+            }
+            SessionStatus::Starting | SessionStatus::Unknown | SessionStatus::Exited(_) => {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The transport came back after [`StatusSignal::TransportUnavailable`]
+    /// (a failed remote session reconnected). The next snapshot decides the
+    /// status again; until one arrives it stays `Unknown`.
+    pub fn transport_restored(&mut self) {
+        self.state.transport_unavailable = false;
+        // The frame seen before the outage must be re-read, not skipped as
+        // unchanged.
+        self.state.last_screen_seq = None;
+    }
+
     /// The Agent manifest a shell's foreground program is being read with.
     pub fn foreground_agent(&self) -> Option<&str> {
         self.lent_from.as_ref().and(self.manifest_id.as_deref())

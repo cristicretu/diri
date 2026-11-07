@@ -9,7 +9,6 @@ use gpui::{Modifiers, Subscription};
 #[derive(Default)]
 pub(super) struct VoiceFieldsState {
     command: QueryEditor,
-    command_active: bool,
     recording_shortcut: bool,
     /// Swallows key bindings while a shortcut is being recorded, so ⌘K is
     /// captured instead of opening the palette.
@@ -44,7 +43,7 @@ fn answer_label(answer: TalkAnswer) -> &'static str {
 
 impl UtilitySurfaces {
     pub(super) fn deactivate_voice_fields(&mut self) {
-        self.voice_fields.command_active = false;
+        self.active_field.release(SettingsField::VoiceCommand);
         self.stop_dictation_recording();
     }
 
@@ -80,12 +79,12 @@ impl UtilitySurfaces {
             cx.stop_propagation();
             return true;
         }
-        if !self.voice_fields.command_active {
+        if !self.active_field.is(SettingsField::VoiceCommand) {
             return false;
         }
         let key = &event.keystroke;
         match key.key.as_str() {
-            "escape" | "enter" | "tab" => self.voice_fields.command_active = false,
+            "escape" | "enter" | "tab" => self.active_field.release(SettingsField::VoiceCommand),
             _ => {
                 let Some(edit) = query_editor::edit_for(key) else {
                     return false;
@@ -249,7 +248,7 @@ impl UtilitySurfaces {
 
     pub(super) fn voice_command_field(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.settings_colors();
-        let active = self.voice_fields.command_active;
+        let active = self.active_field.is(SettingsField::VoiceCommand);
         let saved = self.prefs.talk_voice_command.clone();
         let content = if active {
             query_label(&self.voice_fields.command)
@@ -268,10 +267,7 @@ impl UtilitySurfaces {
                 this.stop_dictation_recording();
                 this.voice_fields.command = text_editor(&saved);
                 this.voice_fields.command.select_all();
-                this.voice_fields.command_active = true;
-                this.roots_editor_active = false;
-                this.include_editor_active = false;
-                this.settings_search_active = false;
+                this.active_field = SettingsField::VoiceCommand;
                 this.focus.focus(window, cx);
                 cx.notify();
             }))
@@ -287,9 +283,9 @@ impl UtilitySurfaces {
         let saved = self.prefs.talk_answer_shortcut.is_some();
         let begin = cx.listener(|this, _, window, cx| {
             this.deactivate_privacy_name();
-            this.voice_fields.command_active = false;
+            this.active_field.release(SettingsField::VoiceCommand);
             this.arm_dictation_recording(cx);
-            this.settings_search_active = false;
+            this.active_field.release(SettingsField::Search);
             this.focus.focus(window, cx);
             cx.notify();
         });

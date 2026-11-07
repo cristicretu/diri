@@ -21,6 +21,25 @@ struct State {
     checked: usize,
     error: Option<String>,
 }
+/// Ends the scan's `running` however its thread leaves: a scan that panics
+/// must not leave every later request joining a scan that no longer runs.
+struct ScanRunning(Arc<Mutex<State>>);
+
+impl Drop for ScanRunning {
+    fn drop(&mut self) {
+        let mut state = self.0.lock().unwrap_or_else(|poisoned| {
+            self.0.clear_poison();
+            poisoned.into_inner()
+        });
+        if state.running {
+            state.running = false;
+            state
+                .error
+                .get_or_insert_with(|| "The worktree scan stopped unexpectedly".into());
+        }
+    }
+}
+
 impl ScanStore {
     pub(crate) fn request(
         &self,
@@ -42,6 +61,7 @@ impl ScanStore {
             if let Err(error) = std::thread::Builder::new()
                 .name("diri-worktree-scan".into())
                 .spawn(move || {
+                    let _running = ScanRunning(Arc::clone(&shared));
                     let result = scan(p.measure_disk, &mut |entry, checked| {
                         let mut state = shared.lock().expect("worktree scan state");
                         if let Some(entry) = entry {
@@ -102,6 +122,28 @@ mod tests {
             health: Default::default(),
         }
     }
+    #[test]
+    fn a_scan_that_panics_does_not_stay_running() {
+        let store = ScanStore::default();
+        let params = || WorktreeScanParams {
+            refresh: true,
+            ..Default::default()
+        };
+        store
+            .request(params(), |_, emit| {
+                emit(Some(entry(0)), false);
+                panic!("scan failed");
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while store.0.lock().unwrap_or_else(|p| p.into_inner()).running {
+            assert!(Instant::now() < deadline, "the scan stayed running");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let next = store.request(params(), |_, _| Ok(())).unwrap();
+        assert_eq!(next.generation, 2, "a refresh starts a new scan");
+    }
+
     #[test]
     fn worktree_scan_10000_entries_are_incremental_and_refreshes_share_one_worker() {
         let store = ScanStore::default();

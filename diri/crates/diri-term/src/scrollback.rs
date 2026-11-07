@@ -145,7 +145,8 @@ impl From<GridCodecError> for ScrollbackApplyError {
 
 #[derive(Clone, Debug, Default)]
 pub struct ScrollbackViewport {
-    find_source: Option<std::sync::Arc<crate::find::RetainedFindSnapshot>>,
+    /// A find capture or a relocation the view is pinned to; see [`ViewPin`].
+    pin: ViewPin,
     view_offset: i64,
     /// How far the window at `view_offset` is slid up, as a part of one row.
     /// Zero whenever `view_offset` is: the live edge has no residue.
@@ -189,9 +190,6 @@ pub struct ScrollbackViewport {
     /// moving, signed like `view_offset` (positive toward history). Zero
     /// means one screen either way.
     lead: i64,
-    /// Set while a column change re-wraps the history under a reader; see
-    /// [`Relocation`].
-    relocation: Option<Relocation>,
     /// The history position of the latest grid that carried one
     /// (`grid-history-v1`), on any screen and in any view.
     published_history: Option<GridHistory>,
@@ -199,6 +197,24 @@ pub struct ScrollbackViewport {
     /// last applied, so it names the mirror's rows exactly. Only a live view
     /// follows the position; anything else that sets the origin clears this.
     live_synced: bool,
+}
+
+/// What a reading view shows besides its own fetched history.
+///
+/// A paused find paints an immutable capture; a relocation waits to find a
+/// reader's place after a column change. They used to be two independent
+/// fields, and a find pinned mid-relocation swallowed the relocation's reply
+/// and left it waiting forever. As one value, pinning a find (or returning to
+/// live) ends a relocation by construction.
+#[derive(Clone, Debug, Default)]
+enum ViewPin {
+    /// The view shows fetched history and the live grid.
+    #[default]
+    None,
+    /// A column change is re-wrapping history under a reader.
+    Relocating(Relocation),
+    /// A paused search: the capture is painted instead of history.
+    Find(std::sync::Arc<crate::find::RetainedFindSnapshot>),
 }
 
 /// Characters of a hard line kept to recognize it after a re-wrap.
@@ -307,8 +323,15 @@ pub(crate) struct HistoryStep {
 }
 
 impl ScrollbackViewport {
+    fn find_source(&self) -> Option<&std::sync::Arc<crate::find::RetainedFindSnapshot>> {
+        match &self.pin {
+            ViewPin::Find(source) => Some(source),
+            ViewPin::None | ViewPin::Relocating(_) => None,
+        }
+    }
+
     pub fn has_find_source(&self, source: &crate::find::RetainedFindSnapshot) -> bool {
-        self.find_source.as_deref() == Some(source)
+        self.find_source().map(|pinned| &**pinned) == Some(source)
     }
     pub fn pin_find_source(
         &mut self,
@@ -326,14 +349,16 @@ impl ScrollbackViewport {
         self.cache_seq = Some(source.capture_revision);
         self.geometry_known = true;
         self.history_rows = Some(self.live_start_row.max(0));
-        self.find_source = Some(source);
+        // Ends any relocation: its reply is dropped as stale.
+        self.pin = ViewPin::Find(source);
         self.queued = None;
         self.in_flight = Default::default();
         self.scroll_to_absolute(absolute_row, crate::find::HISTORY_ANCHOR, visible_rows);
         self.sync_anchor();
     }
     pub fn clear_find_source(&mut self) {
-        if self.find_source.take().is_some() {
+        if matches!(self.pin, ViewPin::Find(_)) {
+            self.pin = ViewPin::None;
             self.view_offset = 0;
             self.sub_row = 0.0;
             self.anchor = None;
@@ -341,7 +366,7 @@ impl ScrollbackViewport {
         }
     }
     pub(crate) fn is_reading(&self) -> bool {
-        self.find_source.is_some()
+        self.find_source().is_some()
             || self.keyboard_pinned
             || self.frame_held
             || self.view_offset > 0
@@ -402,7 +427,7 @@ impl ScrollbackViewport {
     /// frame draws blank. Zero on the live grid and under find.
     #[must_use]
     pub fn unfetched_rows(&self, visible_rows: usize) -> usize {
-        if self.find_source.is_some() || self.view_offset <= 0 {
+        if self.find_source().is_some() || self.view_offset <= 0 {
             return 0;
         }
         let held_start = self.held_live.as_ref().map(|held| {
@@ -455,7 +480,7 @@ impl ScrollbackViewport {
 
     #[must_use]
     pub fn max_offset(&self, visible_rows: usize) -> i64 {
-        if let Some(source) = &self.find_source {
+        if let Some(source) = self.find_source() {
             return self.live_start_row.saturating_sub(source.first_row).max(0);
         }
         if self.geometry_known {
@@ -479,7 +504,7 @@ impl ScrollbackViewport {
     #[must_use]
     pub fn indicator_max_offset(&self, visible_rows: usize) -> i64 {
         let navigable = self.max_offset(visible_rows);
-        if self.geometry_known || self.find_source.is_some() {
+        if self.geometry_known || self.find_source().is_some() {
             return navigable;
         }
         // Never under the navigable range: a range of zero reads as "already
@@ -492,7 +517,7 @@ impl ScrollbackViewport {
     /// predates following live.
     #[must_use]
     pub fn indicator_extent_is_estimated(&self) -> bool {
-        !self.geometry_known && self.find_source.is_none()
+        !self.geometry_known && self.find_source().is_none()
     }
 
     /// Records the history length from a read made only to learn it. Unlike
@@ -531,7 +556,7 @@ impl ScrollbackViewport {
         if clamped.rows == 0
             && !self.keyboard_pinned
             && !self.frame_held
-            && self.find_source.is_none()
+            && self.find_source().is_none()
         {
             self.release_reading_view();
         }
@@ -595,7 +620,7 @@ impl ScrollbackViewport {
     }
 
     pub fn scroll_to_live(&mut self, visible_rows: usize) -> bool {
-        let was_find = self.find_source.is_some();
+        let was_find = self.find_source().is_some();
         self.clear_find_source();
         self.set_view_offset(0, visible_rows) || was_find
     }
@@ -651,7 +676,7 @@ impl ScrollbackViewport {
     }
 
     fn row_metadata_ref<'a>(&'a self, buffer: &'a GridBuffer, row: i64) -> Option<&'a RowMetadata> {
-        if let Some(source) = &self.find_source {
+        if let Some(source) = self.find_source() {
             return source.metadata(row);
         }
         if let (Some(held), Some(start)) = (&self.held_live, self.held_live_start)
@@ -683,7 +708,7 @@ impl ScrollbackViewport {
     /// The stored cells behind `absolute_row`, before padding to the grid
     /// width. Empty when the row has not been fetched.
     fn row_source<'a>(&'a self, buffer: &'a GridBuffer, absolute_row: i64) -> &'a [GridCell] {
-        if let Some(source) = &self.find_source {
+        if let Some(source) = self.find_source() {
             return source.row(absolute_row).unwrap_or_default();
         }
         if self.is_reading()
@@ -747,7 +772,7 @@ impl ScrollbackViewport {
     /// Called at local navigation and before applying live damage. The live
     /// mirror keeps receiving every update; only the reading view is held.
     pub(crate) fn hold_reading_view(&mut self, buffer: &GridBuffer) {
-        if self.find_source.is_none() && self.is_reading() && self.held_live.is_none() {
+        if self.find_source().is_none() && self.is_reading() && self.held_live.is_none() {
             self.held_live = Some(buffer.clone());
             // A live origin that follows the grids names this exact screen.
             self.held_live_start =
@@ -756,6 +781,11 @@ impl ScrollbackViewport {
     }
 
     fn release_reading_view(&mut self) {
+        // A live view has no place to find again: a relocation reply after
+        // this would throw the view back into history.
+        if matches!(self.pin, ViewPin::Relocating(_)) {
+            self.pin = ViewPin::None;
+        }
         self.held_live = None;
         self.held_live_start = None;
         // A later scroll starts a fresh reading view, including history that
@@ -777,10 +807,10 @@ impl ScrollbackViewport {
     /// (see [`Relocation`]); a view resting on the live edge just drops the
     /// old-width screen it held.
     pub fn note_width_change(&mut self, buffer: &GridBuffer, cols: u16) {
-        if self.find_source.is_some() || !self.is_reading() {
+        if self.find_source().is_some() || !self.is_reading() {
             return;
         }
-        if let Some(relocation) = &mut self.relocation {
+        if let ViewPin::Relocating(relocation) = &mut self.pin {
             // A drag: the place captured before the first change still
             // describes the rows on screen.
             relocation.cols = cols;
@@ -834,7 +864,7 @@ impl ScrollbackViewport {
                 });
             chars_before_top = 0;
         }
-        self.relocation = Some(Relocation {
+        self.pin = ViewPin::Relocating(Relocation {
             line,
             chars_before_top,
             blank_rows_above,
@@ -852,7 +882,7 @@ impl ScrollbackViewport {
     /// change; the host keeps fetching until it clears.
     #[must_use]
     pub fn relocating(&self) -> bool {
-        self.relocation.is_some()
+        matches!(self.pin, ViewPin::Relocating(_))
     }
 
     /// Returns the next coalesced request and marks it in flight. Until it is
@@ -861,7 +891,7 @@ impl ScrollbackViewport {
     /// Up to [`MAX_FETCHES_IN_FLIGHT`] requests can be out at once, so a host
     /// calls this until it returns `None`.
     pub fn begin_fetch(&mut self, visible_rows: usize) -> Option<ScrollbackRequest> {
-        if let Some(relocation) = &mut self.relocation {
+        if let ViewPin::Relocating(relocation) = &mut self.pin {
             if self.in_flight.iter().any(Option::is_some) || relocation.request_in_flight {
                 return None;
             }
@@ -904,18 +934,18 @@ impl ScrollbackViewport {
         visible_rows: usize,
     ) -> Result<(), ScrollbackApplyError> {
         self.finish_in_flight(result.first_row);
-        if self.find_source.is_some() {
+        if self.find_source().is_some() {
             return Ok(());
         }
-        let relocation_reply = match &mut self.relocation {
+        let relocation_reply = match &mut self.pin {
             // Asked before the column change: rows at a width and numbering
             // that no longer exist.
-            Some(relocation) if !relocation.request_in_flight => return Ok(()),
-            Some(relocation) => {
+            ViewPin::Relocating(relocation) if !relocation.request_in_flight => return Ok(()),
+            ViewPin::Relocating(relocation) => {
                 relocation.request_in_flight = false;
                 true
             }
-            None => false,
+            ViewPin::None | ViewPin::Find(_) => false,
         };
         let row_count = usize::try_from(result.row_count)
             .map_err(|_| ScrollbackApplyError::NegativeRowCount(result.row_count))?;
@@ -960,7 +990,7 @@ impl ScrollbackViewport {
 
     /// Fails the oldest request in flight; its rows are queued again.
     pub fn fail_fetch(&mut self) {
-        if let Some(relocation) = &mut self.relocation {
+        if let ViewPin::Relocating(relocation) = &mut self.pin {
             relocation.request_in_flight = false;
             self.in_flight = Default::default();
             return;
@@ -1011,7 +1041,7 @@ impl ScrollbackViewport {
         result: ReadScrollbackCellsResult,
         visible_rows: usize,
     ) {
-        let Some(relocation) = self.relocation.as_mut() else {
+        let ViewPin::Relocating(relocation) = &mut self.pin else {
             return;
         };
         let history = result.live_start_row.max(0);
@@ -1110,7 +1140,7 @@ impl ScrollbackViewport {
         metadata: Vec<RowMetadata>,
         result: &ReadScrollbackCellsResult,
     ) {
-        self.relocation = None;
+        self.pin = ViewPin::None;
         self.held_live = None;
         self.held_live_start = None;
         self.cache.clear();
@@ -1154,7 +1184,7 @@ impl ScrollbackViewport {
         content_seq: u64,
         visible_rows: usize,
     ) {
-        if self.find_source.is_some() {
+        if self.find_source().is_some() {
             return;
         }
         let old_sequence = self.cache_seq;
@@ -1298,7 +1328,7 @@ impl ScrollbackViewport {
         self.frame_held = false;
         // A paused search is an explicit immutable reading view, including
         // when the live application changes screen modes underneath it.
-        if self.find_source.is_some() {
+        if self.find_source().is_some() {
             return false;
         }
         if !self.is_reading() {
@@ -1314,7 +1344,7 @@ impl ScrollbackViewport {
     }
 
     fn queue_missing_window(&mut self, visible_rows: usize) {
-        if self.find_source.is_some() || self.view_offset <= 0 || visible_rows == 0 {
+        if self.find_source().is_some() || self.view_offset <= 0 || visible_rows == 0 {
             return;
         }
         let painted_rows = i64::try_from(self.painted_rows(visible_rows)).unwrap_or(i64::MAX);
@@ -2581,5 +2611,30 @@ mod tests {
                 .iter()
                 .all(|row| row.chars().count() <= 40)
         );
+    }
+
+    /// Returning to live (or the alternate screen) while a relocation fetch
+    /// is out used to leave the relocation alive; its reply then mixed the
+    /// old-width offset with re-wrapped rows and threw the view back into
+    /// history.
+    #[test]
+    fn leaving_history_mid_relocation_ends_the_relocation() {
+        let rows = 10;
+        for leave in ["live", "alt-screen"] {
+            let (mut screen, mut buffer) = numbered_history(80, rows);
+            let mut viewport = scrolled_back(&mut screen, &buffer, rows, 150);
+            resize_under_reader(&mut viewport, &mut buffer, &mut screen, 40, rows);
+            let probe = viewport.begin_fetch(rows).expect("relocation probe");
+            match leave {
+                "live" => assert!(viewport.set_view_offset(0, rows)),
+                _ => assert!(viewport.enter_alt_screen()),
+            }
+            assert!(!viewport.relocating(), "{leave}");
+            let reply = screen.scrollback_cells(probe.first_row, probe.max_rows);
+            viewport.complete_fetch(reply, rows).unwrap();
+            settle_against(&mut viewport, &mut screen, rows);
+            assert_eq!(viewport.view_offset(), 0, "{leave}");
+            assert!(!viewport.is_reading(), "{leave}");
+        }
     }
 }

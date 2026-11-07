@@ -9,7 +9,6 @@ use crate::telemetry::PrivacySettings;
 pub(super) struct PrivacyState {
     settings: PrivacySettings,
     name: QueryEditor,
-    name_active: bool,
     copied: bool,
     save_error: Option<&'static str>,
     send: SendState,
@@ -34,7 +33,7 @@ impl UtilitySurfaces {
     pub(super) fn set_privacy_settings(&mut self, settings: PrivacySettings) {
         self.privacy.name = text_editor(&settings.name_text());
         self.privacy.settings = settings;
-        self.privacy.name_active = false;
+        self.active_field.release(SettingsField::PrivacyName);
         self.privacy.copied = false;
         self.privacy.save_error = None;
         if self.privacy.send != SendState::Sending {
@@ -42,8 +41,13 @@ impl UtilitySurfaces {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn privacy_name_text(&self) -> String {
+        self.privacy.name.text().to_owned()
+    }
+
     pub(super) fn deactivate_privacy_name(&mut self) {
-        self.privacy.name_active = false;
+        self.active_field.release(SettingsField::PrivacyName);
     }
 
     /// Uploads everything recorded so far, now, even with sharing off: the
@@ -121,7 +125,7 @@ impl UtilitySurfaces {
     ) -> bool {
         if self.surface != Surface::Settings
             || self.settings_tab != SettingsTab::Privacy
-            || !self.privacy.name_active
+            || !self.active_field.is(SettingsField::PrivacyName)
         {
             return false;
         }
@@ -129,7 +133,7 @@ impl UtilitySurfaces {
         match key.key.as_str() {
             "escape" | "enter" | "tab" => {
                 self.store_privacy_name();
-                self.privacy.name_active = false;
+                self.active_field.release(SettingsField::PrivacyName);
             }
             _ => {
                 let Some(edit) = query_editor::edit_for(key) else {
@@ -296,7 +300,7 @@ impl UtilitySurfaces {
 
     fn privacy_name_field(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.settings_colors();
-        let active = self.privacy.name_active;
+        let active = self.active_field.is(SettingsField::PrivacyName);
         let content = if active {
             query_label(&self.privacy.name)
         } else if self.privacy.name.is_empty() {
@@ -329,11 +333,11 @@ impl UtilitySurfaces {
             .text_color(colors.primary)
             .cursor(CursorStyle::IBeam)
             .on_click(cx.listener(|this, _, window, cx| {
-                this.privacy.name_active = true;
+                this.active_field = SettingsField::PrivacyName;
                 this.privacy.name.select_all();
-                this.roots_editor_active = false;
-                this.include_editor_active = false;
-                this.settings_search_active = false;
+                this.active_field.release(SettingsField::Roots);
+                this.active_field.release(SettingsField::Include);
+                this.active_field.release(SettingsField::Search);
                 this.focus.focus(window, cx);
                 cx.notify();
             }))

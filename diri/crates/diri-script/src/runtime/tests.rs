@@ -411,6 +411,29 @@ fn timers_fire_repeat_and_cancel() {
 }
 
 #[test]
+fn stop_ends_the_batch_and_keeps_the_first_exit_code() {
+    let (runtime, _) = runtime();
+    runtime
+        .load_source(
+            "ran = 0\n\
+             diri.on('session.status', function() ran = ran + 1; diri.stop(3) end)\n\
+             diri.on('session.status', function() ran = ran + 1; diri.stop(4) end)\n\
+             diri.after(0, function() ran = ran + 10 end)",
+            "init.lua",
+        )
+        .unwrap();
+    runtime.emit("session.status", &json!({"to": "idle"}));
+    assert!(runtime.stopped());
+    assert_eq!(runtime.exit_code(), 3, "the first stop decides");
+    runtime.run_timers(Instant::now());
+    assert_eq!(
+        runtime.eval("ran").unwrap(),
+        "1",
+        "nothing ran after the stop"
+    );
+}
+
+#[test]
 fn the_same_error_toasts_once_but_is_always_logged() {
     let (runtime, record) = runtime();
     runtime
