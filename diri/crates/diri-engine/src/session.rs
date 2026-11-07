@@ -3243,7 +3243,7 @@ impl Session {
         };
         loop {
             if !chunk.is_empty()
-                && let Err(error) = self.write_transport(&chunk, false)
+                && let Err(error) = self.write_ungated(&chunk)
             {
                 // Nothing can flush a queue behind a broken transport; input
                 // from now on reports the failure itself.
@@ -3261,6 +3261,17 @@ impl Session {
                 InputGate::Frozen(_) | InputGate::Open => return Ok(()),
             }
         }
+    }
+
+    /// Writes past the input gate, still honouring a deferred launch's
+    /// queue, which comes first in [`Self::write_raw_kind`] too.
+    fn write_ungated(&self, bytes: &[u8]) -> std::io::Result<()> {
+        if let Some(deferred) = &self.deferred
+            && deferred.queue_input(bytes)
+        {
+            return Ok(());
+        }
+        self.write_transport(bytes, false)
     }
 
     /// Queues `bytes` behind a closed gate. Returns false when the caller
