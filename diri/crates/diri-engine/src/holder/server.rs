@@ -1873,10 +1873,25 @@ fn handle(shared: &Shared, request: &HolderRequest) -> HolderResult<HolderRespon
         }
 
         HolderOperation::KillTree => {
-            let state = shared.tree.lock().expect("tree");
-            if matches!(*state, ChildTree::Running { .. }) {
+            let tree = {
+                let state = shared.tree.lock().expect("tree");
+                if !matches!(*state, ChildTree::Running { .. }) {
+                    return Ok(HolderResponse::success());
+                }
                 shared.killing.store(true, Ordering::SeqCst);
-                process_tree::kill_tree(shared.child_pid);
+                process_tree::begin_kill_tree(shared.child_pid)
+            };
+            // The grace is waited out off the lock: the exit path takes it
+            // before reaping the leader, and on Linux an unreaped leader
+            // keeps its start time, so holding it here waited the full
+            // grace for every shell that died at once.
+            if !process_tree::wait_tree_gone(&tree) {
+                let state = shared.tree.lock().expect("tree");
+                // Once ended, the exit path's sweep already SIGKILLed the
+                // group, and the leader's pid may be someone else's.
+                if matches!(*state, ChildTree::Running { .. }) {
+                    process_tree::escalate_kill_tree(shared.child_pid, tree);
+                }
             }
             Ok(HolderResponse::success())
         }
