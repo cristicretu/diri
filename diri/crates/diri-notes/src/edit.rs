@@ -1301,12 +1301,15 @@ impl Editor {
                         continue;
                     }
                     let text = block.text.clone();
+                    let was_diagram = block.is_diagram();
                     block.set_kind(kind);
                     if kind == BlockKind::Code {
                         block.text = text;
                         // Code is plain code: a diagram turns back into
-                        // its source.
-                        block.info.clear();
+                        // its source. Any other fence keeps its language.
+                        if was_diagram {
+                            block.info.clear();
+                        }
                     }
                 }
                 let selection = self.selection;
@@ -2680,6 +2683,18 @@ mod tests {
         assert!(
             markdown::write(&markdown::FrontMatter::default(), &e.document())
                 .contains("```mermaid\nflowchart LR")
+        );
+    }
+
+    #[test]
+    fn code_keeps_another_fence_language() {
+        let mut e = editor("# T\n\n```rust title=main.rs\nfn main() {}\n```\n");
+        e.set_caret(Pos::new(1, 0));
+        e.turn_into(Turn::Kind(BlockKind::Code), 0);
+        assert_eq!(e.block(1).info, "rust title=main.rs");
+        assert!(
+            markdown::write(&markdown::FrontMatter::default(), &e.document())
+                .contains("```rust title=main.rs\nfn main() {}")
         );
     }
 

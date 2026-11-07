@@ -784,6 +784,42 @@ fn a_mermaid_block_draws_and_a_click_opens_its_source(cx: &mut gpui::TestAppCont
     assert!(text.contains("```mermaid\nflowchart LR\n  A --> B\n```"), "{text}");
 }
 
+/// A diagram's source can run far taller than its drawing. Away from the
+/// caret that source lies hidden under the card, and a click just below the
+/// card belongs to the block below, not to the unseen source lines.
+#[gpui::test]
+fn a_click_below_a_short_drawing_lands_in_the_next_block(cx: &mut gpui::TestAppContext) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Arc::new(NoteStore::open(dir.path().join("notes")).expect("store"));
+    let comments = "%% a note on the chart\n".repeat(40);
+    let (_, doc) = markdown::parse(&format!(
+        "# Flow\n\n```mermaid\nflowchart LR\n  A --> B\n{comments}```\n\nBelow\n\nLast\n"
+    ));
+    let (id, _) = store.create(doc, None).expect("create");
+    let (pane, cx) = pane(cx, store.clone());
+    let session = SessionId::new("s_note");
+    pane.update_in(cx, |pane, window, cx| pane.show(&session, &id, window, cx));
+    let editor = editor(&pane, cx);
+    editor.update_in(cx, |view, _, cx| {
+        view.editor.set_caret(diri_notes::edit::Pos::new(3, 0));
+        cx.notify();
+    });
+    let diagram = editor.read_with(cx, |view, _| view.editor.block(1).id);
+    cx.run_until_parked();
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    assert!(editor.read_with(cx, |view, _| view.diagram_drawn_for_test(diagram)));
+    let selector: &'static str = format!("note-diagram-{diagram}").leak();
+    let card = cx.debug_bounds(selector).expect("the drawing is on screen");
+
+    cx.simulate_click(
+        gpui::point(card.left() + gpui::px(4.0), card.bottom() + gpui::px(12.0)),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    editor.read_with(cx, |view, _| assert_eq!(view.editor.selection.head.block, 2));
+}
+
 /// A long, realistic note: sections of paragraphs with bold and links,
 /// to-dos, bullets with children, quotes, a code block, mention and tool
 /// chips, repeated to `blocks` blocks.

@@ -12,9 +12,27 @@ const MAX_FRAMES: usize = 48;
 pub fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        record_panic(info);
+        if !EXPECTED.get() {
+            record_panic(info);
+        }
         previous(info);
     }));
+}
+
+thread_local! {
+    /// Set while [`catch_expected`] runs on this thread.
+    static EXPECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f`, catching a panic it raises without recording it as an
+/// incident. For third-party code fed user input (a parser meeting text it
+/// never expected), where a panic is an input error the caller reports,
+/// not a crash.
+pub fn catch_expected<R>(f: impl FnOnce() -> R + std::panic::UnwindSafe) -> std::thread::Result<R> {
+    let was = EXPECTED.replace(true);
+    let result = std::panic::catch_unwind(f);
+    EXPECTED.set(was);
+    result
 }
 
 fn record_panic(info: &PanicHookInfo<'_>) {
@@ -101,6 +119,13 @@ pub fn signature_id(signature: &str) -> crate::Id {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_expected_panic_is_caught_and_the_flag_cleared() {
+        assert!(catch_expected(|| panic!("bad input")).is_err());
+        assert_eq!(catch_expected(|| 7).unwrap(), 7);
+        assert!(!EXPECTED.get());
+    }
 
     #[test]
     fn extracts_function_names_and_signature() {

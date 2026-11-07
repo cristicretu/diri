@@ -618,6 +618,13 @@ pub(crate) struct NoteEditorView {
         std::cell::RefCell<std::collections::HashMap<std::path::PathBuf, Option<(u32, u32)>>>,
     /// Each Mermaid block's drawing.
     diagrams: Diagrams,
+    /// Each Mermaid block's redraw in flight, by block id. Replacing one
+    /// cancels it, so a burst of typing draws once.
+    diagram_draws: std::collections::HashMap<u64, Task<()>>,
+    /// The visible part of each diagram block shown without its source, by
+    /// block index: its hidden source lays out taller than the drawing, and
+    /// clicks below the card belong to the blocks under it.
+    diagram_clips: ImageRects,
     /// Each block's rendered height by id, measured the last time it was on
     /// screen: what an off-screen block's spacer is sized from.
     row_heights: RowHeights,
@@ -644,6 +651,8 @@ fn now_ms() -> u64 {
 
 impl NoteEditorView {
     pub(crate) fn new(editor: Editor, colors: SemanticColors, cx: &mut Context<Self>) -> Self {
+        cx.on_release(|this: &mut Self, cx| release_pictures(this.diagrams.take_all(), cx))
+            .detach();
         Self {
             editor,
             focus: cx.focus_handle(),
@@ -680,6 +689,8 @@ impl NoteEditorView {
             image_rects: Rc::default(),
             image_sizes: Default::default(),
             diagrams: Diagrams::default(),
+            diagram_draws: Default::default(),
+            diagram_clips: Rc::default(),
             row_heights: Rc::default(),
             caret_bounds: None,
             ticked: Vec::new(),
@@ -1023,6 +1034,21 @@ impl NoteEditorView {
         Some((point, layout.line_height()))
     }
 
+    /// Where block `index` takes clicks: its text's bounds, cut to the
+    /// drawing for a diagram whose source lies hidden under it.
+    fn hit_bounds(&self, index: usize) -> Option<Bounds<Pixels>> {
+        let mut bounds = self.layout(index)?.bounds();
+        if let Some((_, clip)) = self
+            .diagram_clips
+            .borrow()
+            .iter()
+            .find(|(clipped, _)| *clipped == index)
+        {
+            bounds.size.height = (clip.bottom() - bounds.top()).max(px(0.0));
+        }
+        Some(bounds)
+    }
+
     fn hit(&self, at: Point<Pixels>) -> Option<Pos> {
         // A click anywhere on a picture selects it.
         if let Some((index, _)) = self
@@ -1041,16 +1067,15 @@ impl NoteEditorView {
         // blocks can be hit.
         for index in (0..hidden.len()).filter(|i| !hidden[*i]) {
             // Off-screen blocks have no layout; a click never lands there.
-            let Some(layout) = self.layout(index) else {
+            let Some(bounds) = self.hit_bounds(index) else {
                 continue;
             };
-            let bounds = layout.bounds();
             chosen = Some(index);
             if point_at.y <= bounds.bottom() {
                 if let Some(previous) = previous
                     && point_at.y < bounds.top()
                 {
-                    let above = self.layout(previous)?.bounds();
+                    let above = self.hit_bounds(previous)?;
                     if point_at.y - above.bottom() < bounds.top() - point_at.y {
                         chosen = Some(previous);
                     }
@@ -2593,6 +2618,32 @@ const DIAGRAM_PAD: f32 = 16.0;
 const DIAGRAM_MAX_HEIGHT: f32 = 640.0;
 /// A diagram's card while its first drawing is on its way.
 const DIAGRAM_PENDING_HEIGHT: f32 = 96.0;
+/// How long typing in a diagram pauses before it redraws: a burst of
+/// keystrokes lays the diagram out once, not once per key.
+const DIAGRAM_REDRAW_DELAY: Duration = Duration::from_millis(150);
+
+/// Frees what gpui holds for pictures no diagram shows any more: the
+/// decoded raster in the app-wide image cache and each window's atlas
+/// sprite. Deferred, so no window is mid-update.
+fn release_pictures(pictures: Vec<std::sync::Arc<gpui::Image>>, cx: &mut App) {
+    if pictures.is_empty() {
+        return;
+    }
+    cx.defer(move |cx| {
+        if let Some(window) = cx.windows().into_iter().next() {
+            let _ = window.update(cx, |_, window, cx| {
+                for picture in &pictures {
+                    if let Some(frame) = std::sync::Arc::clone(picture).get_render_image(window, cx) {
+                        cx.drop_image(frame, Some(window));
+                    }
+                }
+            });
+        }
+        for picture in pictures {
+            picture.remove_asset(cx);
+        }
+    });
+}
 
 /// A diagram's size in the note: its natural size in points, shrunk to fit
 /// the card and the height cap, aspect kept. Never enlarged: its labels
@@ -2810,6 +2861,7 @@ impl Render for NoteEditorView {
         self.anchor_work_menu();
         self.place_block_menu();
         self.image_rects.borrow_mut().clear();
+        self.diagram_clips.borrow_mut().clear();
         let mut layouts = Vec::with_capacity(self.editor.blocks().len());
         let mut shown_all = Vec::with_capacity(self.editor.blocks().len());
         let hidden = self.editor.hidden();
@@ -3738,7 +3790,8 @@ impl NoteEditorView {
     }
 
     /// What each Mermaid block laid out this frame shows, by block id.
-    /// Starts drawing, off the main thread, every source not drawn yet.
+    /// Starts drawing, off the main thread, every source not drawn yet: at
+    /// once for a new block, after a pause in typing for an edit.
     fn diagram_looks(
         &mut self,
         rendered: &[bool],
@@ -3746,12 +3799,16 @@ impl NoteEditorView {
     ) -> std::collections::HashMap<u64, Look> {
         let dark = self.colors.appearance == diri_ui::Appearance::Dark;
         let blocks = self.editor.blocks();
-        let live: std::collections::HashSet<u64> = blocks
-            .iter()
-            .filter(|b| b.is_diagram())
-            .map(|b| b.id)
-            .collect();
-        self.diagrams.retain(|id| live.contains(&id));
+        if !self.diagrams.is_empty() {
+            let live: std::collections::HashSet<u64> = blocks
+                .iter()
+                .filter(|b| b.is_diagram())
+                .map(|b| b.id)
+                .collect();
+            self.diagrams.retain(|id| live.contains(&id));
+            self.diagram_draws.retain(|id, _| live.contains(id));
+        }
+        release_pictures(self.diagrams.take_retired(), cx);
         let mut looks = std::collections::HashMap::new();
         let mut starts = Vec::new();
         for (index, block) in blocks.iter().enumerate() {
@@ -3760,12 +3817,16 @@ impl NoteEditorView {
             }
             let (look, start) = self.diagrams.look(block.id, &block.text, dark);
             if let Some(key) = start {
-                starts.push((block.id, key, block.text.clone()));
+                let edit = !matches!(look, Look::Pending);
+                starts.push((block.id, key, block.text.clone(), edit));
             }
             looks.insert(block.id, look);
         }
-        for (id, key, source) in starts {
-            cx.spawn(async move |this, cx| {
+        for (id, key, source, edit) in starts {
+            let task = cx.spawn(async move |this, cx| {
+                if edit {
+                    cx.background_executor().timer(DIAGRAM_REDRAW_DELAY).await;
+                }
                 let drawn = cx
                     .background_spawn(async move { diagram::draw(&source, dark) })
                     .await;
@@ -3774,8 +3835,10 @@ impl NoteEditorView {
                         cx.notify();
                     }
                 });
-            })
-            .detach();
+            });
+            // Replacing an earlier redraw drops it: one still waiting out
+            // the pause never starts.
+            self.diagram_draws.insert(id, task);
         }
         looks
     }
@@ -3805,6 +3868,9 @@ impl NoteEditorView {
                 };
                 // The source stays laid out under the drawing, unseen, so
                 // the block keeps the text geometry the caret moves by.
+                // Its lines can run below the card; clicks there belong to
+                // the blocks below, so the card's bounds clip its hits.
+                let clips = Rc::clone(&self.diagram_clips);
                 div()
                     .relative()
                     .flex_1()
@@ -3817,6 +3883,14 @@ impl NoteEditorView {
                             .overflow_hidden()
                             .opacity(0.0)
                             .child(code),
+                    )
+                    .child(
+                        canvas(
+                            move |bounds, _, _| clips.borrow_mut().push((index, bounds)),
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
                     )
                     .into_any_element()
             }

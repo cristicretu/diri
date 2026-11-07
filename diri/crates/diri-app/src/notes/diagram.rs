@@ -49,6 +49,9 @@ struct Entry {
 #[derive(Default)]
 pub(super) struct Diagrams {
     entries: HashMap<u64, Entry>,
+    /// Pictures no block shows any more, whose rasters gpui still caches
+    /// until the view releases them ([`Self::take_retired`]).
+    retired: Vec<Arc<Image>>,
 }
 
 impl Diagrams {
@@ -69,7 +72,10 @@ impl Diagrams {
         });
         if entry.key != key {
             let last = match entry.result.take() {
-                Some(Ok(drawing)) => Some(drawing),
+                Some(Ok(drawing)) => {
+                    self.retired.extend(entry.last.take().map(|old| old.image));
+                    Some(drawing)
+                }
                 _ => entry.last.take(),
             };
             *entry = Entry {
@@ -95,6 +101,11 @@ impl Diagrams {
     pub fn landed(&mut self, id: u64, key: u64, result: Result<Drawing, SharedString>) -> bool {
         match self.entries.get_mut(&id) {
             Some(entry) if entry.key == key => {
+                // A new drawing replaces the stand-in; a failure keeps it
+                // to show faded under the error.
+                if result.is_ok() {
+                    self.retired.extend(entry.last.take().map(|old| old.image));
+                }
                 entry.result = Some(result);
                 true
             }
@@ -109,9 +120,46 @@ impl Diagrams {
             .is_some_and(|entry| matches!(entry.result, Some(Ok(_))))
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Forgets blocks that are gone or no longer diagrams.
     pub fn retain(&mut self, keep: impl Fn(u64) -> bool) {
-        self.entries.retain(|id, _| keep(*id));
+        let retired = &mut self.retired;
+        self.entries.retain(|id, entry| {
+            let kept = keep(*id);
+            if !kept {
+                retired.extend(entry.images());
+            }
+            kept
+        });
+    }
+
+    /// Pictures dropped since the last call, for the view to release from
+    /// gpui's image cache and sprite atlas.
+    pub fn take_retired(&mut self) -> Vec<Arc<Image>> {
+        std::mem::take(&mut self.retired)
+    }
+
+    /// Every picture held, emptying the cache: the view is going away.
+    pub fn take_all(&mut self) -> Vec<Arc<Image>> {
+        let mut all = self.take_retired();
+        for (_, mut entry) in self.entries.drain() {
+            all.extend(entry.images());
+        }
+        all
+    }
+}
+
+impl Entry {
+    /// Takes the pictures this entry holds.
+    fn images(&mut self) -> impl Iterator<Item = Arc<Image>> + use<> {
+        let result = match self.result.take() {
+            Some(Ok(drawing)) => Some(drawing.image),
+            _ => None,
+        };
+        result.into_iter().chain(self.last.take().map(|d| d.image))
     }
 }
 
@@ -123,7 +171,9 @@ fn key(source: &str, dark: bool) -> u64 {
 }
 
 /// Draws `source` for a light or dark note. Runs off the main thread: the
-/// first call on a thread loads the system fonts to measure labels.
+/// first call in the process loads the system fonts the renderer measures
+/// labels with (one shared database behind a lock, so draws run one at a
+/// time).
 pub(super) fn draw(source: &str, dark: bool) -> Result<Drawing, SharedString> {
     if source.trim().is_empty() {
         return Err(crate::i18n::t("notes.diagram.empty").into());
@@ -132,8 +182,8 @@ pub(super) fn draw(source: &str, dark: bool) -> Result<Drawing, SharedString> {
         return Err(crate::i18n::t("notes.diagram.too_big").into());
     }
     // A third-party parser meeting text it never expected must not take
-    // the app down with it.
-    let drawn = std::panic::catch_unwind(|| svg(source, dark)).map_err(|_| {
+    // the app down with it, nor file a crash report per keystroke.
+    let drawn = diri_telemetry::catch_expected(|| svg(source, dark)).map_err(|_| {
         SharedString::from(crate::i18n::t("notes.diagram.failed"))
     })??;
     let (svg, width, height) = drawn;
@@ -251,11 +301,11 @@ mod tests {
     fn broken_or_empty_sources_fail_with_a_message() {
         assert!(draw("", false).is_err());
         assert!(draw("   \n ", false).is_err());
-        let error = draw("flowchart LR\n  A --> ", false);
-        let error2 = draw("this is not mermaid", false);
-        assert!(error.is_err() || error2.is_err());
-        if let Err(message) = error2 {
-            assert!(!message.is_empty());
+        for source in ["this is not mermaid", "flowchart LR\n  A --> B -->"] {
+            match draw(source, false) {
+                Err(message) => assert!(!message.is_empty(), "{source}"),
+                Ok(_) => panic!("{source:?} drew"),
+            }
         }
         assert!(draw(&"a".repeat(MAX_SOURCE + 1), false).is_err());
     }
@@ -285,5 +335,26 @@ mod tests {
         assert!(start.is_some());
         diagrams.retain(|id| id != 7);
         assert!(diagrams.look(7, "graph TD; A-->C", true).1.is_some());
+    }
+
+    #[test]
+    fn replaced_and_removed_pictures_are_retired_once() {
+        let picture = |source| draw(source, false).unwrap();
+        let mut diagrams = Diagrams::default();
+        let first = diagrams.look(1, "graph TD; A-->B", false).1.unwrap();
+        diagrams.landed(1, first, Ok(picture("graph TD; A-->B")));
+        assert!(diagrams.take_retired().is_empty());
+        // The edit's redraw lands: the stand-in goes.
+        let second = diagrams.look(1, "graph TD; A-->C", false).1.unwrap();
+        diagrams.landed(1, second, Ok(picture("graph TD; A-->C")));
+        assert_eq!(diagrams.take_retired().len(), 1);
+        // A failure keeps the last good picture to show faded.
+        let third = diagrams.look(1, "graph TD; A-->", false).1.unwrap();
+        diagrams.landed(1, third, Err("bad".into()));
+        assert!(diagrams.take_retired().is_empty());
+        // The block goes: its picture with it.
+        diagrams.retain(|_| false);
+        assert_eq!(diagrams.take_retired().len(), 1);
+        assert!(diagrams.take_all().is_empty());
     }
 }
