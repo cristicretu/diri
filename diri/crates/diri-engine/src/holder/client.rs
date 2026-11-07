@@ -23,6 +23,62 @@ use super::protocol::{
 use super::socket;
 use super::{HolderError, HolderResult};
 
+/// What a liveness probe learned about one Holder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HolderLiveness {
+    /// The Holder answered, and its child runs.
+    Alive,
+    /// Proven gone: the Holder answered that its child exited, or its socket
+    /// file no longer exists (a Holder unlinks it on the way out).
+    Dead,
+    /// The probe could not tell, with the error kind the last attempt saw:
+    /// descriptor exhaustion on either side, a full listen backlog, a wedged
+    /// Holder, or the stale socket a crashed Holder leaves behind
+    /// (`ConnectionRefused`). Never evidence of death on its own.
+    Unknown(std::io::ErrorKind),
+}
+
+impl HolderLiveness {
+    /// Whether a new Holder may take this socket. A live Holder, or one the
+    /// probe could not reach for any reason but a refused connection, may
+    /// still own the session: a second Holder would stack a second child
+    /// and writer. A refusal that outlasted the retries is a socket nothing
+    /// listens on.
+    pub fn may_replace(self) -> bool {
+        matches!(
+            self,
+            Self::Dead | Self::Unknown(std::io::ErrorKind::ConnectionRefused)
+        )
+    }
+}
+
+/// Bounds one liveness probe from connect to reply, so a Holder that accepts
+/// and never answers cannot wedge the caller.
+const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long a launch's double-run guard keeps probing a Holder that cannot
+/// be reached before refusing; see [`HolderClient::settled_liveness`].
+pub const DOUBLE_RUN_SETTLE: Duration = Duration::from_secs(5);
+const LIVENESS_SETTLE_POLL: Duration = Duration::from_millis(100);
+/// The pauses before each retry of a probe that could not tell.
+const LIVENESS_RETRY_BACKOFF: [Duration; 2] =
+    [Duration::from_millis(50), Duration::from_millis(200)];
+
+fn classify_probe_error(socket_path: &Path, error: &std::io::Error) -> HolderLiveness {
+    // Only a missing socket file proves the Holder gone. Asking the file
+    // system again covers platforms whose connect reports it some other way;
+    // `symlink_metadata` needs no descriptor, so it answers under EMFILE.
+    let missing = matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    ) || std::fs::symlink_metadata(socket_path)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+    if missing {
+        HolderLiveness::Dead
+    } else {
+        HolderLiveness::Unknown(error.kind())
+    }
+}
+
 /// Control client for one session holder.
 #[derive(Clone, Debug)]
 pub struct HolderClient {
@@ -125,8 +181,8 @@ impl HolderClient {
     }
 
     /// On-demand inspection shares one caller deadline across connection,
-    /// write, partial reads and verification. No existing input/stat loop uses
-    /// this stronger request path implicitly.
+    /// write, partial reads and verification; [`Self::liveness`] probes
+    /// through it.
     pub fn stat_until(&self, deadline: std::time::Instant) -> std::io::Result<HolderStat> {
         use diri_pty::unix_socket::{connect_until, read_line_until, remaining};
         let mut stream = connect_until(&self.socket_path, deadline)?;
@@ -172,8 +228,57 @@ impl HolderClient {
         HolderOutputStream::open(&self.socket_path, Some(offset))
     }
 
+    /// Whether a live holder with a live child serves this socket, by
+    /// [`Self::liveness`]. `false` includes [`HolderLiveness::Unknown`], so
+    /// it is never evidence of death: a caller that acts on death matches
+    /// [`HolderLiveness::Dead`] instead.
     pub fn is_alive(&self) -> bool {
-        self.stat().map(|stat| stat.alive).unwrap_or(false)
+        self.liveness() == HolderLiveness::Alive
+    }
+
+    /// Probes the Holder, retrying a probe that could not tell with bounded
+    /// backoff ([`LIVENESS_RETRY_BACKOFF`]), each attempt bounded by
+    /// [`LIVENESS_PROBE_TIMEOUT`]. A transport failure (`EMFILE`, a full
+    /// backlog, a wedged Holder) stays [`HolderLiveness::Unknown`]; only a
+    /// Holder reporting its child exited, or a socket file that no longer
+    /// exists, is [`HolderLiveness::Dead`].
+    pub fn liveness(&self) -> HolderLiveness {
+        let mut liveness = self.probe_liveness();
+        for delay in LIVENESS_RETRY_BACKOFF {
+            if !matches!(liveness, HolderLiveness::Unknown(_)) {
+                break;
+            }
+            std::thread::sleep(delay);
+            liveness = self.probe_liveness();
+        }
+        liveness
+    }
+
+    /// [`Self::liveness`] for a launch deciding whether it may take this
+    /// socket: a probe that still cannot tell, and is not a refusal, is
+    /// repeated until `settle` passes. A Holder busy finishing its exit
+    /// (draining, writing its marker) answers late or unlinks its socket
+    /// within that window; one still unreachable after it keeps the session.
+    pub fn settled_liveness(&self, settle: Duration) -> HolderLiveness {
+        let deadline = Instant::now() + settle;
+        loop {
+            let liveness = self.liveness();
+            if liveness.may_replace()
+                || liveness == HolderLiveness::Alive
+                || Instant::now() >= deadline
+            {
+                return liveness;
+            }
+            std::thread::sleep(LIVENESS_SETTLE_POLL);
+        }
+    }
+
+    fn probe_liveness(&self) -> HolderLiveness {
+        match self.stat_until(Instant::now() + LIVENESS_PROBE_TIMEOUT) {
+            Ok(stat) if stat.alive => HolderLiveness::Alive,
+            Ok(_) => HolderLiveness::Dead,
+            Err(error) => classify_probe_error(&self.socket_path, &error),
+        }
     }
 
     fn request(&self, request: &HolderRequest) -> HolderResult<HolderResponse> {
@@ -910,5 +1015,110 @@ mod deadline_tests {
             std::io::ErrorKind::InvalidData
         );
         worker.join().unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod liveness_tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    fn stat_reply(alive: bool) -> Vec<u8> {
+        format!(r#"{{"ok":true,"stat":{{"childPID":1,"alive":{alive},"logOffset":0}}}}"#)
+            .into_bytes()
+            .into_iter()
+            .chain(*b"\n")
+            .collect()
+    }
+
+    /// A fake Holder answering every Stat with `alive`.
+    fn answer(listener: UnixListener, alive: bool) {
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut line = Vec::new();
+                let mut byte = [0u8];
+                while stream.read(&mut byte).is_ok_and(|n| n == 1) && byte[0] != b'\n' {
+                    line.push(byte[0]);
+                }
+                let _ = stream.write_all(&stat_reply(alive));
+            }
+        });
+    }
+
+    #[test]
+    fn only_a_reported_exit_or_a_missing_socket_is_a_death() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let missing = HolderClient::new(temp.path().join("missing.sock"));
+        assert_eq!(missing.liveness(), HolderLiveness::Dead);
+        assert!(missing.liveness().may_replace());
+
+        let live = temp.path().join("live.sock");
+        answer(UnixListener::bind(&live).unwrap(), true);
+        assert_eq!(HolderClient::new(&live).liveness(), HolderLiveness::Alive);
+        assert!(HolderClient::new(&live).is_alive());
+
+        let exited = temp.path().join("exited.sock");
+        answer(UnixListener::bind(&exited).unwrap(), false);
+        assert_eq!(HolderClient::new(&exited).liveness(), HolderLiveness::Dead);
+    }
+
+    /// What a crashed Holder leaves: a socket file nothing listens on.
+    #[test]
+    fn a_stale_socket_is_unknown_but_replaceable() {
+        let temp = tempfile::tempdir().unwrap();
+        let stale = temp.path().join("stale.sock");
+        drop(UnixListener::bind(&stale).unwrap());
+        assert!(stale.exists());
+        let liveness = HolderClient::new(&stale).liveness();
+        assert_eq!(
+            liveness,
+            HolderLiveness::Unknown(std::io::ErrorKind::ConnectionRefused)
+        );
+        assert!(liveness.may_replace());
+    }
+
+    /// A Holder that accepts and never answers was a death on main (or a
+    /// pump wedged forever); it is unknown now, within a bounded wait, and
+    /// nothing may replace it.
+    #[test]
+    fn an_unresponsive_holder_is_unknown_within_a_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("wedged.sock");
+        let _listener = UnixListener::bind(&path).unwrap();
+        let client = HolderClient::new(&path);
+        let started = Instant::now();
+        let liveness = client.liveness();
+        let bound = LIVENESS_PROBE_TIMEOUT * 3 + LIVENESS_RETRY_BACKOFF.iter().sum::<Duration>();
+        assert!(
+            started.elapsed() < bound + Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(liveness, HolderLiveness::Unknown(_)),
+            "{liveness:?}"
+        );
+        assert!(!liveness.may_replace());
+        assert!(!client.is_alive());
+    }
+
+    /// A launch guard that meets a Holder finishing its exit (accepting, not
+    /// answering) waits for it to unlink its socket instead of refusing.
+    #[test]
+    fn a_launch_guard_waits_out_an_exiting_holder() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("exiting.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let remove = path.clone();
+        let exiting = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            std::fs::remove_file(&remove).unwrap();
+            drop(listener);
+        });
+        let liveness = HolderClient::new(&path).settled_liveness(DOUBLE_RUN_SETTLE);
+        exiting.join().unwrap();
+        assert_eq!(liveness, HolderLiveness::Dead);
     }
 }

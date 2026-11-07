@@ -1020,3 +1020,50 @@ fn a_resize_at_capacity_keeps_history_like_the_current_core() {
         }
     }
 }
+
+/// A run of combining marks keeps at most 32 on the cell, in both cores
+/// alike, after a base that presents alone and after one that does not.
+#[test]
+fn combining_marks_per_cell_are_capped() {
+    use alacritty_terminal::index::{Column, Line};
+    use alacritty_terminal::term::cell::MAX_ZEROWIDTH;
+
+    use super::page::MAX_CLUSTER_CHARS;
+
+    assert_eq!(MAX_CLUSTER_CHARS, MAX_ZEROWIDTH);
+    let mut input = String::from("e");
+    input.extend(std::iter::repeat_n('\u{301}', 100));
+    input.push_str("x\r\n\u{0915}");
+    input.extend(std::iter::repeat_n('\u{94D}', 50));
+    input.push('y');
+    check(4, 10, 0, input.as_bytes());
+    let want = reference(4, 10, 0, input.as_bytes());
+    let got = core(4, 10, 0, &[input.as_bytes()], false, None);
+    for line in 0..2 {
+        let v1 = want.grid()[Line(line)][Column(0)]
+            .zerowidth()
+            .map_or(0, <[char]>::len);
+        assert_eq!(v1, MAX_ZEROWIDTH, "v1 line {line}");
+        assert_eq!(
+            got.zerowidth(line, 0).len(),
+            MAX_CLUSTER_CHARS,
+            "v2 line {line}"
+        );
+    }
+}
+
+/// A flood of marks on one cell fills neither the page's cluster arena
+/// nor, once it would, recompacts the whole page per mark.
+#[test]
+fn combining_mark_flood_stays_bounded() {
+    let mut input = String::from("e");
+    input.extend(std::iter::repeat_n('\u{301}', 1_100_000));
+    input.push('x');
+    let started = std::time::Instant::now();
+    for raw in [false, true] {
+        let got = core(4, 10, 0, &[input.as_bytes()], raw, None);
+        assert_eq!(got.zerowidth(0, 0).len(), 32);
+        assert_eq!(got.cell(0, 1).ch(), 'x');
+    }
+    assert!(started.elapsed() < std::time::Duration::from_secs(60));
+}

@@ -9,6 +9,11 @@
 //! while the app writes it to the config directory, so every host the user
 //! added was "unknown" to the Engine.
 //!
+//! Up to 0.11.4 the schedule, task, tracked-operation and message-receipt
+//! SQLite stores were derived the same way, so on Linux a reboot dropped
+//! every schedule and task and reset the at-most-once ids. They now live in
+//! the state directory.
+//!
 //! The move runs under the daemon lock, before the stores open. It never
 //! overwrites a file at the destination, and never follows a symlink.
 
@@ -18,6 +23,20 @@ use std::path::Path;
 
 const CONFIG_FILES: [&str; 2] = ["agents.json", "accounts.json"];
 pub const REMOTE_BINDINGS_DIR_NAME: &str = "remote-bindings";
+pub const SCHEDULES_STORE: &str = "schedules-v1.sqlite";
+pub const TASKS_STORE: &str = "tasks-v1.sqlite";
+pub const OPERATIONS_STORE: &str = "operations-v1.sqlite";
+pub const MESSAGE_RECEIPTS_STORE: &str = "message-receipts-v1.sqlite";
+/// The Engine's durable SQLite stores, kept in the state directory.
+pub const DURABLE_STORES: [&str; 4] = [
+    SCHEDULES_STORE,
+    TASKS_STORE,
+    OPERATIONS_STORE,
+    MESSAGE_RECEIPTS_STORE,
+];
+/// SQLite files that belong to a database and must travel with it: a hot
+/// rollback journal or an unmerged WAL holds committed or recoverable state.
+const SQLITE_SIDECARS: [&str; 3] = ["-journal", "-wal", "-shm"];
 
 /// What [`adopt_runtime_files`] moved, for one startup log line.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -27,8 +46,9 @@ pub struct Moved {
 }
 
 /// Moves files from the legacy `runtime_dir` into `config_dir` (Agent and
-/// account configuration) and `state_dir` (remote session bindings). A no-op
-/// when the directories coincide, as they do on macOS.
+/// account configuration) and `state_dir` (remote session bindings and the
+/// durable SQLite stores). A no-op when the directories coincide, as they do
+/// on macOS.
 pub fn adopt_runtime_files(runtime_dir: &Path, config_dir: &Path, state_dir: &Path) -> Moved {
     let mut moved = Moved::default();
     if runtime_dir != config_dir {
@@ -37,6 +57,11 @@ pub fn adopt_runtime_files(runtime_dir: &Path, config_dir: &Path, state_dir: &Pa
                 &mut moved,
                 move_file(&runtime_dir.join(name), &config_dir.join(name)),
             );
+        }
+    }
+    if runtime_dir != state_dir {
+        for name in DURABLE_STORES {
+            adopt_sqlite_store(&mut moved, runtime_dir, state_dir, name);
         }
     }
     let legacy = runtime_dir.join(REMOTE_BINDINGS_DIR_NAME);
@@ -59,6 +84,32 @@ pub fn adopt_runtime_files(runtime_dir: &Path, config_dir: &Path, state_dir: &Pa
         let _ = fs::remove_dir(&legacy);
     }
     moved
+}
+
+/// Moves one SQLite database with its sidecars, sidecars first so the main
+/// file never lands without the journal it needs. Skipped entirely when the
+/// destination already has the database: the state directory wins.
+fn adopt_sqlite_store(moved: &mut Moved, runtime_dir: &Path, state_dir: &Path, name: &str) {
+    let source = runtime_dir.join(name);
+    let destination = state_dir.join(name);
+    if !fs::symlink_metadata(&source).is_ok_and(|metadata| metadata.is_file())
+        || fs::symlink_metadata(&destination).is_ok()
+    {
+        return;
+    }
+    for suffix in SQLITE_SIDECARS {
+        let sidecar = format!("{name}{suffix}");
+        match move_file(&runtime_dir.join(&sidecar), &state_dir.join(&sidecar)) {
+            Ok(true) => moved.files += 1,
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("diri-engine: cannot move {sidecar}: {error}");
+                moved.failed += 1;
+                return;
+            }
+        }
+    }
+    tally(moved, move_file(&source, &destination));
 }
 
 fn tally(moved: &mut Moved, result: io::Result<bool>) {
@@ -160,6 +211,48 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn moves_durable_sqlite_stores_out_of_the_runtime_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("run/diri");
+        let config = root.path().join("config/diri");
+        let state = root.path().join("state/diri");
+        for dir in [&runtime, &config, &state] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(runtime.join(SCHEDULES_STORE), b"schedules").unwrap();
+        fs::write(runtime.join(format!("{SCHEDULES_STORE}-journal")), b"hot").unwrap();
+        fs::write(runtime.join(TASKS_STORE), b"tasks").unwrap();
+        fs::write(runtime.join(OPERATIONS_STORE), b"stale ops").unwrap();
+        fs::write(state.join(OPERATIONS_STORE), b"current ops").unwrap();
+
+        let moved = adopt_runtime_files(&runtime, &config, &state);
+
+        assert_eq!(
+            moved,
+            Moved {
+                files: 3,
+                failed: 0
+            }
+        );
+        assert_eq!(fs::read(state.join(SCHEDULES_STORE)).unwrap(), b"schedules");
+        assert_eq!(
+            fs::read(state.join(format!("{SCHEDULES_STORE}-journal"))).unwrap(),
+            b"hot"
+        );
+        assert_eq!(fs::read(state.join(TASKS_STORE)).unwrap(), b"tasks");
+        assert!(!runtime.join(SCHEDULES_STORE).exists());
+        assert!(!runtime.join(TASKS_STORE).exists());
+        // The state directory's copy wins; the stale one is left alone.
+        assert_eq!(
+            fs::read(state.join(OPERATIONS_STORE)).unwrap(),
+            b"current ops"
+        );
+        assert!(runtime.join(OPERATIONS_STORE).exists());
+        assert!(!state.join(MESSAGE_RECEIPTS_STORE).exists());
     }
 
     #[cfg(unix)]

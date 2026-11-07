@@ -476,8 +476,8 @@ impl ActiveRun {
 }
 
 impl super::ControlServer {
-    fn schedules_path(&self) -> PathBuf {
-        self.socket_path.with_file_name("schedules-v1.sqlite")
+    pub(super) fn schedules_path(&self) -> PathBuf {
+        self.durable_store_path(crate::layout_migration::SCHEDULES_STORE)
     }
 
     fn publish_schedule(&self, id: &str) {

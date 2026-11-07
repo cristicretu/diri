@@ -608,6 +608,14 @@ impl DaemonClient {
         self.no_params(Method::SESSION_LIST).await
     }
 
+    /// `session.list` with the event seq it reflects (`None` from an older
+    /// Engine), for a store that also applies the event stream.
+    pub async fn sessions_stamped(
+        &self,
+    ) -> Result<diri_proto::StampedSessionListResult, ClientError> {
+        self.no_params(Method::SESSION_LIST).await
+    }
+
     pub async fn spawn(&self, params: SessionSpawnParams) -> Result<SessionId, ClientError> {
         let record: SessionSpawnResult = self.typed(Method::SESSION_SPAWN, &params).await?;
         Ok(record.id)

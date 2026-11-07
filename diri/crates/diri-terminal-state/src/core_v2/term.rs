@@ -22,7 +22,7 @@ use super::cell::{
     fill_cells,
 };
 use super::ops::{Inactive, Saved};
-use super::page::{Clusters, Link, Pages, RowMeta, TextLog, push_mark};
+use super::page::{Clusters, Link, MAX_CLUSTER_CHARS, Pages, RowMeta, TextLog, push_mark};
 use super::text::{Tables, tables};
 
 pub struct Core {
@@ -477,7 +477,6 @@ impl Core {
 
     /// `Term::continue_cluster`, on this grid.
     fn continue_cluster(&mut self, c: char, info: Info) -> bool {
-        const MAX_CLUSTER_CHARS: usize = 32;
         let line = self.line;
         let mut col = self.col;
         if !self.wrap_pending {
@@ -1620,6 +1619,10 @@ fn classify_rare(cp: u32, row: &[Cell], x: usize, clusters: &Clusters) -> Rare {
         return Rare::General;
     };
     let cell = row[base];
+    // A full cluster: the general path drops the mark.
+    if clusters.of(cell).len() >= MAX_CLUSTER_CHARS {
+        return Rare::General;
+    }
     let mark_only = cell.has(GRAPHEME) || {
         let b = cell.ch();
         !Cluster::new(b, Info::of(b)).presentation()

@@ -49,11 +49,52 @@ const INTERACTIVE_GRID_BUDGET: u8 = 2;
 /// bypass it: publishing the erase alone is the flash this hold prevents.
 const REPAINT_HOLD: Duration = Duration::from_millis(16);
 const MAX_OUTBOUND_BYTES: usize = 20 << 20;
+/// Input queued for the PTY past which this Holder stops reading its
+/// controller: a program that is not reading its terminal pushes back through
+/// the attach socket, the Bridge and SSH to the Engine instead of failing the
+/// session. Also the most query replies are queued behind.
 const MAX_PENDING_INPUT_BYTES: usize = 1 << 20;
+/// The hard bound on queued PTY input. Reading stops at
+/// [`MAX_PENDING_INPUT_BYTES`], so at most one more read's worth of frames
+/// (the codec holds at most one partial frame) can arrive on top of it.
+const MAX_BACKLOGGED_INPUT_BYTES: usize = MAX_PENDING_INPUT_BYTES + MAX_FRAME_BYTES + (64 << 10);
 /// How much raw output may accumulate before it is framed for the client.
 const OUTPUT_FRAME_BYTES: usize = 64 << 10;
 const REPLAY_BUDGET_BYTES: usize = 4 << 20;
 const PERSIST_OFFSET_INTERVAL: u64 = 1 << 20;
+/// Backoff bounds for a failed metadata checkpoint (full disk, quota). Retries
+/// ride on the next submission, so a degraded idle Holder still never polls.
+const CHECKPOINT_RETRY_MIN: Duration = Duration::from_millis(500);
+const CHECKPOINT_RETRY_MAX: Duration = Duration::from_secs(30);
+/// Backoff bounds for a failed `accept` (EMFILE, ENFILE, ENOBUFS). The
+/// listener stays readable while the backlog waits, so it leaves the poll set
+/// for this long instead of spinning.
+const ACCEPT_RETRY_MIN: Duration = Duration::from_millis(10);
+const ACCEPT_RETRY_MAX: Duration = Duration::from_secs(1);
+
+/// The largest grid publication the Holder can produce: a full snapshot of
+/// `MAX_TERMINAL_CELLS` cells with no two neighbours alike (one RLE run per
+/// cell), the most rows, a history position and the largest annotation
+/// block, inside the message's sequence and mode bytes. A terminal of any
+/// valid size must always fit one frame, or its snapshot could never be sent.
+const WORST_CASE_GRID_MESSAGE_BYTES: usize = {
+    use diri_proto::grid::{GridRowCodec, MAX_GRID_METADATA_BYTES};
+    use diri_proto::remote_pty::{MAX_TERMINAL_CELLS, MAX_TERMINAL_ROWS};
+    let rows = MAX_TERMINAL_ROWS as usize;
+    let run_bytes = GridRowCodec::max_row_len(1) - GridRowCodec::max_row_len(0);
+    // Message: sequence (u64) and modes (u8).
+    9
+    // Grid header: cols, rows, cursor col/row (u16 each), flags, row count.
+    + 11
+    // Every row: its `y` and run count, then one run per cell.
+    + rows * (2 + GridRowCodec::max_row_len(0))
+    + MAX_TERMINAL_CELLS * run_bytes
+    // History position: two u64 varints.
+    + 2 * 10
+    // Annotation block: version byte, u32 length, bounded JSON.
+    + 1 + 4 + MAX_GRID_METADATA_BYTES
+};
+const _: () = assert!(WORST_CASE_GRID_MESSAGE_BYTES <= MAX_FRAME_BYTES);
 const FOREGROUND_PROBE_AFTER_INPUT: Duration = Duration::from_millis(100);
 const FOREGROUND_PROBE_WHILE_JOB: Duration = Duration::from_secs(1);
 
@@ -106,6 +147,16 @@ pub fn launch(request: LaunchRequest, executable: &std::path::Path) -> io::Resul
             process_pid: pid,
             persistence: state.persistence,
         });
+    }
+    // A Holder still owns this Session, but its socket is not under this
+    // command's runtime root (sshd gave the launching SSH session a different
+    // `XDG_RUNTIME_DIR`) or it is between bind and unlink. Resetting here
+    // would delete the live Holder's state, credentials and output log and
+    // start a second Agent beside it; only a dead Session may be reset.
+    if crate::state::holder_lock_held(&paths.lock)? {
+        return Err(
+            diri_proto::remote_pty::RemoteManagementFailure::HolderUnavailable.into_io_error(),
+        );
     }
     reset_dead_session(&paths)?;
     initialize_auth(&paths, &request.session_token)?;
@@ -467,6 +518,57 @@ struct Holder {
     reset_output_offset: u64,
     last_foreground_pid: Option<Option<i32>>,
     foreground_probe_deadline: Option<Instant>,
+    degraded: Degraded,
+}
+
+/// Persistence and accept failures this Holder survives. A full disk, an
+/// exhausted quota or descriptor table must never end the Agent: the PTY and
+/// process keep running and only a PTY-fatal condition ends `run`.
+#[derive(Default)]
+struct Degraded {
+    /// The output log refused an append. Appends stop for this Holder's
+    /// lifetime (resuming would leave a gap the log cannot represent);
+    /// offsets keep advancing in memory, live output still streams, and a
+    /// reattach gets the exact grid snapshot without raw replay.
+    log: bool,
+    /// The checkpoint worker failed. The first submission at or after this
+    /// instant replaces it and writes the latest state.
+    checkpoint_retry_at: Option<Instant>,
+    checkpoint_backoff: Duration,
+    /// `accept` failed; the listener leaves the poll set until this instant.
+    accept_paused_until: Option<Instant>,
+    accept_backoff: Duration,
+}
+
+impl Degraded {
+    fn checkpoint_due(&self, now: Instant) -> bool {
+        self.checkpoint_retry_at.is_some_and(|at| now >= at)
+    }
+}
+
+fn next_backoff(current: Duration, minimum: Duration, maximum: Duration) -> Duration {
+    if current.is_zero() {
+        minimum
+    } else {
+        current.saturating_mul(2).min(maximum)
+    }
+}
+
+/// One line on the Holder's stderr, which is its diagnostics file. Never
+/// `eprintln!`: it panics when stderr itself sits on the full disk.
+fn holder_diagnostic_line(message: std::fmt::Arguments<'_>) {
+    let _ = writeln!(io::stderr().lock(), "{message}");
+}
+
+fn holder_checkpoint(
+    paths: &SessionPaths,
+) -> io::Result<diri_pty::checkpoint::CheckpointWriter<SessionState>> {
+    let state_path = paths.state.clone();
+    let metadata_lock = paths.launch_lock.clone();
+    diri_pty::checkpoint::CheckpointWriter::new("holder-checkpoint", move |state| {
+        let _lock = crate::state::acquire_launch_lock_wait(&metadata_lock)?;
+        write_state(&state_path, &state)
+    })
 }
 
 impl Holder {
@@ -534,13 +636,7 @@ impl Holder {
         );
         state.output_offset = log.tail_offset();
         write_state(&paths.state, &state)?;
-        let state_path = paths.state.clone();
-        let metadata_lock = paths.launch_lock.clone();
-        let checkpoint =
-            diri_pty::checkpoint::CheckpointWriter::new("holder-checkpoint", move |state| {
-                let _lock = crate::state::acquire_launch_lock_wait(&metadata_lock)?;
-                write_state(&state_path, &state)
-            })?;
+        let checkpoint = holder_checkpoint(&paths)?;
 
         Ok(Self {
             checkpoint,
@@ -575,16 +671,27 @@ impl Holder {
             reset_output_offset: 0,
             last_foreground_pid: None,
             foreground_probe_deadline: None,
+            degraded: Degraded::default(),
         })
     }
 
     fn run(mut self) -> io::Result<()> {
         loop {
             let mut descriptors = Vec::with_capacity(6);
-            descriptors.push(libc::pollfd {
-                fd: self.listener.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
+            if self
+                .degraded
+                .accept_paused_until
+                .is_some_and(|until| Instant::now() >= until)
+            {
+                self.degraded.accept_paused_until = None;
+            }
+            let listener_index = self.degraded.accept_paused_until.is_none().then(|| {
+                descriptors.push(libc::pollfd {
+                    fd: self.listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+                descriptors.len() - 1
             });
             let pty_index = self.pty_reader.as_ref().map(|reader| {
                 let index = descriptors.len();
@@ -618,11 +725,15 @@ impl Holder {
                 });
                 index
             });
+            let input_backlogged = self.input_backlogged();
             let connection_index = self.connection.as_ref().map(|connection| {
                 let index = descriptors.len();
                 descriptors.push(libc::pollfd {
                     fd: connection.stream.as_raw_fd(),
-                    events: libc::POLLIN
+                    // Backpressure: input waits in the socket, not in memory,
+                    // while the program is not reading its terminal. Hangup
+                    // and error are reported regardless and still read.
+                    events: if input_backlogged { 0 } else { libc::POLLIN }
                         | if connection.outbound.is_empty() {
                             0
                         } else {
@@ -641,11 +752,15 @@ impl Holder {
                 });
                 index
             });
-            let checkpoint_index = descriptors.len();
-            descriptors.push(libc::pollfd {
-                fd: self.checkpoint.failure_fd(),
-                events: libc::POLLIN,
-                revents: 0,
+            // A failed worker's descriptor stays readable; it leaves the
+            // poll set until a retry replaces the writer.
+            let checkpoint_index = self.degraded.checkpoint_retry_at.is_none().then(|| {
+                descriptors.push(libc::pollfd {
+                    fd: self.checkpoint.failure_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+                descriptors.len() - 1
             });
             let timeout = self.poll_timeout_ms();
             // SAFETY: `descriptors` owns initialized pollfd entries for the
@@ -665,11 +780,16 @@ impl Holder {
                 return Err(error);
             }
 
-            if descriptors[checkpoint_index].revents != 0 {
-                self.checkpoint.check_error()?;
+            if let Some(index) = checkpoint_index
+                && descriptors[index].revents != 0
+                && let Err(error) = self.checkpoint.check_error()
+            {
+                self.checkpoint_failed(&error);
             }
-            if descriptors[0].revents & libc::POLLIN != 0 {
-                self.accept_connection()?;
+            if let Some(index) = listener_index
+                && descriptors[index].revents & libc::POLLIN != 0
+            {
+                self.accept_connection();
             }
             if let Some(index) = pty_index {
                 let events = descriptors[index].revents;
@@ -781,15 +901,105 @@ impl Holder {
         Ok(false)
     }
 
-    fn accept_connection(&mut self) -> io::Result<()> {
+    /// Accepts every waiting connection. A failure never ends the session:
+    /// the client retries, and the listener backs off while descriptors or
+    /// buffers are exhausted.
+    fn accept_connection(&mut self) {
         loop {
             match self.listener.accept() {
                 Ok((stream, _)) => {
-                    stream.set_nonblocking(true)?;
+                    self.degraded.accept_backoff = Duration::ZERO;
+                    if let Err(error) = stream.set_nonblocking(true) {
+                        holder_diagnostic_line(format_args!(
+                            "dropping a connection that cannot be made non-blocking: {error}"
+                        ));
+                        continue;
+                    }
                     self.pending_connection = Some(Connection::new(stream));
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                Err(error) => return Err(error),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
+                    ) => {}
+                Err(error) => {
+                    self.accept_failed(&error);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn accept_failed(&mut self, error: &io::Error) {
+        if self.degraded.accept_backoff.is_zero() {
+            holder_diagnostic_line(format_args!(
+                "accept failed, pausing new connections: {error}"
+            ));
+        }
+        let backoff = next_backoff(
+            self.degraded.accept_backoff,
+            ACCEPT_RETRY_MIN,
+            ACCEPT_RETRY_MAX,
+        );
+        self.degraded.accept_backoff = backoff;
+        self.degraded.accept_paused_until = Some(Instant::now() + backoff);
+    }
+
+    /// Queues the latest state for the checkpoint worker. A failed worker is
+    /// replaced by the first submission after its backoff; until then the
+    /// state stays dirty in memory and the next submission carries it.
+    fn submit_checkpoint(&mut self) {
+        if let Some(retry_at) = self.degraded.checkpoint_retry_at {
+            if Instant::now() < retry_at {
+                return;
+            }
+            match holder_checkpoint(&self.paths) {
+                // The failed worker has already exited, so dropping it
+                // joins at once.
+                Ok(writer) => {
+                    self.checkpoint = writer;
+                    self.degraded.checkpoint_retry_at = None;
+                }
+                Err(error) => {
+                    self.checkpoint_failed(&error);
+                    return;
+                }
+            }
+        }
+        if let Err(error) = self.checkpoint.submit(self.state.clone()) {
+            self.checkpoint_failed(&error);
+        }
+    }
+
+    fn checkpoint_failed(&mut self, error: &io::Error) {
+        let backoff = next_backoff(
+            self.degraded.checkpoint_backoff,
+            CHECKPOINT_RETRY_MIN,
+            CHECKPOINT_RETRY_MAX,
+        );
+        holder_diagnostic_line(format_args!(
+            "session checkpoint failed, retrying in {backoff:?}: {error}"
+        ));
+        self.degraded.checkpoint_backoff = backoff;
+        self.degraded.checkpoint_retry_at = Some(Instant::now() + backoff);
+    }
+
+    /// Durably writes exit facts, retrying a failed writer at once; the
+    /// final state is the one checkpoint worth an immediate retry. Failure
+    /// is recorded, never fatal: `ProcessExit` still reaches the Engine.
+    fn persist_exit_state(&mut self) {
+        for _ in 0..2 {
+            if self.degraded.checkpoint_retry_at.is_some() {
+                self.degraded.checkpoint_retry_at = Some(Instant::now());
+            }
+            self.submit_checkpoint();
+            if self.degraded.checkpoint_retry_at.is_some() {
+                continue;
+            }
+            match self.checkpoint.flush() {
+                Ok(()) => return,
+                Err(error) => self.checkpoint_failed(&error),
             }
         }
     }
@@ -825,8 +1035,22 @@ impl Holder {
     }
 
     fn consume_output(&mut self, bytes: &[u8]) -> io::Result<()> {
-        let offset = self.log.append(bytes)?;
-        self.state.output_offset = self.log.tail_offset();
+        let offset = self.state.output_offset;
+        if !self.degraded.log {
+            match self.log.append(bytes) {
+                Ok(appended) => debug_assert_eq!(appended, offset),
+                Err(error) => {
+                    // A full disk or quota must not end the Agent. The log
+                    // keeps its last committed prefix; this Holder stops
+                    // writing it and replay becomes unavailable.
+                    holder_diagnostic_line(format_args!(
+                        "output log append failed, raw replay disabled: {error}"
+                    ));
+                    self.degraded.log = true;
+                }
+            }
+        }
+        self.state.output_offset = offset.saturating_add(bytes.len() as u64);
         let now = Instant::now();
         let since = *self.dirty_since.get_or_insert_with(|| {
             self.batch_filled = self.screen.filled_cells();
@@ -877,8 +1101,9 @@ impl Holder {
             .output_offset
             .saturating_sub(self.last_persisted_offset)
             >= PERSIST_OFFSET_INTERVAL
+            || self.degraded.checkpoint_due(now)
         {
-            self.checkpoint.submit(self.state.clone())?;
+            self.submit_checkpoint();
             self.last_persisted_offset = self.state.output_offset;
         }
         Ok(())
@@ -966,6 +1191,13 @@ impl Holder {
         let mut buffer = [0_u8; 64 * 1024];
         let mut closed = false;
         loop {
+            // Leave further input in the socket until the PTY drains. A peer
+            // that hung up is still read to the end: its remaining bytes are
+            // bounded by the socket buffer, and it would otherwise report
+            // hangup to every poll.
+            if connection.epoch.is_some() && self.input_backlogged() && !peer_hung_up(connection) {
+                break;
+            }
             match connection.stream.read(&mut buffer) {
                 Ok(0) => {
                     closed = true;
@@ -988,6 +1220,18 @@ impl Holder {
                             continue;
                         }
                         if let Err(error) = self.handle_message(connection, message) {
+                            if let Some(recoverable) = Recoverable::of(&error) {
+                                // The request failed, the session did not:
+                                // tell the controller and keep serving it.
+                                // Older Engines log non-fatal errors and
+                                // continue, as for `slow_client_reseed`.
+                                if connection
+                                    .queue_error(recoverable.code, &error.to_string(), false)
+                                    .is_ok()
+                                {
+                                    continue;
+                                }
+                            }
                             let code = if self.stop.is_some()
                                 && error.kind() == io::ErrorKind::NotConnected
                             {
@@ -1048,7 +1292,8 @@ impl Holder {
                     let keyboard = self.screen.input_keyboard_state();
                     ensure_keyboard_controller(keyboard, connection.enhanced_keyboard)?;
                     if keyboard.is_none() {
-                        return Err(io::Error::new(
+                        return Err(Recoverable::error(
+                            "input_rejected",
                             io::ErrorKind::Unsupported,
                             "enhanced keyboard state is unknown",
                         ));
@@ -1079,7 +1324,7 @@ impl Holder {
                     self.state.cols = cols;
                     self.state.rows = rows;
                     self.state.snapshot_sequence = self.state.snapshot_sequence.saturating_add(1);
-                    self.checkpoint.submit(self.state.clone())?;
+                    self.submit_checkpoint();
                     self.queue_snapshot(connection)
                 }
                 FrameType::Ping => connection.queue(RemoteMessage::Terminal(Frame::pong())),
@@ -1167,13 +1412,27 @@ impl Holder {
                 }))
             }
             RemoteMessage::ScrollbackRequest(request) => {
-                let result = self
-                    .screen
-                    .scrollback_cells(request.first_row, request.max_rows);
-                connection.queue(RemoteMessage::ScrollbackResponse(ScrollbackResponse {
-                    request_id: request.request_id,
-                    result,
-                }))
+                // Wide terminals answer with fewer rows, so the response
+                // always fits one frame; `row_count` says how many.
+                let max_rows =
+                    request
+                        .max_rows
+                        .min(diri_proto::remote_pty::max_scrollback_response_rows(
+                            usize::from(self.state.cols),
+                        ));
+                let result = self.screen.scrollback_cells(request.first_row, max_rows);
+                connection
+                    .queue(RemoteMessage::ScrollbackResponse(ScrollbackResponse {
+                        request_id: request.request_id,
+                        result,
+                    }))
+                    .map_err(|error| {
+                        Recoverable::error(
+                            "scrollback_unavailable",
+                            io::ErrorKind::InvalidData,
+                            &error.to_string(),
+                        )
+                    })
             }
             RemoteMessage::TerminalPalette(palette) => {
                 if !connection.query_replies {
@@ -1197,7 +1456,8 @@ impl Holder {
                     ));
                 }
                 if connection.outbound.len() > MAX_OUTBOUND_BYTES {
-                    return Err(io::Error::new(
+                    return Err(Recoverable::error(
+                        "image_unavailable",
                         io::ErrorKind::WouldBlock,
                         "image output queue is full",
                     ));
@@ -1424,7 +1684,8 @@ impl Holder {
         connection.queue(RemoteMessage::ControlGranted(ControlGranted {
             controller_epoch: epoch,
         }))?;
-        self.checkpoint.submit(self.state.clone())
+        self.submit_checkpoint();
+        Ok(())
     }
 
     /// The rows a resuming controller lacks, or why it must take a snapshot.
@@ -1524,7 +1785,9 @@ impl Holder {
     ) -> io::Result<()> {
         let tail = self.log.tail_offset();
         let requested = acknowledged.unwrap_or(tail);
-        if requested >= tail {
+        // A log that stopped accepting appends no longer reaches the live
+        // offset; the snapshot that follows is the authoritative screen.
+        if requested >= tail || self.degraded.log {
             return Ok(());
         }
         let start = requested.max(tail.saturating_sub(REPLAY_BUDGET_BYTES as u64));
@@ -1545,8 +1808,11 @@ impl Holder {
         if bytes.is_empty() {
             return Ok(());
         }
-        if self.pending_input.len().saturating_add(bytes.len()) > MAX_PENDING_INPUT_BYTES {
-            return Err(io::Error::new(
+        // Reading stops at the soft bound (see `input_backlogged`), so only
+        // a peer flushing its socket on hangup can reach this one.
+        if self.pending_input.len().saturating_add(bytes.len()) > MAX_BACKLOGGED_INPUT_BYTES {
+            return Err(Recoverable::error(
+                "input_queue_full",
                 io::ErrorKind::WouldBlock,
                 "pending input queue is full",
             ));
@@ -1558,6 +1824,10 @@ impl Holder {
         self.interactive_grid_budget = INTERACTIVE_GRID_BUDGET;
         self.foreground_probe_deadline = Some(Instant::now() + FOREGROUND_PROBE_AFTER_INPUT);
         self.flush_input()
+    }
+
+    fn input_backlogged(&self) -> bool {
+        self.pending_input.len() >= MAX_PENDING_INPUT_BYTES
     }
 
     fn flush_input(&mut self) -> io::Result<()> {
@@ -1605,7 +1875,8 @@ impl Holder {
             .as_ref()
             .and_then(|stop| stop.grace_deadline.or(stop.flush_deadline))
             .map(poll_timeout);
-        [grid, probe, stop]
+        let accept = self.degraded.accept_paused_until.map(poll_timeout);
+        [grid, probe, stop, accept]
             .into_iter()
             .flatten()
             .min()
@@ -1815,10 +2086,13 @@ impl Holder {
             ),
         };
         self.state.process_state = state;
-        self.state.output_offset = self.log.tail_offset();
-        self.log.flush()?;
-        self.checkpoint.submit(self.state.clone())?;
-        self.checkpoint.flush()?;
+        if !self.degraded.log
+            && let Err(error) = self.log.flush()
+        {
+            holder_diagnostic_line(format_args!("output log flush failed at exit: {error}"));
+            self.degraded.log = true;
+        }
+        self.persist_exit_state();
         self.queue(RemoteMessage::ProcessExit(message))
     }
 }
@@ -1915,6 +2189,52 @@ fn resolve_remote_executable(
         io::ErrorKind::NotFound,
         "Agent executable was not found on the captured remote PATH",
     ))
+}
+
+/// A controller request that failed without harming the session: answered
+/// with a non-fatal structured error, and the connection keeps being served.
+/// Anything else a controller sends wrong still closes its connection fatally.
+#[derive(Debug)]
+struct Recoverable {
+    code: &'static str,
+    message: String,
+}
+
+impl Recoverable {
+    fn error(code: &'static str, kind: io::ErrorKind, message: &str) -> io::Error {
+        io::Error::new(
+            kind,
+            Self {
+                code,
+                message: message.to_string(),
+            },
+        )
+    }
+
+    fn of(error: &io::Error) -> Option<&Self> {
+        error.get_ref()?.downcast_ref::<Self>()
+    }
+}
+
+impl std::fmt::Display for Recoverable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Recoverable {}
+
+/// Whether the controller's socket reports hangup or error, which `poll`
+/// raises whether or not reading was asked for.
+fn peer_hung_up(connection: &Connection) -> bool {
+    let mut descriptor = libc::pollfd {
+        fd: connection.stream.as_raw_fd(),
+        events: 0,
+        revents: 0,
+    };
+    // SAFETY: one initialized pollfd for the call's duration; zero timeout.
+    let ready = unsafe { libc::poll(&mut descriptor, 1, 0) };
+    ready > 0 && descriptor.revents & (libc::POLLHUP | libc::POLLERR) != 0
 }
 
 fn ensure_keyboard_controller(
@@ -2864,6 +3184,7 @@ mod tests {
             reset_output_offset: 0,
             last_foreground_pid: None,
             foreground_probe_deadline: None,
+            degraded: Degraded::default(),
         };
         (temp, holder, request)
     }
@@ -3543,6 +3864,90 @@ mod tests {
             holder.pty.try_wait().unwrap().is_none(),
             "the child is untouched"
         );
+    }
+
+    /// A full disk (ENOSPC on the output log, a checkpoint worker that
+    /// cannot write) degrades persistence; it must not end `run`, whose
+    /// return drops the guard pipe and SIGKILLs the Agent's group. The
+    /// Agent runs to its own exit, offsets stay continuous in memory and the
+    /// retried checkpoint records the genuine exit once the disk accepts.
+    #[test]
+    fn full_disk_degrades_persistence_without_ending_the_agent() {
+        let (_temp, mut holder, _request) =
+            waiting_holder_running(&["/bin/sh", "-c", "head -c 1200000 /dev/zero; exit 42"]);
+        let socket = holder.paths.socket.clone();
+        let state_path = holder.paths.state.clone();
+        let output_path = holder.paths.output.clone();
+        holder.log.fail_appends = Some(io::ErrorKind::StorageFull);
+        holder.checkpoint =
+            diri_pty::checkpoint::CheckpointWriter::new("full-disk-test", |_: SessionState| {
+                Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "No space left on device",
+                ))
+            })
+            .unwrap();
+        // Return once the Agent has exited, without signalling it.
+        holder.stop = Some(StopState {
+            grace_deadline: None,
+            flush_deadline: None,
+        });
+        holder
+            .run()
+            .expect("persistence failures must not end the Holder");
+        let state = read_state(&state_path).unwrap();
+        assert_eq!(
+            state.process_state,
+            RemoteProcessState::Exited {
+                code: Some(42),
+                signal: None
+            },
+            "the Agent ran to its own exit and the retried checkpoint recorded it"
+        );
+        assert_eq!(state.output_offset, 1_200_000, "offsets kept advancing");
+        assert_eq!(
+            OutputLog::open(&output_path).unwrap().tail_offset(),
+            0,
+            "the failed log was not written after the failure"
+        );
+        let _ = fs::remove_file(socket);
+    }
+
+    /// EMFILE on accept pauses the listener with a bounded backoff instead
+    /// of ending the session or spinning on a readable listener, and the
+    /// waiting client is accepted once the pause ends.
+    #[test]
+    fn accept_failure_backs_off_and_recovers() {
+        let (_temp, mut holder, _request) = waiting_holder();
+        let socket = holder.paths.socket.clone();
+        // As `Holder::new` configures it; the fixture binds a blocking one.
+        holder.listener.set_nonblocking(true).unwrap();
+        holder.accept_failed(&io::Error::from_raw_os_error(libc::EMFILE));
+        assert!(holder.degraded.accept_paused_until.is_some());
+        assert_eq!(holder.degraded.accept_backoff, ACCEPT_RETRY_MIN);
+        let timeout = holder.poll_timeout_ms();
+        assert!(
+            (0..=ACCEPT_RETRY_MIN.as_millis() as libc::c_int).contains(&timeout),
+            "the pause bounds the poll: {timeout}"
+        );
+        holder.accept_failed(&io::Error::from_raw_os_error(libc::EMFILE));
+        assert_eq!(holder.degraded.accept_backoff, ACCEPT_RETRY_MIN * 2);
+        for _ in 0..20 {
+            holder.accept_failed(&io::Error::from_raw_os_error(libc::EMFILE));
+        }
+        assert_eq!(holder.degraded.accept_backoff, ACCEPT_RETRY_MAX);
+
+        let _client = UnixStream::connect(&socket).unwrap();
+        holder.accept_connection();
+        assert!(holder.pending_connection.is_some());
+        assert!(
+            holder.degraded.accept_backoff.is_zero(),
+            "a successful accept resets the backoff"
+        );
+        holder.pty.kill_group(libc::SIGKILL).unwrap();
+        let _ = holder.pty.wait_draining(diri_pty::KILL_REAP_TIMEOUT);
+        drop(holder);
+        let _ = fs::remove_file(socket);
     }
 
     #[test]
