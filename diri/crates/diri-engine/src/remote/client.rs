@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex};
 use diri_proto::frames::Frame;
 use diri_proto::remote_pty::{
     Hello, HelloAck, ImageChunk, ImageRequest, ImageResponse, PHASE_ONE_HOLDER_CAPABILITIES,
-    ProtocolVersion, RemoteCodec, RemoteMessage, RemoteProcessState, RemoteRole, ScrollbackRequest,
-    ScrollbackResponse, SessionInspection, SessionSelector, SessionToken, Signal,
-    validate_terminal_dimensions,
+    ProtocolVersion, RemoteCodec, RemoteManagementFailure, RemoteMessage, RemoteProcessState,
+    RemoteRole, ScrollbackRequest, ScrollbackResponse, SessionInspection, SessionSelector,
+    SessionToken, Signal, StopSession, validate_terminal_dimensions,
 };
 
 use super::binding::RemoteBindingStore;
@@ -27,6 +27,8 @@ const MAX_QUEUED_INPUT: usize = 1024 * 1024;
 const OFFSET_PERSIST_INTERVAL: u64 = 1024 * 1024;
 /// One image chunk is at most 256 KiB; this allows a slow link (about
 /// 200 kbit/s) to deliver it behind ordinary output.
+/// Bounds retries while a Holder picks up a stop sent over the attach lease.
+const CONTROLLER_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const IMAGE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const REQUIRED_CAPABILITIES: &[diri_proto::remote_pty::RemoteCapability] =
     PHASE_ONE_HOLDER_CAPABILITIES;
@@ -658,14 +660,17 @@ impl RemoteSessionClient {
     }
 
     pub fn kill(&self) -> io::Result<diri_proto::remote_pty::ProcessExit> {
-        let inspection = self.manager.kill(
-            &self.helper,
-            &SessionSelector {
-                session_id: self.session_id.clone(),
-                session_token: self.token.clone(),
-                expected_incarnation: Some(self.incarnation.clone()),
-            },
-        )?;
+        let selector = SessionSelector {
+            session_id: self.session_id.clone(),
+            session_token: self.token.clone(),
+            expected_incarnation: Some(self.incarnation.clone()),
+        };
+        let inspection = match self.manager.kill(&self.helper, &selector) {
+            Err(error) if is_stop_unsupported(&error) => {
+                self.stop_through_controller(&selector, error)?
+            }
+            result => result?,
+        };
         let RemoteProcessState::Exited { code, signal } = inspection.process_state else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -673,6 +678,45 @@ impl RemoteSessionClient {
             ));
         };
         Ok(diri_proto::remote_pty::ProcessExit { code, signal })
+    }
+
+    /// Helpers built before the stop handshake asked for enhanced-keyboard-v1
+    /// are refused by their own Holder whenever the Agent has kitty keyboard
+    /// flags pushed (Claude Code always does), and those Holders live on
+    /// across upgrades. This Engine's attach is already the granted
+    /// controller, so it asks the Holder to stop over that lease; the owning
+    /// Helper's `kill` then reports the exit the Holder recorded, under the
+    /// same identity validation as a direct stop.
+    fn stop_through_controller(
+        &self,
+        selector: &SessionSelector,
+        unsupported: io::Error,
+    ) -> io::Result<SessionInspection> {
+        {
+            let mut writer = self.writer.lock().expect("remote writer");
+            let Some(epoch) = writer.controller_epoch.filter(|_| writer.control_granted) else {
+                return Err(unsupported);
+            };
+            write_message(
+                &mut writer,
+                &RemoteMessage::StopSession(StopSession {
+                    controller_epoch: epoch,
+                }),
+            )?;
+        }
+        let deadline = std::time::Instant::now() + CONTROLLER_STOP_TIMEOUT;
+        loop {
+            match self.manager.kill(&self.helper, selector) {
+                // Until the Holder reads the request it can still refuse the
+                // management Hello the same way.
+                Err(error)
+                    if is_stop_unsupported(&error) && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                result => return result,
+            }
+        }
     }
 
     pub fn inspect(&self) -> io::Result<SessionInspection> {
@@ -932,6 +976,13 @@ impl RemoteSessionClient {
     pub fn incarnation(&self) -> &str {
         &self.incarnation
     }
+}
+
+fn is_stop_unsupported(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<RemoteManagementFailure>())
+        == Some(&RemoteManagementFailure::StopUnsupported)
 }
 
 fn write_message(writer: &mut WriterState, message: &RemoteMessage) -> io::Result<()> {

@@ -1267,6 +1267,87 @@ fn engine_terminate_uses_stop_result_after_controller_revocation() {
     );
 }
 
+/// Helpers built before the stop handshake asked for enhanced-keyboard-v1
+/// refuse `kill` while their Agent runs with kitty keyboard flags pushed, and
+/// such Holders outlive Engine upgrades. The Engine must still close them by
+/// stopping over its own controller lease.
+#[test]
+fn engine_terminate_stops_through_controller_when_helper_refuses_stop() {
+    let temporary = tempfile::tempdir().unwrap();
+    let remote_home = temporary.path().join("remote-home");
+    let remote_state = temporary.path().join("remote-state");
+    fs::create_dir(&remote_home).unwrap();
+    let fake_ssh = temporary.path().join("ssh-refuses-running-stop");
+    write_executable_script(
+        &fake_ssh,
+        &format!(
+            "#!/bin/sh\nexport HOME='{home}'\nexport DIRI_REMOTE_STATE_DIR='{state}'\nfor last; do :; done\ncase \"$last\" in\n  *'diri-remote\" kill'\\'*)\n    if grep -qs '\"state\":\"running\"' '{state}'/sessions/*/session.json; then\n      cat >/dev/null\n      printf '{{\"error\":\"stop_unsupported\"}}'\n      exit 1\n    fi\n    ;;\nesac\nexec /bin/sh -c \"$last\"",
+            home = remote_home.display(),
+            state = remote_state.display(),
+        ),
+    );
+    let manager = Arc::new(
+        RemoteManager::new(
+            ProcessExecutor::new(fake_ssh),
+            ArtifactCatalog::from_native_helper(Path::new(helper())).unwrap(),
+            temporary.path().join("ssh-control"),
+        )
+        .unwrap(),
+    );
+    let host = HostEntry {
+        transport: Default::default(),
+        id: "legacy-stop-fixture".into(),
+        name: None,
+        ssh: "fixture-host".into(),
+        default_cwd: Some("/".into()),
+        node: None,
+    };
+    let installed = manager.ensure_helper(&host).unwrap();
+    let request = LaunchRequest {
+        session_id: unique_stop_session_id("legacy-stop"),
+        session_token: token_for_retry(),
+        argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            // Like a frozen (SIGSTOPped) Agent: the Engine's TERM does nothing.
+            "trap '' TERM; printf ready; while :; do sleep 0.05; done".into(),
+        ],
+        cwd: "/".into(),
+        environment: vec![],
+        cols: 80,
+        rows: 24,
+        persistence: PersistenceCapability::NonPersistent,
+        keyboard_enhancements: false,
+    };
+    let mut session = Session::spawn(
+        SessionSpec {
+            id: request.session_id.clone(),
+            pty: PtySpec::new(request.argv.clone(), "/").size(80, 24),
+            manifest_id: "shell".into(),
+            authority: Authority::ProcessOnly,
+            logs_dir: temporary.path().join("logs"),
+            holder: None,
+            defer_launch: false,
+            remote: Some(RemoteSessionSpec {
+                manager,
+                helper: installed,
+                launch: request,
+                host_id: host.id,
+                binding_store: RemoteBindingStore::new(temporary.path().join("bindings")).unwrap(),
+            }),
+        },
+        Arc::new(ManifestEngine::new(Vec::new())),
+    )
+    .unwrap();
+    wait_for_grid(&session, "ready");
+    let exit = session
+        .terminate(Duration::ZERO)
+        .expect("a refused Helper stop falls back to the controller lease");
+    // The Holder's stop escalates to SIGKILL after its TERM grace.
+    assert_eq!(exit, diri_engine::Exit::Signal(libc::SIGKILL));
+    assert!(session.view().exited);
+}
+
 /// A remote program prints an inline image; the Holder keeps its pixels and
 /// anchors the cells, and the Engine reads the pixels back in bounded chunks
 /// over the same SSH protocol channel.

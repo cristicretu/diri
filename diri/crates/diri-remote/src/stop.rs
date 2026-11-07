@@ -89,10 +89,15 @@ pub(crate) fn kill(selector: &SessionSelector) -> io::Result<SessionInspection> 
         expected_incarnation: Some(expected.session_incarnation.clone()),
         requested_role: RemoteRole::Controller,
         client_nonce: state::random_hex(16)?,
+        // EnhancedKeyboard never sends a key here. The Holder refuses any
+        // controller without it while the Agent has kitty keyboard flags
+        // pushed (Claude Code always does), which made every such session
+        // impossible to stop.
         required_capabilities: vec![
             RemoteCapability::ControllerLease,
             RemoteCapability::ProcessIdentity,
             RemoteCapability::StopSession,
+            RemoteCapability::EnhancedKeyboard,
         ],
         last_acknowledged_output_offset: Some(expected.output_offset),
         last_acknowledged_grid_sequence: None,

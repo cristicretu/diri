@@ -809,6 +809,63 @@ fn list_kill_and_gc_complete_the_session_lifecycle() {
 }
 
 #[test]
+fn kill_stops_an_agent_that_pushed_enhanced_keyboard_flags() {
+    // Claude Code pushes kitty keyboard flags; the Holder then refuses any
+    // controller Hello without enhanced-keyboard-v1. The stop handshake must
+    // still be accepted, or the session can never be closed.
+    let temporary = tempfile::tempdir().expect("temp");
+    let state_dir = temporary.path().join("state");
+    let request = LaunchRequest {
+        session_id: test_session_id("holder-kitty-stop"),
+        session_token: token(),
+        argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf '\\033[>1u'; printf 'kitty-ready>'; IFS= read -r _".into(),
+        ],
+        cwd: "/".into(),
+        environment: vec![diri_proto::remote_pty::EnvironmentVariable {
+            name: "TERM".into(),
+            value: "xterm-256color".into(),
+        }],
+        cols: 80,
+        rows: 24,
+        persistence: PersistenceCapability::NonPersistent,
+        keyboard_enhancements: true,
+    };
+    let launched: LaunchResult = run_json("launch", &state_dir, Some(&request));
+    let output_log = state_dir
+        .join("sessions")
+        .join(&request.session_id)
+        .join("output.log");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !std::fs::read(&output_log)
+        .unwrap_or_default()
+        .windows(b"kitty-ready>".len())
+        .any(|window| window == b"kitty-ready>")
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "agent never became ready"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let stopped: SessionInspection = run_json(
+        "kill",
+        &state_dir,
+        Some(&SessionSelector {
+            session_id: launched.session_id,
+            session_token: token(),
+            expected_incarnation: Some(launched.session_incarnation),
+        }),
+    );
+    assert!(matches!(
+        stopped.process_state,
+        RemoteProcessState::Exited { .. }
+    ));
+}
+
+#[test]
 fn killed_session_id_can_launch_a_new_authenticated_incarnation() {
     let temporary = tempfile::tempdir().expect("temp");
     let state_dir = temporary.path().join("state");
