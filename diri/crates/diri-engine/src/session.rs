@@ -3658,9 +3658,10 @@ impl Session {
     /// that then reports a different size resizes the child like any other
     /// resize. False when the session was not waiting to launch.
     pub fn launch_at(&self, cols: u16, rows: u16) -> bool {
-        self.deferred
-            .as_ref()
-            .is_some_and(|deferred| deferred.propose_size(cols.max(2), rows.max(2)))
+        self.deferred.as_ref().is_some_and(|deferred| {
+            let (cols, rows) = diri_proto::clamp_terminal_size(i64::from(cols), i64::from(rows), 2);
+            deferred.propose_size(cols, rows)
+        })
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
@@ -3705,6 +3706,9 @@ impl Session {
     /// 10,000 history rows and took 8–43 ms per drag step, during which the
     /// Registry lock used to stall every other session's input.
     pub(crate) fn resize_pty(&self, cols: u16, rows: u16) -> std::io::Result<Option<MirrorResize>> {
+        // Every entry clamps already; this is the one chokepoint that sizes
+        // the PTY and the emulator, so it holds the bound for all of them.
+        let (cols, rows) = diri_proto::clamp_terminal_size(i64::from(cols), i64::from(rows), 2);
         // Before the deferred exec, the FIRST client size decides the launch
         // geometry — record it and push the exec back so the viewport can
         // settle; the emulator is resized at launch, not per proposal.
