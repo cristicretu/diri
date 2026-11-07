@@ -91,6 +91,8 @@ pub enum IconName {
     Pointer,
     Power,
     PullRequest,
+    PullRequestClosed,
+    PullRequestDraft,
     Refresh,
     ResizeHorizontal,
     Return,
@@ -155,7 +157,7 @@ pub enum IconName {
 }
 
 impl IconName {
-    pub const ALL: [Self; 106] = [
+    pub const ALL: [Self; 108] = [
         Self::Account,
         Self::Activity,
         Self::Archive,
@@ -201,6 +203,8 @@ impl IconName {
         Self::Pointer,
         Self::Power,
         Self::PullRequest,
+        Self::PullRequestClosed,
+        Self::PullRequestDraft,
         Self::Refresh,
         Self::ResizeHorizontal,
         Self::Return,
@@ -311,6 +315,8 @@ impl IconName {
             Self::Pointer => "icons/pointer.svg",
             Self::Power => "icons/power.svg",
             Self::PullRequest => "icons/pull-request.svg",
+            Self::PullRequestClosed => "icons/pull-request-closed.svg",
+            Self::PullRequestDraft => "icons/pull-request-draft.svg",
             Self::Refresh => "icons/refresh.svg",
             Self::ResizeHorizontal => "icons/resize-horizontal.svg",
             Self::Return => "icons/return.svg",
@@ -627,6 +633,10 @@ fn embedded_svg(path: &str) -> Option<&'static [u8]> {
         "icons/pointer.svg" => include_bytes!("../assets/icons/pointer.svg"),
         "icons/power.svg" => include_bytes!("../assets/icons/power.svg"),
         "icons/pull-request.svg" => include_bytes!("../assets/icons/pull-request.svg"),
+        "icons/pull-request-closed.svg" => {
+            include_bytes!("../assets/icons/pull-request-closed.svg")
+        }
+        "icons/pull-request-draft.svg" => include_bytes!("../assets/icons/pull-request-draft.svg"),
         "icons/refresh.svg" => include_bytes!("../assets/icons/refresh.svg"),
         "icons/return.svg" => include_bytes!("../assets/icons/return.svg"),
         "icons/resize-horizontal.svg" => include_bytes!("../assets/icons/resize-horizontal.svg"),

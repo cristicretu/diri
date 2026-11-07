@@ -16,6 +16,8 @@ pub(super) struct SessionLinks {
     pull_request: Option<String>,
     /// Filters the home page only; a PR's detail page is short and fixed.
     query: QueryEditor,
+    /// Narrows the home page to one kind; `None` lists every kind.
+    scope: Option<Section>,
     selected: usize,
     parent_selection: usize,
     focus: FocusHandle,
@@ -28,6 +30,7 @@ impl SessionLinks {
             open: false,
             pull_request: None,
             query: QueryEditor::default(),
+            scope: None,
             selected: 0,
             parent_selection: 0,
             focus: cx.focus_handle(),
@@ -39,6 +42,7 @@ impl SessionLinks {
         self.open = false;
         self.pull_request = None;
         self.query.clear();
+        self.scope = None;
         self.selected = 0;
     }
 }
@@ -57,6 +61,7 @@ enum Section {
     Links,
 }
 impl Section {
+    const ALL: [Self; 3] = [Self::PullRequests, Self::Running, Self::Links];
     fn label(self) -> &'static str {
         match self {
             Self::PullRequests => "Pull requests",
@@ -64,6 +69,36 @@ impl Section {
             Self::Links => "Links",
         }
     }
+    /// The name on the scope control, where four labels share one row.
+    fn short_label(self) -> &'static str {
+        match self {
+            Self::PullRequests => "PRs",
+            Self::Running => "Running",
+            Self::Links => "Links",
+        }
+    }
+}
+/// The scopes worth offering for `rows`: every kind present, and only when
+/// there are at least two kinds to choose between.
+fn scopes(rows: &[LinkRow]) -> Vec<Section> {
+    let present: Vec<Section> = Section::ALL
+        .into_iter()
+        .filter(|section| rows.iter().any(|row| row.section == *section))
+        .collect();
+    if present.len() > 1 { present } else { Vec::new() }
+}
+/// The scope after `current` (or before it, `back`), wrapping through "All".
+fn cycle_scope(available: &[Section], current: Option<Section>, back: bool) -> Option<Section> {
+    let order: Vec<Option<Section>> = std::iter::once(None)
+        .chain(available.iter().copied().map(Some))
+        .collect();
+    let index = order.iter().position(|scope| *scope == current).unwrap_or(0);
+    let next = if back {
+        (index + order.len() - 1) % order.len()
+    } else {
+        (index + 1) % order.len()
+    };
+    order[next]
 }
 #[derive(Clone, Debug)]
 struct LinkRow {
@@ -77,9 +112,10 @@ struct LinkRow {
     /// A PR's glyph wears its state's color, so open and merged differ at a
     /// glance rather than only in the status word.
     icon_tint: Option<gpui::Rgba>,
-    /// Merged or closed: listed after the open ones.
+    /// Merged or closed: listed after the open ones, title dimmed.
     settled: bool,
-    status: Option<(String, gpui::Rgba)>,
+    /// The trailing word, colored only when it needs attention.
+    status: Option<(String, Option<gpui::Rgba>)>,
     action: LinkAction,
     details: Option<String>,
 }
@@ -103,11 +139,28 @@ fn pr_tone(pr: &PullRequestStatus) -> gpui::Rgba {
 fn pr_settled(pr: &PullRequestStatus) -> bool {
     matches!(pr.state.as_str(), "MERGED" | "CLOSED")
 }
-fn pr_summary(pr: &PullRequestStatus) -> (String, gpui::Rgba) {
-    if pr_settled(pr) {
-        return (pr_state(pr).into(), pr_tone(pr));
+/// GitHub's glyph for a PR's state: the shape says it even without color.
+fn pr_icon(pr: &PullRequestStatus) -> IconName {
+    match pr.state.as_str() {
+        "MERGED" => IconName::Merge,
+        "CLOSED" => IconName::PullRequestClosed,
+        _ if pr.is_draft => IconName::PullRequestDraft,
+        _ => IconName::PullRequest,
     }
-    check_summary(pr).unwrap_or_else(|| (pr_state(pr).into(), pr_tone(pr)))
+}
+/// The word at the end of a PR row. Only a check that needs someone is
+/// colored; the state itself is quiet text the glyph already announces.
+fn pr_summary(pr: &PullRequestStatus) -> (String, Option<gpui::Rgba>) {
+    if pr_settled(pr) || pr.is_draft {
+        return (pr_state(pr).into(), None);
+    }
+    if pr.checks_failed > 0 {
+        return (format!("{} failing", pr.checks_failed), Some(Ink::DANGER));
+    }
+    if pr.checks_pending > 0 {
+        return ("Checks running".into(), Some(Ink::ATTENTION));
+    }
+    (pr_state(pr).into(), None)
 }
 
 fn check_summary(pr: &PullRequestStatus) -> Option<(String, gpui::Rgba)> {
@@ -183,14 +236,14 @@ fn pr_row(pr: &PullRequestStatus) -> LinkRow {
             .clone()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| format!("Pull request #{}", pr.number)),
-        subtitle: format!("#{} · {}", pr.number, repository_name(&pr.url)),
+        // Searched, not shown: "failed" or "passed" still find a PR.
+        subtitle: match check_summary(pr) {
+            Some((checks, _)) => format!("#{} · {} · {checks}", pr.number, repository_name(&pr.url)),
+            None => format!("#{} · {}", pr.number, repository_name(&pr.url)),
+        },
         site: format!("#{}", pr.number),
         section: Section::PullRequests,
-        icon: if pr.state == "MERGED" {
-            IconName::Merge
-        } else {
-            IconName::PullRequest
-        },
+        icon: pr_icon(pr),
         icon_tint: Some(pr_tone(pr)),
         settled: pr_settled(pr),
         status: Some(pr_summary(pr)),
@@ -581,7 +634,10 @@ fn row_score(row: &LinkRow, words: &[String]) -> Option<u32> {
         LinkAction::Account => String::new(),
     };
     let kind = match row.icon {
-        IconName::PullRequest | IconName::Merge => "pull request pr github",
+        IconName::PullRequest
+        | IconName::PullRequestClosed
+        | IconName::PullRequestDraft
+        | IconName::Merge => "pull request pr github",
         IconName::Checklist => "linear issue",
         IconName::Monitor => "preview localhost",
         _ => "link",
@@ -646,7 +702,7 @@ fn detail_rows(pr: &PullRequestStatus) -> Vec<LinkRow> {
             icon,
             icon_tint: None,
             settled: false,
-            status: Some((label.into(), tone)),
+            status: Some((label.into(), Some(tone))),
             details: None,
             action: LinkAction::Open(
                 check
@@ -701,11 +757,29 @@ impl TerminalPane {
         {
             return detail_rows(pr);
         }
+        let mut rows = self.links_matches(session);
+        if let Some(scope) = self.session_links.scope {
+            rows.retain(|row| row.section == scope);
+        }
+        rows
+    }
+    /// The home page's rows matching the search, in every scope.
+    fn links_matches(&self, session: &SessionRecord) -> Vec<LinkRow> {
         filter_rows(session_rows(session), self.session_links.query.text())
     }
-    /// A search or a PR's page lists rows without labels.
+    /// A search, a scope, or a PR's page lists rows without labels.
     fn links_flat(&self) -> bool {
-        self.session_links.pull_request.is_some() || !self.session_links.query.is_empty()
+        self.session_links.pull_request.is_some()
+            || self.session_links.scope.is_some()
+            || !self.session_links.query.is_empty()
+    }
+    fn set_links_scope(&mut self, scope: Option<Section>, cx: &mut Context<Self>) {
+        self.session_links.scope = scope;
+        self.session_links.selected = 0;
+        self.session_links
+            .scroll
+            .scroll_to_item(0, ScrollStrategy::Top);
+        cx.notify();
     }
     fn links_items(&self, rows: &[LinkRow]) -> Vec<ListItem> {
         list_items(rows, self.links_flat())
@@ -875,6 +949,15 @@ impl TerminalPane {
                     (self.session_links.selected + 1).min(action_count.saturating_sub(1))
             }
             "up" => self.session_links.selected = self.session_links.selected.saturating_sub(1),
+            "tab" if searching => {
+                let available = scopes(&session_rows(&session));
+                self.session_links.scope = cycle_scope(
+                    &available,
+                    self.session_links.scope,
+                    event.keystroke.modifiers.shift,
+                );
+                self.session_links.selected = 0;
+            }
             "right"
                 if plain
                     && (!searching || caret_at_end)
@@ -1023,7 +1106,12 @@ impl TerminalPane {
                     })
                     .cursor_pointer()
                     .text_size(px(13.0))
-                    .text_color(ink.primary)
+                    // Merged and closed work steps back; open work reads first.
+                    .text_color(if row.settled && !selected {
+                        ink.secondary
+                    } else {
+                        ink.primary
+                    })
                     .child(
                         div()
                             .w(px(16.0))
@@ -1073,7 +1161,11 @@ impl TerminalPane {
                             div()
                                 .flex_none()
                                 .text_size(px(12.0))
-                                .text_color(if selected { ink.primary } else { tone })
+                                .text_color(match tone {
+                                    _ if selected => ink.secondary,
+                                    Some(tone) => tone,
+                                    None => ink.tertiary,
+                                })
                                 .child(label),
                         )
                     })
@@ -1095,7 +1187,7 @@ impl TerminalPane {
                             ink.secondary,
                         )))
                     })
-                    .when_some(row.details.clone(), |el, url| {
+                    .when_some(row.details.clone().filter(|_| selected), |el, url| {
                         el.child(
                             div()
                                 .id(("session-link-details", index))
@@ -1237,6 +1329,46 @@ impl TerminalPane {
             )
             .into_any_element()
     }
+    /// All · PRs · Running · Links, each with how many rows match the search.
+    /// Tab and ⇧Tab move through it from the keyboard.
+    fn render_links_scopes(
+        &self,
+        available: &[Section],
+        matches: &[LinkRow],
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let current = self.session_links.scope;
+        let mut track = crate::details_ui::segmented_track(colors);
+        for scope in std::iter::once(None).chain(available.iter().copied().map(Some)) {
+            let count = matches
+                .iter()
+                .filter(|row| scope.is_none_or(|section| row.section == section))
+                .count();
+            let label = scope.map_or("All", Section::short_label);
+            track = track.child(
+                crate::details_ui::segment(
+                    SharedString::from(format!("session-links-scope-{label}")),
+                    label,
+                    Some(count),
+                    scope == current,
+                    colors,
+                )
+                .debug_selector(move || format!("session-links-scope-{label}"))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_links_scope(scope, cx);
+                    cx.stop_propagation();
+                })),
+            );
+        }
+        div()
+            .mx(px(crate::navigation::PALETTE_ROW_INSET))
+            .mb(px(4.0))
+            .flex()
+            .child(track)
+            .into_any_element()
+    }
     fn render_list_label(text: &'static str, colors: SemanticColors) -> AnyElement {
         div()
             .h(px(ROW_HEIGHT))
@@ -1272,6 +1404,16 @@ impl TerminalPane {
             self.session_links.pull_request = None;
             self.session_links.selected = self.session_links.parent_selection;
         }
+        let all_rows = session_rows(session);
+        let available = scopes(&all_rows);
+        // A scope whose last row went away falls back to everything.
+        if self
+            .session_links
+            .scope
+            .is_some_and(|scope| !available.contains(&scope))
+        {
+            self.session_links.scope = None;
+        }
         let rows = self.links_rows(session);
         let has_account = self.links_has_account(session);
         let action_count = rows.len() + usize::from(has_account);
@@ -1288,22 +1430,50 @@ impl TerminalPane {
                 .iter()
                 .find(|pr| &pr.url == url)
         });
+        // Nothing to search yet: no search field, just what will appear here.
+        let nothing = all_rows.is_empty() && pr.is_none();
+        let header = (!nothing)
+            .then(|| self.render_palette_links_header(pr.map(|pr| pr.number), colors, cx));
+        let scope_control = (pr.is_none() && !available.is_empty()).then(|| {
+            let matches = self.links_matches(session);
+            self.render_links_scopes(&available, &matches, colors, cx)
+        });
         let query = &self.session_links.query;
-        let header = self.render_palette_links_header(pr.map(|pr| pr.number), colors, cx);
         let items = self.links_items(&rows);
         let list_height = (items.len() as f32 * ROW_HEIGHT)
             .min(420.0)
             .min((f32::from(self.main_viewport.height) - 230.0).max(ROW_HEIGHT));
-        let body = if rows.is_empty() {
-            let empty = if query.is_empty() || pr.is_some() {
-                "Links shared in this chat appear here.".to_owned()
+        let body = if nothing {
+            div()
+                .px(px(crate::navigation::PALETTE_ROW_INSET + 10.0))
+                .pt(px(14.0))
+                .pb(px(12.0))
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(colors.primary)
+                        .child("No links yet"),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(colors.secondary)
+                        .child("PRs, dev servers and links from this chat show up here."),
+                )
+                .into_any_element()
+        } else if rows.is_empty() {
+            let empty = if query.is_empty() {
+                "Nothing here yet".to_owned()
             } else {
-                format!("No links match \u{201c}{}\u{201d}", query.text().trim())
+                format!("No matches for \u{201c}{}\u{201d}", query.text().trim())
             };
             div()
-                .px(px(14.0))
+                .px(px(crate::navigation::PALETTE_ROW_INSET + 10.0))
                 .pt(px(6.0))
-                .pb(px(14.0))
+                .pb(px(12.0))
                 .text_size(px(13.0))
                 .text_color(colors.secondary)
                 .child(empty)
@@ -1356,7 +1526,8 @@ impl TerminalPane {
             .line_height(px(16.0))
             .flex()
             .flex_col()
-            .child(header)
+            .children(header)
+            .children(scope_control)
             .child(div().pb(px(6.0)).child(body));
         if pr.is_none() && query.is_empty() {
             let host = session
@@ -1364,8 +1535,9 @@ impl TerminalPane {
                 .as_ref()
                 .map(|host| self.runtime.store.read().unwrap().host_display_name(host));
             if session.git_branch.is_some() || host.is_some() || session.account_profile.is_some() {
+                // The footer's icons sit in the rows' icon column.
                 let mut context = div()
-                    .mx(px(14.0))
+                    .mx(px(crate::navigation::PALETTE_ROW_INSET + 10.0))
                     .py(px(10.0))
                     .border_t_1()
                     .border_color(colors.floating_stroke())
@@ -1688,8 +1860,8 @@ mod tests {
         let rows = session_rows(&session);
         assert_eq!(rows.len(), 4);
         // Newest mention first: one scan stamps every link with one time.
-        assert_eq!(rows[0].status.as_ref().unwrap().0, "Checks passed");
-        assert_eq!(rows[1].status.as_ref().unwrap().0, "1 check failed");
+        assert_eq!(rows[0].status.as_ref().unwrap().0, "Open");
+        assert_eq!(rows[1].status.as_ref().unwrap().0, "1 failing");
         assert_eq!(
             rows[0].action,
             LinkAction::Open("https://github.com/diri/app/pull/180".into())
@@ -1748,7 +1920,7 @@ mod tests {
             session.artifacts.as_mut().unwrap()[0].kind = kind;
             let rows = session_rows(&session);
             assert_eq!(rows.len(), 4);
-            assert_eq!(rows[1].status.as_ref().unwrap().0, "1 check failed");
+            assert_eq!(rows[1].status.as_ref().unwrap().0, "1 failing");
             assert_eq!(
                 rows[1].action,
                 LinkAction::Open("https://github.com/diri/app/pull/181".into())
@@ -1770,6 +1942,62 @@ mod tests {
             LinkAction::Open("https://github.com/diri/app/pull/180".into())
         );
     }
+    #[test]
+    fn scopes_offer_only_the_kinds_present_and_tab_wraps_through_all() {
+        let rows = session_rows(&fixture());
+        let available = scopes(&rows);
+        assert_eq!(available, [Section::PullRequests, Section::Links]);
+        let next = |scope, back| cycle_scope(&available, scope, back);
+        assert_eq!(next(None, false), Some(Section::PullRequests));
+        assert_eq!(next(Some(Section::PullRequests), false), Some(Section::Links));
+        assert_eq!(next(Some(Section::Links), false), None);
+        assert_eq!(next(None, true), Some(Section::Links));
+        // One kind alone needs no control.
+        let prs: Vec<_> = rows
+            .into_iter()
+            .filter(|row| row.section == Section::PullRequests)
+            .collect();
+        assert!(scopes(&prs).is_empty());
+    }
+    #[test]
+    fn each_pr_state_has_its_own_glyph() {
+        let mut pr = pull_request("https://github.com/diri/app/pull/1");
+        pr.state = "OPEN".into();
+        assert_eq!(pr_icon(&pr), IconName::PullRequest);
+        pr.is_draft = true;
+        assert_eq!(pr_icon(&pr), IconName::PullRequestDraft);
+        assert_eq!(pr_summary(&pr).0, "Draft");
+        pr.state = "CLOSED".into();
+        assert_eq!(pr_icon(&pr), IconName::PullRequestClosed);
+        pr.state = "MERGED".into();
+        assert_eq!(pr_icon(&pr), IconName::Merge);
+        assert_eq!(pr_summary(&pr), ("Merged".into(), None));
+    }
+    #[gpui::test]
+    fn tab_scopes_the_list_to_one_kind(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (runtime, tokio) = runtime(fixture());
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        cx.simulate_resize(size(px(900.0), px(700.0)));
+        cx.run_until_parked();
+        let trigger = cx.debug_bounds("session-links-trigger").unwrap();
+        cx.simulate_click(trigger.center(), Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("session-link-2").is_none());
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.session_links.scope),
+            Some(Section::Links)
+        );
+        let all = cx.debug_bounds("session-links-scope-All").unwrap();
+        cx.simulate_click(all.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(pane.read_with(cx, |pane, _| pane.session_links.scope), None);
+    }
     #[gpui::test]
     fn mouse_and_keyboard_keep_explicit_detail_navigation_inside_the_menu(cx: &mut TestAppContext) {
         cx.update(|cx| cx.set_reduce_motion(true));
@@ -1782,6 +2010,10 @@ mod tests {
         cx.simulate_click(trigger.center(), Modifiers::default());
         cx.run_until_parked();
         assert!(pane.read_with(cx, |pane, _| pane.session_links.open));
+        // The chevron belongs to the highlighted row; hovering highlights it.
+        let row = cx.debug_bounds("session-link-1").unwrap();
+        cx.simulate_mouse_move(row.center(), None, Modifiers::default());
+        cx.run_until_parked();
         let second = cx.debug_bounds("session-link-details-1").unwrap();
         cx.simulate_click(second.center(), Modifiers::default());
         cx.run_until_parked();
@@ -2240,6 +2472,12 @@ mod tests {
             );
             session.pull_requests = Some(prs);
         }
+        // A chat that has not shared anything yet.
+        if std::env::var_os("DIRI_VISUAL_EMPTY").is_some() {
+            session.artifacts = None;
+            session.pull_requests = None;
+            session.listening_ports = None;
+        }
         let (runtime, tokio) = runtime(session);
         if std::env::var_os("DIRI_VISUAL_LIGHT").is_some() {
             runtime
@@ -2273,6 +2511,12 @@ mod tests {
                     if let Some(query) = std::env::var_os("DIRI_VISUAL_QUERY") {
                         pane.session_links.query.insert(&query.to_string_lossy());
                     }
+                    pane.session_links.scope = match std::env::var("DIRI_VISUAL_SCOPE").as_deref() {
+                        Ok("prs") => Some(Section::PullRequests),
+                        Ok("running") => Some(Section::Running),
+                        Ok("links") => Some(Section::Links),
+                        _ => None,
+                    };
                     if std::env::var_os("DIRI_VISUAL_DETAIL").is_some() {
                         pane.session_links.pull_request =
                             Some("https://github.com/diri/app/pull/181".into());
