@@ -285,15 +285,21 @@ impl HolderManagerServer {
                     _ => {}
                 }
 
-                if state.shutting_down.load(Ordering::SeqCst) {
-                    return Err(HolderError::Rejected("manager is shutting down".into()));
-                }
                 {
+                    // The idle watchdog decides to shut down under the idle
+                    // lock and claims `shutting_down` before releasing it, so
+                    // checking the flag and leaving idle under the same lock
+                    // means a session is never admitted by a dying manager.
                     let mut active = state.active.lock().expect("active");
+                    let mut idle = state.idle_since.lock().expect("idle");
+                    if state.shutting_down.load(Ordering::SeqCst) {
+                        return Err(HolderError::Rejected("manager is shutting down".into()));
+                    }
                     if !active.insert(spec.session_id.clone()) {
                         return Ok(HolderManagerResponse::success(std::process::id() as i32));
                     }
-                    state.set_idle(None);
+                    *idle = None;
+                    state.idle_changed.notify_all();
                 }
 
                 let state = Arc::clone(state);
@@ -326,7 +332,8 @@ impl HolderManagerServer {
                 // its lanes run on threads only while they have work.
                 let release = Arc::new(Mutex::new(Some(release)));
                 let on_failure = Arc::clone(&release);
-                std::thread::Builder::new()
+                let on_spawn_failure = Arc::clone(&release);
+                let spawned = std::thread::Builder::new()
                     .name(format!("holder-{session_id}"))
                     .spawn(move || {
                         let on_finish = Box::new(move || {
@@ -347,8 +354,16 @@ impl HolderManagerServer {
                                 release();
                             }
                         }
-                    })
-                    .map_err(|error| HolderError::io("spawn session holder", error))?;
+                    });
+                if let Err(error) = spawned {
+                    // The thread never ran, so nothing else will release the
+                    // id; left in `active`, every later Launch of it would
+                    // report success with no Holder behind it.
+                    if let Some(release) = on_spawn_failure.lock().expect("release").take() {
+                        release();
+                    }
+                    return Err(HolderError::io("spawn session holder", error));
+                }
                 Ok(HolderManagerResponse::success(std::process::id() as i32))
             }
             HolderManagerOperation::ShutdownIfIdle => {
@@ -430,14 +445,23 @@ fn watch_idle(state: &State, idle_timeout: Duration) {
         #[cfg(test)]
         state.watchdog_wakeups.fetch_add(1, Ordering::SeqCst);
     }
+    // Claimed before the idle lock is released: a Launch that takes it next
+    // sees the shutdown and is refused instead of admitted.
+    let first = !state.shutting_down.swap(true, Ordering::SeqCst);
     drop(idle);
-    stop_listener(state);
+    if first {
+        close_listener(state);
+    }
 }
 
 fn stop_listener(state: &State) {
     if state.shutting_down.swap(true, Ordering::SeqCst) {
         return;
     }
+    close_listener(state);
+}
+
+fn close_listener(state: &State) {
     let fd = state.listen_fd.swap(-1, Ordering::SeqCst);
     if fd >= 0 {
         // Shutdown then close — only the close wakes a blocked accept(2) on

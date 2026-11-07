@@ -42,7 +42,10 @@ struct Performer {
 #[derive(Default)]
 pub(crate) struct AppActionHub {
     performer: Mutex<Option<Performer>>,
-    pending: Mutex<HashMap<u64, SyncSender<Reply>>>,
+    /// Each waiting request with the connection it was sent to: only that
+    /// connection answers it, and its close fails it, whether or not a newer
+    /// app has become the performer since.
+    pending: Mutex<HashMap<u64, (Writer, SyncSender<Reply>)>>,
     next_request: AtomicU64,
     methods: OnceLock<Vec<ApiMethod>>,
 }
@@ -92,22 +95,24 @@ impl AppActionHub {
     }
 
     fn disconnected(&self, writer: &Writer) {
-        let Ok(mut performer) = self.performer.lock() else {
-            return;
-        };
-        if performer
-            .as_ref()
-            .is_some_and(|performer| Arc::ptr_eq(&performer.writer, writer))
+        if let Ok(mut performer) = self.performer.lock()
+            && performer
+                .as_ref()
+                .is_some_and(|performer| Arc::ptr_eq(&performer.writer, writer))
         {
             *performer = None;
-            drop(performer);
-            // Nobody will answer what is still waiting: say so now rather
-            // than at each request's timeout.
-            if let Ok(mut pending) = self.pending.lock() {
-                for (_, reply) in pending.drain() {
+        }
+        // Nobody will answer what this connection still owes: say so now
+        // rather than at each request's timeout.
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.retain(|_, (sent_to, reply)| {
+                if Arc::ptr_eq(sent_to, writer) {
                     let _ = reply.try_send(Err(not_connected()));
+                    false
+                } else {
+                    true
                 }
-            }
+            });
         }
     }
 
@@ -163,7 +168,7 @@ impl AppActionHub {
         self.pending
             .lock()
             .map_err(super::poisoned)?
-            .insert(request_id, reply);
+            .insert(request_id, (Arc::clone(&writer), reply));
         let request = AppPerformRequest {
             request_id,
             action: p.action.clone(),
@@ -214,24 +219,34 @@ impl AppActionHub {
         writer: &Writer,
     ) -> Result<JsonValue, ControlError> {
         let p: AppReplyParams = super::decode(params)?;
-        let is_performer = self
-            .performer
-            .lock()
-            .map_err(super::poisoned)?
-            .as_ref()
-            .is_some_and(|performer| Arc::ptr_eq(&performer.writer, writer));
-        if !is_performer {
-            return Err(ControlError::new(
+        let forbidden = || {
+            ControlError::new(
                 "forbidden",
                 "only the app that published the actions may answer them",
-            ));
+            )
+        };
+        let waiting = {
+            let mut pending = self.pending.lock().map_err(super::poisoned)?;
+            match pending.get(&p.request_id) {
+                Some((sent_to, _)) if Arc::ptr_eq(sent_to, writer) => {
+                    pending.remove(&p.request_id).map(|(_, waiting)| waiting)
+                }
+                Some(_) => return Err(forbidden()),
+                None => None,
+            }
+        };
+        // A late reply after a timeout has nobody to tell; that is fine, from
+        // the performer. Anyone else is still refused.
+        if waiting.is_none()
+            && !self
+                .performer
+                .lock()
+                .map_err(super::poisoned)?
+                .as_ref()
+                .is_some_and(|performer| Arc::ptr_eq(&performer.writer, writer))
+        {
+            return Err(forbidden());
         }
-        let waiting = self
-            .pending
-            .lock()
-            .map_err(super::poisoned)?
-            .remove(&p.request_id);
-        // A late reply after a timeout has nobody to tell; that is fine.
         if let Some(waiting) = waiting {
             let reply = match p.error {
                 Some(error) => Err(error),
@@ -513,6 +528,48 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         let listed = caller.call(Method::APP_ACTIONS_LIST, json!({}));
         assert_eq!(listed["ok"]["connected"], false);
+    }
+
+    #[test]
+    fn a_replaced_performer_still_owns_its_requests() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = crate::control::tests::server(temp.path());
+        let mut caller = Peer::connect(&server);
+        let mut first = Peer::connect(&server);
+        first.call(Method::APP_ACTIONS_PUBLISH, catalog());
+        let id = caller.send(
+            Method::APP_PERFORM,
+            json!({"action": "toggle-sidebar", "timeoutMs": 20_000}),
+        );
+        let request = first.line();
+        assert_eq!(request["event"], EventName::APP_PERFORM_REQUESTED);
+        let request_id = request["params"]["requestId"].clone();
+
+        // A second app takes over before the first answers.
+        let mut second = Peer::connect(&server);
+        second.call(Method::APP_ACTIONS_PUBLISH, catalog());
+        let forged = second.call(
+            Method::APP_REPLY,
+            json!({"requestId": request_id, "result": {"forged": true}}),
+        );
+        assert_eq!(
+            forged["err"]["code"], "forbidden",
+            "it never saw the request"
+        );
+
+        // The first app closing fails its request at once.
+        let started = std::time::Instant::now();
+        drop(first);
+        let answer = loop {
+            let message = caller.line();
+            if message["id"] == id {
+                break message;
+            }
+        };
+        assert_eq!(answer["err"]["code"], "app_not_connected");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let listed = caller.call(Method::APP_ACTIONS_LIST, json!({}));
+        assert_eq!(listed["ok"]["connected"], true, "the second app still acts");
     }
 
     #[test]

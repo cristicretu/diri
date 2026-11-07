@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::detect::ManifestEngine;
 use crate::history::CursorTranscriptTurn;
 use crate::holder::{HolderClient, HolderManagerPaths, HolderPaths};
-use crate::lifecycle::{LifecycleAction, LifecyclePlan};
+use crate::lifecycle::{LifecycleAction, LifecyclePlan, RecordTransitions};
 use crate::session::{HolderConfig, RemoteAdoptSpec, Session, SessionSpec, SessionView};
 use crate::state_file::JsonStateFile;
 use crate::status::StatusSignal;
@@ -913,9 +913,7 @@ impl Registry {
         if let Some(record) = record {
             self.records.insert(id.clone(), record);
         } else if let Some(record) = self.records.get_mut(&id) {
-            record.status = SessionStatus::Starting;
-            record.needs_input = None;
-            record.updated_at = DateMillis::from(std::time::SystemTime::now());
+            record.mark_starting(DateMillis::from(std::time::SystemTime::now()));
         }
         self.sessions.insert(id.clone(), session);
         self.close_completed_views(&id);
@@ -949,7 +947,7 @@ impl Registry {
 
     fn record_exit(&mut self, id: &str, exit: crate::pty::Exit) {
         if let Some(record) = self.records.get_mut(id) {
-            record.status = SessionStatus::Exited(diri_proto::ExitInfo {
+            record.mark_exited(diri_proto::ExitInfo {
                 reason: match exit {
                     crate::pty::Exit::Signal(_) => diri_proto::ExitReason::Signaled,
                     crate::pty::Exit::Code(_) => diri_proto::ExitReason::Exited,
@@ -1072,8 +1070,7 @@ impl Registry {
                     conv = record.agent_session_id.as_deref().map(diri_telemetry::id),
                     status = crate::telemetry::status_name(&record.status),
                 );
-                record.status = SessionStatus::Exited(ExitInfo::restart(system_restart));
-                record.needs_input = None;
+                record.mark_exited(ExitInfo::restart(system_restart));
             }
         }
         diri_telemetry::warn_event!(
@@ -1723,15 +1720,14 @@ impl Registry {
             // The stack holds the record as it was before the close, so it
             // still claims its last live status. Nothing runs under it now;
             // re-listing it live would leave clients attaching to no PTY.
-            if !record.is_note() && !matches!(record.status, SessionStatus::Exited(_)) {
-                record.status = SessionStatus::Exited(diri_proto::ExitInfo {
+            if !record.is_note() {
+                record.mark_ended(diri_proto::ExitInfo {
                     reason: diri_proto::ExitReason::Exited,
                     code: None,
                     signal: None,
                     system_restart: false,
                     interrupted: false,
                 });
-                record.needs_input = None;
             }
             self.records.insert(record.id.0.clone(), record.clone());
             return Some(record);
@@ -1745,6 +1741,15 @@ impl Registry {
         if !self.records.contains_key(&id) {
             return Err(not_found(&id));
         }
+        // Inserting over a live or launching session would drop its Session
+        // without stopping it and orphan its Holder. Callers end the previous
+        // incarnation first; if that failed, the respawn must not happen.
+        if self.sessions.contains_key(&id) || self.pending_launches.contains(&id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "session already has an owner or pending launch",
+            ));
+        }
         let record = self.records.get(&id).expect("checked above");
         let recoverable = spec.holder.is_some() && record.host.is_none();
         if recoverable {
@@ -1754,9 +1759,7 @@ impl Registry {
         self.sessions.insert(id.clone(), session);
         self.close_completed_views(&id);
         let record = self.records.get_mut(&id).expect("checked above");
-        record.status = SessionStatus::Starting;
-        record.needs_input = None;
-        record.updated_at = DateMillis::from(std::time::SystemTime::now());
+        record.mark_starting(DateMillis::from(std::time::SystemTime::now()));
         Ok(())
     }
 
@@ -2068,9 +2071,16 @@ impl Registry {
     ) -> std::io::Result<()> {
         let tree = {
             let session = self.sessions.get(id).ok_or_else(|| not_found(id))?;
-            let tree = session.signal_tree(diri_platform::signals::SIGSTOP)?;
+            // Close the input gate before the tree stops: a write that
+            // passed an open gate after SIGSTOP would wedge in the PTY.
             let _ = session.set_hibernated(true);
-            tree
+            match session.signal_tree(diri_platform::signals::SIGSTOP) {
+                Ok(tree) => tree,
+                Err(error) => {
+                    let _ = session.set_hibernated(false);
+                    return Err(error);
+                }
+            }
         };
         self.set_hibernation(
             id,
@@ -3092,7 +3102,12 @@ fn fold_session_status(record: &mut SessionRecord, view: &SessionView) {
         .as_ref()
         .filter(|evidence| evidence.status == view.status)
         .cloned();
-    record.needs_input.clone_from(&view.needs_input);
+    if matches!(view.status, SessionStatus::Exited(_)) {
+        // No process is left to answer a prompt.
+        record.needs_input = None;
+    } else {
+        record.needs_input.clone_from(&view.needs_input);
+    }
     if view.last_turn_completed_at > record.last_turn_completed_at {
         record.last_turn_completed_at = view.last_turn_completed_at;
     }
@@ -3596,6 +3611,54 @@ mod tests {
         let governed = registry.governed_records();
         assert_eq!(governed.len(), 1, "what it clones now");
         assert_eq!(governed[0].id.0, "frozen");
+    }
+
+    fn hibernated(id: &str) -> SessionRecord {
+        let mut frozen = record(id);
+        frozen.hibernation = Some(diri_proto::HibernationInfo {
+            since: DateMillis(1.0),
+            reason: diri_proto::HibernationReason::Idle,
+            tree_pids: vec![1234],
+            tree_start_times: None,
+        });
+        frozen.memory_bytes = Some(1 << 20);
+        frozen.listening_ports = Some(Vec::new());
+        frozen.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission);
+        frozen
+    }
+
+    #[test]
+    fn an_archived_hibernated_record_drops_its_live_facts() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        registry
+            .records
+            .insert("frozen".into(), hibernated("frozen"));
+        registry.archive("frozen").unwrap();
+        let archived = registry.record("frozen").unwrap();
+        assert!(matches!(archived.status, SessionStatus::Exited(_)));
+        assert_eq!(archived.hibernation, None);
+        assert_eq!(archived.memory_bytes, None);
+        assert_eq!(archived.listening_ports, None);
+        assert_eq!(archived.needs_input, None);
+        assert!(
+            registry.governed_records().is_empty(),
+            "the governor must not sample a dead tree's pids"
+        );
+    }
+
+    #[test]
+    fn a_reopened_record_does_not_claim_its_old_hibernation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut frozen = hibernated("frozen");
+        frozen.cwd = temp.path().to_string_lossy().into_owned();
+        registry.records.insert("frozen".into(), frozen);
+        registry.remove("frozen", temp.path()).unwrap();
+        let reopened = registry.reopen_last_closed().unwrap();
+        assert!(matches!(reopened.status, SessionStatus::Exited(_)));
+        assert_eq!(reopened.hibernation, None);
+        assert!(registry.governed_records().is_empty());
     }
 
     #[test]
@@ -5795,6 +5858,43 @@ mod tests {
         registry
             .terminate("quiet-exit", std::time::Duration::from_secs(1))
             .ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn respawn_never_replaces_a_live_or_launching_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let spec = || SessionSpec {
+            id: "live".into(),
+            pty: crate::PtySpec::new(
+                vec!["/bin/sh".into(), "-c".into(), "read -r x".into()],
+                "/tmp",
+            ),
+            manifest_id: "shell".into(),
+            authority: crate::Authority::ProcessOnly,
+            logs_dir: temp.path().join("logs"),
+            holder: None,
+            remote: None,
+            defer_launch: false,
+        };
+        registry.spawn(spec(), record("live")).unwrap();
+        let pid = registry.sessions["live"].child_pid();
+        let error = registry.respawn(spec()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            registry.sessions["live"].child_pid(),
+            pid,
+            "the live incarnation keeps its process"
+        );
+        registry
+            .terminate("live", std::time::Duration::from_secs(1))
+            .unwrap();
+
+        registry.pending_launches.insert("live".into());
+        let error = registry.respawn(spec()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(!registry.sessions.contains_key("live"));
     }
 
     #[cfg(unix)]

@@ -100,13 +100,19 @@ impl BrowserPool {
             .get("action")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let result = self.request("browser", params, None)?;
+        let (result, incarnation) = self.request_on("browser", params, None);
         // Track open pages so the idle sweep never drops one from under an
-        // agent mid-use.
+        // agent mid-use. A page belongs to the sidecar that opened it: one
+        // opened by a launch that has since ended is gone with it, and a
+        // close takes the page out of the books even when it failed.
         if let (Some(id), Some(action)) = (session_id, action) {
             let mut inner = self.shared.inner.lock().expect("pool");
             match action.as_str() {
-                "open" => {
+                "open"
+                    if result.is_ok()
+                        && inner.child.is_some()
+                        && Some(inner.incarnation) == incarnation =>
+                {
                     inner.open_browser_sessions.insert(id);
                 }
                 "close" => {
@@ -115,7 +121,7 @@ impl BrowserPool {
                 _ => {}
             }
         }
-        Ok(result)
+        result
     }
 
     fn request(
@@ -124,9 +130,33 @@ impl BrowserPool {
         params: Value,
         timeout: Option<Duration>,
     ) -> Result<Value, String> {
+        self.request_on(method, params, timeout).0
+    }
+
+    /// A request, and the sidecar launch it was sent to (`None` when it
+    /// never reached one).
+    fn request_on(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Option<Duration>,
+    ) -> (Result<Value, String>, Option<u64>) {
+        let mut sent_to = None;
+        let result = self.send(method, params, timeout, &mut sent_to);
+        (result, sent_to)
+    }
+
+    fn send(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Option<Duration>,
+        sent_to: &mut Option<u64>,
+    ) -> Result<Value, String> {
         let (id, receiver) = {
             let mut inner = self.shared.inner.lock().expect("pool");
             self.ensure_running(&mut inner)?;
+            *sent_to = Some(inner.incarnation);
             inner.last_activity = Instant::now();
             inner.next_id += 1;
             let id = inner.next_id;
@@ -169,8 +199,10 @@ impl BrowserPool {
             // That wait reaped it, so its pid is free to be reused. Let go of
             // the handle now: every other path that finds one here signals its
             // process group, which is only safe while the pid is still ours.
-            inner.child = None;
-            inner.stdin = None;
+            // Its reader will find the incarnation already replaced, so the
+            // requests it was serving are failed here, not left to time out.
+            end_incarnation(inner, "sidecar exited");
+            drop(inner.child.take());
         }
         let node =
             resolve_node().ok_or("node not found on PATH — install Node.js to use test_run")?;
@@ -303,10 +335,7 @@ fn sidecar_gone(pool: &PoolShared, incarnation: u64) {
         if inner.incarnation != incarnation {
             return;
         }
-        for (_, sender) in inner.pending.drain() {
-            let _ = sender.send(Err("sidecar exited".into()));
-        }
-        inner.stdin = None;
+        end_incarnation(&mut inner, "sidecar exited");
         inner.child.take()
     };
     // Off the lock: the group gets up to half a second to go quietly.
@@ -315,11 +344,19 @@ fn sidecar_gone(pool: &PoolShared, incarnation: u64) {
     }
 }
 
-fn terminate_sidecar(inner: &mut PoolInner, reason: &str) {
+/// Everything that belonged to the current sidecar launch ends with it: its
+/// pipe, the requests waiting on it, and the pages it held open (left
+/// behind, they would keep the idle sweep from ever recycling a successor).
+fn end_incarnation(inner: &mut PoolInner, reason: &str) {
     inner.stdin = None;
     for (_, sender) in inner.pending.drain() {
         let _ = sender.send(Err(reason.to_owned()));
     }
+    inner.open_browser_sessions.clear();
+}
+
+fn terminate_sidecar(inner: &mut PoolInner, reason: &str) {
+    end_incarnation(inner, reason);
     let Some(mut child) = inner.child.take() else {
         return;
     };
@@ -560,6 +597,52 @@ mod tests {
         // A request that gave up waiting leaves nothing behind.
         forget_request(&pool.shared, 7);
         assert!(pool.shared.inner.lock().expect("pool").pending.is_empty());
+        pool.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_sidecar_takes_its_pages_and_requests_with_it() {
+        let temp = tempfile::tempdir().expect("temp");
+        let pool = BrowserPool::new(temp.path());
+        let (sender, receiver) = mpsc::channel();
+        {
+            let mut inner = pool.shared.inner.lock().expect("pool");
+            inner.child = Some(exited_fixture());
+            inner.incarnation = 1;
+            inner.pending.insert(1, sender);
+            inner.open_browser_sessions.insert("agent".into());
+            // A request finds it dead and reaps it before its reader does.
+            let _ = pool.ensure_running(&mut inner);
+            assert!(inner.open_browser_sessions.is_empty());
+            assert!(inner.pending.is_empty());
+        }
+        assert!(
+            receiver
+                .try_recv()
+                .expect("failed, not left to time out")
+                .is_err(),
+            "its request was failed"
+        );
+        // Stop whatever that request relaunched, where Node.js is installed.
+        pool.shutdown();
+
+        let mut inner = pool.shared.inner.lock().expect("pool");
+        inner.child = Some(exited_fixture());
+        inner.incarnation += 1;
+        let incarnation = inner.incarnation;
+        inner.open_browser_sessions.insert("agent".into());
+        drop(inner);
+        sidecar_gone(&pool.shared, incarnation);
+        assert!(
+            pool.shared
+                .inner
+                .lock()
+                .expect("pool")
+                .open_browser_sessions
+                .is_empty(),
+            "a dead sidecar's pages no longer block the idle recycle"
+        );
         pool.shutdown();
     }
 
