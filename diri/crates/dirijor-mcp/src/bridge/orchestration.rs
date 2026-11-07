@@ -149,7 +149,7 @@ impl Bridge {
             return Err(format!("wait on at most {MAX_WAIT_TARGETS} targets"));
         }
         let caller = self.require_caller()?.to_owned();
-        let mode = optional_string(arguments, "until").unwrap_or_else(|| "settled".into());
+        let mode = WaitUntil::parse(arguments, WaitUntil::Settled)?;
         let since = optional_number(arguments, "since_ms");
         let timeout =
             Duration::from_secs_f64(optional_number(arguments, "timeout_s").unwrap_or(600.0));
@@ -207,7 +207,7 @@ impl Bridge {
                     if matches!(record.status, SessionStatus::Working) {
                         worked.insert(id.clone());
                     }
-                    if reached_since(&mode, record, since, worked.contains(id)) {
+                    if mode.reached(record, since, worked.contains(id)) {
                         let reason = match &record.status {
                             SessionStatus::Exited(_) => "exited",
                             SessionStatus::NeedsInput(_) => "needs_input",
