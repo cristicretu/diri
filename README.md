@@ -2,13 +2,13 @@
 
 **Every coding agent. All at once.**
 
-diri is a native workspace for running coding agents in parallel. Claude Code,
-Codex, Cursor, Gemini, OpenCode and more than a dozen others run side by side,
-on your Mac or on any SSH host you own. One sidebar tells you which agents need
-you. Everything else keeps working.
+Agents are good now. Watching thirty terminals is not. diri runs Claude Code,
+Codex, Cursor, Gemini, OpenCode and more than a dozen others side by side, on
+your Mac or any SSH host you own, and tells you which ones need you. Native,
+Rust and GPUI, no Electron.
 
-Free and open source. No diri account, no hosted relay. You pay only for the
-agents you already use.
+Free and open source. No diri account, no cloud in the middle. You pay only for
+the agents you already use.
 
 [Download](https://github.com/cristicretu/diri/releases/latest) ·
 [Quickstart](https://diri.sh/docs/quickstart/) ·
@@ -59,6 +59,30 @@ a full terminal.
   history of every past conversation (⇧⌘H).
 - **Your own machines.** Remote sessions bootstrap a small helper over SSH. No
   tmux, no sudo, nothing to install on the server first.
+
+## Things people actually do with it
+
+You are the bottleneck, not the model. These are setups where you stop being one.
+
+- **An agent on your own iPhone.** Open iPhone Mirroring, tell Claude to run
+  your TikTok outreach: open the app, find creators in your niche, send the
+  DMs, log who answered in a note. It taps and scrolls in the background. You
+  keep using your Mac.
+- **Ten bugs, ten agents, one coffee.** Paste the issue list, say "use diri to
+  fix each of these in its own worktree". Come back to ten diffs and ten PRs.
+  Merge the good ones, kill the rest.
+- **A spec in, a feature out.** Write the plan in a note. Each to-do becomes an
+  agent. They report back into the same note, so the plan stays the source of
+  truth instead of your memory.
+- **A night shift.** Schedule Codex for 3am to triage new issues and Claude for
+  7am to summarise what broke. diri wakes the Mac, runs them, and the results
+  are waiting.
+- **The big box does the work.** Point diri at a GPU server over SSH. Agents
+  run there, survive your laptop closing, and show up in the same sidebar.
+- **A folder as an inbox.** Drop invoices, screenshots or CSVs in a folder and
+  an agent picks up each new file as it lands.
+
+None of this needs a new app per task. It's the same agents, run more of them.
 
 ## Add an agent
 
