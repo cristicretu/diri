@@ -95,15 +95,26 @@ impl DetachedLeader {
     }
 }
 
+/// The child's tree as signal requests see it.
+enum ChildTree {
+    Running {
+        frozen: Vec<super::protocol::HolderProcessSample>,
+    },
+    /// The exit path took the tree: the leader is about to be reaped and its
+    /// pid may be reissued, so nothing may signal it any more.
+    Ended,
+}
+
 struct Shared {
     spec: HolderLaunchSpec,
     child_pid: i32,
     child_identity: Option<diri_proto::process::ProcessIdentity>,
-    /// What the last SIGSTOP stopped, until a SIGCONT resumes it. If the
-    /// leader exits while these are still frozen they would stay stopped
-    /// forever, so the exit path kills them (see
-    /// [`process_tree::kill_stragglers`]).
-    frozen: Mutex<Vec<super::protocol::HolderProcessSample>>,
+    /// Whether signals may still address the child's tree, and what the
+    /// last SIGSTOP stopped until a SIGCONT resumes it. If the leader exits
+    /// while these are still frozen they would stay stopped forever, so the
+    /// exit path kills them (see [`process_tree::kill_stragglers`]) and ends
+    /// the tree before reaping, after which no request signals it again.
+    tree: Mutex<ChildTree>,
     /// The manager's guard, told about the session's group and frozen
     /// processes so they die with the manager too.
     guard: Option<Arc<GroupGuard>>,
@@ -392,7 +403,7 @@ impl HolderServer {
         let shared = Arc::new(Shared {
             child_pid,
             child_identity: pty.child_identity(),
-            frozen: Mutex::new(Vec::new()),
+            tree: Mutex::new(ChildTree::Running { frozen: Vec::new() }),
             guard: guard.clone(),
             pty: Mutex::new(pty),
             log: Mutex::new(log),
@@ -1526,14 +1537,17 @@ fn finish_holder(shared: &Shared) -> Option<Box<dyn FnOnce() + Send>> {
             None
         }
     };
-    let mut frozen = shared.frozen.lock().expect("frozen");
+    let mut tree = shared.tree.lock().expect("tree");
+    let frozen = match std::mem::replace(&mut *tree, ChildTree::Ended) {
+        ChildTree::Running { frozen } => frozen,
+        ChildTree::Ended => Vec::new(),
+    };
     process_tree::kill_stragglers(shared.child_pid, &frozen);
     if let Some(guard) = &shared.guard {
         guard.thaw(&frozen);
         guard.release(shared.child_pid);
     }
-    frozen.clear();
-    drop(frozen);
+    drop(tree);
 
     let mut status: libc::c_int = 0;
     match detached_exit {
@@ -1826,25 +1840,32 @@ fn handle(shared: &Shared, request: &HolderRequest) -> HolderResult<HolderRespon
                     "signal requires a valid sig".into(),
                 ));
             }
+            // Held across the signal: the exit path cannot end the tree
+            // between this check and the signal, nor clear a freeze that a
+            // late SIGSTOP would then re-create with nobody left to thaw it.
+            let mut state = shared.tree.lock().expect("tree");
+            let ChildTree::Running { frozen } = &mut *state else {
+                // The child is gone and its stragglers killed; its pid may
+                // already be someone else's.
+                return Ok(HolderResponse::with_tree(Vec::new()));
+            };
             if signal == libc::SIGKILL {
                 shared.killing.store(true, Ordering::SeqCst);
             }
             let tree = if signal == libc::SIGCONT {
-                let frozen = shared.frozen.lock().expect("frozen").clone();
-                process_tree::resume(shared.child_pid, &frozen)
+                process_tree::resume(shared.child_pid, frozen)
             } else {
                 process_tree::signal(shared.child_pid, signal)
             };
             if matches!(signal, libc::SIGSTOP | libc::SIGCONT) {
-                let mut frozen = shared.frozen.lock().expect("frozen");
                 if let Some(guard) = &shared.guard {
-                    guard.thaw(&frozen);
+                    guard.thaw(frozen);
                 }
                 frozen.clear();
                 if signal == libc::SIGSTOP {
                     frozen.clone_from(&tree);
                     if let Some(guard) = &shared.guard {
-                        guard.freeze(&frozen);
+                        guard.freeze(frozen);
                     }
                 }
             }
@@ -1852,8 +1873,11 @@ fn handle(shared: &Shared, request: &HolderRequest) -> HolderResult<HolderRespon
         }
 
         HolderOperation::KillTree => {
-            shared.killing.store(true, Ordering::SeqCst);
-            process_tree::kill_tree(shared.child_pid);
+            let state = shared.tree.lock().expect("tree");
+            if matches!(*state, ChildTree::Running { .. }) {
+                shared.killing.store(true, Ordering::SeqCst);
+                process_tree::kill_tree(shared.child_pid);
+            }
             Ok(HolderResponse::success())
         }
 
@@ -1961,7 +1985,7 @@ fn current_stat(shared: &Shared) -> HolderStat {
     // `sh -c 'exit 3'` does on Linux, is gone before the Engine's first stat.
     // Keep vouching for the birth identity while `alive` says the process
     // itself cannot be read; a stranger on the PID never reads as alive here
-    // because `finished` is already set once the child was reaped.
+    // because the exit path ends the tree before it reaps the child.
     let mut stat = current_stat_without_identity(shared);
     if !stat.alive {
         stat.child_identity = Some(expected);
@@ -1970,7 +1994,8 @@ fn current_stat(shared: &Shared) -> HolderStat {
 }
 
 fn current_stat_without_identity(shared: &Shared) -> HolderStat {
-    let finished = shared.finished.load(Ordering::SeqCst);
+    let finished = shared.finished.load(Ordering::SeqCst)
+        || matches!(*shared.tree.lock().expect("tree"), ChildTree::Ended);
     let log_offset = shared.log_tail.load(Ordering::Acquire);
     let pty = shared.pty.lock().expect("pty");
     // SAFETY: kill with signal 0 only checks existence.
