@@ -323,20 +323,34 @@ impl SessionOverviewState {
     }
 
     pub fn open(&mut self, sessions: &[SessionRecord]) {
+        if !self.visible {
+            // A fresh showing: picks and a filter from the last one would
+            // turn a click into a selection toggle and hide sessions.
+            self.query.clear();
+            self.selection.clear();
+        }
         self.visible = true;
         self.focus_first_visible(sessions);
     }
 
     pub fn toggle(&mut self, sessions: &[SessionRecord]) {
         if self.visible {
-            self.visible = false;
+            self.hide();
         } else {
             self.open(sessions);
         }
     }
 
     pub fn dismiss(&mut self) {
+        self.hide();
+    }
+
+    /// The one way the overview hides: the query and selection belong to a
+    /// single showing and go with it. Mode and lane filter persist.
+    fn hide(&mut self) {
         self.visible = false;
+        self.query.clear();
+        self.selection.clear();
     }
 
     pub fn set_columns(&mut self, columns: usize) {
@@ -383,7 +397,7 @@ impl SessionOverviewState {
             self.selection.clear();
             OverviewOutcome::Changed
         } else if self.visible {
-            self.visible = false;
+            self.hide();
             OverviewOutcome::Dismissed
         } else {
             OverviewOutcome::Ignored
@@ -392,7 +406,7 @@ impl SessionOverviewState {
 
     pub fn activate(&mut self, id: SessionId) -> OverviewOutcome {
         if self.selection.is_empty() {
-            self.visible = false;
+            self.hide();
             OverviewOutcome::Activate(id)
         } else {
             self.toggle_selection(id);
@@ -788,6 +802,32 @@ mod tests {
             overview.close_selected(),
             OverviewOutcome::RequestClose(vec![id("alpha"), id("beta")])
         );
+    }
+
+    #[test]
+    fn a_hidden_overview_forgets_its_selection_and_query() {
+        let sessions = vec![
+            session("alpha", SessionStatus::Working),
+            session("beta", SessionStatus::Idle),
+        ];
+        for hide in [
+            SessionOverviewState::dismiss as fn(&mut SessionOverviewState),
+            |overview| overview.toggle(&[]),
+        ] {
+            let mut overview = SessionOverviewState::default();
+            overview.open(&sessions);
+            overview.toggle_selection(id("alpha"));
+            overview.append_query("b", &sessions);
+            hide(&mut overview);
+            overview.open(&sessions);
+            assert!(overview.query().is_empty());
+            assert!(overview.selection().is_empty());
+            assert_eq!(
+                overview.activate(id("beta")),
+                OverviewOutcome::Activate(id("beta")),
+                "a click after reopening activates instead of toggling a stale pick"
+            );
+        }
     }
 
     #[test]

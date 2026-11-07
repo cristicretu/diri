@@ -400,8 +400,10 @@ pub struct WorkbenchInspector {
     pr_cards: PrCardState,
     ask_draft: Option<AskDraft>,
     ask_query: QueryEditor,
+    /// The Ask send in flight; `Some` is "busy". It belongs to the open
+    /// composer: closing or replacing the composer drops it, so its
+    /// completion can never clear a later question.
     ask_task: Option<Task<()>>,
-    ask_busy: bool,
     ask_feedback: Option<(bool, String)>,
     commit_open: bool,
     commit_query: QueryEditor,
@@ -560,7 +562,6 @@ impl WorkbenchInspector {
             ask_draft: None,
             ask_query: QueryEditor::default(),
             ask_task: None,
-            ask_busy: false,
             ask_feedback: None,
             commit_open: false,
             commit_query: QueryEditor::default(),
@@ -631,9 +632,7 @@ impl WorkbenchInspector {
         } else {
             self.comparison_menu_open = false;
             self.files_open = false;
-            self.ask_draft = None;
-            self.ask_feedback = None;
-            self.ask_query.clear();
+            self.close_ask();
             self.release_hidden_state();
         }
         self.reconcile_diff_polling(cx);
@@ -1072,9 +1071,7 @@ impl WorkbenchInspector {
         self.files_open = false;
         self.status_evidence_open = false;
         self.commit_open = false;
-        self.ask_draft = None;
-        self.ask_feedback = None;
-        self.ask_query.clear();
+        self.close_ask();
         self.commit_query.clear();
         self.discard_armed = false;
         self.armed_hunk = None;
@@ -1091,7 +1088,6 @@ impl WorkbenchInspector {
         self.review_action_task = None;
         self.ask_task = None;
         self.review_action_busy = false;
-        self.ask_busy = false;
         self.review_feedback = None;
         self.loading = false;
         self.state = LoadState::NoSession;
@@ -1328,7 +1324,7 @@ impl WorkbenchInspector {
         self.files_open = false;
         self.status_evidence_open = false;
         self.commit_open = false;
-        self.ask_draft = None;
+        self.close_ask();
         self.browser_address_focused = false;
         let preference_tab = match surface {
             WorkspaceSurface::Files => Some(InspectorTab::Code),
@@ -1733,9 +1729,10 @@ impl WorkbenchInspector {
                         cx,
                     );
                 } else {
+                    // The hint is drawn from `armed_hunk`, so it goes when
+                    // the arming does.
                     self.armed_hunk = Some(hunk.fingerprint);
-                    self.review_feedback =
-                        Some((false, t("panel.review.confirm_discard_hint").to_owned()));
+                    self.review_feedback = None;
                     cx.notify();
                 }
             }
@@ -1808,9 +1805,7 @@ impl WorkbenchInspector {
             self.diff_selection.clear();
             self.review_ui.reset_for_context();
             self.selected_turn = None;
-            self.ask_draft = None;
-            self.ask_feedback = None;
-            self.ask_query.clear();
+            self.close_ask();
             self.status_evidence_open = false;
             self.transcript_version = None;
             let workspace = (!context.remote).then(|| context.cwd.clone());
@@ -2079,15 +2074,34 @@ impl WorkbenchInspector {
         } else {
             tf("panel.review.contexts", &[("count", &evidence.len())])
         };
+        // A new composer starts clean: the old send keeps going, but its
+        // completion belongs to the composer it came from.
+        self.close_ask();
         self.ask_draft = Some(AskDraft { evidence, label });
-        self.ask_feedback = None;
-        self.ask_query.clear();
         self.ask_query
             .insert("Review this for correctness, regressions, and missing tests.");
         self.ask_query.select_all();
         self.commit_open = false;
         window.focus(&self.focus, cx);
         cx.notify();
+    }
+
+    /// The line under the review controls: the last action's result, else
+    /// the confirm hint while a hunk discard is armed (and only then).
+    fn review_notice(&self) -> Option<(bool, String)> {
+        self.review_feedback.clone().or_else(|| {
+            self.armed_hunk
+                .map(|_| (false, t("panel.review.confirm_discard_hint").to_owned()))
+        })
+    }
+
+    /// The one way the Ask composer closes: its draft, question, feedback
+    /// and in-flight send go together.
+    fn close_ask(&mut self) {
+        self.ask_draft = None;
+        self.ask_feedback = None;
+        self.ask_query.clear();
+        self.ask_task = None;
     }
 
     fn set_ask_question(&mut self, question: &str, cx: &mut Context<Self>) {
@@ -2098,7 +2112,7 @@ impl WorkbenchInspector {
     }
 
     fn submit_ask(&mut self, cx: &mut Context<Self>) {
-        if self.ask_busy {
+        if self.ask_task.is_some() {
             return;
         }
         let Some(draft) = self.ask_draft.clone() else {
@@ -2119,7 +2133,6 @@ impl WorkbenchInspector {
             return;
         };
 
-        self.ask_busy = true;
         self.ask_feedback = None;
         let subject = prompt.subject_label.clone();
         let session_id = session.id;
@@ -2132,7 +2145,7 @@ impl WorkbenchInspector {
                 .map_err(|error| tf("panel.ask.send_stopped", &[("error", &error)]))
                 .and_then(|result| result.map_err(|error| error.to_string()));
             let _ = this.update(cx, |this, cx| {
-                this.ask_busy = false;
+                this.ask_task = None;
                 match result {
                     Ok(()) => {
                         this.ask_feedback =
@@ -4688,9 +4701,7 @@ impl WorkbenchInspector {
                 |this, window, cx| {
                     this.commit_open = !this.commit_open;
                     this.discard_armed = false;
-                    this.ask_draft = None;
-                    this.ask_feedback = None;
-                    this.ask_query.clear();
+                    this.close_ask();
                     if this.commit_open {
                         window.focus(&this.focus, cx);
                     }
@@ -4883,7 +4894,7 @@ impl WorkbenchInspector {
                     )),
             );
         }
-        if let Some((success, message)) = &self.review_feedback {
+        if let Some((success, message)) = &self.review_notice() {
             let accent = if *success {
                 palette.added
             } else {
@@ -4928,9 +4939,7 @@ impl WorkbenchInspector {
         if self.ask_draft.is_some() {
             match event.keystroke.key.as_str() {
                 "escape" => {
-                    self.ask_draft = None;
-                    self.ask_feedback = None;
-                    self.ask_query.clear();
+                    self.close_ask();
                     cx.notify();
                 }
                 "enter" => self.submit_ask(cx),
@@ -5663,7 +5672,7 @@ impl WorkbenchInspector {
     ) -> Option<AnyElement> {
         let draft = self.ask_draft.as_ref()?;
         let empty = self.ask_query.text().trim().is_empty();
-        let busy = self.ask_busy;
+        let busy = self.ask_task.is_some();
         let label = draft.label.clone();
 
         let mut composer = div()
@@ -5718,9 +5727,7 @@ impl WorkbenchInspector {
                             .hover(move |button| button.bg(colors.primary.alpha(0.07)))
                             .child(sf_symbol("xmark", 9.5, colors.tertiary))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.ask_draft = None;
-                                this.ask_feedback = None;
-                                this.ask_query.clear();
+                                this.close_ask();
                                 cx.notify();
                                 cx.stop_propagation();
                             })),
@@ -6968,6 +6975,51 @@ index 1111111..2222222 100644
         assert!(InspectorTab::Info.index() < InspectorTab::Changes.index());
         assert!(InspectorTab::Changes.index() < InspectorTab::Code.index());
         assert!(InspectorTab::Code.index() < InspectorTab::Artifacts.index());
+    }
+
+    #[gpui::test]
+    fn closing_ask_drops_its_send_and_the_discard_hint_follows_its_arming(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let inspector = cx.new(|cx| WorkbenchInspector::new(runtime.clone(), tokio, cx));
+        inspector.update(cx, |inspector, cx| {
+            // A send in flight whose completion would clear the question.
+            inspector.ask_draft = Some(AskDraft {
+                evidence: Vec::new(),
+                label: "diff".into(),
+            });
+            inspector.ask_task = Some(cx.spawn(async move |this, cx| {
+                let _ = this.update(cx, |this, _| this.ask_query.clear());
+            }));
+            inspector.close_ask();
+            inspector.ask_draft = Some(AskDraft {
+                evidence: Vec::new(),
+                label: "diff".into(),
+            });
+            inspector.ask_query.insert("A new question");
+            assert!(
+                inspector.ask_task.is_none(),
+                "the reopened composer is not busy with the old send"
+            );
+
+            inspector.armed_hunk = Some(7);
+            assert!(inspector.review_notice().is_some_and(|(ok, _)| !ok));
+            inspector.select_diff_layer(DiffLayer::Staged, cx);
+            assert_eq!(
+                inspector.review_notice(),
+                None,
+                "the confirm hint goes when the arming does"
+            );
+        });
+        cx.run_until_parked();
+        inspector.read_with(cx, |inspector, _| {
+            assert_eq!(inspector.ask_query.text(), "A new question");
+        });
     }
 
     #[gpui::test]

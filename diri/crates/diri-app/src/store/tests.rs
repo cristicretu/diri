@@ -14,10 +14,10 @@ use tokio::sync::mpsc;
 use crate::notifications::NotificationSound;
 
 use super::{
-    ClickModifiers, ClientStartup, EventEnvelope, InspectorTab, Prefs, ResumeAllProgress,
-    SavedWindow, SessionStore, SidebarOrdering, SidebarProjection, StoreEffect, StoreEventChange,
-    StoreRuntime, TerminalResidency, WindowMode, WindowPlacement, event_publication_policy,
-    now_millis,
+    ActionFailure, ClickModifiers, ClientStartup, EventEnvelope, InspectorTab, Prefs,
+    ResumeAllProgress, SavedWindow, SessionStore, SidebarOrdering, SidebarProjection, StoreEffect,
+    StoreEventChange, StoreRuntime, TerminalResidency, WindowMode, WindowPlacement, action_context,
+    event_publication_policy, now_millis, settle_action_failure,
 };
 use crate::switcher::{OverviewFilter, OverviewLane, SwitcherKey};
 
@@ -5273,4 +5273,68 @@ fn deleting_a_note_trashes_it_and_closing_does_not() {
     let emitted = drain(&mut effects);
     assert!(emitted.contains(&StoreEffect::Remove(id("kept"))));
     assert!(!emitted.contains(&StoreEffect::DeleteNote(id("kept"))));
+}
+
+#[test]
+fn another_actions_success_keeps_a_failure_and_its_retry() {
+    let rename = || {
+        action_context(&StoreEffect::Rename {
+            id: SessionId::new("a"),
+            title: "new".into(),
+        })
+        .unwrap()
+    };
+    let mut slot = None;
+    settle_action_failure(&mut slot, rename(), Err("offline".into()));
+    assert!(slot.as_ref().is_some_and(ActionFailure::can_retry));
+    // An unrelated close succeeds: the rename failure and its Retry stay.
+    settle_action_failure(
+        &mut slot,
+        action_context(&StoreEffect::Remove(SessionId::new("b"))).unwrap(),
+        Ok(()),
+    );
+    assert!(slot.as_ref().is_some_and(ActionFailure::can_retry));
+    // So does a rename of another session.
+    settle_action_failure(
+        &mut slot,
+        action_context(&StoreEffect::Rename {
+            id: SessionId::new("other"),
+            title: "x".into(),
+        })
+        .unwrap(),
+        Ok(()),
+    );
+    assert!(slot.is_some());
+    // The retried rename itself succeeding clears it.
+    settle_action_failure(&mut slot, rename(), Ok(()));
+    assert!(slot.is_none());
+}
+
+#[test]
+fn a_connection_change_forgets_the_hydrated_list_and_identity() {
+    let (mut store, _effects) = SessionStore::headless(Prefs::default());
+    let identity = diri_proto::HelloResult {
+        proto: 1,
+        build: "test".into(),
+        pid: 1,
+        engine_instance_id: None,
+        engine_kind: None,
+        executable_hash: None,
+    };
+    store.apply_connection_state(ConnectionState::Connected(identity.clone()));
+    store.hydrate(SessionListResult {
+        sessions: vec![session("a", "p", 1.0)],
+        projects: Vec::new(),
+    });
+    assert!(store.has_hydrated_sessions());
+    // The watch may skip Disconnected and show only Connecting.
+    store.apply_connection_state(ConnectionState::Connecting);
+    assert!(
+        !store.has_hydrated_sessions(),
+        "a missing session is unknown, not ended, until the new list arrives"
+    );
+    assert!(store.daemon_identity().is_none());
+    store.apply_connection_state(ConnectionState::Connected(identity));
+    assert!(!store.has_hydrated_sessions());
+    assert!(store.daemon_identity().is_some());
 }

@@ -944,6 +944,18 @@ impl CodeViewer {
                     self.refresh_git(cx);
                 }
             }
+            EditorEvent::SavedAway(saved) => {
+                // The save finished after its file was switched away: settle
+                // it on that file's draft, never on the file now shown.
+                if let Some(draft) = self.drafts.get_mut(&saved.absolute_path)
+                    && draft.apply_saved_away(saved)
+                    && !draft.is_dirty()
+                {
+                    self.drafts.remove(&saved.absolute_path);
+                }
+                self.sync_dirty(cx);
+                self.refresh_git(cx);
+            }
             EditorEvent::OpenLocation { path, line } => {
                 self.open_path(path.clone(), Some((*line, 1)), cx)
             }
@@ -2999,6 +3011,39 @@ mod tests {
             editor.read_with(cx, |editor, _| editor.text().to_owned()),
             "// edited\nfn a() {}\n"
         );
+    }
+
+    #[gpui::test]
+    fn a_save_finishing_after_a_switch_settles_its_own_document(cx: &mut TestAppContext) {
+        let tokio = runtime();
+        let workspace = workspace(&[("a.rs", "fn a() {}\n"), ("b.rs", "fn b() {}\n")]);
+        let root = workspace.path().canonicalize().unwrap();
+        let file = root.join("a.rs");
+        let (viewer, cx) = cx.add_window_view(|_, cx| viewer(&tokio, cx));
+        viewer.update(cx, |viewer, cx| open_now(viewer, &root, "a.rs", cx));
+        let editor = viewer.read_with(cx, |viewer, _| viewer.editor());
+        // Save a.rs, then switch to b.rs and make the same number of edits
+        // there before the save completes: the buffer versions collide.
+        viewer.update(cx, |viewer, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.insert("// one\n", false, cx);
+                editor.save(false, cx);
+            });
+            open_now(viewer, &root, "b.rs", cx);
+            editor.update(cx, |editor, cx| editor.insert("// two\n", false, cx));
+        });
+        wait_until(cx, |_| {
+            std::fs::read_to_string(&file).unwrap() == "// one\nfn a() {}\n"
+        });
+        wait_until(cx, |cx| {
+            viewer.read_with(cx, |viewer, _| viewer.drafts.is_empty())
+        });
+        viewer.read_with(cx, |viewer, cx| {
+            let editor = viewer.editor.read(cx);
+            assert!(editor.is_dirty(), "b.rs was never saved");
+            assert_eq!(editor.text(), "// two\nfn b() {}\n");
+            assert!(!viewer.tree.is_dirty(Path::new("a.rs")));
+        });
     }
 
     #[gpui::test]

@@ -225,6 +225,33 @@ impl UpdaterConfig {
     }
 }
 
+/// An archive [`Updater::download`] matched against its release's size and
+/// SHA-256. [`Updater::stage`] takes only this, so a path that never went
+/// through the checksum cannot be unpacked and installed.
+#[derive(Debug)]
+pub struct VerifiedArchive(PathBuf);
+
+impl VerifiedArchive {
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for VerifiedArchive {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for VerifiedArchive {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
 /// A downloaded, unpacked, signature-checked bundle waiting to be swapped in.
 #[derive(Clone, Debug)]
 pub struct StagedUpdate {
@@ -392,7 +419,11 @@ impl Updater {
     /// failure on one tries the other. Whichever serves the bytes, they must
     /// match the feed's size and SHA-256 — a mismatch is final, not a reason
     /// to shop for other bytes.
-    pub fn download(&self, release: &Release, mut on_progress: impl FnMut(f32)) -> Result<PathBuf> {
+    pub fn download(
+        &self,
+        release: &Release,
+        mut on_progress: impl FnMut(f32),
+    ) -> Result<VerifiedArchive> {
         bundle::ensure_writable(&self.config.bundle)?;
         net::validated_download_url(&release.url, &self.config.releases_host)?;
         let expected = release.sha256.as_deref().ok_or_else(|| {
@@ -457,21 +488,21 @@ impl Updater {
             let _ = std::fs::remove_file(&archive);
             return Err(error);
         }
-        Ok(archive)
+        Ok(VerifiedArchive(archive))
     }
 
     /// Unpacks the archive and refuses it unless it is a notarized build from
     /// the same developer as the running app.
-    pub fn stage(&self, release: &Release, archive: &Path) -> Result<StagedUpdate> {
+    pub fn stage(&self, release: &Release, archive: &VerifiedArchive) -> Result<StagedUpdate> {
         let directory = self.release_dir(release);
-        let app = install::unpack(archive, &directory.join("staged"))?;
+        let app = install::unpack(archive.path(), &directory.join("staged"))?;
         codesign::verify_matches_installed(&app, &self.config.installed_signature)?;
         // A tampered feed could advertise 0.9.0 and serve the 0.1.0 archive.
         // The signature check would pass — it is a real diri build — so the
         // unpacked bundle has to be held to the version that was promised.
         verify_staged_version(&app, release)?;
         // Reclaim the download now that its contents are unpacked.
-        let _ = std::fs::remove_file(archive);
+        let _ = std::fs::remove_file(archive.path());
         Ok(StagedUpdate {
             release: release.clone(),
             app,

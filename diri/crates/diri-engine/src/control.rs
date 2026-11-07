@@ -2734,17 +2734,16 @@ impl ControlServer {
                 record.worktree_path = worktree;
                 record.git_branch = Some(branch);
                 record.transcript_path = if local { transcript } else { None };
-                record.status = diri_proto::SessionStatus::Exited(diri_proto::ExitInfo {
-                    reason: diri_proto::ExitReason::Exited,
-                    code: Some(0),
-                    signal: None,
-                    system_restart: false,
-                    interrupted: false,
-                });
-                record.needs_input = None;
-                record.hibernation = None;
-                record.memory_bytes = None;
-                record.listening_ports = None;
+                crate::lifecycle::RecordTransitions::mark_exited(
+                    record,
+                    diri_proto::ExitInfo {
+                        reason: diri_proto::ExitReason::Exited,
+                        code: Some(0),
+                        signal: None,
+                        system_restart: false,
+                        interrupted: false,
+                    },
+                );
                 record.resumability = diri_proto::Resumability::Resumable;
             });
             let _ = registry.persist();
@@ -4407,7 +4406,11 @@ impl ControlServer {
             // does not mean alive. Evicting the corpse — which also releases
             // the holder still owning this id — is what keeps resume from
             // silently handing back the dead record it was asked to revive.
-            let _ = registry.terminate(&p.session_id.0, std::time::Duration::from_millis(500));
+            // A corpse whose Holder refuses to stop is still owned: replacing
+            // it would orphan that Holder under the same identity.
+            registry
+                .terminate(&p.session_id.0, std::time::Duration::from_millis(500))
+                .map_err(io_control_error)?;
         }
         let local_shell = record.kind == diri_proto::AgentKind::SHELL && record.host.is_none();
         registry

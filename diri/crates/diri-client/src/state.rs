@@ -9,6 +9,20 @@ pub enum ConnectionState {
     Disconnected(String),
 }
 
+impl ConnectionState {
+    /// A stable wire name for the state: `connecting`, `connected` or
+    /// `disconnected`. Unlike `Debug`, it carries no Engine details and does
+    /// not change shape when the Hello payload grows.
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Connecting => "connecting",
+            Self::Connected(_) => "connected",
+            Self::Disconnected(_) => "disconnected",
+        }
+    }
+}
+
 /// A sequence-stamped event delivered by the daemon.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EventEnvelope {
