@@ -225,7 +225,8 @@ impl NodeClient {
             ));
         }
 
-        let operation = async {
+        let lease_id = random_lease_id()?;
+        let staging = async {
             target.put_manifest(checkpoint.clone()).await?;
             let mut digests = checkpoint
                 .files
@@ -258,42 +259,52 @@ impl NodeClient {
                 })
                 .await?
                 .result;
-            let lease_id = random_lease_id()?;
-            let target_commit = target
-                .commit_move(MoveCommitParams {
-                    checkpoint_id: checkpoint.checkpoint_id.clone(),
-                    target_node_id: target_hello.node_id.clone(),
-                    lease_id: lease_id.clone(),
-                })
-                .await?;
-            let source_commit = self
-                .commit_move(MoveCommitParams {
-                    checkpoint_id: checkpoint.checkpoint_id.clone(),
-                    target_node_id: target_hello.node_id,
-                    lease_id,
-                })
-                .await?;
-            Ok::<SessionHandoffResult, ClientError>(SessionHandoffResult {
-                checkpoint: checkpoint.clone(),
-                staged,
-                provider_result,
-                target_commit,
-                source_commit,
-            })
+            Ok::<_, ClientError>((staged, provider_result))
         };
-        match tokio::time::timeout(HANDOFF_TIMEOUT, operation).await {
-            Ok(Ok(result)) => Ok(result),
+        // Until the target commits, nothing is decided: any failure aborts
+        // both sides.
+        let (staged, provider_result) = match tokio::time::timeout(HANDOFF_TIMEOUT, staging).await {
+            Ok(Ok(staged)) => staged,
             Ok(Err(error)) => {
                 self.abort_best_effort(target, &checkpoint.checkpoint_id, &error.to_string())
                     .await;
-                Err(error)
+                return Err(error);
             }
             Err(_) => {
                 let error = ClientError::Timeout("node handoff timed out".into());
                 self.abort_best_effort(target, &checkpoint.checkpoint_id, &error.to_string())
                     .await;
+                return Err(error);
+            }
+        };
+        let commit = MoveCommitParams {
+            checkpoint_id: checkpoint.checkpoint_id.clone(),
+            target_node_id: target_hello.node_id,
+            lease_id,
+        };
+        match commit_handoff(
+            async || target.commit_move(commit.clone()).await,
+            async || self.commit_move(commit.clone()).await,
+        )
+        .await
+        {
+            Ok((target_commit, source_commit)) => Ok(SessionHandoffResult {
+                checkpoint,
+                staged,
+                provider_result,
+                target_commit,
+                source_commit,
+            }),
+            Err(HandoffCommitError::TargetRefused(error)) => {
+                self.abort_best_effort(target, &commit.checkpoint_id, &error.to_string())
+                    .await;
                 Err(error)
             }
+            // Never abort here: the target may own the session already, and
+            // aborting the source would leave both nodes claiming it. The
+            // source stays `Prepared` (a pending move) and a commit retried
+            // with the same lease is idempotent on both nodes.
+            Err(HandoffCommitError::Unresolved(error)) => Err(error),
         }
     }
 
@@ -592,6 +603,69 @@ fn provider_resume_call(
     (method, params)
 }
 
+/// How a handoff commit failed, which decides whether aborting is safe.
+#[derive(Debug)]
+enum HandoffCommitError {
+    /// The target answered and refused the commit, so it never committed and
+    /// both sides can abort.
+    TargetRefused(ClientError),
+    /// The target committed (or might have): the move is decided, so it must
+    /// not be aborted on either side.
+    Unresolved(ClientError),
+}
+
+const COMMIT_RETRIES: u32 = 2;
+const COMMIT_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// Commits the target first, then the source, under one lease.
+///
+/// The target commit is the point of no return. Commits are idempotent for
+/// the same lease, so a transport failure (no answer from the node) is
+/// retried; only an explicit refusal from the target lets the caller abort.
+async fn commit_handoff(
+    mut commit_target: impl AsyncFnMut() -> Result<MoveRecord, ClientError>,
+    mut commit_source: impl AsyncFnMut() -> Result<MoveRecord, ClientError>,
+) -> Result<(MoveRecord, MoveRecord), HandoffCommitError> {
+    let target = match retry_unanswered(&mut commit_target).await {
+        Ok(record) => record,
+        Err(error @ ClientError::Control(_)) => {
+            return Err(HandoffCommitError::TargetRefused(error));
+        }
+        Err(error) => {
+            return Err(HandoffCommitError::Unresolved(ClientError::protocol(
+                format!(
+                    "handoff outcome unknown: the target never confirmed its commit ({error}); \
+                 the source move was left prepared, not aborted"
+                ),
+            )));
+        }
+    };
+    let source = retry_unanswered(&mut commit_source)
+        .await
+        .map_err(|error| {
+            HandoffCommitError::Unresolved(ClientError::protocol(format!(
+                "the target committed the handoff but the source commit failed ({error}); \
+                 the source move was left prepared, not aborted"
+            )))
+        })?;
+    Ok((target, source))
+}
+
+async fn retry_unanswered(
+    call: &mut impl AsyncFnMut() -> Result<MoveRecord, ClientError>,
+) -> Result<MoveRecord, ClientError> {
+    let mut attempt = 0;
+    loop {
+        match call().await {
+            Err(error) if !matches!(error, ClientError::Control(_)) && attempt < COMMIT_RETRIES => {
+                attempt += 1;
+                tokio::time::sleep(COMMIT_RETRY_DELAY * attempt).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 fn random_lease_id() -> Result<String, ClientError> {
     let mut bytes = [0_u8; 16];
     getrandom::fill(&mut bytes).map_err(ClientError::io)?;
@@ -674,6 +748,73 @@ mod tests {
             "100.64.0.2:7337"
         );
         assert!(endpoint_address("https://example.com").is_err());
+    }
+
+    fn record(phase: diri_proto::MovePhase) -> MoveRecord {
+        MoveRecord {
+            checkpoint_id: "cp-1".into(),
+            session_id: "session-1".into(),
+            source_node_id: "source".into(),
+            target_node_id: Some("target".into()),
+            phase,
+            lease_id: Some("lease-1".into()),
+            reason: None,
+            updated_at: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_source_commit_after_the_target_committed_is_never_aborted() {
+        let mut source_calls = 0;
+        let outcome = commit_handoff(
+            async || Ok(record(diri_proto::MovePhase::Committed)),
+            async || {
+                source_calls += 1;
+                Err(ClientError::io("connection reset"))
+            },
+        )
+        .await;
+        assert!(matches!(outcome, Err(HandoffCommitError::Unresolved(_))));
+        assert_eq!(source_calls, 1 + COMMIT_RETRIES);
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_target_commit_is_retried_with_the_same_lease() {
+        let mut target_calls = 0;
+        let outcome = commit_handoff(
+            async || {
+                target_calls += 1;
+                if target_calls == 1 {
+                    Err(ClientError::Timeout("lost reply".into()))
+                } else {
+                    Ok(record(diri_proto::MovePhase::Committed))
+                }
+            },
+            async || Ok(record(diri_proto::MovePhase::Committed)),
+        )
+        .await;
+        assert!(outcome.is_ok());
+        assert_eq!(target_calls, 2);
+    }
+
+    #[tokio::test]
+    async fn only_an_explicit_target_refusal_allows_abort() {
+        let refused = commit_handoff(
+            async || {
+                Err(ClientError::Control(
+                    diri_proto::control::ControlError::new("conflict", "not ready"),
+                ))
+            },
+            async || panic!("the source must not commit after a refusal"),
+        )
+        .await;
+        assert!(matches!(refused, Err(HandoffCommitError::TargetRefused(_))));
+        let unknown = commit_handoff(
+            async || Err(ClientError::disconnected("node closed the connection")),
+            async || panic!("the source must not commit before the target"),
+        )
+        .await;
+        assert!(matches!(unknown, Err(HandoffCommitError::Unresolved(_))));
     }
 
     #[tokio::test]

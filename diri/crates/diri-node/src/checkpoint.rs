@@ -30,6 +30,67 @@ pub struct CheckpointStore {
     node_id: String,
     paths: NodePaths,
     upload_lock: Mutex<()>,
+    /// Serialises every load-transition-save of a move record so two
+    /// concurrent requests can never both pass the same guard.
+    move_lock: Mutex<()>,
+}
+
+/// An event that may move a checkpoint's [`MoveRecord`] to a new phase.
+#[derive(Clone, Copy, Debug)]
+enum MoveEvent<'a> {
+    /// The target restores the checkpoint into its quarantine.
+    Staged,
+    /// The target activated the provider state; it can resume the session.
+    TargetReady,
+    /// Either side records the move under `lease_id`.
+    Commit { lease_id: &'a str },
+    /// Either side gives the move up.
+    Abort,
+}
+
+/// The single guarded transition table for checkpoint moves.
+///
+/// Source records are `Prepared` until they commit or abort. Target records
+/// walk `Transferring -> Staged -> TargetReady -> Committed`; a target may
+/// only commit once the restore is staged *and* its provider state is
+/// active. `Committed` and `Aborted` are terminal. `Ok(None)` means the event
+/// is an idempotent retry that leaves the record untouched.
+fn next_move_phase(record: &MoveRecord, event: MoveEvent<'_>) -> NodeResult<Option<MovePhase>> {
+    use MovePhase::{Aborted, Committed, Prepared, Staged, TargetReady, Transferring};
+    let phase = record.phase;
+    let refused = |what: &str| {
+        Err(NodeError::Conflict(format!(
+            "{what} is not allowed while the move is {phase:?}"
+        )))
+    };
+    match event {
+        MoveEvent::Staged => match phase {
+            Transferring => Ok(Some(Staged)),
+            Staged | TargetReady => Ok(None),
+            Prepared | Committed | Aborted => refused("staging"),
+        },
+        MoveEvent::TargetReady => match phase {
+            Staged => Ok(Some(TargetReady)),
+            TargetReady => Ok(None),
+            Prepared | Transferring | Committed | Aborted => refused("activating"),
+        },
+        MoveEvent::Commit { lease_id } => match phase {
+            Prepared | TargetReady => Ok(Some(Committed)),
+            Committed if record.lease_id.as_deref() == Some(lease_id) => Ok(None),
+            Committed => Err(NodeError::Conflict(
+                "checkpoint already committed under another lease".into(),
+            )),
+            Aborted => Err(NodeError::Conflict("an aborted move cannot commit".into())),
+            Transferring | Staged => refused("committing"),
+        },
+        MoveEvent::Abort => match phase {
+            Committed => Err(NodeError::Conflict(
+                "a committed move needs a new reverse move, not abort".into(),
+            )),
+            Aborted => Ok(None),
+            Prepared | Transferring | Staged | TargetReady => Ok(Some(Aborted)),
+        },
+    }
 }
 
 impl CheckpointStore {
@@ -38,6 +99,7 @@ impl CheckpointStore {
             node_id: node_id.into(),
             paths,
             upload_lock: Mutex::new(()),
+            move_lock: Mutex::new(()),
         }
     }
 
@@ -104,6 +166,19 @@ impl CheckpointStore {
             return Err(NodeError::Conflict(
                 "source manifest already belongs to this node".into(),
             ));
+        }
+        let _moves = self.lock_moves()?;
+        // A repeated put may only refresh a transfer that has not progressed;
+        // it must never resurrect a staged, committed or aborted move.
+        match self.load_move(&manifest.checkpoint_id) {
+            Ok(existing) if existing.phase != MovePhase::Transferring => {
+                return Err(NodeError::Conflict(format!(
+                    "checkpoint manifest cannot be replaced while the move is {:?}",
+                    existing.phase
+                )));
+            }
+            Ok(_) | Err(NodeError::NotFound(_)) => {}
+            Err(error) => return Err(error),
         }
         self.save_manifest(manifest)?;
         self.save_move(&MoveRecord {
@@ -229,46 +304,42 @@ impl CheckpointStore {
         provider_config_home: &Path,
     ) -> NodeResult<CheckpointStageResult> {
         let manifest = self.load_manifest(checkpoint_id)?;
+        let _moves = self.lock_moves()?;
+        let movement = self.load_move(checkpoint_id)?;
+        // Guard before touching the disk: an aborted or committed move must
+        // never be restored (or re-committed under a new lease) again.
+        next_move_phase(&movement, MoveEvent::Staged)?;
         let destination = self.paths.restores.join(checkpoint_id);
-        if destination.exists() {
-            self.activate_provider_state(&manifest, provider_config_home)?;
-            return Ok(CheckpointStageResult {
-                checkpoint_id: checkpoint_id.to_owned(),
-                quarantine_path: destination.to_string_lossy().into_owned(),
-                ready: true,
-            });
-        }
-        let temporary = self
-            .paths
-            .restores
-            .join(format!(".{checkpoint_id}.staging"));
-        if temporary.exists() {
-            return Err(NodeError::Conflict(
-                "checkpoint already has a staging operation".into(),
-            ));
-        }
-        fs::create_dir_all(&temporary)?;
-        set_owner_directory(&temporary)?;
-        let result = (|| {
-            for entry in &manifest.files {
-                self.restore_file(&temporary, entry)?;
+        if !destination.exists() {
+            let temporary = self.staging_path(checkpoint_id);
+            if temporary.exists() {
+                return Err(NodeError::Conflict(
+                    "checkpoint already has a staging operation".into(),
+                ));
             }
-            if let Some(provider_state) = &manifest.provider_state {
-                self.restore_file(&temporary.join(".dirijor"), provider_state)?;
+            fs::create_dir_all(&temporary)?;
+            set_owner_directory(&temporary)?;
+            let result = (|| {
+                for entry in &manifest.files {
+                    self.restore_file(&temporary, entry)?;
+                }
+                if let Some(provider_state) = &manifest.provider_state {
+                    self.restore_file(&temporary.join(".dirijor"), provider_state)?;
+                }
+                fs::rename(&temporary, &destination)?;
+                Ok::<_, NodeError>(())
+            })();
+            if let Err(error) = result {
+                // The partial restore is ours alone and never touched the live
+                // workspace; drop it so a retry is not refused as a
+                // concurrent staging operation.
+                let _ = fs::remove_dir_all(&temporary);
+                return Err(error);
             }
-            fs::rename(&temporary, &destination)?;
-            Ok::<_, NodeError>(())
-        })();
-        if result.is_err() {
-            // Leave the quarantine for inspection; never mutate the live
-            // workspace when a restore is incomplete.
-            return result.map(|_| unreachable!());
         }
+        let movement = self.advance_move(movement, MoveEvent::Staged)?;
         self.activate_provider_state(&manifest, provider_config_home)?;
-        let mut movement = self.load_move(checkpoint_id)?;
-        movement.phase = MovePhase::Staged;
-        movement.updated_at = now_seconds();
-        self.save_move(&movement)?;
+        self.advance_move(movement, MoveEvent::TargetReady)?;
         Ok(CheckpointStageResult {
             checkpoint_id: checkpoint_id.to_owned(),
             quarantine_path: destination.to_string_lossy().into_owned(),
@@ -280,38 +351,43 @@ impl CheckpointStore {
         if params.lease_id.trim().is_empty() {
             return Err(NodeError::BadRequest("move lease cannot be empty".into()));
         }
+        let _moves = self.lock_moves()?;
         let mut movement = self.load_move(&params.checkpoint_id)?;
-        if movement.phase == MovePhase::Aborted {
-            return Err(NodeError::Conflict("an aborted move cannot commit".into()));
+        if next_move_phase(
+            &movement,
+            MoveEvent::Commit {
+                lease_id: &params.lease_id,
+            },
+        )?
+        .is_none()
+        {
+            return Ok(movement);
         }
-        if movement.phase == MovePhase::Committed {
-            if movement.lease_id.as_deref() == Some(&params.lease_id) {
-                return Ok(movement);
-            }
-            return Err(NodeError::Conflict(
-                "checkpoint already committed under another lease".into(),
-            ));
-        }
-        movement.phase = MovePhase::Committed;
         movement.target_node_id = Some(params.target_node_id);
-        movement.lease_id = Some(params.lease_id);
-        movement.updated_at = now_seconds();
-        self.save_move(&movement)?;
-        Ok(movement)
+        movement.lease_id = Some(params.lease_id.clone());
+        self.advance_move(
+            movement,
+            MoveEvent::Commit {
+                lease_id: &params.lease_id,
+            },
+        )
     }
 
     pub fn abort(&self, params: MoveAbortParams) -> NodeResult<MoveRecord> {
+        let _moves = self.lock_moves()?;
         let mut movement = self.load_move(&params.checkpoint_id)?;
-        if movement.phase == MovePhase::Committed {
-            return Err(NodeError::Conflict(
-                "a committed move needs a new reverse move, not abort".into(),
-            ));
+        let first_abort = next_move_phase(&movement, MoveEvent::Abort)?.is_some();
+        // A failed or interrupted restore may have left its private staging
+        // directory behind; it never reached the quarantine, so drop it.
+        let staging = self.staging_path(&params.checkpoint_id);
+        if staging.exists() {
+            fs::remove_dir_all(&staging)?;
         }
-        movement.phase = MovePhase::Aborted;
+        if !first_abort {
+            return Ok(movement);
+        }
         movement.reason = Some(params.reason);
-        movement.updated_at = now_seconds();
-        self.save_move(&movement)?;
-        Ok(movement)
+        self.advance_move(movement, MoveEvent::Abort)
     }
 
     pub fn rollback_provider_state(
@@ -530,6 +606,32 @@ impl CheckpointStore {
         Ok(manifest)
     }
 
+    fn lock_moves(&self) -> NodeResult<std::sync::MutexGuard<'_, ()>> {
+        self.move_lock
+            .lock()
+            .map_err(|_| NodeError::Protocol("checkpoint move lock is poisoned".into()))
+    }
+
+    /// Applies `event` through [`next_move_phase`] and persists the result.
+    fn advance_move(
+        &self,
+        mut movement: MoveRecord,
+        event: MoveEvent<'_>,
+    ) -> NodeResult<MoveRecord> {
+        if let Some(phase) = next_move_phase(&movement, event)? {
+            movement.phase = phase;
+            movement.updated_at = now_seconds();
+            self.save_move(&movement)?;
+        }
+        Ok(movement)
+    }
+
+    fn staging_path(&self, checkpoint_id: &str) -> PathBuf {
+        self.paths
+            .restores
+            .join(format!(".{checkpoint_id}.staging"))
+    }
+
     fn save_move(&self, movement: &MoveRecord) -> NodeResult<()> {
         atomic_json(&self.move_path(&movement.checkpoint_id), movement)?;
         Ok(())
@@ -720,6 +822,206 @@ mod tests {
     use super::*;
     use diri_proto::TransferMode;
 
+    /// A second node that accepted `manifest` and holds every blob the
+    /// source stored, as after a completed blob transfer.
+    fn receive(
+        root: &Path,
+        source: &NodePaths,
+        manifest: &CheckpointManifest,
+    ) -> (NodePaths, CheckpointStore) {
+        let paths = NodePaths::for_root(root.join("target-node"));
+        paths.create_layout().expect("target layout");
+        let target = CheckpointStore::new(paths.clone(), "target");
+        target
+            .put_manifest(manifest)
+            .expect("target accepts manifest");
+        for entry in fs::read_dir(&source.blobs).expect("source blobs").flatten() {
+            fs::copy(entry.path(), paths.blobs.join(entry.file_name())).expect("copy blob");
+        }
+        (paths, target)
+    }
+
+    /// A source checkpoint of a one-file workspace and its receiving target.
+    fn moved_checkpoint(
+        root: &Path,
+    ) -> (
+        NodePaths,
+        CheckpointStore,
+        NodePaths,
+        CheckpointStore,
+        CheckpointManifest,
+    ) {
+        let paths = NodePaths::for_root(root.join("source-node"));
+        paths.create_layout().expect("layout");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(workspace.join("README.md"), "hello\n").expect("readme");
+        let source = CheckpointStore::new(paths.clone(), "source");
+        let manifest = source
+            .prepare(
+                CheckpointPrepareParams {
+                    session_id: "session-1".into(),
+                    provider: ProviderKind::Claude,
+                    profile_id: "work".into(),
+                    workspace_root: workspace.to_string_lossy().into_owned(),
+                    provider_session_id: None,
+                    mode: TransferMode::Move,
+                },
+                root,
+            )
+            .expect("checkpoint");
+        let (target_paths, target) = receive(root, &paths, &manifest);
+        (paths, source, target_paths, target, manifest)
+    }
+
+    fn commit_params(manifest: &CheckpointManifest, lease: &str) -> MoveCommitParams {
+        MoveCommitParams {
+            checkpoint_id: manifest.checkpoint_id.clone(),
+            target_node_id: "target".into(),
+            lease_id: lease.into(),
+        }
+    }
+
+    fn abort_params(manifest: &CheckpointManifest) -> MoveAbortParams {
+        MoveAbortParams {
+            checkpoint_id: manifest.checkpoint_id.clone(),
+            reason: "test".into(),
+        }
+    }
+
+    fn phase(store: &CheckpointStore, manifest: &CheckpointManifest) -> MovePhase {
+        store
+            .load_move(&manifest.checkpoint_id)
+            .expect("move")
+            .phase
+    }
+
+    #[test]
+    fn target_walks_staged_then_ready_before_it_may_commit() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let home = directory.path().join("home");
+        let (_, source, _, target, manifest) = moved_checkpoint(directory.path());
+        assert_eq!(phase(&target, &manifest), MovePhase::Transferring);
+        assert!(matches!(
+            target.commit(commit_params(&manifest, "lease-1")),
+            Err(NodeError::Conflict(_))
+        ));
+        target.stage(&manifest.checkpoint_id, &home).expect("stage");
+        assert_eq!(phase(&target, &manifest), MovePhase::TargetReady);
+        // A retried stage is idempotent and keeps the phase.
+        target
+            .stage(&manifest.checkpoint_id, &home)
+            .expect("restage");
+        assert_eq!(phase(&target, &manifest), MovePhase::TargetReady);
+        target
+            .commit(commit_params(&manifest, "lease-1"))
+            .expect("target commit");
+        source
+            .commit(commit_params(&manifest, "lease-1"))
+            .expect("source commit");
+        assert_eq!(phase(&source, &manifest), MovePhase::Committed);
+        // Same lease is idempotent; a new lease is a conflict.
+        target
+            .commit(commit_params(&manifest, "lease-1"))
+            .expect("idempotent commit");
+        assert!(matches!(
+            target.commit(commit_params(&manifest, "lease-2")),
+            Err(NodeError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn terminal_moves_can_never_be_staged_or_recommitted() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let home = directory.path().join("home");
+        let (_, _, _, target, manifest) = moved_checkpoint(directory.path());
+        target.abort(abort_params(&manifest)).expect("abort");
+        assert!(matches!(
+            target.stage(&manifest.checkpoint_id, &home),
+            Err(NodeError::Conflict(_))
+        ));
+        assert!(matches!(
+            target.put_manifest(&manifest),
+            Err(NodeError::Conflict(_))
+        ));
+        assert!(matches!(
+            target.commit(commit_params(&manifest, "lease-1")),
+            Err(NodeError::Conflict(_))
+        ));
+        assert_eq!(phase(&target, &manifest), MovePhase::Aborted);
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (_, _, _, target, manifest) = moved_checkpoint(directory.path());
+        target.stage(&manifest.checkpoint_id, &home).expect("stage");
+        target
+            .commit(commit_params(&manifest, "lease-1"))
+            .expect("commit");
+        assert!(matches!(
+            target.stage(&manifest.checkpoint_id, &home),
+            Err(NodeError::Conflict(_))
+        ));
+        assert!(matches!(
+            target.abort(abort_params(&manifest)),
+            Err(NodeError::Conflict(_))
+        ));
+        let record = target.load_move(&manifest.checkpoint_id).expect("move");
+        assert_eq!(record.phase, MovePhase::Committed);
+        assert_eq!(record.lease_id.as_deref(), Some("lease-1"));
+    }
+
+    #[test]
+    fn source_cannot_stage_its_own_prepared_checkpoint() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (_, source, _, _, manifest) = moved_checkpoint(directory.path());
+        assert!(matches!(
+            source.stage(&manifest.checkpoint_id, directory.path()),
+            Err(NodeError::Conflict(_))
+        ));
+        assert_eq!(phase(&source, &manifest), MovePhase::Prepared);
+    }
+
+    #[test]
+    fn a_failed_restore_leaves_no_staging_and_can_be_retried() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let home = directory.path().join("home");
+        let (source_paths, _, target_paths, target, manifest) = moved_checkpoint(directory.path());
+        let blob = target_paths.blobs.join(&manifest.files[0].digest);
+        fs::write(&blob, "corrupt").expect("corrupt blob");
+        assert!(matches!(
+            target.stage(&manifest.checkpoint_id, &home),
+            Err(NodeError::Conflict(_))
+        ));
+        assert!(!target.staging_path(&manifest.checkpoint_id).exists());
+        assert_eq!(phase(&target, &manifest), MovePhase::Transferring);
+        fs::copy(source_paths.blobs.join(&manifest.files[0].digest), &blob).expect("repair");
+        target
+            .stage(&manifest.checkpoint_id, &home)
+            .expect("retry after repair");
+        assert_eq!(phase(&target, &manifest), MovePhase::TargetReady);
+    }
+
+    #[test]
+    fn abort_removes_a_leftover_staging_directory() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (_, _, _, target, manifest) = moved_checkpoint(directory.path());
+        let staging = target.staging_path(&manifest.checkpoint_id);
+        fs::create_dir_all(staging.join("partial")).expect("interrupted staging");
+        target.abort(abort_params(&manifest)).expect("abort");
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn a_crash_after_restore_records_the_staged_phase_on_retry() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let (_, _, target_paths, target, manifest) = moved_checkpoint(directory.path());
+        fs::create_dir_all(target_paths.restores.join(&manifest.checkpoint_id))
+            .expect("restored before crash");
+        target
+            .stage(&manifest.checkpoint_id, directory.path())
+            .expect("stage");
+        assert_eq!(phase(&target, &manifest), MovePhase::TargetReady);
+    }
+
     #[test]
     fn checkpoint_is_content_addressed_and_excludes_secrets() {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -775,7 +1077,8 @@ mod tests {
             .expect("checkpoint");
         let provider_home = directory.path().join("provider-home");
         fs::create_dir_all(&provider_home).expect("provider home");
-        let staged = store
+        let (_target_paths, target) = receive(directory.path(), &paths, &manifest);
+        let staged = target
             .stage(&manifest.checkpoint_id, &provider_home)
             .expect("stage");
         assert!(
@@ -858,7 +1161,7 @@ mod tests {
         let rollout = source_home.join("sessions/2026/08/02/rollout-test-thread-1.jsonl");
         fs::create_dir_all(rollout.parent().unwrap()).expect("sessions");
         fs::write(&rollout, "{\"type\":\"session_meta\"}\n").expect("rollout");
-        let store = CheckpointStore::new(paths, "local");
+        let store = CheckpointStore::new(paths.clone(), "local");
         let manifest = store
             .prepare(
                 CheckpointPrepareParams {
@@ -874,7 +1177,8 @@ mod tests {
             .expect("checkpoint");
         assert!(manifest.provider_state.is_some());
         let target_home = directory.path().join("target-codex");
-        store
+        let (_target_paths, target) = receive(directory.path(), &paths, &manifest);
+        target
             .stage(&manifest.checkpoint_id, &target_home)
             .expect("stage");
         assert!(
