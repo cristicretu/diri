@@ -773,6 +773,21 @@ pub struct SessionListResult {
     pub projects: Vec<Project>,
 }
 
+/// `session.list` as a current Engine answers it: the list plus the event
+/// sequence it reflects. The list and the event stream travel independently,
+/// so a reply generated before a `session.removed` (or a newer
+/// `session.updated`) can arrive after it; a client lets every session event
+/// with `seq > event_seq` win over the list. The field is additive: an older
+/// Engine omits it, and `SessionListResult` readers ignore it.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct StampedSessionListResult {
+    #[serde(flatten)]
+    pub list: SessionListResult,
+    /// The highest published event seq whose effect the list includes.
+    #[serde(default, rename = "eventSeq", skip_serializing_if = "Option::is_none")]
+    pub event_seq: Option<u64>,
+}
+
 pub type SessionListParams = EmptyParams;
 pub type StateSnapshotResult = SessionListResult;
 pub type StateSnapshotParams = EmptyParams;
