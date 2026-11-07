@@ -459,6 +459,30 @@ struct CacheState {
     last_search: Option<Instant>,
 }
 
+/// Lets a reader that dies mid-read (a panicking parse) go: without this,
+/// `reader` stays set and its file stays `queued`, so no later search ever
+/// reads anything again. The queue is dropped too; the next search queues
+/// what it still needs and starts a new reader.
+struct ReaderExit<'a> {
+    cache: &'a TranscriptCache,
+    finished: bool,
+}
+
+impl Drop for ReaderExit<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let mut state = self.cache.state.lock().unwrap_or_else(|poisoned| {
+            self.cache.state.clear_poison();
+            poisoned.into_inner()
+        });
+        state.reader = false;
+        state.queue.clear();
+        state.queued.clear();
+    }
+}
+
 /// Parsed conversations, shared by every request of this Engine.
 pub(crate) struct TranscriptCache {
     state: Mutex<CacheState>,
@@ -553,6 +577,10 @@ impl TranscriptCache {
     /// The reader thread: parses queued files, then waits for more until
     /// the cache has been idle for [`CACHE_IDLE`], and drops it.
     fn read_queue(&self) {
+        let mut exit = ReaderExit {
+            cache: self,
+            finished: false,
+        };
         loop {
             let job = {
                 let mut state = self.state.lock().expect("transcript cache");
@@ -565,6 +593,7 @@ impl TranscriptCache {
                         state.files = HashMap::new();
                         state.queued = HashSet::new();
                         state.reader = false;
+                        exit.finished = true;
                         return;
                     }
                     state = self

@@ -1029,9 +1029,13 @@ impl AttachHub {
             let hub = self.clone();
             let registry = Arc::clone(registry);
             let session_id = session_id.to_string();
-            let _ = std::thread::Builder::new()
+            let spawned = std::thread::Builder::new()
                 .name(format!("diri-attach-{session_id}"))
                 .spawn(move || hub.pump(&registry, &session_id, seed));
+            if spawned.is_err() {
+                // No pump runs; the next attach must try again.
+                entry.pump_running = false;
+            }
         }
     }
 
@@ -1348,6 +1352,11 @@ impl AttachHub {
             .checked_sub(GRID_FLUSH_INTERVAL)
             .unwrap_or_else(Instant::now);
         let stop = AtomicBool::new(false);
+        let _exit = PumpExit {
+            hub: self,
+            session_id,
+            stop: &stop,
+        };
         let mut last_owner_check = Instant::now();
         let mut publication_pending = false;
         let mut session_present = true;
@@ -1546,6 +1555,30 @@ impl AttachHub {
             if stop.load(Ordering::SeqCst) {
                 break;
             }
+        }
+    }
+}
+
+/// Clears the entry's `pump_running` when the pump leaves any way but its own
+/// (a poisoned Registry, a panic), so a later attach starts a new pump
+/// instead of trusting one that is gone. The pump's own exit removes the
+/// entry under the hub lock and sets `stop`; this then does nothing, and so
+/// never touches an entry a newer attach has created since.
+struct PumpExit<'a> {
+    hub: &'a AttachHub,
+    session_id: &'a str,
+    stop: &'a AtomicBool,
+}
+
+impl Drop for PumpExit<'_> {
+    fn drop(&mut self) {
+        if self.stop.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Ok(mut sessions) = self.hub.sessions.lock()
+            && let Some(entry) = sessions.get_mut(self.session_id)
+        {
+            entry.pump_running = false;
         }
     }
 }
