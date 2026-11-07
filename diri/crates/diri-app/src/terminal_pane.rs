@@ -1983,6 +1983,12 @@ impl TerminalPane {
         self.focus.is_focused(window)
     }
 
+    /// The keyboard is in this pane: its terminal, its note, or the Links
+    /// popover, whose focus sits beside the grid's rather than under it.
+    pub(crate) fn contains_focus(&self, window: &Window, cx: &gpui::App) -> bool {
+        self.focus.contains_focused(window, cx) || self.session_links_focused(window)
+    }
+
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn capture_input_for_test(
         &mut self,

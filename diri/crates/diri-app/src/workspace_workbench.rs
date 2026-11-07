@@ -332,12 +332,14 @@ impl WorkspaceWorkbench {
 
     /// Keyboard focus was inside this workbench but no mounted pane holds it:
     /// its pane was dropped with its session, or it waited on the placeholder
-    /// for the focused pane's session, which has now arrived.
+    /// for the focused pane's session, which has now arrived. Focus inside a
+    /// pane, such as its open Links popover, is held: reclaiming it would
+    /// hand that popover's Esc to the agent.
     fn keyboard_stranded(&self, window: &Window, cx: &gpui::App) -> bool {
         !self
             .mounted
             .values()
-            .any(|pane| pane.terminal.read(cx).is_focused(window))
+            .any(|pane| pane.terminal.read(cx).contains_focus(window, cx))
             && (self.focused_terminal().is_some() || !self.placeholder_focus.is_focused(window))
     }
 
@@ -2252,6 +2254,39 @@ mod tests {
             .update(cx, |_, window, _| window.remove_window())
             .unwrap();
         cx.run_until_parked();
+    }
+    #[gpui::test]
+    fn the_links_popover_keeps_the_keyboard_through_a_layout_sync(cx: &mut TestAppContext) {
+        let (runtime, tokio, tab) = fixture(false);
+        let (workbench, cx) = cx.add_window_view(|window, cx| {
+            let mut workbench = WorkspaceWorkbench::new(runtime, tokio, window, cx);
+            workbench.set_tab(tab.clone(), viewport(), window, cx);
+            workbench.focus(window, cx);
+            workbench
+        });
+        cx.run_until_parked();
+        let terminal = workbench.read_with(cx, |workbench, _| {
+            workbench.focused_terminal().expect("focused pane")
+        });
+        terminal.update_in(cx, |terminal, window, cx| {
+            terminal.focus_session_links_for_test(window, cx)
+        });
+        cx.run_until_parked();
+        workbench.update_in(cx, |workbench, window, cx| {
+            workbench.set_tab(tab.clone(), viewport(), window, cx);
+        });
+        cx.run_until_parked();
+        terminal.update_in(cx, |terminal, window, cx| {
+            assert!(
+                terminal.contains_focus(window, cx) && !terminal.is_focused(window),
+                "Esc must reach the popover, not the agent"
+            );
+        });
+        cx.simulate_keystrokes("escape");
+        terminal.update_in(cx, |terminal, window, _| {
+            assert!(!terminal.session_links_open_for_test());
+            assert!(terminal.is_focused(window), "closing hands the keyboard back");
+        });
     }
     #[gpui::test]
     fn a_pane_leaving_the_screen_closes_its_links_popover(cx: &mut TestAppContext) {

@@ -4671,7 +4671,7 @@ impl RootView {
                 && self
                     .auxiliary_terminal
                     .as_ref()
-                    .is_some_and(|terminal| terminal.read(cx).is_focused(window)))
+                    .is_some_and(|terminal| terminal.read(cx).contains_focus(window, cx)))
     }
 
     /// Where the keyboard goes when the panel that held it closes: the
