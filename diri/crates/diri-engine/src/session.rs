@@ -1409,8 +1409,13 @@ fn capture_remote_find_cells(
             // longer belong to one terminal.
             return Err("The terminal changed while it was being searched. Try again");
         }
-        let decoded = diri_proto::grid::GridRowCodec::decode_rows(&chunk.payload, count)
-            .map_err(|_| "Invalid capture cells")?;
+        let decoded = diri_proto::grid::GridRowCodec::decode_rows_bounded(
+            &chunk.payload,
+            count,
+            cols,
+            count.saturating_mul(cols),
+        )
+        .map_err(|_| "Invalid capture cells")?;
         if decoded.iter().any(|row| row.len() != cols) {
             return Err("Invalid capture row width");
         }

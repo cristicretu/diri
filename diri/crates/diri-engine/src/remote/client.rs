@@ -782,11 +782,12 @@ impl RemoteSessionClient {
             .lock()
             .expect("scrollback requests")
             .insert(request_id, sender);
-        let request = RemoteMessage::ScrollbackRequest(ScrollbackRequest {
+        let scrollback = ScrollbackRequest {
             request_id,
             first_row,
             max_rows,
-        });
+        };
+        let request = RemoteMessage::ScrollbackRequest(scrollback);
         let sent = {
             let mut writer = self.writer.lock().expect("remote writer");
             if !writer.control_granted {
@@ -807,6 +808,11 @@ impl RemoteSessionClient {
         }
         match receiver.recv_timeout(std::time::Duration::from_secs(5)) {
             Ok(result) if self.reset_generation.load(Ordering::Acquire) == reset_generation => {
+                // A Holder answer is untrusted: reject it before any caller
+                // sizes a decode from its row count or width.
+                scrollback
+                    .validate_response(&result)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
                 Ok(result)
             }
             Ok(_) => Err(io::Error::new(
