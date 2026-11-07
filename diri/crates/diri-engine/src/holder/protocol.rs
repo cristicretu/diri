@@ -49,6 +49,14 @@ pub const HOLDER_STREAM_VERSION_PIXELS: u16 = 2;
 /// sets the PTY's pixel size. Version 2 streams only.
 pub const HOLDER_STREAM_RESIZE_PIXELS: u8 = 3;
 pub const HOLDER_STREAM_ACK: u8 = 0;
+/// A failed frame. The Holder closes the stream after it.
+pub const HOLDER_STREAM_FAILED: u8 = 1;
+/// A failed INPUT frame, followed by `[written u64]`: exactly that prefix of
+/// the frame reached the PTY. Like [`HOLDER_STREAM_FAILED`] it ends the
+/// stream, so it needs no version: a client that predates it reads any
+/// non-zero acknowledgement as failure and drops the stream, trailing bytes
+/// included.
+pub const HOLDER_STREAM_PARTIAL: u8 = 2;
 pub const HOLDER_STREAM_MAX_PAYLOAD: usize = 1 << 20;
 
 /// One-way output protocol. After the NDJSON handshake the holder writes
@@ -262,6 +270,9 @@ pub struct HolderResponse {
     /// requested offset, or the oldest byte its log keeps when that is later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resumed: Option<bool>,
+    /// On a failed `write`: how many leading bytes did reach the PTY.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written: Option<u64>,
 }
 
 impl HolderResponse {
@@ -293,6 +304,7 @@ impl HolderResponse {
             tree: None,
             start_offset: None,
             resumed: None,
+            written: None,
         }
     }
 
@@ -319,6 +331,18 @@ impl HolderResponse {
             tree: None,
             start_offset: None,
             resumed: None,
+            written: None,
+        }
+    }
+
+    /// A failed request; a partial write also says how much was delivered.
+    pub fn from_error(error: &super::HolderError) -> Self {
+        Self {
+            written: match error {
+                super::HolderError::PartialWrite { written, .. } => Some(*written),
+                _ => None,
+            },
+            ..Self::failure(error.to_string())
         }
     }
 
