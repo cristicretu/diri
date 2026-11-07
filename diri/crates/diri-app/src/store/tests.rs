@@ -378,6 +378,90 @@ fn a_new_session_and_a_new_project_land_at_the_bottom() {
     );
 }
 
+/// The event task starts before the session list is fetched, so a session or
+/// project event can land on an unhydrated store. It must not prune the saved
+/// sidebar layout down to that one row and persist the loss.
+#[test]
+fn events_before_hydrate_keep_the_saved_sidebar_layout() {
+    let dir = tempdir().expect("tempdir");
+    let prefs = Prefs {
+        sidebar_session_order: vec![id("b"), id("a"), id("c")],
+        sidebar_project_order: vec![pid("q"), pid("p")],
+        sidebar_pinned_sessions: vec![id("a")],
+        sidebar_collapsed_sessions: vec![id("b")],
+        ..Prefs::default()
+    };
+    let (mut store, _) = SessionStore::headless(prefs.clone());
+    store.prefs_path = Some(dir.path().join("prefs.json"));
+
+    store.handle_event(EventEnvelope {
+        name: diri_proto::EventName::SESSION_UPDATED.to_owned(),
+        seq: 1,
+        params: serde_json::to_value(session("new", "p", 9.0)).unwrap(),
+    });
+    store.handle_event(EventEnvelope {
+        name: diri_proto::EventName::PROJECT_UPDATED.to_owned(),
+        seq: 2,
+        params: serde_json::to_value(project("p", "Pea")).unwrap(),
+    });
+    store.handle_event(EventEnvelope {
+        name: diri_proto::EventName::SESSION_REMOVED.to_owned(),
+        seq: 3,
+        params: serde_json::json!({ "id": "new" }),
+    });
+
+    let saved = store.preferences();
+    assert_eq!(saved.sidebar_session_order, prefs.sidebar_session_order);
+    assert_eq!(saved.sidebar_project_order, prefs.sidebar_project_order);
+    assert_eq!(saved.sidebar_pinned_sessions, prefs.sidebar_pinned_sessions);
+    assert_eq!(
+        saved.sidebar_collapsed_sessions,
+        prefs.sidebar_collapsed_sessions
+    );
+    let prefs_path = dir.path().join("prefs.json");
+    if prefs_path.exists() {
+        let on_disk = Prefs::load(&prefs_path).expect("saved prefs load");
+        assert_eq!(on_disk.sidebar_session_order, prefs.sidebar_session_order);
+        assert_eq!(on_disk.sidebar_project_order, prefs.sidebar_project_order);
+        assert_eq!(
+            on_disk.sidebar_pinned_sessions,
+            prefs.sidebar_pinned_sessions
+        );
+        assert_eq!(
+            on_disk.sidebar_collapsed_sessions,
+            prefs.sidebar_collapsed_sessions
+        );
+    }
+
+    // An empty list (wiped state, wrong daemon) is not evidence either.
+    store.hydrate(SessionListResult {
+        sessions: vec![],
+        projects: vec![],
+    });
+    assert_eq!(
+        store.preferences().sidebar_session_order,
+        prefs.sidebar_session_order
+    );
+
+    // The real list reconciles once: survivors keep their saved ranks.
+    store.hydrate(SessionListResult {
+        sessions: vec![
+            session("a", "p", 1.0),
+            session("b", "p", 2.0),
+            session("new", "p", 9.0),
+        ],
+        projects: vec![project("p", "Pea"), project("q", "Queue")],
+    });
+    let saved = store.preferences();
+    assert_eq!(
+        saved.sidebar_session_order,
+        vec![id("b"), id("a"), id("new")]
+    );
+    assert_eq!(saved.sidebar_project_order, vec![pid("q"), pid("p")]);
+    assert_eq!(saved.sidebar_pinned_sessions, vec![id("a")]);
+    assert_eq!(saved.sidebar_collapsed_sessions, vec![id("b")]);
+}
+
 /// The order is total, so a row dragged to the end of its group stays there.
 /// Under the old ranked-before-unranked comparator it sprang back above every
 /// sibling that had never been dragged.
