@@ -17,12 +17,35 @@ pub struct TerminalNotification {
     pub body: String,
 }
 
+/// Where the scanner is in the escape-sequence grammar.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ScanState {
+    /// Plain output, between sequences.
+    #[default]
+    Ground,
+    /// After `ESC`.
+    Escape,
+    /// In an OSC body whose payload is kept.
+    Osc,
+    /// After `ESC` inside an OSC body: `\` ends it.
+    OscEscape,
+    /// In a string nothing here reads (DCS, APC, PM, SOS) or an OSC past its
+    /// limit: skipped to its end.
+    Ignored,
+    /// After `ESC` inside an ignored string.
+    IgnoredEscape,
+    /// In an OSC body [`NotificationParser::finish`] would ignore: only its
+    /// length is counted, to apply the same limit.
+    OscSkipped,
+}
+
 #[derive(Default)]
 pub(crate) struct NotificationParser {
-    state: u8,
+    state: ScanState,
     payload: Vec<u8>,
-    /// State 6: the length the payload of an OSC [`finish`](Self::finish)
-    /// ignores would have, kept only to apply the same limit.
+    /// [`ScanState::OscSkipped`]: the length the payload of an OSC
+    /// [`finish`](Self::finish) ignores would have, kept only to apply the
+    /// same limit.
     skipped: usize,
     pending: VecDeque<(String, TerminalNotification)>,
     pub ready: VecDeque<TerminalNotification>,
@@ -108,7 +131,8 @@ const PREFIXES: [&str; 8] = [
     "777;notify;",
     "99;",
 ];
-/// The bytes after `ESC` that state 1 does not answer with state 0.
+/// The bytes after `ESC` that [`ScanState::Escape`] does not answer with
+/// [`ScanState::Ground`].
 const STATE_1_LEADS: [u8; 7] = [b']', b'P', b'_', b'^', b'X', b'c', 0x1b];
 
 const MAX_PREFIX_BYTES: usize = AGENT_EXIT_OSC.len();
@@ -126,7 +150,7 @@ impl NotificationParser {
     /// Between sequences: output whose escapes are all CSIs leaves the
     /// parser exactly as it is.
     pub fn is_idle(&self) -> bool {
-        self.state == 0
+        self.state == ScanState::Ground
     }
 
     pub fn queries_only() -> Self {
@@ -145,7 +169,7 @@ impl NotificationParser {
     }
 
     pub fn reset_sequence(&mut self) {
-        self.state = 0;
+        self.state = ScanState::Ground;
         self.payload.clear();
         self.pending.clear();
     }
@@ -162,11 +186,11 @@ impl NotificationParser {
         // No copy or bytewise scan for the common plain-output case.
         let mut index = 0;
         while index < bytes.len() {
-            if self.state == 0 {
+            if self.state == ScanState::Ground {
                 // Plain output between escapes cannot start an OSC. Nor can
-                // an escape whose next byte state 1 maps straight back to
-                // state 0 (a CSI, say): skipping both bytes at once is what
-                // states 1 and 0 would do with them.
+                // an escape whose next byte `Escape` maps straight back to
+                // `Ground` (a CSI, say): skipping both bytes at once is what
+                // those two states would do with them.
                 let rest = &bytes[index..];
                 let found = match c0 {
                     Some(c0) => {
@@ -195,17 +219,20 @@ impl NotificationParser {
                 }
             }
             // String bodies go a run at a time: everything up to the next
-            // BEL, CAN, SUB or ESC is payload (state 2), counted (6) or
-            // skipped (4).
-            if matches!(self.state, 2 | 4 | 6) {
+            // BEL, CAN, SUB or ESC is payload (`Osc`), counted (`OscSkipped`)
+            // or skipped (`Ignored`).
+            if matches!(
+                self.state,
+                ScanState::Osc | ScanState::Ignored | ScanState::OscSkipped
+            ) {
                 let run = match c0 {
                     Some(c0) => c0.next(bytes, index, &STRING_ENDS) - index,
                     None => plain_run(&bytes[index..]),
                 };
                 if run != 0 {
                     match self.state {
-                        2 => self.push_payload(&bytes[index..index + run]),
-                        6 => self.skip_payload(run),
+                        ScanState::Osc => self.push_payload(&bytes[index..index + run]),
+                        ScanState::OscSkipped => self.skip_payload(run),
                         _ => {}
                     }
                     index += run;
@@ -215,12 +242,12 @@ impl NotificationParser {
             let byte = bytes[index];
             index += 1;
             match self.state {
-                0 => {
+                ScanState::Ground => {
                     if byte == 0x1b {
-                        self.state = 1;
+                        self.state = ScanState::Escape;
                     }
                 }
-                1 => {
+                ScanState::Escape => {
                     if byte == b'c' {
                         self.shell = ShellPhase::Unknown;
                         // RIS ends every program-status record; a soft reset
@@ -229,56 +256,59 @@ impl NotificationParser {
                             .end_program(crate::program_status::ProgramRemoval::Reset);
                     }
                     self.state = match byte {
-                        b']' => 2,
-                        b'P' | b'_' | b'^' | b'X' => 4,
-                        0x1b => 1,
-                        _ => 0,
+                        b']' => ScanState::Osc,
+                        b'P' | b'_' | b'^' | b'X' => ScanState::Ignored,
+                        0x1b => ScanState::Escape,
+                        _ => ScanState::Ground,
                     };
                     self.payload.clear();
                 }
-                2 => match byte {
+                ScanState::Osc => match byte {
                     7 => {
                         self.finish();
-                        self.state = 0;
+                        self.state = ScanState::Ground;
                     }
-                    0x1b => self.state = 3,
+                    0x1b => self.state = ScanState::OscEscape,
                     0x18 | 0x1a => {
                         self.payload.clear();
-                        self.state = 0;
+                        self.state = ScanState::Ground;
                     }
                     _ => self.push_payload(&[byte]),
                 },
                 // An OSC `finish` ignores: it ends, aborts and overflows as
-                // state 2 does, and its (empty) payload finishes to nothing.
-                6 => match byte {
-                    7 | 0x18 | 0x1a => self.state = 0,
-                    0x1b => self.state = 3,
+                // `Osc` does, and its (empty) payload finishes to nothing.
+                ScanState::OscSkipped => match byte {
+                    7 | 0x18 | 0x1a => self.state = ScanState::Ground,
+                    0x1b => self.state = ScanState::OscEscape,
                     _ => self.skip_payload(1),
                 },
-                3 => {
+                ScanState::OscEscape => {
                     if byte == b'\\' {
                         self.finish();
-                        self.state = 0;
+                        self.state = ScanState::Ground;
                     } else {
                         self.payload.clear();
-                        self.state = if byte == 0x1b { 1 } else { 0 };
+                        self.state = if byte == 0x1b {
+                            ScanState::Escape
+                        } else {
+                            ScanState::Ground
+                        };
                     }
                 }
-                4 => match byte {
-                    7 | 0x18 | 0x1a => self.state = 0,
-                    0x1b => self.state = 5,
+                ScanState::Ignored => match byte {
+                    7 | 0x18 | 0x1a => self.state = ScanState::Ground,
+                    0x1b => self.state = ScanState::IgnoredEscape,
                     _ => {}
                 },
-                5 => {
+                ScanState::IgnoredEscape => {
                     self.state = if byte == b'\\' {
-                        0
+                        ScanState::Ground
                     } else if byte == 0x1b {
-                        5
+                        ScanState::IgnoredEscape
                     } else {
-                        4
+                        ScanState::Ignored
                     }
                 }
-                _ => unreachable!(),
             }
         }
     }
@@ -288,7 +318,7 @@ impl NotificationParser {
     /// and skips the rest of the sequence.
     ///
     /// A payload that can no longer start with a prefix [`finish`](Self::finish)
-    /// acts on is not stored: the sequence moves to state 6, which only
+    /// acts on is not stored: the sequence moves to `OscSkipped`, which only
     /// counts its length (a long OSC another feature owns is never copied).
     fn push_payload(&mut self, mut run: &[u8]) {
         // The limit depends on the first three bytes (`52;` is a clipboard
@@ -300,7 +330,7 @@ impl NotificationParser {
             };
             if self.payload.len() >= self.payload_limit() {
                 self.payload.clear();
-                self.state = 4;
+                self.state = ScanState::Ignored;
                 return;
             }
             self.payload.push(byte);
@@ -308,7 +338,7 @@ impl NotificationParser {
             if !may_matter(&self.payload) {
                 self.skipped = self.payload.len();
                 self.payload.clear();
-                self.state = 6;
+                self.state = ScanState::OscSkipped;
                 self.skip_payload(run.len());
                 return;
             }
@@ -316,7 +346,7 @@ impl NotificationParser {
         let room = self.payload_limit().saturating_sub(self.payload.len());
         if run.len() > room {
             self.payload.clear();
-            self.state = 4;
+            self.state = ScanState::Ignored;
         } else {
             self.payload.extend_from_slice(run);
         }
@@ -326,7 +356,7 @@ impl NotificationParser {
     /// only the limit (an ignored payload never starts `52;`) applies.
     fn skip_payload(&mut self, run: usize) {
         if self.skipped + run > OSC_PAYLOAD_LIMIT {
-            self.state = 4;
+            self.state = ScanState::Ignored;
         } else {
             self.skipped += run;
         }
@@ -488,65 +518,69 @@ mod tests {
         fn feed_bytewise(&mut self, bytes: &[u8]) {
             for &byte in bytes {
                 match self.state {
-                    0 => {
+                    ScanState::Ground => {
                         if byte == 0x1b {
-                            self.state = 1;
+                            self.state = ScanState::Escape;
                         }
                     }
-                    1 => {
+                    ScanState::Escape => {
                         if byte == b'c' {
                             self.shell = ShellPhase::Unknown;
                             self.program
                                 .end_program(crate::program_status::ProgramRemoval::Reset);
                         }
                         self.state = match byte {
-                            b']' => 2,
-                            b'P' | b'_' | b'^' | b'X' => 4,
-                            0x1b => 1,
-                            _ => 0,
+                            b']' => ScanState::Osc,
+                            b'P' | b'_' | b'^' | b'X' => ScanState::Ignored,
+                            0x1b => ScanState::Escape,
+                            _ => ScanState::Ground,
                         };
                         self.payload.clear();
                     }
-                    2 => match byte {
+                    ScanState::Osc => match byte {
                         7 => {
                             self.finish();
-                            self.state = 0;
+                            self.state = ScanState::Ground;
                         }
-                        0x1b => self.state = 3,
+                        0x1b => self.state = ScanState::OscEscape,
                         0x18 | 0x1a => {
                             self.payload.clear();
-                            self.state = 0;
+                            self.state = ScanState::Ground;
                         }
                         _ if self.payload.len() < self.payload_limit() => self.payload.push(byte),
                         _ => {
                             self.payload.clear();
-                            self.state = 4;
+                            self.state = ScanState::Ignored;
                         }
                     },
-                    3 => {
+                    ScanState::OscEscape => {
                         if byte == b'\\' {
                             self.finish();
-                            self.state = 0;
+                            self.state = ScanState::Ground;
                         } else {
                             self.payload.clear();
-                            self.state = if byte == 0x1b { 1 } else { 0 };
+                            self.state = if byte == 0x1b {
+                                ScanState::Escape
+                            } else {
+                                ScanState::Ground
+                            };
                         }
                     }
-                    4 => match byte {
-                        7 | 0x18 | 0x1a => self.state = 0,
-                        0x1b => self.state = 5,
+                    ScanState::Ignored => match byte {
+                        7 | 0x18 | 0x1a => self.state = ScanState::Ground,
+                        0x1b => self.state = ScanState::IgnoredEscape,
                         _ => {}
                     },
-                    5 => {
+                    ScanState::IgnoredEscape => {
                         self.state = if byte == b'\\' {
-                            0
+                            ScanState::Ground
                         } else if byte == 0x1b {
-                            5
+                            ScanState::IgnoredEscape
                         } else {
-                            4
+                            ScanState::Ignored
                         }
                     }
-                    _ => unreachable!(),
+                    ScanState::OscSkipped => unreachable!("the oracle keeps every payload"),
                 }
             }
         }

@@ -799,6 +799,10 @@ where
         &serde_json::json!({ "host": api.host_label }),
     )
     .await?;
+    // The current state, not only later changes: a phone that connects while
+    // the daemon is down must not keep the green dot `onopen` gave it.
+    let state = connection.borrow_and_update().label();
+    http::write_event(writer, "daemon", &serde_json::json!({ "state": state })).await?;
 
     loop {
         tokio::select! {
@@ -827,8 +831,10 @@ where
                 if changed.is_err() {
                     return Ok(());
                 }
-                let connected = matches!(*connection.borrow(), diri_client::ConnectionState::Connected(_));
-                let state = format!("{:?}", *connection.borrow());
+                let (state, connected) = {
+                    let current = connection.borrow_and_update();
+                    (current.label(), matches!(*current, diri_client::ConnectionState::Connected(_)))
+                };
                 if connected {
                     api.seed_turns(&mut turns).await;
                 }
@@ -989,6 +995,68 @@ mod tests {
             json!({"sessionID": "s_a", "turn": 2, "spoken": "Tests pass."})
         );
         server.abort();
+    }
+
+    /// A phone that opens the stream while the daemon is down used to keep
+    /// the green dot `onopen` set: no `daemon` event came until the state
+    /// next changed, and its text was a `Debug` rendering.
+    #[tokio::test]
+    async fn the_event_stream_starts_with_the_current_daemon_state() {
+        use tokio::io::{AsyncBufReadExt as _, BufReader as TokioBufReader};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let auth = Auth::temporary().unwrap();
+        let token = auth.token().to_owned();
+        let api = Arc::new(Api {
+            client: Arc::new(DaemonClient::with_socket_path(
+                "/nonexistent/diri-phone-test.sock",
+            )),
+            auth,
+            host_label: "test".into(),
+            inputs: Default::default(),
+            tailnet: None,
+        });
+        let server = tokio::spawn(serve_connections(listener, api));
+        let stream = TcpStream::connect(address).await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        write_half
+            .write_all(
+                format!(
+                    "GET /api/events HTTP/1.1\r\nHost: {address}\r\nX-Diri-Token: {token}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut lines = TokioBufReader::new(read_half).lines();
+        let mut events = Vec::new();
+        while events.len() < 2 {
+            let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+                .await
+                .expect("event in time")
+                .unwrap()
+                .expect("stream open");
+            if let Some(name) = line.strip_prefix("event: ") {
+                let data = lines.next_line().await.unwrap().unwrap();
+                events.push((name.to_owned(), data));
+            }
+        }
+        assert_eq!(events[0].0, "ready");
+        assert_eq!(events[1].0, "daemon");
+        let data: serde_json::Value =
+            serde_json::from_str(events[1].1.strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(data, json!({"state": "disconnected"}));
+        server.abort();
+    }
+
+    #[test]
+    fn connection_states_have_stable_wire_names() {
+        use diri_client::ConnectionState;
+        assert_eq!(ConnectionState::Connecting.label(), "connecting");
+        assert_eq!(
+            ConnectionState::Disconnected("socket missing".into()).label(),
+            "disconnected"
+        );
     }
 
     fn grid_frame(update: &diri_proto::grid::GridUpdate) -> Vec<u8> {
