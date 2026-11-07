@@ -1365,6 +1365,41 @@ impl ScrollbackRequest {
             Ok(())
         }
     }
+
+    /// Checks a Holder's answer against this request before anyone decodes
+    /// it: no more rows than asked for, a width a Helper terminal can have,
+    /// and no more payload than those rows could encode to. The row codec's
+    /// `decode_rows_bounded` then caps the expansion at `rows x cols`.
+    pub fn validate_response(
+        &self,
+        result: &crate::ReadScrollbackCellsResult,
+    ) -> Result<(), RemoteCodecError> {
+        let rows = usize::try_from(result.row_count)
+            .ok()
+            .filter(|_| result.row_count <= self.max_rows);
+        let cols = u16::try_from(result.cols)
+            .ok()
+            .filter(|cols| (1..=MAX_TERMINAL_COLS).contains(cols));
+        let valid = match (rows, cols) {
+            (Some(rows), Some(cols)) => {
+                result.first_row >= 0
+                    && result.metadata.len() <= rows
+                    && result.payload.len()
+                        <= rows.saturating_mul(crate::grid::GridRowCodec::max_row_len(usize::from(
+                            cols,
+                        )))
+            }
+            _ => false,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(RemoteCodecError::InvalidControlPayload {
+                kind: KIND_SCROLLBACK_RESPONSE,
+                detail: "scrollback response does not fit its request".into(),
+            })
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1938,7 +1973,7 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
             }
             let sequence = u64::from_be_bytes(payload[..8].try_into().expect("length checked"));
             let modes = payload[8];
-            let grid = GridUpdate::decode(&payload[FULL_SNAPSHOT_FIXED_BYTES..])?;
+            let grid = decode_remote_grid(&payload[FULL_SNAPSHOT_FIXED_BYTES..])?;
             validate_grid_update(&grid)?;
             if !grid.is_full_snapshot {
                 return Err(RemoteCodecError::InvalidFullSnapshot(
@@ -1963,7 +1998,7 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
             }
             let sequence = u64::from_be_bytes(payload[..8].try_into().expect("length checked"));
             let modes = payload[8];
-            let grid = GridUpdate::decode(&payload[9..])?;
+            let grid = decode_remote_grid(&payload[9..])?;
             validate_grid_update(&grid)?;
             if grid.is_full_snapshot {
                 return Err(RemoteCodecError::InvalidFullSnapshot(
@@ -2055,6 +2090,19 @@ fn validate_identifier(field: &'static str, value: &str) -> Result<(), RemoteCod
             value: value.to_string(),
         })
     }
+}
+
+/// Decodes a Holder grid only after its header dimensions pass
+/// [`validate_terminal_dimensions`], so the codec's rows-per-grid and
+/// cells-per-row bounds cap the expansion at [`MAX_TERMINAL_CELLS`].
+fn decode_remote_grid(payload: &[u8]) -> Result<GridUpdate, RemoteCodecError> {
+    if let [c0, c1, r0, r1, ..] = *payload {
+        let (cols, rows) = (u16::from_be_bytes([c0, c1]), u16::from_be_bytes([r0, r1]));
+        validate_terminal_dimensions(cols, rows).map_err(|error| {
+            RemoteCodecError::InvalidFullSnapshot(format!("grid dimensions are invalid: {error}"))
+        })?;
+    }
+    Ok(GridUpdate::decode(payload)?)
 }
 
 fn validate_grid_update(grid: &GridUpdate) -> Result<(), RemoteCodecError> {
@@ -2700,6 +2748,98 @@ mod tests {
             RemoteCodec::new().feed(&frame),
             Err(RemoteCodecError::InvalidFullSnapshot(_))
         ));
+    }
+
+    #[test]
+    fn forged_grid_dimensions_are_rejected_before_any_row_expands() {
+        // 65,535 rows of one 16-byte run of 65,535 cells: ~1.3 MB that once
+        // decoded to 4.3 billion cells before validation ran.
+        let mut grid = Vec::new();
+        for value in [u16::MAX, u16::MAX, 0, 0] {
+            grid.extend_from_slice(&value.to_be_bytes());
+        }
+        grid.push(2);
+        grid.extend_from_slice(&u16::MAX.to_be_bytes());
+        for y in 0..u16::MAX {
+            grid.extend_from_slice(&y.to_be_bytes());
+            grid.extend_from_slice(&1_u16.to_be_bytes());
+            grid.extend_from_slice(&u16::MAX.to_be_bytes());
+            grid.extend_from_slice(&[0; 14]);
+        }
+        for kind in [KIND_FULL_SNAPSHOT, KIND_GRID_DELTA] {
+            let mut payload = vec![0; 9];
+            payload.extend_from_slice(&grid);
+            let mut frame = vec![kind];
+            frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            frame.extend_from_slice(&payload);
+            let error = RemoteCodec::new()
+                .feed(&frame)
+                .expect_err("forged dimensions");
+            assert!(
+                matches!(&error, RemoteCodecError::InvalidFullSnapshot(detail) if detail.contains("dimensions")),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scrollback_responses_must_fit_their_request() {
+        let request = ScrollbackRequest {
+            request_id: 7,
+            first_row: 0,
+            max_rows: 2,
+        };
+        let rows = vec![vec![GridCell::BLANK; 80]; 2];
+        let honest = crate::ReadScrollbackCellsResult {
+            metadata: Vec::new(),
+            payload: crate::grid::GridRowCodec::encode_rows(&rows).expect("rows"),
+            first_row: 0,
+            row_count: 2,
+            total_rows: 2,
+            live_start_row: 0,
+            cols: 80,
+            content_seq: 1,
+        };
+        request.validate_response(&honest).expect("honest response");
+
+        let forged = [
+            crate::ReadScrollbackCellsResult {
+                row_count: 3,
+                ..honest.clone()
+            },
+            crate::ReadScrollbackCellsResult {
+                row_count: -1,
+                ..honest.clone()
+            },
+            crate::ReadScrollbackCellsResult {
+                cols: 0,
+                ..honest.clone()
+            },
+            crate::ReadScrollbackCellsResult {
+                cols: i64::from(MAX_TERMINAL_COLS) + 1,
+                ..honest.clone()
+            },
+            crate::ReadScrollbackCellsResult {
+                first_row: -1,
+                ..honest.clone()
+            },
+            crate::ReadScrollbackCellsResult {
+                payload: vec![0; 2 * crate::grid::GridRowCodec::max_row_len(80) + 1],
+                ..honest.clone()
+            },
+        ];
+        for result in forged {
+            assert!(
+                matches!(
+                    request.validate_response(&result),
+                    Err(RemoteCodecError::InvalidControlPayload {
+                        kind: KIND_SCROLLBACK_RESPONSE,
+                        ..
+                    })
+                ),
+                "{result:?}"
+            );
+        }
     }
 
     #[test]

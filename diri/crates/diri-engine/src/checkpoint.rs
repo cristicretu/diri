@@ -73,7 +73,14 @@ impl ScreenCheckpoint {
         if history_row_count > history_payload.len() / 2 {
             return None;
         }
-        let history = GridRowCodec::decode_rows(history_payload, history_row_count).ok()?;
+        let cols = usize::from(grid.cols);
+        let history = GridRowCodec::decode_rows_bounded(
+            history_payload,
+            history_row_count,
+            cols,
+            history_row_count.saturating_mul(cols),
+        )
+        .ok()?;
         if history
             .iter()
             .any(|row| row.len() != usize::from(grid.cols))
