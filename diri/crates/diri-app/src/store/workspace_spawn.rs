@@ -189,6 +189,7 @@ impl SessionStore {
             detail: detail.into(),
             retrying: false,
             retry: None,
+            owner: None,
         });
         self.emit(StoreEffect::UiChanged);
     }

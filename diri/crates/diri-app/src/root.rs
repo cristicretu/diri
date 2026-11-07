@@ -3769,9 +3769,11 @@ impl RootView {
         {
             // Collapsing a pane is UI-only: keep its daemon shell alive so
             // the next ⌘J restores the same scrollback and process state.
+            // A spawn it was waiting on no longer earns focus on arrival.
             self.auxiliary_terminal = None;
             self.auxiliary_id = None;
             self.auxiliary_parent = None;
+            self.auxiliary_spawn_parent = None;
             if let Some(inspector) = &self.inspector {
                 inspector.update(cx, |inspector, cx| inspector.set_terminal_surface(None, cx));
             }

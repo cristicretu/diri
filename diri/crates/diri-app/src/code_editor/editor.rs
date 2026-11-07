@@ -51,6 +51,31 @@ pub enum EditorEvent {
     Reload,
     /// The file was written.
     Saved,
+    /// A save finished after its document was switched away; the Files
+    /// surface applies it to that document wherever it now lives (a draft).
+    SavedAway(SavedAway),
+}
+
+/// A finished save whose document is no longer the one shown.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedAway {
+    pub document: DocumentId,
+    pub absolute_path: PathBuf,
+    /// The buffer version that was written; edits made after it stay dirty.
+    pub version: u64,
+    pub modified: Option<SystemTime>,
+}
+
+/// One document's identity for its lifetime. Buffer versions are per buffer
+/// and collide across documents, so async results key on this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DocumentId(u64);
+
+impl DocumentId {
+    pub(crate) fn fresh() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
 }
 
 /// One row the editor draws, all the same height.
@@ -63,6 +88,7 @@ pub(crate) enum Row {
 
 /// A file's editing state; it outlives the view while another file is shown.
 pub struct Document {
+    pub(crate) id: DocumentId,
     pub relative_path: PathBuf,
     pub absolute_path: PathBuf,
     pub language: SourceLanguage,
@@ -85,6 +111,7 @@ impl Document {
             )
         });
         Self {
+            id: DocumentId::fresh(),
             relative_path: snapshot.relative_path.clone(),
             absolute_path: snapshot.absolute_path.clone(),
             language: snapshot.language,
@@ -104,6 +131,19 @@ impl Document {
 
     pub fn text(&self) -> &str {
         self.buffer.text()
+    }
+
+    /// Applies a save that finished while this document was not shown.
+    /// Returns false when `saved` was for another document.
+    pub(crate) fn apply_saved_away(&mut self, saved: &SavedAway) -> bool {
+        if saved.document != self.id {
+            return false;
+        }
+        self.modified = saved.modified;
+        if self.buffer.version() == saved.version {
+            self.history.mark_saved();
+        }
+        true
     }
 }
 
@@ -309,10 +349,10 @@ impl CodeEditor {
         self.h_offset = px(0.0);
         self.marked = None;
         self.composing = None;
-        self.completion = None;
+        self.close_completion();
         self.hover = None;
         self.hover_pending = None;
-        self.signature = None;
+        self.close_signature();
         self.save_error = None;
         self.conflict = false;
         self.word_counts = None;
@@ -539,6 +579,20 @@ impl CodeEditor {
         self.restart_blink(cx);
     }
 
+    /// Closes the completion menu with its lookup, so a lookup still
+    /// running cannot reopen what Escape or a keystroke closed. Returns
+    /// whether the menu was open.
+    pub(crate) fn close_completion(&mut self) -> bool {
+        self._completion_task = None;
+        self.completion.take().is_some()
+    }
+
+    /// Closes signature help with its lookup; see [`Self::close_completion`].
+    pub(crate) fn close_signature(&mut self) -> bool {
+        self._signature_task = None;
+        self.signature.take().is_some()
+    }
+
     /// Completion and signature help follow the caret; leaving their word
     /// or call closes them.
     fn dismiss_transient_for_caret(&mut self) {
@@ -546,10 +600,10 @@ impl CodeEditor {
         if let Some(completion) = &self.completion
             && !(completion.word.start..=completion.word.end).contains(&head)
         {
-            self.completion = None;
+            self.close_completion();
         }
         if self.signature.is_some() && self.call_at_caret().is_none() {
-            self.signature = None;
+            self.close_signature();
         }
     }
 
@@ -679,10 +733,7 @@ impl CodeEditor {
 
     /// Escape: one cursor again, and nothing floating over the code.
     pub(crate) fn escape(&mut self, cx: &mut Context<Self>) {
-        if self.completion.take().is_some()
-            || self.signature.take().is_some()
-            || self.hover.take().is_some()
-        {
+        if self.close_completion() || self.close_signature() || self.hover.take().is_some() {
             cx.notify();
             return;
         }
@@ -1001,12 +1052,12 @@ impl CodeEditor {
         if super::buffer::is_word_char(ch) {
             self.update_completion(false, cx);
         } else {
-            self.completion = None;
+            self.close_completion();
         }
         if matches!(ch, '(' | ',') {
             self.update_signature(cx);
         } else if ch == ')' {
-            self.signature = None;
+            self.close_signature();
         }
     }
 
@@ -1112,7 +1163,7 @@ impl CodeEditor {
         let mut carets = carets;
         let lead = carets.remove(primary_index);
         carets.push(lead);
-        self.completion = None;
+        self.close_completion();
         self.apply_with(edits, carets, false, cx);
     }
 
@@ -1692,21 +1743,34 @@ impl CodeEditor {
         let text = doc.buffer.text().to_string();
         let expected = doc.modified;
         let version = doc.buffer.version();
+        let document = doc.id;
+        let absolute_path = doc.absolute_path.clone();
         self._save_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move { intelligence.save_file(&relative, &text, expected, force) })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                let saved = SavedAway {
+                    document,
+                    absolute_path,
+                    version,
+                    modified: result.as_ref().ok().copied().flatten(),
+                };
+                if this.doc.as_ref().is_none_or(|doc| doc.id != document) {
+                    // The saved document was switched away: its outcome
+                    // belongs to it, not to whatever is shown now.
+                    if result.is_ok() {
+                        cx.emit(EditorEvent::SavedAway(saved));
+                    }
+                    return;
+                }
                 match result {
-                    Ok(modified) => {
+                    Ok(_) => {
                         this.conflict = false;
                         this.save_error = None;
                         if let Some(doc) = this.doc.as_mut() {
-                            doc.modified = modified;
-                            if doc.buffer.version() == version {
-                                doc.history.mark_saved();
-                            }
+                            doc.apply_saved_away(&saved);
                         }
                         let dirty = this.is_dirty();
                         if dirty != this.was_dirty {
@@ -1750,7 +1814,7 @@ impl CodeEditor {
     /// this file now, workspace symbols when the index answers.
     pub(crate) fn update_completion(&mut self, explicit: bool, cx: &mut Context<Self>) {
         let Some(word) = self.word_before_caret() else {
-            self.completion = None;
+            self.close_completion();
             cx.notify();
             return;
         };
@@ -1761,7 +1825,7 @@ impl CodeEditor {
         if (prefix.chars().count() < 2 && !explicit)
             || prefix.starts_with(|ch: char| ch.is_ascii_digit())
         {
-            self.completion = None;
+            self.close_completion();
             cx.notify();
             return;
         }
@@ -1844,6 +1908,7 @@ impl CodeEditor {
     }
 
     pub(crate) fn accept_completion(&mut self, cx: &mut Context<Self>) -> bool {
+        self._completion_task = None;
         let Some(completion) = self.completion.take() else {
             return false;
         };
@@ -1886,7 +1951,7 @@ impl CodeEditor {
     /// Looks up the callee's declaration for signature help.
     pub(crate) fn update_signature(&mut self, cx: &mut Context<Self>) {
         let Some((name, argument)) = self.call_at_caret() else {
-            self.signature = None;
+            self.close_signature();
             cx.notify();
             return;
         };

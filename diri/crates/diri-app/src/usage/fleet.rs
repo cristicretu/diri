@@ -41,9 +41,12 @@ pub async fn merge_fleet_usage(mut snapshot: UsageSnapshot, home: &Path) -> Usag
             .flatten()
         });
     }
-    while let Some(Ok(Some((today, month)))) = tasks.join_next().await {
-        merge_window(&mut snapshot.claude, &today, &month, ProviderKind::Claude);
-        merge_window(&mut snapshot.codex, &today, &month, ProviderKind::Codex);
+    // One unreachable host must not drop the hosts that answer after it.
+    while let Some(joined) = tasks.join_next().await {
+        if let Ok(Some((today, month))) = joined {
+            merge_window(&mut snapshot.claude, &today, &month, ProviderKind::Claude);
+            merge_window(&mut snapshot.codex, &today, &month, ProviderKind::Codex);
+        }
     }
     snapshot
 }
