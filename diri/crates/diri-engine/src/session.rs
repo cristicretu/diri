@@ -481,6 +481,10 @@ struct Shared {
     /// tree's PTY wedges (nobody drains the slave; the buffer fills), so
     /// input is queued instead and flushed right after SIGCONT.
     input_gate: Mutex<InputGate>,
+    /// Bytes acknowledged while a deferred launch was pending that never
+    /// reached the child (launch failed, or the post-exec flush did not
+    /// finish). Zero when nothing was lost.
+    lost_launch_input: std::sync::atomic::AtomicU64,
     /// The child's pid, for tree enumeration by the resource governor.
     child_pid: std::sync::atomic::AtomicI32,
     /// The remote Holder's grid is display-authoritative. Raw output still
@@ -732,6 +736,31 @@ impl std::fmt::Display for InputModesUnavailable {
     }
 }
 impl std::error::Error for InputModesUnavailable {}
+
+/// Input that did not fully reach the child: exactly the first `delivered`
+/// of `total` bytes did. Retrying must resend only the tail.
+#[derive(Debug)]
+pub(crate) struct PartialInputDelivery {
+    pub delivered: u64,
+    pub total: u64,
+    pub reason: String,
+}
+impl std::fmt::Display for PartialInputDelivery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "input delivered {} of {} bytes: {}",
+            self.delivered, self.total, self.reason
+        )
+    }
+}
+impl std::error::Error for PartialInputDelivery {}
+
+impl PartialInputDelivery {
+    fn into_io(self) -> std::io::Error {
+        std::io::Error::other(self)
+    }
+}
 
 /// One bounded staged input-state record, committed with its matching grid.
 #[derive(Default)]
@@ -1823,6 +1852,20 @@ struct DeferredState {
     queued_input: Vec<u8>,
     launched: bool,
     cancelled: bool,
+    /// The launch failed: there is no child and never will be, so input
+    /// can no longer be accepted on its behalf.
+    failed: bool,
+}
+
+/// Where [`DeferredLaunch::queue_input`] put the bytes.
+#[derive(Debug, PartialEq)]
+enum DeferredInput {
+    /// Held for the post-exec flush.
+    Queued,
+    /// The child exists: write through.
+    Launched,
+    /// The launch failed; the bytes were not accepted.
+    LaunchFailed,
 }
 
 impl DeferredLaunch {
@@ -1834,6 +1877,7 @@ impl DeferredLaunch {
                 queued_input: Vec::new(),
                 launched: false,
                 cancelled: false,
+                failed: false,
             }),
             cond: std::sync::Condvar::new(),
         }
@@ -1858,14 +1902,26 @@ impl DeferredLaunch {
         true
     }
 
-    /// Queues input while unlaunched. False once launched: write through.
-    fn queue_input(&self, bytes: &[u8]) -> bool {
+    /// Queues input while unlaunched; once launched the caller writes
+    /// through, and after a failed launch the input is refused.
+    fn queue_input(&self, bytes: &[u8]) -> DeferredInput {
         let mut state = self.state.lock().expect("deferred");
         if state.launched {
-            return false;
+            return DeferredInput::Launched;
+        }
+        if state.failed {
+            return DeferredInput::LaunchFailed;
         }
         state.queued_input.extend_from_slice(bytes);
-        true
+        DeferredInput::Queued
+    }
+
+    /// Records a failed launch and hands back the input that was accepted
+    /// for it and will now never be delivered.
+    fn fail_launch(&self) -> Vec<u8> {
+        let mut state = self.state.lock().expect("deferred");
+        state.failed = true;
+        std::mem::take(&mut state.queued_input)
     }
 
     /// Blocks until the debounce window closes and returns the launch size;
@@ -2427,6 +2483,12 @@ impl Session {
                     if let Err(error) = HolderLauncher::launch(&holder.executable, &paths, &launch)
                     {
                         mark_launch_failed(&shared, "holder_launch", &error);
+                        report_lost_launch_input(
+                            &shared,
+                            "holder_launch",
+                            &deferred.fail_launch(),
+                            0,
+                        );
                         return;
                     }
                     let (floor, stat) =
@@ -2434,6 +2496,12 @@ impl Session {
                             Ok(ready) => ready,
                             Err(error) => {
                                 mark_launch_failed(&shared, "holder_wait", &error);
+                                report_lost_launch_input(
+                                    &shared,
+                                    "holder_wait",
+                                    &deferred.fail_launch(),
+                                    0,
+                                );
                                 stop_late_holder(&shared, &client);
                                 return;
                             }
@@ -2478,8 +2546,19 @@ impl Session {
                         let _ = client.kill_tree();
                         return;
                     };
-                    if !handoff.queued_input.is_empty() {
-                        let _ = client.write(&handoff.queued_input);
+                    if !handoff.queued_input.is_empty()
+                        && let Err(error) = client.write(&handoff.queued_input)
+                    {
+                        let delivered = match error {
+                            crate::holder::HolderError::PartialWrite { written, .. } => written,
+                            _ => 0,
+                        };
+                        report_lost_launch_input(
+                            &shared,
+                            "flush",
+                            &handoff.queued_input,
+                            delivered,
+                        );
                     }
                     if let Some((cols, rows)) = handoff.late_size {
                         // A size proposed while the exec was in flight: apply
@@ -3236,6 +3315,12 @@ impl Session {
         }
     }
 
+    /// Bytes accepted before a deferred launch that never reached the
+    /// child; see [`Shared::lost_launch_input`].
+    pub fn lost_launch_input(&self) -> u64 {
+        self.shared.lost_launch_input.load(Ordering::SeqCst)
+    }
+
     /// Marks the session hibernated (input queues) or awake. On wake, the
     /// queued input flushes in order — right after the caller's SIGCONT, as
     /// the Swift daemon's wake() did.
@@ -3293,10 +3378,12 @@ impl Session {
     /// Writes past the input gate, still honouring a deferred launch's
     /// queue, which comes first in [`Self::write_raw_kind`] too.
     fn write_ungated(&self, bytes: &[u8]) -> std::io::Result<()> {
-        if let Some(deferred) = &self.deferred
-            && deferred.queue_input(bytes)
-        {
-            return Ok(());
+        if let Some(deferred) = &self.deferred {
+            match deferred.queue_input(bytes) {
+                DeferredInput::Queued => return Ok(()),
+                DeferredInput::LaunchFailed => return Err(launch_failed_input(bytes)),
+                DeferredInput::Launched => {}
+            }
         }
         self.write_transport(bytes, false)
     }
@@ -3381,10 +3468,12 @@ impl Session {
     fn write_raw_kind(&self, bytes: &[u8], mouse: bool) -> std::io::Result<()> {
         // Before the deferred exec there is no PTY: queue for the launch
         // flush, exactly like the Swift daemon's `queuedLaunchInput`.
-        if let Some(deferred) = &self.deferred
-            && deferred.queue_input(bytes)
-        {
-            return Ok(());
+        if let Some(deferred) = &self.deferred {
+            match deferred.queue_input(bytes) {
+                DeferredInput::Queued => return Ok(()),
+                DeferredInput::LaunchFailed => return Err(launch_failed_input(bytes)),
+                DeferredInput::Launched => {}
+            }
         }
         if self.queue_if_gated(bytes) {
             return Ok(());
@@ -3498,11 +3587,15 @@ impl Session {
         self.observe_prompt_input(bytes);
         // Typed before the deferred exec: queue for the launch flush, and
         // still count as a keystroke for the reducer.
-        if let Some(deferred) = &self.deferred
-            && deferred.queue_input(bytes)
-        {
-            self.feed_signal(StatusSignal::UserKeystroke);
-            return Ok(());
+        if let Some(deferred) = &self.deferred {
+            match deferred.queue_input(bytes) {
+                DeferredInput::Queued => {
+                    self.feed_signal(StatusSignal::UserKeystroke);
+                    return Ok(());
+                }
+                DeferredInput::LaunchFailed => return Err(launch_failed_input(bytes)),
+                DeferredInput::Launched => {}
+            }
         }
         if self.queue_if_gated(bytes) {
             // Never write into a stopped tree's PTY (nobody drains the slave;
@@ -4091,6 +4184,7 @@ fn new_shared(
         last_interaction: AtomicU64::new(0),
         artifacts: Mutex::new(Vec::new()),
         input_gate: Mutex::new(InputGate::Open),
+        lost_launch_input: std::sync::atomic::AtomicU64::new(0),
         child_pid: std::sync::atomic::AtomicI32::new(0),
         remote_grid: Mutex::new(None),
         remote_output_offset: AtomicU64::new(0),
@@ -4217,7 +4311,29 @@ fn stop_late_holder(shared: &Shared, client: &HolderClient) {
 }
 
 fn holder_io_error(error: crate::holder::HolderError) -> std::io::Error {
-    std::io::Error::other(error.to_string())
+    match error {
+        crate::holder::HolderError::PartialWrite {
+            written,
+            total,
+            reason,
+        } => PartialInputDelivery {
+            delivered: written,
+            total,
+            reason,
+        }
+        .into_io(),
+        error => std::io::Error::other(error.to_string()),
+    }
+}
+
+/// Input refused because the deferred launch it was waiting for failed.
+fn launch_failed_input(bytes: &[u8]) -> std::io::Error {
+    PartialInputDelivery {
+        delivered: 0,
+        total: bytes.len() as u64,
+        reason: "the session failed to launch".into(),
+    }
+    .into_io()
 }
 
 /// Replaces control characters other than `\n`, `\r` and `\t` with a space,
@@ -7930,6 +8046,28 @@ fn watch_early_return_to_shell(shared: &Arc<Shared>, client: &HolderClient) {
 
 /// Records a deferred launch that never produced a child: the session
 /// reports exit 127, the spawn-failure convention the app already knows.
+/// Input typed before a deferred exec was acknowledged to its writer, then
+/// never (fully) reached the child. The writer has long returned, so this is
+/// the session's record of it: which stage lost it and how much did arrive.
+/// Only sizes are recorded, never the bytes, which may be a secret.
+fn report_lost_launch_input(shared: &Shared, stage: &'static str, queued: &[u8], delivered: u64) {
+    if queued.is_empty() {
+        return;
+    }
+    diri_telemetry::incident!(
+        "session.launch_input_lost",
+        session = diri_telemetry::id(&shared.id),
+        agent = diri_telemetry::id(&shared.agent),
+        stage = stage,
+        queued_bytes = queued.len(),
+        delivered_bytes = delivered,
+    );
+    shared.lost_launch_input.store(
+        queued.len() as u64 - delivered.min(queued.len() as u64),
+        Ordering::SeqCst,
+    );
+}
+
 fn mark_launch_failed(shared: &Shared, stage: &'static str, error: &crate::holder::HolderError) {
     diri_telemetry::incident!(
         "session.launch_failed",
@@ -10742,6 +10880,57 @@ mod remote_reconnect_delay_tests {
             delay = next_remote_reconnect_delay(delay, attempt);
         }
         assert_eq!(delay, REMOTE_UNREACHABLE_MAX);
+    }
+}
+
+#[cfg(test)]
+mod deferred_input_loss_tests {
+    use super::*;
+
+    /// Input typed before a deferred exec is acknowledged at once and
+    /// flushed after the exec. When the exec fails there is nothing to flush
+    /// into: the session records how much accepted input was lost, and later
+    /// input is refused as undelivered instead of being queued forever.
+    #[test]
+    fn a_failed_deferred_launch_reports_the_queued_input_it_lost() {
+        let temp = tempfile::tempdir().unwrap();
+        let (engine, _) = ManifestEngine::load_dir(&crate::detect::bundled_manifest_dir()).unwrap();
+        let spec = SessionSpec {
+            id: "s_lost_launch_input".into(),
+            pty: PtySpec::new(vec!["/bin/sh".into()], "/tmp"),
+            manifest_id: "shell".into(),
+            authority: Authority::ProcessOnly,
+            logs_dir: temp.path().to_path_buf(),
+            holder: Some(HolderConfig {
+                holders_dir: temp.path().join("holders"),
+                executable: temp.path().join("no-such-holder"),
+            }),
+            remote: None,
+            defer_launch: true,
+        };
+        let session = Session::spawn(spec, Arc::new(engine)).unwrap();
+        session.write_input(b"echo typed early\r").unwrap();
+        assert_eq!(session.lost_launch_input(), 0);
+
+        assert!(session.launch_at(80, 24));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while session.lost_launch_input() == 0 {
+            assert!(Instant::now() < deadline, "launch failure never reported");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            session.lost_launch_input(),
+            b"echo typed early\r".len() as u64
+        );
+
+        let error = session
+            .write_raw(b"late")
+            .expect_err("no child will ever read this");
+        let partial = error
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<PartialInputDelivery>())
+            .expect("a delivery count");
+        assert_eq!((partial.delivered, partial.total), (0, 4));
     }
 }
 

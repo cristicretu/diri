@@ -15,10 +15,10 @@ use base64::Engine as _;
 
 use super::protocol::{
     HOLDER_OUTPUT_MAX_FRAME, HOLDER_OUTPUT_STREAM_VERSION, HOLDER_STREAM_ACK, HOLDER_STREAM_INPUT,
-    HOLDER_STREAM_MAX_PAYLOAD, HOLDER_STREAM_RESIZE, HOLDER_STREAM_RESIZE_PIXELS,
-    HOLDER_STREAM_VERSION, HOLDER_STREAM_VERSION_PIXELS, HolderLaunchSpec, HolderManagerRequest,
-    HolderManagerResponse, HolderOperation, HolderProcessSample, HolderRequest, HolderResponse,
-    HolderStat,
+    HOLDER_STREAM_MAX_PAYLOAD, HOLDER_STREAM_PARTIAL, HOLDER_STREAM_RESIZE,
+    HOLDER_STREAM_RESIZE_PIXELS, HOLDER_STREAM_VERSION, HOLDER_STREAM_VERSION_PIXELS,
+    HolderLaunchSpec, HolderManagerRequest, HolderManagerResponse, HolderOperation,
+    HolderProcessSample, HolderRequest, HolderResponse, HolderStat,
 };
 use super::socket;
 use super::{HolderError, HolderResult};
@@ -110,7 +110,9 @@ impl HolderClient {
         }
     }
 
-    /// Sends bytes to the held child, as if typed.
+    /// Sends bytes to the held child, as if typed. A
+    /// [`HolderError::PartialWrite`] says exactly how many leading bytes the
+    /// child received; the caller must not resend those.
     pub fn write(&self, data: &[u8]) -> HolderResult<()> {
         if self.send_stream(HOLDER_STREAM_INPUT, data)? {
             return Ok(());
@@ -121,7 +123,21 @@ impl HolderClient {
     fn write_legacy(&self, data: &[u8]) -> HolderResult<()> {
         let mut request = HolderRequest::op(HolderOperation::Write);
         request.data = Some(base64::engine::general_purpose::STANDARD.encode(data));
-        self.request(&request).map(drop)
+        let mut stream = socket::connect(&self.socket_path)?;
+        socket::write_json_line(&mut stream, &request)?;
+        let response: HolderResponse = socket::read_json_line(&mut stream)?;
+        if response.ok {
+            return Ok(());
+        }
+        let reason = response.error.unwrap_or_else(|| "unknown error".into());
+        Err(match response.written {
+            Some(written) => HolderError::PartialWrite {
+                written,
+                total: data.len() as u64,
+                reason,
+            },
+            None => HolderError::Rejected(reason),
+        })
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> HolderResult<()> {
@@ -305,8 +321,23 @@ impl HolderClient {
         let sent = self.with_stream(|stream| {
             let mut chunks = payload.chunks(HOLDER_STREAM_MAX_PAYLOAD);
             let first = chunks.next().unwrap_or_default();
+            let mut delivered = 0_u64;
             for chunk in std::iter::once(first).chain(chunks) {
-                stream.send(kind, chunk)?;
+                match stream.send(kind, chunk) {
+                    Ok(()) => delivered += chunk.len() as u64,
+                    // Earlier chunks were acknowledged whole: the count is
+                    // of the paste, not of the failing chunk.
+                    Err(HolderError::PartialWrite {
+                        written, reason, ..
+                    }) => {
+                        return Err(HolderError::PartialWrite {
+                            written: delivered + written,
+                            total: payload.len() as u64,
+                            reason,
+                        });
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             Ok(())
         })?;
@@ -677,6 +708,17 @@ impl HolderInputStream {
         self.stream
             .read_exact(&mut acknowledgement)
             .map_err(|error| HolderError::io("read input acknowledgement", error))?;
+        if acknowledgement[0] == HOLDER_STREAM_PARTIAL {
+            let mut written = [0_u8; 8];
+            self.stream
+                .read_exact(&mut written)
+                .map_err(|error| HolderError::io("read input acknowledgement", error))?;
+            return Err(HolderError::PartialWrite {
+                written: u64::from_be_bytes(written).min(payload.len() as u64),
+                total: payload.len() as u64,
+                reason: "the Holder could not write the whole frame to the PTY".into(),
+            });
+        }
         if acknowledgement[0] != HOLDER_STREAM_ACK {
             return Err(HolderError::Rejected(format!(
                 "input stream returned acknowledgement {}",

@@ -6356,6 +6356,19 @@ fn io_control_error(error: std::io::Error) -> ControlError {
     {
         return ControlError::new("input_modes_unavailable", error.to_string());
     }
+    if let Some(partial) = error
+        .get_ref()
+        .and_then(|cause| cause.downcast_ref::<crate::session::PartialInputDelivery>())
+    {
+        // Retrying the whole input would duplicate a delivered prefix, so
+        // the caller is told exactly how much arrived.
+        let code = if partial.delivered == 0 {
+            "input_not_delivered"
+        } else {
+            "input_partially_delivered"
+        };
+        return ControlError::new(code, partial.to_string());
+    }
     if error
         .get_ref()
         .is_some_and(|cause| cause.is::<crate::remote::client::RemoteTransportFailed>())
