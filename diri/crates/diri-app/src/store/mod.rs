@@ -1624,7 +1624,18 @@ impl SessionStore {
     /// New ids are appended in arrival order — the same order the projection
     /// falls back to — so materialising the order never moves a single row.
     /// Runs on membership changes only, and reports whether it wrote anything.
+    ///
+    /// Pruning is only sound against the full session list. Before the first
+    /// `session.list` lands, `self.sessions` holds whatever events raced ahead
+    /// of it (one `session.updated` is enough), so reconciling then would cut
+    /// the saved order, pins and collapsed rows down to that one session and
+    /// write the loss to prefs.json. An empty list is no better evidence: a
+    /// wiped state or the wrong daemon must not erase the layout either, and
+    /// rows for ids that are gone are harmless until a real list prunes them.
     fn reconcile_sidebar_order(&mut self) -> bool {
+        if !self.session_list_hydrated || self.sessions.is_empty() {
+            return false;
+        }
         let live_sessions: HashSet<&SessionId> = self.sessions.keys().collect();
         let live_projects: HashSet<&ProjectId> = self.projects.keys().collect();
         let mut arrivals: Vec<(f64, &SessionId)> = self
