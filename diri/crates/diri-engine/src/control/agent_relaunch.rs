@@ -65,6 +65,8 @@ impl ControlServer {
     /// conversation starts fresh and one launched to resume resumes the same
     /// id again; never `resume --last`, which could pick another tab's thread.
     pub(super) fn relaunch_agent(&self, id: &str) -> Result<(), ControlError> {
+        // Every launch holds the account gate (see account_gate.rs).
+        let _launch = self.launch_permit()?;
         let _operation = account_handoff::SessionOperation::for_session(self, id)?;
         let (record, mut spec) = {
             let registry = self.registry.lock().map_err(poisoned)?;

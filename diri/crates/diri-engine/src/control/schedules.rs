@@ -1076,7 +1076,7 @@ impl super::ControlServer {
         info: &diri_proto::schedules::ScheduledRunInfo,
     ) -> (Option<String>, Result<(), ControlError>) {
         let attempt = || {
-            let _account = self.account_operations.try_read().map_err(|_| {
+            let _account = self.account_gate.permit().ok_or_else(|| {
                 ControlError::new(
                     "busy",
                     "An account switch is in progress. Retry when it finishes.",

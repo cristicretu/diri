@@ -582,7 +582,7 @@ impl ControlServer {
         catalog: &mut AgentAccountCatalog,
         knowns: &[(String, Known)],
     ) -> bool {
-        let Ok(_shared) = self.account_operations.try_read() else {
+        let Some(_shared) = self.account_gate.permit() else {
             return false;
         };
         // Decide against the catalog as it is now, under its lock: the user

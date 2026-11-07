@@ -100,6 +100,8 @@ impl ControlServer {
         } in prepared
         {
             let change = (|| {
+                // Nested under this switch's exclusive hold (see account_gate.rs).
+                let _launch = self.launch_permit()?;
                 let mut registry = self.registry.lock().map_err(poisoned)?;
                 if installed {
                     registry.update_record(&record.id.0, |r| {
