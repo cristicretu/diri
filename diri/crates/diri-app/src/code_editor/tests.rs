@@ -400,7 +400,7 @@ fn escape_closes_completion_and_its_lookup_for_good(cx: &mut TestAppContext) {
     std::fs::write(workspace.path().join("lib.rs"), "fn alphabet() {}\n").unwrap();
     let intelligence = std::sync::Arc::new(
         crate::code_intelligence::CodeIntelligence::for_session(
-            &workspace.path().canonicalize().unwrap(),
+            workspace.path().canonicalize().unwrap(),
         )
         .unwrap(),
     );

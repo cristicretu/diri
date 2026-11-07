@@ -657,19 +657,21 @@ mod tests {
 
     #[test]
     fn a_resolved_entry_cannot_be_marked_unread_again() {
-        let mut feed = NotificationFeed::default();
-        feed.entries = vec![NotificationEntry {
-            id: "n".into(),
-            session_id: SessionId::new("a"),
-            incarnation: 0,
-            kind: NotificationKind::NeedsInput,
-            title: String::new(),
-            body: String::new(),
-            created_at_ms: 0,
-            read: true,
-            resolved: true,
-            blocker: String::new(),
-        }];
+        let mut feed = NotificationFeed {
+            entries: vec![NotificationEntry {
+                id: "n".into(),
+                session_id: SessionId::new("a"),
+                incarnation: 0,
+                kind: NotificationKind::NeedsInput,
+                title: String::new(),
+                body: String::new(),
+                created_at_ms: 0,
+                read: true,
+                resolved: true,
+                blocker: String::new(),
+            }],
+            ..NotificationFeed::default()
+        };
         assert!(!feed.set_read("n", false));
         assert_eq!(feed.unread_count(), 0, "the badge stays gone");
         // An unresolved entry still toggles both ways.

@@ -152,6 +152,7 @@ impl PhoneStartSlot {
         self.pending.take().is_some()
     }
 
+    #[cfg(test)]
     pub fn is_pending(&self) -> bool {
         self.pending.is_some()
     }
