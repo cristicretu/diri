@@ -94,7 +94,13 @@ const COALESCE_MS: u64 = 1_200;
 pub enum Turn {
     Kind(BlockKind),
     Divider,
+    /// A Mermaid diagram: a code block fenced `mermaid`.
+    Diagram,
 }
+
+/// What an empty block turned into a diagram starts with, so it draws at
+/// once and shows the syntax.
+pub const DIAGRAM_STARTER: &str = "flowchart LR\n  A[Idea] --> B[Plan] --> C[Ship]";
 
 pub struct Editor {
     blocks: Vec<Block>,
@@ -1295,13 +1301,47 @@ impl Editor {
                         continue;
                     }
                     let text = block.text.clone();
+                    let was_diagram = block.is_diagram();
                     block.set_kind(kind);
                     if kind == BlockKind::Code {
                         block.text = text;
+                        // Code is plain code: a diagram turns back into
+                        // its source. Any other fence keeps its language.
+                        if was_diagram {
+                            block.info.clear();
+                        }
                     }
                 }
                 let selection = self.selection;
                 self.set_selection(selection);
+            }
+            Turn::Diagram => {
+                let mut seeded = None;
+                for index in range {
+                    let block = &mut self.blocks[index];
+                    if index == 0 || block.kind.is_atomic() || block.kind.is_cell() {
+                        continue;
+                    }
+                    let text = block.text.clone();
+                    block.set_kind(BlockKind::Code);
+                    block.info = crate::doc::DIAGRAM_LANG.to_owned();
+                    block.text = if text.trim().is_empty() {
+                        seeded = Some(index);
+                        DIAGRAM_STARTER.to_owned()
+                    } else {
+                        text
+                    };
+                }
+                match seeded {
+                    Some(index) => {
+                        let end = self.blocks[index].text.len();
+                        self.set_selection(Selection::caret(Pos::new(index, end)));
+                    }
+                    None => {
+                        let selection = self.selection;
+                        self.set_selection(selection);
+                    }
+                }
             }
         }
         self.changed();
@@ -2630,5 +2670,49 @@ mod tests {
         e.move_blocks(false, 0);
         let texts: Vec<&str> = e.blocks().iter().map(|b| b.text.as_str()).collect();
         assert_eq!(texts, ["T", "one", "a", "b", "1", "2", "two"]);
+    }
+
+    #[test]
+    fn an_empty_block_turns_into_a_starter_diagram() {
+        let mut e = editor("# T\n\n&nbsp;\n");
+        e.set_caret(Pos::new(1, 0));
+        e.turn_into(Turn::Diagram, 0);
+        assert!(e.block(1).is_diagram());
+        assert_eq!(e.block(1).text, DIAGRAM_STARTER);
+        assert_eq!(e.selection.head, Pos::new(1, DIAGRAM_STARTER.len()));
+        assert!(
+            markdown::write(&markdown::FrontMatter::default(), &e.document())
+                .contains("```mermaid\nflowchart LR")
+        );
+    }
+
+    #[test]
+    fn code_keeps_another_fence_language() {
+        let mut e = editor("# T\n\n```rust title=main.rs\nfn main() {}\n```\n");
+        e.set_caret(Pos::new(1, 0));
+        e.turn_into(Turn::Kind(BlockKind::Code), 0);
+        assert_eq!(e.block(1).info, "rust title=main.rs");
+        assert!(
+            markdown::write(&markdown::FrontMatter::default(), &e.document())
+                .contains("```rust title=main.rs\nfn main() {}")
+        );
+    }
+
+    #[test]
+    fn code_turns_a_diagram_back_into_its_source() {
+        let mut e = editor("# T\n\n```mermaid\ngraph TD; A-->B\n```\n");
+        assert!(e.block(1).is_diagram());
+        e.set_caret(Pos::new(1, 0));
+        e.turn_into(Turn::Kind(BlockKind::Code), 0);
+        assert_eq!(e.block(1).kind, BlockKind::Code);
+        assert!(!e.block(1).is_diagram());
+        assert_eq!(e.block(1).text, "graph TD; A-->B");
+        // A paragraph keeps the text and drops the fence's language.
+        e.turn_into(Turn::Diagram, 0);
+        assert!(e.block(1).is_diagram());
+        e.turn_into(Turn::Kind(BlockKind::Paragraph), 0);
+        assert_eq!(e.block(1).info, "");
+        assert!(e.undo());
+        assert!(e.block(1).is_diagram());
     }
 }

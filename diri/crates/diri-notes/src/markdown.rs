@@ -97,6 +97,9 @@ fn parse_blocks(lines: &[&str]) -> Vec<Block> {
             continue;
         }
         if let Some(fence) = fence_of(trimmed) {
+            let info = trimmed
+                .trim_start_matches(fence.as_bytes()[0] as char)
+                .trim();
             let mut code = Vec::new();
             i += 1;
             while i < lines.len() && !lines[i].trim_start().starts_with(fence) {
@@ -104,7 +107,7 @@ fn parse_blocks(lines: &[&str]) -> Vec<Block> {
                 i += 1;
             }
             i += 1; // closing fence
-            blocks.push(Block::new(0, BlockKind::Code, code.join("\n")));
+            blocks.push(Block::code(0, info, code.join("\n")));
             continue;
         }
         if is_divider(trimmed) {
@@ -768,12 +771,16 @@ fn write_block(out: &mut String, doc: &Document, index: usize, block: &Block) {
             out.push_str(&quoted.join("\n"));
         }
         BlockKind::Code => {
-            let fence = if block.text.contains("```") {
+            // An info string is one line, and a backtick fence's cannot hold
+            // a backtick.
+            let info = block.info.split_whitespace().collect::<Vec<_>>().join(" ");
+            let fence = if block.text.contains("```") || info.contains('`') {
                 "~~~"
             } else {
                 "```"
             };
             out.push_str(fence);
+            out.push_str(&info);
             out.push('\n');
             out.push_str(&block.text);
             out.push('\n');
@@ -1267,6 +1274,7 @@ mod tests {
                 x.kind == y.kind
                     && x.indent == y.indent
                     && x.text == y.text
+                    && x.info == y.info
                     && visible(x) == visible(y)
             })
     }
@@ -1283,6 +1291,34 @@ mod tests {
 
     fn b(kind: BlockKind, text: &str) -> Block {
         Block::new(0, kind, text)
+    }
+
+    #[test]
+    fn a_code_fence_keeps_its_info_string() {
+        let src = "# D\n\n```mermaid\nflowchart LR\n  A --> B\n```\n\n~~~rust title=main.rs\nfn main() {}\n~~~\n\n```\nplain\n```\n";
+        let (_, doc) = parse(src);
+        assert_eq!(doc.blocks[0].info, "mermaid");
+        assert!(doc.blocks[0].is_diagram());
+        assert_eq!(doc.blocks[0].text, "flowchart LR\n  A --> B");
+        assert_eq!(doc.blocks[1].info, "rust title=main.rs");
+        assert_eq!(doc.blocks[1].lang(), "rust");
+        assert!(!doc.blocks[1].is_diagram());
+        assert_eq!(doc.blocks[2].info, "");
+        let text = write(&FrontMatter::default(), &doc);
+        assert!(text.contains("```mermaid\nflowchart LR"), "{text}");
+        assert!(
+            text.contains("```rust title=main.rs\nfn main() {}"),
+            "{text}"
+        );
+        round_trip(&doc);
+    }
+
+    #[test]
+    fn an_info_string_with_a_backtick_uses_a_tilde_fence() {
+        let doc = Document::new("D", vec![Block::code(0, "odd`lang", "x")]);
+        let text = write(&FrontMatter::default(), &doc);
+        assert!(text.contains("~~~odd`lang\nx\n~~~"), "{text}");
+        round_trip(&doc);
     }
 
     #[test]

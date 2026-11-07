@@ -33,7 +33,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub use health::{ProcessStats, register_gauge, start_health_sampler};
 pub use identity::{Config, Identity, login_name, support_id, telemetry_dir};
 pub use metrics::{count, observe, observe_ms};
-pub use panic::{install_panic_hook, signature_id};
+pub use panic::{catch_expected, install_panic_hook, signature_id};
 pub use redact::scrub;
 pub use value::{AgentClass, Id, Text, Value, agent_class, id, io_error, path_hash, text};
 
