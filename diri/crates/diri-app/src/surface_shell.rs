@@ -576,6 +576,9 @@ pub struct UtilitySurfaces {
     schedules: gpui::Entity<crate::schedules_page::SchedulesPage>,
     accounts: AccountsState,
     phone_access: Option<crate::phone_access::PhoneAccess>,
+    /// The in-flight gateway start, so a stop while it runs makes its
+    /// result stale instead of installing a gateway with the old rule.
+    phone_start: crate::phone_access::PhoneStartSlot,
     phone_loading: bool,
     phone_error: Option<String>,
     phone_setup: Option<crate::phone_access::TailscaleSetup>,
@@ -838,6 +841,7 @@ impl UtilitySurfaces {
             schedules,
             accounts: AccountsState::default(),
             phone_access: None,
+            phone_start: crate::phone_access::PhoneStartSlot::default(),
             phone_loading: false,
             phone_error: None,
             phone_setup: None,
@@ -3654,6 +3658,51 @@ impl UtilitySurfaces {
             })
     }
 
+    /// The one way a phone gateway starts: stops the current one, then
+    /// installs the result only if no stop or newer start revoked it while
+    /// it ran. A stale gateway is dropped, which turns it off.
+    fn start_phone_access(
+        &mut self,
+        start: impl std::future::Future<Output = Result<crate::phone_access::PhoneAccess, String>>
+        + Send
+        + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.phone_access = None;
+        let ticket = self.phone_start.begin();
+        self.phone_loading = true;
+        self.phone_error = None;
+        let task = self.runtime.spawn(start);
+        cx.spawn(async move |this, cx| {
+            let result = task
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+            let _ = this.update(cx, |this, cx| {
+                if !this.phone_start.finish(ticket) {
+                    // Revoked while starting: `result` drops here.
+                    return;
+                }
+                this.phone_loading = false;
+                match result {
+                    Ok(access) => this.phone_access = Some(access),
+                    Err(error) => this.phone_error = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Turns the gateway off and revokes any start still in flight.
+    fn stop_phone_access(&mut self) {
+        if self.phone_start.cancel() {
+            self.phone_loading = false;
+        }
+        self.phone_access = None;
+    }
+
     fn phone_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::phone_access::TailscaleSetup;
         let colors = self.settings_colors();
@@ -3768,32 +3817,15 @@ impl UtilitySurfaces {
                                 Some("iphone"),
                                 cx,
                                 |this, _, cx| {
-                                    this.phone_loading = true;
-                                    this.phone_error = None;
                                     let client = Arc::clone(this.store_runtime.client());
                                     let tailnet = this
                                         .prefs
                                         .phone_tailnet_identity
                                         .then(|| Arc::clone(&this.phone_devices));
-                                    let task = this.runtime.spawn(
+                                    this.start_phone_access(
                                         crate::phone_access::PhoneAccess::start(client, tailnet),
+                                        cx,
                                     );
-                                    cx.spawn(async move |this, cx| {
-                                        let result = task
-                                            .await
-                                            .map_err(|error| error.to_string())
-                                            .and_then(|result| result);
-                                        let _ = this.update(cx, |this, cx| {
-                                            this.phone_loading = false;
-                                            match result {
-                                                Ok(access) => this.phone_access = Some(access),
-                                                Err(error) => this.phone_error = Some(error),
-                                            }
-                                            cx.notify();
-                                        });
-                                    })
-                                    .detach();
-                                    cx.notify();
                                 },
                             ),
                             colors,
@@ -3901,38 +3933,18 @@ impl UtilitySurfaces {
                                                 }
                                                 // Stop serving the old code
                                                 // before it is replaced.
-                                                this.phone_access = None;
-                                                this.phone_loading = true;
-                                                this.phone_error = None;
                                                 let client =
                                                     Arc::clone(this.store_runtime.client());
-                                                let task = this.runtime.spawn(async move {
-                                                    crate::phone_access::PhoneAccess::reset_pairing()?;
-                                                    crate::phone_access::PhoneAccess::start(
-                                                        client, None,
-                                                    )
-                                                    .await
-                                                });
-                                                cx.spawn(async move |this, cx| {
-                                                    let result = task
+                                                this.start_phone_access(
+                                                    async move {
+                                                        crate::phone_access::PhoneAccess::reset_pairing()?;
+                                                        crate::phone_access::PhoneAccess::start(
+                                                            client, None,
+                                                        )
                                                         .await
-                                                        .map_err(|error| error.to_string())
-                                                        .and_then(|result| result);
-                                                    let _ = this.update(cx, |this, cx| {
-                                                        this.phone_loading = false;
-                                                        match result {
-                                                            Ok(access) => {
-                                                                this.phone_access = Some(access)
-                                                            }
-                                                            Err(error) => {
-                                                                this.phone_error = Some(error)
-                                                            }
-                                                        }
-                                                        cx.notify();
-                                                    });
-                                                })
-                                                .detach();
-                                                cx.notify();
+                                                    },
+                                                    cx,
+                                                );
                                             },
                                         ))
                                         .child(settings_danger_button(
@@ -3940,7 +3952,7 @@ impl UtilitySurfaces {
                                             "phone-disable",
                                             cx,
                                             |this, cx| {
-                                                this.phone_access = None;
+                                                this.stop_phone_access();
                                                 cx.notify();
                                             },
                                         )),
@@ -3973,9 +3985,9 @@ impl UtilitySurfaces {
             |this, cx| {
                 let enabled = !this.prefs.phone_tailnet_identity;
                 if this.update_prefs(move |prefs| prefs.phone_tailnet_identity = enabled) {
-                    // The running gateway admits the old way; stop it so the
-                    // next Enable uses the new rule.
-                    this.phone_access = None;
+                    // The running (or still starting) gateway admits the
+                    // old way; stop it so the next Enable uses the new rule.
+                    this.stop_phone_access();
                 }
                 cx.notify();
             },
