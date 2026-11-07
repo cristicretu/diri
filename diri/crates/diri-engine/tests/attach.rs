@@ -1051,3 +1051,153 @@ fn unsolicited_output_reaches_the_client_without_waiting_out_the_batch() {
         "a lone write took {median:?} (median) to reach the client; it must not wait out the 8 ms batch"
     );
 }
+
+/// Every Engine entry that sizes a terminal (spawn, `session.resize`, an
+/// attach `Resize` frame) holds the shared Helper limits. Before, each one
+/// clamped only to `u16::MAX`, so a 65535×65535 request allocated billions
+/// of cells and aborted the Engine with every session in it. The sizes here
+/// are just past the limits so an unbounded build fails on the assertions
+/// rather than by exhausting memory.
+#[test]
+fn oversized_terminal_sizes_are_bounded_at_every_engine_entry() {
+    use diri_proto::remote_pty::{MAX_TERMINAL_CELLS, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS};
+    use std::io::BufRead;
+
+    let temp = tempfile::tempdir().expect("temp");
+    let registry = Arc::new(Mutex::new(Registry::new(
+        engine(),
+        temp.path().join("state.json"),
+    )));
+    let server = Arc::new(
+        ControlServer::new(Arc::clone(&registry), temp.path().join("daemon.sock"))
+            .with_logs_dir(temp.path().join("logs")),
+    );
+    let listener = server.bind().expect("bind");
+    {
+        let server = Arc::clone(&server);
+        std::thread::spawn(move || {
+            while let Ok((stream, _)) = listener.accept() {
+                let server = Arc::clone(&server);
+                std::thread::spawn(move || {
+                    let _ = server.serve(stream);
+                });
+            }
+        });
+    }
+    let control = UnixStream::connect(server.socket_path()).expect("connect control");
+    let mut reader = std::io::BufReader::new(control.try_clone().expect("clone"));
+    let mut request = |id: u64, method: &str, params: serde_json::Value| {
+        let mut bytes = serde_json::to_vec(&ControlMessage::Request {
+            id,
+            method: method.into(),
+            params: Some(params),
+        })
+        .expect("encode");
+        bytes.push(b'\n');
+        (&control).write_all(&bytes).expect("write");
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("reply");
+        match serde_json::from_str(&line).expect("decode") {
+            ControlMessage::Response {
+                result: Ok(result), ..
+            } => result,
+            other => panic!("{method} failed: {other:?}"),
+        }
+    };
+    let size_of = |id: &str| {
+        registry
+            .lock()
+            .unwrap()
+            .get(id)
+            .expect("session")
+            .screen_size()
+    };
+    let wait_for = |id: &str, want: (usize, usize), what: &str| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let size = size_of(id);
+            if size == want {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what}: size {size:?}, want {want:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The emulator is not the whole story: the PTY's own winsize, as the
+        // child reads it, must be bounded too.
+        let report = format!("{} {}", want.1, want.0);
+        registry
+            .lock()
+            .unwrap()
+            .get(id)
+            .expect("session")
+            .send_text("", true)
+            .expect("ask the child for its size");
+        loop {
+            let text = registry
+                .lock()
+                .unwrap()
+                .get(id)
+                .expect("session")
+                .screen_text(diri_terminal_state::TextOptions {
+                    unwrap: true,
+                    scrollback: true,
+                    ..Default::default()
+                });
+            if text.iter().any(|line| line.trim() == report) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what}: child never reported `{report}`: {:?}",
+                text.iter()
+                    .filter(|l| !l.trim().is_empty())
+                    .collect::<Vec<_>>()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let max_cols = usize::from(MAX_TERMINAL_COLS);
+
+    // Spawn: initial columns past the limit.
+    let spawned = request(
+        1,
+        "session.spawn",
+        json!({
+            "kind": { "shell": {} },
+            "cwd": "/tmp",
+            "argv": ["/bin/sh", "-c", "stty -echo; while IFS= read -r _; do stty size; done"],
+            "initialCols": i64::from(MAX_TERMINAL_COLS) + 904,
+            "initialRows": 3,
+        }),
+    );
+    let id = spawned["id"].as_str().expect("id").to_owned();
+    wait_for(&id, (max_cols, 3), "spawn initialCols");
+
+    // session.resize: rows past the row limit.
+    request(
+        2,
+        "session.resize",
+        json!({ "sessionID": id, "cols": 100, "rows": i64::from(MAX_TERMINAL_ROWS) + 1000 }),
+    );
+    wait_for(
+        &id,
+        (100, usize::from(MAX_TERMINAL_ROWS)),
+        "session.resize rows",
+    );
+
+    // Attach Resize frame: within each axis but past the cell budget.
+    let mut data = UnixStream::connect(server.socket_path()).expect("connect data");
+    let mut attach_line = serde_json::to_vec(&json!({ "attach": id })).expect("encode");
+    attach_line.push(b'\n');
+    data.write_all(&attach_line).expect("attach");
+    let mut frames = FrameReader::new(data.try_clone().expect("clone data"));
+    frames.until("the seed grid", |frame| frame.frame_type == FrameType::Grid);
+    data.write_all(&FrameCodec::encode(&Frame::resize(400, 4000)).expect("encode"))
+        .expect("send resize");
+    wait_for(&id, (400, MAX_TERMINAL_CELLS / 400), "attach Resize cells");
+
+    request(3, "session.kill", json!({ "sessionID": id }));
+}

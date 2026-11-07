@@ -220,6 +220,10 @@ pub struct ControlServer {
     accounts: Mutex<crate::accounts::AccountStore>,
     /// `hosts.json`, `agents.json` and `accounts.json` live here.
     config_dir: PathBuf,
+    /// The durable SQLite stores (schedules, tasks, operations, message
+    /// receipts) live here. Never the socket's directory on Linux: that is
+    /// `$XDG_RUNTIME_DIR`, a tmpfs emptied at logout and reboot.
+    state_dir: PathBuf,
     account_operations: std::sync::RwLock<()>,
     session_operations: Mutex<std::collections::HashSet<String>>,
     agent_scans: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>>,
@@ -326,6 +330,7 @@ impl ControlServer {
             .parent()
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
         load_terminal_palette(&config_dir, &registry);
+        let state_dir = config_dir.clone();
         let remote_bindings = remote_binding_store(&config_dir);
         let (agent_catalog, accounts) = agent_config_stores(&config_dir);
         let events = crate::events::EventBus::new();
@@ -366,6 +371,7 @@ impl ControlServer {
             agent_catalog: Arc::new(Mutex::new(agent_catalog)),
             accounts: Mutex::new(accounts),
             config_dir,
+            state_dir,
             account_operations: std::sync::RwLock::new(()),
             session_operations: Mutex::new(std::collections::HashSet::new()),
             agent_scans: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -613,6 +619,24 @@ impl ControlServer {
         self.agent_catalog = Arc::new(Mutex::new(agent_catalog));
         self.accounts = Mutex::new(accounts);
         self
+    }
+
+    /// Where the durable SQLite stores live. Defaults to the socket's
+    /// directory, which is right on macOS (one App Support root) and wrong on
+    /// Linux, where the socket sits in the runtime tmpfs: a reboot would drop
+    /// schedules and tasks and reset the at-most-once operation and message
+    /// receipts.
+    pub fn with_state_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.state_dir = dir.into();
+        self
+    }
+
+    fn durable_store_path(&self, name: &str) -> PathBuf {
+        self.state_dir.join(name)
+    }
+
+    fn message_receipts_path(&self) -> PathBuf {
+        self.durable_store_path(crate::layout_migration::MESSAGE_RECEIPTS_STORE)
     }
 
     /// Where remote session bindings are kept. They must outlive a reboot of
@@ -1750,10 +1774,7 @@ impl ControlServer {
         // instead of waiting out the pane's first report. Only a spawn with
         // neither waits, up to the launch fallback, for its pane.
         let launch_size = match (p.initial_cols, p.initial_rows) {
-            (Some(cols), Some(rows)) => Some((
-                cols.clamp(2, u16::MAX as i64) as u16,
-                rows.clamp(2, u16::MAX as i64) as u16,
-            )),
+            (Some(cols), Some(rows)) => Some(diri_proto::clamp_terminal_size(cols, rows, 2)),
             _ => registry.last_client_size(),
         };
         if let Some((cols, rows)) = launch_size {
@@ -2279,8 +2300,7 @@ impl ControlServer {
             spec
         };
         if let (Some(cols), Some(rows)) = (p.initial_cols, p.initial_rows) {
-            pty.cols = cols.clamp(2, u16::MAX as i64) as u16;
-            pty.rows = rows.clamp(2, u16::MAX as i64) as u16;
+            (pty.cols, pty.rows) = diri_proto::clamp_terminal_size(cols, rows, 2);
         }
 
         if let Some(profile) = &mut account_profile {
@@ -3020,10 +3040,16 @@ impl ControlServer {
     fn session_list(&self) -> Result<JsonValue, ControlError> {
         let registry = self.registry.lock().map_err(poisoned)?;
         let mut sessions = registry.records();
+        // Read under the registry lock, after the records: every registry
+        // change happens under this lock and is published after it, so each
+        // event with seq <= this stamp is already in the list, and the app
+        // lets later session events win over it (StampedSessionListResult).
+        let event_seq = self.events.current_seq();
         fit_session_list(&mut sessions);
         serde_json::to_value(json!({
             "sessions": sessions,
             "projects": registry.projects_raw(),
+            "eventSeq": event_seq,
         }))
         .map_err(|error| ControlError::internal(error.to_string()))
     }
@@ -3039,23 +3065,17 @@ impl ControlServer {
         if registry.get(&p.session_id.0).is_none() {
             return Err(ControlError::not_found(p.session_id.0.clone()));
         }
-        let receipt = message_delivery::deliver(
-            &self
-                .socket_path
-                .with_file_name("message-receipts-v1.sqlite"),
-            &p,
-            || {
-                registry
-                    .wake_session(&p.session_id.0)
-                    .map_err(io_control_error)?;
-                self.publish_updated(&registry, &p.session_id.0);
-                registry
-                    .get(&p.session_id.0)
-                    .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
-                    .send_text(&p.text, p.submit)
-                    .map_err(io_control_error)
-            },
-        );
+        let receipt = message_delivery::deliver(&self.message_receipts_path(), &p, || {
+            registry
+                .wake_session(&p.session_id.0)
+                .map_err(io_control_error)?;
+            self.publish_updated(&registry, &p.session_id.0);
+            registry
+                .get(&p.session_id.0)
+                .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
+                .send_text(&p.text, p.submit)
+                .map_err(io_control_error)
+        });
         if let Ok(receipt) = &receipt {
             diri_telemetry::event!(
                 "message.deliver",
@@ -3130,8 +3150,7 @@ impl ControlServer {
 
     fn session_resize(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::ResizeParams = decode(params)?;
-        let cols = u16::try_from(p.cols.clamp(2, u16::MAX as i64)).expect("clamped");
-        let rows = u16::try_from(p.rows.clamp(2, u16::MAX as i64)).expect("clamped");
+        let (cols, rows) = diri_proto::clamp_terminal_size(p.cols, p.rows, 2);
         let reflow = {
             let registry = self.registry.lock().map_err(poisoned)?;
             let session = registry
@@ -5555,7 +5574,8 @@ impl ControlServer {
 
     fn publish_updated(&self, registry: &Registry, id: &str) {
         // One folded record, not a folded copy of the whole table.
-        if let Some(record) = registry.record(id) {
+        if let Some(mut record) = registry.record(id) {
+            truncate_originating_prompt(&mut record, UPDATED_PROMPT_BYTES);
             self.events
                 .publish_encoded(diri_proto::EventName::SESSION_UPDATED, &record, Some(id));
         }
@@ -6130,12 +6150,67 @@ fn read_bounded_control_line<R: BufRead>(reader: &mut R) -> std::io::Result<Opti
 /// Serializes one message onto the shared write half. Responses and event
 /// frames interleave here; the mutex keeps each line whole.
 fn write_message(writer: &Arc<Mutex<UnixStream>>, message: &ControlMessage) -> std::io::Result<()> {
+    let bytes = encode_bounded_line(message)?;
+    write_line(writer, &bytes)
+}
+
+/// Encodes `message` as one control line no client will reject. Every client
+/// treats a line over [`MAX_CONTROL_LINE_BYTES`] as fatal and drops the
+/// connection, failing every pending request, and the same request fails the
+/// same way after reconnect. So an oversized response becomes a structured
+/// `reply_too_large` error for the same id, and an oversized event becomes an
+/// `events.dropped` marker for its seq.
+fn encode_bounded_line(message: &ControlMessage) -> std::io::Result<Vec<u8>> {
     let mut bytes = serde_json::to_vec(message)?;
+    if bytes.len() > MAX_CONTROL_LINE_BYTES {
+        let size = bytes.len();
+        bytes = match message {
+            ControlMessage::Response { id, .. } => {
+                eprintln!(
+                    "diri-engine: reply {id} is {size} bytes, over the {MAX_CONTROL_LINE_BYTES}-byte control line limit"
+                );
+                serde_json::to_vec(&ControlMessage::Response {
+                    id: *id,
+                    result: Err(ControlError::new(
+                        diri_proto::control::REPLY_TOO_LARGE,
+                        format!(
+                            "the reply is {size} bytes, over the {MAX_CONTROL_LINE_BYTES}-byte control line limit"
+                        ),
+                    )),
+                })?
+            }
+            ControlMessage::Event { name, seq, .. } => oversized_event_marker(name, *seq, size)?,
+            ControlMessage::Request { .. } => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "control request exceeded the protocol maximum",
+                ));
+            }
+        };
+    }
     bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// The `events.dropped` line sent in place of an event too large for one
+/// control line, in the shape the bus uses for a queue overflow.
+fn oversized_event_marker(name: &str, seq: u64, size: usize) -> std::io::Result<Vec<u8>> {
+    eprintln!(
+        "diri-engine: dropped event {name} seq {seq}: {size} bytes, over the {MAX_CONTROL_LINE_BYTES}-byte control line limit"
+    );
+    serde_json::to_vec(&ControlMessage::Event {
+        name: crate::events::EVENTS_DROPPED.into(),
+        seq: 0,
+        params: json!({ "dropped": 1, "fromSeq": seq, "toSeq": seq }),
+    })
+    .map_err(std::io::Error::from)
+}
+
+fn write_line(writer: &Arc<Mutex<UnixStream>>, bytes: &[u8]) -> std::io::Result<()> {
     let mut stream = writer
         .lock()
         .map_err(|_| std::io::Error::other("writer poisoned"))?;
-    stream.write_all(&bytes)?;
+    stream.write_all(bytes)?;
     stream.flush()
 }
 
@@ -6153,12 +6228,12 @@ fn write_event_frame(
     bytes.extend_from_slice(event.seq.to_string().as_bytes());
     bytes.extend_from_slice(b",\"params\":");
     bytes.extend_from_slice(&event.encoded);
-    bytes.extend_from_slice(b"}\n");
-    let mut stream = writer
-        .lock()
-        .map_err(|_| std::io::Error::other("writer poisoned"))?;
-    stream.write_all(&bytes)?;
-    stream.flush()
+    bytes.push(b'}');
+    if bytes.len() > MAX_CONTROL_LINE_BYTES {
+        bytes = oversized_event_marker(&event.name, event.seq, bytes.len())?;
+    }
+    bytes.push(b'\n');
+    write_line(writer, &bytes)
 }
 
 /// Share of the control frame a `session.list` reply may use with full pull
@@ -6170,6 +6245,14 @@ const SESSION_LIST_DETAIL_BUDGET: usize = MAX_CONTROL_LINE_BYTES / 4 * 3;
 /// Drops pull request bodies, checks and discussion from a list that would
 /// not fit [`SESSION_LIST_DETAIL_BUDGET`]. Summaries and counts stay, and
 /// `session.updated` still carries each record's detail.
+/// Originating prompts still too large for the list are cut to this many
+/// bytes; `session.updated` and the registry keep the full value.
+const LISTED_PROMPT_BYTES: usize = 16 * 1024;
+
+/// The most of an originating prompt one `session.updated` carries, so a
+/// single record always fits a control line with room for everything else.
+const UPDATED_PROMPT_BYTES: usize = 1024 * 1024;
+
 fn fit_session_list(sessions: &mut [diri_proto::SessionRecord]) {
     if encoded_len(&sessions) <= SESSION_LIST_DETAIL_BUDGET {
         return;
@@ -6180,6 +6263,27 @@ fn fit_session_list(sessions: &mut [diri_proto::SessionRecord]) {
         .flatten()
     {
         crate::pr_monitor::drop_detail(status);
+    }
+    // Prompts are caller-supplied and unbounded: a few large ones alone can
+    // push the list past the frame limit.
+    if encoded_len(&sessions) <= SESSION_LIST_DETAIL_BUDGET {
+        return;
+    }
+    for session in sessions.iter_mut() {
+        truncate_originating_prompt(session, LISTED_PROMPT_BYTES);
+    }
+}
+
+/// Cuts the record's originating prompt to at most `max` bytes (on a char
+/// boundary) plus a visible marker. Only for what goes on the wire.
+fn truncate_originating_prompt(record: &mut diri_proto::SessionRecord, max: usize) {
+    const MARKER: &str = "\n… [prompt truncated]";
+    if let Some(prompt) = record.originating_prompt.as_mut()
+        && prompt.len() > max
+    {
+        let keep = prompt.floor_char_boundary(max.saturating_sub(MARKER.len()));
+        prompt.truncate(keep);
+        prompt.push_str(MARKER);
     }
 }
 
@@ -7893,6 +7997,138 @@ mod tests {
     }
 
     #[test]
+    fn a_session_list_with_huge_prompts_still_fits_one_control_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = server(temp.path());
+        let prompt = "p".repeat(1024 * 1024);
+        {
+            let mut registry = server.registry.lock().unwrap();
+            for index in 0..6 {
+                let mut record = test_record(&format!("s_{index}"));
+                record.originating_prompt = Some(prompt.clone());
+                registry.insert_record(record);
+            }
+        }
+        let response = call(&server, "session.list", None);
+        let line = encode_bounded_line(&response).unwrap();
+        // Before the fix this reply was ~6 MiB and every client dropped the
+        // connection on it.
+        assert!(line.len() <= SESSION_LIST_DETAIL_BUDGET);
+        let list = ok_of(response);
+        let sessions = list["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 6);
+        for session in sessions {
+            let listed = session["originatingPrompt"].as_str().unwrap();
+            assert!(listed.len() <= LISTED_PROMPT_BYTES);
+            assert!(listed.starts_with("ppp") && listed.ends_with("[prompt truncated]"));
+        }
+        // The registry keeps the full prompt.
+        let registry = server.registry.lock().unwrap();
+        assert_eq!(
+            registry
+                .record("s_0")
+                .unwrap()
+                .originating_prompt
+                .as_deref(),
+            Some(prompt.as_str())
+        );
+    }
+
+    #[test]
+    fn session_updated_carries_at_most_the_updated_prompt_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = server(temp.path());
+        let mut record = test_record("s_big");
+        record.originating_prompt = Some("界".repeat(UPDATED_PROMPT_BYTES));
+        server.registry.lock().unwrap().insert_record(record);
+        let stream = server.events.subscribe(None, crate::events::Filter::all());
+        server.publish_updated(&server.registry.lock().unwrap(), "s_big");
+        let event = stream.try_recv().expect("session.updated");
+        let prompt = event.params()["originatingPrompt"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(prompt.len() <= UPDATED_PROMPT_BYTES);
+        assert!(prompt.starts_with('界') && prompt.ends_with("[prompt truncated]"));
+    }
+
+    #[test]
+    fn an_oversized_reply_is_a_structured_error_and_the_connection_survives() {
+        let (read, write) = UnixStream::pair().unwrap();
+        let writer = Arc::new(Mutex::new(write));
+        let huge = "x".repeat(MAX_CONTROL_LINE_BYTES + 1);
+        let reader = std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(read);
+            let mut messages = Vec::new();
+            // The same bound every client enforces; an over-limit line errors.
+            while let Some(line) = read_bounded_control_line(&mut reader).unwrap() {
+                messages.push(diri_proto::control::decode_line(&line).unwrap());
+            }
+            messages
+        });
+        write_message(
+            &writer,
+            &ControlMessage::Response {
+                id: 7,
+                result: Ok(json!({ "text": huge })),
+            },
+        )
+        .unwrap();
+        write_message(
+            &writer,
+            &ControlMessage::Event {
+                name: "session.updated".into(),
+                seq: 41,
+                params: json!({ "text": huge }),
+            },
+        )
+        .unwrap();
+        let bus = crate::events::EventBus::new();
+        let stream = bus.subscribe(None, crate::events::Filter::all());
+        bus.publish("session.updated", json!({ "text": huge }), Some("s_1"));
+        write_event_frame(&writer, &stream.try_recv().unwrap()).unwrap();
+        write_message(
+            &writer,
+            &ControlMessage::Response {
+                id: 8,
+                result: Ok(json!({ "small": true })),
+            },
+        )
+        .unwrap();
+        drop(writer);
+        let messages = reader.join().unwrap();
+        assert_eq!(messages.len(), 4);
+        match &messages[0] {
+            ControlMessage::Response {
+                id: 7,
+                result: Err(error),
+            } => assert_eq!(error.code, diri_proto::control::REPLY_TOO_LARGE),
+            other => panic!("expected reply_too_large, got {other:?}"),
+        }
+        for (message, seq) in [(&messages[1], 41), (&messages[2], 1)] {
+            match message {
+                ControlMessage::Event {
+                    name,
+                    seq: 0,
+                    params,
+                } => {
+                    assert_eq!(name, crate::events::EVENTS_DROPPED);
+                    assert_eq!(params["fromSeq"], seq);
+                    assert_eq!(params["toSeq"], seq);
+                }
+                other => panic!("expected events.dropped, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            messages[3],
+            ControlMessage::Response {
+                id: 8,
+                result: Ok(json!({ "small": true })),
+            }
+        );
+    }
+
+    #[test]
     fn open_api_request_relays_a_valid_draft_for_a_live_session() {
         let temp = tempfile::tempdir().unwrap();
         let server = server(temp.path());
@@ -8157,6 +8393,42 @@ mod tests {
         let registry = Registry::new(engine(), temp.path().join("state.json"));
         let bare = ControlServer::new(Arc::new(Mutex::new(registry)), temp.path().join("socket"));
         assert!(bare.terminal_shell_integration().is_none());
+    }
+
+    #[test]
+    fn durable_stores_live_in_the_state_dir_not_beside_the_socket() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("run/diri");
+        let state = temp.path().join("state/diri");
+        let registry = Registry::new(engine(), state.join("state.json"));
+        let server =
+            ControlServer::new(Arc::new(Mutex::new(registry)), runtime.join("daemon.sock"))
+                .with_state_dir(&state);
+        let stores = [
+            server.schedules_path(),
+            server.tasks_path(),
+            server.operations_path(),
+            server.message_receipts_path(),
+        ];
+        for path in &stores {
+            assert!(
+                !path.starts_with(&runtime),
+                "{} is in the runtime dir",
+                path.display()
+            );
+            assert_eq!(path.parent(), Some(state.as_path()));
+        }
+        let names: Vec<_> = stores
+            .iter()
+            .map(|path| path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, crate::layout_migration::DURABLE_STORES);
+
+        // Without a state dir (macOS's single root, tests) they stay beside
+        // the socket, where existing installs already keep them.
+        let registry = Registry::new(engine(), temp.path().join("state.json"));
+        let bare = ControlServer::new(Arc::new(Mutex::new(registry)), runtime.join("daemon.sock"));
+        assert_eq!(bare.schedules_path(), runtime.join("schedules-v1.sqlite"));
     }
 
     #[test]
@@ -10214,6 +10486,17 @@ mod tests {
         let result = ok_of(call(&server, "session.list", None));
         assert!(result["sessions"].is_array());
         assert!(result["projects"].is_array());
+        // Stamped with the event seq the list reflects, so a reply that
+        // races a later session.removed cannot resurrect that session.
+        assert_eq!(result["eventSeq"], json!(server.events.current_seq()));
+        server
+            .events
+            .publish("session.removed", json!({"id": "s_x"}), Some("s_x"));
+        let later = ok_of(call(&server, "session.list", None));
+        assert_eq!(
+            later["eventSeq"].as_u64(),
+            Some(result["eventSeq"].as_u64().unwrap() + 1)
+        );
         // state.snapshot is the same view under another name.
         let snapshot = ok_of(call(&server, "state.snapshot", None));
         assert!(snapshot["sessions"].is_array());
