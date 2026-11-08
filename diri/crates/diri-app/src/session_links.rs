@@ -1,6 +1,6 @@
 //! One contextual home for session links. Status is always attached by URL.
 use super::*;
-use crate::palette_chrome::{PaletteTooltip, keycap, scroll_fades};
+use crate::palette_chrome::{PaletteTooltip, scroll_fades};
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
 use crate::tooltip_warmth::WarmTooltip;
 use diri_proto::{ArtifactKind, PrCheck, PullRequestStatus, SessionArtifact};
@@ -1106,12 +1106,7 @@ impl TerminalPane {
                     })
                     .cursor_pointer()
                     .text_size(px(13.0))
-                    // Merged and closed work steps back; open work reads first.
-                    .text_color(if row.settled && !selected {
-                        ink.secondary
-                    } else {
-                        ink.primary
-                    })
+                    .text_color(ink.primary)
                     .child(
                         div()
                             .w(px(16.0))
@@ -1142,6 +1137,11 @@ impl TerminalPane {
                                         el.flex_shrink_0().max_w(gpui::relative(0.7))
                                     })
                                     .truncate()
+                                    // Merged and closed work steps back; open
+                                    // work reads first.
+                                    .when(row.settled && !selected, |el| {
+                                        el.text_color(ink.primary.alpha(0.5))
+                                    })
                                     .child(row.title.clone()),
                             )
                             .when(selected && !address.is_empty(), |el| {
@@ -1164,7 +1164,8 @@ impl TerminalPane {
                                 .text_color(match tone {
                                     _ if selected => ink.secondary,
                                     Some(tone) => tone,
-                                    None => ink.tertiary,
+                                    // Below a dimmed title, never above it.
+                                    None => ink.primary.alpha(0.4),
                                 })
                                 .child(label),
                         )
@@ -1179,13 +1180,6 @@ impl TerminalPane {
                                 .text_color(ink.secondary)
                                 .child(text),
                         )
-                    })
-                    .when(selected, |el| {
-                        el.child(keycap(ink).child(Icon::new(
-                            IconName::Return,
-                            14.0,
-                            ink.secondary,
-                        )))
                     })
                     .when_some(row.details.clone().filter(|_| selected), |el, url| {
                         el.child(
@@ -1243,7 +1237,8 @@ impl TerminalPane {
             }))
             .into_any_element()
     }
-    /// The ⌘K palette's search field: an inset pill with an esc keycap.
+    /// The search field: bare text over a hairline, as a popover's own field
+    /// rather than a palette's pill. Esc still closes it.
     fn render_palette_links_header(
         &self,
         pull_request: Option<i64>,
@@ -1267,14 +1262,13 @@ impl TerminalPane {
                 .into_any_element(),
         };
         div()
-            .mt(px(inset))
             .mx(px(inset))
             .mb(px(inset))
-            .h(px(34.0))
+            .h(px(42.0))
             .pl(px(4.0))
             .pr(px(10.0))
-            .rounded(px(Radius::inner(Radius::PANEL, inset)))
-            .bg(Fill::subtle(colors))
+            .border_b_1()
+            .border_color(colors.floating_stroke())
             .flex()
             .items_center()
             .gap(px(4.0))
@@ -1316,17 +1310,6 @@ impl TerminalPane {
                     .text_size(px(14.0))
                     .child(text),
             )
-            .child(
-                keycap(colors)
-                    .id("session-links-close")
-                    .cursor_pointer()
-                    .hover(move |el| el.bg(Fill::hover(colors, true)))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.close_session_links(window, cx);
-                        cx.stop_propagation();
-                    }))
-                    .child("esc"),
-            )
             .into_any_element()
     }
     /// All · PRs · Running · Links, each with how many rows match the search.
@@ -1339,7 +1322,16 @@ impl TerminalPane {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let current = self.session_links.scope;
-        let mut track = crate::details_ui::segmented_track(colors);
+        // Only the chosen scope is raised; a filled track under the filled
+        // search field stacked two boxes.
+        let mut track = div()
+            .min_w(px(0.0))
+            .flex_1()
+            .h(px(26.0))
+            .p(px(2.0))
+            .flex()
+            .items_center()
+            .gap(px(2.0));
         for scope in std::iter::once(None).chain(available.iter().copied().map(Some)) {
             let count = matches
                 .iter()
