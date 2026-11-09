@@ -69,6 +69,7 @@ Each page is available as Markdown at the URL below. The docs are concatenated i
 
 ## Releases
 
+- [diri 0.11.5: Mermaid diagrams in notes](https://diri.sh/whats-new/0.11.5/): diri 0.11.5 draws Mermaid diagrams in notes, lets you drag sessions between projects, keeps your selected row visible when you fold, and makes remote sessions sturdier.
 - [diri 0.11.1: Hold ⌘T for anything new](https://diri.sh/whats-new/0.11.1/): diri 0.11.1 adds a launch ring on a held ⌘T, find in notes, smoother note scrolling, and safer computer use for agents working side by side.
 - [diri 0.11.0: Scripting, splits you can read, and nothing lost under load](https://diri.sh/whats-new/0.11.0/): diri 0.11.0 adds Lua scripting, readable splits and terminal setup import, keeps every byte of a flood, and runs on a faster terminal core.
 - [diri 0.10.0: Voice, Mac apps, and current model prices](https://diri.sh/whats-new/0.10.0/): diri 0.10.0 reads finished turns aloud, lets agents use Mac apps in the background, prices new models from LiteLLM, and moves to AGPL-3.0.

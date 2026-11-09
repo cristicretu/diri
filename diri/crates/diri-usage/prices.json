@@ -1,6 +1,7 @@
 {
   "claude-fable-5": {"input": 10.0, "output": 50.0, "cache_read": 1.0, "cache_write_5m": 12.5, "cache_write_1h": 20.0},
   "claude-fable-5-1": {"input": 10.0, "output": 50.0, "cache_read": 0.25, "cache_write_5m": 12.5, "cache_write_1h": 20.0},
+  "claude-fable-5-2": {"input": 8.0, "output": 40.0, "cache_read": 0.2, "cache_write_5m": 10.0, "cache_write_1h": 16.0},
   "claude-haiku-4-5": {"input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write_5m": 1.25, "cache_write_1h": 2.0},
   "claude-haiku-4-5-20251001": {"input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write_5m": 1.25, "cache_write_1h": 2.0},
   "claude-haiku-5-5": {"input": 0.1, "output": 0.5, "cache_read": 0.01, "cache_write_5m": 0.125, "cache_write_1h": 0.2},

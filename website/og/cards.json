@@ -322,6 +322,14 @@
     "hash": "4c9bc17f79d23e17"
   },
   {
+    "key": "whats-new-0-11-5",
+    "url": "/whats-new/0.11.5/",
+    "eyebrow": "Release · November 9, 2026",
+    "title": "diri 0.11.5",
+    "subtitle": "Mermaid diagrams in notes",
+    "hash": "1ddd2fbf0a559c6a"
+  },
+  {
     "key": "whats-new-0-11-1",
     "url": "/whats-new/0.11.1/",
     "eyebrow": "Release · November 2, 2026",
@@ -357,9 +365,9 @@
     "key": "whats-new",
     "url": "/whats-new/",
     "eyebrow": "What's new",
-    "title": "diri 0.11.1",
-    "subtitle": "Hold ⌘T for anything new",
-    "hash": "90c8d44f6ecc3010"
+    "title": "diri 0.11.5",
+    "subtitle": "Mermaid diagrams in notes",
+    "hash": "d9c946523f6a12c7"
   },
   {
     "key": "guides-agent-teams",
