@@ -214,6 +214,45 @@ fn project_open_limit_failure_keeps_the_file_unchanged() {
 }
 
 #[test]
+fn project_open_at_the_workspace_limit_reclaims_empty_project_workspaces() {
+    let mut f = Fixture::new();
+    let mut snapshot = WorkspaceSnapshot::default();
+    for i in 0..MAX_WORKSPACES {
+        // Odd ones are a person's own empty workspaces and must survive.
+        snapshot.workspaces.push(WorkspaceRecord {
+            project_id: (i % 2 == 0).then(|| ProjectId(format!("old_{i}"))),
+            id: WorkspaceId::new(format!("workspace_{i}")),
+            name: format!("Workspace {i}"),
+            tabs: vec![],
+            selected_tab: None,
+        });
+    }
+    // A project workspace that still holds a tab is kept too.
+    snapshot.workspaces[0]
+        .tabs
+        .push(single_pane_tab(0, "session_1"));
+    snapshot.workspaces[0].selected_tab = Some(TabId::new("tab_0"));
+    std::fs::write(
+        &f.path,
+        serde_json::to_vec(&serde_json::json!({"workspaceState": snapshot})).unwrap(),
+    )
+    .unwrap();
+    f.snapshot = snapshot;
+    open(&mut f, &inventory(0, "p"), None);
+    let workspaces = &f.snapshot.workspaces;
+    assert_eq!(workspaces.len(), 1 + MAX_WORKSPACES / 2 + 1);
+    assert_eq!(workspaces[0].id, WorkspaceId::new("workspace_0"));
+    assert!(
+        workspaces[1..MAX_WORKSPACES / 2 + 1]
+            .iter()
+            .all(|w| w.project_id.is_none())
+    );
+    let opened = workspaces.last().unwrap();
+    assert_eq!(opened.project_id, Some(ProjectId("p".into())));
+    assert_eq!(opened.tabs.len(), 1);
+}
+
+#[test]
 fn old_workspaces_decode_unbound_and_duplicate_project_bindings_fail_closed() {
     let old = serde_json::json!({"schemaVersion": 1, "revision": 0, "workspaces": [{"id":"old", "name":"Old", "tabs":[], "selectedTab":null}]});
     let mut state: WorkspaceSnapshot = serde_json::from_value(old).unwrap();

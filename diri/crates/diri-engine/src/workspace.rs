@@ -78,6 +78,7 @@ impl WorkspaceStore {
             }
             mutate(next, params.mutation, sessions, project_agent)?;
             reclaim_unavailable_tabs(next, sessions);
+            reclaim_empty_project_workspaces(next);
             Ok(true)
         })
         .map(|(snapshot, _)| snapshot)
@@ -502,6 +503,21 @@ fn reclaim_unavailable_tabs(state: &mut WorkspaceSnapshot, sessions: &HashSet<Se
             .tabs
             .retain(|tab| available(&tab.layout, sessions));
     }
+}
+/// Every project that ever opened an agent got a workspace, and closing its
+/// last tab leaves that workspace behind, empty. A long-used install (one
+/// project per worktree) fills `MAX_WORKSPACES` with them, and then opening an
+/// agent in any new project is rejected. Only when an edit would exceed the
+/// limit are the project-bound workspaces with no tabs dropped: opening an
+/// agent in that project recreates one. Workspaces a person made (unbound)
+/// are never dropped, even empty.
+fn reclaim_empty_project_workspaces(state: &mut WorkspaceSnapshot) {
+    if state.workspaces.len() <= MAX_WORKSPACES {
+        return;
+    }
+    state
+        .workspaces
+        .retain(|workspace| workspace.project_id.is_none() || !workspace.tabs.is_empty());
 }
 fn require_pane(tab: &WorkspaceTab, id: &PaneId) -> Result<(), ControlError> {
     if tree::find(&tab.layout, &LayoutNodeId::Pane(id.clone())).is_some() {
