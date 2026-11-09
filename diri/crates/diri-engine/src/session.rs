@@ -10925,7 +10925,9 @@ mod deferred_input_loss_tests {
         assert_eq!(session.lost_launch_input(), 0);
 
         assert!(session.launch_at(80, 24));
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // The Engine gives up on the Holder only after HOLDER_READY_TIMEOUT;
+        // a loaded runner can use most of it.
+        let deadline = Instant::now() + HOLDER_READY_TIMEOUT + Duration::from_secs(10);
         while session.lost_launch_input() == 0 {
             assert!(Instant::now() < deadline, "launch failure never reported");
             std::thread::sleep(Duration::from_millis(10));
