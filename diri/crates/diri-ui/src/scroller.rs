@@ -45,11 +45,12 @@ use crate::{Appearance, SemanticColors};
 /// "Show scroll bars".
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ScrollerStyle {
-    /// "Automatically" / "When scrolling": a translucent knob over the
-    /// content that hides itself.
+    /// "When scrolling", or "Automatically" with only a trackpad: a
+    /// translucent knob over the content that hides itself.
     #[default]
     Overlay,
-    /// "Always": a permanent track beside the content.
+    /// "Always", or "Automatically" with a mouse connected: a permanent track
+    /// beside the content.
     Legacy,
 }
 
