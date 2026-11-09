@@ -33,6 +33,7 @@ impl PhoneAccess {
     pub async fn start(
         client: Arc<diri_client::DaemonClient>,
         tailnet: Option<Arc<diri_web::Devices>>,
+        store: Arc<crate::store::StoreRuntime>,
     ) -> Result<Self, String> {
         let address = tailscale_address().await?;
         let admission = match &tailnet {
@@ -44,7 +45,14 @@ impl PhoneAccess {
             },
         };
         let (url, server) =
-            diri_web::start_phone_access(address, client, "Your Mac".into(), admission).await?;
+            diri_web::start_phone_access(
+            address,
+            client,
+            "Your Mac".into(),
+            admission,
+            Some(PhoneSidebar::start(store) as Arc<dyn diri_web::Desktop>),
+        )
+        .await?;
         let qr = match qrcode::QrCode::new(url.as_bytes()) {
             Ok(qr) => qr,
             Err(error) => {
@@ -334,6 +342,173 @@ mod tests {
                 &serde_json::json!({"BackendState":"Running", "TailscaleIPs":["fd7a::1","100.90.0.2"]})
             ),
             Some(Ipv4Addr::new(100, 90, 0, 2))
+        );
+    }
+}
+
+/// The Mac sidebar, as the phone sees it: the order this app draws, and
+/// reorders from the phone applied exactly as a drag here would.
+pub struct PhoneSidebar {
+    runtime: Arc<crate::store::StoreRuntime>,
+    changes: tokio::sync::watch::Sender<u64>,
+    watcher: tokio::task::JoinHandle<()>,
+}
+
+impl PhoneSidebar {
+    /// Starts watching the store; a phone is told whenever the drawn order
+    /// moves. Must run inside the app's Tokio runtime.
+    pub fn start(runtime: Arc<crate::store::StoreRuntime>) -> Arc<Self> {
+        let (changes, _) = tokio::sync::watch::channel(0_u64);
+        let mut store_changes = runtime.changes();
+        let watched = Arc::clone(&runtime);
+        let ticks = changes.clone();
+        let watcher = tokio::spawn(async move {
+            let mut last = layout(&watched);
+            loop {
+                match store_changes.recv().await {
+                    Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+                // Store changes arrive coalesced (at most every 50 ms), and the
+                // projection is cached per store revision, so this is cheap.
+                let next = layout(&watched);
+                if next != last {
+                    last = next;
+                    ticks.send_modify(|tick| *tick = tick.wrapping_add(1));
+                }
+            }
+        });
+        Arc::new(Self {
+            runtime,
+            changes,
+            watcher,
+        })
+    }
+}
+
+impl Drop for PhoneSidebar {
+    fn drop(&mut self) {
+        self.watcher.abort();
+    }
+}
+
+fn layout(runtime: &crate::store::StoreRuntime) -> diri_web::SidebarLayout {
+    let mut store = runtime.store.write().expect("session store lock poisoned");
+    let projection = store.sidebar_projection();
+    let prefs = store.preferences();
+    diri_web::SidebarLayout {
+        project_order: projection
+            .projects
+            .iter()
+            .map(|group| group.project.id.0.clone())
+            .collect(),
+        session_order: projection
+            .display_order
+            .iter()
+            .map(|id| id.0.clone())
+            .collect(),
+        pinned_sessions: prefs
+            .sidebar_pinned_sessions
+            .iter()
+            .map(|id| id.0.clone())
+            .collect(),
+        pinned_projects: prefs
+            .sidebar_pinned_projects
+            .iter()
+            .map(|id| id.0.clone())
+            .collect(),
+        reorderable: prefs.sidebar_ordering == crate::store::SidebarOrdering::Custom,
+    }
+}
+
+impl diri_web::Desktop for PhoneSidebar {
+    fn sidebar(&self) -> diri_web::SidebarLayout {
+        layout(&self.runtime)
+    }
+
+    fn set_sidebar_order(
+        &self,
+        sessions: Option<Vec<String>>,
+        projects: Option<Vec<String>>,
+    ) -> Result<(), String> {
+        {
+            let mut store = self
+                .runtime
+                .store
+                .write()
+                .expect("session store lock poisoned");
+            if store.preferences().sidebar_ordering != crate::store::SidebarOrdering::Custom {
+                return Err("Your Mac sorts its sidebar by activity. Choose Custom order there to reorder.".into());
+            }
+            store
+                .update_preferences(|prefs| {
+                    if let Some(sessions) = sessions {
+                        prefs.sidebar_session_order =
+                            sessions.into_iter().map(diri_proto::SessionId).collect();
+                    }
+                    if let Some(projects) = projects {
+                        prefs.sidebar_project_order =
+                            projects.into_iter().map(diri_proto::ProjectId).collect();
+                    }
+                })
+                .map_err(|error| error.to_string())?;
+        }
+        // Redraw the Mac sidebar now, as its own drag would.
+        self.runtime.publish_local_change();
+        Ok(())
+    }
+
+    fn sidebar_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+}
+
+#[cfg(test)]
+mod sidebar_tests {
+    use super::*;
+    use diri_web::Desktop as _;
+
+    #[tokio::test]
+    async fn a_phone_reorder_lands_in_the_mac_prefs_only_when_sorting_by_hand() {
+        let runtime = Arc::new(crate::store::StoreRuntime::inert());
+        let sidebar = PhoneSidebar::start(Arc::clone(&runtime));
+        assert!(sidebar.sidebar().reorderable);
+
+        sidebar
+            .set_sidebar_order(Some(vec!["s_b".into(), "s_a".into()]), None)
+            .unwrap();
+        {
+            let store = runtime.store.read().unwrap();
+            let prefs = store.preferences();
+            assert_eq!(
+                prefs.sidebar_session_order,
+                [diri_proto::SessionId::new("s_b"), diri_proto::SessionId::new("s_a")]
+            );
+            assert!(prefs.sidebar_project_order.is_empty(), "untouched");
+        }
+
+        runtime
+            .store
+            .write()
+            .unwrap()
+            .update_preferences(|prefs| {
+                prefs.sidebar_ordering = crate::store::SidebarOrdering::NewestFirst;
+            })
+            .unwrap();
+        assert!(!sidebar.sidebar().reorderable);
+        assert!(
+            sidebar
+                .set_sidebar_order(None, Some(vec!["p_a".into()]))
+                .is_err()
+        );
+        assert!(
+            runtime
+                .store
+                .read()
+                .unwrap()
+                .preferences()
+                .sidebar_project_order
+                .is_empty()
         );
     }
 }

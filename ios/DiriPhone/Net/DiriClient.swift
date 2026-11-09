@@ -43,6 +43,8 @@ actor DiriClient {
         case unauthorized
         case daemonUnreachable(String)
         case http(Int, String)
+        /// `409`, with the body: the caller decides what the current state is.
+        case conflict(Data)
         case malformed
 
         var errorDescription: String? {
@@ -50,6 +52,7 @@ actor DiriClient {
             case .unauthorized: "That token was not accepted."
             case let .daemonUnreachable(detail): "The daemon is not reachable: \(detail)"
             case let .http(code, message): message.isEmpty ? "HTTP \(code)" : message
+            case .conflict: "It changed on your Mac."
             case .malformed: "The response could not be read."
             }
         }
@@ -130,6 +133,8 @@ actor DiriClient {
             return data
         case 401:
             throw Failure.unauthorized
+        case 409:
+            throw Failure.conflict(data)
         default:
             let message = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? String
             throw Failure.http(http.statusCode, message ?? "")
@@ -152,6 +157,62 @@ actor DiriClient {
         /// Absent on older `diri-web` builds, in which case group headers fall
         /// back to a name derived from the path.
         var projects: [Project]?
+        /// The Mac sidebar's order. Absent from a gateway with no Mac app
+        /// behind it, which then orders the way the Mac would by default.
+        var sidebar: SidebarLayout?
+    }
+
+    /// `diri_web::SidebarLayout` — the order the Mac draws, not its raw
+    /// preferences, so the phone cannot drift from it.
+    struct SidebarLayout: Decodable, Equatable, Sendable {
+        var projectOrder: [String]
+        var sessionOrder: [String]
+        var pinnedSessions: [String]
+        var pinnedProjects: [String]
+        /// False while the Mac sorts by activity: a drag would mean nothing.
+        var reorderable: Bool
+    }
+
+    /// Replaces the Mac sidebar's manual order, as a drag there would.
+    func setSidebarOrder(sessions: [String]? = nil, projects: [String]? = nil) async throws {
+        var body: [String: Any] = [:]
+        if let sessions { body["sessions"] = sessions }
+        if let projects { body["projects"] = projects }
+        _ = try await send(try request("/api/sidebar/order", method: "PUT", body: body))
+    }
+
+    // MARK: - Notes
+
+    struct Note: Decodable, Equatable, Sendable {
+        var noteId: String
+        var title: String
+        /// The title as a leading `# ` line, then the body. No front matter.
+        var markdown: String
+        /// Fingerprint of the file as loaded; a save sends it back.
+        var version: String
+    }
+
+    enum NoteSave: Equatable, Sendable {
+        case saved(version: String)
+        /// The Mac (or an agent) changed the note since it was loaded.
+        case conflict(Note)
+    }
+
+    func note(sessionID: String) async throws -> Note {
+        try decode(Note.self, from: try await send(try request("/api/session/\(escape(sessionID))/note")))
+    }
+
+    func saveNote(sessionID: String, markdown: String, version: String) async throws -> NoteSave {
+        let request = try request(
+            "/api/session/\(escape(sessionID))/note", method: "PUT",
+            body: ["markdown": markdown, "version": version]
+        )
+        do {
+            struct Saved: Decodable { var version: String }
+            return .saved(version: try decode(Saved.self, from: try await send(request)).version)
+        } catch let Failure.conflict(data) {
+            return .conflict(try decode(Note.self, from: data))
+        }
     }
 
     func sessions() async throws -> SessionsResponse {
@@ -265,8 +326,10 @@ actor DiriClient {
     }
 
     func spawn(kind: String, cwd: String, prompt: String?, host: String? = nil,
-               worktree: Bool = false, branch: String? = nil, base: String? = nil) async throws -> SessionRecord {
+               worktree: Bool = false, branch: String? = nil, base: String? = nil,
+               title: String? = nil) async throws -> SessionRecord {
         var body: [String: Any] = ["kind": kind, "cwd": cwd]
+        if let title, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { body["title"] = title }
         if let host { body["host"] = host }
         if worktree {
             body["worktree"] = true

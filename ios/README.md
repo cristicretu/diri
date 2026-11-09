@@ -76,6 +76,29 @@ text to width** and **Resize session to this phone**. Network errors preserve
 the prompt draft. Mutations are never automatically retried: after a dropped
 connection, inspect the session before sending or starting again.
 
+## Sidebar
+
+The list mirrors the Mac's sidebar: project headers that fold, then each
+project's sessions in the order the Mac draws them (`/api/sessions` carries
+the Mac's computed order as `sidebar`, and an SSE `sidebar` event announces a
+reorder there). Each row leads with the Mac's activity mark (working dots,
+needs-input warning, done check, sleeping moon) and ends with the agent's mark.
+While the Mac sorts by hand (Custom order), hold a row or project header and
+choose **Reorder…** to drag projects, or sessions among their siblings; each
+drop is written to the Mac's order as a drag there would be.
+
+## Notes
+
+A Diri note opens as a document, not a terminal (`/api/session/<id>/note`).
+The Markdown is styled in place while you type: headings, emphasis, to-dos
+(tap a box to tick it), quotes, code and `[[note links]]`. Return continues a
+list. The key bar above the keyboard writes Markdown instead of terminal keys.
+Edits save shortly after typing stops. A save is compare-and-swap against the
+version the phone loaded, so a note changed on the Mac meanwhile asks which
+version to keep instead of being overwritten. An untouched note follows edits
+made on the Mac. **New note** (the pencil beside **+**) creates one in a
+project on the Mac.
+
 ## Terminal
 
 A session opens on its terminal, drawn from `diri-web`'s grid stream

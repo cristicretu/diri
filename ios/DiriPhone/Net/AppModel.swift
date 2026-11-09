@@ -28,6 +28,10 @@ final class AppModel {
     /// The live gateway's host label.
     private(set) var host: String = ""
 
+    /// Projects in the Mac's sidebar order, sectioned by computer.
+    private(set) var sections: [SidebarSection] = []
+    private var layouts: [String: DiriClient.SidebarLayout] = [:]
+
     private(set) var gateways: [Gateway] = []
     private(set) var outcomes: [String: GatewayProbe.Outcome] = [:]
     private(set) var liveGatewayID: String?
@@ -313,6 +317,7 @@ final class AppModel {
         sessions = merged.sessions
         projects = merged.projects
         sessionOwner = merged.owner
+        layouts = merged.layouts
         reproject()
     }
 
@@ -320,6 +325,8 @@ final class AppModel {
         var sessions: [SessionRecord]
         var projects: [String: Project]
         var owner: [String: String]
+        /// Each gateway's Mac sidebar order, by gateway id.
+        var layouts: [String: DiriClient.SidebarLayout] = [:]
     }
 
     /// Joins lists from several gateways, in priority order. Sessions are
@@ -338,6 +345,7 @@ final class AppModel {
             for project in payload.projects ?? [] where result.projects[project.id] == nil {
                 result.projects[project.id] = project
             }
+            if let layout = payload.sidebar { result.layouts[gateway.id] = layout }
         }
         return result
     }
@@ -377,28 +385,60 @@ final class AppModel {
         prefs.collapsedSessions = collapsedSessions
         prefs.collapsedProjects = collapsedProjects
         prefs.pinnedSessions = Set(sessions.filter(\.pinned).map(\.id))
+        // The Mac's drawn order, gateway by gateway in priority order. Ranks
+        // from it reproduce the Mac sidebar exactly, whatever it sorts by.
+        for gateway in gateways {
+            guard let layout = layouts[gateway.id] else { continue }
+            prefs.projectOrder += layout.projectOrder
+            prefs.sessionOrder += layout.sessionOrder
+            prefs.pinnedSessions.formUnion(layout.pinnedSessions)
+            prefs.pinnedProjects.formUnion(layout.pinnedProjects)
+        }
+        orderPrefs = prefs
         groups = SidebarProjection.build(
             sessions: sessions.filter { !$0.isArchived },
             projects: projects,
             prefs: prefs
         )
+        sections = Self.section(groups, owner: sessionOwner, gateways: gateways)
+    }
+
+    private var orderPrefs = SidebarProjection.Preferences()
+
+    /// One computer's projects with nothing folded away: what a reorder
+    /// shows, since a folded row still has a place in the order.
+    func unfoldedGroups(gatewayID: String) -> [SidebarGroup] {
+        var prefs = orderPrefs
+        prefs.collapsedSessions = []
+        prefs.collapsedProjects = []
+        return SidebarProjection.build(
+            sessions: sessions.filter { !$0.isArchived && sessionOwner[$0.id] == gatewayID },
+            projects: projects,
+            prefs: prefs
+        )
+    }
+
+    /// One section per contributing computer, in priority order. Only the
+    /// label depends on how many there are: one computer needs no header.
+    static func section(_ groups: [SidebarGroup], owner: [String: String], gateways: [Gateway]) -> [SidebarSection] {
+        var byGateway: [String: [SidebarGroup]] = [:]
+        for group in groups {
+            let first = group.rows.first?.session ?? group.archived.first
+            let gateway = first.flatMap { owner[$0.id] } ?? gateways.first?.id ?? ""
+            byGateway[gateway, default: []].append(group)
+        }
+        let contributing = gateways.filter { byGateway[$0.id] != nil }
+        return contributing.map { gateway in
+            SidebarSection(
+                gatewayID: gateway.id,
+                name: contributing.count > 1 ? gateway.name : nil,
+                groups: byGateway[gateway.id] ?? []
+            )
+        }
     }
 
     func session(_ id: String) -> SessionRecord? {
         sessions.first { $0.id == id }
-    }
-
-    /// Sessions grouped by the computer they run on — the live gateway's own,
-    /// then each SSH host or other paired gateway — in sidebar order.
-    var computers: [ComputerGroup] {
-        var order: [String] = []
-        var rows: [String: [SidebarRow]] = [:]
-        for row in groups.flatMap(\.rows) {
-            let name = computerName(of: row.session)
-            if rows[name] == nil { order.append(name) }
-            rows[name, default: []].append(row)
-        }
-        return order.map { ComputerGroup(name: $0, rows: rows[$0] ?? []) }
     }
 
     func computerName(of session: SessionRecord) -> String {
@@ -408,7 +448,10 @@ final class AppModel {
     }
 
     /// Every visible session in drawn order, for ⌘[ and ⌘].
-    var orderedSessionIDs: [String] { computers.flatMap { $0.rows.map(\.session.id) } }
+    var orderedSessionIDs: [String] { visibleRows.map(\.session.id) }
+
+    /// Every drawn row, top to bottom.
+    var visibleRows: [SidebarRow] { sections.flatMap { $0.groups.flatMap(\.rows) } }
 
     func neighbour(of id: String?, step: Int) -> String? {
         let ids = orderedSessionIDs
@@ -441,6 +484,40 @@ final class AppModel {
             collapsedProjects.insert(id)
         }
         reproject()
+    }
+
+    /// Whether the Mac that owns `gatewayID` sorts its sidebar by hand. When
+    /// it sorts by activity there is no order to move a row within.
+    func canReorder(gatewayID: String) -> Bool {
+        layouts[gatewayID]?.reorderable == true
+    }
+
+    /// Moves projects within one computer's section, as a drag on the Mac
+    /// would. `order` is that section's project ids in their new order.
+    func reorderProjects(_ order: [String], gatewayID: String) async throws {
+        guard let client = clients[gatewayID], var full = layouts[gatewayID]?.projectOrder else { return }
+        full = Self.permute(full, run: order)
+        try await client.setSidebarOrder(projects: full)
+        await refresh(gateway: gatewayID)
+    }
+
+    /// Moves sessions within one sibling run (same project, same parent).
+    func reorderSessions(_ siblings: [String], gatewayID: String) async throws {
+        guard let client = clients[gatewayID], var full = layouts[gatewayID]?.sessionOrder else { return }
+        full = Self.permute(full, run: siblings)
+        try await client.setSidebarOrder(sessions: full)
+        await refresh(gateway: gatewayID)
+    }
+
+    /// `run`'s members take the places they already hold in `order`, in
+    /// `run`'s new order; everything else stays put. Members missing from
+    /// `order` (a session newer than the last read) go on the end.
+    nonisolated static func permute(_ order: [String], run: [String]) -> [String] {
+        let known = Set(order)
+        let members = Set(run)
+        var queue = run.filter(known.contains).makeIterator()
+        return order.map { id in members.contains(id) ? (queue.next() ?? id) : id }
+            + run.filter { !known.contains($0) }
     }
 
     private func requireClient(_ id: String) throws -> DiriClient {
@@ -490,6 +567,18 @@ final class AppModel {
         return record
     }
 
+    /// Starts a note on the live gateway's Mac. Notes live in that Mac's
+    /// notes store, so a note always belongs to a local project folder.
+    func spawnNote(title: String, cwd: String) async throws -> SessionRecord {
+        guard let client = liveClient, let live = liveGatewayID else {
+            throw DiriClient.Failure.daemonUnreachable("No paired computer answered.")
+        }
+        let record = try await client.spawn(kind: AgentKind.note.id, cwd: cwd, prompt: nil, title: title)
+        sessionOwner[record.id] = live
+        await refresh(gateway: live)
+        return record
+    }
+
     /// Directories that already have sessions on the live gateway — almost
     /// always where the next one belongs.
     var recentDirectories: [String] {
@@ -504,8 +593,10 @@ final class AppModel {
     }
 }
 
-struct ComputerGroup: Identifiable, Hashable {
-    var name: String
-    var rows: [SidebarRow]
-    var id: String { name }
+struct SidebarSection: Identifiable, Hashable {
+    var gatewayID: String
+    /// Set only when sessions come from more than one computer.
+    var name: String?
+    var groups: [SidebarGroup]
+    var id: String { gatewayID }
 }

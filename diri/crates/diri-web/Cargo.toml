@@ -13,6 +13,7 @@ path = "src/main.rs"
 base64.workspace = true
 diri-platform = { workspace = true, features = ["async"] }
 diri-client.workspace = true
+diri-notes.workspace = true
 diri-proto.workspace = true
 getrandom.workspace = true
 serde.workspace = true

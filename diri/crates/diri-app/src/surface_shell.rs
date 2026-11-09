@@ -3842,7 +3842,11 @@ impl UtilitySurfaces {
                                         .phone_tailnet_identity
                                         .then(|| Arc::clone(&this.phone_devices));
                                     this.start_phone_access(
-                                        crate::phone_access::PhoneAccess::start(client, tailnet),
+                                        crate::phone_access::PhoneAccess::start(
+                                            client,
+                                            tailnet,
+                                            Arc::clone(&this.store_runtime),
+                                        ),
                                         cx,
                                     );
                                 },
@@ -3954,11 +3958,12 @@ impl UtilitySurfaces {
                                                 // before it is replaced.
                                                 let client =
                                                     Arc::clone(this.store_runtime.client());
+                                                let store = Arc::clone(&this.store_runtime);
                                                 this.start_phone_access(
                                                     async move {
                                                         crate::phone_access::PhoneAccess::reset_pairing()?;
                                                         crate::phone_access::PhoneAccess::start(
-                                                            client, None,
+                                                            client, None, store,
                                                         )
                                                         .await
                                                     },

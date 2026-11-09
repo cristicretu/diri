@@ -7,6 +7,7 @@ struct RootView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var spawning = false
+    @State private var noting = false
     @State private var pairing = false
     @State private var switcher = false
     @State private var drawerOpen = false
@@ -27,6 +28,9 @@ struct RootView: View {
         .tint(Tokens.Ink.primary)
         .sheet(isPresented: $spawning) {
             NewSessionSheet { record in select(record.id) }
+        }
+        .sheet(isPresented: $noting) {
+            NewNoteSheet { record in select(record.id) }
         }
         .sheet(isPresented: $pairing) {
             ConnectView(onConnected: { pairing = false; model.selectedSessionID = nil })
@@ -100,6 +104,7 @@ struct RootView: View {
             selection: model.selectedSessionID,
             onSelect: select,
             onNew: { spawning = true },
+            onNewNote: { noting = true },
             onPair: { pairing = true }
         )
         .background(Tokens.Ink.background)
@@ -201,7 +206,7 @@ struct SessionSwitcher: View {
     @FocusState private var focused: Bool
 
     private var matches: [SidebarRow] {
-        let rows = model.computers.flatMap(\.rows)
+        let rows = model.visibleRows
         let needle = query.trimmingCharacters(in: .whitespaces).lowercased()
         guard !needle.isEmpty else { return rows }
         return rows.filter { row in

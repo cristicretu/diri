@@ -6,11 +6,13 @@ struct SessionListView: View {
     let selection: String?
     let onSelect: (String) -> Void
     let onNew: () -> Void
+    var onNewNote: () -> Void = {}
     let onPair: () -> Void
 
     @Environment(AppModel.self) private var model
     @State private var actionError: String?
     @State private var confirmingKill: SessionRecord?
+    @State private var reordering: ReorderTarget?
 
     var body: some View {
         Group {
@@ -45,29 +47,53 @@ struct SessionListView: View {
 
     private var list: some View {
         List {
-            ForEach(model.computers) { computer in
-                Section {
-                    ForEach(computer.rows) { row in rowButton(row) }
-                } header: {
-                    Text(computer.name)
+            ForEach(model.sections) { section in
+                if let name = section.name {
+                    Text(name)
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(Tokens.Ink.tertiary)
-                        .textCase(nil)
                         .padding(.leading, 10)
+                        .padding(.top, 10)
                         .accessibilityAddTraits(.isHeader)
+                        .listRowSeparator(.hidden)
+                        .listRowBackground(Color.clear)
+                        .listRowInsets(EdgeInsets(top: 0, leading: 8, bottom: 0, trailing: 8))
                 }
-                .listRowSeparator(.hidden)
-                .listRowBackground(Color.clear)
-                .listRowInsets(EdgeInsets(top: 0, leading: 8, bottom: 0, trailing: 8))
+                ForEach(section.groups) { group in
+                    // The header is a row, not a list section header: a plain
+                    // list pins section headers, and the Mac's do not stick.
+                    ProjectHeaderView(
+                        group: group,
+                        collapsed: model.collapsedProjects.contains(group.id)
+                    ) {
+                        model.toggleProjectCollapsed(group.id)
+                    }
+                    .contextMenu { reorderButton(section.gatewayID) }
+                    .listRowSeparator(.hidden)
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets(top: 0, leading: 8, bottom: 0, trailing: 8))
+                    ForEach(group.rows) { row in rowButton(row, gatewayID: section.gatewayID) }
+                }
             }
         }
         .listStyle(.plain)
-        .listSectionSpacing(8)
-        .scrollContentBackground(.hidden)
+                .scrollContentBackground(.hidden)
         .refreshable { await model.refresh() }
+        .sheet(item: $reordering) { target in
+            ReorderSheet(gatewayID: target.id)
+        }
     }
 
-    private func rowButton(_ row: SidebarRow) -> some View {
+    @ViewBuilder
+    private func reorderButton(_ gatewayID: String) -> some View {
+        if model.canReorder(gatewayID: gatewayID) {
+            Button { reordering = ReorderTarget(id: gatewayID) } label: {
+                Label("Reorder…", systemImage: "arrow.up.arrow.down")
+            }
+        }
+    }
+
+    private func rowButton(_ row: SidebarRow, gatewayID: String) -> some View {
         Button {
             onSelect(row.session.id)
         } label: {
@@ -95,6 +121,7 @@ struct SessionListView: View {
                     Label(row.collapsed ? "Expand" : "Collapse", systemImage: "chevron.right")
                 }
             }
+            reorderButton(gatewayID)
             Divider()
             Button(role: .destructive) { confirmingKill = row.session } label: {
                 Label("Kill session", systemImage: "xmark.circle")
@@ -139,6 +166,9 @@ struct SessionListView: View {
                 }
                 .accessibilityLabel("\(model.needingInput.count) waiting for input")
             }
+            Button(action: onNewNote) { Image(systemName: "square.and.pencil") }
+                .accessibilityLabel("New note")
+                .accessibilityIdentifier("new-note")
             Button(action: onNew) { Image(systemName: "plus") }
                 .accessibilityLabel("New session")
                 .accessibilityIdentifier("new-session")
@@ -163,6 +193,56 @@ struct SessionListView: View {
     private func displayTitle(_ session: SessionRecord) -> String {
         let trimmed = session.title.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? session.id : trimmed
+    }
+}
+
+private struct ReorderTarget: Identifiable {
+    var id: String
+}
+
+/// A project's header, matching the Mac's: the fold chevron in the lead slot
+/// where a row keeps its activity mark, then the name, then pin and remote
+/// marks. The whole header folds the project.
+struct ProjectHeaderView: View {
+    let group: SidebarGroup
+    let collapsed: Bool
+    let onToggle: () -> Void
+
+    var body: some View {
+        Button(action: onToggle) {
+            HStack(spacing: 8) {
+                Image(systemName: collapsed ? "chevron.right" : "chevron.down")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(Tokens.Ink.tertiary)
+                    .frame(width: 18, height: 18)
+                Text(group.project.displayName)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Tokens.Ink.primary.opacity(0.55))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if group.pinned {
+                    Image(systemName: "pin.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(Tokens.Ink.tertiary)
+                }
+                if group.project.host != nil {
+                    Image(systemName: "server.rack")
+                        .font(.system(size: 9))
+                        .foregroundStyle(Tokens.Ink.tertiary)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.top, 6)
+            .frame(height: 40)
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .textCase(nil)
+        .accessibilityAddTraits(.isHeader)
+        .accessibilityLabel(group.project.displayName)
+        .accessibilityValue(collapsed ? "Collapsed" : "Expanded")
+        .accessibilityIdentifier("project-header-\(group.id)")
     }
 }
 

@@ -61,7 +61,7 @@ enum SidebarProjection {
         let projectRank = rankMap(prefs.projectOrder)
 
         var grouped: [String: [SessionRecord]] = [:]
-        for session in sessions {
+        for session in sessions where !session.isAuxiliaryTerminal {
             grouped[session.projectID, default: []].append(session)
         }
 

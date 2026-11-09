@@ -2,10 +2,10 @@ import SwiftUI
 
 /// One sidebar row, matching `session_row` in the desktop's `sidebar/view.rs`.
 ///
-/// The lane order is fixed and load-bearing: indent rails, disclosure slot,
-/// status glyph, title, then trailing chips. Every row has the same lanes even
-/// when a lane is empty, which is what lets the column of glyphs scan straight
-/// down the list instead of stepping left and right with the text.
+/// The lane order is fixed and load-bearing: indent rails, activity mark,
+/// title, then the trailing fold control, pin and agent mark. Every row has
+/// the same lanes even when a lane is empty, which is what lets each column
+/// of marks scan straight down the list instead of stepping with the text.
 struct SessionRowView: View {
     let row: SidebarRow
     let selected: Bool
@@ -19,27 +19,8 @@ struct SessionRowView: View {
         HStack(spacing: 8) {
             IndentRails(depth: row.depth, rails: row.rails)
 
-            // The fold control's column is always present, so a row with no
-            // children does not slide its title left of its siblings.
-            Group {
-                if row.hasChildren {
-                    Button(action: onToggleCollapse) {
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(Tokens.Ink.tertiary)
-                            .rotationEffect(.degrees(row.collapsed ? 0 : 90))
-                            .frame(width: Tokens.Space.indent, height: Tokens.Metrics.rowHeight)
-                            .contentShape(.rect)
-                    }
-                    .buttonStyle(.plain)
-                } else {
-                    Color.clear.frame(width: Tokens.Space.indent)
-                }
-            }
-            .frame(width: Tokens.Space.indent)
-
-            StatusGlyphView(kind: session.effectiveKind, state: session.statusState)
-                .frame(width: Tokens.Metrics.glyph, height: Tokens.Metrics.glyph)
+            // What the session is doing leads the row, as on the Mac.
+            ActivityMarkView(state: session.statusState)
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(displayTitle)
@@ -88,41 +69,50 @@ struct SessionRowView: View {
     }
 
     /// The branch is the single most useful second line on a phone: it is how
-    /// you tell two sessions in the same repo apart at a glance.
+    /// you tell two sessions in the same repo apart at a glance. The project
+    /// is already the header above, so it is not repeated here.
     private var subtitle: String? {
-        if let branch = session.gitBranch, !branch.isEmpty { return branch }
-        let path = session.worktreePath ?? session.cwd
-        let name = (path as NSString).lastPathComponent
-        return name.isEmpty ? nil : name
+        guard !session.isNote, let branch = session.gitBranch, !branch.isEmpty else { return nil }
+        return branch
     }
 
-    /// One quiet word for the states worth reading from across the list;
-    /// the glyph's colour already carries the rest.
+    /// The fold control, pin and agent mark, in the Mac's trailing order.
+    /// The fold slot is kept on every row so the agent marks line up.
     @ViewBuilder
     private var trailing: some View {
         HStack(spacing: 6) {
+            if session.hasEnded {
+                Text("ended")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Tokens.Ink.tertiary)
+            }
             if row.pinned {
                 Image(systemName: "pin.fill")
                     .font(.system(size: 9))
                     .foregroundStyle(Tokens.Ink.tertiary)
             }
-            if let word = statusWord {
-                Text(word.text)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(word.color)
+            Group {
+                if row.hasChildren {
+                    Button(action: onToggleCollapse) {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(Tokens.Ink.tertiary)
+                            .rotationEffect(.degrees(row.collapsed ? 0 : 90))
+                            .frame(width: 28, height: Tokens.Metrics.rowHeight)
+                            .contentShape(.rect)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(row.collapsed ? "Expand" : "Collapse")
+                } else {
+                    Color.clear
+                }
             }
+            .frame(width: 28)
+
+            StatusGlyphView(kind: session.effectiveKind, state: session.statusState)
+                .frame(width: Tokens.Metrics.glyph, height: Tokens.Metrics.glyph)
         }
         .fixedSize()
-    }
-
-    private var statusWord: (text: String, color: Color)? {
-        if session.hasEnded { return ("ended", Tokens.Ink.tertiary) }
-        switch session.statusState {
-        case let .needsInput(destructive): return ("needs you", destructive ? Tokens.Ink.danger : Tokens.Ink.attention)
-        case .doneUnseen: return ("done", Tokens.Ink.fresh)
-        case .working: return ("working", Tokens.Ink.tertiary)
-        default: return nil
-        }
     }
 }
 

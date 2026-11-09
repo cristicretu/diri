@@ -153,3 +153,50 @@ final class SidebarProjectionTests: XCTestCase {
         XCTAssertEqual(groups.map(\.project.id), ["/older", "/newer"])
     }
 }
+
+/// The phone draws the Mac's computed order, whatever the Mac sorts by.
+final class DesktopOrderTests: XCTestCase {
+    private func session(_ id: String, project: String, created: Double, kind: AgentKind = .claudeCode,
+                         parent: String? = nil) -> SessionRecord {
+        SessionRecord(id: id, kind: kind, foregroundAgent: nil, cwd: project, projectID: project,
+                      worktreePath: nil, gitBranch: nil, title: id, status: .idle, needsInput: nil,
+                      parent: parent, createdAt: created, updatedAt: created, lastSeenAt: nil, pinned: false,
+                      archivedAt: nil, host: nil, hibernation: nil)
+    }
+
+    func testTheMacsOrderWinsOverCreationTime() {
+        var prefs = SidebarProjection.Preferences()
+        prefs.projectOrder = ["/b", "/a"]
+        prefs.sessionOrder = ["b2", "b1", "a2", "a1"]
+        let groups = SidebarProjection.build(sessions: [
+            session("a1", project: "/a", created: 1), session("a2", project: "/a", created: 2),
+            session("b1", project: "/b", created: 3), session("b2", project: "/b", created: 4),
+        ], projects: [:], prefs: prefs)
+        XCTAssertEqual(groups.map(\.id), ["/b", "/a"])
+        XCTAssertEqual(groups.flatMap(\.rows).map(\.session.id), ["b2", "b1", "a2", "a1"])
+    }
+
+    func testAWorkbenchShellIsNotARow() {
+        let groups = SidebarProjection.build(sessions: [
+            session("agent", project: "/a", created: 1),
+            session("shell", project: "/a", created: 2, kind: .shell, parent: "agent"),
+        ], projects: [:], prefs: .init())
+        XCTAssertEqual(groups.flatMap(\.rows).map(\.session.id), ["agent"])
+    }
+
+    func testAMoveKeepsEveryoneElseInPlace() {
+        XCTAssertEqual(AppModel.permute(["a", "x", "b", "y", "c"], run: ["c", "a", "b"]), ["c", "x", "a", "y", "b"])
+        // A session newer than the order the phone read goes on the end.
+        XCTAssertEqual(AppModel.permute(["a", "b"], run: ["new", "b", "a"]), ["b", "a", "new"])
+    }
+
+    func testRunsFollowTheTree() {
+        let rows = [("p", 0), ("c1", 1), ("c2", 1), ("q", 0)].map { id, depth in
+            SidebarRow(session: session(id, project: "/a", created: 0), depth: depth, hasChildren: false,
+                       collapsed: false, pinned: false, rails: 0)
+        }
+        let group = SidebarGroup(project: Project(id: "/a", name: "a"), rows: rows, archived: [], pinned: false)
+        let runs = ReorderSheet.runs(in: group)
+        XCTAssertEqual(runs.map { $0.sessions.map(\.id) }, [["p", "q"], ["c1", "c2"]])
+    }
+}
