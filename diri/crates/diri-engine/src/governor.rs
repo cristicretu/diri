@@ -514,6 +514,11 @@ pub fn idle_since(record: &diri_proto::SessionRecord, attached: bool) -> Option<
     if record.hibernation.is_some() || record.pinned || attached {
         return None;
     }
+    // Idle by status, but waiting on a shell it started: freezing the tree
+    // would stop that shell too.
+    if record.background_shells.is_some_and(|shells| shells > 0) {
+        return None;
+    }
     if record
         .listening_ports
         .as_deref()
@@ -1063,6 +1068,7 @@ mod tests {
             note_id: None,
             foreground_ports: None,
             terminal_progress: None,
+            background_shells: None,
             scheduled_run: None,
         }
     }
@@ -1087,5 +1093,14 @@ mod tests {
         assert_eq!(idle_since(&serving, false), None);
         serving.listening_ports = Some(Vec::new());
         assert_eq!(idle_since(&serving, false), Some(1.0));
+    }
+
+    #[test]
+    fn a_record_waiting_on_background_shells_is_never_eligible() {
+        let mut waiting = record(SessionStatus::Idle);
+        waiting.background_shells = Some(1);
+        assert_eq!(idle_since(&waiting, false), None);
+        waiting.background_shells = None;
+        assert_eq!(idle_since(&waiting, false), Some(1.0));
     }
 }

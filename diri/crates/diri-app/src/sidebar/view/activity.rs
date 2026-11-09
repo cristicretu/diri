@@ -227,7 +227,10 @@ fn unread_sessions(store: &crate::store::SessionStore) -> HashSet<SessionId> {
 pub(super) fn has_activity(state: StatusState) -> bool {
     matches!(
         state,
-        StatusState::Working | StatusState::NeedsInput { .. } | StatusState::DoneUnseen
+        StatusState::Working
+            | StatusState::NeedsInput { .. }
+            | StatusState::DoneUnseen
+            | StatusState::ShellsRunning
     )
 }
 
@@ -252,6 +255,8 @@ mod tests {
         assert!(has_activity(StatusState::Working));
         assert!(has_activity(StatusState::NeedsInput { destructive: false }));
         assert!(has_activity(StatusState::DoneUnseen));
+        // An Agent waiting on its own background shell is not idle.
+        assert!(has_activity(StatusState::ShellsRunning));
         assert!(!has_activity(StatusState::IdleSeen));
         assert!(!has_activity(StatusState::None));
         assert!(!has_activity(StatusState::Hibernated));

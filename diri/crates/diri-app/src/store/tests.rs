@@ -71,6 +71,7 @@ pub(super) fn session(value: &str, project: &str, created: f64) -> SessionRecord
         note_id: None,
         foreground_ports: None,
         terminal_progress: None,
+        background_shells: None,
         scheduled_run: None,
     }
 }
@@ -3961,6 +3962,7 @@ fn a_new_terminal_starts_where_the_last_terminal_in_its_project_was() {
         agent_workspace: None,
         note_id: None,
         terminal_progress: None,
+        background_shells: None,
         scheduled_run: None,
         ..session(value, project, 2.0)
     };
@@ -4022,6 +4024,7 @@ fn only_terminals_carry_a_location_for_their_hover() {
         agent_workspace: None,
         note_id: None,
         terminal_progress: None,
+        background_shells: None,
         scheduled_run: None,
         ..session("term", "p", 1.0)
     };

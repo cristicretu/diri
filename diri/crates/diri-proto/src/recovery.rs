@@ -106,6 +106,24 @@ pub fn claude_pending_work(payload: &serde_json::Value) -> Option<bool> {
     Some(tasks_pending || crons_pending)
 }
 
+/// How many of a Claude payload's `background_tasks` are shells still in
+/// flight. `None` when the payload carries no task list (older Claude, and
+/// notifications that omit it), so callers keep the last known count.
+pub fn claude_background_shells(payload: &serde_json::Value) -> Option<u32> {
+    let tasks = payload.get("background_tasks")?.as_array()?;
+    let running = tasks
+        .iter()
+        .filter(|task| {
+            task.get("type").and_then(serde_json::Value::as_str) == Some("shell")
+                && matches!(
+                    task.get("status").and_then(serde_json::Value::as_str),
+                    Some("running" | "pending")
+                )
+        })
+        .count();
+    Some(u32::try_from(running).unwrap_or(u32::MAX))
+}
+
 /// Filesystem adapter for one session's recovery directory.
 #[derive(Clone, Debug)]
 pub struct SessionRecoveryStore {
@@ -296,5 +314,26 @@ mod tests {
 
         assert!(session.join("provider").is_dir());
         assert!(!session.join(RECOVERY_CAPSULE_FILE).exists());
+    }
+
+    #[test]
+    fn background_shells_count_only_shells_still_in_flight() {
+        let payload = serde_json::json!({"background_tasks": [
+            {"id": "a", "type": "shell", "status": "running", "command": "npm run dev"},
+            {"id": "b", "type": "shell", "status": "pending"},
+            {"id": "c", "type": "shell", "status": "completed"},
+            {"id": "d", "type": "subagent", "status": "running"},
+            {"id": "e", "type": "monitor", "status": "running"},
+        ]});
+        assert_eq!(claude_background_shells(&payload), Some(2));
+        assert_eq!(
+            claude_background_shells(&serde_json::json!({"background_tasks": []})),
+            Some(0)
+        );
+        // No list is no news: the caller keeps what it knew.
+        assert_eq!(
+            claude_background_shells(&serde_json::json!({"session_crons": []})),
+            None
+        );
     }
 }

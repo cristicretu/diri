@@ -494,30 +494,38 @@ final class AppModel {
 
     /// Moves projects within one computer's section, as a drag on the Mac
     /// would. `order` is that section's project ids in their new order.
-    func reorderProjects(_ order: [String], gatewayID: String) async throws {
-        guard let client = clients[gatewayID], var full = layouts[gatewayID]?.projectOrder else { return }
-        full = Self.permute(full, run: order)
-        try await client.setSidebarOrder(projects: full)
+    func moveProject(_ id: String, in order: [String], gatewayID: String) async throws {
+        try await move("project", id, in: order, gatewayID: gatewayID)
+    }
+
+    /// Moves a session within its sibling run (same project, same parent).
+    func moveSession(_ id: String, in siblings: [String], gatewayID: String) async throws {
+        try await move("session", id, in: siblings, gatewayID: gatewayID)
+    }
+
+    /// Sends one move, named by the row it now sits before (or after, at the
+    /// end): the Mac applies it to its saved order the way its own drag
+    /// does, so rows this phone did not touch keep the Mac's latest order.
+    private func move(_ row: String, _ id: String, in order: [String], gatewayID: String) async throws {
+        guard let client = clients[gatewayID] else { return }
+        let place = Self.placement(of: id, in: order)
+        do {
+            try await client.moveSidebarRow(row, id: id, before: place.before, after: place.after)
+        } catch {
+            // A refusal means this phone's layout is stale; show the Mac's.
+            await refresh(gateway: gatewayID)
+            throw error
+        }
         await refresh(gateway: gatewayID)
     }
 
-    /// Moves sessions within one sibling run (same project, same parent).
-    func reorderSessions(_ siblings: [String], gatewayID: String) async throws {
-        guard let client = clients[gatewayID], var full = layouts[gatewayID]?.sessionOrder else { return }
-        full = Self.permute(full, run: siblings)
-        try await client.setSidebarOrder(sessions: full)
-        await refresh(gateway: gatewayID)
-    }
-
-    /// `run`'s members take the places they already hold in `order`, in
-    /// `run`'s new order; everything else stays put. Members missing from
-    /// `order` (a session newer than the last read) go on the end.
-    nonisolated static func permute(_ order: [String], run: [String]) -> [String] {
-        let known = Set(order)
-        let members = Set(run)
-        var queue = run.filter(known.contains).makeIterator()
-        return order.map { id in members.contains(id) ? (queue.next() ?? id) : id }
-            + run.filter { !known.contains($0) }
+    /// Where `moved` sits in `order`, by its neighbour: the row after it,
+    /// or, when it is last, the row before it. Neither when it is alone.
+    nonisolated static func placement(of moved: String, in order: [String]) -> (before: String?, after: String?) {
+        guard let index = order.firstIndex(of: moved) else { return (nil, nil) }
+        if index + 1 < order.count { return (order[index + 1], nil) }
+        if index > 0 { return (nil, order[index - 1]) }
+        return (nil, nil)
     }
 
     private func requireClient(_ id: String) throws -> DiriClient {
@@ -577,6 +585,18 @@ final class AppModel {
         sessionOwner[record.id] = live
         await refresh(gateway: live)
         return record
+    }
+
+    /// The live gateway's own projects. A note is spawned there, so only its
+    /// projects can hold one; another Mac's paths mean nothing to it.
+    var liveProjects: [Project] {
+        guard let live = liveGatewayID else { return [] }
+        return payloads[live]?.projects ?? []
+    }
+
+    /// Whether `sessionID` belongs to the live gateway's Mac.
+    func isOnLiveGateway(_ sessionID: String) -> Bool {
+        liveGatewayID != nil && sessionOwner[sessionID] == liveGatewayID
     }
 
     /// Directories that already have sessions on the live gateway — almost

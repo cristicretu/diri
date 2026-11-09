@@ -100,7 +100,7 @@ impl Api {
                 Err(error) => daemon_error(&error),
             },
             ("POST", ["api", "spawn"]) => self.spawn(request).await,
-            ("PUT", ["api", "sidebar", "order"]) => self.set_sidebar_order(request),
+            ("POST", ["api", "sidebar", "move"]) => self.move_sidebar_row(request).await,
             ("GET", ["api", "voice"]) => self.phone_reader(None).await,
             ("POST", ["api", "voice"]) => {
                 match request.json().get("readAloud").and_then(Value::as_bool) {
@@ -563,48 +563,54 @@ impl Api {
     }
 }
 
-/// The most ids one order may name: far beyond any real sidebar, small
-/// enough that a hostile body cannot make the app persist megabytes.
-const MAX_ORDER_IDS: usize = 10_000;
-
 impl Api {
-    fn set_sidebar_order(&self, request: &Request) -> Response {
+    /// `{"session"|"project": id, "before"|"after": id}`; with neither
+    /// `before` nor `after` the row goes to the end.
+    async fn move_sidebar_row(&self, request: &Request) -> Response {
+        use crate::desktop::{SidebarMove, SidebarPlace, SidebarRefusal, SidebarRow};
         let Some(desktop) = &self.desktop else {
             return Response::error(404, "this gateway has no desktop sidebar");
         };
         let body = request.json();
-        let ids = |key: &str| -> Result<Option<Vec<String>>, Response> {
-            let Some(value) = body.get(key) else {
-                return Ok(None);
-            };
-            let list = value
-                .as_array()
-                .filter(|list| list.len() <= MAX_ORDER_IDS)
-                .ok_or_else(|| Response::error(400, "order must be a list of ids"))?;
-            list.iter()
-                .map(|id| {
-                    id.as_str()
-                        .filter(|id| !id.is_empty() && id.len() <= 256)
-                        .map(str::to_owned)
-                        .ok_or_else(|| Response::error(400, "order must be a list of ids"))
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map(Some)
+        let id = |key: &str| -> Result<Option<String>, Response> {
+            match body.get(key) {
+                None | Some(Value::Null) => Ok(None),
+                Some(value) => value
+                    .as_str()
+                    .filter(|id| !id.is_empty() && id.len() <= 256)
+                    .map(|id| Some(id.to_owned()))
+                    .ok_or_else(|| Response::error(400, &format!("{key} must be an id"))),
+            }
         };
-        let sessions = match ids("sessions") {
-            Ok(ids) => ids,
+        let fields = (|| Ok((id("session")?, id("project")?, id("before")?, id("after")?)))();
+        let (session, project, before, after) = match fields {
+            Ok(fields) => fields,
             Err(response) => return response,
         };
-        let projects = match ids("projects") {
-            Ok(ids) => ids,
-            Err(response) => return response,
+        let (row, moved) = match (session, project) {
+            (Some(id), None) => (SidebarRow::Session, id),
+            (None, Some(id)) => (SidebarRow::Project, id),
+            _ => return Response::error(400, "name exactly one session or project"),
         };
-        if sessions.is_none() && projects.is_none() {
-            return Response::error(400, "missing sessions or projects");
-        }
-        match desktop.set_sidebar_order(sessions, projects) {
-            Ok(()) => Response::json(&json!({ "ok": true })),
-            Err(error) => Response::error(500, &error),
+        let place = match (before, after) {
+            (Some(target), None) => SidebarPlace::Before(target),
+            (None, Some(target)) => SidebarPlace::After(target),
+            (None, None) => SidebarPlace::End,
+            (Some(_), Some(_)) => return Response::error(400, "give before or after, not both"),
+        };
+        let desktop = Arc::clone(desktop);
+        let moved = SidebarMove {
+            row,
+            id: moved,
+            place,
+        };
+        // The app's store lock is shared with its UI thread: wait for it on a
+        // blocking thread, never on an async worker.
+        match tokio::task::spawn_blocking(move || desktop.move_sidebar_row(moved)).await {
+            Ok(Ok(())) => Response::json(&json!({ "ok": true })),
+            Ok(Err(SidebarRefusal::Conflict(reason))) => Response::error(409, &reason),
+            Ok(Err(SidebarRefusal::Failed(reason))) => Response::error(500, &reason),
+            Err(error) => Response::error(500, &error.to_string()),
         }
     }
 }
@@ -812,10 +818,11 @@ mod tests {
         (response.status, body)
     }
 
-    /// A desktop that records the orders it is given.
+    /// A desktop that records the moves it is given.
     #[derive(Default)]
     struct RecordingDesktop {
         layout: std::sync::Mutex<crate::desktop::SidebarLayout>,
+        moves: std::sync::Mutex<Vec<crate::desktop::SidebarMove>>,
         refits: std::sync::Mutex<Vec<String>>,
     }
 
@@ -824,18 +831,16 @@ mod tests {
             self.layout.lock().unwrap().clone()
         }
 
-        fn set_sidebar_order(
+        fn move_sidebar_row(
             &self,
-            sessions: Option<Vec<String>>,
-            projects: Option<Vec<String>>,
-        ) -> Result<(), String> {
-            let mut layout = self.layout.lock().unwrap();
-            if let Some(sessions) = sessions {
-                layout.session_order = sessions;
+            row: crate::desktop::SidebarMove,
+        ) -> Result<(), crate::desktop::SidebarRefusal> {
+            if !self.layout.lock().unwrap().reorderable {
+                return Err(crate::desktop::SidebarRefusal::Conflict(
+                    "sorted by activity".into(),
+                ));
             }
-            if let Some(projects) = projects {
-                layout.project_order = projects;
-            }
+            self.moves.lock().unwrap().push(row);
             Ok(())
         }
 
@@ -849,15 +854,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_phone_reads_and_writes_the_mac_sidebar_order() {
-        use crate::desktop::Desktop as _;
+    async fn the_phone_reads_the_mac_sidebar_and_moves_one_row() {
+        use crate::desktop::{SidebarMove, SidebarPlace, SidebarRow};
         let engine = crate::testing::fake_engine(|method, _| match method {
             diri_proto::Method::SESSION_LIST => json!({"sessions": [], "projects": []}),
             _ => json!({}),
         })
         .await;
         let desktop = Arc::new(RecordingDesktop::default());
-        desktop.layout.lock().unwrap().pinned_projects = vec!["p_a".into()];
+        {
+            let mut layout = desktop.layout.lock().unwrap();
+            layout.pinned_projects = vec!["p_a".into()];
+            layout.reorderable = true;
+        }
         let mut api = Api {
             client: Arc::clone(&engine.client),
             auth: Auth::temporary().unwrap(),
@@ -872,30 +881,49 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(listed["sidebar"]["pinnedProjects"], json!(["p_a"]));
 
-        let (status, _) = call(
-            &api,
-            "PUT",
-            "/api/sidebar/order",
-            r#"{"sessions":["s_b","s_a"],"projects":["p_b","p_a"]}"#,
-        )
-        .await;
-        assert_eq!(status, 200);
-        let layout = desktop.sidebar();
-        assert_eq!(layout.session_order, ["s_b", "s_a"]);
-        assert_eq!(layout.project_order, ["p_b", "p_a"]);
-
-        // Only the order that was sent changes.
-        call(&api, "PUT", "/api/sidebar/order", r#"{"projects":["p_a"]}"#).await;
-        assert_eq!(desktop.sidebar().session_order, ["s_b", "s_a"]);
+        for (body, expected) in [
+            (
+                r#"{"session":"s_b","before":"s_a"}"#,
+                SidebarMove {
+                    row: SidebarRow::Session,
+                    id: "s_b".into(),
+                    place: SidebarPlace::Before("s_a".into()),
+                },
+            ),
+            (
+                r#"{"project":"p_a","after":"p_b"}"#,
+                SidebarMove {
+                    row: SidebarRow::Project,
+                    id: "p_a".into(),
+                    place: SidebarPlace::After("p_b".into()),
+                },
+            ),
+            (
+                r#"{"project":"p_a"}"#,
+                SidebarMove {
+                    row: SidebarRow::Project,
+                    id: "p_a".into(),
+                    place: SidebarPlace::End,
+                },
+            ),
+        ] {
+            assert_eq!(
+                call(&api, "POST", "/api/sidebar/move", body).await.0,
+                200,
+                "{body}"
+            );
+            assert_eq!(desktop.moves.lock().unwrap().pop(), Some(expected));
+        }
 
         for bad in [
             r#"{}"#,
-            r#"{"sessions":"s_a"}"#,
-            r#"{"sessions":[1]}"#,
-            r#"{"sessions":[""]}"#,
+            r#"{"session":"s_a","project":"p_a"}"#,
+            r#"{"session":1}"#,
+            r#"{"session":""}"#,
+            r#"{"session":"s_a","before":"s_b","after":"s_c"}"#,
         ] {
             assert_eq!(
-                call(&api, "PUT", "/api/sidebar/order", bad).await.0,
+                call(&api, "POST", "/api/sidebar/move", bad).await.0,
                 400,
                 "{bad}"
             );
@@ -907,6 +935,16 @@ mod tests {
         );
         assert_eq!(*desktop.refits.lock().unwrap(), ["s_a"]);
 
+        // A Mac that now sorts by activity refuses: a conflict the phone
+        // answers by refreshing, not a server failure.
+        desktop.layout.lock().unwrap().reorderable = false;
+        assert_eq!(
+            call(&api, "POST", "/api/sidebar/move", r#"{"session":"s_a"}"#)
+                .await
+                .0,
+            409
+        );
+
         // The standalone gateway has no Mac sidebar to mirror.
         api.desktop = None;
         assert_eq!(
@@ -916,7 +954,7 @@ mod tests {
         let (_, listed) = call(&api, "GET", "/api/sessions", "").await;
         assert!(listed.get("sidebar").is_none());
         assert_eq!(
-            call(&api, "PUT", "/api/sidebar/order", r#"{"sessions":[]}"#)
+            call(&api, "POST", "/api/sidebar/move", r#"{"session":"s_a"}"#)
                 .await
                 .0,
             404

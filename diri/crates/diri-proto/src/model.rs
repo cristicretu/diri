@@ -1000,6 +1000,13 @@ pub struct SessionRecord {
     /// still stands. Live state: it is cleared on load and when the job ends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_progress: Option<TerminalProgress>,
+    /// How many background shells the Agent last reported still running
+    /// (Claude's `background_tasks` of type `shell`), while any are. Live
+    /// state: cleared on load, and the next hook that lists none clears it.
+    /// A finished turn with one still running is waiting on the shell, not
+    /// idle. Additive, so older clients ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_shells: Option<u32>,
     /// Present when a Diri schedule opened this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduled_run: Option<crate::schedules::ScheduledRunInfo>,

@@ -4,6 +4,8 @@
   "activity.idle": "Inactivo",
   "activity.needed_you": "Te necesitaba",
   "activity.needs_you": "Te necesita",
+  "activity.shells_running_one": "Shell en ejecución",
+  "activity.shells_running_other": "{count} shells en ejecución",
   "activity.working": "Trabajando",
   "activity.working_percent": "Trabajando · {percent} %",
   "empty.choose_folder": "Elegir una carpeta…",

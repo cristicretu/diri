@@ -38,8 +38,11 @@ struct ReorderSheet: View {
                                 .foregroundStyle(Tokens.Ink.primary)
                         }
                         .onMove { from, to in
+                            guard let first = from.first else { return }
+                            let moved = projects[first].id
                             projects.move(fromOffsets: from, toOffset: to)
-                            commit { try await model.reorderProjects(projects.map(\.id), gatewayID: gatewayID) }
+                            let order = projects.map(\.id)
+                            commit { try await model.moveProject(moved, in: order, gatewayID: gatewayID) }
                         }
                     } footer: {
                         Text("Pinned projects stay on top.")
@@ -61,9 +64,11 @@ struct ReorderSheet: View {
                                 }
                             }
                             .onMove { from, to in
+                                guard let first = from.first else { return }
+                                let moved = run.sessions[first].id
                                 run.sessions.move(fromOffsets: from, toOffset: to)
                                 let order = run.sessions.map(\.id)
-                                commit { try await model.reorderSessions(order, gatewayID: gatewayID) }
+                                commit { try await model.moveSession(moved, in: order, gatewayID: gatewayID) }
                             }
                         }
                     }

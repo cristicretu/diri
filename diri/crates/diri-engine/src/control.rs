@@ -6081,6 +6081,7 @@ pub(crate) fn new_record(id: &str, kind: &str, cwd: &str) -> diri_proto::Session
         note_id: None,
         foreground_ports: None,
         terminal_progress: None,
+        background_shells: None,
         scheduled_run: None,
     }
 }
@@ -8747,6 +8748,7 @@ mod tests {
             note_id: None,
             foreground_ports: None,
             terminal_progress: None,
+            background_shells: None,
             scheduled_run: None,
         }
     }

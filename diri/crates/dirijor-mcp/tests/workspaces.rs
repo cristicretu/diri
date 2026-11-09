@@ -124,6 +124,7 @@ fn record(id: &str, project: &str, host: Option<&str>) -> diri_proto::SessionRec
         note_id: None,
         foreground_ports: None,
         terminal_progress: None,
+        background_shells: None,
         scheduled_run: None,
     }
 }

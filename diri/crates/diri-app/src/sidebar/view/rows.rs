@@ -324,9 +324,10 @@ impl Sidebar {
 pub(super) fn most_urgent(row: StatusState, pane: StatusState) -> StatusState {
     fn rank(state: StatusState) -> u8 {
         match state {
-            StatusState::NeedsInput { .. } => 3,
-            StatusState::Working => 2,
-            StatusState::DoneUnseen => 1,
+            StatusState::NeedsInput { .. } => 4,
+            StatusState::Working => 3,
+            StatusState::DoneUnseen => 2,
+            StatusState::ShellsRunning => 1,
             _ => 0,
         }
     }

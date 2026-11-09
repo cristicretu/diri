@@ -28,19 +28,54 @@ pub struct SidebarLayout {
     pub reorderable: bool,
 }
 
+/// Which kind of sidebar row a move names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidebarRow {
+    Session,
+    Project,
+}
+
+/// Where a moved row lands, relative to a row the phone could see.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SidebarPlace {
+    Before(String),
+    After(String),
+    /// After every other row.
+    End,
+}
+
+/// One row moved, as one drag in the Mac sidebar moves it.
+///
+/// A move, not a whole order: the Mac applies it to its own saved order, so
+/// rows the phone did not touch keep wherever the Mac last put them, and the
+/// order the phone was shown (pinned rows first, rows it never sees left
+/// out) is never written back as if it were the saved one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SidebarMove {
+    pub row: SidebarRow,
+    pub id: String,
+    pub place: SidebarPlace,
+}
+
+/// Why the Mac did not apply a move.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SidebarRefusal {
+    /// The Mac's sidebar no longer allows it (it sorts by activity now, or a
+    /// named row is gone). The phone's layout is stale: refresh it.
+    Conflict(String),
+    /// The move was valid but could not be saved.
+    Failed(String),
+}
+
 pub trait Desktop: Send + Sync {
-    /// The current layout. Called on every session-list read, so it must be
-    /// cheap and must not block on the UI thread.
+    /// The current layout. Called on every session-list read from async
+    /// tasks, so it must answer from a cache and never wait on the UI.
     fn sidebar(&self) -> SidebarLayout;
 
-    /// Replaces the manual session and/or project order, exactly as a drag
-    /// in the Mac sidebar would. `None` leaves that order alone. Refused
-    /// while the Mac is not sorting by hand.
-    fn set_sidebar_order(
-        &self,
-        sessions: Option<Vec<String>>,
-        projects: Option<Vec<String>>,
-    ) -> Result<(), String>;
+    /// Applies one move to the manual order, exactly as a drag in the Mac
+    /// sidebar would. Refused while the Mac is not sorting by hand. May
+    /// block briefly on the app's store; call it off the async workers.
+    fn move_sidebar_row(&self, row: SidebarMove) -> Result<(), SidebarRefusal>;
 
     /// Sizes `session`'s terminal to the Mac pane showing it again, undoing
     /// a resize to the phone. A session no pane shows is sized when one

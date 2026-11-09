@@ -184,10 +184,14 @@ final class DesktopOrderTests: XCTestCase {
         XCTAssertEqual(groups.flatMap(\.rows).map(\.session.id), ["agent"])
     }
 
-    func testAMoveKeepsEveryoneElseInPlace() {
-        XCTAssertEqual(AppModel.permute(["a", "x", "b", "y", "c"], run: ["c", "a", "b"]), ["c", "x", "a", "y", "b"])
-        // A session newer than the order the phone read goes on the end.
-        XCTAssertEqual(AppModel.permute(["a", "b"], run: ["new", "b", "a"]), ["b", "a", "new"])
+    func testAMoveIsNamedByItsNeighbour() {
+        let place = { (moved: String, order: [String]) in
+            let p = AppModel.placement(of: moved, in: order)
+            return [p.before ?? "-", p.after ?? "-"]
+        }
+        XCTAssertEqual(place("c", ["c", "a", "b"]), ["a", "-"])
+        XCTAssertEqual(place("a", ["c", "b", "a"]), ["-", "b"], "last goes after its new upper neighbour")
+        XCTAssertEqual(place("a", ["a"]), ["-", "-"])
     }
 
     func testRunsFollowTheTree() {

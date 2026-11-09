@@ -193,8 +193,32 @@ final class NoteTextView: UITextView, UITextViewDelegate {
     }
 
     func textViewDidChange(_ textView: UITextView) {
-        restyle()
+        // Mid-composition (Japanese, Chinese, Korean…): restyling would
+        // rewrite the attributes of the marked candidate and can commit or
+        // garble it, and the text is not final yet. The commit calls back.
+        guard textView.markedTextRange == nil else { return }
+        restyleSoon()
         onChange(text)
+    }
+
+    /// Notes past this many UTF-16 units restyle once typing pauses rather
+    /// than on every key: restyling re-parses the whole document.
+    private static let immediateRestyleLimit = 20_000
+    private var pendingRestyle: DispatchWorkItem?
+
+    private func restyleSoon() {
+        pendingRestyle?.cancel()
+        guard textStorage.length > Self.immediateRestyleLimit else {
+            pendingRestyle = nil
+            restyle()
+            return
+        }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.markedTextRange == nil else { return }
+            self.restyle()
+        }
+        pendingRestyle = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
     }
 
     // MARK: - To-do taps

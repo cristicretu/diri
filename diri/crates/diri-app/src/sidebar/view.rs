@@ -7056,6 +7056,19 @@ impl Sidebar {
                 colors,
             ));
         }
+        // The row's clock mark has no tooltip of its own: one inside the row
+        // opened on top of this card. The card says why the session appeared.
+        if let Some(run) = &session.scheduled_run {
+            details = details.child(
+                div()
+                    .debug_selector(|| "hover-card-schedule".to_owned())
+                    .child(hover_note(
+                        "clock.fill",
+                        &crate::schedules_page::scheduled_run_summary(run),
+                        colors,
+                    )),
+            );
+        }
         let card = div()
             .id("session-hover-card")
             .debug_selector(|| "session-hover-card".into())
@@ -9201,8 +9214,11 @@ fn pin_mark(colors: SemanticColors) -> AnyElement {
 }
 
 /// Quiet trailing glyph for a session a schedule opened: a grey clock, or an
-/// indigo one when diri woke the Mac for it (a moon already means Sleeping). Hover names the schedule and what happened,
-/// so the tab explains why it appeared while nobody was at the keyboard.
+/// indigo one when diri woke the Mac for it (a moon already means Sleeping).
+/// The row's hover card names the schedule and what happened, so the tab
+/// explains why it appeared while nobody was at the keyboard. The mark has no
+/// tooltip of its own: it sits inside the row, so a tooltip here opened on
+/// top of that card.
 fn scheduled_mark(
     id: &SessionId,
     run: &diri_proto::schedules::ScheduledRunInfo,
@@ -9213,20 +9229,14 @@ fn scheduled_mark(
     } else {
         ("clock.fill", colors.tertiary)
     };
-    use crate::tooltip_warmth::WarmTooltip;
-    let tooltip = crate::schedules_page::scheduled_run_summary(run);
     div()
         .id(format!("scheduled-mark:{}", id.0))
         .debug_selector(|| "scheduled-mark".to_owned())
-        .aria_label(tooltip.clone())
+        .aria_label(crate::schedules_page::scheduled_run_summary(run))
         .flex_none()
         .flex()
         .items_center()
         .child(sf_symbol(symbol, 9.0, color))
-        .warm_tooltip(move |_, cx| {
-            cx.new(|_| crate::palette_chrome::PaletteTooltip(tooltip.clone(), colors))
-                .into()
-        })
         .into_any_element()
 }
 
@@ -9752,6 +9762,36 @@ fn hover_detail(icon: &str, text: &str, mono: bool, colors: SemanticColors) -> A
                 .overflow_hidden()
                 .text_ellipsis()
                 .when(mono, |text| text.font_family(crate::fonts::mono_family()))
+                .text_size(px(Typo::META.size))
+                .text_color(colors.primary.alpha(0.82))
+                .child(text.to_owned()),
+        )
+        .into_any_element()
+}
+
+/// A hover-card line for a sentence rather than a value: it wraps instead of
+/// ending in an ellipsis, with the icon held against the first line.
+fn hover_note(icon: &str, text: &str, colors: SemanticColors) -> AnyElement {
+    div()
+        .flex()
+        .items_start()
+        .gap(px(7.0))
+        .child(
+            div()
+                .w(px(13.0))
+                .h(px(16.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(sf_symbol(icon, 10.0, colors.secondary)),
+        )
+        .child(
+            div()
+                .min_w(px(0.0))
+                .flex_1()
+                .line_clamp(3)
+                .line_height(px(16.0))
                 .text_size(px(Typo::META.size))
                 .text_color(colors.primary.alpha(0.82))
                 .child(text.to_owned()),
@@ -11256,6 +11296,53 @@ mod tests {
         });
     }
 
+    /// The clock on a scheduled run used to carry its own tooltip, which
+    /// opened on top of the row's hover card. Hovering it now shows only the
+    /// card, and the card carries the schedule line.
+    #[gpui::test]
+    fn scheduled_mark_hover_shows_the_card_with_the_schedule(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| {
+                let sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                let mut store = sidebar.store.write().unwrap();
+                let mut session = (**store
+                    .sessions()
+                    .get(&SessionId::new("preview-claude"))
+                    .unwrap())
+                .clone();
+                session.scheduled_run = Some(diri_proto::schedules::ScheduledRunInfo {
+                    schedule_id: "sched_test".into(),
+                    title: "Weekly visibility check".into(),
+                    due_at: diri_proto::DateMillis(0.0),
+                    wake_mac: false,
+                    woke_mac: false,
+                });
+                store.upsert_session(session);
+                drop(store);
+                sidebar
+            });
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let mark = cx
+            .debug_bounds("scheduled-mark")
+            .expect("scheduled run shows its clock");
+        cx.simulate_mouse_move(mark.center(), None, Modifiers::default());
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.ui.hover_card.clone()),
+            Some(SessionId::new("preview-claude"))
+        );
+        assert!(
+            cx.debug_bounds("hover-card-schedule").is_some(),
+            "the hover card must say which schedule started the session"
+        );
+    }
+
     #[gpui::test]
     fn session_preview_dismisses_on_click_and_stays_dismissed(cx: &mut TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, cx| {
@@ -12743,6 +12830,17 @@ mod tests {
                 let mut session = (**store.sessions().get(&SessionId::new("preview-claude")).unwrap()).clone();
                 session.title = "Make the session preview behave like a normal tooltip, even while switching between conversations with very long titles".into();
                 session.git_branch = Some("fix/sidebar-preview-dismissal-and-long-branch-name".into());
+                // `DIRI_VISUAL_SCHEDULED=1` makes it a scheduled run and
+                // hovers its clock instead of the row's centre.
+                if std::env::var_os("DIRI_VISUAL_SCHEDULED").is_some() {
+                    session.scheduled_run = Some(diri_proto::schedules::ScheduledRunInfo {
+                        schedule_id: "sched_preview".into(),
+                        title: "UGC Agent weekly visibility check".into(),
+                        due_at: diri_proto::DateMillis(0.0),
+                        wake_mac: false,
+                        woke_mac: false,
+                    });
+                }
                 store.upsert_session(session);
                 drop(store);
                 sidebar
@@ -12757,7 +12855,13 @@ mod tests {
             let view = view.downcast::<SidebarPopoverHarness>().unwrap();
             let sidebar = view.read(cx).sidebar.clone();
             let row = sidebar.read(cx).row_bounds.borrow()[&SessionId::new("preview-claude")];
-            window.simulate_mouse_move(row.center(), cx);
+            let target = if std::env::var_os("DIRI_VISUAL_SCHEDULED").is_some() {
+                // The clock is the last mark before the agent glyph.
+                point(row.right() - px(SIDEBAR_TRAILING_SLOT + 16.0), row.center().y)
+            } else {
+                row.center()
+            };
+            window.simulate_mouse_move(target, cx);
         })
         .unwrap();
         cx.run_until_parked();
@@ -13471,6 +13575,20 @@ mod tests {
                                 } else {
                                     now - 1.0
                                 }));
+                        }
+                        // `DIRI_VISUAL_SHELLS=<n>` finishes Claude's turn with
+                        // n background shells still running (2 when not a
+                        // number).
+                        if let Some(shells) = std::env::var("DIRI_VISUAL_SHELLS").ok()
+                            && session.id == SessionId::new("preview-claude")
+                        {
+                            session.status = diri_proto::SessionStatus::Idle;
+                            session.attention_state = None;
+                            session.needs_input = None;
+                            session.last_turn_completed_at = Some(diri_proto::DateMillis(now));
+                            session.last_seen_at = Some(diri_proto::DateMillis(now + 1.0));
+                            session.background_shells =
+                                Some(shells.parse().ok().filter(|n| *n > 0).unwrap_or(2));
                         }
                         // `DIRI_VISUAL_SCHEDULED=1` marks two sessions as
                         // scheduled runs: one diri woke the Mac for (indigo

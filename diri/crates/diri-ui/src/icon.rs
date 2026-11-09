@@ -547,6 +547,8 @@ fn embedded_svg(path: &str) -> Option<&'static [u8]> {
         "icons/working-5.svg" => include_bytes!("../assets/icons/working-5.svg"),
         "icons/working-6.svg" => include_bytes!("../assets/icons/working-6.svg"),
         "icons/working-7.svg" => include_bytes!("../assets/icons/working-7.svg"),
+        "icons/shell-running-0.svg" => include_bytes!("../assets/icons/shell-running-0.svg"),
+        "icons/shell-running-1.svg" => include_bytes!("../assets/icons/shell-running-1.svg"),
 
         "icons/text.svg" => include_bytes!("../assets/icons/text.svg"),
         "icons/heading-1.svg" => include_bytes!("../assets/icons/heading-1.svg"),

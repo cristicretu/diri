@@ -516,19 +516,31 @@ impl ComputerUse {
             Some(name) => name,
             None => self.start_driver_session(caller.session_id, &label),
         };
-        args.insert("session".into(), Value::String(name));
         bound_screenshot(tool, &mut args);
         if !READ_ONLY_TOOLS.contains(&tool) && moves_pointer(tool, &args) {
             wait_for_typing_pause(keyboard_idle, std::thread::sleep);
         }
 
-        let result = self
-            .request(
+        let call = |name: &str| {
+            let mut args = args.clone();
+            args.insert("session".into(), Value::String(name.to_owned()));
+            self.request(
                 "tools/call",
                 json!({"name": tool, "arguments": Value::Object(args)}),
                 REQUEST_TIMEOUT,
             )
-            .map_err(ComputerError::driver)?;
+            .map_err(ComputerError::driver)
+        };
+        let mut result = call(&name)?;
+        // The driver refuses before acting, so the retry cannot act twice.
+        if session_gone(&result) {
+            let name = self.revive_driver_session(caller.session_id, &label, &name);
+            result = call(&name)?;
+            if session_gone(&result) {
+                self.lock().state.release(caller.session_id, &pids);
+                return Err(ComputerError::driver(SESSION_LOST_MESSAGE));
+            }
+        }
         if needs_permission(&result) {
             self.lock().state.release(caller.session_id, &pids);
             return Err(ComputerError::new(PERMISSIONS, PERMISSIONS_MESSAGE));
@@ -572,9 +584,12 @@ impl ComputerUse {
                 }}),
                 HANDSHAKE_TIMEOUT,
             );
-            let taken = reply
-                .as_ref()
-                .is_ok_and(|reply| reply["structuredContent"]["code"] == "session_unavailable");
+            let taken = reply.as_ref().is_ok_and(|reply| {
+                matches!(
+                    reply["structuredContent"]["code"].as_str(),
+                    Some("session_unavailable" | "session_ended")
+                )
+            });
             if !taken {
                 break;
             }
@@ -584,6 +599,23 @@ impl ComputerUse {
             .driver_names
             .insert(session_id.to_owned(), name.clone());
         name
+    }
+
+    /// Replaces a driver session the driver has ended: ends it for good so
+    /// its app locks go now rather than on expiry, then starts a fresh name.
+    /// A concurrent call that already replaced it wins.
+    fn revive_driver_session(&self, session_id: &str, label: &str, stale: &str) -> String {
+        if let Some(current) = self.lock().state.driver_names.get(session_id)
+            && current != stale
+        {
+            return current.clone();
+        }
+        let _ = self.request(
+            "tools/call",
+            json!({"name": "end_session", "arguments": {"session": stale}}),
+            HANDSHAKE_TIMEOUT,
+        );
+        self.start_driver_session(session_id, label)
     }
 
     /// Whether to tell the app this session wants computer use set up: once
@@ -941,6 +973,28 @@ fn terminate(shared: &Shared, inner: &mut Inner, reason: &str) {
 const PERMISSIONS_MESSAGE: &str = "Computer use is installed, but macOS hasn't allowed it to see \
      and control apps yet. Ask the user to open Diri Settings › Agents › Computer use and \
      finish setup (two switches in System Settings). Don't change System Settings yourself.";
+
+const SESSION_LOST_MESSAGE: &str = "Computer use lost this session's driver session and could \
+     not restart it. Nothing was done. Retry the call; if it fails again, tell the user.";
+
+/// The driver refused because the call's session has ended or never started.
+fn session_gone(result: &Value) -> bool {
+    if result["isError"] != true {
+        return false;
+    }
+    if matches!(
+        result["structuredContent"]["code"].as_str(),
+        Some("session_ended" | "session_not_started")
+    ) {
+        return true;
+    }
+    result["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|block| block["text"].as_str())
+        .any(|text| text.contains("session has ended") && text.contains("start_session"))
+}
 
 /// The driver refused because a macOS grant is missing.
 fn needs_permission(result: &Value) -> bool {

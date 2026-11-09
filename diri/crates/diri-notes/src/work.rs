@@ -896,6 +896,7 @@ mod tests {
             foreground_ports: None,
             note_id: None,
             terminal_progress: None,
+            background_shells: None,
             scheduled_run: None,
         }
     }
