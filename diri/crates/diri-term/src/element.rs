@@ -523,13 +523,15 @@ struct TerminalInputHandler {
 
 impl TerminalInputHandler {
     /// Forwards committed text and reports whether the caller has to repaint:
-    /// either it brought a reading view back to live, or a dimmed cursor has
-    /// to come back solid.
+    /// it brought a reading view back to live, a dimmed cursor has to come
+    /// back solid, or a drawn composition has to disappear.
     fn commit_text(&self, text: &str) -> bool {
-        let mut state = mutex_lock(&self.ime_state);
-        state.marked_text.clear();
-        let enabled = state.enabled;
-        drop(state);
+        let had_composition = self.unmark();
+        let enabled = mutex_lock(&self.ime_state).enabled;
+        had_composition | self.forward_commit(enabled, text)
+    }
+
+    fn forward_commit(&self, enabled: bool, text: &str) -> bool {
         // Native input is for committed printable/IME text. AppKit can still
         // send a control character after dispatching a Command shortcut; in
         // particular, Command-C may arrive as ETX, which would interrupt the
@@ -556,11 +558,23 @@ impl TerminalInputHandler {
         returned || solid
     }
 
-    fn mark_text(&self, text: &str) {
+    /// Stores the uncommitted composition and reports whether it changed, so
+    /// the caller repaints the preedit drawn at the cursor.
+    fn mark_text(&self, text: &str) -> bool {
         let mut state = mutex_lock(&self.ime_state);
-        if state.enabled {
-            text.clone_into(&mut state.marked_text);
+        if !state.enabled || state.marked_text == text {
+            return false;
         }
+        text.clone_into(&mut state.marked_text);
+        true
+    }
+
+    /// Drops the composition and reports whether one was showing.
+    fn unmark(&self) -> bool {
+        let mut state = mutex_lock(&self.ime_state);
+        let had = !state.marked_text.is_empty();
+        state.marked_text.clear();
+        had
     }
 }
 
@@ -616,12 +630,16 @@ impl InputHandler for TerminalInputHandler {
         window: &mut Window,
         _cx: &mut App,
     ) {
-        self.mark_text(new_text);
+        if self.mark_text(new_text) {
+            window.refresh();
+        }
         window.invalidate_character_coordinates();
     }
 
     fn unmark_text(&mut self, window: &mut Window, _cx: &mut App) {
-        mutex_lock(&self.ime_state).marked_text.clear();
+        if self.unmark() {
+            window.refresh();
+        }
         window.invalidate_character_coordinates();
     }
 
@@ -652,6 +670,14 @@ impl InputHandler for TerminalInputHandler {
     fn prefers_ime_for_printable_keys(&mut self, _window: &mut Window, _cx: &mut App) -> bool {
         true
     }
+}
+
+/// Left edge of a composition `width` wide drawn from the cursor at
+/// `cursor_x`: near the pane's right edge it slides left instead of being
+/// clipped mid-word, and a run wider than the pane starts at its left edge.
+fn ime_composition_x(cursor_x: Pixels, width: Pixels, content: Bounds<Pixels>) -> Pixels {
+    let right = (cursor_x + width).min(content.right());
+    (right - width).max(content.left())
 }
 
 struct ElementSharedState {
@@ -2708,6 +2734,59 @@ impl TerminalElement {
 
     /// Paints power mode's particles over the grid and keeps frames coming
     /// until the last one burns out. Off, it only drops what was in the air.
+    /// Draws the uncommitted IME composition (Pinyin `ni hao`, kana before
+    /// conversion) over the cursor cell, underlined like a native text field.
+    /// It is never part of the grid: the PTY sees only committed text.
+    fn paint_ime_composition(
+        &self,
+        cell: Bounds<Pixels>,
+        content: Bounds<Pixels>,
+        metrics: CellMetrics,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let text = {
+            let state = mutex_lock(&self.ime_state);
+            if !state.enabled || state.marked_text.is_empty() {
+                return;
+            }
+            SharedString::from(state.marked_text.clone())
+        };
+        let run = TextRun {
+            len: text.len(),
+            font: self.font.clone(),
+            color: self.theme.foreground.into(),
+            background_color: None,
+            underline: Some(gpui::UnderlineStyle {
+                thickness: px(1.0),
+                color: Some(self.theme.foreground.into()),
+                wavy: false,
+            }),
+            strikethrough: None,
+        };
+        // Natural advances: wide kana and hanzi must not be squeezed into
+        // one cell each.
+        let line = window
+            .text_system()
+            .shape_line(text, self.font_size, &[run], None);
+        let width = line.width.max(metrics.cell_width);
+        let origin = point(ime_composition_x(cell.left(), width, content), cell.top());
+        window.paint_layer(content, |window| {
+            window.paint_quad(fill(
+                Bounds::new(origin, size(width, metrics.line_height)),
+                self.theme.background,
+            ));
+        });
+        let _ = line.paint(
+            metrics.text_origin(origin),
+            metrics.line_height,
+            TextAlign::Left,
+            None,
+            window,
+            cx,
+        );
+    }
+
     fn paint_power_mode(
         &self,
         bounds: Bounds<Pixels>,
@@ -3668,8 +3747,14 @@ impl Element for TerminalElement {
         if let Some(armed) = mutex_lock(&self.shared.content_paint).as_mut() {
             armed.shown_at.get_or_insert(paint_started);
         }
+        // The grid cursor's cell even when the caret is hidden, as TUIs such
+        // as Codex do while drawing their own: where typed text will land.
+        let input_cell = *mutex_lock(&self.shared.input_cell);
         if let (Some(focus_handle), Some(text_input)) = (&self.focus_handle, &self.text_input) {
             let (cursor_bounds, cell_width) = match (prepaint.metrics, prepaint.cursor.as_ref()) {
+                (Some(metrics), _) if input_cell.is_some() => {
+                    (input_cell.unwrap_or_default(), metrics.cell_width)
+                }
                 (Some(metrics), Some(cursor)) => (
                     Bounds::new(
                         point(
@@ -3932,6 +4017,9 @@ impl Element for TerminalElement {
                         cx,
                     );
                 }
+            }
+            if let Some(cell) = input_cell {
+                self.paint_ime_composition(cell, content, metrics, window, cx);
             }
         });
         self.paint_power_mode(bounds, metrics, scroll_shift, window);
@@ -5800,6 +5888,52 @@ mod link_tests {
     }
 
     #[test]
+    fn composition_changes_report_the_repaint_that_shows_them() {
+        let state = Arc::new(Mutex::new(TerminalImeState::default()));
+        let handler = TerminalInputHandler {
+            text_input: Arc::new(|_| {}),
+            ime_state: Arc::clone(&state),
+            view: terminal_with_rows(&["test"]).damage_observer(),
+            cursor_bounds: Bounds::new(point(px(0.0), px(0.0)), size(px(8.0), px(16.0))),
+            cell_width: px(8.0),
+            cursor: Arc::default(),
+        };
+
+        // #1055: every keystroke of `nihao` changes the preedit drawn at the
+        // cursor, so each one has to repaint.
+        assert!(handler.mark_text("n"));
+        assert!(handler.mark_text("ni"));
+        assert!(!handler.mark_text("ni"), "unchanged: nothing to redraw");
+        assert!(handler.mark_text("ni h"));
+        assert!(handler.mark_text("ni"), "deleting redraws too");
+        assert_eq!(mutex_lock(&state).marked_text, "ni");
+        // Cancelling (Escape) removes it.
+        assert!(handler.unmark());
+        assert!(!handler.unmark());
+        // An empty commit cancels a composition without echo from the PTY.
+        handler.mark_text("ni");
+        assert!(handler.commit_text(""));
+        assert!(mutex_lock(&state).marked_range().is_none());
+    }
+
+    #[test]
+    fn composition_slides_left_at_the_pane_edge_and_never_past_its_start() {
+        let content = Bounds::new(point(px(10.0), px(0.0)), size(px(100.0), px(20.0)));
+        assert_eq!(
+            super::ime_composition_x(px(30.0), px(40.0), content),
+            px(30.0)
+        );
+        assert_eq!(
+            super::ime_composition_x(px(90.0), px(40.0), content),
+            px(70.0)
+        );
+        assert_eq!(
+            super::ime_composition_x(px(90.0), px(400.0), content),
+            px(10.0)
+        );
+    }
+
+    #[test]
     fn native_text_commit_never_forwards_terminal_control_bytes() {
         let committed = Arc::new(Mutex::new(Vec::<String>::new()));
         let sink = Arc::clone(&committed);
@@ -5866,8 +6000,12 @@ mod link_tests {
         // after Command-C: copying while reading must not lose the place.
         read_history();
         handler.mark_text("ni");
-        assert!(!handler.commit_text("\u{3}"));
+        assert!(
+            handler.commit_text("\u{3}"),
+            "only the drawn composition owes a repaint"
+        );
         assert_eq!(terminal.view_offset(), 5);
+        assert!(!handler.commit_text("\u{3}"));
 
         // Find owns text while it is open; its query is not PTY input.
         terminal.set_text_input_enabled(false);
@@ -7224,5 +7362,65 @@ mod padding_extend_tests {
             cell.style = TermStyle::INVERSE;
         }
         assert_eq!(quads(&screen).len(), 4);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod ime_render_tests {
+    use std::sync::Arc;
+
+    use diri_terminal_state::HeadlessScreen;
+    use gpui::{AppContext as _, Context, IntoElement, ParentElement, Render, Styled, div, px};
+
+    use super::{GridBuffer, TerminalElement, mutex_lock};
+
+    struct Fixture(TerminalElement);
+
+    impl Render for Fixture {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            _cx: &mut Context<Self>,
+        ) -> impl IntoElement {
+            div().size_full().child(self.0.clone())
+        }
+    }
+
+    /// #1055: a shell prompt with Pinyin `ni hao` mid-composition. The
+    /// preedit is drawn underlined at the cursor, never sent to the PTY.
+    ///
+    /// ```sh
+    /// DIRI_VISUAL_OUTPUT=/tmp/ime.png cargo test -p diri-term --lib render_ime_composition_screenshot -- --ignored
+    /// ```
+    #[test]
+    #[ignore = "renders a PNG screenshot of an IME composition"]
+    fn render_ime_composition_screenshot() {
+        let output = std::env::var("DIRI_VISUAL_OUTPUT").expect("DIRI_VISUAL_OUTPUT");
+        let text = std::env::var("DIRI_VISUAL_IME").unwrap_or_else(|_| "ni hao".into());
+        let mut screen = HeadlessScreen::new(40, 4);
+        screen.feed(b"~/fun/diri $ echo ");
+        let element = TerminalElement::with_buffer(GridBuffer::new(40, 4))
+            .focused(true)
+            .font(gpui::font("Menlo"));
+        element.apply_damage(screen.full_snapshot());
+        text.clone_into(&mut mutex_lock(&element.ime_state).marked_text);
+
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = gpui::HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(()),
+            gpui_platform::current_headless_renderer,
+        );
+        let window = cx
+            .open_window(gpui::size(px(400.0), px(80.0)), |_, cx| {
+                cx.new(|_| Fixture(element))
+            })
+            .expect("headless window");
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, _| window.refresh())
+            .unwrap();
+        cx.run_until_parked();
+        let image = cx.capture_screenshot(window.into()).expect("screenshot");
+        image.save(output).expect("write screenshot");
     }
 }
