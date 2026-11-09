@@ -1072,6 +1072,7 @@ pub struct TerminalPane {
     _window_owner: gpui::Subscription,
     _pane_events: Task<()>,
     _store_changes: Task<()>,
+    _refits: Task<()>,
     _telemetry: crate::telemetry::Live,
 }
 
@@ -1259,6 +1260,25 @@ impl TerminalPane {
             }
         });
 
+        let mut refit_requests = runtime.refits();
+        let refits = cx.spawn_in(window, async move |this, cx| {
+            loop {
+                match refit_requests.recv().await {
+                    Ok(id) => {
+                        if crate::floating::update_in_owner(&this, cx, |this, window, cx| {
+                            this.refit(&id, window, cx);
+                        })
+                        .is_none()
+                        {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+
         let tokio = tokio_owner.handle().clone();
         let observed_selected_id = matches!(session_source, SessionSource::FollowSelection)
             .then(|| {
@@ -1337,6 +1357,7 @@ impl TerminalPane {
             _window_owner: window_owner,
             _pane_events: pane_events,
             _store_changes: store_changes,
+            _refits: refits,
             _telemetry: crate::telemetry::Live::pane(),
         };
         pane.reconcile_residency(cx);
@@ -4786,6 +4807,18 @@ impl TerminalPane {
             None => return,
         }
         cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// Sizes `id`'s terminal to this pane again, after another client (the
+    /// phone) resized it. Forgetting the size this pane last sent makes the
+    /// next measure send, exactly as a first attach does.
+    fn refit(&mut self, id: &SessionId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(resident) = self.residents.get_mut(id) else {
+            return;
+        };
+        resident.last_size = (0, 0);
+        self.update_selected_geometry(window, cx);
         cx.notify();
     }
 

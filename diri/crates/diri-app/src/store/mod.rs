@@ -4130,6 +4130,9 @@ pub struct StoreRuntime {
     status_tx: broadcast::Sender<StatusTransition>,
     snapshot_tx: tokio::sync::watch::Sender<StoreSnapshot>,
     action_tx: mpsc::UnboundedSender<SendTextCommand>,
+    /// Sessions whose terminal should be sized to its pane again, after
+    /// another client (the phone) resized it.
+    refit_tx: broadcast::Sender<SessionId>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -4185,6 +4188,7 @@ impl StoreRuntime {
             .snapshot();
         let (snapshot_tx, _) = tokio::sync::watch::channel(snapshot);
         let (action_tx, _action_rx) = mpsc::unbounded_channel();
+        let (refit_tx, _) = broadcast::channel(1);
         Self {
             store,
             client: Arc::new(DaemonClient::new()),
@@ -4193,6 +4197,7 @@ impl StoreRuntime {
             status_tx,
             snapshot_tx,
             action_tx,
+            refit_tx,
             tasks: Mutex::new(Vec::new()),
         }
     }
@@ -4515,6 +4520,7 @@ impl StoreRuntime {
         if client_startup == ClientStartup::Immediate {
             client.connect();
         }
+        let (refit_tx, _) = broadcast::channel(16);
         Self {
             store,
             client,
@@ -4523,8 +4529,18 @@ impl StoreRuntime {
             status_tx,
             snapshot_tx,
             action_tx,
+            refit_tx,
             tasks: Mutex::new(tasks),
         }
+    }
+
+    /// Asks every pane showing `id` to size its terminal to the pane again.
+    pub fn request_refit(&self, id: SessionId) {
+        let _ = self.refit_tx.send(id);
+    }
+
+    pub fn refits(&self) -> broadcast::Receiver<SessionId> {
+        self.refit_tx.subscribe()
     }
 
     pub fn detachments(&self) -> broadcast::Receiver<SessionId> {

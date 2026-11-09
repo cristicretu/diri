@@ -101,6 +101,7 @@ const TERMINAL_ONLY_METHODS: &[&str] = &[
     Method::SESSION_SEND_KEY,
     Method::SESSION_SEND_TEXT,
     Method::SESSION_RESIZE,
+    Method::SESSION_SCROLL,
     Method::SESSION_READ_SCREEN,
     Method::SESSION_TERMINAL_TITLE,
     Method::SESSION_RESET_TERMINAL,
@@ -1388,6 +1389,7 @@ impl ControlServer {
             Method::SESSION_SEND_KEY => self.session_send_key(params),
             Method::SESSION_SEND_TEXT => self.session_send_text(params),
             Method::SESSION_RESIZE => self.session_resize(params),
+            Method::SESSION_SCROLL => self.session_scroll(params),
             Method::SESSION_READ_SCREEN => self.session_read_screen(params),
             Method::SESSION_TERMINAL_TITLE => self.session_terminal_title(params),
             Method::SESSION_RESET_TERMINAL => self.session_reset_terminal(params),
@@ -3199,6 +3201,26 @@ impl ControlServer {
                 session.write_reports(&reports);
             }
         }
+        Ok(json!({}))
+    }
+
+    fn session_scroll(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::ScrollParams = decode(params)?;
+        if p.lines == 0 {
+            return Ok(json!({}));
+        }
+        let registry = self.registry.lock().map_err(poisoned)?;
+        let session = registry
+            .get(&p.session_id.0)
+            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+        session
+            .scroll(
+                p.up,
+                usize::from(p.lines),
+                usize::from(p.col),
+                usize::from(p.row),
+            )
+            .map_err(io_control_error)?;
         Ok(json!({}))
     }
 

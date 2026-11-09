@@ -72,7 +72,9 @@ options** for a different base. The original checkout is left unchanged.
 Remote SSH hosts and agent login should first be initialized from the Mac.
 
 The session menu offers **Review changes** (tracked diff against HEAD), **Fit
-text to width** and **Resize session to this phone**. Network errors preserve
+text to width** and **Resize session to this phone**. Once resized, the same
+item reads **Resize back to Mac**: the Mac sizes the terminal to its own pane
+again (`/api/session/<id>/refit`). Network errors preserve
 the prompt draft. Mutations are never automatically retried: after a dropped
 connection, inspect the session before sending or starting again.
 
@@ -106,6 +108,12 @@ A session opens on its terminal, drawn from `diri-web`'s grid stream
 bold/dim/italic/underline/inverse/strike, the cursor, and wide characters
 placed on the cell grid. It is a `UIScrollView` of recycled line layers drawn
 with Core Text; a layer is redrawn only when its line changes.
+
+A full-screen program (Claude Code, Codex, `less`, `vim`) runs on the
+alternate screen and keeps no scrollback here, so a swipe over it becomes
+wheel notches (`/api/session/<id>/scroll`), as a Mac trackpad's would. The
+Engine encodes them for the program's mouse mode, or as arrow keys under
+alternate scroll.
 
 Scrollback lives in an on-device cache (`LineCache`, 256-line pages, 40k lines,
 least-recently-used pages evicted). The newest 10k lines are fetched on open,

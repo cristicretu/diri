@@ -358,6 +358,12 @@ function diri.session.send_text(params, opts) end
 ---@return table # {}
 function diri.session.resize(params, opts) end
 
+---Turn the mouse wheel over a session's terminal.
+---@param params {sessionID: string, up: boolean, lines: integer, col: integer, row: integer}
+---@param opts? {timeout?: number}
+---@return table # {}
+function diri.session.scroll(params, opts) end
+
 ---The visible screen as text.
 ---@param params {sessionID: string}
 ---@param opts? {timeout?: number}

@@ -950,6 +950,28 @@ impl DaemonClient {
         .await
     }
 
+    /// A wheel over the session's terminal; see `Method::SESSION_SCROLL`.
+    pub async fn scroll(
+        &self,
+        session_id: &SessionId,
+        up: bool,
+        lines: u16,
+        col: u16,
+        row: u16,
+    ) -> Result<(), ClientError> {
+        self.empty(
+            Method::SESSION_SCROLL,
+            &diri_proto::ScrollParams {
+                session_id: session_id.clone(),
+                up,
+                lines,
+                col,
+                row,
+            },
+        )
+        .await
+    }
+
     pub async fn resize(
         &self,
         session_id: &SessionId,
