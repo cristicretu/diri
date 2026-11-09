@@ -1839,41 +1839,12 @@ impl SessionStore {
         })
     }
 
-    /// Folds or unfolds a session's spawned children. Collapsing the ancestor
-    /// of the current selection would hide it, so the selection moves up to
-    /// the row doing the folding rather than disappearing under it.
+    /// Folds or unfolds a session's spawned children. The selection stays put:
+    /// a selected descendant keeps showing under the fold until it is left.
     pub fn toggle_session_collapsed(&mut self, id: SessionId) -> io::Result<()> {
-        let collapsing = !self.prefs.sidebar_collapsed_sessions.contains(&id);
-        if collapsing
-            && let Some(selected) = self.selected_session_id.clone()
-            && self.is_descendant_of(&selected, &id)
-        {
-            self.select(id.clone());
-        }
         self.update_preferences(|prefs| {
             toggle_vec_member(&mut prefs.sidebar_collapsed_sessions, id)
         })
-    }
-
-    fn is_descendant_of(&self, candidate: &SessionId, ancestor: &SessionId) -> bool {
-        let mut seen = HashSet::from([candidate.clone()]);
-        let mut cursor = self
-            .sessions
-            .get(candidate)
-            .and_then(|session| session.parent.clone());
-        while let Some(node) = cursor {
-            if &node == ancestor {
-                return true;
-            }
-            if !seen.insert(node.clone()) {
-                return false;
-            }
-            cursor = self
-                .sessions
-                .get(&node)
-                .and_then(|session| session.parent.clone());
-        }
-        false
     }
 
     pub fn toggle_archive_expanded(&mut self, id: ProjectId) -> io::Result<()> {
@@ -4010,9 +3981,10 @@ impl SessionStore {
         self.overview.reconcile(&sessions);
     }
 
-    /// Unfolds whatever is hiding `id` so the selected row is on screen: its
-    /// project, every session up its spawn chain, and the archive bucket when
-    /// the row is parked. Reports whether anything actually moved.
+    /// Unfolds what the projection cannot show through: the archive bucket, and
+    /// the project, when the row is parked. Collapsed projects and sessions
+    /// above an active row stay folded; the projection shows the selected row
+    /// through them. Reports whether anything actually moved.
     ///
     /// This is the invariant that keeps collapse honest. Without it ⌘J, the
     /// switcher, and an MCP focus can all land on a row the user cannot see,
@@ -4022,6 +3994,9 @@ impl SessionStore {
         let Some(session) = self.sessions.get(id).cloned() else {
             return false;
         };
+        if !session.is_archived() {
+            return false;
+        }
         let mut changed = false;
         let project = session.project_id.clone();
         if let Some(index) = self
@@ -4033,31 +4008,9 @@ impl SessionStore {
             self.prefs.sidebar_collapsed_projects.remove(index);
             changed = true;
         }
-        if session.is_archived() && !self.prefs.sidebar_expanded_archives.contains(&project) {
+        if !self.prefs.sidebar_expanded_archives.contains(&project) {
             self.prefs.sidebar_expanded_archives.push(project);
             changed = true;
-        }
-        // Walk up the spawn chain. `seen` guards against a cycle the daemon
-        // should never produce but which would spin here if it did.
-        let mut seen = HashSet::from([id.clone()]);
-        let mut cursor = session.parent.clone();
-        while let Some(ancestor) = cursor {
-            if !seen.insert(ancestor.clone()) {
-                break;
-            }
-            if let Some(index) = self
-                .prefs
-                .sidebar_collapsed_sessions
-                .iter()
-                .position(|candidate| candidate == &ancestor)
-            {
-                self.prefs.sidebar_collapsed_sessions.remove(index);
-                changed = true;
-            }
-            cursor = self
-                .sessions
-                .get(&ancestor)
-                .and_then(|record| record.parent.clone());
         }
         if changed {
             self.invalidate_projection();

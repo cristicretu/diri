@@ -530,13 +530,6 @@ impl WindowWrite<'_> {
     }
 
     pub fn toggle_session_collapsed(&mut self, id: SessionId) -> io::Result<()> {
-        if !self.prefs.sidebar_collapsed_sessions.contains(&id)
-            && self
-                .selected_session_id()
-                .is_some_and(|selected| self.is_descendant_of(selected, &id))
-        {
-            self.select(id.clone());
-        }
         self.canonical.update_preferences(|prefs| {
             toggle_vec_member(&mut prefs.sidebar_collapsed_sessions, id)
         })

@@ -61,8 +61,9 @@ pub struct SidebarProject {
     /// Execution location shared by every Session in this project node.
     /// `None` means local; a host id means the remote filesystem owns root.
     pub host: Option<String>,
-    /// Visible rows in tree order. Subtrees under a collapsed row are omitted,
-    /// and the list is empty while the project itself is collapsed.
+    /// Visible rows in tree order. Subtrees under a collapsed row, and every
+    /// row of a collapsed project, are omitted except the selected row and the
+    /// rows leading down to it.
     pub sessions: Vec<SidebarRow>,
     /// Every active session in the group, in the same tree order, regardless of
     /// what is folded away. Rollups and selection ranges read this.
@@ -84,7 +85,7 @@ pub struct SidebarProjection {
 impl SidebarProjection {
     /// The row an empty selection should fall back to: the first active
     /// session in sidebar order, whether or not its project is collapsed.
-    /// Selecting it unfolds whatever is hiding it (`SessionStore::reveal`).
+    /// Selecting it shows it through any fold.
     pub fn first_active(&self) -> Option<&Arc<SessionRecord>> {
         self.projects.iter().find_map(|group| group.active.first())
     }
@@ -157,6 +158,7 @@ pub(super) fn build_projection(
             &session_rank,
             &pinned_sessions,
             &collapsed_sessions,
+            selected,
             expanded,
             prefs.sidebar_ordering,
         );
@@ -231,11 +233,16 @@ pub(super) fn build_projection(
 
 /// Arranges one project's active sessions into the lineage forest the sidebar
 /// draws, and returns `(visible rows, every session in tree order)`.
+///
+/// A fold (a collapsed row or project) hides its subtree except the selected
+/// row and the rows leading down to it: collapsing over the selection keeps it
+/// on screen, and it folds away as soon as the selection leaves.
 fn build_tree(
     active: Vec<Arc<SessionRecord>>,
     session_rank: &HashMap<&SessionId, usize>,
     pinned: &HashSet<&SessionId>,
     collapsed: &HashSet<&SessionId>,
+    selected: Option<&SessionId>,
     project_expanded: bool,
     ordering: SidebarOrdering,
 ) -> (Vec<SidebarRow>, Vec<Arc<SessionRecord>>) {
@@ -247,6 +254,14 @@ fn build_tree(
             Some(parent) => children[*parent].push(index),
             None => roots.push(index),
         }
+    }
+    // The selected row and its ancestors. `resolve_parents` has already broken
+    // cycles, so this walk ends.
+    let mut on_selected_path = vec![false; active.len()];
+    let mut cursor = selected.and_then(|id| active.iter().position(|session| &session.id == id));
+    while let Some(index) = cursor {
+        on_selected_path[index] = true;
+        cursor = parents[index];
     }
 
     let order = |left: &usize, right: &usize| {
@@ -267,11 +282,16 @@ fn build_tree(
     let mut tree_order = Vec::with_capacity(active.len());
     // Explicit stack rather than recursion: a spawn chain is attacker-shaped
     // input in the sense that nothing in the daemon bounds its depth.
-    let mut stack: Vec<(usize, u16, bool, u32)> = Vec::with_capacity(active.len());
+    // `(index, depth, visible, folded, rails)`, where `folded` means some
+    // ancestor is collapsed and only the selected path still shows.
+    let mut stack: Vec<(usize, u16, bool, bool, u32)> = Vec::with_capacity(active.len());
+    // A collapsed project folds like a collapsed row: only the selected path
+    // stays visible under it.
     for index in roots.iter().rev() {
-        stack.push((*index, 0, project_expanded, 0));
+        let visible = project_expanded || on_selected_path[*index];
+        stack.push((*index, 0, visible, !project_expanded, 0));
     }
-    while let Some((index, depth, visible, rails)) = stack.pop() {
+    while let Some((index, depth, visible, folded, rails)) = stack.pop() {
         let session = &active[index];
         tree_order.push(Arc::clone(session));
         let has_children = !children[index].is_empty();
@@ -286,18 +306,25 @@ fn build_tree(
                 rails,
             });
         }
-        let children_visible = visible && !is_collapsed;
-        let count = children[index].len();
+        let children_folded = folded || is_collapsed;
+        let shown = |child: &usize| !children_folded || on_selected_path[*child];
+        let last_shown = children[index].iter().rposition(shown);
         // Children inherit this row's rails and light the column beside it,
-        // except for the last one — whose rail stops on its own elbow.
+        // except for the last shown one, whose rail stops on its own elbow.
         let inherited = rails | (1u32 << depth.min(31));
         for (position, child) in children[index].iter().enumerate().rev() {
-            let child_rails = if position + 1 == count {
+            let child_rails = if Some(position) >= last_shown {
                 rails
             } else {
                 inherited
             };
-            stack.push((*child, depth + 1, children_visible, child_rails));
+            stack.push((
+                *child,
+                depth + 1,
+                visible && shown(child),
+                children_folded,
+                child_rails,
+            ));
         }
     }
     (rows, tree_order)

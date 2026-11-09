@@ -798,6 +798,10 @@ pub struct Sidebar {
     update: UpdateState,
     /// When visibility last flipped, so a held ⌘B cannot outrun the slide.
     last_toggle: Option<Instant>,
+    /// The row the last single click selected. A selection change can fold a
+    /// peeking row away and slide the rows below it, so the second click of a
+    /// double-click may land on a different row; only the same row renames.
+    last_clicked_row: Option<SessionId>,
     /// Hold-⌘ hint opacity for the horizontal strip, which `RootView`
     /// renders inline and so samples for it.
     pub(crate) strip_held_hint: f32,
@@ -1042,6 +1046,7 @@ impl Sidebar {
             accounts: accounts::MenuAccounts::new(preview),
             update: UpdateState::default(),
             last_toggle: None,
+            last_clicked_row: None,
             preview,
             new_agent_panel: NewAgentPanel::Agents,
             new_agent_anchor: None,
@@ -3179,6 +3184,12 @@ impl Sidebar {
         section = section.child(header);
         self.row_window.advance(SIDEBAR_NAV_ROW_HEIGHT);
 
+        // A collapsed project still shows the selected row and the rows above
+        // it (the Store's projection), so its body stays open for them. The
+        // archive bucket folds away with the rest.
+        let peeking = collapsed && !group.sessions.is_empty();
+        let open = !collapsed || peeking;
+        let archive = !group.archived.is_empty() && !peeking;
         // Keep the last visible rows only for the close animation. The Store
         // remains authoritative for keyboard navigation and selection.
         let now = Instant::now();
@@ -3188,14 +3199,14 @@ impl Sidebar {
             .or_insert_with(|| {
                 (
                     Disclosure::new(
-                        !collapsed,
-                        group.sessions.len() + usize::from(!group.archived.is_empty()),
+                        open,
+                        group.sessions.len() + usize::from(archive),
                         now,
                     ),
                     Vec::new(),
                 )
             });
-        if !collapsed {
+        if open {
             retained.clone_from(&group.sessions);
         } else {
             // A session removed while closing must not survive in the visual tail.
@@ -3204,7 +3215,7 @@ impl Sidebar {
         let rows = retained.clone();
         // Arrivals and departures, while the folder is open; a folding
         // project already moves by its own disclosure.
-        let slots = if collapsed {
+        let slots = if !open {
             None
         } else {
             self.arrange_rows(&id.0, &rows)
@@ -3215,13 +3226,13 @@ impl Sidebar {
             .get_mut(&id)
             .expect("inserted above");
         let frame = motion.update(
-            !collapsed,
-            count + usize::from(!group.archived.is_empty()),
+            open,
+            count + usize::from(archive),
             now,
             cx.reduce_motion(),
         );
         self.disclosure_animating |= frame.animating;
-        if collapsed && !frame.animating {
+        if !open && !frame.animating {
             retained.clear();
         }
         let body_top = self.row_window.cursor();
@@ -3247,7 +3258,7 @@ impl Sidebar {
                 }
                 let shortcut = (!ghost).then(|| self.shortcut_for(row.id())).flatten();
                 let id = row.id().clone();
-                let drop = if collapsed || ghost {
+                let drop = if !open || ghost {
                     None
                 } else {
                     self.row_drop_feedback(row, window, cx)
@@ -3273,7 +3284,7 @@ impl Sidebar {
                 // A leaving row does not keep the activity tick alive.
                 self.working_row_rendered &= !ghost || working;
                 let rendered = self.row_slot(rendered, presence, natural, ghost);
-                let rendered = if collapsed || ghost {
+                let rendered = if !open || ghost {
                     rendered
                 } else {
                     self.track_row_bounds(id, rendered, marker)
@@ -3284,7 +3295,7 @@ impl Sidebar {
                     margin,
                 });
             }
-            if !group.archived.is_empty() {
+            if archive {
                 self.row_window.advance(2.0);
                 let (bucket, height) = self.archived_bucket(group, !collapsed, colors, window, cx);
                 children.push(Slot::Built {
@@ -3300,7 +3311,7 @@ impl Sidebar {
                 .sum();
             self.row_window
                 .set_cursor(body_top + natural * frame.reveal);
-            section = section.child(disclosure_body(children, &frame, !collapsed));
+            section = section.child(disclosure_body(children, &frame, open));
         }
         // The whole section rides with the pointer, sessions included,
         // exactly as it looks at rest. Its slot moves under it on reorder.
@@ -4302,10 +4313,13 @@ impl Sidebar {
                 cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                     this.commit_rename();
                     this.ui.focus_cursor = Some(row_session.id.clone());
-                    if event.click_count() == 2 {
+                    if event.click_count() == 2
+                        && this.last_clicked_row.as_ref() == Some(&row_session.id)
+                    {
                         this.begin_rename(&row_session, window, cx);
                         return;
                     }
+                    this.last_clicked_row = Some(row_session.id.clone());
                     let modifiers = event.modifiers();
                     this.store
                         .write()
@@ -15109,6 +15123,77 @@ mod tests {
         }
     }
 
+    /// A folded project keeps showing its selected row, so tests that watch
+    /// the whole Dirijor body close select a row elsewhere first.
+    fn select_outside_dirijor(sidebar: &Entity<Sidebar>, cx: &mut VisualTestContext) {
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar
+                .store
+                .write()
+                .unwrap()
+                .select(SessionId::new("preview-sleeping"));
+            cx.notify();
+        });
+        cx.run_until_parked();
+    }
+
+    fn click_with_count(cx: &mut VisualTestContext, at: Point<Pixels>, click_count: usize) {
+        let modifiers = Modifiers::default();
+        cx.update(|window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: at,
+                    modifiers,
+                    click_count,
+                    first_mouse: false,
+                }),
+                cx,
+            );
+            window.dispatch_event(
+                gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                    button: MouseButton::Left,
+                    position: at,
+                    modifiers,
+                    click_count,
+                }),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+    }
+
+    /// Selecting can fold a peeking row away and slide the rows below it, so
+    /// the second click of a double-click may land on another row. It selects
+    /// that row instead of renaming it; a true double-click still renames.
+    #[gpui::test]
+    fn a_double_click_renames_only_the_row_its_first_click_hit(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        select_outside_dirijor(&sidebar, cx);
+        let first = row_bounds(&sidebar, cx, "preview-sleeping").center();
+        let second = row_bounds(&sidebar, cx, "preview-claude").center();
+
+        click_with_count(cx, first, 1);
+        click_with_count(cx, second, 2);
+        sidebar.read_with(cx, |sidebar, _| {
+            assert_eq!(sidebar.ui.renaming, None);
+            assert_eq!(
+                sidebar.store.read().unwrap().selected_session_id(),
+                Some(&SessionId::new("preview-claude"))
+            );
+        });
+
+        click_with_count(cx, second, 1);
+        click_with_count(cx, second, 2);
+        sidebar.read_with(cx, |sidebar, _| {
+            assert_eq!(sidebar.ui.renaming, Some(SessionId::new("preview-claude")));
+        });
+    }
+
     #[gpui::test]
     fn disclosure_advances_without_pointer_or_display_link_callbacks(cx: &mut TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, cx| {
@@ -15116,6 +15201,7 @@ mod tests {
             SidebarPopoverHarness { sidebar }
         });
         let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        select_outside_dirijor(&sidebar, cx);
         let project = cx.debug_bounds("PROJECT_preview-dirijor").unwrap();
         cx.simulate_click(project.center(), Modifiers::default());
         cx.run_until_parked();
@@ -15138,6 +15224,7 @@ mod tests {
             SidebarPopoverHarness { sidebar }
         });
         let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        select_outside_dirijor(&sidebar, cx);
         let row = row_bounds(&sidebar, cx, "preview-claude");
         let selected = sidebar.read_with(cx, |sidebar, _| {
             sidebar.store.read().unwrap().selected_session_id().cloned()

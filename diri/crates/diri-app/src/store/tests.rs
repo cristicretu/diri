@@ -610,41 +610,82 @@ fn collapsing_a_parent_folds_away_its_subtree() {
     );
 }
 
-/// Selecting a hidden session unfolds whatever is covering it. Without this a
-/// ⌘J or an MCP focus lands on a row the sidebar never shows.
+/// Selecting a hidden session shows it through its folded project and parent.
+/// Without this a ⌘J or an MCP focus lands on a row the sidebar never shows.
+/// Both stay folded, so the rest of their rows stay hidden.
 #[test]
-fn selecting_a_folded_session_reveals_it() {
+fn selecting_a_folded_session_peeks_it_through_the_fold() {
     let mut child = session("child", "p", 2.0);
     child.parent = Some(id("root"));
+    let mut sibling = session("sibling", "p", 3.0);
+    sibling.parent = Some(id("root"));
     let prefs = Prefs {
         sidebar_collapsed_projects: vec![pid("p")],
         sidebar_collapsed_sessions: vec![id("root")],
         ..Prefs::default()
     };
     let (mut store, _) = hydrated(
-        vec![session("root", "p", 1.0), child],
+        vec![session("root", "p", 1.0), child, sibling],
         vec![project("p", "P")],
         prefs,
     );
 
     store.select(id("child"));
 
-    assert!(store.preferences().sidebar_collapsed_projects.is_empty());
-    assert!(store.preferences().sidebar_collapsed_sessions.is_empty());
+    assert_eq!(store.preferences().sidebar_collapsed_projects, vec![pid("p")]);
     assert_eq!(
-        rows(&store.sidebar_projection(), 0),
-        vec![id("root"), id("child")]
+        store.preferences().sidebar_collapsed_sessions,
+        vec![id("root")]
     );
+    let projection = store.sidebar_projection();
+    assert_eq!(rows(&projection, 0), vec![id("root"), id("child")]);
+    assert!(projection.projects[0].sessions[0].collapsed);
 }
 
-/// Folding the ancestor of the selection would hide it, so the selection walks
-/// up to the row being folded instead of vanishing under it.
+/// Collapsing a project keeps its selected row showing, and that row folds
+/// away once the selection moves to another project.
 #[test]
-fn folding_over_the_selection_moves_it_to_the_fold() {
+fn folding_a_project_keeps_its_selection_until_it_is_left() {
+    let (mut store, _) = hydrated(
+        vec![
+            session("one", "p", 1.0),
+            session("two", "p", 2.0),
+            session("elsewhere", "q", 3.0),
+        ],
+        vec![project("p", "P"), project("q", "Q")],
+        Prefs::default(),
+    );
+    store.select(id("two"));
+
+    store
+        .toggle_project_collapsed(pid("p"))
+        .expect("collapse");
+
+    assert_eq!(store.selected_session_id(), Some(&id("two")));
+    assert_eq!(rows(&store.sidebar_projection(), 0), vec![id("two")]);
+
+    store.select(id("elsewhere"));
+
+    assert!(rows(&store.sidebar_projection(), 0).is_empty());
+    assert_eq!(store.preferences().sidebar_collapsed_projects, vec![pid("p")]);
+}
+
+/// Folding the ancestor of the selection keeps the selection where it is and
+/// leaves only that row showing under the fold. Selecting anything else folds
+/// it away with its siblings.
+#[test]
+fn folding_over_the_selection_keeps_it_until_it_is_left() {
     let mut child = session("child", "p", 2.0);
     child.parent = Some(id("root"));
+    let mut sibling = session("sibling", "p", 3.0);
+    sibling.parent = Some(id("root"));
     let (mut store, _) = hydrated(
-        vec![session("root", "p", 1.0), child],
+        vec![
+            session("root", "p", 1.0),
+            child,
+            sibling,
+            session("other", "p", 4.0),
+        ],
         vec![project("p", "P")],
         Prefs::default(),
     );
@@ -654,8 +695,50 @@ fn folding_over_the_selection_moves_it_to_the_fold() {
         .toggle_session_collapsed(id("root"))
         .expect("collapse");
 
-    assert_eq!(store.selected_session_id(), Some(&id("root")));
-    assert_eq!(rows(&store.sidebar_projection(), 0), vec![id("root")]);
+    assert_eq!(store.selected_session_id(), Some(&id("child")));
+    let projection = store.sidebar_projection();
+    assert_eq!(
+        rows(&projection, 0),
+        vec![id("root"), id("child"), id("other")]
+    );
+    let peeking = &projection.projects[0].sessions[1];
+    assert_eq!(peeking.rails, 0, "the only shown child ends its rail");
+
+    store.select(id("other"));
+
+    assert_eq!(
+        rows(&store.sidebar_projection(), 0),
+        vec![id("root"), id("other")]
+    );
+}
+
+/// A selected grandchild shows the path down to it through a folded ancestor,
+/// and nothing else from that subtree.
+#[test]
+fn folding_over_a_selected_grandchild_shows_only_its_path() {
+    let mut middle = session("middle", "p", 2.0);
+    middle.parent = Some(id("root"));
+    let mut aunt = session("aunt", "p", 3.0);
+    aunt.parent = Some(id("root"));
+    let mut note = session("note", "p", 4.0);
+    note.parent = Some(id("middle"));
+    let mut cousin = session("cousin", "p", 5.0);
+    cousin.parent = Some(id("middle"));
+    let (mut store, _) = hydrated(
+        vec![session("root", "p", 1.0), middle, aunt, note, cousin],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    store.select(id("note"));
+
+    store
+        .toggle_session_collapsed(id("root"))
+        .expect("collapse");
+
+    assert_eq!(
+        rows(&store.sidebar_projection(), 0),
+        vec![id("root"), id("middle"), id("note")]
+    );
 }
 
 /// A parent in another project, or one that points back at its own descendant,
@@ -3451,8 +3534,6 @@ fn the_menu_bar_projection_is_cached_per_revision() {
         vec![project("p", "P")],
         Prefs::default(),
     );
-    // Collapse after hydration: hydrating selects a session, and selecting
-    // unfolds whatever hides it (`selecting_a_folded_session_reveals_it`).
     store
         .toggle_project_collapsed(pid("p"))
         .expect("collapse the project");
@@ -3465,8 +3546,10 @@ fn the_menu_bar_projection_is_cached_per_revision() {
 
     // The menu bar keeps its own collapse state, so it ignores the sidebar's
     // folds; that difference is why it cannot just share `sidebar_projection`.
+    // The sidebar keeps only its selected row under the folded project.
     assert_eq!(rows(&first, 0), vec![id("one"), id("two")]);
-    assert!(store.sidebar_projection().projects[0].sessions.is_empty());
+    let selected = store.selected_session_id().cloned().expect("hydration selects");
+    assert_eq!(rows(&store.sidebar_projection(), 0), vec![selected]);
 
     store.rename(id("one"), "renamed");
     assert!(

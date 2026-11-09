@@ -10340,7 +10340,9 @@ mod tests {
         let fold = cx.debug_bounds("PROJECT_preview-dirijor").unwrap().center();
         cx.simulate_click(fold, Modifiers::default());
         cx.run_until_parked();
-        assert!(cx.debug_bounds("SESSION_preview-claude").is_none());
+        // The selected row stays under the folded project; the rest fold away.
+        assert!(cx.debug_bounds("SESSION_preview-claude").is_some());
+        assert!(cx.debug_bounds("SESSION_preview-codex").is_none());
         assert_eq!(
             root.read_with(cx, |root, cx| root.active_terminal(cx).unwrap()),
             terminal
