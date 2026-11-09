@@ -1373,12 +1373,19 @@ impl Registry {
             .iter()
             .filter_map(|(id, session)| {
                 let version = session.state_version();
-                (published.get(id) != Some(&version)).then(|| (id.clone(), version, session.view()))
+                (published.get(id) != Some(&version)).then(|| {
+                    (
+                        id.clone(),
+                        version,
+                        session.view(),
+                        session.take_agent_ended(),
+                    )
+                })
             })
             .collect::<Vec<_>>();
         let mut persistence_changed = false;
         let mut exit_observed = false;
-        for (id, version, view) in changed_views {
+        for (id, version, view, agent_ended) in changed_views {
             published.insert(id.clone(), version);
             self.bind_completed_run(&id);
             if let Some(record) = self.records.get_mut(&id) {
@@ -1397,6 +1404,11 @@ impl Registry {
                     record.terminal_cwd.clone(),
                 );
                 fold_session_view(record, &view);
+                if agent_ended {
+                    // The Agent took its background shells with it; no hook
+                    // will say so when it was killed rather than quit.
+                    record.background_shells = None;
+                }
                 fold_record_lifecycle(&self.engine, record);
                 let exit_changed = match &record.status {
                     SessionStatus::Exited(exit) => previous_exit.as_ref() != Some(exit),

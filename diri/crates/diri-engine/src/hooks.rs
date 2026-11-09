@@ -195,7 +195,12 @@ pub fn parse_claude_hook(
     };
 
     if !is_subagent {
-        meta.background_shells = diri_proto::recovery::claude_background_shells(payload);
+        meta.background_shells = match hook {
+            // Claude stops its background shells as it exits, and its last
+            // payload need not list them.
+            ClaudeHook::SessionEnd => Some(0),
+            _ => diri_proto::recovery::claude_background_shells(payload),
+        };
     }
     Some((
         StatusSignal::ClaudeHook {
@@ -551,6 +556,22 @@ mod tests {
                 1
             );
             assert!(!reducer.reduce(stop, at).turn_completed);
+        }
+    }
+
+    #[test]
+    fn background_shells_come_from_the_main_agent_and_end_with_it() {
+        let running = json!({"background_tasks": [{"type": "shell", "status": "running"}]});
+        let (_, meta) = parse_claude_hook("Stop", &running, now()).unwrap();
+        assert_eq!(meta.background_shells, Some(1));
+        let mut child = running.clone();
+        child["agent_id"] = json!("child");
+        let (_, meta) = parse_claude_hook("SubagentStop", &child, now()).unwrap();
+        assert_eq!(meta.background_shells, None);
+        // Claude stops its shells as it exits, listed or not.
+        for payload in [json!({}), running] {
+            let (_, meta) = parse_claude_hook("SessionEnd", &payload, now()).unwrap();
+            assert_eq!(meta.background_shells, Some(0));
         }
     }
 

@@ -13472,9 +13472,10 @@ mod tests {
                                     now - 1.0
                                 }));
                         }
-                        // `DIRI_VISUAL_SHELLS=1` finishes Claude's turn with
-                        // two background shells still running.
-                        if std::env::var_os("DIRI_VISUAL_SHELLS").is_some()
+                        // `DIRI_VISUAL_SHELLS=<n>` finishes Claude's turn with
+                        // n background shells still running (2 when not a
+                        // number).
+                        if let Some(shells) = std::env::var("DIRI_VISUAL_SHELLS").ok()
                             && session.id == SessionId::new("preview-claude")
                         {
                             session.status = diri_proto::SessionStatus::Idle;
@@ -13482,7 +13483,8 @@ mod tests {
                             session.needs_input = None;
                             session.last_turn_completed_at = Some(diri_proto::DateMillis(now));
                             session.last_seen_at = Some(diri_proto::DateMillis(now + 1.0));
-                            session.background_shells = Some(2);
+                            session.background_shells =
+                                Some(shells.parse().ok().filter(|n| *n > 0).unwrap_or(2));
                         }
                         // `DIRI_VISUAL_SCHEDULED=1` marks two sessions as
                         // scheduled runs: one diri woke the Mac for (indigo

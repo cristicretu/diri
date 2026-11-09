@@ -148,6 +148,8 @@ fn a_clean_exit_without_the_notice_stays_at_the_shell() {
     ));
     let mut record = test_record("s_quit");
     record.kind = diri_proto::AgentKind::CODEX;
+    // Shells the agent last reported end with it, hook or no hook.
+    record.background_shells = Some(2);
     record.cwd = temp.path().to_string_lossy().into_owned();
     {
         let mut guard = registry.lock().unwrap();
@@ -169,5 +171,10 @@ fn a_clean_exit_without_the_notice_stays_at_the_shell() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(registry.lock().unwrap().take_relaunch_requests().is_empty());
+    {
+        let mut guard = registry.lock().unwrap();
+        let _ = guard.changed_since(&mut std::collections::HashMap::new());
+        assert_eq!(guard.record("s_quit").unwrap().background_shells, None);
+    }
     let _ = registry.lock().unwrap().terminate("s_quit", Duration::ZERO);
 }

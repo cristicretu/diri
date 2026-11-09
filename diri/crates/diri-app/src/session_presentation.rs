@@ -110,7 +110,7 @@ pub(crate) fn status_state(session: &SessionRecord, migrating: bool) -> StatusSt
         ProtoAttentionLevel::Working => StatusState::Working,
         // A finished turn whose background shell still runs is waiting on
         // that shell, not on nothing.
-        ProtoAttentionLevel::IdleSeen |ProtoAttentionLevel::None | ProtoAttentionLevel::Unknown
+        ProtoAttentionLevel::IdleSeen | ProtoAttentionLevel::None | ProtoAttentionLevel::Unknown
             if background_shells(session) > 0 =>
         {
             StatusState::ShellsRunning
