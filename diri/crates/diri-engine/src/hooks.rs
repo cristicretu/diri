@@ -34,6 +34,9 @@ pub struct HookMetadata {
     /// A file an edit tool just changed, from the Agent or a subagent. Lets a
     /// client follow work done in another checkout without a `cd`.
     pub edited_path: Option<String>,
+    /// Background shells the main Agent reports still running; `None` when
+    /// the payload had no task list. Subagent payloads never set it.
+    pub background_shells: Option<u32>,
 }
 
 /// Claude's file-editing tools, by the `tool_input` key naming the file.
@@ -191,6 +194,9 @@ pub fn parse_claude_hook(
         _ => return None,
     };
 
+    if !is_subagent {
+        meta.background_shells = diri_proto::recovery::claude_background_shells(payload);
+    }
     Some((
         StatusSignal::ClaudeHook {
             hook,

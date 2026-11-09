@@ -138,6 +138,7 @@ pub(super) fn state_text(session: &SessionRecord, state: StatusState, now_ms: f6
             },
         ),
         StatusState::Working => Some(t("session.hover.working").to_owned()),
+        StatusState::ShellsRunning => Some(crate::session_presentation::shells_running_text(session)),
         StatusState::DoneUnseen | StatusState::IdleSeen => {
             match session.last_turn_completed_at {
                 Some(done) if agent => Some(done_ago(now_ms, done.0)),
@@ -180,6 +181,7 @@ pub(super) fn state_ink(session: &SessionRecord, state: StatusState, colors: Sem
         StatusState::NeedsInput { destructive: true } => Ink::on_surface(Ink::DANGER, colors),
         StatusState::NeedsInput { destructive: false } => Ink::on_surface(Ink::ATTENTION, colors),
         StatusState::DoneUnseen => Ink::on_surface(Ink::FRESH, colors),
+        StatusState::ShellsRunning => colors.primary.alpha(0.55),
         // Filled, so the pane's place still reads, but quieter than work.
         StatusState::IdleSeen | StatusState::None | StatusState::Hibernated => {
             colors.primary.alpha(0.34)
@@ -382,7 +384,7 @@ impl HoverStatus {
 /// The single line's dot: the state's colour, quiet at rest.
 fn state_dot(state: StatusState, colors: SemanticColors) -> Rgba {
     match state {
-        StatusState::Working => colors.primary.alpha(0.55),
+        StatusState::Working | StatusState::ShellsRunning => colors.primary.alpha(0.55),
         StatusState::NeedsInput { destructive: true } => Ink::on_surface(Ink::DANGER, colors),
         StatusState::NeedsInput { destructive: false } => Ink::on_surface(Ink::ATTENTION, colors),
         StatusState::DoneUnseen => Ink::on_surface(Ink::FRESH, colors),

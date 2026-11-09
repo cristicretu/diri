@@ -130,6 +130,7 @@ fn start_server(temp: &Path, fixture: &Path, parent_cwd: &Path) -> Arc<ControlSe
         note_id: None,
         foreground_ports: None,
         terminal_progress: None,
+        background_shells: None,
         scheduled_run: None,
     });
     let registry = Arc::new(Mutex::new(registry));

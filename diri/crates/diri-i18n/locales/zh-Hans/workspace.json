@@ -4,6 +4,8 @@
   "activity.idle": "空闲",
   "activity.needed_you": "曾需要你",
   "activity.needs_you": "需要你",
+  "activity.shells_running_one": "Shell 运行中",
+  "activity.shells_running_other": "{count} 个 Shell 运行中",
   "activity.working": "工作中",
   "activity.working_percent": "工作中 · {percent}%",
   "empty.choose_folder": "选择文件夹…",

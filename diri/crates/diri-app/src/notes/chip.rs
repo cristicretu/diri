@@ -47,7 +47,7 @@ pub(crate) fn status_ink(
         StatusState::NeedsInput { destructive: false } => Ink::on_surface(Ink::ATTENTION, colors),
         StatusState::NeedsInput { destructive: true } => Ink::on_surface(Ink::DANGER, colors),
         StatusState::DoneUnseen => Ink::on_surface(Ink::FRESH, colors),
-        StatusState::IdleSeen => colors.secondary,
+        StatusState::IdleSeen | StatusState::ShellsRunning => colors.secondary,
         StatusState::None | StatusState::Hibernated => colors.tertiary,
     }
 }

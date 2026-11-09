@@ -1920,7 +1920,10 @@ fn status_color(session: &SessionRecord, colors: SemanticColors) -> gpui::Rgba {
         StatusState::NeedsInput { destructive: true } => Ink::DANGER,
         StatusState::NeedsInput { destructive: false } => Ink::ATTENTION,
         StatusState::DoneUnseen => Ink::FRESH,
-        StatusState::IdleSeen | StatusState::None | StatusState::Hibernated => colors.secondary,
+        StatusState::IdleSeen
+        | StatusState::None
+        | StatusState::Hibernated
+        | StatusState::ShellsRunning => colors.secondary,
     }
 }
 
@@ -2004,6 +2007,7 @@ mod tests {
             note_id: None,
             foreground_ports: None,
             terminal_progress: None,
+            background_shells: None,
             scheduled_run: None,
         }
     }

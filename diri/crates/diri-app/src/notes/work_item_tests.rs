@@ -100,6 +100,7 @@ pub(crate) fn record(id: &str, kind: AgentKind) -> SessionRecord {
         note_id: None,
         foreground_ports: None,
         terminal_progress: None,
+        background_shells: None,
         scheduled_run: None,
     }
 }
