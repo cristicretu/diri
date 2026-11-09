@@ -487,6 +487,12 @@ mod catalog {
                 "Record that a session now works in another worktree."
             ),
             entry!(
+                Method::SESSION_SET_PROJECT,
+                SessionSetProjectParams,
+                "SessionRecord",
+                "File a session and its children under another project."
+            ),
+            entry!(
                 Method::SESSION_HISTORY,
                 EmptyParams,
                 "SessionHistoryResult",

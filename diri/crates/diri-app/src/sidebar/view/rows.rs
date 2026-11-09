@@ -45,6 +45,8 @@ pub(in crate::sidebar) struct SessionRowProps {
     pub(super) selected: bool,
     pub(super) multi: bool,
     pub(super) drag_selection: Option<Vec<SessionId>>,
+    /// This row is the one riding the pointer in a drag.
+    pub(super) lifted: bool,
     pub(super) migrating: bool,
     pub(super) activity_state: StatusState,
     /// The question or permission the row waits on
@@ -181,6 +183,7 @@ impl Sidebar {
             selected,
             multi,
             drag_selection,
+            lifted: self.lift_offset(&LiftKey::SessionRow(id.clone())).is_some(),
             migrating,
             activity_state,
             question,

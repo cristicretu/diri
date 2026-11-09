@@ -41,12 +41,15 @@ its executable.
 
 ## Drag and drop in the sidebar
 
-Drag a session between two rows to reorder it among its siblings; an insertion
-line shows where it will land. Drop it onto another session's row to review a
-handoff of its work to that session, or onto the zone that appears below the
-last project to fan out a sibling with the same prompt. Project headers reorder
-the same way. Escape cancels a drag, and releasing where nothing accepts the
-drop does nothing.
+Drag a session up or down to reorder it among its siblings: the row lifts and
+follows the pointer while its neighbours slide out of the way, and releasing
+keeps the new order. Drop it on another project's header, or beside one of its
+rows, to move the session (and the sessions it started) into that project; the
+agent keeps its working directory. Holding a drag near the top or bottom of
+the list scrolls it. Drag a session out to the zone that appears below the last
+project to move it to your home folder. Project headers reorder the
+same way. Escape cancels a drag and puts everything back, and releasing where
+nothing accepts the drop does nothing.
 
 ## Sidebar usage indicator
 

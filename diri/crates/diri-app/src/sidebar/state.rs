@@ -1,7 +1,6 @@
 use diri_proto::{ProjectId, SessionId};
 use gpui::{Bounds, Pixels, Point};
 
-use crate::delegation::SiblingProposal;
 use crate::query_editor::QueryEditor;
 use crate::text_input::Composition;
 
@@ -115,8 +114,6 @@ pub struct SidebarUiState {
     pub session_order_at_drag_start: Option<Vec<SessionId>>,
     /// Keyboard source for the two-step mark-then-delegate equivalent.
     pub delegation_mark: Option<SessionId>,
-    /// Empty-space drops stop here until the user confirms the sibling spawn.
-    pub pending_sibling: Option<SiblingProposal>,
     /// Inline explanation for a rejected drop or keyboard target.
     pub delegation_notice: Option<String>,
     /// A live drag has staged a reorder in memory that still needs one prefs
@@ -151,7 +148,6 @@ impl SidebarUiState {
             project_order_at_drag_start: None,
             session_order_at_drag_start: None,
             delegation_mark: None,
-            pending_sibling: None,
             delegation_notice: None,
             order_dirty: false,
             resize_origin: None,
@@ -267,7 +263,6 @@ impl SidebarUiState {
         self.drag = None;
         self.drag_target = None;
         self.delegation_mark = None;
-        self.pending_sibling = None;
         self.delegation_notice = None;
     }
 }
@@ -430,22 +425,11 @@ mod tests {
             parent: None,
             archived: false,
         });
-        state.pending_sibling = Some(SiblingProposal {
-            source_id: SessionId::new("source"),
-            source_title: "Source".to_owned(),
-            kind: diri_proto::AgentKind::CODEX,
-            project_id: ProjectId::new("project"),
-            cwd: "/repo".to_owned(),
-            prompt: "Keep going".to_owned(),
-            parent: None,
-            host: None,
-        });
         state.delegation_notice = Some("proposal".to_owned());
 
         state.cancel_delegation();
 
         assert!(state.drag.is_none());
-        assert!(state.pending_sibling.is_none());
         assert!(state.delegation_notice.is_none());
         assert!(state.delegation_mark.is_none());
     }

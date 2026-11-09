@@ -526,6 +526,12 @@ function diri.session.migrate(params, opts) end
 ---@return table # SessionRecord
 function diri.session.reparent_worktree(params, opts) end
 
+---File a session and its children under another project.
+---@param params {sessionID: string, projectID?: string, projectRoot?: string}
+---@param opts? {timeout?: number}
+---@return table # SessionRecord
+function diri.session.set_project(params, opts) end
+
 ---Push Agent preferences to a remote host.
 ---@param params {host: string}
 ---@param opts? {timeout?: number}

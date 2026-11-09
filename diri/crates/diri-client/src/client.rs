@@ -662,6 +662,19 @@ impl DaemonClient {
             .await
     }
 
+    /// Files a session (and the sessions it spawned) under another project
+    /// on the same host. The process keeps its working directory.
+    pub async fn set_project(
+        &self,
+        target: &diri_proto::SessionSetProjectParams,
+    ) -> Result<(), ClientError> {
+        let _: JsonValue = self
+            .core
+            .request_typed(Method::SESSION_SET_PROJECT, Some(target), None)
+            .await?;
+        Ok(())
+    }
+
     pub async fn rename(&self, session_id: &SessionId, title: String) -> Result<(), ClientError> {
         self.empty(
             Method::SESSION_RENAME,

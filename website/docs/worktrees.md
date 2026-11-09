@@ -59,12 +59,9 @@ When helpers worked in separate worktrees, review each one in the Review panel a
 Try asking the lead agent: "Use diri to give each sub-task its own agent in a separate worktree, review their changes, and merge only the ones whose tests pass." See [Let agents work as a team](/guides/agent-teams/).
 
 ## Hand work to another session
-- **Keyboard.** Select the source session and press <kbd>⌃</kbd><kbd>⌘</kbd><kbd>D</kbd>, select the target, and press it again.
-- **Drag and drop.** Drop a session onto another session's row to hand its work to that session.
+Select the source session and press <kbd>⌃</kbd><kbd>⌘</kbd><kbd>D</kbd>, select the target, and press it again.
 
-Either way, a handoff sheet opens with the generated context. You can edit it, remote targets carry a Remote badge, and nothing is sent until you click **Send handoff** or press Return. Esc cancels.
-
-Dropping a session on the zone below the last project instead starts a sibling with the same prompt.
+A handoff sheet opens with the generated context. You can edit it, remote targets carry a Remote badge, and nothing is sent until you click **Send handoff** or press Return. Esc cancels.
 
 ## Clean up
 Open **Settings → Worktrees** to see the linked worktrees of your local projects, with their age and pull request state (Open, Merged or Closed). Filter by **All**, **Ready to clean** or **Older than 30 days**. Each worktree shows what keeps it from being cleaned up:
