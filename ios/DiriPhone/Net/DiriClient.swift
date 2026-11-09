@@ -174,11 +174,14 @@ actor DiriClient {
     }
 
     /// Replaces the Mac sidebar's manual order, as a drag there would.
-    func setSidebarOrder(sessions: [String]? = nil, projects: [String]? = nil) async throws {
-        var body: [String: Any] = [:]
-        if let sessions { body["sessions"] = sessions }
-        if let projects { body["projects"] = projects }
-        _ = try await send(try request("/api/sidebar/order", method: "PUT", body: body))
+    /// Moves one sidebar row, as one drag on the Mac does. With neither
+    /// `before` nor `after` it goes to the end. `row` is `"session"` or
+    /// `"project"`.
+    func moveSidebarRow(_ row: String, id: String, before: String? = nil, after: String? = nil) async throws {
+        var body: [String: Any] = [row: id]
+        if let before { body["before"] = before }
+        if let after { body["after"] = after }
+        _ = try await send(try request("/api/sidebar/move", method: "POST", body: body))
     }
 
     // MARK: - Notes

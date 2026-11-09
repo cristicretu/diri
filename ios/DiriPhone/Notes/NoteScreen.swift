@@ -10,33 +10,21 @@ struct NoteScreen: View {
 
     @Environment(AppModel.self) private var model
     @Environment(\.scenePhase) private var scenePhase
-    @State private var markdown = ""
-    /// Moves whenever `markdown` comes from the Mac rather than the editor.
-    @State private var revision = 0
-    @State private var version: String?
-    @State private var state = SaveState.loading
-    @State private var conflict: DiriClient.Note?
-    @State private var loadError: String?
-    @State private var saveTask: Task<Void, Never>?
+    /// The note's text and save state. A class, not view state: a save that
+    /// is in flight, or the last one fired as the screen closes, must keep
+    /// working after this view is gone.
+    @State private var draft = NoteDraft()
 
-    enum SaveState: Equatable {
-        case loading
-        case saved
-        case edited
-        case saving
-        case failed(String)
-    }
-
-    /// How long typing must pause before the note is saved.
-    private let saveDelay: Duration = .milliseconds(800)
     /// How often an untouched note checks for edits made elsewhere.
     private let followInterval: Duration = .seconds(4)
 
     private var session: SessionRecord? { model.session(sessionID) }
+    private var markdown: String { draft.markdown }
+    private var state: NoteDraft.SaveState { draft.state }
 
     var body: some View {
         Group {
-            if let loadError, version == nil {
+            if let loadError = draft.loadError, draft.version == nil {
                 VStack(spacing: 10) {
                     Text("Couldn't open this note")
                         .font(.system(size: 17, weight: .semibold))
@@ -45,16 +33,16 @@ struct NoteScreen: View {
                         .font(.system(size: 13))
                         .foregroundStyle(Tokens.Ink.tertiary)
                         .multilineTextAlignment(.center)
-                    Button("Try again") { Task { await load() } }
+                    Button("Try again") { Task { await draft.load() } }
                         .foregroundStyle(Tokens.Ink.clay)
                 }
                 .padding(24)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if version == nil {
+            } else if draft.version == nil {
                 ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                NoteEditor(markdown: markdown, revision: revision) { text in
-                    edited(text)
+                NoteEditor(markdown: draft.markdown, revision: draft.revision) { text in
+                    draft.edited(text)
                 }
                 .ignoresSafeArea(.container, edges: .bottom)
             }
@@ -63,25 +51,26 @@ struct NoteScreen: View {
         .toolbar { toolbar }
         .navigationBarTitleDisplayMode(.inline)
         .task(id: scenePhase == .active) {
+            draft.bind(model: model, sessionID: sessionID)
             guard scenePhase == .active else {
-                await flush()
+                draft.flush()
                 return
             }
-            if version == nil { await load() }
+            if draft.version == nil { await draft.load() }
             await model.markSeen(sessionID)
             while !Task.isCancelled {
                 try? await Task.sleep(for: followInterval)
                 guard !Task.isCancelled else { return }
-                await follow()
+                await draft.follow()
             }
         }
-        .onDisappear { Task { await flush() } }
+        .onDisappear { draft.flush() }
         .alert(
             "This note changed on your Mac",
-            isPresented: .init(get: { conflict != nil }, set: { if !$0 { conflict = nil } })
+            isPresented: .init(get: { draft.conflict != nil }, set: { if !$0 { draft.conflict = nil } })
         ) {
-            Button("Use the Mac's version") { takeTheirs() }
-            Button("Keep mine") { keepMine() }
+            Button("Use the Mac's version") { draft.takeTheirs() }
+            Button("Keep mine") { draft.keepMine() }
         } message: {
             Text("It was edited there while you were typing here. Keep yours to replace it, or use the Mac's to drop your edits since the last save.")
         }
@@ -137,17 +126,59 @@ struct NoteScreen: View {
         if case .failed = state { return Tokens.Ink.attention }
         return Tokens.Ink.tertiary
     }
+}
+
+/// One open note's text and its saves. Saves never overlap: typing during a
+/// save's round trip is saved after it, against the version it returned, so
+/// the phone never conflicts with its own write.
+@MainActor
+@Observable
+final class NoteDraft {
+    enum SaveState: Equatable {
+        case loading
+        case saved
+        case edited
+        case saving
+        case failed(String)
+    }
+
+    private(set) var markdown = ""
+    /// Moves whenever `markdown` comes from the Mac rather than the editor.
+    private(set) var revision = 0
+    private(set) var version: String?
+    private(set) var state = SaveState.loading
+    var conflict: DiriClient.Note?
+    private(set) var loadError: String?
+
+    @ObservationIgnored private var model: AppModel?
+    @ObservationIgnored private var sessionID = ""
+    /// The pending debounce or retry. Only ever sleeping: a request in
+    /// flight is never cancelled by new typing.
+    @ObservationIgnored private var pending: Task<Void, Never>?
+    @ObservationIgnored private var inFlight = false
+    /// Set when the screen closes mid-save: what was typed during the round
+    /// trip is saved at once rather than after the typing pause.
+    @ObservationIgnored private var flushing = false
+
+    /// How long typing must pause before the note is saved.
+    private let saveDelay: Duration = .milliseconds(800)
+
+    func bind(model: AppModel, sessionID: String) {
+        self.model = model
+        self.sessionID = sessionID
+    }
+
+    private var client: DiriClient? { model?.client(for: sessionID) }
 
     // MARK: - Loading
 
-    private func load() async {
-        guard let client = model.client(for: sessionID) else {
+    func load() async {
+        guard let client else {
             loadError = "Connect to your Mac first."
             return
         }
         do {
-            let note = try await client.note(sessionID: sessionID)
-            show(note)
+            show(try await client.note(sessionID: sessionID))
             loadError = nil
         } catch {
             loadError = error.localizedDescription
@@ -164,83 +195,99 @@ struct NoteScreen: View {
 
     /// Picks up an edit made elsewhere, unless this phone is mid-edit: then
     /// the next save finds the conflict and asks.
-    private func follow() async {
-        guard state == .saved, conflict == nil, let client = model.client(for: sessionID),
+    func follow() async {
+        guard state == .saved, conflict == nil, let client,
               let note = try? await client.note(sessionID: sessionID)
         else { return }
-        if state == .saved, note.version != version { show(note) }
+        if state == .saved, !inFlight, note.version != version { show(note) }
     }
 
     // MARK: - Saving
 
-    private func edited(_ text: String) {
+    func edited(_ text: String) {
         guard text != markdown else { return }
         markdown = text
         state = .edited
-        saveTask?.cancel()
-        saveTask = Task {
-            try? await Task.sleep(for: saveDelay)
-            guard !Task.isCancelled else { return }
-            await save()
-        }
+        // A save in flight picks this up when it returns.
+        if !inFlight { schedule(after: saveDelay) }
     }
 
     /// Saves now if anything is unsaved: leaving the screen or the app must
-    /// not drop the last few words.
-    private func flush() async {
+    /// not drop the last few words. Runs in its own task, so it outlives
+    /// the view and the scene-phase task that asked for it.
+    func flush() {
         switch state {
         case .edited, .failed: break
         case .loading, .saved, .saving: return
         }
-        saveTask?.cancel()
-        await save()
+        if inFlight {
+            flushing = true
+            return
+        }
+        pending?.cancel()
+        pending = nil
+        Task { await self.save() }
+    }
+
+    private func schedule(after delay: Duration) {
+        pending?.cancel()
+        pending = Task {
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled else { return }
+            await self.save()
+        }
     }
 
     private func save() async {
-        guard let version, let client = model.client(for: sessionID), conflict == nil else { return }
+        guard !inFlight, let version, let client, conflict == nil else { return }
+        pending = nil
         let text = markdown
+        inFlight = true
         state = .saving
+        defer { inFlight = false }
         do {
             switch try await client.saveNote(sessionID: sessionID, markdown: text, version: version) {
             case let .saved(next):
                 self.version = next
-                // Typing that arrived during the round trip saves next.
                 if markdown == text {
                     state = .saved
+                    flushing = false
                 } else {
+                    // Typing that arrived during the round trip saves next.
                     state = .edited
-                    saveTask = Task {
-                        try? await Task.sleep(for: saveDelay)
-                        guard !Task.isCancelled else { return }
+                    inFlight = false
+                    if flushing {
+                        flushing = false
                         await save()
+                    } else {
+                        schedule(after: saveDelay)
                     }
                 }
             case let .conflict(current):
                 conflict = current
                 state = .edited
+                flushing = false
             }
         } catch {
             state = .failed(error.localizedDescription)
-            saveTask = Task {
-                try? await Task.sleep(for: .seconds(3))
-                guard !Task.isCancelled else { return }
-                await save()
-            }
+            flushing = false
+            schedule(after: .seconds(3))
         }
     }
 
-    private func takeTheirs() {
+    func takeTheirs() {
         guard let current = conflict else { return }
         conflict = nil
-        saveTask?.cancel()
+        pending?.cancel()
+        pending = nil
         show(current)
     }
 
-    private func keepMine() {
+    func keepMine() {
         guard let current = conflict else { return }
         conflict = nil
         // Saving against the version just seen replaces it, deliberately.
         version = current.version
-        Task { await save() }
+        Task { await self.save() }
     }
 }

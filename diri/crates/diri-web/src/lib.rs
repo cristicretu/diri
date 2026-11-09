@@ -32,7 +32,7 @@ mod testing;
 mod turns;
 mod ui;
 
-pub use desktop::{Desktop, SidebarLayout};
+pub use desktop::{Desktop, SidebarLayout, SidebarMove, SidebarPlace, SidebarRefusal, SidebarRow};
 pub use devices::{CODE_LIFETIME as PAIRING_CODE_LIFETIME, Device, Devices};
 pub use tailnet::{LocalApi, Owner};
 pub use terminal::{TerminalPalette, set_terminal_palette};

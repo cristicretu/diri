@@ -12,9 +12,10 @@ struct NewNoteSheet: View {
     @State private var error: String?
     @FocusState private var titleFocused: Bool
 
-    /// Notes are kept on the Mac, so only its own projects can hold one.
+    /// Notes are kept on the Mac they are created on — the live one — so
+    /// only that Mac's own projects can hold one.
     private var projects: [Project] {
-        model.projects.values.filter { $0.host == nil && $0.root != nil }
+        model.liveProjects.filter { $0.host == nil && $0.root != nil }
             .sorted { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
     }
 
@@ -65,7 +66,8 @@ struct NewNoteSheet: View {
     /// thought that needs writing down came from.
     private var defaultProject: String? {
         guard let open = model.selectedSessionID.flatMap(model.session),
-              let project = model.projects[open.projectID], project.host == nil
+              model.isOnLiveGateway(open.id),
+              let project = projects.first(where: { $0.id == open.projectID })
         else { return nil }
         return project.root
     }

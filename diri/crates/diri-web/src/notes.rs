@@ -94,9 +94,22 @@ impl Api {
         }
         // `[[Title]]` typed on the phone links that note, as it does when an
         // agent writes it; a title no single note matches stays as written.
+        //
+        // The phone autosaves every pause in typing, so only a `[[…]]` this
+        // save adds is looked up, and the store is listed only for one: an
+        // unresolved link already in the note was tried when it was typed.
         let linked = if text.contains("[[") {
-            let notes = store.list().unwrap_or_default();
-            backlinks::rewrite_wiki_links(text, |name| backlinks::wiki_target(&notes, name)).text
+            let saved = editable_markdown(&current);
+            let before = wiki_names(&saved);
+            let notes = std::cell::OnceCell::new();
+            backlinks::rewrite_wiki_links(text, |name| {
+                if before.contains(name) {
+                    return None;
+                }
+                let notes = notes.get_or_init(|| store.list().unwrap_or_default());
+                backlinks::wiki_target(notes, name)
+            })
+            .text
         } else {
             text.to_owned()
         };
@@ -123,6 +136,19 @@ impl Api {
             Err(error) => Response::error(500, &error.to_string()),
         }
     }
+}
+
+/// The names inside every `[[…]]` in `markdown`.
+fn wiki_names(markdown: &str) -> std::collections::HashSet<&str> {
+    let mut names = std::collections::HashSet::new();
+    let mut rest = markdown;
+    while let Some(open) = rest.find("[[") {
+        rest = &rest[open + 2..];
+        let Some(close) = rest.find("]]") else { break };
+        names.insert(&rest[..close]);
+        rest = &rest[close + 2..];
+    }
+    names
 }
 
 fn read_source(store: &NoteStore, note_id: &str) -> Result<String, Response> {
@@ -193,6 +219,13 @@ mod tests {
 
     use super::*;
     use crate::auth::Auth;
+
+    #[test]
+    fn only_links_a_save_adds_are_looked_up() {
+        let names = wiki_names("see [[A]] and [[B c]], not [[open");
+        assert_eq!(names, ["A", "B c"].into_iter().collect());
+        assert!(wiki_names("no links").is_empty());
+    }
 
     fn record(id: &str, kind: &AgentKind, note_id: Option<&str>, title: &str) -> Value {
         let mut record = json!({
