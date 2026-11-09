@@ -23,6 +23,14 @@ static FRAMES: [&str; 8] = [
 /// One working-mark frame lasts this long: eight frames, one sweep a second.
 const FRAME_INTERVAL: Duration = Duration::from_millis(125);
 
+/// A prompt whose `>` holds still while its `_` cursor blinks: the Agent is
+/// done, a shell it started is not. The full prompt comes first, so reduced
+/// motion shows it whole.
+static SHELL_FRAMES: [&str; 2] = ["icons/shell-running-0.svg", "icons/shell-running-1.svg"];
+
+/// A terminal cursor's own blink: a hard step on and off, not a fade.
+const SHELL_BLINK_INTERVAL: Duration = Duration::from_millis(530);
+
 pub(crate) fn activity_mark(state: StatusState, colors: SemanticColors) -> AnyElement {
     // Match the project badge column; the mark itself stays optically smaller.
     let slot = div()
@@ -38,6 +46,17 @@ pub(crate) fn activity_mark(state: StatusState, colors: SemanticColors) -> AnyEl
             .child(FrameLoop::new(
                 &FRAMES,
                 FRAME_INTERVAL,
+                14.0,
+                colors.secondary,
+            ))
+            .into_any_element(),
+        StatusState::ShellsRunning => slot
+            .id("shells-running-status")
+            .role(Role::Image)
+            .aria_label(crate::i18n::t("activity.shells_running_one"))
+            .child(FrameLoop::new(
+                &SHELL_FRAMES,
+                SHELL_BLINK_INTERVAL,
                 14.0,
                 colors.secondary,
             ))
@@ -89,8 +108,33 @@ pub(crate) fn status_state(session: &SessionRecord, migrating: bool) -> StatusSt
         },
         ProtoAttentionLevel::DoneUnseen => StatusState::DoneUnseen,
         ProtoAttentionLevel::Working => StatusState::Working,
+        // A finished turn whose background shell still runs is waiting on
+        // that shell, not on nothing.
+        ProtoAttentionLevel::IdleSeen | ProtoAttentionLevel::None | ProtoAttentionLevel::Unknown
+            if background_shells(session) > 0 =>
+        {
+            StatusState::ShellsRunning
+        }
         ProtoAttentionLevel::IdleSeen => StatusState::IdleSeen,
         ProtoAttentionLevel::None | ProtoAttentionLevel::Unknown => StatusState::None,
+    }
+}
+
+/// The background shells a live session's Agent last reported running. An
+/// exited session has none, whatever its record last said.
+fn background_shells(session: &SessionRecord) -> u32 {
+    if matches!(session.status, diri_proto::SessionStatus::Exited(_)) {
+        return 0;
+    }
+    session.background_shells.unwrap_or(0)
+}
+
+/// "Shell running", or how many: the line a waiting-on-shells row reads.
+pub(crate) fn shells_running_text(session: &SessionRecord) -> String {
+    use crate::i18n::{t, tf};
+    match background_shells(session) {
+        0 | 1 => t("activity.shells_running_one").to_owned(),
+        count => tf("activity.shells_running_other", &[("count", &count)]),
     }
 }
 
@@ -148,6 +192,10 @@ pub(crate) fn activity_line(
                 }) => tf("activity.working_percent", &[("percent", &percent)]),
                 _ => t("activity.working").to_owned(),
             },
+            since_ms: None,
+        },
+        StatusState::ShellsRunning => ActivityLine {
+            text: shells_running_text(session),
             since_ms: None,
         },
         _ => match unseen {
@@ -361,6 +409,42 @@ mod tests {
         let failed = activity_line(&session, StatusState::DoneUnseen, Some(&entry(NotificationKind::Failed)));
         assert_eq!(failed.text, "Failed");
         assert_eq!(activity_line(&session, StatusState::IdleSeen, None).text, "Idle");
+    }
+
+    #[test]
+    fn an_idle_agent_with_a_background_shell_reads_as_running_shells() {
+        let mut session = asking("unused");
+        session.needs_input = None;
+        session.attention_state = None;
+        session.status = diri_proto::SessionStatus::Idle;
+        session.last_turn_completed_at = None;
+        assert_eq!(status_state(&session, false), StatusState::IdleSeen);
+
+        session.background_shells = Some(1);
+        assert_eq!(status_state(&session, false), StatusState::ShellsRunning);
+        let line = activity_line(&session, StatusState::ShellsRunning, None);
+        assert_eq!((line.text.as_str(), line.since_ms), ("Shell running", None));
+        session.background_shells = Some(3);
+        assert_eq!(
+            activity_line(&session, StatusState::ShellsRunning, None).text,
+            "3 shells running"
+        );
+
+        // An unreadable Agent still has its shell.
+        session.status = diri_proto::SessionStatus::Unknown;
+        assert_eq!(status_state(&session, false), StatusState::ShellsRunning);
+        // Work and questions say more than the shell does.
+        session.status = diri_proto::SessionStatus::Working;
+        assert_eq!(status_state(&session, false), StatusState::Working);
+        // An exited session's shells went with it.
+        session.status = diri_proto::SessionStatus::Exited(diri_proto::ExitInfo {
+            reason: diri_proto::ExitReason::Exited,
+            code: Some(0),
+            signal: None,
+            system_restart: false,
+            interrupted: false,
+        });
+        assert_eq!(status_state(&session, false), StatusState::None);
     }
 
     #[test]

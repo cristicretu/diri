@@ -34,6 +34,9 @@ pub struct HookMetadata {
     /// A file an edit tool just changed, from the Agent or a subagent. Lets a
     /// client follow work done in another checkout without a `cd`.
     pub edited_path: Option<String>,
+    /// Background shells the main Agent reports still running; `None` when
+    /// the payload had no task list. Subagent payloads never set it.
+    pub background_shells: Option<u32>,
 }
 
 /// Claude's file-editing tools, by the `tool_input` key naming the file.
@@ -191,6 +194,14 @@ pub fn parse_claude_hook(
         _ => return None,
     };
 
+    if !is_subagent {
+        meta.background_shells = match hook {
+            // Claude stops its background shells as it exits, and its last
+            // payload need not list them.
+            ClaudeHook::SessionEnd => Some(0),
+            _ => diri_proto::recovery::claude_background_shells(payload),
+        };
+    }
     Some((
         StatusSignal::ClaudeHook {
             hook,
@@ -545,6 +556,22 @@ mod tests {
                 1
             );
             assert!(!reducer.reduce(stop, at).turn_completed);
+        }
+    }
+
+    #[test]
+    fn background_shells_come_from_the_main_agent_and_end_with_it() {
+        let running = json!({"background_tasks": [{"type": "shell", "status": "running"}]});
+        let (_, meta) = parse_claude_hook("Stop", &running, now()).unwrap();
+        assert_eq!(meta.background_shells, Some(1));
+        let mut child = running.clone();
+        child["agent_id"] = json!("child");
+        let (_, meta) = parse_claude_hook("SubagentStop", &child, now()).unwrap();
+        assert_eq!(meta.background_shells, None);
+        // Claude stops its shells as it exits, listed or not.
+        for payload in [json!({}), running] {
+            let (_, meta) = parse_claude_hook("SessionEnd", &payload, now()).unwrap();
+            assert_eq!(meta.background_shells, Some(0));
         }
     }
 

@@ -434,6 +434,9 @@ impl Registry {
                     record.terminal_progress = None;
                     // Likewise the foreground job: the next fold reads it again.
                     record.foreground_program = None;
+                    // And the Agent's background shells: it reports them
+                    // again with its next hook.
+                    record.background_shells = None;
                     repair_persisted_agent_title(&mut record);
                     // Resolve the owning project before repairing its
                     // location namespace. In particular, a linked worktree's
@@ -1370,12 +1373,19 @@ impl Registry {
             .iter()
             .filter_map(|(id, session)| {
                 let version = session.state_version();
-                (published.get(id) != Some(&version)).then(|| (id.clone(), version, session.view()))
+                (published.get(id) != Some(&version)).then(|| {
+                    (
+                        id.clone(),
+                        version,
+                        session.view(),
+                        session.take_agent_ended(),
+                    )
+                })
             })
             .collect::<Vec<_>>();
         let mut persistence_changed = false;
         let mut exit_observed = false;
-        for (id, version, view) in changed_views {
+        for (id, version, view, agent_ended) in changed_views {
             published.insert(id.clone(), version);
             self.bind_completed_run(&id);
             if let Some(record) = self.records.get_mut(&id) {
@@ -1394,6 +1404,11 @@ impl Registry {
                     record.terminal_cwd.clone(),
                 );
                 fold_session_view(record, &view);
+                if agent_ended {
+                    // The Agent took its background shells with it; no hook
+                    // will say so when it was killed rather than quit.
+                    record.background_shells = None;
+                }
                 fold_record_lifecycle(&self.engine, record);
                 let exit_changed = match &record.status {
                     SessionStatus::Exited(exit) => previous_exit.as_ref() != Some(exit),
@@ -2038,6 +2053,13 @@ impl Registry {
                 meta.edited_path.as_deref(),
                 DateMillis::from(std::time::SystemTime::now()),
             );
+        }
+        if let Some(count) = meta.background_shells {
+            let shells = (count > 0).then_some(count);
+            if record.background_shells != shells {
+                record.background_shells = shells;
+                changed = true;
+            }
         }
         if repair_persisted_agent_title(record) {
             changed = true;
@@ -3329,6 +3351,7 @@ fn recovered_record(capsule: diri_proto::recovery::SessionRecoveryCapsule) -> Se
         note_id: None,
         foreground_ports: None,
         terminal_progress: None,
+        background_shells: None,
         scheduled_run: None,
     }
 }
@@ -3573,6 +3596,7 @@ mod tests {
             note_id: None,
             foreground_ports: None,
             terminal_progress: None,
+            background_shells: None,
             scheduled_run: None,
         }
     }
@@ -4645,6 +4669,29 @@ mod tests {
         let updated = registry.record("claude").expect("record");
         assert_eq!(updated.title, "Repair remote session recovery");
         assert_eq!(updated.title_source, TitleSource::AgentProvided);
+    }
+
+    #[test]
+    fn claude_background_shells_fold_into_the_record_until_none_run() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut session = record("claude");
+        session.kind = AgentKind::CLAUDE_CODE;
+        registry.insert_record(session);
+        let report = |shells| crate::hooks::HookMetadata {
+            background_shells: shells,
+            ..crate::hooks::HookMetadata::default()
+        };
+        let shells =
+            |registry: &Registry| registry.record("claude").expect("record").background_shells;
+
+        assert!(registry.apply_hook_metadata_with_home("claude", &report(Some(2)), None));
+        assert_eq!(shells(&registry), Some(2));
+        // A payload without a task list is no news.
+        assert!(!registry.apply_hook_metadata_with_home("claude", &report(None), None));
+        assert_eq!(shells(&registry), Some(2));
+        assert!(registry.apply_hook_metadata_with_home("claude", &report(Some(0)), None));
+        assert_eq!(shells(&registry), None);
     }
 
     fn claude_transcript(home: &Path, agent_id: &str, title: &str) -> String {

@@ -538,6 +538,10 @@ struct Shared {
     /// The wrapped agent exited asking to be started again; the Registry
     /// watcher takes this and the control server relaunches the tab.
     relaunch_requested: AtomicBool,
+    /// The wrapped agent exited since the Registry last folded this session.
+    /// Anything the agent reported about its own live work (background
+    /// shells) went with it.
+    agent_ended: AtomicBool,
     /// The latest keystroke whose echo the held pump has not published yet.
     echo_request: Mutex<Option<EchoRequest>>,
     /// Rings the held pump out of an idle park; see [`PumpWake`].
@@ -2820,6 +2824,11 @@ impl Session {
         *self.shared.agent_exit.lock().expect("agent exit")
     }
 
+    /// Whether the wrapped agent exited since the last call, once.
+    pub fn take_agent_ended(&self) -> bool {
+        self.shared.agent_ended.swap(false, Ordering::SeqCst)
+    }
+
     /// Whether the wrapped agent exited asking to be started again, once.
     pub fn take_relaunch_request(&self) -> bool {
         self.shared.relaunch_requested.swap(false, Ordering::SeqCst)
@@ -4209,6 +4218,7 @@ fn new_shared(
             .and_then(|agent| agent.relaunch_notice.clone())
             .filter(|notice| !notice.is_empty()),
         relaunch_requested: AtomicBool::new(false),
+        agent_ended: AtomicBool::new(false),
         echo_request: Mutex::new(None),
         pump_wake: PumpWake::default(),
         history_swap: Mutex::new(None),
@@ -7916,6 +7926,8 @@ fn split_shell_status(status: i32) -> (Option<i32>, Option<i32>) {
 /// that change with the rest of this output.
 fn note_agent_exit(shared: &Shared, status: i32, screen: &mut HeadlessScreen) {
     *shared.agent_exit.lock().expect("agent exit") = Some(status);
+    shared.agent_ended.store(true, Ordering::SeqCst);
+    shared.bump_state_version();
     if screen.end_program_status(diri_terminal_state::ProgramRemoval::ChildExited) {
         observe_program_status(shared, screen);
     }

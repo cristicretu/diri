@@ -4,6 +4,8 @@
   "activity.idle": "Idle",
   "activity.needed_you": "Needed you",
   "activity.needs_you": "Needs you",
+  "activity.shells_running_one": "Shell running",
+  "activity.shells_running_other": "{count} shells running",
   "activity.working": "Working",
   "activity.working_percent": "Working · {percent}%",
   "empty.choose_folder": "Choose a folder…",

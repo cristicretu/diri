@@ -10,15 +10,19 @@ use crate::{AgentKind, BrandMark, Ink, Motion, SemanticColors};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatusState {
     Working,
-    NeedsInput { destructive: bool },
+    NeedsInput {
+        destructive: bool,
+    },
     DoneUnseen,
     IdleSeen,
     None,
     Hibernated,
+    /// The Agent is idle, but shells it started in the background still run.
+    ShellsRunning,
 }
 
 impl StatusState {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Working,
         Self::NeedsInput { destructive: false },
         Self::NeedsInput { destructive: true },
@@ -26,6 +30,7 @@ impl StatusState {
         Self::IdleSeen,
         Self::None,
         Self::Hibernated,
+        Self::ShellsRunning,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -37,6 +42,7 @@ impl StatusState {
             Self::IdleSeen => "Idle · seen",
             Self::None => "Ended",
             Self::Hibernated => "Hibernated",
+            Self::ShellsRunning => "Shells running",
         }
     }
 }
@@ -169,7 +175,7 @@ fn static_status_color(kind: AgentKind, state: StatusState, colors: SemanticColo
         StatusState::NeedsInput { destructive: false } => Ink::on_surface(Ink::ATTENTION, colors),
         StatusState::NeedsInput { destructive: true } => Ink::on_surface(Ink::DANGER, colors),
         StatusState::DoneUnseen => Ink::on_surface(Ink::FRESH, colors),
-        StatusState::IdleSeen => colors.secondary,
+        StatusState::IdleSeen | StatusState::ShellsRunning => colors.secondary,
         StatusState::None => colors.tertiary,
         StatusState::Hibernated => colors.tertiary,
     }
