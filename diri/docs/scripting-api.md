@@ -54,6 +54,7 @@ Call one as `diri.call("session.list")` or through its generated function, `diri
 | `diri.session.send_key` | `sessionID, key, modifiers?, action?` | `{}` | Press one named key in a session's terminal. |
 | `diri.session.send_text` | `sessionID, text, submit` | `{}` | Type text into a session's terminal, optionally pressing Return. |
 | `diri.session.resize` | `sessionID, cols, rows` | `{}` | Resize a session's terminal. |
+| `diri.session.scroll` | `sessionID, up, lines, col, row` | `{}` | Turn the mouse wheel over a session's terminal. |
 | `diri.session.read_screen` | `sessionID` | `ReadScreenResult` | The visible screen as text. |
 | `diri.session.terminal_title` | `sessionID` | `TerminalTitleResult` | The terminal's current OSC title. |
 | `diri.session.reset_terminal` | `sessionID` | `{}` | Reset the emulator without touching the process. |

@@ -17,6 +17,7 @@ struct SessionScreen: View {
     @State private var voiceMode = false
     @State private var typing = false
     @State private var resizeError: String?
+    @State private var phoneSized = false
     @State private var composerHeight: CGFloat = 64
     @State private var voiceHeight: CGFloat = 0
     @FocusState private var composerFocused: Bool
@@ -90,6 +91,7 @@ struct SessionScreen: View {
         .toolbar { toolbar(terminal) }
         .navigationBarTitleDisplayMode(.inline)
         .toolbarBackground(.hidden, for: .navigationBar)
+        .onAppear { phoneSized = PhoneSizedSessions.contains(sessionID) }
         .task(id: "\(sessionID)-\(scenePhase != .background)") {
             guard scenePhase != .background else {
                 TerminalRegistry.shared.deactivateAll()
@@ -161,7 +163,13 @@ struct SessionScreen: View {
                 Button { showingChanges = true } label: { Label("Review changes", systemImage: "doc.text.magnifyingglass") }
                 Divider()
                 Button { fitText() } label: { Label("Fit text to width", systemImage: "arrow.left.and.right.text.vertical") }
-                Button { fitSession(terminal) } label: { Label("Resize session to this phone", systemImage: "rectangle.portrait.arrowtriangle.2.inward") }
+                if phoneSized {
+                    Button { refitToMac(terminal) } label: { Label("Resize back to Mac", systemImage: "macbook") }
+                        .accessibilityIdentifier("resize-to-mac")
+                } else {
+                    Button { fitSession(terminal) } label: { Label("Resize session to this phone", systemImage: "rectangle.portrait.arrowtriangle.2.inward") }
+                        .accessibilityIdentifier("resize-to-phone")
+                }
                 Divider()
                 Button { Task { await model.markSeen(sessionID) } } label: { Label("Mark seen", systemImage: "checkmark.circle") }
             } label: {
@@ -181,7 +189,23 @@ struct SessionScreen: View {
         guard let view = TerminalRegistry.shared.existingView(sessionID) else { return }
         let grid = view.fittingGrid
         Task {
-            do { try await terminal.resize(cols: grid.cols, rows: grid.rows) } catch {
+            do {
+                try await terminal.resize(cols: grid.cols, rows: grid.rows)
+                PhoneSizedSessions.set(sessionID, true)
+                phoneSized = true
+            } catch {
+                resizeError = error.localizedDescription
+            }
+        }
+    }
+
+    private func refitToMac(_ terminal: TerminalSession) {
+        Task {
+            do {
+                try await terminal.refit()
+                PhoneSizedSessions.set(sessionID, false)
+                phoneSized = false
+            } catch {
                 resizeError = error.localizedDescription
             }
         }
@@ -344,5 +368,23 @@ struct NeedsInputBanner: View {
         guard let summary = detail.summary else { return nil }
         let generic = summary.lowercased().contains("waiting for your input")
         return generic && (detail.options?.isEmpty ?? true) ? nil : summary
+    }
+}
+
+/// Sessions this phone resized to itself, so the menu offers to hand them
+/// back to the Mac. Kept across launches: the PTY stays phone-sized after the
+/// app quits, and the way back must still be there.
+enum PhoneSizedSessions {
+    private static let key = "terminal.phoneSizedSessions"
+
+    static func contains(_ id: String) -> Bool {
+        (UserDefaults.standard.stringArray(forKey: key) ?? []).contains(id)
+    }
+
+    static func set(_ id: String, _ sized: Bool) {
+        var ids = Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
+        if sized { ids.insert(id) } else { ids.remove(id) }
+        // Bounded: ids of long-gone sessions must not pile up forever.
+        UserDefaults.standard.set(Array(ids.suffix(200)), forKey: key)
     }
 }

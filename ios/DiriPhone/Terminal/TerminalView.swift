@@ -58,6 +58,9 @@ final class TerminalView: UIScrollView, UIKeyInput, UITextInputTraits {
 
         addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped)))
         addGestureRecognizer(UIPinchGestureRecognizer(target: self, action: #selector(pinched(_:))))
+        wheelPan.addTarget(self, action: #selector(wheelPanned(_:)))
+        wheelPan.maximumNumberOfTouches = 1
+        addGestureRecognizer(wheelPan)
 
         isAccessibilityElement = true
         accessibilityTraits = [.staticText, .allowsDirectInteraction]
@@ -289,6 +292,87 @@ final class TerminalView: UIScrollView, UIKeyInput, UITextInputTraits {
     }
 
     private var pinchStart: CGFloat = 11
+
+    // MARK: - Wheel
+
+    /// Swipes over a full-screen program. Such a program (an agent's TUI,
+    /// `less`, `vim`) keeps no scrollback for this view to move through, so
+    /// a swipe is turned into wheel notches for the program instead, the way
+    /// a Mac trackpad's would be.
+    private let wheelPan = UIPanGestureRecognizer()
+    private var wheelTravel: CGFloat = 0
+    private var wheelLastTranslation: CGFloat = 0
+    private var wheelMomentum: CGFloat = 0
+    private var wheelLink: CADisplayLink?
+    private var wheelLinkLast: CFTimeInterval = 0
+    private var wheelPoint = CGPoint.zero
+
+    /// The scroll view's own pan stands down while the program owns the
+    /// wheel; the wheel pan only works then.
+    override func gestureRecognizerShouldBegin(_ gesture: UIGestureRecognizer) -> Bool {
+        if gesture === panGestureRecognizer, session.programOwnsWheel { return false }
+        if gesture === wheelPan {
+            guard session.programOwnsWheel else { return false }
+            let velocity = wheelPan.velocity(in: self)
+            return abs(velocity.y) > abs(velocity.x)
+        }
+        return super.gestureRecognizerShouldBegin(gesture)
+    }
+
+    @objc private func wheelPanned(_ gesture: UIPanGestureRecognizer) {
+        switch gesture.state {
+        case .began:
+            stopWheelMomentum()
+            wheelTravel = 0
+            wheelLastTranslation = 0
+            wheelPoint = gesture.location(in: canvas)
+        case .changed:
+            let translation = gesture.translation(in: self).y
+            travelWheel(translation - wheelLastTranslation)
+            wheelLastTranslation = translation
+        case .ended:
+            // A flick keeps going and slows, as the scrollback's would.
+            wheelMomentum = gesture.velocity(in: self).y
+            if abs(wheelMomentum) > 200 { startWheelMomentum() }
+        default:
+            break
+        }
+    }
+
+    /// Finger travel in points, positive downwards (towards older output).
+    /// Each line height of travel is one notch.
+    private func travelWheel(_ delta: CGFloat) {
+        wheelTravel += delta
+        let notches = Int(wheelTravel / lineHeight)
+        guard notches != 0 else { return }
+        wheelTravel -= CGFloat(notches) * lineHeight
+        let col = Int((wheelPoint.x - padding) / font.cellWidth)
+        let row = Int(wheelPoint.y / lineHeight) - session.buffer.historySize
+        session.wheel(up: notches > 0, lines: abs(notches), col: col, row: row)
+    }
+
+    private func startWheelMomentum() {
+        let link = CADisplayLink(target: self, selector: #selector(wheelTick(_:)))
+        link.add(to: .main, forMode: .common)
+        wheelLink = link
+        wheelLinkLast = 0
+    }
+
+    private func stopWheelMomentum() {
+        wheelLink?.invalidate()
+        wheelLink = nil
+        wheelMomentum = 0
+    }
+
+    @objc private func wheelTick(_ link: CADisplayLink) {
+        if wheelLinkLast == 0 { wheelLinkLast = link.timestamp; return }
+        let dt = CGFloat(link.timestamp - wheelLinkLast)
+        wheelLinkLast = link.timestamp
+        travelWheel(wheelMomentum * dt)
+        // UIScrollView's normal deceleration: velocity × 0.998 per millisecond.
+        wheelMomentum *= pow(0.998, dt * 1000)
+        if abs(wheelMomentum) < 60 || !session.programOwnsWheel { stopWheelMomentum() }
+    }
 
     @objc private func pinched(_ gesture: UIPinchGestureRecognizer) {
         switch gesture.state {

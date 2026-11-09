@@ -50,6 +50,10 @@ impl Method {
     pub const SESSION_SEND_KEY: &'static str = "session.send_key";
     pub const SESSION_SEND_TEXT: &'static str = "session.send_text";
     pub const SESSION_RESIZE: &'static str = "session.resize";
+    /// A wheel over a session's terminal, for a client with no attachment
+    /// (the phone). The Engine encodes it for the program's mouse mode, or
+    /// as arrow keys under alternate scroll; otherwise it is dropped.
+    pub const SESSION_SCROLL: &'static str = "session.scroll";
     pub const SESSION_READ_SCREEN: &'static str = "session.read_screen";
     pub const SESSION_TERMINAL_TITLE: &'static str = "session.terminal_title";
     /// Resets the emulator (screens, history, modes, title) without touching
@@ -203,6 +207,7 @@ impl Method {
         Self::SESSION_SEND_KEY,
         Self::SESSION_SEND_TEXT,
         Self::SESSION_RESIZE,
+        Self::SESSION_SCROLL,
         Self::SESSION_READ_SCREEN,
         Self::SESSION_TERMINAL_TITLE,
         Self::SESSION_RESET_TERMINAL,
@@ -1074,6 +1079,23 @@ pub struct ResizeParams {
 }
 
 pub type ResizeResult = EmptyResult;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ScrollParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    /// Towards older output.
+    pub up: bool,
+    /// Wheel notches, at least one.
+    pub lines: u16,
+    /// The cell under the pointer, zero-based; clamped to the screen.
+    pub col: u16,
+    pub row: u16,
+}
+
+pub type ScrollResult = EmptyResult;
 
 /// Bounds a client-supplied terminal size (spawn `initialCols`/`initialRows`,
 /// `session.resize`, an attach `Resize` frame) to the Remote Helper's limits,

@@ -29,6 +29,20 @@ extension DiriClient {
         return (try? JSONSerialization.jsonObject(with: reply) as? [String: Any])?["once"] as? Bool ?? false
     }
 
+    /// Wheel notches over a full-screen program; the Engine encodes them for
+    /// the program's mouse mode (or as arrows under alternate scroll).
+    func scroll(sessionID: String, up: Bool, lines: Int, col: Int, row: Int) async throws {
+        let path = "/api/session/\(escape(sessionID))/scroll"
+        _ = try await send(try request(path, method: "POST", body: [
+            "up": up, "lines": lines, "col": max(0, col), "row": max(0, row),
+        ]))
+    }
+
+    /// Hands the terminal back to the Mac: it sizes it to its pane again.
+    func refit(sessionID: String) async throws {
+        _ = try await send(try request("/api/session/\(escape(sessionID))/refit", method: "POST"))
+    }
+
     func resize(sessionID: String, cols: Int, rows: Int) async throws {
         let path = "/api/session/\(escape(sessionID))/resize"
         _ = try await send(try request(path, method: "POST", body: ["cols": cols, "rows": rows]))

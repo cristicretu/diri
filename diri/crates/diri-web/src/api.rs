@@ -28,6 +28,8 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 /// A summary lookup sits in the event stream; it must not stall it.
 const SPOKEN_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_TRANSCRIPT_TURNS: u32 = 20;
+/// The most wheel notches one request moves: a hard fling, not a loop.
+const MAX_WHEEL_LINES: u64 = 60;
 const MAX_TRANSCRIPT_TURNS: u32 = 100;
 
 pub struct Api {
@@ -118,6 +120,8 @@ impl Api {
             ("POST", ["api", "session", id, "send"]) => self.send(id, request).await,
             ("POST", ["api", "session", id, "key"]) => self.key(id, request).await,
             ("POST", ["api", "session", id, "resize"]) => self.resize(id, request).await,
+            ("POST", ["api", "session", id, "scroll"]) => self.scroll(id, request).await,
+            ("POST", ["api", "session", id, "refit"]) => self.refit(id),
             ("POST", ["api", "session", id, "seen"]) => self.seen(id).await,
             ("POST", ["api", "session", id, "kill"]) => self.kill(id).await,
             ("GET", ["api", "session", id, "note"]) => self.read_note(id).await,
@@ -444,6 +448,42 @@ impl Api {
         match self.client.resize(&session_id(id), cols, rows).await {
             Ok(()) => Response::json(&json!({ "ok": true })),
             Err(error) => daemon_error(&error),
+        }
+    }
+
+    /// A swipe over a full-screen program (an agent's TUI, `less`, `vim`):
+    /// it has no scrollback for the phone to move through, so the swipe is
+    /// a wheel, as it is under a Mac trackpad.
+    async fn scroll(&self, id: &str, request: &Request) -> Response {
+        let body = request.json();
+        let Some(up) = body.get("up").and_then(Value::as_bool) else {
+            return Response::error(400, "missing up");
+        };
+        let field = |key: &str| body.get(key).and_then(Value::as_u64);
+        let lines = field("lines").unwrap_or(1);
+        if !(1..=MAX_WHEEL_LINES).contains(&lines) {
+            return Response::error(400, "implausible wheel distance");
+        }
+        let cell = |key| u16::try_from(field(key).unwrap_or(0)).unwrap_or(u16::MAX);
+        match self
+            .client
+            .scroll(&session_id(id), up, lines as u16, cell("col"), cell("row"))
+            .await
+        {
+            Ok(()) => Response::json(&json!({ "ok": true })),
+            Err(error) => daemon_error(&error),
+        }
+    }
+
+    /// Undoes "Resize session to this phone": the Mac sizes the terminal to
+    /// its own pane again. Only the Mac knows that size.
+    fn refit(&self, id: &str) -> Response {
+        match &self.desktop {
+            Some(desktop) => {
+                desktop.refit(id);
+                Response::json(&json!({ "ok": true }))
+            }
+            None => Response::error(404, "this gateway has no Mac window to fit"),
         }
     }
 
@@ -783,6 +823,7 @@ mod tests {
     struct RecordingDesktop {
         layout: std::sync::Mutex<crate::desktop::SidebarLayout>,
         moves: std::sync::Mutex<Vec<crate::desktop::SidebarMove>>,
+        refits: std::sync::Mutex<Vec<String>>,
     }
 
     impl crate::desktop::Desktop for RecordingDesktop {
@@ -801,6 +842,10 @@ mod tests {
             }
             self.moves.lock().unwrap().push(row);
             Ok(())
+        }
+
+        fn refit(&self, session: &str) {
+            self.refits.lock().unwrap().push(session.to_owned());
         }
 
         fn sidebar_changes(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -884,6 +929,12 @@ mod tests {
             );
         }
 
+        assert_eq!(
+            call(&api, "POST", "/api/session/s_a/refit", "").await.0,
+            200
+        );
+        assert_eq!(*desktop.refits.lock().unwrap(), ["s_a"]);
+
         // A Mac that now sorts by activity refuses: a conflict the phone
         // answers by refreshing, not a server failure.
         desktop.layout.lock().unwrap().reorderable = false;
@@ -896,6 +947,10 @@ mod tests {
 
         // The standalone gateway has no Mac sidebar to mirror.
         api.desktop = None;
+        assert_eq!(
+            call(&api, "POST", "/api/session/s_a/refit", "").await.0,
+            404
+        );
         let (_, listed) = call(&api, "GET", "/api/sessions", "").await;
         assert!(listed.get("sidebar").is_none());
         assert_eq!(
@@ -904,6 +959,45 @@ mod tests {
                 .0,
             404
         );
+    }
+
+    #[tokio::test]
+    async fn a_swipe_reaches_the_engine_as_a_wheel() {
+        let mut engine = crate::testing::fake_engine(|_, _| json!({})).await;
+        let api = Api {
+            client: Arc::clone(&engine.client),
+            auth: Auth::temporary().unwrap(),
+            host_label: "Mac".into(),
+            inputs: Default::default(),
+            desktop: None,
+            notes_dir: None,
+            tailnet: None,
+        };
+        let (status, _) = call(
+            &api,
+            "POST",
+            "/api/session/s_a/scroll",
+            r#"{"up":true,"lines":3,"col":10,"row":4}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let (method, params) = engine.calls.recv().await.unwrap();
+        assert_eq!(method, diri_proto::Method::SESSION_SCROLL);
+        assert_eq!(
+            params.unwrap(),
+            json!({"sessionID": "s_a", "up": true, "lines": 3, "col": 10, "row": 4})
+        );
+        for bad in [
+            r#"{}"#,
+            r#"{"up":true,"lines":0}"#,
+            r#"{"up":false,"lines":500}"#,
+        ] {
+            assert_eq!(
+                call(&api, "POST", "/api/session/s_a/scroll", bad).await.0,
+                400,
+                "{bad}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -3,7 +3,8 @@
 //! The sidebar's manual order and pins live in the app's preferences, not in
 //! the Engine, so a phone that only read the Engine would order rows its own
 //! way. The app hands the embedded gateway a [`Desktop`] so the phone mirrors
-//! the Mac's order and can change it. The standalone `diri-web` binary has no
+//! the Mac's order and can change it, and can hand a terminal it resized
+//! back to the Mac's pane. The standalone `diri-web` binary has no
 //! app behind it and serves without one.
 
 use serde::{Deserialize, Serialize};
@@ -75,6 +76,11 @@ pub trait Desktop: Send + Sync {
     /// sidebar would. Refused while the Mac is not sorting by hand. May
     /// block briefly on the app's store; call it off the async workers.
     fn move_sidebar_row(&self, row: SidebarMove) -> Result<(), SidebarRefusal>;
+
+    /// Sizes `session`'s terminal to the Mac pane showing it again, undoing
+    /// a resize to the phone. A session no pane shows is sized when one
+    /// next does.
+    fn refit(&self, session: &str);
 
     /// Ticks whenever [`Self::sidebar`] would answer differently, so a phone
     /// sees a reorder on the Mac without waiting for its next poll.

@@ -337,6 +337,12 @@ mod catalog {
                 "Resize a session's terminal."
             ),
             entry!(
+                Method::SESSION_SCROLL,
+                ScrollParams,
+                "{}",
+                "Turn the mouse wheel over a session's terminal."
+            ),
+            entry!(
                 Method::SESSION_READ_SCREEN,
                 SessionIdParams,
                 "ReadScreenResult",

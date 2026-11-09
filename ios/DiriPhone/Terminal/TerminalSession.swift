@@ -288,4 +288,51 @@ final class TerminalSession {
     func resize(cols: Int, rows: Int) async throws {
         try await client.resize(sessionID: sessionID, cols: cols, rows: rows)
     }
+
+    // MARK: - Wheel
+
+    /// Whether a swipe belongs to the program rather than the scrollback: a
+    /// full-screen program keeps no history to scroll, and one reporting the
+    /// mouse wants the wheel itself. The Mac routes its trackpad the same way.
+    var programOwnsWheel: Bool { buffer.modes.altScreen || buffer.modes.mouse }
+
+    /// Signed notches not yet sent, positive towards older output.
+    private var pendingWheel = 0
+    private var pendingWheelCell = (col: 0, row: 0)
+    private var wheeling = false
+
+    /// Wheel notches for the program. Notches that arrive while one request
+    /// is in flight are added up and go as one, so a fast swipe over a slow
+    /// link is a handful of requests, not dozens.
+    func wheel(up: Bool, lines: Int, col: Int, row: Int) {
+        guard lines > 0 else { return }
+        pendingWheel += up ? lines : -lines
+        pendingWheelCell = (col, row)
+        flushWheel()
+    }
+
+    private func flushWheel() {
+        guard !wheeling, pendingWheel != 0 else { return }
+        wheeling = true
+        let notches = pendingWheel
+        pendingWheel = 0
+        let cell = pendingWheelCell
+        let client = client
+        let id = sessionID
+        Task { [weak self] in
+            // A lost wheel is harmless (the screen shows where it stopped),
+            // so it is never retried.
+            try? await client.scroll(
+                sessionID: id, up: notches > 0, lines: min(abs(notches), 60), col: cell.col, row: cell.row
+            )
+            guard let self else { return }
+            self.wheeling = false
+            self.flushWheel()
+        }
+    }
+
+    /// Gives the PTY back to the Mac's pane size.
+    func refit() async throws {
+        try await client.refit(sessionID: sessionID)
+    }
 }

@@ -50,7 +50,7 @@ impl PhoneAccess {
             client,
             "Your Mac".into(),
             admission,
-            Some(PhoneSidebar::start(store) as Arc<dyn diri_web::Desktop>),
+            Some(PhoneDesktop::start(store) as Arc<dyn diri_web::Desktop>),
         )
         .await?;
         let qr = match qrcode::QrCode::new(url.as_bytes()) {
@@ -346,9 +346,10 @@ mod tests {
     }
 }
 
-/// The Mac sidebar, as the phone sees it: the order this app draws, and
-/// moves from the phone applied exactly as a drag here would.
-pub struct PhoneSidebar {
+/// What the phone gets from this app beyond the Engine: the sidebar order
+/// this app draws (reorders applied as a drag here would be), and terminals
+/// handed back to their pane after the phone resized them.
+pub struct PhoneDesktop {
     runtime: Arc<crate::store::StoreRuntime>,
     /// The last computed layout. Phone reads answer from here so they never
     /// wait on the store lock the UI thread also holds.
@@ -357,7 +358,7 @@ pub struct PhoneSidebar {
     watcher: std::sync::OnceLock<tokio::task::JoinHandle<()>>,
 }
 
-impl PhoneSidebar {
+impl PhoneDesktop {
     /// Starts watching the store; a phone is told whenever the drawn order
     /// moves. Must run inside the app's Tokio runtime.
     pub fn start(runtime: Arc<crate::store::StoreRuntime>) -> Arc<Self> {
@@ -403,7 +404,7 @@ impl PhoneSidebar {
     }
 }
 
-impl Drop for PhoneSidebar {
+impl Drop for PhoneDesktop {
     fn drop(&mut self) {
         if let Some(watcher) = self.watcher.get() {
             watcher.abort();
@@ -484,7 +485,7 @@ fn place_in<T: PartialEq>(
     Ok(())
 }
 
-impl diri_web::Desktop for PhoneSidebar {
+impl diri_web::Desktop for PhoneDesktop {
     fn sidebar(&self) -> diri_web::SidebarLayout {
         (**self.cached.lock().expect("sidebar cache poisoned")).clone()
     }
@@ -547,6 +548,11 @@ impl diri_web::Desktop for PhoneSidebar {
         Ok(())
     }
 
+    fn refit(&self, session: &str) {
+        self.runtime
+            .request_refit(diri_proto::SessionId::new(session));
+    }
+
     fn sidebar_changes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.changes.subscribe()
     }
@@ -587,7 +593,7 @@ mod sidebar_tests {
     #[tokio::test]
     async fn a_phone_move_lands_in_the_mac_prefs_only_when_sorting_by_hand() {
         let runtime = Arc::new(crate::store::StoreRuntime::inert());
-        let sidebar = PhoneSidebar::start(Arc::clone(&runtime));
+        let sidebar = PhoneDesktop::start(Arc::clone(&runtime));
         assert!(sidebar.sidebar().reorderable);
 
         // A row the Mac does not have is a stale phone, not a server failure.
