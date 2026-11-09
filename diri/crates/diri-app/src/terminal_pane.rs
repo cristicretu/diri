@@ -4859,7 +4859,9 @@ impl TerminalPane {
             viewport.width,
             viewport.height,
             self.header_height(),
-            0.0,
+            // A permanent ("legacy") scroller takes its gutter out of the grid's
+            // width; offering those pixels to the PTY clips the last column.
+            f32::from(diri_ui::scroller_style(cx).reserved_width()),
             metrics,
         );
         if let Some(resident) = self.residents.get_mut(&session.id)
@@ -12983,5 +12985,25 @@ mod tests {
             "reported {} columns but only {painted} fit",
             reported.0
         );
+    }
+
+    #[test]
+    fn legacy_scroller_gutter_is_not_offered_to_the_pty() {
+        // Issue #1054: with "Show scroll bars" resolving to a permanent
+        // scroller, the scroll area pads its child by the scroller width, so
+        // the grid paints that much narrower than the pane.
+        let metrics =
+            CellMetrics::from_measurements(px(8.0), px(16.0), px(12.0), px(4.0), gpui::FontId(7));
+        let width = 1600.0;
+        let gutter = f32::from(diri_ui::ScrollerStyle::Legacy.reserved_width());
+        let reported = estimated_grid_size(width, 900.0, Metrics::TITLE_BAR, gutter, metrics);
+        let painted = metrics.cols_for_width(px(width
+            - gutter
+            - GRID_HORIZONTAL_PADDING
+            - GRID_LAYOUT_HORIZONTAL_CHROME));
+        let overlay = estimated_grid_size(width, 900.0, Metrics::TITLE_BAR, 0.0, metrics);
+
+        assert_eq!(reported.0, painted);
+        assert!(reported.0 < overlay.0, "the gutter must cost columns");
     }
 }
