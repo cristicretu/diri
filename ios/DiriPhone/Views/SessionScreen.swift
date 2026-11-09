@@ -24,7 +24,10 @@ struct SessionScreen: View {
     private var session: SessionRecord? { model.session(sessionID) }
 
     var body: some View {
-        if let client = model.client(for: sessionID) {
+        if session?.isNote == true {
+            // A note has no process and no terminal: it opens as a document.
+            NoteScreen(sessionID: sessionID, showsSidebarButton: showsSidebarButton, onShowSidebar: onShowSidebar)
+        } else if let client = model.client(for: sessionID) {
             content(TerminalRegistry.shared.session(for: sessionID, client: client), client: client)
         } else {
             ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity).background(Tokens.Ink.background)

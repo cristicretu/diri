@@ -1920,6 +1920,7 @@ dependencies = [
  "base64 0.23.1",
  "diri-client",
  "diri-engine",
+ "diri-notes",
  "diri-platform",
  "diri-proto",
  "getrandom 0.4.3",

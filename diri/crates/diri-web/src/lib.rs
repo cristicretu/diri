@@ -20,9 +20,11 @@ mod api;
 mod auth;
 #[cfg(test)]
 mod bench;
+mod desktop;
 mod devices;
 mod http;
 mod input_ledger;
+mod notes;
 mod tailnet;
 mod terminal;
 #[cfg(test)]
@@ -30,6 +32,7 @@ mod testing;
 mod turns;
 mod ui;
 
+pub use desktop::{Desktop, SidebarLayout, SidebarMove, SidebarPlace, SidebarRefusal, SidebarRow};
 pub use devices::{CODE_LIFETIME as PAIRING_CODE_LIFETIME, Device, Devices};
 pub use tailnet::{LocalApi, Owner};
 pub use terminal::{TerminalPalette, set_terminal_palette};
@@ -441,6 +444,8 @@ async fn serve(config: Config, auth: Auth, minted: bool) -> Result<(), String> {
         auth,
         host_label: config.host_label,
         inputs: Default::default(),
+        desktop: None,
+        notes_dir: None,
         tailnet,
     });
 
@@ -502,6 +507,7 @@ pub async fn start_phone_access(
     client: Arc<DaemonClient>,
     label: String,
     admission: PhoneAdmission,
+    desktop: Option<Arc<dyn Desktop>>,
 ) -> Result<(String, tokio::task::JoinHandle<Result<(), String>>), String> {
     let [a, b, _, _] = address.octets();
     if a != 100 || !(64..=127).contains(&b) {
@@ -537,6 +543,8 @@ pub async fn start_phone_access(
         auth,
         host_label: label,
         inputs: Default::default(),
+        desktop,
+        notes_dir: None,
         tailnet,
     });
     Ok((url, tokio::spawn(serve_connections(listener, api))))
@@ -789,6 +797,15 @@ where
         Err(_) => api.client.events(),
     };
     let mut connection = api.client.connection_state();
+    // The Mac sidebar's order lives in the app; a reorder there is announced
+    // so the phone refetches. A desktop-less gateway has nothing to announce.
+    let mut sidebar = api
+        .desktop
+        .as_ref()
+        .map(|desktop| desktop.sidebar_changes());
+    if let Some(sidebar) = &mut sidebar {
+        sidebar.borrow_and_update();
+    }
     // Subscribed first, then seeded, so no completion falls in between.
     let mut turns = turns::TurnWatcher::default();
     api.seed_turns(&mut turns).await;
@@ -827,6 +844,14 @@ where
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
             },
+            changed = async { sidebar.as_mut()?.changed().await.ok() }, if sidebar.is_some() => {
+                if changed.is_none() {
+                    // The app dropped its side; keep serving Engine events.
+                    sidebar = None;
+                    continue;
+                }
+                http::write_event(writer, "sidebar", &serde_json::json!({})).await?;
+            }
             changed = connection.changed() => {
                 if changed.is_err() {
                     return Ok(());
@@ -868,6 +893,7 @@ mod tests {
                     client,
                     "test".into(),
                     PhoneAdmission::Token(token.path().join("phone.token")),
+                    None,
                 )
                 .await
                 .is_err()
@@ -892,6 +918,8 @@ mod tests {
             auth,
             host_label: "test".into(),
             inputs: Default::default(),
+            desktop: None,
+            notes_dir: None,
             tailnet: None,
         });
         let server = tokio::spawn(serve_connections(listener, api));
@@ -937,6 +965,8 @@ mod tests {
             auth,
             host_label: "test".into(),
             inputs: Default::default(),
+            desktop: None,
+            notes_dir: None,
             tailnet: None,
         });
         let server = tokio::spawn(serve_connections(listener, api));
@@ -1014,6 +1044,8 @@ mod tests {
             auth,
             host_label: "test".into(),
             inputs: Default::default(),
+            desktop: None,
+            notes_dir: None,
             tailnet: None,
         });
         let server = tokio::spawn(serve_connections(listener, api));
@@ -1112,6 +1144,8 @@ mod tests {
             auth,
             host_label: "test".into(),
             inputs: Default::default(),
+            desktop: None,
+            notes_dir: None,
             tailnet: None,
         });
         (
@@ -1433,6 +1467,8 @@ mod tests {
                 auth,
                 host_label: "test".into(),
                 inputs: Default::default(),
+                desktop: None,
+                notes_dir: None,
                 tailnet: Some(Arc::clone(&gate)),
             });
             Gateway {

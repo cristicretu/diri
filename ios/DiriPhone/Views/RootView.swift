@@ -7,6 +7,7 @@ struct RootView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var spawning = false
+    @State private var noting = false
     @State private var pairing = false
     @State private var switcher = false
     @State private var drawerOpen = false
@@ -27,6 +28,9 @@ struct RootView: View {
         .tint(Tokens.Ink.primary)
         .sheet(isPresented: $spawning) {
             NewSessionSheet { record in select(record.id) }
+        }
+        .sheet(isPresented: $noting) {
+            NewNoteSheet { record in select(record.id) }
         }
         .sheet(isPresented: $pairing) {
             ConnectView(onConnected: { pairing = false; model.selectedSessionID = nil })
@@ -100,6 +104,7 @@ struct RootView: View {
             selection: model.selectedSessionID,
             onSelect: select,
             onNew: { spawning = true },
+            onNewNote: { noting = true },
             onPair: { pairing = true }
         )
         .background(Tokens.Ink.background)
@@ -133,7 +138,11 @@ struct RootView: View {
                     .onTapGesture { closeDrawer() }
             }
 
-            if revealed > 0 || drawerOpen {
+            // The drawer stays alive while closed, parked off screen, so it
+            // opens where it was left rather than back at the top. Closed, it
+            // takes no touches, is hidden from VoiceOver and stops animating.
+            if model.selectedSessionID != nil {
+                let shown = revealed > 0 || drawerOpen
                 NavigationStack { list }
                     .frame(width: drawerWidth)
                     .clipShape(RoundedRectangle(cornerRadius: 34, style: .continuous))
@@ -141,6 +150,10 @@ struct RootView: View {
                     .padding(.vertical, 6)
                     .padding(.leading, 6)
                     .offset(x: revealed - drawerWidth - 6)
+                    .opacity(shown ? 1 : 0)
+                    .allowsHitTesting(shown)
+                    .accessibilityHidden(!shown)
+                    .environment(\.marksAnimate, shown)
                     .gesture(closeGesture(drawerWidth: drawerWidth))
                     .accessibilityIdentifier("session-drawer")
             }
@@ -201,7 +214,7 @@ struct SessionSwitcher: View {
     @FocusState private var focused: Bool
 
     private var matches: [SidebarRow] {
-        let rows = model.computers.flatMap(\.rows)
+        let rows = model.visibleRows
         let needle = query.trimmingCharacters(in: .whitespaces).lowercased()
         guard !needle.isEmpty else { return rows }
         return rows.filter { row in

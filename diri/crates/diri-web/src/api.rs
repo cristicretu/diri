@@ -38,6 +38,11 @@ pub struct Api {
     /// `Some` when callers are admitted by Tailscale identity and pairing
     /// instead of the bearer token. The token is then never accepted.
     pub tailnet: Option<Arc<crate::tailnet::Admission>>,
+    /// The Mac app embedding this gateway, for what only it knows (the
+    /// sidebar's manual order). `None` for the standalone binary.
+    pub desktop: Option<Arc<dyn crate::desktop::Desktop>>,
+    /// Pins the notes store; `None` resolves it the way the Engine does.
+    pub notes_dir: Option<std::path::PathBuf>,
 }
 
 impl Api {
@@ -93,6 +98,7 @@ impl Api {
                 Err(error) => daemon_error(&error),
             },
             ("POST", ["api", "spawn"]) => self.spawn(request).await,
+            ("POST", ["api", "sidebar", "move"]) => self.move_sidebar_row(request).await,
             ("GET", ["api", "voice"]) => self.phone_reader(None).await,
             ("POST", ["api", "voice"]) => {
                 match request.json().get("readAloud").and_then(Value::as_bool) {
@@ -114,12 +120,14 @@ impl Api {
             ("POST", ["api", "session", id, "resize"]) => self.resize(id, request).await,
             ("POST", ["api", "session", id, "seen"]) => self.seen(id).await,
             ("POST", ["api", "session", id, "kill"]) => self.kill(id).await,
+            ("GET", ["api", "session", id, "note"]) => self.read_note(id).await,
+            ("PUT", ["api", "session", id, "note"]) => self.write_note(id, request).await,
 
             // A browser asks for things nobody wrote a route for — /favicon.ico
             // above all. That is a 404, not a 405; answering "method not
             // allowed" to a plain GET is just wrong, and it shows up as a
             // console error on every load.
-            ("GET" | "HEAD" | "POST", _) => Response::error(404, "no such endpoint"),
+            ("GET" | "HEAD" | "POST" | "PUT", _) => Response::error(404, "no such endpoint"),
             _ => Response::error(405, "method not allowed"),
         }
     }
@@ -140,11 +148,20 @@ impl Api {
             // guess a group's name from a path, and the daemon's project ids
             // are opaque (`p_6e5a8d7b38f5`) — so the guess is a raw id on
             // screen where the desktop shows a repository name.
-            Ok(result) => Response::json(&json!({
-                "host": self.host_label,
-                "sessions": serde_json::to_value(&result.sessions).unwrap_or(Value::Null),
-                "projects": serde_json::to_value(&result.projects).unwrap_or(Value::Null),
-            })),
+            Ok(result) => {
+                let mut body = json!({
+                    "host": self.host_label,
+                    "sessions": serde_json::to_value(&result.sessions).unwrap_or(Value::Null),
+                    "projects": serde_json::to_value(&result.projects).unwrap_or(Value::Null),
+                });
+                // The Mac's manual order and pins, so the phone draws its
+                // sidebar in the same order rather than its own.
+                if let Some(desktop) = &self.desktop {
+                    body["sidebar"] =
+                        serde_json::to_value(desktop.sidebar()).unwrap_or(Value::Null);
+                }
+                Response::json(&body)
+            }
             Err(error) => daemon_error(&error),
         }
     }
@@ -506,13 +523,65 @@ impl Api {
     }
 }
 
-fn session_id(raw: &str) -> SessionId {
+impl Api {
+    /// `{"session"|"project": id, "before"|"after": id}`; with neither
+    /// `before` nor `after` the row goes to the end.
+    async fn move_sidebar_row(&self, request: &Request) -> Response {
+        use crate::desktop::{SidebarMove, SidebarPlace, SidebarRefusal, SidebarRow};
+        let Some(desktop) = &self.desktop else {
+            return Response::error(404, "this gateway has no desktop sidebar");
+        };
+        let body = request.json();
+        let id = |key: &str| -> Result<Option<String>, Response> {
+            match body.get(key) {
+                None | Some(Value::Null) => Ok(None),
+                Some(value) => value
+                    .as_str()
+                    .filter(|id| !id.is_empty() && id.len() <= 256)
+                    .map(|id| Some(id.to_owned()))
+                    .ok_or_else(|| Response::error(400, &format!("{key} must be an id"))),
+            }
+        };
+        let fields = (|| Ok((id("session")?, id("project")?, id("before")?, id("after")?)))();
+        let (session, project, before, after) = match fields {
+            Ok(fields) => fields,
+            Err(response) => return response,
+        };
+        let (row, moved) = match (session, project) {
+            (Some(id), None) => (SidebarRow::Session, id),
+            (None, Some(id)) => (SidebarRow::Project, id),
+            _ => return Response::error(400, "name exactly one session or project"),
+        };
+        let place = match (before, after) {
+            (Some(target), None) => SidebarPlace::Before(target),
+            (None, Some(target)) => SidebarPlace::After(target),
+            (None, None) => SidebarPlace::End,
+            (Some(_), Some(_)) => return Response::error(400, "give before or after, not both"),
+        };
+        let desktop = Arc::clone(desktop);
+        let moved = SidebarMove {
+            row,
+            id: moved,
+            place,
+        };
+        // The app's store lock is shared with its UI thread: wait for it on a
+        // blocking thread, never on an async worker.
+        match tokio::task::spawn_blocking(move || desktop.move_sidebar_row(moved)).await {
+            Ok(Ok(())) => Response::json(&json!({ "ok": true })),
+            Ok(Err(SidebarRefusal::Conflict(reason))) => Response::error(409, &reason),
+            Ok(Err(SidebarRefusal::Failed(reason))) => Response::error(500, &reason),
+            Err(error) => Response::error(500, &error.to_string()),
+        }
+    }
+}
+
+pub(crate) fn session_id(raw: &str) -> SessionId {
     SessionId(raw.to_string())
 }
 
 /// A daemon that is down is a `502`: the frontend is fine, the thing behind it
 /// is not, and the phone should say so rather than show an empty list.
-fn daemon_error(error: &ClientError) -> Response {
+pub(crate) fn daemon_error(error: &ClientError) -> Response {
     let status = match error {
         ClientError::Disconnected(_) | ClientError::Timeout(_) => 502,
         _ => 400,
@@ -624,6 +693,8 @@ mod tests {
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
             inputs: Default::default(),
+            desktop: None,
+            notes_dir: None,
             tailnet: None,
         };
         for (path, method, body, expected) in [
@@ -707,6 +778,134 @@ mod tests {
         (response.status, body)
     }
 
+    /// A desktop that records the moves it is given.
+    #[derive(Default)]
+    struct RecordingDesktop {
+        layout: std::sync::Mutex<crate::desktop::SidebarLayout>,
+        moves: std::sync::Mutex<Vec<crate::desktop::SidebarMove>>,
+    }
+
+    impl crate::desktop::Desktop for RecordingDesktop {
+        fn sidebar(&self) -> crate::desktop::SidebarLayout {
+            self.layout.lock().unwrap().clone()
+        }
+
+        fn move_sidebar_row(
+            &self,
+            row: crate::desktop::SidebarMove,
+        ) -> Result<(), crate::desktop::SidebarRefusal> {
+            if !self.layout.lock().unwrap().reorderable {
+                return Err(crate::desktop::SidebarRefusal::Conflict(
+                    "sorted by activity".into(),
+                ));
+            }
+            self.moves.lock().unwrap().push(row);
+            Ok(())
+        }
+
+        fn sidebar_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+            tokio::sync::watch::channel(0).1
+        }
+    }
+
+    #[tokio::test]
+    async fn the_phone_reads_the_mac_sidebar_and_moves_one_row() {
+        use crate::desktop::{SidebarMove, SidebarPlace, SidebarRow};
+        let engine = crate::testing::fake_engine(|method, _| match method {
+            diri_proto::Method::SESSION_LIST => json!({"sessions": [], "projects": []}),
+            _ => json!({}),
+        })
+        .await;
+        let desktop = Arc::new(RecordingDesktop::default());
+        {
+            let mut layout = desktop.layout.lock().unwrap();
+            layout.pinned_projects = vec!["p_a".into()];
+            layout.reorderable = true;
+        }
+        let mut api = Api {
+            client: Arc::clone(&engine.client),
+            auth: Auth::temporary().unwrap(),
+            host_label: "Mac".into(),
+            inputs: Default::default(),
+            desktop: Some(Arc::clone(&desktop) as Arc<dyn crate::desktop::Desktop>),
+            notes_dir: None,
+            tailnet: None,
+        };
+
+        let (status, listed) = call(&api, "GET", "/api/sessions", "").await;
+        assert_eq!(status, 200);
+        assert_eq!(listed["sidebar"]["pinnedProjects"], json!(["p_a"]));
+
+        for (body, expected) in [
+            (
+                r#"{"session":"s_b","before":"s_a"}"#,
+                SidebarMove {
+                    row: SidebarRow::Session,
+                    id: "s_b".into(),
+                    place: SidebarPlace::Before("s_a".into()),
+                },
+            ),
+            (
+                r#"{"project":"p_a","after":"p_b"}"#,
+                SidebarMove {
+                    row: SidebarRow::Project,
+                    id: "p_a".into(),
+                    place: SidebarPlace::After("p_b".into()),
+                },
+            ),
+            (
+                r#"{"project":"p_a"}"#,
+                SidebarMove {
+                    row: SidebarRow::Project,
+                    id: "p_a".into(),
+                    place: SidebarPlace::End,
+                },
+            ),
+        ] {
+            assert_eq!(
+                call(&api, "POST", "/api/sidebar/move", body).await.0,
+                200,
+                "{body}"
+            );
+            assert_eq!(desktop.moves.lock().unwrap().pop(), Some(expected));
+        }
+
+        for bad in [
+            r#"{}"#,
+            r#"{"session":"s_a","project":"p_a"}"#,
+            r#"{"session":1}"#,
+            r#"{"session":""}"#,
+            r#"{"session":"s_a","before":"s_b","after":"s_c"}"#,
+        ] {
+            assert_eq!(
+                call(&api, "POST", "/api/sidebar/move", bad).await.0,
+                400,
+                "{bad}"
+            );
+        }
+
+        // A Mac that now sorts by activity refuses: a conflict the phone
+        // answers by refreshing, not a server failure.
+        desktop.layout.lock().unwrap().reorderable = false;
+        assert_eq!(
+            call(&api, "POST", "/api/sidebar/move", r#"{"session":"s_a"}"#)
+                .await
+                .0,
+            409
+        );
+
+        // The standalone gateway has no Mac sidebar to mirror.
+        api.desktop = None;
+        let (_, listed) = call(&api, "GET", "/api/sessions", "").await;
+        assert!(listed.get("sidebar").is_none());
+        assert_eq!(
+            call(&api, "POST", "/api/sidebar/move", r#"{"session":"s_a"}"#)
+                .await
+                .0,
+            404
+        );
+    }
+
     #[tokio::test]
     async fn voice_routes_keep_the_phone_contract() {
         use diri_proto::Method;
@@ -733,6 +932,8 @@ mod tests {
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
             inputs: Default::default(),
+            desktop: None,
+            notes_dir: None,
             tailnet: None,
         };
 
@@ -847,6 +1048,8 @@ mod tests {
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
             inputs: Default::default(),
+            desktop: None,
+            notes_dir: None,
             tailnet: None,
         };
         let text = |line: &Value| line["runs"][0]["t"].as_str().unwrap().to_owned();
@@ -931,6 +1134,8 @@ mod tests {
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
             inputs: Default::default(),
+            desktop: None,
+            notes_dir: None,
             tailnet: None,
         };
         // Ctrl-C, Up, Escape and a paste: exactly these bytes, no Enter, no
@@ -966,6 +1171,8 @@ mod tests {
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
             inputs: Default::default(),
+            desktop: None,
+            notes_dir: None,
             tailnet: None,
         };
         let batch = json!({ "data": base64_encode(b"deploy\r"), "id": "b1" }).to_string();
@@ -1000,6 +1207,8 @@ mod tests {
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
             inputs: Default::default(),
+            desktop: None,
+            notes_dir: None,
             tailnet: None,
         };
         for (method, path, body) in [
@@ -1035,6 +1244,8 @@ mod tests {
             auth: Auth::temporary().unwrap(),
             host_label: "Mac".into(),
             inputs: Default::default(),
+            desktop: None,
+            notes_dir: None,
             tailnet: None,
         });
         let request = tokio::spawn({

@@ -21,6 +21,7 @@ struct AgentKind: Codable, Hashable, Sendable {
     static let cursor = AgentKind(id: "cursor", command: nil)
     static let gemini = AgentKind(id: "gemini", command: nil)
     static let shell = AgentKind(id: "shell", command: nil)
+    static let note = AgentKind(id: "note", command: nil)
     static let unknown = AgentKind(id: "unknown", command: nil)
 
     /// Legacy Swift case name ⇄ manifest id. Frozen: a state file written by
@@ -255,6 +256,8 @@ struct SessionRecord: Codable, Identifiable, Hashable, Sendable {
     var archivedAt: Double?
     var host: String?
     var hibernation: Hibernation?
+    /// For a note (`kind` = note): its Markdown file in the Mac's notes store.
+    var noteId: String?
     /// Which paired gateway this record came from. Set by the phone, never on
     /// the wire; shown only when more than one gateway is reachable.
     var gateway: String?
@@ -267,6 +270,12 @@ struct SessionRecord: Codable, Identifiable, Hashable, Sendable {
     var effectiveKind: AgentKind { foregroundAgent ?? kind }
 
     var isArchived: Bool { archivedAt != nil }
+    /// A note has no process: it opens in the editor, not a terminal.
+    var isNote: Bool { kind.id == AgentKind.note.id }
+
+    /// `is_auxiliary_terminal`: a shell an agent's workbench opened. The Mac
+    /// shows it inside that agent's workbench, never as a sidebar row.
+    var isAuxiliaryTerminal: Bool { kind.id == AgentKind.shell.id && parent != nil }
     var isHibernated: Bool { hibernation != nil }
 
     var hasEnded: Bool {

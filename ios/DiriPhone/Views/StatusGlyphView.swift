@@ -17,6 +17,8 @@ struct StatusGlyphView: View {
         Group {
             if let mark = kind.brandMark {
                 BrandMarkView(kind: mark, size: size, color: color)
+            } else if kind.id == AgentKind.note.id {
+                LineIconView(icon: .file, size: size, color: color)
             } else {
                 ShellCaretView(size: size, color: color)
             }
@@ -46,7 +48,7 @@ struct StatusGlyphView: View {
     /// `Ink::working` — each agent works in its own colour.
     private var workingColor: Color {
         switch kind.id {
-        case "claude-code": Tokens.Ink.clay
+        case "claude-code", "note": Tokens.Ink.clay
         case "codex", "cursor": Tokens.Ink.primary.opacity(0.82)
         case "gemini": Tokens.Ink.geminiBlue
         default: Tokens.Ink.genericWorking
