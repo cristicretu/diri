@@ -170,7 +170,7 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}}}}\n' "$id" ;;
     *'"method":"tools/list"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"launch_app","description":"Launch a macOS app in the background. More.","inputSchema":{"type":"object","properties":{"session":{"type":"string"},"bundle_id":{"type":"string"}}}},{"name":"click","description":"Click a target pid.","inputSchema":{"type":"object"}},{"name":"get_window_state","description":"Snapshot a window.","inputSchema":{"type":"object"}},{"name":"set_config","description":"Driver-wide.","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"launch_app","description":"Launch a macOS app in the background. More.","inputSchema":{"type":"object","properties":{"session":{"type":"string"},"bundle_id":{"type":"string"}}}},{"name":"click","description":"Click a target pid.","inputSchema":{"type":"object"}},{"name":"get_window_state","description":"Snapshot a window.","inputSchema":{"type":"object"}},{"name":"type_text","description":"Type text.","inputSchema":{"type":"object"}},{"name":"set_config","description":"Driver-wide.","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
     *'"name":"start_session"'*)
       # The first name asked for belongs to an earlier pipe.
       if [ ! -e "$0.taken" ]; then
@@ -179,8 +179,19 @@ while IFS= read -r line; do
       else
         printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"active"}],"structuredContent":{"active":true}}}\n' "$id"
       fi ;;
+    *'"name":"end_session"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"ended"}]}}\n' "$id" ;;
     *'"name":"launch_app"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"launched"}],"structuredContent":{"pid":4242,"echo":%s}}}\n' "$id" "$line" ;;
+    *'"name":"type_text"'*)
+      # `$0.end_next` ends the caller's session; the driver then refuses that name.
+      name=$(printf '%s' "$line" | sed -n 's/.*"session":"\([^"]*\)".*/\1/p')
+      if [ -e "$0.end_next" ]; then rm "$0.end_next"; printf '%s' "$name" > "$0.ended"; fi
+      if [ -e "$0.ended" ] && [ "$name" = "$(cat "$0.ended")" ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"session has ended; tool call was rejected. Call start_session to start it again, or use a new session label."}],"isError":true,"structuredContent":{"code":"session_ended"}}}\n' "$id"
+      else
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"ok"}],"structuredContent":{"echo":%s}}}\n' "$id" "$line"
+      fi ;;
     # Either key order: serde_json keeps insertion order when another crate
     # in the build enables `preserve_order`.
     *'"x":-1'*'"name":"click"'* | *'"name":"click"'*'"x":-1'*)
@@ -214,7 +225,10 @@ fn agents_share_one_driver_with_their_own_badges_and_apps() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["launch_app", "click", "get_window_state"]);
+    assert_eq!(
+        names,
+        ["launch_app", "click", "get_window_state", "type_text"]
+    );
     assert_eq!(
         catalog["tools"][0]["summary"],
         "Launch a macOS app in the background"
@@ -434,6 +448,82 @@ fn a_driver_that_dies_is_relaunched_on_the_next_call() {
     // The old pipe's names died with it; the badge reads the same.
     assert_ne!(before, after);
     assert_eq!(visible(&before), visible(&after));
+}
+
+#[test]
+fn a_session_the_driver_ended_is_restarted_under_the_same_badge() {
+    let temp = tempfile::tempdir().unwrap();
+    let driver = fake_driver(temp.path());
+    let computer = ComputerUse::with_binary(Some(driver.clone()));
+    let live = |_: &str| true;
+    let agent = caller("s", "Claude Code · hiring");
+    let typed = json!({"pid":7,"window_id":1,"text":"hi"});
+    let name_on = |result: &Value| {
+        result["mcpToolResult"]["structuredContent"]["echo"]["params"]["arguments"]["session"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let before = name_on(
+        &computer
+            .act(&agent, "type_text", typed.clone(), &live)
+            .unwrap(),
+    );
+
+    std::fs::write(driver.with_extension("end_next"), "").unwrap();
+    let after = name_on(
+        &computer
+            .act(&agent, "type_text", typed.clone(), &live)
+            .unwrap(),
+    );
+    assert_ne!(before, after);
+    assert_eq!(visible(&after), "Claude Code · hiring");
+    // Every later call keeps the fresh name; the dead one is never sent again.
+    assert_eq!(
+        name_on(&computer.act(&agent, "type_text", typed, &live).unwrap()),
+        after
+    );
+
+    let log: Vec<Value> = std::fs::read_to_string(driver.with_extension("log"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let ended: Vec<&Value> = log
+        .iter()
+        .filter(|message| message["params"]["name"] == "end_session")
+        .collect();
+    assert_eq!(
+        ended.len(),
+        1,
+        "the dead session is ended, releasing its locks"
+    );
+    assert_eq!(ended[0]["params"]["arguments"]["session"], before);
+    // The app stays with its session across the restart.
+    let other = computer
+        .act(
+            &caller("t", "Other"),
+            "type_text",
+            json!({"pid":7,"text":"x"}),
+            &live,
+        )
+        .unwrap_err();
+    assert_eq!(other.code, APP_BUSY);
+}
+
+#[test]
+fn a_session_that_cannot_be_restarted_never_points_the_agent_at_start_session() {
+    let result = json!({"isError": true, "content": [{"type": "text", "text":
+        "session has ended; tool call 'run_steps' was rejected. Call start_session with session \
+         'x' to start it again, or use a new session label."}]});
+    assert!(session_gone(&result));
+    assert!(session_gone(
+        &json!({"isError": true, "structuredContent": {"code": "session_not_started"}})
+    ));
+    assert!(!session_gone(
+        &json!({"content": [{"type": "text", "text": "ok"}]})
+    ));
+    assert!(!SESSION_LOST_MESSAGE.contains("start_session"));
 }
 
 #[test]
