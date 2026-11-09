@@ -2766,11 +2766,16 @@ mod tests {
     fn a_stalled_write_reports_exactly_the_prefix_the_child_received() {
         let root = tempfile::tempdir().unwrap();
         let received = root.path().join("received");
+        // The child reads again only when told to: a fixed sleep raced the
+        // Holder's stall window on slow runners and let the whole paste in.
+        let resume = root.path().join("resume");
         let spec = held(
             root.path(),
             "s_partial",
             &format!(
-                "stty raw -echo; printf 'rea''dy'; sleep 6; exec cat > '{}'",
+                "stty raw -echo; printf 'rea''dy'; \
+                 while [ ! -e '{}' ]; do sleep 0.05; done; exec cat > '{}'",
+                resume.display(),
                 received.display()
             ),
         );
@@ -2797,6 +2802,7 @@ mod tests {
         assert!(started.elapsed() >= PTY_WRITE_STALL_PARTIAL);
 
         // When the child reads again it finds exactly that prefix.
+        std::fs::write(&resume, b"").unwrap();
         wait_until("child drained its input", || {
             std::fs::metadata(&received).is_ok_and(|meta| meta.len() >= written)
         });

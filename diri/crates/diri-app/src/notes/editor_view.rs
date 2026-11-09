@@ -770,7 +770,7 @@ impl NoteEditorView {
 
     /// Puts the caret at the end of the note's first diagram, as a click
     /// on it would, for the screenshot fixture.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn edit_diagram_for_screenshot(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.editor.blocks().iter().position(|b| b.is_diagram()) else {
             return;
