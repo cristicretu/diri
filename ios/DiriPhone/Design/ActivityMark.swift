@@ -30,12 +30,13 @@ struct ActivityMarkView: View {
     let state: StatusState
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.marksAnimate) private var marksAnimate
 
     var body: some View {
         Group {
             switch state {
             case .working:
-                if reduceMotion {
+                if reduceMotion || !marksAnimate {
                     WorkingDots(frame: 3)
                 } else {
                     // The desktop's `FrameLoop`: eight frames, one sweep a second.
@@ -89,4 +90,10 @@ private struct WorkingDots: View {
         }
         .frame(width: 14, height: 14)
     }
+}
+
+extension EnvironmentValues {
+    /// False for a list that is alive but not on screen (the closed drawer):
+    /// its working marks hold still instead of ticking eight times a second.
+    @Entry var marksAnimate = true
 }

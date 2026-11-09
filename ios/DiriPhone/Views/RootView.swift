@@ -138,7 +138,11 @@ struct RootView: View {
                     .onTapGesture { closeDrawer() }
             }
 
-            if revealed > 0 || drawerOpen {
+            // The drawer stays alive while closed, parked off screen, so it
+            // opens where it was left rather than back at the top. Closed, it
+            // takes no touches, is hidden from VoiceOver and stops animating.
+            if model.selectedSessionID != nil {
+                let shown = revealed > 0 || drawerOpen
                 NavigationStack { list }
                     .frame(width: drawerWidth)
                     .clipShape(RoundedRectangle(cornerRadius: 34, style: .continuous))
@@ -146,6 +150,10 @@ struct RootView: View {
                     .padding(.vertical, 6)
                     .padding(.leading, 6)
                     .offset(x: revealed - drawerWidth - 6)
+                    .opacity(shown ? 1 : 0)
+                    .allowsHitTesting(shown)
+                    .accessibilityHidden(!shown)
+                    .environment(\.marksAnimate, shown)
                     .gesture(closeGesture(drawerWidth: drawerWidth))
                     .accessibilityIdentifier("session-drawer")
             }
