@@ -35,10 +35,10 @@ Sessions are grouped by project folder. Sessions started by another agent nest u
 | --- | --- |
 | Rename | Double-click the row, <kbd>⌘</kbd><kbd>R</kbd>, or **Rename…** |
 | Pin | **Pin Session** in the row's menu |
-| Reorder | Drag between rows, or <kbd>⌃</kbd><kbd>⌘</kbd><kbd>↑</kbd> / <kbd>↓</kbd> |
+| Reorder | Drag the row up or down, or <kbd>⌃</kbd><kbd>⌘</kbd><kbd>↑</kbd> / <kbd>↓</kbd> |
 | Reorder projects | Drag the project header |
-| Hand off work | Drop a session onto another session's row |
-| Start a sibling with the same prompt | Drop a session on the zone below the last project |
+| Move to another project | Drop the session on that project's header or beside one of its rows |
+| Move to the home folder | Drag the session out to the zone below the last project |
 | Archive | **Archive Session**, or <kbd>⌥</kbd><kbd>⇧</kbd><kbd>⌘</kbd><kbd>W</kbd> |
 | Remove | **Remove from Sidebar**, or <kbd>⌘</kbd><kbd>W</kbd> |
 | Close a project | **Close All Sessions** on the project |

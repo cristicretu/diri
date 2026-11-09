@@ -55,6 +55,7 @@ impl Sidebar {
         if !self.windowing
             || self.disclosure_tick
             || self.section_shift.in_flight()
+            || self.row_shift.in_flight()
             || self
                 .lift
                 .as_ref()
@@ -552,15 +553,64 @@ mod tests {
         let below = point(target_bounds.center().x, target_bounds.bottom() - px(2.0));
         cx.simulate_mouse_move(below, MouseButton::Left, Modifiers::default());
         redraw(&sidebar, cx);
-        assert!(
-            cx.debug_bounds("insertion-marker:After").is_some(),
-            "the drop resolves against the row under the pointer"
-        );
         cx.simulate_mouse_up(below, MouseButton::Left, Modifiers::default());
         let reordered = visible_order(&sidebar, cx);
         let position = |id: &SessionId| reordered.iter().position(|row| row == id).unwrap();
         assert_eq!(position(&source), position(&target) + 1);
         assert_eq!(reordered.len(), order.len());
+    }
+
+    #[gpui::test]
+    fn holding_a_dragged_row_at_an_edge_scrolls_the_list(cx: &mut TestAppContext) {
+        let (sidebar, cx) = fleet(cx, 300, 1, None, SidebarGrouping::Project);
+        let order = visible_order(&sidebar, cx);
+        let from = built(&sidebar, cx)[&order[2]].center();
+        let list = sidebar.read_with(cx, |sidebar, _| sidebar.list_scroll.bounds());
+        let offset = |cx: &mut VisualTestContext| {
+            sidebar.read_with(cx, |sidebar, _| f32::from(sidebar.list_scroll.offset().y))
+        };
+        cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(
+            from + point(px(0.0), px(6.0)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        let middle = offset(cx);
+        cx.simulate_mouse_move(
+            point(from.x, list.center().y),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        assert_eq!(offset(cx), middle, "away from the edges the list rests");
+
+        // Held still at the bottom edge, it keeps scrolling.
+        let edge = point(from.x, list.bottom() - px(4.0));
+        cx.simulate_mouse_move(edge, MouseButton::Left, Modifiers::default());
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        let scrolled = offset(cx);
+        assert!(scrolled < middle - 50.0, "scrolled down to {scrolled}");
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        let lowest = offset(cx);
+        assert!(lowest < scrolled, "holding still keeps it going");
+
+        // And back up at the top edge; the release stops it.
+        let top = point(from.x, list.top() + px(4.0));
+        cx.simulate_mouse_move(top, MouseButton::Left, Modifiers::default());
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        let rising = offset(cx);
+        assert!(rising > lowest, "scrolled back up to {rising}");
+        cx.simulate_mouse_up(top, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+        let released = offset(cx);
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        assert_eq!(offset(cx), released, "the release stops the scroll");
+        assert!(sidebar.read_with(cx, |sidebar, _| sidebar.drag_autoscroll.is_none()));
     }
 
     #[gpui::test]

@@ -53,7 +53,7 @@ use tokio::sync::mpsc;
 use crate::tooltip_warmth::WarmTooltip;
 
 use crate::commands::{CommandId, OpenSettings, ToggleHistory};
-use crate::delegation::{HandoffProposal, handoff_proposal, sibling_proposal, validate_handoff};
+use crate::delegation::{HandoffProposal, handoff_proposal};
 use crate::external_drop::{ExternalDropPlan, ExternalDropTarget, plan_external_drop};
 use crate::haptics::{self, Haptic};
 use crate::i18n::{t, tf};
@@ -83,9 +83,10 @@ use super::{
 };
 use lineage::{LineageRole, LineageSession, lineage_anchor, lineage_marks};
 
-/// Height of each insertion band at the top and bottom of a session row. A
-/// quarter of the row on each side leaves half the row as the drop-onto core.
-const INSERT_BAND: f32 = Metrics::ROW_HEIGHT / 4.0;
+/// How close to the session list's top or bottom edge a drag starts
+/// scrolling it, and how fast it scrolls at the very edge (points per frame).
+const AUTOSCROLL_EDGE: f32 = 36.0;
+const AUTOSCROLL_MAX_STEP: f32 = 14.0;
 
 const PREVIEW_USAGE: f64 = 4.82;
 /// How often the remaining-quota footer re-reads its expiry and freshness.
@@ -302,10 +303,16 @@ enum RowDrop {
     /// The row the drag started from. A release here is the click the press
     /// was about to be before it wandered past GPUI's drag threshold.
     Origin,
-    /// Reorder among siblings; the zone is never `Onto`.
-    Insert(DropZone),
+    /// A sibling in the dragged row's own run. The run already reordered
+    /// live under the lifted row, so the release only commits it.
+    Settle,
+    /// File the session under the row's (different) project. `Some` places
+    /// it beside the row, like `Insert`; `None` appends it to that project.
+    Rehome {
+        project: ProjectId,
+        zone: Option<DropZone>,
+    },
     Revive,
-    Handoff,
     Refused(String),
 }
 
@@ -433,6 +440,8 @@ pub(super) enum LiftAxis {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum LiftKey {
     Project(ProjectId),
+    /// A session row in the vertical list.
+    SessionRow(SessionId),
     SessionTab(SessionId),
     WorkspaceTab(diri_proto::workspace::TabId),
 }
@@ -607,6 +616,57 @@ fn section_shift_deltas(
     deltas
 }
 
+/// Offsets that carry each session row from where it is drawn to where
+/// `after` lays it out. Only the stretch of rows whose order changed takes
+/// part; it starts where its first row lays out now, and rows keep their
+/// heights and the gap between them. Rows without bounds are skipped.
+fn row_shift_deltas(
+    before: &[SessionId],
+    after: &[SessionId],
+    layout: &HashMap<SessionId, row_window::Span>,
+    applied: &HashMap<SessionId, f32>,
+) -> HashMap<SessionId, f32> {
+    let Some(first) = before.iter().zip(after).position(|(old, new)| old != new) else {
+        return HashMap::new();
+    };
+    let last = before
+        .iter()
+        .rev()
+        .zip(after.iter().rev())
+        .position(|(old, new)| old != new)
+        .map_or(first, |from_end| before.len().max(after.len()) - 1 - from_end);
+    let changed = |order: &[SessionId]| -> Vec<SessionId> {
+        order[first.min(order.len())..=last.min(order.len().saturating_sub(1))].to_vec()
+    };
+    let (old, new) = (changed(before), changed(after));
+    let tops: Vec<(f32, f32)> = old
+        .iter()
+        .filter_map(|id| layout.get(id))
+        .map(|slot| (slot.top, slot.bottom - slot.top))
+        .collect();
+    let Some(&(top, _)) = tops.first() else {
+        return HashMap::new();
+    };
+    let gap = tops
+        .windows(2)
+        .next()
+        .map_or(2.0, |pair| (pair[1].0 - pair[0].0 - pair[0].1).max(0.0));
+    let mut deltas = HashMap::new();
+    let mut y = top;
+    for id in &new {
+        let Some(slot) = layout.get(id) else {
+            continue;
+        };
+        let visual = slot.top + applied.get(id).copied().unwrap_or(0.0);
+        let delta = visual - y;
+        if delta.abs() >= 0.5 {
+            deltas.insert(id.clone(), delta);
+        }
+        y += slot.bottom - slot.top + gap;
+    }
+    deltas
+}
+
 pub struct Sidebar {
     /// Open to-dos across notes; set by RootView. The To-dos row appears
     /// only while some note has one.
@@ -670,6 +730,11 @@ pub struct Sidebar {
     section_shift: Shift<ProjectId>,
     /// Slide state for session tabs in the horizontal strip.
     pub(super) tab_shift: Shift<SessionId>,
+    /// Session rows stepping aside for a lifted row in the vertical list.
+    row_shift: Shift<SessionId>,
+    /// A live trade staged since the last render: slots are stale until the
+    /// walk runs again, so no second trade is judged against them.
+    row_trade_unrendered: bool,
     /// The row a drag has picked up, drawn by the sidebar on its list's axis.
     pub(super) lift: Option<Lift>,
     /// The session list's viewport from the latest prepaint.
@@ -774,6 +839,13 @@ pub struct Sidebar {
     /// Keeps a finite sidebar motion moving if its display-link frames stop
     /// arriving; see `request_motion_frame`.
     motion_backstop: Option<Task<()>>,
+    /// Scrolls the session list while a dragged row is held near its top or
+    /// bottom edge; ends itself when the pointer leaves the edge or the drag
+    /// ends.
+    drag_autoscroll: Option<Task<()>>,
+    /// Latest pointer position of a sidebar drag, read by the autoscroll
+    /// loop between moves (holding still at an edge keeps scrolling).
+    drag_pointer: Option<Point<Pixels>>,
     /// Titles an agent changed crossfade instead of snapping. Shared by the
     /// rows and the horizontal strip, which show the same sessions.
     title_settles: TitleSettles,
@@ -928,6 +1000,8 @@ impl Sidebar {
             section_bounds: Rc::new(RefCell::new(HashMap::new())),
             section_shift: Shift::default(),
             tab_shift: Shift::default(),
+            row_shift: Shift::default(),
+            row_trade_unrendered: false,
             lift: None,
             fade_viewport: Rc::new(Cell::new(None)),
             fade_glass: false,
@@ -980,6 +1054,8 @@ impl Sidebar {
             disclosure_animating: false,
             disclosure_tick: false,
             motion_backstop: None,
+            drag_autoscroll: None,
+            drag_pointer: None,
             title_settles: TitleSettles::default(),
             title_clock: Instant::now,
             title_now: Instant::now(),
@@ -1062,7 +1138,6 @@ impl Sidebar {
         self.ui.popover.is_some()
             || self.ui.renaming.is_some()
             || self.ui.drag.is_some()
-            || self.ui.pending_sibling.is_some()
             || self.ui.delegation_notice.is_some()
             || self
                 .store
@@ -2569,8 +2644,8 @@ impl Sidebar {
     }
 
     /// The strip below the last project. Finder drops open the launcher
-    /// here, and a dragged session can be fanned out into a sibling -- but
-    /// only here, and only while the zone says so. It used to be the whole
+    /// here, and a session dragged out of its project lands in the home
+    /// folder -- but only here, and only while the zone says so. It used to be the whole
     /// list, which turned every release between two rows into a proposal.
     fn empty_space_drop_target(
         &self,
@@ -2581,13 +2656,8 @@ impl Sidebar {
             self.revivable_drop(&DraggedSidebarItem(item.clone()), None)
                 .is_some()
         }) && cx.has_active_drag();
-        let fan_out_offered = matches!(
-            self.ui.drag,
-            Some(DragItem::Session {
-                archived: false,
-                ..
-            })
-        ) && cx.has_active_drag();
+        // Dragged out below every project, a session goes home.
+        let fan_out_offered = self.home_drop().is_some() && cx.has_active_drag();
         div()
             .id("sidebar-empty-space-drop-target")
             .flex_1()
@@ -2608,7 +2678,7 @@ impl Sidebar {
                     .child(if revive_offered {
                         t("sidebar.drop_revive")
                     } else {
-                        t("sidebar.drop_sibling")
+                        t("sidebar.drop_home")
                     })
             })
             .drag_over::<DraggedSidebarItem>(move |element, dragged, _, _| {
@@ -2875,6 +2945,7 @@ impl Sidebar {
             // never mistaken for one the pointer crossed.
             .drag_over::<DraggedSidebarItem>({
                 let id = id.clone();
+                let header_host = project_host.clone();
                 move |element, dragged, window, cx| {
                     if let DragItem::Project(moved) = &dragged.0 {
                         entity.update(cx, |this, cx| {
@@ -2896,7 +2967,12 @@ impl Sidebar {
                             }
                         });
                         element
-                    } else if entity.read(cx).revivable_drop(dragged, Some(&id)).is_some() {
+                    } else if entity.read(cx).revivable_drop(dragged, Some(&id)).is_some()
+                        || matches!(
+                            entity.read(cx).header_rehome(&id, &header_host),
+                            Some(Ok(_))
+                        )
+                    {
                         element.bg(Palette::CLAY.alpha(0.18))
                     } else {
                         element
@@ -2905,6 +2981,7 @@ impl Sidebar {
             })
             .on_drop(cx.listener({
                 let id = id.clone();
+                let host = project_host.clone();
                 move |this, dragged: &DraggedSidebarItem, _, cx| {
                     cx.stop_propagation();
                     if this.ui.drag.is_some()
@@ -2914,6 +2991,14 @@ impl Sidebar {
                             .write()
                             .expect("session store lock poisoned")
                             .revive_sessions(vec![session]);
+                    } else if let Some(rehome) = this.header_rehome(&id, &host) {
+                        match rehome {
+                            Ok(session) => {
+                                this.move_session_to_project(&session, id.clone());
+                                this.reorder_session_to_end(&session);
+                            }
+                            Err(reason) => this.ui.delegation_notice = Some(reason),
+                        }
                     }
                     this.finish_drag();
                     cx.notify();
@@ -3168,7 +3253,9 @@ impl Sidebar {
                     self.row_drop_feedback(row, window, cx)
                 };
                 let marker = match drop {
-                    Some(RowDrop::Insert(zone)) => Some((zone, row.depth)),
+                    Some(RowDrop::Rehome {
+                        zone: Some(zone), ..
+                    }) => Some((zone, row.depth)),
                     _ => None,
                 };
                 let working = self.working_row_rendered;
@@ -3555,7 +3642,7 @@ impl Sidebar {
     }
 
     fn track_row_bounds(
-        &self,
+        &mut self,
         id: SessionId,
         row: AnyElement,
         insertion: Option<(DropZone, u16)>,
@@ -3563,14 +3650,44 @@ impl Sidebar {
         let bounds = Rc::clone(&self.row_bounds);
         let alpha = self.edge_fade_alpha(bounds.borrow().get(&id).copied());
         let weak = self.weak_self.clone();
-        div()
+        // The lifted row's slot is where this frame's walk placed it, in
+        // window space: a trade, a scroll or a resync moves it under the row.
+        if let Some(slot) = self.lifted_row_slot_y(&id)
+            && let Some(lift) = self.lift.as_mut()
+        {
+            lift.slot.y = slot;
+        }
+        let lifted_by = self.lift_offset(&LiftKey::SessionRow(id.clone()));
+        // The lifted row never slides: it is drawn from the pointer, and its
+        // slot simply moves under it.
+        let shift = if lifted_by.is_some() {
+            None
+        } else {
+            self.row_shift.deltas.get(&id).copied()
+        };
+        if shift.is_none() {
+            self.row_shift.applied.borrow_mut().remove(&id);
+        }
+        let applied = Rc::clone(&self.row_shift.applied);
+        let probe_id = id.clone();
+        let element = div()
             .w_full()
             .flex_none()
             .relative()
             .opacity(alpha)
+            // Bounds are recorded where the row lays out: any slide in
+            // flight and the lift are taken back out of what was painted.
             .on_children_prepainted(move |children, window, _| {
                 if let Some(row) = children.first().copied() {
-                    let changed = bounds.borrow_mut().insert(id.clone(), row) != Some(row);
+                    let offset = applied.borrow().get(&probe_id).copied().unwrap_or(0.0);
+                    let row = Bounds {
+                        origin: point(
+                            row.origin.x,
+                            row.origin.y - px(offset) - lifted_by.unwrap_or(px(0.0)),
+                        ),
+                        size: row.size,
+                    };
+                    let changed = bounds.borrow_mut().insert(probe_id.clone(), row) != Some(row);
                     if changed {
                         Self::refresh_on_next_frame(&weak, window);
                     }
@@ -3579,8 +3696,157 @@ impl Sidebar {
             .child(row)
             .when_some(insertion, |element, (zone, depth)| {
                 element.child(insertion_marker(zone, depth))
-            })
+            });
+        if let Some(offset) = lifted_by {
+            return lift_in_place(element, LiftAxis::Vertical, offset, self.colors());
+        }
+        let Some(delta) = shift else {
+            return element.into_any_element();
+        };
+        let applied = Rc::clone(&self.row_shift.applied);
+        let settled = Rc::clone(&self.row_shift.settled);
+        element
+            .with_animation(
+                SharedString::from(format!("row-shift:{}:{}", id.0, self.row_shift.generation)),
+                Animation::new(SECTION_SHIFT_TIME)
+                    .with_easing(|delta| Motion::SETTLE.settle(delta)),
+                move |row, progress| {
+                    let offset = delta * (1.0 - progress);
+                    applied.borrow_mut().insert(id.clone(), offset);
+                    if progress >= 1.0 {
+                        settled.set(true);
+                    }
+                    row.top(px(offset))
+                },
+            )
             .into_any_element()
+    }
+
+    /// Trades the lifted session row past the farthest sibling whose middle
+    /// its own middle has crossed, the way a held row lands in a sortable
+    /// list, and starts the displaced rows sliding into their new slots.
+    /// Nothing trades while a previous slide is still moving under the row.
+    fn live_reorder_session(&mut self, cx: &mut Context<Self>) {
+        let Some(lift) = self.lift.as_ref() else {
+            return;
+        };
+        let LiftKey::SessionRow(moved) = &lift.key else {
+            return;
+        };
+        let moved = moved.clone();
+        if !cx.has_active_drag() || self.row_shift.in_flight() || self.row_trade_unrendered {
+            return;
+        }
+        // Content-space slots cover every row the walk placed, built or not,
+        // so a list scrolled far from where the drag began still resolves.
+        let Some(held) = self.row_slots.borrow().get(&moved).copied() else {
+            return;
+        };
+        let viewport = self.list_scroll.bounds();
+        let content_top = f32::from(lift.pointer.y - lift.grab.y)
+            - f32::from(viewport.top())
+            - f32::from(self.list_scroll.offset().y);
+        let middle = content_top + (held.bottom - held.top) / 2.0;
+        let (before, run) = {
+            let mut store = self.store.write().expect("session store lock poisoned");
+            if store.preferences().sidebar_ordering != SidebarOrdering::Custom
+                || store.preferences().sidebar_grouping != SidebarGrouping::Project
+            {
+                return;
+            }
+            let projection = store.sidebar_projection();
+            let Some(group) = projection
+                .projects
+                .iter()
+                .find(|group| group.sessions.iter().any(|row| row.id() == &moved))
+            else {
+                return;
+            };
+            let pinned = |id: &SessionId| {
+                group
+                    .sessions
+                    .iter()
+                    .find(|row| row.id() == id)
+                    .map(|row| row.pinned)
+            };
+            let run: Vec<SessionId> = sibling_run(&projection, &moved)
+                .into_iter()
+                .filter(|id| pinned(id) == pinned(&moved))
+                .collect();
+            let before: Vec<SessionId> = group.sessions.iter().map(|row| row.id().clone()).collect();
+            (before, run)
+        };
+        let target = {
+            let slots = self.row_slots.borrow();
+            let Some(from) = run.iter().position(|id| id == &moved) else {
+                return;
+            };
+            let midline = |id: &SessionId| slots.get(id).map(|row| (row.top + row.bottom) / 2.0);
+            let below = run[from + 1..]
+                .iter()
+                .rev()
+                .find(|id| midline(id).is_some_and(|line| middle > line));
+            let above = run[..from]
+                .iter()
+                .find(|id| midline(id).is_some_and(|line| middle < line));
+            below.or(above).cloned()
+        };
+        let Some(target) = target else {
+            return;
+        };
+        let staged = {
+            let mut store = self.store.write().expect("session store lock poisoned");
+            let mut order = store.sidebar_session_order();
+            move_past(&mut order, &moved, &target);
+            store.stage_session_order(order)
+        };
+        if !staged {
+            return;
+        }
+        self.ui.order_dirty = true;
+        self.row_trade_unrendered = true;
+        let after: Vec<SessionId> = {
+            let mut store = self.store.write().expect("session store lock poisoned");
+            store
+                .sidebar_projection()
+                .projects
+                .iter()
+                .find(|group| group.sessions.iter().any(|row| row.id() == &moved))
+                .map(|group| group.sessions.iter().map(|row| row.id().clone()).collect())
+                .unwrap_or_default()
+        };
+        self.shift_rows(&before, &after, cx.reduce_motion());
+        haptics::perform(Haptic::Snap, haptics::key("session-slot", &target));
+        cx.notify();
+    }
+
+    /// Window-space top of `id`'s slot when it is the lifted row: where the
+    /// walk placed it, moved by the list's scroll.
+    fn lifted_row_slot_y(&self, id: &SessionId) -> Option<Pixels> {
+        let lift = self.lift.as_ref()?;
+        if lift.key != LiftKey::SessionRow(id.clone()) {
+            return None;
+        }
+        let slot = self.row_slots.borrow().get(id).copied()?;
+        Some(self.list_scroll.bounds().top() + self.list_scroll.offset().y + px(slot.top))
+    }
+
+    /// Starts the slide from the rows' drawn positions to the slots `after`
+    /// lays them out in. The lifted row's slot moves under it instead.
+    fn shift_rows(&mut self, before: &[SessionId], after: &[SessionId], reduce_motion: bool) {
+        let mut deltas = row_shift_deltas(
+            before,
+            after,
+            &self.row_slots.borrow(),
+            &self.row_shift.applied.borrow(),
+        );
+        // The lifted row never slides; its slot follows the walk.
+        if let Some(lift) = self.lift.as_ref()
+            && let LiftKey::SessionRow(session) = &lift.key
+        {
+            deltas.remove(session);
+        }
+        self.row_shift.start(deltas, reduce_motion);
     }
 
     /// Height of the band in which rows dissolve at either list edge.
@@ -3697,7 +3963,9 @@ impl Sidebar {
         window: &Window,
     ) {
         let gap = match drop {
-            RowDrop::Insert(zone) => self.row_bounds.borrow().get(row.id()).map(|bounds| {
+            RowDrop::Rehome {
+                zone: Some(zone), ..
+            } => self.row_bounds.borrow().get(row.id()).map(|bounds| {
                 let line = f32::from(if *zone == DropZone::Before {
                     bounds.top()
                 } else {
@@ -3737,7 +4005,15 @@ impl Sidebar {
             return None;
         }
         let bounds = *self.row_bounds.borrow().get(row.id())?;
-        let zone = drop_zone(bounds, window.mouse_position(), px(INSERT_BAND))?;
+        // Rows only take a session beside them, never onto them: the row
+        // splits at its midline into the gap above and the gap below.
+        drop_zone(bounds, window.mouse_position(), px(0.0))?;
+        let position = window.mouse_position();
+        let zone = if position.y - bounds.origin.y < bounds.size.height / 2.0 {
+            DropZone::Before
+        } else {
+            DropZone::After
+        };
         let target = &row.session;
         if source == &target.id {
             return Some(RowDrop::Origin);
@@ -3753,21 +4029,25 @@ impl Sidebar {
         }
         // Reordering only ever moves a row inside its own sibling run, and
         // pinned rows sort ahead of the manual order, so a pin boundary is a
-        // run boundary too. Anywhere else the bands fall back to the handoff
-        // the core offers rather than drawing a marker the drop cannot honour.
+        // run boundary too.
         let store = self.store.read().expect("session store lock poisoned");
-        let sibling = store.preferences().sidebar_ordering == SidebarOrdering::Custom
-            && !archived
-            && project == &target.project_id
-            && parent == &target.parent
+        let custom = store.preferences().sidebar_ordering == SidebarOrdering::Custom;
+        let same_run = parent == &target.parent
             && store.preferences().sidebar_pinned_sessions.contains(source) == row.pinned;
-        if sibling && zone != DropZone::Onto {
-            return Some(RowDrop::Insert(zone));
+        if project == &target.project_id {
+            return (custom && !archived && same_run).then_some(RowDrop::Settle);
         }
+        if store.preferences().sidebar_grouping != SidebarGrouping::Project {
+            return None;
+        }
+        let source_host = store.sessions().get(source).map(|session| session.host.clone());
         Some(
-            match validate_handoff(store.sessions(), source, &target.id) {
-                Ok(()) => RowDrop::Handoff,
-                Err(refusal) => RowDrop::Refused(refusal.0),
+            match rehome_refusal(*archived, parent.is_some(), source_host, &target.host) {
+                Some(reason) => RowDrop::Refused(reason),
+                None => RowDrop::Rehome {
+                    project: target.project_id.clone(),
+                    zone: (custom && same_run).then_some(zone),
+                },
             },
         )
     }
@@ -3815,6 +4095,7 @@ impl Sidebar {
             hover_linger,
             look,
             ref split,
+            lifted,
             ..
         } = *props;
         let drop = drop.clone();
@@ -4064,15 +4345,44 @@ impl Sidebar {
                     cx.notify();
                 }),
             )
-            .on_drag(drag_payload, move |dragged, _, _, cx| {
+            .on_drag(drag_payload, move |dragged, grab, window, cx| {
                 let dragged = dragged.0.clone();
+                // A live row lifts in place and rides the pointer up and
+                // down; archived rows and multi-selections carry a label.
+                let lifted = match &dragged {
+                    DragItem::Session {
+                        id, archived: false, ..
+                    } => Some(id.clone()),
+                    _ => None,
+                };
                 let preview = cx.new(|_| DragPreview {
-                    ghost: DragGhost::Label(drag_label.clone()),
+                    ghost: if lifted.is_some() {
+                        DragGhost::Lifted
+                    } else {
+                        DragGhost::Label(drag_label.clone())
+                    },
                     colors,
                     hidden: false,
                 });
+                let origin = window.mouse_position() - grab;
                 drag_entity.update(cx, |this, cx| {
                     this.begin_drag(dragged, preview.clone(), cx);
+                    if let Some(id) = lifted
+                        && this.ui.drag.is_some()
+                    {
+                        let order = this
+                            .store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .sidebar_session_order();
+                        this.ui.session_order_at_drag_start = Some(order);
+                        this.lift = Some(Lift::new(
+                            LiftKey::SessionRow(id),
+                            origin,
+                            grab,
+                            LiftAxis::Vertical,
+                        ));
+                    }
                 });
                 preview
             })
@@ -4082,9 +4392,12 @@ impl Sidebar {
             // red at every row the pointer crosses; the refusal is explained
             // on release instead.
             .drag_over::<DraggedSidebarItem>({
-                let handoff = matches!(drop, Some(RowDrop::Handoff | RowDrop::Revive));
+                let highlight = matches!(
+                    drop,
+                    Some(RowDrop::Revive | RowDrop::Rehome { zone: None, .. })
+                );
                 move |element, _, _, _| {
-                    if handoff {
+                    if highlight {
                         element
                             .bg(Palette::CLAY.alpha(0.18))
                             .border_1()
@@ -4094,14 +4407,20 @@ impl Sidebar {
                     }
                 }
             })
-            .on_drop(cx.listener({
-                let target = id.clone();
-                let drop = drop.clone();
-                move |this, dragged: &DraggedSidebarItem, window, cx| {
-                    cx.stop_propagation();
-                    this.finish_row_drop(dragged, &target, drop.clone(), window, cx);
-                }
-            }))
+            // The lifted row rides under the pointer, so it is on top of
+            // every release, and GPUI hands a drag to the first listener it
+            // meets. It takes none: the release belongs to whatever lies
+            // beneath it (the root finishes a release over its own slot).
+            .when(!lifted, |row| {
+                row.on_drop(cx.listener({
+                    let target = id.clone();
+                    let drop = drop.clone();
+                    move |this, dragged: &DraggedSidebarItem, window, cx| {
+                        cx.stop_propagation();
+                        this.finish_row_drop(dragged, &target, drop.clone(), window, cx);
+                    }
+                }))
+            })
             .drag_over::<ExternalPaths>({
                 let id = id.clone();
                 move |element, paths, _, _| {
@@ -6970,6 +7289,74 @@ impl Sidebar {
     /// A drag-move listener's report of where the pointer is. GPUI repaints
     /// on every drag move, but the lifted row is placed at render time, so
     /// the view re-renders too.
+    /// Starts the edge autoscroll loop when a sidebar drag reaches the top or
+    /// bottom of the session list. The loop owns the scrolling from there:
+    /// it reads `drag_pointer` each frame, so holding still keeps it going.
+    fn drag_autoscroll_moved(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.drag_pointer = Some(position);
+        if self.drag_autoscroll.is_some() || self.ui.drag.is_none() || self.list_step() == 0.0 {
+            return;
+        }
+        self.drag_autoscroll = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(16))
+                    .await;
+                let keep_going = this
+                    .update(cx, |this, cx| {
+                        let step = if cx.has_active_drag() && this.ui.drag.is_some() {
+                            this.list_step()
+                        } else {
+                            0.0
+                        };
+                        if step == 0.0 {
+                            this.drag_autoscroll = None;
+                            return false;
+                        }
+                        let offset = this.list_scroll.offset();
+                        let max = f32::from(this.list_scroll.max_offset().y).max(0.0);
+                        let next = (f32::from(offset.y) - step).clamp(-max, 0.0);
+                        if next == f32::from(offset.y) {
+                            // Already at the end the pointer is pushing toward.
+                            return true;
+                        }
+                        this.list_scroll.set_offset(point(offset.x, px(next)));
+                        // The content moved under a still pointer. Rows are
+                        // where they will lay out next frame, so drop
+                        // feedback sees the scrolled list.
+                        let moved_by = px(next) - offset.y;
+                        for row in this.row_bounds.borrow_mut().values_mut() {
+                            row.origin.y += moved_by;
+                        }
+                        this.live_reorder_session(cx);
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// This frame's autoscroll step for the held pointer: negative scrolls
+    /// toward the top, positive toward the bottom, zero leaves the list be.
+    fn list_step(&self) -> f32 {
+        let Some(pointer) = self.drag_pointer else {
+            return 0.0;
+        };
+        let bounds = self.list_scroll.bounds();
+        if pointer.x < bounds.left() || pointer.x > bounds.right() {
+            return 0.0;
+        }
+        autoscroll_step(
+            f32::from(bounds.top()),
+            f32::from(bounds.bottom()),
+            f32::from(pointer.y),
+        )
+    }
+
     pub(super) fn track_lift_pointer(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         if let Some(lift) = self.lift.as_mut() {
             lift.pointer = position;
@@ -7255,146 +7642,6 @@ impl Sidebar {
         self.shortcut_ranks.get(id).copied()
     }
 
-    fn sibling_confirmation(
-        &self,
-        proposal: crate::delegation::SiblingProposal,
-        colors: SemanticColors,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let prompt = proposal
-            .prompt
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        let prompt = if prompt.chars().count() > 120 {
-            prompt.chars().take(119).collect::<String>() + "…"
-        } else {
-            prompt
-        };
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(colors.background.alpha(0.56))
-            .flex()
-            .items_end()
-            .p(px(8.0))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.ui.pending_sibling = None;
-                    cx.notify();
-                    cx.stop_propagation();
-                }),
-            )
-            .child(FloatingSurface::new(
-                colors,
-                div()
-                    .w_full()
-                    .p(px(12.0))
-                    .flex()
-                    .flex_col()
-                    .gap(px(9.0))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(
-                        div()
-                            .flex()
-                            .items_start()
-                            .justify_between()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .min_w(px(0.0))
-                                    .flex_1()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(3.0))
-                                    .child(
-                                        div()
-                                            .text_size(px(Typo::ROW_EMPHASIZED.size))
-                                            .font_weight(Typo::ROW_EMPHASIZED.weight)
-                                            .child(t("sidebar.sibling.title")),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(Typo::META.size))
-                                            .text_color(colors.secondary)
-                                            .child(tf(
-                                                "sidebar.sibling.detail",
-                                                &[("title", &proposal.source_title)],
-                                            )),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id("cancel-sibling-proposal")
-                                    .size(px(22.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(Radius::CHIP))
-                                    .cursor_pointer()
-                                    .hover(move |button| button.bg(colors.primary.alpha(0.08)))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.ui.pending_sibling = None;
-                                        cx.notify();
-                                    }))
-                                    .child(sf_symbol("xmark", 9.0, colors.secondary)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .p(px(8.0))
-                            .rounded(px(Radius::ROW))
-                            .bg(colors.primary.alpha(0.045))
-                            .text_size(px(Typo::META.size))
-                            .line_height(px(15.0))
-                            .text_color(colors.secondary)
-                            .child(prompt),
-                    )
-                    .child(
-                        div()
-                            .id("confirm-sibling-proposal")
-                            .h(px(30.0))
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(Radius::ROW))
-                            .bg(colors.primary)
-                            .text_size(px(Typo::ROW.size))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(colors.background)
-                            .cursor_pointer()
-                            .hover(|button| button.opacity(0.88))
-                            .active(|button| button.opacity(0.72))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let Some(proposal) = this.ui.pending_sibling.take() else {
-                                    return;
-                                };
-                                this.store
-                                    .write()
-                                    .expect("session store lock poisoned")
-                                    .spawn_kind(
-                                        proposal.kind,
-                                        SpawnOptions {
-                                            cwd: Some(proposal.cwd),
-                                            initial_prompt: Some(proposal.prompt),
-                                            parent: proposal.parent,
-                                            host: proposal.host,
-                                            ..SpawnOptions::default()
-                                        },
-                                    );
-                                this.ui.delegation_notice = None;
-                                cx.emit(SidebarEvent::FocusTerminal);
-                                cx.notify();
-                            }))
-                            .child(t("sidebar.sibling.create")),
-                    ),
-            ))
-            .into_any_element()
-    }
-
     fn delegation_notice(
         &self,
         notice: String,
@@ -7450,7 +7697,6 @@ impl Sidebar {
         let cancelled_drag = self.cancel_active_drag(cx);
         if !cancelled_drag
             && self.ui.delegation_mark.is_none()
-            && self.ui.pending_sibling.is_none()
             && self.ui.delegation_notice.is_none()
         {
             return false;
@@ -7478,6 +7724,7 @@ impl Sidebar {
             self.shift_sections(&before, &after, reduce_motion);
         }
         if let Some(order) = self.ui.session_order_at_drag_start.take() {
+            let rows_before = self.visible_session_rows();
             let before = self.visible_tab_order();
             self.store
                 .write()
@@ -7485,6 +7732,9 @@ impl Sidebar {
                 .stage_session_order(order);
             let after = self.visible_tab_order();
             self.shift_tabs(&before, &after, reduce_motion);
+            let rows_after = self.visible_session_rows();
+            self.lift = None;
+            self.shift_rows(&rows_before, &rows_after, reduce_motion);
         }
         self.ui.order_dirty = false;
         if let Some(preview) = self.drag_preview.take() {
@@ -7498,6 +7748,18 @@ impl Sidebar {
         true
     }
 
+    /// Every visible session row in list order, across projects.
+    fn visible_session_rows(&self) -> Vec<SessionId> {
+        self.store
+            .write()
+            .expect("session store lock poisoned")
+            .sidebar_projection()
+            .projects
+            .iter()
+            .flat_map(|group| group.sessions.iter().map(|row| row.id().clone()))
+            .collect()
+    }
+
     /// Forgets every piece of an ended or cancelled gesture's state.
     fn clear_drag_gesture(&mut self) {
         self.insertion_haptic.borrow_mut().reset();
@@ -7508,6 +7770,8 @@ impl Sidebar {
         self.ui.session_order_at_drag_start = None;
         self.drag_preview = None;
         self.lift = None;
+        self.drag_pointer = None;
+        self.drag_autoscroll = None;
     }
 
     fn begin_drag(&mut self, item: DragItem, preview: Entity<DragPreview>, cx: &mut Context<Self>) {
@@ -7578,17 +7842,19 @@ impl Sidebar {
                 cx.notify();
                 return;
             }
-            let drop = drop.unwrap_or(if &source == target {
-                RowDrop::Origin
-            } else {
-                RowDrop::Handoff
-            });
-            match drop {
+            // A release GPUI delivers without a frame of feedback does
+            // nothing rather than guess.
+            let drop = drop.or_else(|| (&source == target).then_some(RowDrop::Origin));
+            match drop.unwrap_or(RowDrop::Revive) {
                 RowDrop::Origin => {
                     // The press was a click until the pointer wandered past
-                    // the threshold. Finish it as one: select, activate.
+                    // the threshold. Finish it as one: select, activate. A
+                    // row that already traded places was a real move.
                     let modifiers = window.modifiers();
-                    if !crate::platform::shortcut_modifier(&modifiers) && !modifiers.shift {
+                    if !self.ui.order_dirty
+                        && !crate::platform::shortcut_modifier(&modifiers)
+                        && !modifiers.shift
+                    {
                         self.ui.focus_cursor = Some(target.clone());
                         self.store
                             .write()
@@ -7597,19 +7863,12 @@ impl Sidebar {
                         cx.emit(SidebarEvent::SessionActivated);
                     }
                 }
-                RowDrop::Insert(zone) => self.reorder_session_beside(&source, target, zone),
-                RowDrop::Handoff => {
-                    let proposal = {
-                        let store = self.store.read().expect("session store lock poisoned");
-                        handoff_proposal(store.sessions(), &source, target)
-                    };
-                    match proposal {
-                        Ok(proposal) => {
-                            self.ui.delegation_mark = None;
-                            self.ui.delegation_notice = None;
-                            cx.emit(SidebarEvent::HandoffProposed(proposal));
-                        }
-                        Err(refusal) => self.ui.delegation_notice = Some(refusal.0),
+                RowDrop::Settle => {}
+                RowDrop::Rehome { project, zone } => {
+                    self.move_session_to_project(&source, project);
+                    match zone {
+                        Some(zone) => self.reorder_session_beside(&source, target, zone),
+                        None => self.reorder_session_to_end(&source),
                     }
                 }
                 RowDrop::Revive => {} // The source or destination changed since feedback.
@@ -7618,6 +7877,40 @@ impl Sidebar {
         }
         self.finish_drag();
         cx.notify();
+    }
+
+    fn move_session_to_project(&mut self, id: &SessionId, project: ProjectId) {
+        self.store
+            .write()
+            .expect("session store lock poisoned")
+            .set_session_project(id.clone(), project);
+    }
+
+    /// What dropping the dragged session on `project`'s header would do:
+    /// `Ok` files it there, `Err` explains why not, `None` is no offer (the
+    /// session is already there, or the drag is not a single session).
+    fn header_rehome(&self, project: &ProjectId, host: &Option<String>) -> Option<Result<SessionId, String>> {
+        let Some(DragItem::Session {
+            id,
+            project: from,
+            parent,
+            archived,
+        }) = self.ui.drag.as_ref()
+        else {
+            return None;
+        };
+        if from == project || *archived {
+            return None;
+        }
+        let store = self.store.read().expect("session store lock poisoned");
+        if store.preferences().sidebar_grouping != SidebarGrouping::Project {
+            return None;
+        }
+        let source_host = store.sessions().get(id).map(|session| session.host.clone());
+        Some(match rehome_refusal(false, parent.is_some(), source_host, host) {
+            Some(reason) => Err(reason),
+            None => Ok(id.clone()),
+        })
     }
 
     /// A restore keeps the session's existing project and conversation identity.
@@ -7633,7 +7926,38 @@ impl Sidebar {
             .then(|| id.clone())
     }
 
-    /// Release of a dragged session on the fan-out zone below the projects.
+    /// Where a session dragged out below every project would go: the home
+    /// folder, on this Mac. `None` offers no zone (not a single live session,
+    /// or it is already there); `Err` explains a refusal on release.
+    fn home_drop(&self) -> Option<Result<(SessionId, String), String>> {
+        let Some(DragItem::Session {
+            id,
+            project,
+            parent,
+            archived: false,
+        }) = self.ui.drag.as_ref()
+        else {
+            return None;
+        };
+        let home = diri_platform::home_dir()?.to_string_lossy().into_owned();
+        let store = self.store.read().expect("session store lock poisoned");
+        if store.preferences().sidebar_grouping != SidebarGrouping::Project
+            || store
+                .projects()
+                .get(project)
+                .is_some_and(|current| current.root == home && current.host.is_none())
+        {
+            return None;
+        }
+        let source_host = store.sessions().get(id).map(|session| session.host.clone());
+        Some(match rehome_refusal(false, parent.is_some(), source_host, &None) {
+            Some(reason) => Err(reason),
+            None => Ok((id.clone(), home)),
+        })
+    }
+
+    /// Release of a dragged session on the zone below the projects: an
+    /// archived one revives, a live one moves to the home folder.
     fn finish_fan_out_drop(&mut self, dragged: &DraggedSidebarItem, cx: &mut Context<Self>) {
         if self.ui.drag.is_some()
             && let Some(id) = self.revivable_drop(dragged, None)
@@ -7646,36 +7970,16 @@ impl Sidebar {
             cx.notify();
             return;
         }
-        if let Some(source_id) = dragged.session_id()
-            && self.ui.drag.is_some()
-        {
-            let proposal = {
-                let store = self.store.read().expect("session store lock poisoned");
-                store.sessions().get(source_id).map_or_else(
-                    || {
-                        Err(crate::delegation::DelegationRefusal(
-                            t("sidebar.notice.dragged_gone").to_owned(),
-                        ))
-                    },
-                    |source| {
-                        store.projects().get(&source.project_id).map_or_else(
-                            || {
-                                Err(crate::delegation::DelegationRefusal(
-                                    t("sidebar.notice.project_gone").to_owned(),
-                                ))
-                            },
-                            |project| sibling_proposal(source, project),
-                        )
-                    },
-                )
-            };
-            match proposal {
-                Ok(proposal) => {
-                    self.ui.pending_sibling = Some(proposal);
-                    self.ui.delegation_notice = None;
-                }
-                Err(refusal) => self.ui.delegation_notice = Some(refusal.0),
+        match self.home_drop() {
+            Some(Ok((id, home))) => {
+                self.store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .set_session_project_root(id.clone(), home);
+                self.reorder_session_to_end(&id);
             }
+            Some(Err(reason)) => self.ui.delegation_notice = Some(reason),
+            None => {}
         }
         self.finish_drag();
         cx.notify();
@@ -8737,6 +9041,7 @@ impl Sidebar {
         retain_live_glyphs(&mut self.glyphs, &projection.display_order);
         self.question_lines.retain(&projection.display_order);
         self.end_lift_if_released(cx);
+        self.row_trade_unrendered = false;
         // The session list is the sidebar's most expensive frame work,
         // and settings has no use for it.
         self.row_motion.begin_layout(self.title_now);
@@ -8823,6 +9128,8 @@ impl Sidebar {
             .on_drag_move::<DraggedSidebarItem>(cx.listener(
                 |this, event: &gpui::DragMoveEvent<DraggedSidebarItem>, _, cx| {
                     this.track_lift_pointer(event.event.position, cx);
+                    this.live_reorder_session(cx);
+                    this.drag_autoscroll_moved(event.event.position, cx);
                 },
             ))
             .on_drag_move::<workspaces::DraggedWorkspaceTab>(cx.listener(
@@ -8855,11 +9162,29 @@ impl Sidebar {
             )
             // A release over chrome that accepts nothing (the top bar, the
             // footer, a header) is a cancel, not a gesture left half-open.
-            .on_drop(cx.listener(|this, _: &DraggedSidebarItem, _, cx| {
-                if this.ui.drag.is_some() {
-                    this.finish_drag();
-                    cx.notify();
+            .on_drop(cx.listener(|this, dragged: &DraggedSidebarItem, window, cx| {
+                if this.ui.drag.is_none() {
+                    return;
                 }
+                // A lifted row released over its own slot before it traded
+                // places is the click the press started as.
+                if let Some(Lift {
+                    key: LiftKey::SessionRow(id),
+                    ..
+                }) = this.lift.as_ref()
+                    && !this.ui.order_dirty
+                    && this
+                        .row_bounds
+                        .borrow()
+                        .get(id)
+                        .is_some_and(|slot| slot.contains(&window.mouse_position()))
+                {
+                    let id = id.clone();
+                    this.finish_row_drop(dragged, &id, Some(RowDrop::Origin), window, cx);
+                    return;
+                }
+                this.finish_drag();
+                cx.notify();
             }))
             .child({
                 self.top_bar(crate::held_hints::opacity(window, cx), colors, cx)
@@ -8984,9 +9309,7 @@ impl Sidebar {
         }
         root = root.children(self.pane_new_tab_slot(false, cx));
         self.animate_pane_drop(window, cx);
-        if let Some(proposal) = self.ui.pending_sibling.clone() {
-            root = root.child(self.sibling_confirmation(proposal, colors, cx));
-        } else if let Some(notice) = self.ui.delegation_notice.clone() {
+        if let Some(notice) = self.ui.delegation_notice.clone() {
             root = root.child(self.delegation_notice(notice, colors, cx));
         }
         root
@@ -9094,6 +9417,45 @@ fn sibling_run(projection: &crate::store::SidebarProjection, id: &SessionId) -> 
         .filter(|row| row.session.parent == parent)
         .map(|row| row.id().clone())
         .collect()
+}
+
+/// Edge autoscroll speed for a pointer at `y` over a list spanning `top` to
+/// `bottom`: ramps from nothing at `AUTOSCROLL_EDGE` inside an edge to
+/// `AUTOSCROLL_MAX_STEP` at the edge and beyond it, so a pointer dragged past
+/// the list keeps it moving at full speed.
+fn autoscroll_step(top: f32, bottom: f32, y: f32) -> f32 {
+    let edge = AUTOSCROLL_EDGE.min((bottom - top) / 3.0).max(1.0);
+    let ramp = |depth: f32| {
+        let t = (depth / edge).clamp(0.0, 1.0);
+        AUTOSCROLL_MAX_STEP * t * t
+    };
+    if y < top + edge {
+        -ramp(top + edge - y)
+    } else if y > bottom - edge {
+        ramp(y - (bottom - edge))
+    } else {
+        0.0
+    }
+}
+
+/// Why a dragged session cannot be filed under another project, or `None`
+/// when it can. A spawned session stays with the session that started it,
+/// and a project never crosses machines: its id carries the host.
+fn rehome_refusal(
+    archived: bool,
+    has_parent: bool,
+    source_host: Option<Option<String>>,
+    target_host: &Option<String>,
+) -> Option<String> {
+    if archived {
+        Some(t("sidebar.notice.move_archived").to_owned())
+    } else if has_parent {
+        Some(t("sidebar.notice.move_child").to_owned())
+    } else if source_host.is_some_and(|host| &host != target_host) {
+        Some(t("sidebar.notice.move_other_host").to_owned())
+    } else {
+        None
+    }
 }
 
 /// Rows sit a couple of pixels apart, so the marker under one row and the
@@ -11650,12 +12012,11 @@ mod tests {
     fn drag_state(
         sidebar: &Entity<Sidebar>,
         cx: &VisualTestContext,
-    ) -> (bool, Option<String>, bool) {
+    ) -> (bool, Option<String>) {
         sidebar.read_with(cx, |sidebar, _| {
             (
                 sidebar.ui.drag.is_some(),
                 sidebar.ui.delegation_notice.clone(),
-                sidebar.ui.pending_sibling.is_some(),
             )
         })
     }
@@ -11748,7 +12109,7 @@ mod tests {
         drag_and_release(cx, archived.center(), target.center());
         assert_drag_source_revived(&sidebar, cx);
         assert!(handoffs.borrow().is_empty());
-        assert_eq!(drag_state(&sidebar, cx), (false, None, false));
+        assert_eq!(drag_state(&sidebar, cx), (false, None));
     }
 
     #[gpui::test]
@@ -11781,7 +12142,7 @@ mod tests {
         cx.simulate_mouse_up(target.center(), MouseButton::Left, Modifiers::default());
         assert_drag_source_revived(&sidebar, cx);
         assert!(handoffs.borrow().is_empty());
-        assert_eq!(drag_state(&sidebar, cx), (false, None, false));
+        assert_eq!(drag_state(&sidebar, cx), (false, None));
     }
 
     fn project_order(sidebar: &Entity<Sidebar>, cx: &VisualTestContext) -> Vec<String> {
@@ -12044,7 +12405,7 @@ mod tests {
         cx.simulate_mouse_move(wobble, MouseButton::Left, Modifiers::default());
         cx.simulate_mouse_up(wobble, MouseButton::Left, Modifiers::default());
 
-        assert_eq!(drag_state(&sidebar, cx), (false, None, false));
+        assert_eq!(drag_state(&sidebar, cx), (false, None));
         assert!(handoffs.borrow().is_empty());
         sidebar.read_with(cx, |sidebar, _| {
             assert_eq!(
@@ -12060,38 +12421,50 @@ mod tests {
     }
 
     #[gpui::test]
-    fn dropping_onto_a_row_proposes_a_handoff(cx: &mut TestAppContext) {
+    fn dropping_onto_a_row_never_proposes_a_handoff(cx: &mut TestAppContext) {
         let (sidebar, handoffs, cx) = drag_harness(cx);
         let claude = row_bounds(&sidebar, cx, "preview-claude");
         let codex = row_bounds(&sidebar, cx, "preview-codex");
+        let cursor = row_bounds(&sidebar, cx, "preview-cursor");
 
+        // A pinned row onto an unpinned sibling, and onto a cousin.
         drag_and_release(cx, claude.center(), codex.center());
+        drag_and_release(cx, claude.center(), cursor.center());
 
-        let handoffs = handoffs.borrow();
-        assert_eq!(handoffs.len(), 1);
-        assert_eq!(handoffs[0].source_id, SessionId::new("preview-claude"));
-        assert_eq!(handoffs[0].target_id, SessionId::new("preview-codex"));
-        assert_eq!(drag_state(&sidebar, cx), (false, None, false));
+        assert!(handoffs.borrow().is_empty());
+        assert_eq!(drag_state(&sidebar, cx), (false, None));
         assert_eq!(
             top_level_run(&sidebar, cx),
             ["preview-claude", "preview-codex", "preview-shell"],
-            "a drop onto the core never reorders"
+            "the pin boundary and a cousin both leave the order alone"
         );
     }
 
     #[gpui::test]
-    fn dropping_below_a_sibling_reorders_after_it(cx: &mut TestAppContext) {
+    fn a_held_row_trades_places_live_and_the_release_keeps_it(cx: &mut TestAppContext) {
         let (sidebar, handoffs, cx) = drag_harness(cx);
         let codex = row_bounds(&sidebar, cx, "preview-codex");
         let shell = row_bounds(&sidebar, cx, "preview-shell");
         let below = point(shell.center().x, shell.bottom() - px(2.0));
+        let _ = haptics::testing::take();
 
         drag_to(cx, codex.center(), below);
-        assert!(
-            cx.debug_bounds("insertion-marker:After").is_some(),
-            "the lower band shows an insertion marker under the target"
+        assert_eq!(
+            top_level_run(&sidebar, cx),
+            ["preview-claude", "preview-shell", "preview-codex"],
+            "the sibling steps aside before the release"
         );
-        assert!(cx.debug_bounds("insertion-marker:Before").is_none());
+        assert_eq!(
+            haptics::testing::take(),
+            [(
+                Haptic::Snap,
+                haptics::key("session-slot", SessionId::new("preview-shell"))
+            )]
+        );
+        assert!(
+            cx.debug_bounds("insertion-marker:After").is_none(),
+            "a live reorder draws no insertion line"
+        );
         cx.simulate_mouse_up(below, MouseButton::Left, Modifiers::default());
 
         assert_eq!(
@@ -12099,101 +12472,149 @@ mod tests {
             ["preview-claude", "preview-shell", "preview-codex"]
         );
         assert!(handoffs.borrow().is_empty());
-        assert_eq!(drag_state(&sidebar, cx), (false, None, false));
-        assert!(cx.debug_bounds("insertion-marker:After").is_none());
+        assert_eq!(drag_state(&sidebar, cx), (false, None));
+        assert!(sidebar.read_with(cx, |sidebar, _| !sidebar.ui.order_dirty));
     }
 
     #[gpui::test]
-    fn dropping_above_a_sibling_reorders_before_it(cx: &mut TestAppContext) {
-        let (sidebar, handoffs, cx) = drag_harness(cx);
-        let codex = row_bounds(&sidebar, cx, "preview-codex");
+    fn escape_puts_a_live_session_reorder_back(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
         let shell = row_bounds(&sidebar, cx, "preview-shell");
+        let codex = row_bounds(&sidebar, cx, "preview-codex");
         let above = point(codex.center().x, codex.top() + px(2.0));
 
         drag_to(cx, shell.center(), above);
-        assert!(cx.debug_bounds("insertion-marker:Before").is_some());
-        cx.simulate_mouse_up(above, MouseButton::Left, Modifiers::default());
-
         assert_eq!(
             top_level_run(&sidebar, cx),
             ["preview-claude", "preview-shell", "preview-codex"]
         );
-        assert!(handoffs.borrow().is_empty());
-    }
-
-    #[gpui::test]
-    fn a_pinned_row_never_offers_to_reorder_across_the_pin_boundary(cx: &mut TestAppContext) {
-        // preview-claude is pinned, so the projection keeps it above every
-        // unpinned sibling; a marker there would promise a move that never
-        // lands. Its bands offer the handoff instead, like a cousin's.
-        let (sidebar, handoffs, cx) = drag_harness(cx);
-        let claude = row_bounds(&sidebar, cx, "preview-claude");
-        let shell = row_bounds(&sidebar, cx, "preview-shell");
-        let below = point(shell.center().x, shell.bottom() - px(2.0));
-
-        drag_to(cx, claude.center(), below);
-        assert!(cx.debug_bounds("insertion-marker:After").is_none());
-        cx.simulate_mouse_up(below, MouseButton::Left, Modifiers::default());
-
-        assert_eq!(handoffs.borrow().len(), 1);
+        assert!(sidebar.update(cx, |sidebar, cx| sidebar.cancel_active_drag(cx)));
+        cx.simulate_mouse_up(above, MouseButton::Left, Modifiers::default());
         assert_eq!(
             top_level_run(&sidebar, cx),
             ["preview-claude", "preview-codex", "preview-shell"]
         );
+        assert!(sidebar.read_with(cx, |sidebar, _| !sidebar.ui.order_dirty));
+    }
+
+    fn project_of(sidebar: &Entity<Sidebar>, cx: &VisualTestContext, id: &str) -> String {
+        sidebar.read_with(cx, |sidebar, _| {
+            sidebar.store.read().expect("store").sessions()[&SessionId::new(id)]
+                .project_id
+                .0
+                .clone()
+        })
     }
 
     #[gpui::test]
-    fn the_insertion_marker_ticks_once_per_gap_and_handoff_rows_stay_silent(
-        cx: &mut TestAppContext,
-    ) {
-        let (sidebar, _, cx) = drag_harness(cx);
-        let claude = row_bounds(&sidebar, cx, "preview-claude");
-        let codex = row_bounds(&sidebar, cx, "preview-codex");
-        let shell = row_bounds(&sidebar, cx, "preview-shell");
-        let x = shell.center().x;
-        let move_to = |cx: &mut VisualTestContext, to: Point<Pixels>| {
-            cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::default());
-            cx.run_until_parked();
-        };
-        let _ = haptics::testing::take();
-
-        // Lifting the row and crossing a pinned cousin's bands and another
-        // row's core offers handoffs only: every row is one, so none ticks.
-        drag_to(cx, codex.center(), claude.center());
-        move_to(cx, point(x, claude.bottom() - px(2.0)));
-        move_to(cx, shell.center());
-        assert_eq!(haptics::testing::take(), []);
-
-        // The marker appears under the last row: one tick, and none for
-        // moving on inside the same band or for holding still there.
-        let below = point(x, shell.bottom() - px(2.0));
-        move_to(cx, below);
-        assert!(cx.debug_bounds("insertion-marker:After").is_some());
-        let ticks = haptics::testing::take();
-        assert_eq!(ticks.len(), 1);
-        assert_eq!(ticks[0].0, Haptic::Snap);
-        move_to(cx, below - point(px(0.0), px(1.0)));
-        move_to(cx, below - point(px(0.0), px(1.0)));
-        assert_eq!(haptics::testing::take(), []);
-
-        // Back onto the core the marker goes away, silently; a different
-        // gap is a different slot, and ticks at once.
-        move_to(cx, shell.center());
-        assert_eq!(haptics::testing::take(), []);
-        move_to(cx, point(x, shell.top() + px(2.0)));
-        assert!(cx.debug_bounds("insertion-marker:Before").is_some());
-        let above = haptics::testing::take();
-        assert_eq!(above.len(), 1);
-        assert_ne!(above[0].1, ticks[0].1, "each gap is its own target");
-
-        // Releasing into the slot adds nothing: the hand already felt it.
-        cx.simulate_mouse_up(
-            point(x, shell.top() + px(2.0)),
-            MouseButton::Left,
-            Modifiers::default(),
-        );
+    fn dropping_beside_another_projects_row_moves_the_session_there(cx: &mut TestAppContext) {
+        let (sidebar, handoffs, cx) = drag_harness(cx);
+        sidebar.update(cx, |sidebar, cx| {
+            let _ = sidebar
+                .store
+                .write()
+                .expect("store")
+                .toggle_project_collapsed(ProjectId::new("preview-anara"));
+            cx.notify();
+        });
+        // Let the disclosure open, then paint the rows it revealed.
         cx.run_until_parked();
-        assert_eq!(haptics::testing::take(), []);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        for _ in 0..2 {
+            sidebar.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+        }
+        let shell = row_bounds(&sidebar, cx, "preview-shell");
+        let gemini = row_bounds(&sidebar, cx, "preview-gemini");
+        let above = point(gemini.center().x, gemini.top() + px(3.0));
+
+        drag_to(cx, shell.center(), above);
+        assert!(
+            cx.debug_bounds("insertion-marker:Before").is_some(),
+            "another project's row shows where the session would land"
+        );
+        cx.simulate_mouse_up(above, MouseButton::Left, Modifiers::default());
+
+        assert_eq!(project_of(&sidebar, cx, "preview-shell"), "preview-anara");
+        assert!(handoffs.borrow().is_empty());
+        assert_eq!(drag_state(&sidebar, cx), (false, None));
+        sidebar.read_with(cx, |sidebar, _| {
+            let mut store = sidebar.store.write().expect("store");
+            let run = sibling_run(&store.sidebar_projection(), &SessionId::new("preview-gemini"));
+            let position = |id: &str| run.iter().position(|row| row.0 == id);
+            assert_eq!(
+                position("preview-shell").map(|index| index + 1),
+                position("preview-gemini"),
+                "it lands right above the row it was dropped on"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn dropping_on_another_projects_header_moves_the_session_there(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        let codex = row_bounds(&sidebar, cx, "preview-codex");
+        let anara = cx.debug_bounds("PROJECT_preview-anara").unwrap();
+
+        drag_and_release(cx, codex.center(), anara.center());
+
+        assert_eq!(project_of(&sidebar, cx, "preview-codex"), "preview-anara");
+        assert_eq!(
+            project_of(&sidebar, cx, "preview-cursor"),
+            "preview-anara",
+            "the sessions it spawned go with it"
+        );
+    }
+
+    #[gpui::test]
+    fn a_spawned_session_stays_with_its_parent(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        let cursor = row_bounds(&sidebar, cx, "preview-cursor");
+        let anara = cx.debug_bounds("PROJECT_preview-anara").unwrap();
+
+        drag_and_release(cx, cursor.center(), anara.center());
+
+        assert_eq!(project_of(&sidebar, cx, "preview-cursor"), "preview-dirijor");
+        assert_eq!(
+            drag_state(&sidebar, cx).1.as_deref(),
+            Some(t("sidebar.notice.move_child"))
+        );
+    }
+
+    #[test]
+    fn autoscroll_ramps_up_toward_each_edge_and_rests_in_between() {
+        assert_eq!(autoscroll_step(100.0, 600.0, 350.0), 0.0);
+        assert_eq!(autoscroll_step(100.0, 600.0, 100.0 + AUTOSCROLL_EDGE), 0.0);
+        let near_top = autoscroll_step(100.0, 600.0, 110.0);
+        let at_top = autoscroll_step(100.0, 600.0, 100.0);
+        assert!(near_top < 0.0 && at_top < near_top, "faster at the edge");
+        assert_eq!(autoscroll_step(100.0, 600.0, 40.0), -AUTOSCROLL_MAX_STEP);
+        assert_eq!(autoscroll_step(100.0, 600.0, 700.0), AUTOSCROLL_MAX_STEP);
+        assert!(autoscroll_step(100.0, 600.0, 590.0) > 0.0);
+    }
+
+    #[test]
+    fn row_shift_carries_the_traded_stretch_into_its_new_slots() {
+        let id = |name: &str| SessionId::new(name);
+        let layout: HashMap<SessionId, row_window::Span> = [
+            ("a", 0.0, 30.0),
+            ("b", 32.0, 62.0),
+            ("c", 64.0, 124.0),
+            ("d", 126.0, 156.0),
+        ]
+        .into_iter()
+        .map(|(name, top, bottom)| (id(name), row_window::Span::new(top, bottom)))
+        .collect();
+        // b moves below the taller c: c rises by b's slot, b drops by c's.
+        let deltas = row_shift_deltas(
+            &[id("a"), id("b"), id("c"), id("d")],
+            &[id("a"), id("c"), id("b"), id("d")],
+            &layout,
+            &HashMap::new(),
+        );
+        assert_eq!(deltas.len(), 2, "rows outside the trade stay put: {deltas:?}");
+        assert_eq!(deltas[&id("c")], 32.0);
+        assert_eq!(deltas[&id("b")], -62.0);
     }
 
     #[test]
@@ -12274,26 +12695,6 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_cousin_row_offers_a_handoff_from_every_band(cx: &mut TestAppContext) {
-        // preview-cursor is codex's child: not a sibling of claude, so its
-        // bands cannot mean "reorder" and fall back to the drop-onto action.
-        let (sidebar, handoffs, cx) = drag_harness(cx);
-        let claude = row_bounds(&sidebar, cx, "preview-claude");
-        let cursor = row_bounds(&sidebar, cx, "preview-cursor");
-        let edge = point(cursor.center().x, cursor.top() + px(2.0));
-
-        drag_to(cx, claude.center(), edge);
-        assert!(cx.debug_bounds("insertion-marker:Before").is_none());
-        cx.simulate_mouse_up(edge, MouseButton::Left, Modifiers::default());
-
-        assert_eq!(handoffs.borrow().len(), 1);
-        assert_eq!(
-            top_level_run(&sidebar, cx),
-            ["preview-claude", "preview-codex", "preview-shell"]
-        );
-    }
-
-    #[gpui::test]
     fn escape_cancels_a_drag_so_the_release_does_nothing(cx: &mut TestAppContext) {
         let (sidebar, handoffs, cx) = drag_harness(cx);
         let claude = row_bounds(&sidebar, cx, "preview-claude");
@@ -12310,7 +12711,7 @@ mod tests {
         cx.simulate_mouse_up(codex.center(), MouseButton::Left, Modifiers::default());
 
         assert!(handoffs.borrow().is_empty());
-        assert_eq!(drag_state(&sidebar, cx), (false, None, false));
+        assert_eq!(drag_state(&sidebar, cx), (false, None));
     }
 
     #[gpui::test]
@@ -12321,11 +12722,11 @@ mod tests {
         // The gap between two rows used to be the whole-list sibling target.
         let gap = point(claude.center().x, claude.bottom() + px(0.5));
         drag_and_release(cx, claude.center(), gap);
-        assert_eq!(drag_state(&sidebar, cx), (false, None, false));
+        assert_eq!(drag_state(&sidebar, cx), (false, None));
 
         // Chrome that accepts nothing: the top bar.
         drag_and_release(cx, claude.center(), point(px(100.0), px(8.0)));
-        assert_eq!(drag_state(&sidebar, cx), (false, None, false));
+        assert_eq!(drag_state(&sidebar, cx), (false, None));
 
         assert!(handoffs.borrow().is_empty());
         assert_eq!(
@@ -12335,18 +12736,8 @@ mod tests {
     }
 
     #[gpui::test]
-    fn the_fan_out_zone_appears_during_a_drag_and_proposes_a_sibling(cx: &mut TestAppContext) {
+    fn dragging_a_session_out_below_the_projects_moves_it_home(cx: &mut TestAppContext) {
         let (sidebar, handoffs, cx) = drag_harness(cx);
-        sidebar.update(cx, |sidebar, _| {
-            let mut store = sidebar.store.write().expect("session store lock poisoned");
-            let mut record = (**store
-                .sessions()
-                .get(&SessionId::new("preview-codex"))
-                .expect("fixture session"))
-            .clone();
-            record.originating_prompt = Some("Ship the parser".to_owned());
-            store.upsert_session(record);
-        });
         let codex = row_bounds(&sidebar, cx, "preview-codex");
         assert!(
             cx.debug_bounds("sidebar-fan-out-zone").is_none(),
@@ -12356,16 +12747,29 @@ mod tests {
         drag_to(cx, codex.center(), codex.center() + point(px(0.0), px(6.0)));
         let zone = cx
             .debug_bounds("sidebar-fan-out-zone")
-            .expect("a live session drag offers the fan-out zone");
+            .expect("a live session drag offers the home zone");
         cx.simulate_mouse_move(zone.center(), MouseButton::Left, Modifiers::default());
         cx.simulate_mouse_up(zone.center(), MouseButton::Left, Modifiers::default());
 
-        let proposal = sidebar
-            .read_with(cx, |sidebar, _| sidebar.ui.pending_sibling.clone())
-            .expect("the zone proposes a sibling for confirmation");
-        assert_eq!(proposal.source_id, SessionId::new("preview-codex"));
-        assert_eq!(proposal.prompt, "Ship the parser");
+        let home = diri_platform::home_dir()
+            .expect("home")
+            .to_string_lossy()
+            .into_owned();
+        let effects = sidebar.update(cx, |sidebar, _| {
+            let receiver = sidebar._preview_effects.as_mut().expect("preview effects");
+            std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>()
+        });
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                StoreEffect::SetProject(params)
+                    if params.session_id == SessionId::new("preview-codex")
+                        && params.project_root.as_deref() == Some(home.as_str())
+            )),
+            "asks the Engine to file it under the home folder: {effects:?}"
+        );
         assert!(handoffs.borrow().is_empty());
+        assert_eq!(drag_state(&sidebar, cx), (false, None));
         assert!(cx.debug_bounds("sidebar-fan-out-zone").is_none());
     }
 

@@ -83,6 +83,7 @@ Call one as `diri.call("session.list")` or through its generated function, `diri
 | `diri.computer.setup` | `action` | `ComputerStatus` | Install or restart computer use. |
 | `diri.session.migrate` | `sessionID, targetHost?` | `SessionRecord` | Move a Claude session between this Mac and a host. |
 | `diri.session.reparent_worktree` | `sessionID, projectRoot, worktreePath` | `SessionRecord` | Record that a session now works in another worktree. |
+| `diri.session.set_project` | `sessionID, projectID?, projectRoot?` | `SessionRecord` | File a session and its children under another project. |
 | `diri.host.sync_prefs` | `host` | `PrefsSyncReport` | Push Agent preferences to a remote host. |
 | `diri.host.locate_repo` | `host?, originURL?, sessionID?` | `HostLocateRepoResult` | Find a session's repository on a host. |
 | `diri.host.initialize` | `host, forceReinstall?` | `HostInitializeResult` | Install or verify the remote Helper on a host. |

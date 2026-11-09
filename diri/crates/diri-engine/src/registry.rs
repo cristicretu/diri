@@ -2250,6 +2250,59 @@ impl Registry {
         project
     }
 
+    /// Files `id` and every session it spawned under `project`, which must
+    /// already be a known project on the session's own host. The project id
+    /// carries the host namespace, so a match proves both. Processes keep
+    /// their working directories; only the grouping (and what a restart
+    /// reloads it as) changes. Returns the ids that moved.
+    pub fn set_project(
+        &mut self,
+        id: &str,
+        project: &diri_proto::ProjectId,
+    ) -> Result<Vec<String>, SetProjectError> {
+        let record = self
+            .records
+            .get(id)
+            .ok_or_else(|| SetProjectError::NotFound(id.to_owned()))?;
+        let root = self
+            .projects
+            .iter()
+            .find(|candidate| {
+                candidate.get("id").and_then(|value| value.as_str()) == Some(project.0.as_str())
+            })
+            .and_then(|candidate| candidate.get("root").and_then(|value| value.as_str()))
+            .ok_or_else(|| SetProjectError::UnknownProject(project.0.clone()))?;
+        if session_project_id(root, record.host.as_deref()) != *project {
+            return Err(SetProjectError::OtherHost);
+        }
+        let mut moved = vec![id.to_owned()];
+        let mut index = 0;
+        while index < moved.len() {
+            let parent = moved[index].clone();
+            let children: Vec<String> = self
+                .records
+                .values()
+                .filter(|child| child.parent.as_ref().is_some_and(|p| p.0 == parent))
+                .map(|child| child.id.0.clone())
+                .filter(|child| !moved.contains(child))
+                .collect();
+            moved.extend(children);
+            index += 1;
+        }
+        let now = DateMillis::from(std::time::SystemTime::now());
+        let mut changed = Vec::new();
+        for moved_id in moved {
+            if let Some(record) = self.records.get_mut(&moved_id)
+                && record.project_id != *project
+            {
+                record.project_id = project.clone();
+                record.updated_at = now;
+                changed.push(moved_id);
+            }
+        }
+        Ok(changed)
+    }
+
     pub fn rename(&mut self, id: &str, title: &str) -> std::io::Result<()> {
         let record = self.records.get_mut(id).ok_or_else(|| not_found(id))?;
         record.title = title.to_string();
@@ -3455,6 +3508,14 @@ impl CompletedRunHandle {
 
 fn ensure_private_dir(directory: &Path) -> std::io::Result<()> {
     diri_platform::security::private_dir_all(directory)
+}
+
+/// Why [`Registry::set_project`] refused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SetProjectError {
+    NotFound(String),
+    UnknownProject(String),
+    OtherHost,
 }
 
 fn not_found(id: &str) -> std::io::Error {

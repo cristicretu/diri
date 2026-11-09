@@ -197,6 +197,8 @@ pub enum StoreEffect {
         id: SessionId,
         title: String,
     },
+    /// `session.set_project` — file a session under another project.
+    SetProject(diri_proto::SessionSetProjectParams),
     Spawn(SessionSpawnParams),
     /// An agent started from a note's to-do: spawned without selecting it,
     /// its id linked back into the to-do (see `work_items`).
@@ -3252,6 +3254,59 @@ impl SessionStore {
             || !self.pending_app_performs.is_empty()
     }
 
+    /// Files `id` and the sessions it spawned under `project` right away;
+    /// the Engine confirms (or a resync puts them back) with its own records.
+    pub fn set_session_project(&mut self, id: SessionId, project: ProjectId) {
+        self.refile_session(&id, project.clone());
+        self.emit(StoreEffect::SetProject(diri_proto::SessionSetProjectParams {
+            session_id: id,
+            project_id: Some(project),
+            project_root: None,
+        }));
+    }
+
+    /// Files `id` under the local folder `root`, which the Engine makes a
+    /// project if it is not one yet. Shown at once when the project is
+    /// already listed; otherwise the Engine's update moves the row.
+    pub fn set_session_project_root(&mut self, id: SessionId, root: String) {
+        if let Some(project) = self
+            .projects
+            .values()
+            .find(|project| project.root == root && project.host.is_none())
+            .map(|project| project.id.clone())
+        {
+            self.refile_session(&id, project);
+        }
+        self.emit(StoreEffect::SetProject(diri_proto::SessionSetProjectParams {
+            session_id: id,
+            project_id: None,
+            project_root: Some(root),
+        }));
+    }
+
+    fn refile_session(&mut self, id: &SessionId, project: ProjectId) {
+        let mut moved = vec![id.clone()];
+        let mut index = 0;
+        while index < moved.len() {
+            let parent = moved[index].clone();
+            let children: Vec<SessionId> = self
+                .sessions
+                .values()
+                .filter(|child| child.parent.as_ref() == Some(&parent))
+                .map(|child| child.id.clone())
+                .filter(|child| !moved.contains(child))
+                .collect();
+            moved.extend(children);
+            index += 1;
+        }
+        for moved_id in &moved {
+            if let Some(session) = self.sessions.get_mut(moved_id) {
+                Arc::make_mut(session).project_id = project.clone();
+            }
+        }
+        self.invalidate_projection();
+    }
+
     pub fn rename(&mut self, id: SessionId, title: impl Into<String>) {
         let title = title.into();
         if let Some(session) = self.sessions.get_mut(&id) {
@@ -4735,6 +4790,7 @@ async fn run_effects(
             StoreEffect::Archive(id) => client.archive(&id).await,
             StoreEffect::Unarchive(id) => client.unarchive(&id).await,
             StoreEffect::Rename { id, title } => client.rename(&id, title).await,
+            StoreEffect::SetProject(params) => client.set_project(&params).await,
             StoreEffect::WorkspaceSpawn { id, params } => {
                 workspace_tasks.spawn(workspace_spawn::run(
                     id,
@@ -5194,6 +5250,7 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         } => ("Resume session failed", None),
         StoreEffect::Archive(_) => ("Archive session failed", None),
         StoreEffect::Unarchive(_) => ("Restore session failed", None),
+        StoreEffect::SetProject(_) => ("Move session to project failed", None),
         StoreEffect::Rename { id, title } => (
             "Rename session failed",
             Some(RetryAction::Rename {

@@ -1,8 +1,6 @@
 {
-  "delegation.refusal.archived_fan_out": "已归档的会话无法分派。",
   "delegation.refusal.cannot_resume": "移到其他工作树后，该会话将无法恢复。",
   "delegation.refusal.descendant": "会话不能把工作委派给它的下级会话。",
-  "delegation.refusal.no_prompt": "这个较早的会话没有可用的初始提示词。",
   "delegation.refusal.other_project": "请从该会话当前所在的项目中选择工作树。",
   "delegation.refusal.remote_move": "远程会话无法移入本地工作树。",
   "delegation.refusal.same_worktree": "该会话已关联到此工作树。",

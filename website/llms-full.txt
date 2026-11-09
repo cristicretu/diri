@@ -531,10 +531,10 @@ Sessions are grouped by project folder. Sessions started by another agent nest u
 | --- | --- |
 | Rename | Double-click the row, <kbd>⌘</kbd><kbd>R</kbd>, or **Rename…** |
 | Pin | **Pin Session** in the row's menu |
-| Reorder | Drag between rows, or <kbd>⌃</kbd><kbd>⌘</kbd><kbd>↑</kbd> / <kbd>↓</kbd> |
+| Reorder | Drag the row up or down, or <kbd>⌃</kbd><kbd>⌘</kbd><kbd>↑</kbd> / <kbd>↓</kbd> |
 | Reorder projects | Drag the project header |
-| Hand off work | Drop a session onto another session's row |
-| Start a sibling with the same prompt | Drop a session on the zone below the last project |
+| Move to another project | Drop the session on that project's header or beside one of its rows |
+| Move to the home folder | Drag the session out to the zone below the last project |
 | Archive | **Archive Session**, or <kbd>⌥</kbd><kbd>⇧</kbd><kbd>⌘</kbd><kbd>W</kbd> |
 | Remove | **Remove from Sidebar**, or <kbd>⌘</kbd><kbd>W</kbd> |
 | Close a project | **Close All Sessions** on the project |
@@ -655,12 +655,9 @@ When helpers worked in separate worktrees, review each one in the Review panel a
 Try asking the lead agent: "Use diri to give each sub-task its own agent in a separate worktree, review their changes, and merge only the ones whose tests pass." See [Let agents work as a team](/guides/agent-teams/).
 
 ## Hand work to another session
-- **Keyboard.** Select the source session and press <kbd>⌃</kbd><kbd>⌘</kbd><kbd>D</kbd>, select the target, and press it again.
-- **Drag and drop.** Drop a session onto another session's row to hand its work to that session.
+Select the source session and press <kbd>⌃</kbd><kbd>⌘</kbd><kbd>D</kbd>, select the target, and press it again.
 
-Either way, a handoff sheet opens with the generated context. You can edit it, remote targets carry a Remote badge, and nothing is sent until you click **Send handoff** or press Return. Esc cancels.
-
-Dropping a session on the zone below the last project instead starts a sibling with the same prompt.
+A handoff sheet opens with the generated context. You can edit it, remote targets carry a Remote badge, and nothing is sent until you click **Send handoff** or press Return. Esc cancels.
 
 ## Clean up
 Open **Settings → Worktrees** to see the linked worktrees of your local projects, with their age and pull request state (Open, Merged or Closed). Filter by **All**, **Ready to clean** or **Older than 30 days**. Each worktree shows what keeps it from being cleaned up:
@@ -711,6 +708,8 @@ Type <kbd>/</kbd> for the block menu or <kbd>@</kbd> to mention something. Markd
 | Divider | `---` | |
 
 The `/` menu adds **Callout**, **Table** and **Image**. Callouts are stored as GitHub alerts such as `> [!NOTE]`. Tables are GFM tables; <kbd>⌃</kbd><kbd>↵</kbd> opens the table menu for inserting rows and columns, alignment and deleting. Pasted or dropped images are saved next to the note, up to 25 MB each.
+
+**Diagram** adds a [Mermaid](https://mermaid.js.org) diagram: a code block fenced ` ```mermaid `, drawn in place as flowcharts, sequence, class, state, ER, pie, Gantt, mindmap and git graphs. Click a diagram to edit its source, with the drawing updating below it as you type. Notes written by agents or pasted from elsewhere draw their ` ```mermaid ` blocks the same way.
 
 Tick a to-do with <kbd>⌘</kbd><kbd>↵</kbd>. Move a block with <kbd>⌥</kbd><kbd>⇧</kbd><kbd>↑</kbd> / <kbd>↓</kbd>. The full list is in [Keyboard shortcuts](/docs/keyboard-shortcuts/#notes).
 
@@ -1720,7 +1719,7 @@ Replace everything under one heading of a Diri note, up to the next heading of t
 
 ### `create_note`
 
-Write a new Diri note for the person, e.g. an explanation ("how sign-in works") or a write-up. markdown is rich Markdown: headings, lists, to-dos, links, quotes, code. Link the notes it builds on or relates to by writing [[Note title]]: each becomes a link to that note (linked_notes lists them; unlinked_titles matched no single note), and the linked note shows this one among its backlinks. It appears under you in the sidebar, in your project (or project, a folder); open:true shows it to the person right away. Use this for anything longer than a write_note entry.
+Write a new Diri note for the person, e.g. an explanation ("how sign-in works") or a write-up. markdown is rich Markdown: headings, lists, to-dos, links, quotes, code, and Mermaid diagrams (a ```mermaid code block, drawn as the diagram). Link the notes it builds on or relates to by writing [[Note title]]: each becomes a link to that note (linked_notes lists them; unlinked_titles matched no single note), and the linked note shows this one among its backlinks. It appears under you in the sidebar, in your project (or project, a folder); open:true shows it to the person right away. Use this for anything longer than a write_note entry.
 
 | Argument | Type | Notes |
 | --- | --- | --- |

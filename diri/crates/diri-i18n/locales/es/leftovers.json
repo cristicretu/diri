@@ -1,8 +1,6 @@
 {
-  "delegation.refusal.archived_fan_out": "Las sesiones archivadas no se pueden repartir.",
   "delegation.refusal.cannot_resume": "Esta sesión no se puede reanudar tras moverla a otro árbol de trabajo.",
   "delegation.refusal.descendant": "Una sesión no puede delegar trabajo a una de sus descendientes.",
-  "delegation.refusal.no_prompt": "El prompt original no está disponible para esta sesión antigua.",
   "delegation.refusal.other_project": "Elige un árbol de trabajo del proyecto actual de la sesión.",
   "delegation.refusal.remote_move": "Las sesiones remotas no se pueden mover a un árbol de trabajo local.",
   "delegation.refusal.same_worktree": "La sesión ya está vinculada a este árbol de trabajo.",

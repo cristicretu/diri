@@ -1,8 +1,6 @@
 {
-  "delegation.refusal.archived_fan_out": "Archived sessions cannot be fanned out.",
   "delegation.refusal.cannot_resume": "This session cannot resume after moving to another worktree.",
   "delegation.refusal.descendant": "A session cannot delegate work to one of its descendants.",
-  "delegation.refusal.no_prompt": "The originating prompt is unavailable for this older session.",
   "delegation.refusal.other_project": "Choose a worktree from the session's current project.",
   "delegation.refusal.remote_move": "Remote sessions cannot move into a local worktree.",
   "delegation.refusal.same_worktree": "The session is already attached to this worktree.",

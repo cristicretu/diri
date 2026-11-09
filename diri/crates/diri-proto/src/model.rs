@@ -304,6 +304,7 @@ impl std::fmt::Display for SessionId {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ProjectId(pub String);
 
 /// Swift spelling retained for protocol-oriented callers.

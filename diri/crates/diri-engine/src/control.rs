@@ -1437,6 +1437,7 @@ impl ControlServer {
             Method::HOST_LIST => encode(&crate::wsl::catalog(self.hosts_file())),
             Method::SESSION_MIGRATE => self.session_migrate(params),
             Method::SESSION_REPARENT_WORKTREE => self.session_reparent_worktree(params),
+            Method::SESSION_SET_PROJECT => self.session_set_project(params),
             Method::HOST_LOCATE_REPO => self.host_locate_repo(params),
             Method::HOOK_REPORT => self.hook_report(params),
             Method::VOICE_STATE => encode(&diri_proto::voice::VoiceStateResult {
@@ -2777,6 +2778,59 @@ impl ControlServer {
     /// Moves an ended resumable session record to a different checkout of the
     /// same repository. The app proposes this from cached overview data, but
     /// confirmation always lands here for authoritative revalidation.
+    fn session_set_project(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        use crate::registry::SetProjectError;
+        let p: diri_proto::SessionSetProjectParams = decode(params)?;
+        let mut registry = self.registry.lock().map_err(poisoned)?;
+        let project = match (p.project_id, p.project_root) {
+            (Some(id), None) => id,
+            (None, Some(root)) => {
+                if root.trim().is_empty() || !root.starts_with('/') {
+                    return Err(ControlError::bad_request(
+                        "projectRoot must be an absolute path",
+                    ));
+                }
+                let host = registry
+                    .record(&p.session_id.0)
+                    .ok_or_else(|| {
+                        ControlError::not_found(format!("no session {}", p.session_id.0))
+                    })?
+                    .host;
+                self.ensure_published_project(&mut registry, &root, host.as_deref());
+                crate::registry::session_project_id(&root, host.as_deref())
+            }
+            _ => {
+                return Err(ControlError::bad_request(
+                    "give exactly one of projectID and projectRoot",
+                ));
+            }
+        };
+        let moved =
+            registry
+                .set_project(&p.session_id.0, &project)
+                .map_err(|error| match error {
+                    SetProjectError::NotFound(id) => {
+                        ControlError::not_found(format!("no session {id}"))
+                    }
+                    SetProjectError::UnknownProject(id) => {
+                        ControlError::not_found(format!("no project {id}"))
+                    }
+                    SetProjectError::OtherHost => ControlError::bad_request(
+                        "the project is on another machine; move the session there first",
+                    ),
+                })?;
+        if !moved.is_empty() {
+            let _ = registry.persist();
+        }
+        for id in &moved {
+            self.publish_updated(&registry, id);
+        }
+        let record = registry
+            .record(&p.session_id.0)
+            .ok_or_else(|| ControlError::not_found(format!("no session {}", p.session_id.0)))?;
+        encode(&record)
+    }
+
     fn session_reparent_worktree(
         &self,
         params: Option<JsonValue>,
@@ -11643,6 +11697,108 @@ mod tests {
             .expect("persisted moved session");
         assert_eq!(persisted["cwd"], target.to_string_lossy().as_ref());
         assert_eq!(persisted["worktreePath"], target.to_string_lossy().as_ref());
+    }
+
+    #[test]
+    fn set_project_refiles_a_session_and_its_children_durably() {
+        let temp = tempfile::tempdir().expect("temp");
+        let registry = Arc::new(Mutex::new(Registry::new(
+            engine(),
+            temp.path().join("state.json"),
+        )));
+        let target = {
+            let mut registry = registry.lock().expect("registry");
+            let anara = registry.add_project("/work/anara");
+            let dirijor = registry.add_project("/work/dirijor");
+            let mut parent = test_record("s_parent");
+            parent.cwd = "/work/anara".into();
+            parent.project_id = crate::registry::session_project_id("/work/anara", None);
+            let mut child = test_record("s_child");
+            child.cwd = "/work/anara".into();
+            child.project_id = parent.project_id.clone();
+            child.parent = Some(diri_proto::SessionId::new("s_parent"));
+            let mut remote = test_record("s_remote");
+            remote.host = Some("forge".into());
+            remote.project_id = crate::registry::session_project_id("/work/anara", Some("forge"));
+            registry.insert_record(parent);
+            registry.insert_record(child);
+            registry.insert_record(remote);
+            assert_ne!(anara["id"], dirijor["id"]);
+            dirijor["id"].as_str().expect("project id").to_owned()
+        };
+        let server = Arc::new(ControlServer::new(
+            Arc::clone(&registry),
+            temp.path().join("daemon.sock"),
+        ));
+
+        let result = ok_of(call(
+            &server,
+            Method::SESSION_SET_PROJECT,
+            Some(json!({ "sessionID": "s_parent", "projectID": target })),
+        ));
+        assert_eq!(result["projectID"], target.as_str());
+        assert_eq!(result["cwd"], "/work/anara", "the process keeps its cwd");
+        let registry_guard = registry.lock().expect("registry");
+        assert_eq!(
+            registry_guard
+                .record("s_child")
+                .expect("child")
+                .project_id
+                .0,
+            target,
+            "children follow their parent"
+        );
+        drop(registry_guard);
+        let state: JsonValue = serde_json::from_slice(
+            &std::fs::read(temp.path().join("state.json")).expect("read durable state"),
+        )
+        .expect("decode durable state");
+        let persisted = state["sessions"]
+            .as_array()
+            .and_then(|sessions| sessions.iter().find(|session| session["id"] == "s_parent"))
+            .expect("persisted session");
+        assert_eq!(persisted["projectID"], target.as_str());
+
+        let error = err_of(call(
+            &server,
+            Method::SESSION_SET_PROJECT,
+            Some(json!({ "sessionID": "s_remote", "projectID": target })),
+        ));
+        assert_eq!(
+            error.code, "bad_request",
+            "a remote session stays on its host"
+        );
+        let error = err_of(call(
+            &server,
+            Method::SESSION_SET_PROJECT,
+            Some(json!({ "sessionID": "s_parent", "projectID": "p_missing" })),
+        ));
+        assert_eq!(error.code, "not_found");
+
+        // A folder that is not a project yet becomes one on the way.
+        let result = ok_of(call(
+            &server,
+            Method::SESSION_SET_PROJECT,
+            Some(json!({ "sessionID": "s_parent", "projectRoot": "/Users/someone" })),
+        ));
+        let home = crate::registry::session_project_id("/Users/someone", None);
+        assert_eq!(result["projectID"], home.0.as_str());
+        assert!(
+            registry
+                .lock()
+                .expect("registry")
+                .projects_raw()
+                .iter()
+                .any(|project| {
+                    project.get("id").and_then(|id| id.as_str()) == Some(home.0.as_str())
+                })
+        );
+        let error = err_of(call(
+            &server,
+            Method::SESSION_SET_PROJECT,
+            Some(json!({ "sessionID": "s_parent" })),
+        ));
+        assert_eq!(error.code, "bad_request");
     }
 
     #[test]

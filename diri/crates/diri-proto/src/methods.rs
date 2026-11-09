@@ -2,7 +2,7 @@
 
 use crate::control::{JsonValue, WIRE_VERSION};
 use crate::model::{
-    AgentKind, DateMillis, PortInfo, Project, SessionArtifact, SessionId, SessionRecord,
+    AgentKind, DateMillis, PortInfo, Project, ProjectId, SessionArtifact, SessionId, SessionRecord,
     SessionStatus, WorktreeInfo,
 };
 use serde::{Deserialize, Serialize};
@@ -103,6 +103,10 @@ impl Method {
     pub const COMPUTER_SETUP: &'static str = "computer.setup";
     pub const SESSION_MIGRATE: &'static str = "session.migrate";
     pub const SESSION_REPARENT_WORKTREE: &'static str = "session.reparent_worktree";
+    /// Files a session (and the sessions it spawned) under another project on
+    /// the same host ([`SessionSetProjectParams`]). Only the sidebar grouping
+    /// changes: the process keeps its working directory.
+    pub const SESSION_SET_PROJECT: &'static str = "session.set_project";
     pub const HOST_SYNC_PREFS: &'static str = "host.sync_prefs";
     pub const HOST_LOCATE_REPO: &'static str = "host.locate_repo";
     pub const HOST_INITIALIZE: &'static str = "host.initialize";
@@ -236,6 +240,7 @@ impl Method {
         Self::COMPUTER_SETUP,
         Self::SESSION_MIGRATE,
         Self::SESSION_REPARENT_WORKTREE,
+        Self::SESSION_SET_PROJECT,
         Self::HOST_SYNC_PREFS,
         Self::HOST_LOCATE_REPO,
         Self::HOST_INITIALIZE,
@@ -963,6 +968,22 @@ pub struct SessionRenameParams {
     /// whose name always lands and is never replaced by an Agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by: Option<RenameAuthor>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SessionSetProjectParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    /// A project the Engine already knows. Give this or `project_root`.
+    #[serde(rename = "projectID", default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<ProjectId>,
+    /// A folder on the session's own host, added as a project if it is not
+    /// one yet (the sidebar's "drag out" files a session under the home
+    /// folder this way).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<String>,
 }
 
 /// Who asked for a [`SessionRenameParams`] rename besides the user.

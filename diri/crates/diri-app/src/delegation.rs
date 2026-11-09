@@ -12,13 +12,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use diri_proto::{
-    AgentKind, Project, ProjectId, SessionId, SessionRecord, SessionStatus, WorktreeOverviewEntry,
+    Project, SessionId, SessionRecord, SessionStatus, WorktreeOverviewEntry,
 };
 use serde_json::Value;
 
 use crate::i18n::t;
 
-const TRANSCRIPT_HEAD_BYTES: u64 = 512 * 1024;
 const TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
 const RESULT_CHAR_LIMIT: usize = 1_200;
 
@@ -29,18 +28,6 @@ pub struct HandoffProposal {
     pub source_title: String,
     pub target_title: String,
     pub summary: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SiblingProposal {
-    pub source_id: SessionId,
-    pub source_title: String,
-    pub kind: AgentKind,
-    pub project_id: ProjectId,
-    pub cwd: String,
-    pub prompt: String,
-    pub parent: Option<SessionId>,
-    pub host: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,29 +95,6 @@ pub fn validate_handoff(
     }
 
     Ok(())
-}
-
-pub fn sibling_proposal(
-    source: &SessionRecord,
-    project: &Project,
-) -> Result<SiblingProposal, DelegationRefusal> {
-    if source.is_archived() {
-        return Err(DelegationRefusal(
-            t("delegation.refusal.archived_fan_out").to_owned(),
-        ));
-    }
-    let prompt = originating_prompt(source)
-        .ok_or_else(|| DelegationRefusal(t("delegation.refusal.no_prompt").to_owned()))?;
-    Ok(SiblingProposal {
-        source_id: source.id.clone(),
-        source_title: display_title(source),
-        kind: source.kind.clone(),
-        project_id: source.project_id.clone(),
-        cwd: project.root.clone(),
-        prompt,
-        parent: source.parent.clone(),
-        host: source.host.clone(),
-    })
 }
 
 pub fn worktree_move_proposal(
@@ -295,22 +259,6 @@ fn diff_stat(session: &SessionRecord) -> String {
     )
 }
 
-pub fn originating_prompt(session: &SessionRecord) -> Option<String> {
-    session
-        .originating_prompt
-        .as_deref()
-        .and_then(nonempty)
-        .map(str::to_owned)
-        .or_else(|| {
-            let path = session.transcript_path.as_deref()?;
-            let text = read_head(Path::new(path), TRANSCRIPT_HEAD_BYTES).ok()?;
-            text.lines().find_map(|line| {
-                let object: Value = serde_json::from_str(line).ok()?;
-                user_text(&object)
-            })
-        })
-}
-
 fn last_transcript_result(session: &SessionRecord) -> Option<String> {
     let path = session.transcript_path.as_deref()?;
     let text = read_tail(Path::new(path), TRANSCRIPT_TAIL_BYTES).ok()?;
@@ -318,24 +266,6 @@ fn last_transcript_result(session: &SessionRecord) -> Option<String> {
         let object: Value = serde_json::from_str(line).ok()?;
         assistant_text(&object).map(|text| truncate_chars(&text, RESULT_CHAR_LIMIT))
     })
-}
-
-fn user_text(object: &Value) -> Option<String> {
-    match object.get("type").and_then(Value::as_str) {
-        Some("user") => text_content(object.get("message")?.get("content")?),
-        Some("event_msg")
-            if object.get("payload")?.get("type").and_then(Value::as_str)
-                == Some("user_message") =>
-        {
-            object
-                .get("payload")?
-                .get("message")?
-                .as_str()
-                .and_then(nonempty)
-                .map(str::to_owned)
-        }
-        _ => None,
-    }
 }
 
 fn assistant_text(object: &Value) -> Option<String> {
@@ -391,13 +321,6 @@ fn truncate_chars(value: &str, limit: usize) -> String {
         + "…"
 }
 
-fn read_head(path: &Path, cap: u64) -> std::io::Result<String> {
-    let file = File::open(path)?;
-    let mut bytes = Vec::new();
-    file.take(cap).read_to_end(&mut bytes)?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
 fn read_tail(path: &Path, cap: u64) -> std::io::Result<String> {
     let mut file = File::open(path)?;
     let end = file.seek(SeekFrom::End(0))?;
@@ -419,6 +342,7 @@ fn read_tail(path: &Path, cap: u64) -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use diri_proto::{AgentKind, ProjectId};
     use diri_proto::{
         DateMillis, ExitInfo, ExitReason, PullRequestStatus, Resumability, TitleSource,
     };
@@ -506,23 +430,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_space_builds_a_sibling_from_the_originating_prompt() {
-        let source = session("source", Some("parent"));
-        let project = Project {
-            id: source.project_id.clone(),
-            root: "/repo".to_owned(),
-            name: "repo".to_owned(),
-            pinned_order: None,
-            host: None,
-        };
-        let proposal = sibling_proposal(&source, &project).unwrap();
-        assert_eq!(proposal.source_id, source.id);
-        assert_eq!(proposal.parent, Some(SessionId::new("parent")));
-        assert_eq!(proposal.prompt, "Implement source");
-        assert_eq!(proposal.cwd, "/repo");
-    }
-
-    #[test]
     fn worktree_drop_proposes_only_a_safe_ended_move() {
         let mut source = session("source", None);
         source.status = SessionStatus::Exited(ExitInfo {
@@ -601,10 +508,6 @@ mod tests {
             discussion: None,
             fetched_at: DateMillis(3.0),
         }]);
-        assert_eq!(
-            originating_prompt(&source).as_deref(),
-            Some("original task")
-        );
         let target = session("target", None);
         let summary = assemble_handoff_summary(&source, &target);
         assert!(summary.contains("Session: Source session"));
