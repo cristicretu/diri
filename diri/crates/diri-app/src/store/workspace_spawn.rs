@@ -190,6 +190,7 @@ impl SessionStore {
             retrying: false,
             retry: None,
             owner: None,
+            catalog_target: None,
         });
         self.emit(StoreEffect::UiChanged);
     }

@@ -320,6 +320,10 @@ pub struct ActionFailure {
     /// The effect kind that failed, so only that action's later success
     /// clears it (and its Retry). `None` for failures reported in place.
     owner: Option<&'static str>,
+    /// The Agent-catalog target (`agent_target_key`) a declined spawn was
+    /// waiting on. That notice is only true until the catalog arrives or the
+    /// launcher takes over showing readiness, so it must not outlive either.
+    catalog_target: Option<String>,
 }
 
 impl ActionFailure {
@@ -349,6 +353,7 @@ impl ActionFailure {
                 title: "fixture".to_owned(),
             }),
             owner: None,
+            catalog_target: None,
         }
     }
 }
@@ -1064,6 +1069,13 @@ impl SessionStore {
         }
         let key = agent_target_key(agents.host.as_deref());
         self.agent_catalog_errors.remove(&key);
+        if self
+            .last_action_failure
+            .as_ref()
+            .is_some_and(|failure| failure.catalog_target.as_deref() == Some(key.as_str()))
+        {
+            self.last_action_failure = None;
+        }
         self.agents.insert(key, agents);
         // Preserve Main's repair policy for the local preference. A remote
         // target may legitimately have a different installed set and must not
@@ -1532,6 +1544,7 @@ impl SessionStore {
             retrying: false,
             retry: None,
             owner: None,
+            catalog_target: None,
         });
     }
 
@@ -1543,6 +1556,7 @@ impl SessionStore {
             retrying: false,
             retry: None,
             owner: None,
+            catalog_target: None,
         });
         self.emit(StoreEffect::UiChanged);
     }
@@ -1561,6 +1575,19 @@ impl SessionStore {
     pub fn dismiss_action_failure(&mut self) {
         self.last_action_failure = None;
         self.emit(StoreEffect::UiChanged);
+    }
+
+    /// Drops a "No Agent to launch yet" notice. The launcher renders catalog
+    /// readiness (loading, failure, Refresh) for its own target inline, so a
+    /// toast about a possibly different host left over it is stale noise.
+    pub fn dismiss_catalog_failure(&mut self) {
+        if self
+            .last_action_failure
+            .as_ref()
+            .is_some_and(|failure| failure.catalog_target.is_some())
+        {
+            self.dismiss_action_failure();
+        }
     }
 
     pub fn retry_last_action(&mut self) {
@@ -3364,6 +3391,7 @@ impl SessionStore {
                 retry: None,
                 // A later successful launch answers it.
                 owner: Some(CREATE_SESSION_FAILED),
+                catalog_target: Some(agent_target_key(target_host.as_deref())),
             });
             self.request_agent_catalog(target_host, force);
             return false;
@@ -5186,6 +5214,7 @@ fn settle_action_failure(
                 retrying: false,
                 retry: context.retry,
                 owner: Some(context.title),
+                catalog_target: None,
             });
         }
     }

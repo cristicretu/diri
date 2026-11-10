@@ -2880,14 +2880,60 @@ fn the_default_shortcut_declines_and_rescans_when_readiness_is_unknown() {
         "the refusal has to be visible, not a shortcut that does nothing"
     );
 
+    // Another target's catalog arriving says nothing about Forge.
+    store.set_agent_catalog(installed_catalog(
+        None,
+        &store.preferences().default_agent.clone(),
+    ));
+    assert!(store.action_failure().is_some());
+
     store.set_agent_catalog(installed_catalog(
         Some("forge"),
         &store.preferences().default_agent.clone(),
     ));
     drain(&mut effects);
+    assert!(
+        store.action_failure().is_none(),
+        "the notice is only true until Forge's catalog arrives"
+    );
 
     assert!(store.spawn_default(super::SpawnOptions::default()));
     assert!(matches!(effects.try_recv(), Ok(StoreEffect::Spawn(_))));
+}
+
+#[test]
+fn opening_the_launcher_retires_only_a_catalog_notice() {
+    let (mut store, mut effects) = SessionStore::headless(Prefs {
+        default_spawn_host: Some("forge".into()),
+        ..Prefs::default()
+    });
+    store.set_hosts(vec![diri_proto::HostEntry {
+        transport: Default::default(),
+        id: "forge".into(),
+        name: Some("Forge".into()),
+        ssh: "forge".into(),
+        default_cwd: None,
+        node: None,
+    }]);
+    assert!(!store.spawn_default(super::SpawnOptions::default()));
+    drain(&mut effects);
+    store.dismiss_catalog_failure();
+    assert!(
+        store.action_failure().is_none(),
+        "the launcher shows readiness inline; the shortcut's toast must not linger over it"
+    );
+
+    store.last_action_failure = Some(super::ActionFailure::fixture(
+        "Rename session failed",
+        "request timed out",
+        true,
+        false,
+    ));
+    store.dismiss_catalog_failure();
+    assert!(
+        store.action_failure().is_some(),
+        "unrelated failures keep their own lifetime"
+    );
 }
 
 #[test]

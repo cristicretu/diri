@@ -3993,6 +3993,14 @@ impl RootView {
     }
 
     fn open_launcher(&mut self, _: &OpenLauncher, window: &mut Window, cx: &mut Context<Self>) {
+        // A ⌘T the catalog declined lands here; the launcher shows that
+        // target's readiness itself, so the shortcut's toast must not linger.
+        self.services
+            .store
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .dismiss_catalog_failure();
         self.sync_workspace_spawn_context(cx);
         self.launcher
             .update(cx, |launcher, cx| launcher.open(window, cx));
