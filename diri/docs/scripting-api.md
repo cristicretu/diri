@@ -156,7 +156,6 @@ Run one with `diri.action("split-pane-right")` or `diri.actions.split_pane_right
 | `close-window` |  | ⇧⌘W | Close the current Diri window **Destructive.** |
 | `close-session` | `session_id?` | ⌘W | Close the selected session **Destructive.** |
 | `reopen-session` |  | ⇧⌘T | Restore the most recently closed session |
-| `open-launcher` |  | ⌘N | Open the new session picker |
 | `new-default` |  | ⌘T | Start a session with the default agent |
 | `new-terminal` |  | ⌥⌘T | Start a standalone shell session |
 | `new-codex` |  | ⌥⇧⌘N | Start a new Codex session |

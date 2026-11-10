@@ -128,8 +128,6 @@ impl RootView {
         self.open_workspace_launch_session(session, window, cx);
         self.sync_inspector_context(cx);
         self.notification_panel_open = false;
-        self.launcher
-            .update(cx, |launcher, cx| launcher.dismiss(cx));
         if let Some(surfaces) = &self.utility_surfaces {
             surfaces.update(cx, |surfaces, cx| surfaces.dismiss(cx));
         }

@@ -137,8 +137,6 @@
   "command.note_version_history.title": "Version history",
   "command.open_find.description": "Search the active terminal output",
   "command.open_find.title": "Find in terminal",
-  "command.open_launcher.description": "Open the new session picker",
-  "command.open_launcher.title": "New session",
   "command.open_settings.description": "Open or close Diri settings",
   "command.open_settings.palette_title": "Settings…",
   "command.open_settings.title": "Open settings",

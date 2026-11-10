@@ -1444,11 +1444,11 @@ fn a_recorded_clash_names_its_holder_and_swaps_or_replaces_on_request(
         highlight_command(overlay, CommandId::ToggleSidebar)
     });
     cx.simulate_keystrokes(&crate::commands::test_chords("cmd-enter"));
-    // ⌘N is New Session's; recording it must not run New Session.
-    cx.simulate_keystrokes(&crate::commands::test_chords("cmd-n"));
+    // ⌘T is New Session's; recording it must not run New Session.
+    cx.simulate_keystrokes(&crate::commands::test_chords("cmd-t"));
     overlay.read_with(cx, |overlay, _| {
         let clash = overlay.rebind.as_ref().unwrap().clash.clone().unwrap();
-        assert_eq!(clash.holder, CommandId::OpenLauncher);
+        assert_eq!(clash.holder, CommandId::NewDefaultSession);
         assert!(saved(overlay).is_empty(), "nothing is saved until resolved");
     });
     assert!(cx.debug_bounds("palette-hint-replace").is_some());
@@ -1459,10 +1459,10 @@ fn a_recorded_clash_names_its_holder_and_swaps_or_replaces_on_request(
         let saved = saved(overlay);
         assert_eq!(
             crate::commands::command(CommandId::ToggleSidebar).effective_keystrokes(&saved),
-            vec![crate::commands::test_chords("cmd-n")]
+            vec![crate::commands::test_chords("cmd-t")]
         );
         assert_eq!(
-            crate::commands::command(CommandId::OpenLauncher).effective_keystrokes(&saved),
+            crate::commands::command(CommandId::NewDefaultSession).effective_keystrokes(&saved),
             vec![crate::commands::test_chords("cmd-b")]
         );
     });

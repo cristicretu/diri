@@ -14,7 +14,6 @@ mod code_editor;
 mod code_intelligence;
 mod code_viewer;
 mod commands;
-mod composer;
 mod daemon_launch;
 mod default_terminal;
 mod delegation;
@@ -47,7 +46,6 @@ mod icons;
 mod imported_themes;
 mod inspector;
 mod launch_recipe;
-mod launcher;
 mod login_item;
 pub mod markdown;
 mod markdown_view;
@@ -158,7 +156,7 @@ use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 #[cfg(target_os = "macos")]
 use crate::commands::HideApp;
 use crate::commands::{
-    CloseSession, CloseWindow, CopySelection, OpenLauncher, Paste, Quit, ReopenSession,
+    CloseSession, CloseWindow, CopySelection, NewDefaultSession, Paste, Quit, ReopenSession,
 };
 use crate::store::{StoreRuntime, WindowMode, WindowPlacement};
 use crate::updates::UpdateHandle;
@@ -225,7 +223,7 @@ pub(crate) fn refresh_app_menus(cx: &mut App) {
             MenuItem::action(t("menu.quit_diri"), Quit),
         ]),
         Menu::new(t("menu.file")).items([
-            MenuItem::action(t("menu.new_session"), OpenLauncher),
+            MenuItem::action(t("menu.new_session"), NewDefaultSession),
             MenuItem::action(t("menu.new_window"), commands::NewWindow),
         ]),
         Menu::new(t("menu.edit")).items([
@@ -249,7 +247,7 @@ pub(crate) fn refresh_app_menus(cx: &mut App) {
     #[cfg(not(target_os = "macos"))]
     cx.set_menus([
         Menu::new(t("menu.file")).items([
-            MenuItem::action(t("menu.new_session"), OpenLauncher),
+            MenuItem::action(t("menu.new_session"), NewDefaultSession),
             MenuItem::action(t("menu.new_window"), commands::NewWindow),
             MenuItem::separator(),
             MenuItem::action(t("menu.quit_diri"), Quit),

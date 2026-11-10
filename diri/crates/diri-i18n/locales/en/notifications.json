@@ -156,7 +156,6 @@
   "toast.prefs_sync_failed": "Couldn’t sync prefs to {host}",
   "toast.privacy_reports": "diri sends crash and error reports",
   "toast.privacy_reports_detail": "Terminal contents never leave your computer.",
-  "toast.prompt_delivery_body": "Check the session before sending again. Your draft is saved.",
   "toast.quote_no_targets": "Start an agent to quote into",
   "toast.quote_not_shell": "Quotes go to an agent, not a shell",
   "toast.quote_nothing_selected": "Select text, a diff hunk or a Markdown turn to quote",

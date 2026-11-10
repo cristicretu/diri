@@ -137,8 +137,6 @@
   "command.note_version_history.title": "版本历史",
   "command.open_find.description": "搜索当前终端的输出",
   "command.open_find.title": "在终端中查找",
-  "command.open_launcher.description": "打开新建会话选择器",
-  "command.open_launcher.title": "新建会话",
   "command.open_settings.description": "打开或关闭 Diri 设置",
   "command.open_settings.palette_title": "设置…",
   "command.open_settings.title": "打开设置",

@@ -309,8 +309,6 @@ impl RetryAction {
     }
 }
 
-pub(crate) const PROMPT_DELIVERY_FAILURE_TITLE: &str = "Check prompt delivery";
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActionFailure {
     pub title: String,
@@ -320,6 +318,10 @@ pub struct ActionFailure {
     /// The effect kind that failed, so only that action's later success
     /// clears it (and its Retry). `None` for failures reported in place.
     owner: Option<&'static str>,
+    /// The Agent-catalog target (`agent_target_key`) a declined spawn was
+    /// waiting on. That notice is only true until the catalog arrives or the
+    /// launcher takes over showing readiness, so it must not outlive either.
+    catalog_target: Option<String>,
 }
 
 impl ActionFailure {
@@ -349,6 +351,7 @@ impl ActionFailure {
                 title: "fixture".to_owned(),
             }),
             owner: None,
+            catalog_target: None,
         }
     }
 }
@@ -545,7 +548,6 @@ pub struct SessionStore {
     cached_menu_projection: Option<(u64, Arc<SidebarProjection>)>,
     prefs_path: Option<PathBuf>,
     /// Set by the menu bar's New Agent action; drained by Root on UI sync.
-    pending_open_launcher: bool,
     /// Set by the menu bar's Settings action; drained by Root on UI sync.
     pending_open_settings: bool,
     /// Requests agents asked to open in their API tab, oldest first.
@@ -670,7 +672,6 @@ impl SessionStore {
                 cached_projection: None,
                 cached_menu_projection: None,
                 prefs_path,
-                pending_open_launcher: false,
                 pending_open_settings: false,
                 pending_api_requests: VecDeque::new(),
                 pending_app_performs: VecDeque::new(),
@@ -1064,6 +1065,13 @@ impl SessionStore {
         }
         let key = agent_target_key(agents.host.as_deref());
         self.agent_catalog_errors.remove(&key);
+        if self
+            .last_action_failure
+            .as_ref()
+            .is_some_and(|failure| failure.catalog_target.as_deref() == Some(key.as_str()))
+        {
+            self.last_action_failure = None;
+        }
         self.agents.insert(key, agents);
         // Preserve Main's repair policy for the local preference. A remote
         // target may legitimately have a different installed set and must not
@@ -1523,18 +1531,6 @@ impl SessionStore {
         self.last_action_failure.as_ref()
     }
 
-    pub(crate) fn report_prompt_delivery_failure(&mut self, detail: String) {
-        // Never offer a blind retry: the Agent may have accepted input before
-        // the connection failed. The composer retains the reviewable draft.
-        self.last_action_failure = Some(ActionFailure {
-            title: PROMPT_DELIVERY_FAILURE_TITLE.into(),
-            detail,
-            retrying: false,
-            retry: None,
-            owner: None,
-        });
-    }
-
     /// A link or file macOS sent diri that it will not open.
     pub(crate) fn report_open_failure(&mut self, detail: String) {
         self.last_action_failure = Some(ActionFailure {
@@ -1543,6 +1539,7 @@ impl SessionStore {
             retrying: false,
             retry: None,
             owner: None,
+            catalog_target: None,
         });
         self.emit(StoreEffect::UiChanged);
     }
@@ -1561,6 +1558,19 @@ impl SessionStore {
     pub fn dismiss_action_failure(&mut self) {
         self.last_action_failure = None;
         self.emit(StoreEffect::UiChanged);
+    }
+
+    /// Drops a "No Agent to launch yet" notice. The launcher renders catalog
+    /// readiness (loading, failure, Refresh) for its own target inline, so a
+    /// toast about a possibly different host left over it is stale noise.
+    pub fn dismiss_catalog_failure(&mut self) {
+        if self
+            .last_action_failure
+            .as_ref()
+            .is_some_and(|failure| failure.catalog_target.is_some())
+        {
+            self.dismiss_action_failure();
+        }
     }
 
     pub fn retry_last_action(&mut self) {
@@ -3126,19 +3136,6 @@ impl SessionStore {
         });
     }
 
-    /// Menu bar can ask for the launcher while another app still owns focus.
-    /// `PublishSnapshot` already forces a publish on its own, so this never
-    /// claims `app_is_active` — that flag gates banner suppression, and lying
-    /// about it would silence notifications for a still-background app.
-    pub fn request_open_launcher(&mut self) {
-        self.pending_open_launcher = true;
-        self.emit(StoreEffect::PublishSnapshot);
-    }
-
-    pub fn take_open_launcher_request(&mut self) -> bool {
-        std::mem::take(&mut self.pending_open_launcher)
-    }
-
     pub fn request_open_settings(&mut self) {
         self.pending_open_settings = true;
         self.emit(StoreEffect::PublishSnapshot);
@@ -3219,8 +3216,7 @@ impl SessionStore {
     /// Cheap read-lock probe so the UI sync loop only takes a write lock on the
     /// rare tick that actually has a menu-bar request to drain.
     pub fn has_pending_ui_request(&self) -> bool {
-        self.pending_open_launcher
-            || self.pending_open_settings
+        self.pending_open_settings
             || !self.pending_api_requests.is_empty()
             || !self.pending_app_performs.is_empty()
     }
@@ -3364,6 +3360,7 @@ impl SessionStore {
                 retry: None,
                 // A later successful launch answers it.
                 owner: Some(CREATE_SESSION_FAILED),
+                catalog_target: Some(agent_target_key(target_host.as_deref())),
             });
             self.request_agent_catalog(target_host, force);
             return false;
@@ -5186,6 +5183,7 @@ fn settle_action_failure(
                 retrying: false,
                 retry: context.retry,
                 owner: Some(context.title),
+                catalog_target: None,
             });
         }
     }

@@ -11023,7 +11023,7 @@ mod tests {
                 surfaces.update(cx, |surfaces, cx| {
                     let mut overrides = crate::commands::ShortcutOverrides::new();
                     for (id, key) in [
-                        (CommandId::OpenLauncher, "cmd-shift-y"),
+                        (CommandId::NewDefaultSession, "cmd-shift-y"),
                         (CommandId::ToggleSidebar, "cmd-alt-y"),
                     ] {
                         overrides = crate::commands::add_shortcut(
@@ -11038,7 +11038,7 @@ mod tests {
                     surfaces.update_prefs(move |prefs| prefs.shortcut_overrides = overrides);
                     if mode == "add" {
                         surfaces.begin_shortcut_edit(
-                            CommandId::OpenLauncher,
+                            CommandId::NewDefaultSession,
                             ShortcutTarget::Add,
                             window,
                             cx,
@@ -13640,7 +13640,7 @@ mod tests {
         });
 
         let binding = cx
-            .debug_bounds("SHORTCUT_BINDING_open-launcher")
+            .debug_bounds("SHORTCUT_BINDING_new-default")
             .expect("shortcut binding should render");
         cx.simulate_click(binding.center(), Modifiers::default());
         cx.simulate_keystrokes(&assigned);
@@ -13655,7 +13655,7 @@ mod tests {
                 surfaces
                     .prefs
                     .shortcut_overrides
-                    .get("open-launcher")
+                    .get("new-default")
                     .and_then(|binding| binding.as_deref()),
                 Some(assigned.as_str())
             );
@@ -13676,11 +13676,11 @@ mod tests {
             .expect("shortcut search should render");
         cx.simulate_click(search.center(), Modifiers::default());
         cx.simulate_input("new session");
-        assert!(cx.debug_bounds("SHORTCUT_ROW_open-launcher").is_some());
+        assert!(cx.debug_bounds("SHORTCUT_ROW_new-default").is_some());
         assert!(cx.debug_bounds("SHORTCUT_ROW_terminal-paste").is_none());
 
         let binding = cx
-            .debug_bounds("SHORTCUT_BINDING_open-launcher")
+            .debug_bounds("SHORTCUT_BINDING_new-default")
             .expect("filtered shortcut binding should render");
         cx.simulate_click(binding.center(), Modifiers::default());
         let assigned = crate::commands::test_chords("cmd-shift-y");
@@ -13690,7 +13690,7 @@ mod tests {
                 surfaces
                     .prefs
                     .shortcut_overrides
-                    .get("open-launcher")
+                    .get("new-default")
                     .and_then(|binding| binding.as_deref()),
                 Some(assigned.as_str())
             );
@@ -13698,18 +13698,18 @@ mod tests {
         });
 
         let clear = cx
-            .debug_bounds("CLEAR_SHORTCUT_open-launcher")
+            .debug_bounds("CLEAR_SHORTCUT_new-default")
             .expect("assigned shortcut should offer unassign");
         cx.simulate_click(clear.center(), Modifiers::default());
         surfaces.read_with(cx, |surfaces, _| {
             assert_eq!(
-                surfaces.prefs.shortcut_overrides.get("open-launcher"),
+                surfaces.prefs.shortcut_overrides.get("new-default"),
                 Some(&None)
             );
         });
 
         let restore = cx
-            .debug_bounds("RESTORE_SHORTCUT_open-launcher")
+            .debug_bounds("RESTORE_SHORTCUT_new-default")
             .expect("modified shortcut should offer restore");
         cx.simulate_click(restore.center(), Modifiers::default());
         surfaces.read_with(cx, |surfaces, _| {
@@ -13717,7 +13717,7 @@ mod tests {
                 !surfaces
                     .prefs
                     .shortcut_overrides
-                    .contains_key("open-launcher")
+                    .contains_key("new-default")
             );
         });
     }
@@ -13801,7 +13801,7 @@ mod tests {
         });
         let keys = |cx: &mut gpui::VisualTestContext| {
             surfaces.read_with(cx, |surfaces, _| {
-                crate::commands::command(CommandId::OpenLauncher)
+                crate::commands::command(CommandId::NewDefaultSession)
                     .effective_keystrokes(&surfaces.prefs.shortcut_overrides)
             })
         };
@@ -13809,7 +13809,7 @@ mod tests {
         assert_eq!(default.len(), 1);
 
         let add = cx
-            .debug_bounds("ADD_SHORTCUT_open-launcher")
+            .debug_bounds("ADD_SHORTCUT_new-default")
             .expect("a bound command offers another key");
         cx.simulate_click(add.center(), Modifiers::default());
         let second = crate::commands::test_chords("cmd-shift-y");
@@ -13817,14 +13817,14 @@ mod tests {
         assert_eq!(keys(cx), vec![default[0].clone(), second.clone()]);
         surfaces.read_with(cx, |surfaces, _| {
             assert!(surfaces.shortcut_editor.is_none());
-            assert!(!surfaces.prefs.shortcut_overrides.contains_key("open-launcher"));
+            assert!(!surfaces.prefs.shortcut_overrides.contains_key("new-default"));
         });
         // Each key is its own chip now.
-        assert!(cx.debug_bounds("SHORTCUT_BINDING_open-launcher_1").is_some());
+        assert!(cx.debug_bounds("SHORTCUT_BINDING_new-default_1").is_some());
 
         // Editing the second chip replaces only that key.
         let chip = cx
-            .debug_bounds("SHORTCUT_BINDING_open-launcher_1")
+            .debug_bounds("SHORTCUT_BINDING_new-default_1")
             .expect("second key chip");
         cx.simulate_click(chip.center(), Modifiers::default());
         let third = crate::commands::test_chords("cmd-shift-u");
@@ -13833,16 +13833,16 @@ mod tests {
 
         // ⌫ on the first chip removes just that one.
         let chip = cx
-            .debug_bounds("SHORTCUT_BINDING_open-launcher")
+            .debug_bounds("SHORTCUT_BINDING_new-default")
             .expect("first key chip");
         cx.simulate_click(chip.center(), Modifiers::default());
         cx.simulate_keystrokes("backspace");
         assert_eq!(keys(cx), vec![third]);
-        assert!(cx.debug_bounds("SHORTCUT_BINDING_open-launcher_1").is_none());
+        assert!(cx.debug_bounds("SHORTCUT_BINDING_new-default_1").is_none());
 
         // Restore brings back the default alone.
         let restore = cx
-            .debug_bounds("RESTORE_SHORTCUT_open-launcher")
+            .debug_bounds("RESTORE_SHORTCUT_new-default")
             .expect("modified shortcut should offer restore");
         cx.simulate_click(restore.center(), Modifiers::default());
         assert_eq!(keys(cx), default);

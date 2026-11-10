@@ -54,8 +54,6 @@ impl RecoveryNotice {
                 },
                 body: if failure.retrying {
                     t("toast.retry_waiting").to_owned()
-                } else if failure.title == crate::store::PROMPT_DELIVERY_FAILURE_TITLE {
-                    t("toast.prompt_delivery_body").to_owned()
                 } else {
                     failure.detail.clone()
                 },
@@ -198,28 +196,6 @@ mod tests {
     fn unsafe_failed_actions_never_offer_retry() {
         let destructive = failure(false, false);
         let notice = RecoveryNotice::resolve(&DaemonState::Connected, Some(&destructive)).unwrap();
-        assert!(notice.primary_action.is_none());
-    }
-
-    #[test]
-    fn prompt_failure_keeps_diagnostics_out_of_the_visible_message() {
-        let failure = ActionFailure::fixture(
-            crate::store::PROMPT_DELIVERY_FAILURE_TITLE,
-            "initial_prompt_delivery_failed: session s_123 was created, but initial prompt delivery was not confirmed",
-            false,
-            false,
-        );
-        let notice = RecoveryNotice::resolve(&DaemonState::Connected, Some(&failure)).unwrap();
-        assert_eq!(notice.title, "Check prompt delivery");
-        let toast = notice.toast();
-        assert_eq!(toast.tone, ToastTone::Error);
-        assert!(toast.dismissible);
-        assert_eq!(toast.visible_for(), None, "stays until dismissed");
-        assert_eq!(toast.actions.len(), 1, "Copy details only");
-        assert!(notice.body.contains("Your draft is saved"));
-        assert!(!notice.body.contains("initial_prompt_delivery_failed"));
-        assert!(!notice.body.contains("s_123"));
-        assert!(notice.dismissible);
         assert!(notice.primary_action.is_none());
     }
 }
