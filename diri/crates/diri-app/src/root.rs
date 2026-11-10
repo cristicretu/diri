@@ -300,8 +300,10 @@ pub struct RootView {
     spawn_owner: crate::store::SpawnOwner,
     window_store: crate::store::WindowStore,
     active_workspace: Option<diri_proto::workspace::WorkspaceId>,
-    /// The last workspace failure shown, and the layout revision it failed at.
-    workspace_error: Option<(u64, String)>,
+    /// The workspace failure this window last showed. Background layout
+    /// writes repeat the same rejection every few minutes (at the tab cap,
+    /// every save fails), so the same text is said once, not per revision.
+    workspace_error: Option<String>,
     /// The survivor this window shows ahead of the Engine after the session
     /// in its focused pane ended. See `session_end`.
     pending_tab: Option<session_end::PendingTab>,
@@ -1450,21 +1452,19 @@ impl RootView {
                             let error = {
                                 let store = this.window_store.read().expect("store");
                                 let catalog = store.workspace_catalog();
-                                catalog.error.clone().map(|error| {
-                                    (catalog.snapshot().map_or(0, |s| s.revision), error)
-                                })
+                                catalog.error.clone()
                             };
-                            // Each edit clears the error, so one rejection
-                            // repeated per click would toast per click. Say it
-                            // once until the layout moves on.
+                            // Every window sees the same catalog error; only
+                            // the one in front says it, and only once.
                             if let Some(error) = error
+                                && window.is_window_active()
                                 && this.workspace_error.as_ref() != Some(&error)
                             {
                                 this.workspace_error = Some(error.clone());
                                 this.show_feedback(
                                     "workspace_rejected",
                                     Toast::error(crate::i18n::t("toast.workspace_rejected"))
-                                        .detail(error.1),
+                                        .detail(error),
                                     cx,
                                 );
                             }

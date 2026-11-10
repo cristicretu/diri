@@ -44,9 +44,6 @@ const REDRAW_TIMEOUT: Duration = Duration::from_millis(90);
 
 /// How a full-screen jump ended, and what it needs to mark the result.
 struct TravelEnd {
-    next: bool,
-    /// Whether the Agent's view moved at all.
-    moved: bool,
     finished: TravelStep,
     /// The screen it ended on.
     rows: Vec<Vec<GridCell>>,
@@ -220,17 +217,14 @@ impl TerminalPane {
                     TravelStep::Wait => None,
                     finished => {
                         let rows = screen_rows(&buffer.read().unwrap());
-                        let moved = travel.moved();
                         let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
                             if this.jump_current(&id, token, interactions) {
                                 let end = TravelEnd {
-                                    next,
-                                    moved,
                                     finished,
                                     rows,
                                     origin,
                                 };
-                                this.finish_travel(&id, end, window, cx);
+                                this.finish_travel(&id, end, cx);
                             }
                             this.end_jump(
                                 token,
@@ -322,12 +316,9 @@ impl TerminalPane {
         &mut self,
         id: &SessionId,
         end: TravelEnd,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let TravelEnd {
-            next,
-            moved,
             finished,
             rows,
             origin,
@@ -364,17 +355,9 @@ impl TerminalPane {
                         top: None,
                     })
                 });
-                self.show_terminal_feedback(
-                    match (next, moved) {
-                        (true, true) => t("terminal.back_to_latest"),
-                        (true, false) => t("terminal.messages.no_later"),
-                        (false, _) => t("terminal.messages.no_earlier"),
-                    },
-                    window,
-                    cx,
-                );
+                cx.notify();
             }
-            _ => self.show_terminal_feedback(t("terminal.messages.none_on_screen"), window, cx),
+            _ => {}
         }
         cx.notify();
     }
@@ -517,7 +500,6 @@ impl TerminalPane {
                     Ok(Ok((None, ..))) if next && offset == 0 => {
                         // Nothing later than the live output.
                         this.qol.message_mark = origin;
-                        this.show_terminal_feedback(t("terminal.messages.no_later"), window, cx);
                     }
                     Ok(Ok((None, ..))) => {
                         // No message that way, but the session may be a
@@ -528,7 +510,7 @@ impl TerminalPane {
                         let miss = if next {
                             PromptMiss::Live
                         } else {
-                            PromptMiss::Say(t("terminal.messages.no_earlier"))
+                            PromptMiss::Stay
                         };
                         this.read_history(Some(next), miss, window, cx);
                     }
@@ -540,7 +522,6 @@ impl TerminalPane {
                         total,
                         sequence,
                         visible_rows,
-                        window,
                         cx,
                     ),
                     Ok(Err(message)) => this.show_terminal_feedback(message, window, cx),
@@ -564,7 +545,6 @@ impl TerminalPane {
         total: i64,
         sequence: u64,
         visible_rows: usize,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(resident) = self.residents.get(id) else {
@@ -573,17 +553,7 @@ impl TerminalPane {
         let Some((row, len)) = found else {
             if next && resident.element.view_offset() > 0 {
                 resident.element.scroll_to_live(visible_rows);
-                self.show_terminal_feedback(t("terminal.back_to_latest"), window, cx);
-            } else {
-                self.show_terminal_feedback(
-                    if next {
-                        t("terminal.messages.no_later")
-                    } else {
-                        t("terminal.messages.no_earlier")
-                    },
-                    window,
-                    cx,
-                );
+                cx.notify();
             }
             return;
         };

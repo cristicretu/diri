@@ -117,7 +117,7 @@ fn quitting_a_focused_claude_session_shows_the_previous_session_at_once(
 }
 
 #[gpui::test]
-fn a_crashed_claude_session_stays_listed_and_is_announced(cx: &mut gpui::TestAppContext) {
+fn a_crashed_claude_session_stays_listed_without_a_toast(cx: &mut gpui::TestAppContext) {
     check_the_window_moves_on_in_place(
         cx,
         |template| claude(template, "crashed-claude"),
@@ -239,13 +239,10 @@ fn check_the_window_moves_on_in_place(
         !closes,
         "only a session that ended cleanly closes"
     );
-    root.update_in(cx, |root, _, _| match notice {
-        Some(notice) => {
-            let toast = root.toast.current().expect("the failure is announced");
-            assert_eq!(toast.tone, crate::toast::ToastTone::Warning);
-            assert!(toast.message.contains(notice), "{}", toast.message);
-        }
-        None => assert!(root.toast.current().is_none(), "a clean end is silent"),
+    // Moving on is silent either way: the failed session's row keeps its
+    // exit status, so a toast would only repeat it.
+    root.update_in(cx, |root, _, _| {
+        assert!(root.toast.current().is_none(), "moving on never toasts");
     });
 
     if closes {
@@ -847,7 +844,7 @@ fn a_keep_open_command_stays_on_screen_after_a_success(cx: &mut gpui::TestAppCon
 }
 
 /// The policy is for commands only: a quick success still closes, and a
-/// command that failed after running a while is listed and announced the
+/// command that failed after running a while stays listed the
 /// way a crashed session is.
 #[gpui::test]
 fn a_quick_successful_command_closes_like_a_shell(cx: &mut gpui::TestAppContext) {
@@ -860,7 +857,7 @@ fn a_quick_successful_command_closes_like_a_shell(cx: &mut gpui::TestAppContext)
 }
 
 #[gpui::test]
-fn a_command_that_fails_after_running_moves_on_and_is_announced(
+fn a_command_that_fails_after_running_moves_on_without_a_toast(
     cx: &mut gpui::TestAppContext,
 ) {
     check_the_window_moves_on_in_place(
