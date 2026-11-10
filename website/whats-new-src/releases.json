@@ -1,5 +1,37 @@
 [
   {
+    "version": "0.11.5",
+    "date": "November 9, 2026",
+    "headline": "Mermaid diagrams in notes",
+    "summary": "diri 0.11.5 draws Mermaid diagrams in notes, lets you drag sessions between projects, keeps your selected row visible when you fold, and makes remote sessions sturdier.",
+    "items": [
+      {
+        "title": "Mermaid diagrams in notes",
+        "text": "Write a ```mermaid block and the note draws the diagram."
+      },
+      {
+        "title": "Drag sessions anywhere",
+        "text": "Drag a session and the rows make room as you go. Drop it on another project to move it there; the list scrolls when you drag near its edge."
+      },
+      {
+        "title": "Folding keeps your place",
+        "text": "Folding a session or project no longer hides the row you're working in. It stays visible until you select something else, and ⌘J or Quick Open no longer unfolds things for good."
+      },
+      {
+        "title": "A better Links popover",
+        "text": "Filter links by kind, read pull request states at a glance, and press Esc to close the popover without interrupting the agent."
+      },
+      {
+        "title": "Sturdier remote sessions",
+        "text": "Remote agents survive large pastes, recoverable Holder errors, and a full disk or file-descriptor limit on the host."
+      },
+      {
+        "title": "And more",
+        "text": "IME input composes at the cursor, notes open on your iPhone, a corrupt prefs.json no longer stops launch, and idle-hiding keeps sessions with a running background shell."
+      }
+    ]
+  },
+  {
     "version": "0.11.1",
     "date": "November 2, 2026",
     "headline": "Hold ⌘T for anything new",
