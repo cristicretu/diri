@@ -2683,6 +2683,9 @@ impl RootView {
                     // Lands once the default branch is fetched.
                 } else if self.spawn_default() {
                     self.focus_spawned_session(window, cx);
+                } else {
+                    // Paint the decline notice now, not on the next repaint.
+                    cx.notify();
                 }
             }
             CommandId::NewTerminal => {
@@ -2693,6 +2696,8 @@ impl RootView {
             CommandId::NewCodexSession => {
                 if self.spawn(Some(AgentKind::CODEX)) {
                     self.focus_spawned_session(window, cx);
+                } else {
+                    cx.notify();
                 }
             }
             CommandId::ToggleCommandPalette => {
@@ -10301,7 +10306,7 @@ mod tests {
         let services = fixture.services.clone();
         let store = services.store.clone();
         let window = cx
-            .open_window(size(px(1100.0), px(700.0)), move |window, cx| {
+            .open_window(gpui::size(px(1100.0), px(700.0)), move |window, cx| {
                 cx.new(|cx| RootView::new(services, false, PreviewScenario::Empty, window, cx))
             })
             .unwrap();
@@ -14187,4 +14192,3 @@ mod tests {
         assert!(!is_quote_target(&exited));
     }
 }
-

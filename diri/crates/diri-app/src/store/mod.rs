@@ -3362,6 +3362,9 @@ impl SessionStore {
                 owner: Some(CREATE_SESSION_FAILED),
                 catalog_target: Some(agent_target_key(target_host.as_deref())),
             });
+            // Nothing else changes on a decline, so without this the notice
+            // waits for an unrelated repaint and the press looks ignored.
+            self.emit(StoreEffect::UiChanged);
             self.request_agent_catalog(target_host, force);
             return false;
         }
