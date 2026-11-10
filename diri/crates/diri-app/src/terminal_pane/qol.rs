@@ -117,10 +117,8 @@ enum MenuAction {
 /// What a prompt jump that finds no prompt mark does.
 #[derive(Clone, Copy)]
 pub(super) enum PromptMiss {
-    /// Explains that prompt jumps need shell integration.
-    NeedsMarks,
-    /// Says this instead: a message jump found nothing either.
-    Say(&'static str),
+    /// Stays put: running off the end of the list is a silent no-op.
+    Stay,
     /// Returns to the latest output, as Next past the last message does.
     Live,
 }
@@ -465,7 +463,6 @@ impl TerminalPane {
                 });
                 if let Some(file) = file {
                     cx.write_to_clipboard(ClipboardItem::new_string(file.display()));
-                    self.show_terminal_feedback(t("terminal.path_copied"), window, cx);
                 }
             }
             MenuAction::CopyLink => {
@@ -473,7 +470,6 @@ impl TerminalPane {
                     cx.write_to_clipboard(ClipboardItem::new_string(
                         hit.reference.destination().to_owned(),
                     ));
-                    self.show_terminal_feedback(t("terminal.link_copied"), window, cx);
                 }
             }
             MenuAction::Copy => self.copy_selection(&CopySelection, window, cx),
@@ -766,7 +762,7 @@ impl TerminalPane {
             selecting: false,
         });
         window.focus(&self.focus, cx);
-        self.show_terminal_feedback(t("terminal.copy_mode.on"), window, cx);
+        cx.notify();
     }
 
     pub(super) fn handle_qol_key(
@@ -1063,7 +1059,7 @@ impl TerminalPane {
             self.jump_to_message(next, gutter, window, cx);
             return;
         }
-        self.read_history(direction, PromptMiss::NeedsMarks, window, cx);
+        self.read_history(direction, PromptMiss::Stay, window, cx);
     }
 
     /// Exports the history, or with a `direction` jumps to the shell prompt
@@ -1114,7 +1110,7 @@ impl TerminalPane {
                 return;
             }
             PromptSearch::Absent => {
-                self.prompt_missed(&id, miss, window, cx);
+                self.prompt_missed(&id, miss, cx);
                 cx.notify();
                 return;
             }
@@ -1169,7 +1165,7 @@ impl TerminalPane {
                         this.qol.feedback = None;
                     }
                     Ok(Ok(PromptFound { target: None, .. })) => {
-                        this.prompt_missed(&id, miss, window, cx);
+                        this.prompt_missed(&id, miss, cx);
                     }
                     Ok(Err(message)) => this.show_terminal_feedback(message, window, cx),
                     Err(_) => {
@@ -1187,20 +1183,18 @@ impl TerminalPane {
         &mut self,
         id: &SessionId,
         miss: PromptMiss,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match miss {
-            PromptMiss::NeedsMarks => {
-                self.show_terminal_feedback(t("terminal.prompt.none"), window, cx);
-            }
-            PromptMiss::Say(message) => self.show_terminal_feedback(message, window, cx),
+            // Nothing to jump to is a no-op, like the end of a list: the
+            // grid not moving already says so.
+            PromptMiss::Stay => {}
             PromptMiss::Live => {
                 if let Some(resident) = self.residents.get(id) {
                     let rows = usize::from(resident.element.grid_rows());
                     resident.element.scroll_to_live(rows);
                 }
-                self.show_terminal_feedback(t("terminal.back_to_latest"), window, cx);
+                cx.notify();
             }
         }
     }
@@ -1234,7 +1228,6 @@ impl TerminalPane {
             Ok::<_, &'static str>(text)
         });
         self.qol.busy = true;
-        self.show_terminal_feedback(t("terminal.history.reading"), window, cx);
         let read_owner = Arc::new(());
         self.qol.read_owner = Some(Arc::clone(&read_owner));
         cx.spawn_in(window, async move |this, cx| {
@@ -1275,11 +1268,6 @@ impl TerminalPane {
                                     cx.open_url(url.as_str());
                                 }
                                 this.qol.export_files.push(file);
-                                this.show_terminal_feedback(
-                                    t("terminal.history.opened"),
-                                    window,
-                                    cx,
-                                );
                             }
                             Err(_) => this.show_terminal_feedback(
                                 t("terminal.history.save_failed"),

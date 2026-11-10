@@ -128,31 +128,6 @@ fn ended(store: &SessionStore, id: &SessionId) -> bool {
     }
 }
 
-/// Said once the window has moved away from a session that stays listed
-/// because it did not end cleanly, so the failure is not missed.
-fn unclean_exit_notice(session: &SessionRecord) -> Option<crate::toast::Toast> {
-    let SessionStatus::Exited(info) = &session.status else {
-        return None;
-    };
-    let how = match (info.reason, info.code, info.signal) {
-        (ExitReason::Exited, Some(0), _) => return None,
-        (ExitReason::Exited, Some(code), _) => {
-            crate::i18n::tf("toast.session_exited_code", &[("code", &code)])
-        }
-        (ExitReason::Signaled, _, Some(signal)) => {
-            crate::i18n::tf("toast.session_stopped_signal", &[("signal", &signal)])
-        }
-        (ExitReason::Signaled, _, None) => crate::i18n::t("toast.session_stopped").to_owned(),
-        _ => return None,
-    };
-    // The title goes on the second line: a long one in the sentence wraps it
-    // and strands the exit code on a line of its own.
-    Some(crate::toast::Toast::warning(how).detail(crate::i18n::tf(
-        "toast.session_ended_detail",
-        &[("title", &crate::switcher::display_title(session))],
-    )))
-}
-
 impl RootView {
     /// The tab the workbench shows: the Engine's selected tab, or the
     /// survivor this window moved to while the Engine catches up. Moves on
@@ -202,11 +177,6 @@ impl RootView {
                 )
             });
             let edits = store.workspace_catalog().selection_edits();
-            let notice = store
-                .sessions()
-                .get(&ended_id)
-                .filter(|_| store.is_open(&ended_id))
-                .and_then(|session| unclean_exit_notice(session));
             match placement {
                 Some(placement) if placement.workspace == active => {
                     self.pending_tab = Some(PendingTab {
@@ -239,11 +209,6 @@ impl RootView {
                         sidebar.update(cx, |sidebar, cx| sidebar.leave_layout_for_survivor(cx));
                     });
                 }
-            }
-            if let Some(notice) = notice {
-                cx.defer_in(window, move |this, _, cx| {
-                    this.show_feedback("session_ended", notice, cx);
-                });
             }
         }
         let tab = tab?;
@@ -469,40 +434,6 @@ mod tests {
         assert_eq!(
             pick(&[], &["sibling", "older", "recent", "elsewhere"]),
             None
-        );
-    }
-
-    #[test]
-    fn only_a_crash_or_a_signal_is_announced_after_moving_away() {
-        let fixture =
-            crate::sidebar::SidebarPreviewFixture::make(crate::sidebar::PreviewScenario::Typical);
-        let mut session = fixture.list.sessions[0].clone();
-        let exit = |reason, code, signal| {
-            SessionStatus::Exited(diri_proto::ExitInfo {
-                reason,
-                code,
-                signal,
-                system_restart: false,
-                interrupted: false,
-            })
-        };
-        session.status = exit(ExitReason::Exited, Some(0), None);
-        assert_eq!(unclean_exit_notice(&session), None);
-        session.status = exit(ExitReason::DaemonRestart, None, None);
-        assert_eq!(unclean_exit_notice(&session), None);
-        session.status = exit(ExitReason::Exited, Some(1), None);
-        assert!(
-            unclean_exit_notice(&session)
-                .unwrap()
-                .message
-                .contains("exited with code 1")
-        );
-        session.status = exit(ExitReason::Signaled, None, Some(9));
-        assert!(
-            unclean_exit_notice(&session)
-                .unwrap()
-                .message
-                .contains("stopped by signal 9")
         );
     }
 }

@@ -4053,7 +4053,7 @@ impl TerminalPane {
             .max(1.0)
     }
 
-    fn copy_selection(&mut self, _: &CopySelection, window: &mut Window, cx: &mut Context<Self>) {
+    fn copy_selection(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.selected_id() else {
             return;
         };
@@ -4088,7 +4088,6 @@ impl TerminalPane {
             ms = started.elapsed(),
             session = diri_telemetry::id(&id.0)
         );
-        self.show_terminal_feedback(t("terminal.copied"), window, cx);
     }
 
     /// Captures terminal text together with the stable absolute scrollback
@@ -10421,19 +10420,19 @@ mod tests {
 
             // The inert runtime has no Engine: every answer below came from
             // the rows the view holds, at once.
-            pane.read_history(Some(false), qol::PromptMiss::NeedsMarks, window, cx);
+            pane.read_history(Some(false), qol::PromptMiss::Stay, window, cx);
             assert!(!pane.qol.busy, "a held prompt waited on an Engine read");
             assert_eq!(top(&element), 12);
-            pane.read_history(Some(false), qol::PromptMiss::NeedsMarks, window, cx);
+            pane.read_history(Some(false), qol::PromptMiss::Stay, window, cx);
             assert_eq!(top(&element), 6, "the failed command's end starts a prompt");
-            pane.read_history(Some(true), qol::PromptMiss::NeedsMarks, window, cx);
+            pane.read_history(Some(true), qol::PromptMiss::Stay, window, cx);
             assert_eq!(top(&element), 12);
-            pane.read_history(Some(false), qol::PromptMiss::NeedsMarks, window, cx);
-            pane.read_history(Some(false), qol::PromptMiss::NeedsMarks, window, cx);
+            pane.read_history(Some(false), qol::PromptMiss::Stay, window, cx);
+            pane.read_history(Some(false), qol::PromptMiss::Stay, window, cx);
             assert_eq!(top(&element), 3);
-            pane.read_history(Some(false), qol::PromptMiss::NeedsMarks, window, cx);
+            pane.read_history(Some(false), qol::PromptMiss::Stay, window, cx);
             assert_eq!(top(&element), 3, "nothing above the first prompt");
-            assert_eq!(pane.qol.feedback.as_deref(), Some(t("terminal.prompt.none")));
+            assert_eq!(pane.qol.feedback, None, "running off the end is silent");
             assert!(!pane.qol.busy);
 
             // Its mark in the gutter selects that command's output.

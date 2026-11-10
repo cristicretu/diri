@@ -199,9 +199,11 @@ fn inline_agent_jumps_through_history_and_the_live_grid(cx: &mut TestAppContext)
     });
     assert!(offset > 1000, "the view is reading history ({offset})");
     assert_eq!(mark, Some(0));
-    assert_eq!(
-        harness.jump("cmd-shift-up"),
-        Err("No earlier messages".into())
+    // Past the first message is a silent no-op: no mark moves, no toast.
+    assert!(
+        harness
+            .jump("cmd-shift-up")
+            .is_err_and(|why| why.starts_with("no mark and no notice"))
     );
     assert_eq!(
         harness.jump("cmd-shift-down").as_deref(),
@@ -213,10 +215,11 @@ fn inline_agent_jumps_through_history_and_the_live_grid(cx: &mut TestAppContext)
             .view_offset()
     });
     assert_eq!(offset, 0, "a message on the live grid is marked at live");
-    // The draft in the composer is not a stop.
-    assert_eq!(
-        harness.jump("cmd-shift-down"),
-        Err("No later messages".into())
+    // The draft in the composer is not a stop: Next stays put, silently.
+    assert!(
+        harness
+            .jump("cmd-shift-down")
+            .is_err_and(|why| why.starts_with("no mark and no notice"))
     );
     assert_eq!(
         harness.jump("cmd-shift-up").as_deref(),
@@ -261,9 +264,11 @@ fn sessions_without_messages_jump_between_shell_prompts(cx: &mut TestAppContext)
         )
     });
     assert_eq!(top, "$ first command");
-    assert_eq!(
-        harness.jump("cmd-shift-up"),
-        Err("No earlier messages".into())
+    // Past the first message is a silent no-op: no mark moves, no toast.
+    assert!(
+        harness
+            .jump("cmd-shift-up")
+            .is_err_and(|why| why.starts_with("no mark and no notice"))
     );
     fixture.verify_process_identity();
 }
