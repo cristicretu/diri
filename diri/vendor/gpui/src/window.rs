@@ -1197,7 +1197,14 @@ pub(crate) struct InputRateTracker {
     inputs_per_second: u32,
     sustain_until: Instant,
     sustain_duration: Duration,
+    // DIRI PATCH (6): when input last changed this window, so a visible but
+    // inactive window the pointer is driving skips the inactive throttle.
+    last_input: Option<Instant>,
 }
+
+/// How long after input changed an inactive window it still draws at full
+/// rate. Covers trackpad momentum and the gap between mouse-wheel notches.
+const INACTIVE_INTERACTION_GRACE: Duration = Duration::from_secs(1);
 
 impl Default for InputRateTracker {
     fn default() -> Self {
@@ -1207,6 +1214,7 @@ impl Default for InputRateTracker {
             inputs_per_second: 60,
             sustain_until: Instant::now(),
             sustain_duration: Duration::from_secs(1),
+            last_input: None,
         }
     }
 }
@@ -1214,6 +1222,7 @@ impl Default for InputRateTracker {
 impl InputRateTracker {
     pub fn record_input(&mut self) {
         let now = Instant::now();
+        self.last_input = Some(now);
         self.timestamps.push(now);
         self.prune_old_timestamps(now);
 
@@ -1225,6 +1234,12 @@ impl InputRateTracker {
 
     pub fn is_high_rate(&self) -> bool {
         Instant::now() < self.sustain_until
+    }
+
+    /// Whether input changed this window within `INACTIVE_INTERACTION_GRACE`.
+    pub fn recently_interacted(&self, now: Instant) -> bool {
+        self.last_input
+            .is_some_and(|last| now.duration_since(last) < INACTIVE_INTERACTION_GRACE)
     }
 
     fn prune_old_timestamps(&mut self, now: Instant) {
@@ -1609,12 +1624,17 @@ impl Window {
                 // Throttle frame rate based on conditions:
                 // - Thermal pressure (Serious/Critical): cap to ~60fps
                 // - Inactive window (not focused): cap to ~30fps to save energy
+                //
+                // DIRI PATCH (6): an inactive window the pointer is driving
+                // (scrolling, hovering on another monitor) draws at full rate.
+                let now = Instant::now();
+                let interacting = input_rate_tracker.borrow().recently_interacted(now);
                 let min_frame_interval = if !request_frame_options.force_render
                     && !request_frame_options.require_presentation
                     && next_frame_callbacks.borrow().is_empty()
                 {
                     None
-                } else if !active.get() && !exempt_from_inactive_throttle {
+                } else if !active.get() && !exempt_from_inactive_throttle && !interacting {
                     Some(Duration::from_micros(33333))
                 } else if let Some(ThermalState::Critical | ThermalState::Serious) = thermal_state {
                     Some(Duration::from_micros(16667))
@@ -1622,7 +1642,6 @@ impl Window {
                     None
                 };
 
-                let now = Instant::now();
                 if let Some(min_interval) = min_frame_interval {
                     if let Some(last_frame) = last_frame_time.get()
                         && now.duration_since(last_frame) < min_interval
@@ -1655,7 +1674,8 @@ impl Window {
                 // to prevent display underclocking during active input.
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
-                    || (active.get() && input_rate_tracker.borrow_mut().is_high_rate());
+                    || ((active.get() || interacting)
+                        && input_rate_tracker.borrow_mut().is_high_rate());
 
                 if invalidator.is_dirty() || request_frame_options.force_render {
                     measure("frame duration", || {

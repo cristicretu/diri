@@ -171,6 +171,22 @@ build on a loaded machine): about 3.5 to 6 ms per capture, about 15 ms for the
 first capture in a process. Capturing never presents or disturbs the next
 frame.
 
+## 6. An inactive window the pointer is driving draws at full rate
+
+**Upstream behavior.** The inactive-window cap from patch 3 also holds a
+normal window to ~30 fps while the user scrolls or hovers it without giving it
+the keyboard, which is common with a second monitor: scrolling the sidebar of
+a visible but unfocused Diri window stutters. Upstream also only keeps
+presenting through high-rate input while the window is active.
+
+**Patch.** `InputRateTracker` remembers when input last changed the window
+(`record_input` already runs only when dispatch invalidated something).
+For `INACTIVE_INTERACTION_GRACE` (1 s) after that, the inactive cap is skipped
+and high-rate input keeps presenting as it does for the key window. The 1 s
+grace covers trackpad momentum and the gap between mouse-wheel notches. An
+unattended inactive window, such as a streaming terminal on another monitor,
+keeps the ~30 fps cap. Files: `src/window.rs`.
+
 ## Re-applying on a GPUI bump
 
 1. Replace `src/` (and `build.rs`, `README.md`, `resources/`) with the new
@@ -184,7 +200,8 @@ frame.
    `ViewElementState`, `ViewElementCacheKey`), `window.rs` (index
    `relative_to`/`rebased_on`, `CachedViewBase*`, base stacks, deferred-draw
    bases, `insert_debug_bounds`, `debug_bounds_history` replay, the
-   `exempt_from_inactive_throttle` frame-rate exemption, and the window
+   `exempt_from_inactive_throttle` frame-rate exemption, the
+   `INACTIVE_INTERACTION_GRACE` input exemption, and the window
    control hitbox reuse and `window_control_area_for`),
    `text_system/line_layout.rs` (`LineLayoutIndex` arithmetic),
    `elements/div.rs` (prepaint opacity, `insert_debug_bounds`), and the scene
