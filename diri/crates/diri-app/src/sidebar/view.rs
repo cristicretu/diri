@@ -2464,7 +2464,7 @@ impl Sidebar {
                 if selected {
                     style
                 } else {
-                    style.bg(look.hover(Fill::hover(colors, true)))
+                    style.bg(Fill::hover(colors, true))
                 }
             })
             .on_click(cx.listener(move |_, _, _, cx| {
@@ -4157,13 +4157,11 @@ impl Sidebar {
         } else {
             colors.primary.alpha(0.90)
         };
-        // Keyboard focus still lights its row in a window that is not key;
-        // only pointer hover stands down there (`chrome_focus`).
         let fill = if selected {
             RowFill::Selected
         } else if multi {
             RowFill::MultiSelected
-        } else if focused || (hovered && look.hover) {
+        } else if focused || hovered {
             RowFill::Hover
         } else {
             RowFill::Clear
@@ -4174,7 +4172,7 @@ impl Sidebar {
         };
         if fill == RowFill::Clear {
             // The row the pointer just left keeps a fading hover fill.
-            fill_color.a = look.hover(RowFill::Hover.color(colors)).a * hover_linger;
+            fill_color.a = RowFill::Hover.color(colors).a * hover_linger;
         }
 
         if renaming {
@@ -4928,10 +4926,10 @@ impl Sidebar {
         let look = self.chrome_look;
         let fill_color = if selected {
             look.pill_fill(colors)
-        } else if focused || (hovered && look.hover) {
+        } else if focused || hovered {
             RowFill::Hover.color(colors)
         } else {
-            let mut trail = look.hover(RowFill::Hover.color(colors));
+            let mut trail = RowFill::Hover.color(colors);
             trail.a *= self.session_hover_linger(&id);
             trail
         };
@@ -11369,7 +11367,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn selection_and_hover_step_back_while_the_window_is_not_key(cx: &mut TestAppContext) {
+    fn selection_steps_back_while_the_window_is_not_key(cx: &mut TestAppContext) {
         let (sidebar, _, cx) = drag_harness(cx);
         sidebar.update(cx, |sidebar, cx| {
             sidebar
@@ -11402,7 +11400,6 @@ mod tests {
         let colors = sidebar.read_with(cx, |sidebar, _| sidebar.colors());
         for (id, _, look) in looks(&sidebar, cx) {
             assert!(!look.key, "{id} still wears the key look");
-            assert!(!look.hover, "{id} lights on hover");
             assert!(look.pill_fill(colors).a < diri_ui::Glass::fill(colors).a, "{id}");
         }
         let title = sidebar.read_with(cx, |sidebar, _| sidebar.title_opacity);
