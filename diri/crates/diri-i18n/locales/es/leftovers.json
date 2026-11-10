@@ -34,7 +34,6 @@
   "herdr.summary_other": "{parts} en {count} espacios de trabajo.",
   "recipe.copy_suffix": " copia",
   "recipe.copy_suffix_numbered": " copia {number}",
-  "recipe.default_name": "Nueva plantilla",
   "recipe.error.full": "La biblioteca de plantillas está llena (máximo 64)",
   "recipe.error.missing": "Esta plantilla ya no existe",
   "recipe.error.unsupported_version": "Las plantillas se crearon con una versión más reciente de Diri y no se pueden editar aquí",

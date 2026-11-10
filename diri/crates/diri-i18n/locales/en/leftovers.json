@@ -34,7 +34,6 @@
   "herdr.summary_other": "{parts} in {count} workspaces.",
   "recipe.copy_suffix": " copy",
   "recipe.copy_suffix_numbered": " copy {number}",
-  "recipe.default_name": "New recipe",
   "recipe.error.full": "Recipe library is full (64 maximum)",
   "recipe.error.missing": "This recipe no longer exists",
   "recipe.error.unsupported_version": "Recipes were created by a newer Diri and cannot be edited here",

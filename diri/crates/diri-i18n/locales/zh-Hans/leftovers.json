@@ -34,7 +34,6 @@
   "herdr.summary_other": "{count} 个工作区中共有 {parts}。",
   "recipe.copy_suffix": " 副本",
   "recipe.copy_suffix_numbered": " 副本 {number}",
-  "recipe.default_name": "新模板",
   "recipe.error.full": "模板库已满（最多 64 个）",
   "recipe.error.missing": "此模板已不存在",
   "recipe.error.unsupported_version": "这些模板由更新版本的 Diri 创建，无法在此编辑",

@@ -5308,7 +5308,7 @@ fn recorded_shortcuts_persist_across_a_restart() {
     let swapped = assign_shortcut(
         &store.preferences().shortcut_overrides,
         CommandId::ToggleSidebar,
-        &test_chords("cmd-n"),
+        &test_chords("cmd-t"),
         Some(ShortcutResolution::Swap),
     )
     .unwrap();
@@ -5322,7 +5322,7 @@ fn recorded_shortcuts_persist_across_a_restart() {
     let saved = &store.preferences().shortcut_overrides.clone();
     assert_eq!(saved, &edited);
     assert_eq!(
-        command(CommandId::OpenLauncher).effective_keystrokes(saved),
+        command(CommandId::NewDefaultSession).effective_keystrokes(saved),
         vec![test_chords("cmd-b")]
     );
     assert!(

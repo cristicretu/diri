@@ -61,7 +61,6 @@ actions!(
     [
         CloseSession,
         ReopenSession,
-        OpenLauncher,
         NewDefaultSession,
         NewTerminal,
         NewCodexSession,
@@ -197,7 +196,6 @@ pub enum CommandId {
     NewWindow,
     CloseSession,
     ReopenSession,
-    OpenLauncher,
     NewDefaultSession,
     NewTerminal,
     NewCodexSession,
@@ -457,13 +455,6 @@ pub const COMMANDS: &[CommandSpec] = &[
         "reopen-session",
         Some("cmd-shift-t"),
         Some("⇧⌘T"),
-        Some(APP_CONTEXT)
-    ),
-    spec!(
-        OpenLauncher,
-        "open-launcher",
-        Some("cmd-n"),
-        Some("⌘N"),
         Some(APP_CONTEXT)
     ),
     spec!(
@@ -1677,7 +1668,6 @@ impl CommandSpec {
             CommandId::NewWindow => KeyBinding::new(key, NewWindow, context),
             CommandId::CloseSession => KeyBinding::new(key, CloseSession, context),
             CommandId::ReopenSession => KeyBinding::new(key, ReopenSession, context),
-            CommandId::OpenLauncher => KeyBinding::new(key, OpenLauncher, context),
             CommandId::NewDefaultSession => KeyBinding::new(key, NewDefaultSession, context),
             CommandId::NewTerminal => KeyBinding::new(key, NewTerminal, context),
             CommandId::NewCodexSession => KeyBinding::new(key, NewCodexSession, context),
@@ -2251,11 +2241,6 @@ impl CommandId {
                 description: t("command.reopen_session.description"),
                 category: Sessions,
             },
-            Self::OpenLauncher => ShortcutMetadata {
-                title: t("command.open_launcher.title"),
-                description: t("command.open_launcher.description"),
-                category: Sessions,
-            },
             Self::NewDefaultSession => ShortcutMetadata {
                 title: t("command.new_default_session.title"),
                 description: t("command.new_default_session.description"),
@@ -2804,7 +2789,6 @@ impl CommandId {
             Self::NewWindow => Box::new(NewWindow),
             Self::CloseSession => Box::new(CloseSession),
             Self::ReopenSession => Box::new(ReopenSession),
-            Self::OpenLauncher => Box::new(OpenLauncher),
             Self::NewDefaultSession => Box::new(NewDefaultSession),
             Self::NewTerminal => Box::new(NewTerminal),
             Self::NewCodexSession => Box::new(NewCodexSession),
@@ -3056,12 +3040,12 @@ mod tests {
         let clash = assign_shortcut(
             &defaults,
             CommandId::ToggleSidebar,
-            &test_chords("cmd-n"),
+            &test_chords("cmd-t"),
             None,
         )
         .unwrap_err();
-        assert_eq!(clash.holder, CommandId::OpenLauncher);
-        assert_eq!(clash.binding, test_chords("cmd-n"));
+        assert_eq!(clash.holder, CommandId::NewDefaultSession);
+        assert_eq!(clash.binding, test_chords("cmd-t"));
         assert!(clash.can_replace && clash.can_swap);
 
         // An unbound command has nothing to hand over, so it cannot swap.
@@ -3069,7 +3053,7 @@ mod tests {
         let clash = assign_shortcut(
             &unbound,
             CommandId::ToggleSidebar,
-            &test_chords("cmd-n"),
+            &test_chords("cmd-t"),
             Some(ShortcutResolution::Swap),
         )
         .unwrap_err();
@@ -3081,20 +3065,20 @@ mod tests {
         let replaced = assign_shortcut(
             &ShortcutOverrides::new(),
             CommandId::ToggleSidebar,
-            &test_chords("cmd-n"),
+            &test_chords("cmd-t"),
             Some(ShortcutResolution::Replace),
         )
         .unwrap();
         assert_eq!(
             command(CommandId::ToggleSidebar).effective_keystrokes(&replaced),
-            vec![test_chords("cmd-n")]
+            vec![test_chords("cmd-t")]
         );
         assert!(
-            command(CommandId::OpenLauncher)
+            command(CommandId::NewDefaultSession)
                 .effective_keystrokes(&replaced)
                 .is_empty()
         );
-        assert!(shortcut_conflict(CommandId::ToggleSidebar, &test_chords("cmd-n"), &replaced).is_none());
+        assert!(shortcut_conflict(CommandId::ToggleSidebar, &test_chords("cmd-t"), &replaced).is_none());
     }
 
     #[test]
@@ -3116,16 +3100,16 @@ mod tests {
         let swapped = assign_shortcut(
             &ShortcutOverrides::new(),
             CommandId::ToggleSidebar,
-            &test_chords("cmd-n"),
+            &test_chords("cmd-t"),
             Some(ShortcutResolution::Swap),
         )
         .unwrap();
         assert_eq!(
             command(CommandId::ToggleSidebar).effective_keystrokes(&swapped),
-            vec![test_chords("cmd-n")]
+            vec![test_chords("cmd-t")]
         );
         assert_eq!(
-            command(CommandId::OpenLauncher).effective_keystrokes(&swapped),
+            command(CommandId::NewDefaultSession).effective_keystrokes(&swapped),
             vec![test_chords("cmd-b")]
         );
         let back = assign_shortcut(
@@ -3176,7 +3160,7 @@ mod tests {
         // Every key is bound and each clashes for other commands.
         assert_eq!(sidebar.key_bindings(&added).len(), 3);
         assert_eq!(
-            shortcut_conflict(CommandId::OpenLauncher, &test_chords("cmd-alt-y"), &added)
+            shortcut_conflict(CommandId::NewDefaultSession, &test_chords("cmd-alt-y"), &added)
                 .map(|holder| holder.id),
             Some(CommandId::ToggleSidebar)
         );
@@ -3241,14 +3225,14 @@ mod tests {
     #[test]
     fn adding_a_held_key_takes_only_that_key_from_its_holder() {
         let sidebar = CommandId::ToggleSidebar;
-        let clash = add_shortcut(&ShortcutOverrides::new(), sidebar, &test_chords("cmd-n"), None, None)
+        let clash = add_shortcut(&ShortcutOverrides::new(), sidebar, &test_chords("cmd-t"), None, None)
             .unwrap_err();
-        assert_eq!(clash.holder, CommandId::OpenLauncher);
+        assert_eq!(clash.holder, CommandId::NewDefaultSession);
         assert!(clash.can_replace && !clash.can_swap, "an added key has nothing to swap");
         let taken = add_shortcut(
             &ShortcutOverrides::new(),
             sidebar,
-            &test_chords("cmd-n"),
+            &test_chords("cmd-t"),
             None,
             Some(ShortcutResolution::Replace),
         )
@@ -3258,17 +3242,17 @@ mod tests {
             vec![
                 test_chords("cmd-b"),
                 test_chords("ctrl-cmd-s"),
-                test_chords("cmd-n")
+                test_chords("cmd-t")
             ]
         );
-        assert!(command(CommandId::OpenLauncher).effective_keystrokes(&taken).is_empty());
+        assert!(command(CommandId::NewDefaultSession).effective_keystrokes(&taken).is_empty());
 
         // An added key is taken away the same way when another command
         // claims it, and the first command keeps its default.
         let claimed = assign_shortcut(
             &taken,
-            CommandId::OpenLauncher,
-            &test_chords("cmd-n"),
+            CommandId::NewDefaultSession,
+            &test_chords("cmd-t"),
             Some(ShortcutResolution::Replace),
         )
         .unwrap();
@@ -3304,7 +3288,7 @@ mod tests {
         // ⌘B perform both.
         let taken = assign_shortcut(
             &ShortcutOverrides::new(),
-            CommandId::OpenLauncher,
+            CommandId::NewDefaultSession,
             &test_chords("cmd-b"),
             Some(ShortcutResolution::Replace),
         )
@@ -3316,11 +3300,11 @@ mod tests {
             vec![test_chords("ctrl-cmd-s")]
         );
         assert_eq!(
-            command(CommandId::OpenLauncher).effective_keystrokes(&reset),
+            command(CommandId::NewDefaultSession).effective_keystrokes(&reset),
             vec![test_chords("cmd-b")]
         );
         // Once the owner gives it up, the reset gets it back.
-        let released = reset_shortcut(&reset, CommandId::OpenLauncher);
+        let released = reset_shortcut(&reset, CommandId::NewDefaultSession);
         let reset = reset_shortcut(&released, CommandId::ToggleSidebar);
         assert!(reset.is_empty(), "{reset:?}");
     }
@@ -3343,15 +3327,15 @@ mod tests {
     #[test]
     fn new_window_defaults_preserve_existing_custom_bindings() {
         let overrides = ShortcutOverrides::from([
-            ("open-launcher".into(), Some(test_chords("cmd-shift-n"))),
-            ("new-default".into(), Some(test_chords("cmd-shift-w"))),
+            ("new-default".into(), Some(test_chords("cmd-shift-n"))),
+            ("new-terminal".into(), Some(test_chords("cmd-shift-w"))),
         ]);
         for id in [CommandId::NewWindow, CommandId::CloseWindow] {
             assert!(command(id).effective_keystrokes(&overrides).is_empty());
             assert_eq!(command(id).shortcut_label_for(&overrides), None);
         }
         assert_eq!(
-            command(CommandId::OpenLauncher).effective_keystrokes(&overrides),
+            command(CommandId::NewDefaultSession).effective_keystrokes(&overrides),
             vec![test_chords("cmd-shift-n")]
         );
         assert_eq!(
@@ -3362,11 +3346,11 @@ mod tests {
             )
             .unwrap()
             .id,
-            CommandId::OpenLauncher
+            CommandId::NewDefaultSession
         );
         assert_eq!(
-            command(CommandId::OpenLauncher).effective_keystrokes(&ShortcutOverrides::new()),
-            vec![test_chords("cmd-n")]
+            command(CommandId::NewDefaultSession).effective_keystrokes(&ShortcutOverrides::new()),
+            vec![test_chords("cmd-t")]
         );
         assert_eq!(
             command(CommandId::CloseSession).effective_keystrokes(&ShortcutOverrides::new()),
@@ -3598,7 +3582,7 @@ mod tests {
     fn conflicts_include_alternate_bindings() {
         let overrides = ShortcutOverrides::new();
         let conflict =
-            shortcut_conflict(CommandId::OpenLauncher, &test_chords("cmd-+"), &overrides)
+            shortcut_conflict(CommandId::NewDefaultSession, &test_chords("cmd-+"), &overrides)
                 .expect("an alternate binding should be reserved");
         assert_eq!(conflict.id, CommandId::ZoomIn);
     }
@@ -3624,19 +3608,19 @@ mod tests {
     #[test]
     fn modal_passthrough_matching_uses_registry_bindings() {
         #[cfg(target_os = "macos")]
-        let (launcher, previous, other) = ("cmd-n", "cmd-{", "cmd-t");
+        let (new_session, previous, other) = ("cmd-t", "cmd-{", "cmd-n");
         #[cfg(not(target_os = "macos"))]
-        let (launcher, previous, other) = ("ctrl-n", "ctrl-alt-left", "ctrl-t");
+        let (new_session, previous, other) = ("ctrl-t", "ctrl-alt-left", "ctrl-n");
         assert!(matches_keystroke(
-            CommandId::OpenLauncher,
-            &Keystroke::parse(launcher).unwrap()
+            CommandId::NewDefaultSession,
+            &Keystroke::parse(new_session).unwrap()
         ));
         assert!(matches_keystroke(
             CommandId::SelectPreviousSession,
             &Keystroke::parse(previous).unwrap()
         ));
         assert!(!matches_keystroke(
-            CommandId::OpenLauncher,
+            CommandId::NewDefaultSession,
             &Keystroke::parse(other).unwrap()
         ));
     }

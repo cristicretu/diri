@@ -54,7 +54,7 @@ pub fn exposure(id: CommandId) -> Exposure {
         HideApp | ShowApp => Exposure::Hidden,
         Quit | CloseWindow | CloseSession | ArchiveSelectedSession | DeleteNote | RemoveFocusedPane
         | CheckForUpdates | ClearScrollback | ResetTerminal => Exposure::Destructive,
-        NewWindow | ReopenSession | OpenLauncher | NewDefaultSession | NewTerminal
+        NewWindow | ReopenSession | NewDefaultSession | NewTerminal
         | NewCodexSession | ToggleCommandPalette | ToggleQuickOpen | ToggleHistory
         | GlobalSearch
         | ToggleNotifications | ToggleOverview | ToggleTabPeek

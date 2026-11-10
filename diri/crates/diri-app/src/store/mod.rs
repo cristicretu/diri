@@ -309,8 +309,6 @@ impl RetryAction {
     }
 }
 
-pub(crate) const PROMPT_DELIVERY_FAILURE_TITLE: &str = "Check prompt delivery";
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActionFailure {
     pub title: String,
@@ -550,7 +548,6 @@ pub struct SessionStore {
     cached_menu_projection: Option<(u64, Arc<SidebarProjection>)>,
     prefs_path: Option<PathBuf>,
     /// Set by the menu bar's New Agent action; drained by Root on UI sync.
-    pending_open_launcher: bool,
     /// Set by the menu bar's Settings action; drained by Root on UI sync.
     pending_open_settings: bool,
     /// Requests agents asked to open in their API tab, oldest first.
@@ -675,7 +672,6 @@ impl SessionStore {
                 cached_projection: None,
                 cached_menu_projection: None,
                 prefs_path,
-                pending_open_launcher: false,
                 pending_open_settings: false,
                 pending_api_requests: VecDeque::new(),
                 pending_app_performs: VecDeque::new(),
@@ -1533,19 +1529,6 @@ impl SessionStore {
 
     pub fn action_failure(&self) -> Option<&ActionFailure> {
         self.last_action_failure.as_ref()
-    }
-
-    pub(crate) fn report_prompt_delivery_failure(&mut self, detail: String) {
-        // Never offer a blind retry: the Agent may have accepted input before
-        // the connection failed. The composer retains the reviewable draft.
-        self.last_action_failure = Some(ActionFailure {
-            title: PROMPT_DELIVERY_FAILURE_TITLE.into(),
-            detail,
-            retrying: false,
-            retry: None,
-            owner: None,
-            catalog_target: None,
-        });
     }
 
     /// A link or file macOS sent diri that it will not open.
@@ -3153,19 +3136,6 @@ impl SessionStore {
         });
     }
 
-    /// Menu bar can ask for the launcher while another app still owns focus.
-    /// `PublishSnapshot` already forces a publish on its own, so this never
-    /// claims `app_is_active` — that flag gates banner suppression, and lying
-    /// about it would silence notifications for a still-background app.
-    pub fn request_open_launcher(&mut self) {
-        self.pending_open_launcher = true;
-        self.emit(StoreEffect::PublishSnapshot);
-    }
-
-    pub fn take_open_launcher_request(&mut self) -> bool {
-        std::mem::take(&mut self.pending_open_launcher)
-    }
-
     pub fn request_open_settings(&mut self) {
         self.pending_open_settings = true;
         self.emit(StoreEffect::PublishSnapshot);
@@ -3246,8 +3216,7 @@ impl SessionStore {
     /// Cheap read-lock probe so the UI sync loop only takes a write lock on the
     /// rare tick that actually has a menu-bar request to drain.
     pub fn has_pending_ui_request(&self) -> bool {
-        self.pending_open_launcher
-            || self.pending_open_settings
+        self.pending_open_settings
             || !self.pending_api_requests.is_empty()
             || !self.pending_app_performs.is_empty()
     }

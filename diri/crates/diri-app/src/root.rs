@@ -72,7 +72,7 @@ use crate::AppServices;
 use crate::commands::{
     self, APP_CONTEXT, ArchiveSelectedSession, CheckForUpdates, CloseSession, CommandId,
     DelegateSelectedSession, FocusSidebar, MoveSelectedSessionDown, MoveSelectedSessionUp,
-    NewCodexSession, NewDefaultSession, NewNote, NewTerminal, OpenLauncher, OpenSettings,
+    NewCodexSession, NewDefaultSession, NewNote, NewTerminal, OpenSettings,
     OpenWorktrees, QuoteSelection, QuoteSelectionToSession, RenameSelectedSession, ReopenSession,
     SESSION_NAVIGATION_CONTEXT, SearchNotes, SelectLastSession, SelectNextAttentionSession,
     SelectNextSession, SelectPreviousSession, SelectSession1, SelectSession2, SelectSession3,
@@ -89,7 +89,6 @@ use crate::haptics::{self, Haptic};
 use crate::i18n::{t, tf};
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::inspector::{BrowserAction, InspectorEvent, WorkbenchInspector};
-use crate::launcher::{LauncherEvent, LauncherOverlay};
 #[cfg(target_os = "macos")]
 use crate::macos::browser::NativeBrowser;
 use crate::navigation::NavigationOverlay;
@@ -314,7 +313,6 @@ pub struct RootView {
     session_surfaces: Option<Entity<SessionSurfaces>>,
     utility_surfaces: Option<Entity<UtilitySurfaces>>,
     usage_share_overlay_open: bool,
-    launcher: Entity<LauncherOverlay>,
     inspector: Option<Entity<WorkbenchInspector>>,
     #[cfg(target_os = "macos")]
     browser: std::rc::Rc<std::cell::RefCell<NativeBrowser>>,
@@ -639,11 +637,6 @@ impl RootView {
             )
             .detach();
         }
-        let launcher = cx.new(|cx| {
-            let mut launcher = LauncherOverlay::new(Arc::clone(&services), preview, cx);
-            launcher.set_window_store(window_store.clone());
-            launcher
-        });
         let inspector = (!preview || preview_scenario == PreviewScenario::Artifacts).then(|| {
             let runtime = Arc::clone(&services.store);
             let tokio = Arc::clone(&services.tokio);
@@ -772,42 +765,42 @@ impl RootView {
                 });
             }
             if let SidebarEvent::HandoffProposed(proposal) = event {
-                this.launcher.update(cx, |launcher, cx| {
-                    launcher.open_handoff(proposal.clone(), window, cx);
-                });
+                // The summary lands unsent at the target's prompt; Return
+                // in that terminal is the confirmation.
+                this.type_into_session(
+                    proposal.target_id.clone(),
+                    proposal.summary.clone(),
+                    window,
+                    cx,
+                );
             }
             if let SidebarEvent::ExternalDrop(plan) = event
                 && let Some(action) = &plan.action
             {
-                let notice = plan.feedback();
                 match action {
-                    ExternalDropAction::OpenLauncher { root } => {
-                        this.launcher.update(cx, |launcher, cx| {
-                            launcher.open_at_directory(root.clone(), notice, window, cx);
-                        });
+                    ExternalDropAction::SpawnAt { root } => {
+                        let spawned = this
+                            .window_store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .spawn_default(SpawnOptions {
+                                cwd: Some(root.clone()),
+                                ..SpawnOptions::default()
+                            });
+                        if spawned {
+                            this.focus_spawned_session(window, cx);
+                        }
                     }
-                    ExternalDropAction::OpenSessionComposer {
+                    ExternalDropAction::TypeIntoSession {
                         session_id,
                         insertion,
                     } => {
-                        this.launcher.update(cx, |launcher, cx| {
-                            launcher.open_local_paths_for_session(
-                                session_id.clone(),
-                                insertion,
-                                notice,
-                                window,
-                                cx,
-                            );
-                        });
+                        this.type_into_session(session_id.clone(), insertion.clone(), window, cx);
                     }
                 }
-                // Like Command-N, a drop swaps the main-pane branch. Focus
-                // once more after GPUI mounts the composer so the insertion
-                // caret is ready without a click.
-                let launcher = this.launcher.clone();
-                cx.defer_in(window, move |_, window, cx| {
-                    launcher.update(cx, |launcher, cx| launcher.focus(window, cx));
-                });
+                if let Some(notice) = plan.feedback() {
+                    this.show_feedback("drop", Toast::info(notice), cx);
+                }
             }
             if matches!(event, SidebarEvent::OpenTodos) {
                 this.open_todos(window, cx);
@@ -827,10 +820,6 @@ impl RootView {
                     this.sidebar
                         .update(cx, |sidebar, cx| sidebar.activate_workspace(None, cx));
                     this.activate_saved_workspace(None, window, cx);
-                }
-                if this.launcher.read(cx).is_open() {
-                    this.launcher
-                        .update(cx, |launcher, cx| launcher.dismiss(cx));
                 }
                 if let Some(terminal) = &this.terminal {
                     terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
@@ -966,39 +955,6 @@ impl RootView {
             )
             .detach();
         }
-        cx.subscribe_in(
-            &launcher,
-            window,
-            |this, _, event: &LauncherEvent, window, cx| {
-                if matches!(event, LauncherEvent::ManageAccounts)
-                    && let Some(surfaces) = &this.utility_surfaces
-                {
-                    surfaces.update(cx, |surfaces, cx| {
-                        surfaces.open_settings(cx);
-                        surfaces.open_settings_tab(crate::settings::SettingsTab::Accounts, cx);
-                        surfaces.focus_handle(cx).focus(window, cx);
-                    });
-                    cx.notify();
-                    return;
-                }
-                if let LauncherEvent::ManageAgents(host) = event
-                    && let Some(surfaces) = &this.utility_surfaces
-                {
-                    surfaces.update(cx, |surfaces, cx| {
-                        surfaces.open_agent_settings(host.clone(), cx);
-                    });
-                }
-                if let Some(terminal) = &this.terminal {
-                    terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
-                } else {
-                    window.focus(&this.focus, cx);
-                }
-                // The launcher is a main-pane destination, so closing it must
-                // make RootView swap the terminal branch back into the row.
-                cx.notify();
-            },
-        )
-        .detach();
         if let Some(inspector) = &inspector {
             cx.subscribe_in(
                 inspector,
@@ -1394,8 +1350,8 @@ impl RootView {
                                         .write()
                                         .expect("store")
                                         .request_close(vec![id]),
-                                    crate::store::WindowAction::OpenLauncher => {
-                                        this.open_launcher(&OpenLauncher, window, cx)
+                                    crate::store::WindowAction::NewSession => {
+                                        this.run_command(CommandId::NewDefaultSession, window, cx)
                                     }
                                     crate::store::WindowAction::OpenSettings => {
                                         this.run_command(CommandId::OpenSettings, window, cx)
@@ -1413,18 +1369,17 @@ impl RootView {
                                 .read()
                                 .expect("session store lock poisoned")
                                 .has_pending_ui_request();
-                            let (open_launcher, open_settings, api_requests) = if pending {
+                            let (open_settings, api_requests) = if pending {
                                 let mut store = this
                                     .window_store
                                     .write()
                                     .expect("session store lock poisoned");
                                 (
-                                    store.take_open_launcher_request(),
                                     store.take_open_settings_request(),
                                     store.take_api_requests(),
                                 )
                             } else {
-                                (false, false, Vec::new())
+                                (false, Vec::new())
                             };
                             this.open_api_requests(api_requests, cx);
                             // The sidebar opens the selected session's
@@ -1433,9 +1388,6 @@ impl RootView {
                             // something repainted it.
                             this.sidebar
                                 .update(cx, |sidebar, cx| sidebar.settle_workspace_navigation(cx));
-                            if open_launcher {
-                                this.open_launcher(&OpenLauncher, window, cx);
-                            }
                             if open_settings && let Some(surfaces) = &this.utility_surfaces {
                                 surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
                             }
@@ -1592,7 +1544,6 @@ impl RootView {
             session_surfaces,
             utility_surfaces,
             usage_share_overlay_open: false,
-            launcher,
             inspector,
             #[cfg(target_os = "macos")]
             browser,
@@ -2196,8 +2147,6 @@ impl RootView {
             .is_some_and(|navigation| navigation.read(cx).is_open())
         {
             "palette"
-        } else if self.launcher.read(cx).is_open() {
-            "launcher"
         } else {
             "workbench"
         };
@@ -2454,16 +2403,34 @@ impl RootView {
             );
             return;
         }
-        let text = quote.framed();
-        self.launcher.update(cx, |launcher, cx| {
-            launcher.open_for_session(target, &text, None, window, cx);
-        });
-        // Mount the app-owned composer before focusing its insertion caret.
-        // This changes no sidebar/session selection and does not touch the PTY.
-        let launcher = self.launcher.clone();
-        cx.defer_in(window, move |_, window, cx| {
-            launcher.update(cx, |launcher, cx| launcher.focus(window, cx));
-        });
+        self.type_into_session(target, quote.framed(), window, cx);
+    }
+
+    /// Types `text` at a session's prompt without submitting it, then shows
+    /// that session so the person reviews and sends it from the terminal.
+    fn type_into_session(
+        &mut self,
+        target: SessionId,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.preview {
+            return;
+        }
+        let _ = self
+            .services
+            .store
+            .notification_action_sender()
+            .send(crate::notifications::SendTextCommand {
+                session_id: target.clone(),
+                text,
+                submit: false,
+            });
+        self.open_workspace_launch_session(target, window, cx);
+        if let Some(terminal) = &self.terminal {
+            terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+        }
     }
 
     fn activate_quote_target(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -2484,8 +2451,7 @@ impl RootView {
     }
 
     pub(crate) fn toggle_tab_peek(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.launcher.read(cx).is_open()
-            || self
+        if self
                 .utility_surfaces
                 .as_ref()
                 .is_some_and(|view| view.read(cx).is_open())
@@ -2594,7 +2560,6 @@ impl RootView {
             return;
         }
         if self.inspector_open
-            && !self.launcher.read(cx).is_open()
             && !self
                 .navigation
                 .as_ref()
@@ -2623,20 +2588,6 @@ impl RootView {
             .is_some_and(|navigation| navigation.read(cx).is_open())
         {
             // The focused palette owns input even over the composer or Settings.
-            return;
-        }
-        if self.launcher.read(cx).is_open() {
-            let reopen = commands::matches_keystroke(CommandId::OpenLauncher, &event.keystroke);
-            let focus_sidebar =
-                commands::matches_keystroke(CommandId::FocusSidebar, &event.keystroke);
-            if !focus_sidebar {
-                self.launcher.update(cx, |launcher, cx| {
-                    launcher.handle_key_down(event, window, cx);
-                });
-            }
-            if !reopen && !focus_sidebar {
-                cx.stop_propagation();
-            }
             return;
         }
         if let Some(surfaces) = &self.utility_surfaces
@@ -2678,7 +2629,6 @@ impl RootView {
         if let Some(pane) = crate::workspace_workbench::PaneCommand::from_id(command) {
             let blocked = (self.sidebar.read(cx).workspace_menu_is_open()
                 || self.sidebar.read(cx).project_picker_active())
-                || self.launcher.read(cx).is_open()
                 || self
                     .navigation
                     .as_ref()
@@ -2726,16 +2676,13 @@ impl RootView {
             return;
         }
         match command {
-            // A spawn the catalog vetoes falls back to the launcher, where the
-            // unavailability is visible and another Agent is one keystroke
-            // away, instead of a shortcut that silently does nothing.
+            // A spawn the catalog vetoes leaves the store's "No Agent to
+            // launch yet" notice up, which clears once the catalog answers.
             CommandId::NewDefaultSession => {
                 if self.spawn_default_in_fresh_worktree(window, cx) {
                     // Lands once the default branch is fetched.
                 } else if self.spawn_default() {
                     self.focus_spawned_session(window, cx);
-                } else {
-                    self.open_launcher(&OpenLauncher, window, cx);
                 }
             }
             CommandId::NewTerminal => {
@@ -2746,8 +2693,6 @@ impl RootView {
             CommandId::NewCodexSession => {
                 if self.spawn(Some(AgentKind::CODEX)) {
                     self.focus_spawned_session(window, cx);
-                } else {
-                    self.open_launcher(&OpenLauncher, window, cx);
                 }
             }
             CommandId::ToggleCommandPalette => {
@@ -2915,10 +2860,6 @@ impl RootView {
                 }
             }
             CommandId::FocusSidebar => {
-                if self.launcher.read(cx).is_open() {
-                    self.launcher
-                        .update(cx, |launcher, cx| launcher.dismiss(cx));
-                }
                 if let Some(navigation) = &self.navigation {
                     navigation.update(cx, |navigation, cx| navigation.dismiss(cx));
                 }
@@ -3397,7 +3338,7 @@ impl RootView {
     /// would uncover whatever was on screen, and a saved layout would then
     /// select its own focused agent again. Select, then take the sidebar's
     /// path: it closes To-dos, focuses the session's pane when a layout holds
-    /// it, leaves a layout that does not, and dismisses the launcher.
+    /// it, and leaves a layout that does not.
     fn show_from_todos(&mut self, session: SessionId, block: Option<usize>, cx: &mut Context<Self>) {
         let note_id = {
             let mut store = self.window_store.write().expect("session store lock poisoned");
@@ -3441,12 +3382,8 @@ impl RootView {
     /// A session the user just spawned owns the keyboard. The pane also
     /// refocuses when the spawn reply selects the new id, but until then
     /// whatever held focus (sidebar, ⌘J pane, inspector) kept swallowing
-    /// keys, and an open launcher kept covering the pane.
+    /// keys.
     fn focus_spawned_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.launcher.read(cx).is_open() {
-            self.launcher
-                .update(cx, |launcher, cx| launcher.dismiss(cx));
-        }
         self.focus_active_terminal(window, cx);
         cx.notify();
     }
@@ -3990,43 +3927,6 @@ impl RootView {
     ) {
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.reopen_last(cx));
-    }
-
-    fn open_launcher(&mut self, _: &OpenLauncher, window: &mut Window, cx: &mut Context<Self>) {
-        // A ⌘T the catalog declined lands here; the launcher shows that
-        // target's readiness itself, so the shortcut's toast must not linger.
-        self.services
-            .store
-            .store
-            .write()
-            .expect("session store lock poisoned")
-            .dismiss_catalog_failure();
-        self.sync_workspace_spawn_context(cx);
-        self.launcher
-            .update(cx, |launcher, cx| launcher.open(window, cx));
-        // Opening changes which main-pane branch RootView renders.
-        cx.notify();
-        // The launcher was not mounted while the terminal branch was active.
-        // Focus it on the next frame, after GPUI has installed its focus node.
-        let launcher = self.launcher.clone();
-        cx.defer_in(window, move |_, window, cx| {
-            launcher.update(cx, |launcher, cx| launcher.focus(window, cx));
-        });
-    }
-
-    fn toggle_launcher(&mut self, _: &OpenLauncher, window: &mut Window, cx: &mut Context<Self>) {
-        self.sync_workspace_spawn_context(cx);
-        let opens = self
-            .launcher
-            .update(cx, |launcher, cx| launcher.toggle(window, cx));
-        cx.notify();
-        if !opens {
-            return;
-        }
-        let launcher = self.launcher.clone();
-        cx.defer_in(window, move |_, window, cx| {
-            launcher.update(cx, |launcher, cx| launcher.focus(window, cx));
-        });
     }
 
     fn on_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -4690,7 +4590,6 @@ impl RootView {
     fn focus_after_inspector_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_workspace.is_none()
             && !self.todos_open
-            && !self.launcher.read(cx).is_open()
             && let Some(terminal) = &self.terminal
         {
             terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
@@ -4840,10 +4739,9 @@ impl RootView {
     }
 
     #[cfg(target_os = "macos")]
-    fn browser_visible(&self, launcher_open: bool, panel_width: f32, cx: &App) -> bool {
+    fn browser_visible(&self, panel_width: f32, cx: &App) -> bool {
         self.browser.borrow().has_page()
             && panel_width > 1.0
-            && !launcher_open
             && !self
                 .utility_surfaces
                 .as_ref()
@@ -5993,7 +5891,6 @@ impl RootView {
         cx: &mut Context<Self>,
     ) {
         let allowed = window.is_window_active()
-            && !self.launcher.read(cx).is_open()
             && !self
                 .navigation
                 .as_ref()
@@ -6058,7 +5955,6 @@ impl Render for RootView {
         });
         let colors = self.colors();
         self.sync_window_material(window);
-        let launcher_open = self.launcher.read(cx).is_open();
         let recovery_notice = if self.preview {
             None
         } else {
@@ -6066,14 +5962,7 @@ impl Render for RootView {
                 .window_store
                 .read()
                 .expect("session store lock poisoned");
-            // The composer owns its inline failure while open. Once closed,
-            // the same failure remains available here without duplicate copy.
-            let notice = RecoveryNotice::resolve(
-                store.daemon_state(),
-                store.action_failure().filter(|failure| {
-                    !launcher_open || failure.title != crate::store::PROMPT_DELIVERY_FAILURE_TITLE
-                }),
-            );
+            let notice = RecoveryNotice::resolve(store.daemon_state(), store.action_failure());
             let connecting = matches!(store.daemon_state(), crate::store::DaemonState::Connecting);
             drop(store);
             self.hold_connecting_notice(notice, connecting, cx)
@@ -6082,8 +5971,7 @@ impl Render for RootView {
         {
             self.notification_health = crate::application_notifications::health(cx);
         }
-        let notification_surface_visible = !launcher_open
-            && !self.notification_panel_open
+        let notification_surface_visible = !self.notification_panel_open
             && !self
                 .utility_surfaces
                 .as_ref()
@@ -6106,7 +5994,7 @@ impl Render for RootView {
         // The inspector's own width, whether or not it is currently shown --
         // the panel keeps painting at full width while it slides away.
         let inspector_panel_width = self.inspector_width.min(self.inspector_max_width);
-        let inspector_width = if self.inspector_open && !launcher_open {
+        let inspector_width = if self.inspector_open {
             inspector_panel_width
         } else {
             0.0
@@ -6127,7 +6015,7 @@ impl Render for RootView {
         let inspector_seam = self.inspector_seam;
         #[cfg(target_os = "macos")]
         {
-            let browser_active = self.browser_visible(launcher_open, inspector_panel_width, cx);
+            let browser_active = self.browser_visible(inspector_panel_width, cx);
             self.browser.borrow_mut().set_visible(browser_active);
             self.browser.borrow_mut().set_pointer_passthrough(
                 self.resize_origin.is_some()
@@ -6341,7 +6229,6 @@ impl Render for RootView {
                 }),
             )
             .on_action(cx.listener(Self::reopen_last_session))
-            .on_action(cx.listener(Self::toggle_launcher))
             .on_action(cx.listener(|this, _: &NewDefaultSession, window, cx| {
                 this.run_command(CommandId::NewDefaultSession, window, cx);
             }))
@@ -6732,45 +6619,26 @@ impl Render for RootView {
                 .utility_surfaces
                 .as_ref()
                 .is_some_and(|surfaces| surfaces.read(cx).is_settings_open());
-        if launcher_open {
-            // Command-N behaves like an unsaved new tab: preserve the app
-            // shell, but replace the live session pane instead of floating a
-            // dialog above it or manufacturing another session/tab up front.
-            root = root.child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .h_full()
-                    .min_w(px(0.0))
-                    .overflow_hidden()
-                    .child(
-                        self.launcher
-                            .clone()
-                            .cached(StyleRefinement::default().size_full()),
-                    ),
-            );
-        } else {
-            let card = self.terminal_card(
-                sidebar_visible,
-                seam,
-                inspector_width,
-                inspector_seam,
-                window,
-                cx,
-            );
-            // Settings paints the same glass as the card it stands over; the
-            // card keeps its layout (and every PTY its size) but must not
-            // read through it.
-            root = root.child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .h_full()
-                    .min_w(px(0.0))
-                    .when(settings_over_glass, |card| card.invisible())
-                    .child(card),
-            );
-        }
+        let card = self.terminal_card(
+            sidebar_visible,
+            seam,
+            inspector_width,
+            inspector_seam,
+            window,
+            cx,
+        );
+        // Settings paints the same glass as the card it stands over; the
+        // card keeps its layout (and every PTY its size) but must not
+        // read through it.
+        root = root.child(
+            div()
+                .flex_1()
+                .flex()
+                .h_full()
+                .min_w(px(0.0))
+                .when(settings_over_glass, |card| card.invisible())
+                .child(card),
+        );
         if inspector_seam > 0.0 {
             // The handle is deferred so it wins hit tests against the terminal.
             // That also puts it above Settings, which covers this sidebar, so
@@ -10185,7 +10053,7 @@ mod tests {
                 .store
                 .write()
                 .unwrap()
-                .report_prompt_delivery_failure("diagnostic detail".into());
+                .report_open_failure("diagnostic detail".into());
             root
         });
         // Measure the resting position, not the entrance rise.
@@ -11817,7 +11685,7 @@ mod tests {
                             })
                             .unwrap();
                         if state == "stack" {
-                            store.report_prompt_delivery_failure("diagnostic detail".into());
+                            store.report_open_failure("diagnostic detail".into());
                         }
                     }
                     let window = cx
@@ -12014,7 +11882,7 @@ mod tests {
                         "dirijor-dark".into()
                     };
                 }).unwrap();
-                store.report_prompt_delivery_failure("initial_prompt_delivery_failed: session s_123 was created, but initial prompt delivery was not confirmed: the agent never confirmed that it submitted".into());
+                store.report_open_failure("diagnostic detail".into());
                 drop(store);
                 services.store.publish_local_change();
                 root
@@ -14127,28 +13995,24 @@ mod tests {
                 .update(cx, |inspector, cx| {
                     inspector.select_workspace(crate::inspector::WorkspaceSurface::Browser, cx);
                 });
-            assert!(root.browser_visible(false, 440.0, cx));
+            assert!(root.browser_visible(440.0, cx));
             root.resize_origin = Some((250.0, 250.0));
             assert!(
-                root.browser_visible(false, 440.0, cx),
+                root.browser_visible(440.0, cx),
                 "left sidebar resize hid the website"
             );
             root.resize_origin = None;
             root.inspector_resize_origin = Some((700.0, 440.0));
             assert!(
-                root.browser_visible(false, 440.0, cx),
+                root.browser_visible(440.0, cx),
                 "right sidebar resize hid the website"
             );
             root.inspector_resize_origin = None;
             root.terminal_resize_origin = Some((300.0, 300.0));
-            assert!(root.browser_visible(false, 440.0, cx));
+            assert!(root.browser_visible(440.0, cx));
             root.terminal_resize_origin = None;
             assert!(
-                !root.browser_visible(true, 440.0, cx),
-                "launcher must cover native content"
-            );
-            assert!(
-                !root.browser_visible(false, 0.0, cx),
+                !root.browser_visible(0.0, cx),
                 "a collapsed panel must not leave a native overlay"
             );
             // TestWindow has no AppKit handle; the separate native fixture

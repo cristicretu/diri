@@ -22,9 +22,6 @@ impl RootView {
 
     pub(super) fn sync_workspace_spawn_context(&self, cx: &mut Context<Self>) {
         let target = self.workspace_spawn_target();
-        self.launcher.update(cx, |launcher, _| {
-            launcher.set_workspace_spawn_target(target.clone())
-        });
         if let Some(navigation) = &self.navigation {
             navigation.update(cx, |navigation, cx| {
                 navigation.set_workspace_spawn_target(target);

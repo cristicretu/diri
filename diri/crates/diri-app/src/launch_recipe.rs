@@ -552,22 +552,6 @@ where
     LaunchRecipeBook::deserialize(deserializer)
 }
 
-pub fn suggested_recipe_name(prompt: &str) -> String {
-    let first_line = prompt
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("");
-    let compact = first_line.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.is_empty() {
-        return t("recipe.default_name").to_owned();
-    }
-    let mut name = compact.chars().take(42).collect::<String>();
-    if compact.chars().count() > 42 {
-        name.push('…');
-    }
-    name
-}
-
 fn unique_copy_name(name: &str, existing: &[LaunchRecipe]) -> String {
     for copy in 1..=existing.len().saturating_add(1) {
         let suffix = if copy == 1 {
@@ -1142,14 +1126,5 @@ mod tests {
         assert_ne!(duplicate.name, original.name);
         assert!(duplicate.name.ends_with(" copy"));
         assert!(duplicate.name.chars().count() <= MAX_RECIPE_NAME_CHARS);
-    }
-
-    #[test]
-    fn generated_names_are_short_and_human() {
-        assert_eq!(
-            suggested_recipe_name("\n  Fix   the flaky test\nthen run it"),
-            "Fix the flaky test"
-        );
-        assert!(suggested_recipe_name(&"x".repeat(80)).ends_with('…'));
     }
 }

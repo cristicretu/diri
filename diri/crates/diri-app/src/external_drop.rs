@@ -77,10 +77,10 @@ pub(crate) enum ExternalDropTarget {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ExternalDropAction {
-    OpenLauncher {
+    SpawnAt {
         root: String,
     },
-    OpenSessionComposer {
+    TypeIntoSession {
         session_id: SessionId,
         insertion: String,
     },
@@ -310,7 +310,7 @@ fn plan_staged_drop(
                 .join(" ");
             ExternalDropPlan {
                 action: (!insertion.is_empty()).then_some(
-                    ExternalDropAction::OpenSessionComposer {
+                    ExternalDropAction::TypeIntoSession {
                         session_id: id,
                         insertion,
                     },
@@ -365,7 +365,7 @@ fn launcher_plan(
         }
     }
     ExternalDropPlan {
-        action: root.map(|root| ExternalDropAction::OpenLauncher { root }),
+        action: root.map(|root| ExternalDropAction::SpawnAt { root }),
         rejected,
     }
 }
@@ -562,7 +562,7 @@ mod tests {
             );
             assert_eq!(
                 plan.action,
-                Some(ExternalDropAction::OpenLauncher {
+                Some(ExternalDropAction::SpawnAt {
                     root: "/tmp/first".into()
                 })
             );
@@ -594,7 +594,7 @@ mod tests {
         );
         assert_eq!(
             plan.action,
-            Some(ExternalDropAction::OpenSessionComposer {
+            Some(ExternalDropAction::TypeIntoSession {
                 session_id: SessionId("session-1".into()),
                 insertion: "'/tmp/a folder' '/tmp/$HOME; rm -rf nope'".into(),
             })

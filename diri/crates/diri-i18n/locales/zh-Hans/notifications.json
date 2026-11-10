@@ -156,7 +156,6 @@
   "toast.prefs_sync_failed": "无法将偏好设置同步到 {host}",
   "toast.privacy_reports": "diri 会发送崩溃和错误报告",
   "toast.privacy_reports_detail": "终端内容绝不会离开你的电脑。",
-  "toast.prompt_delivery_body": "再次发送前请先检查会话。草稿已保存。",
   "toast.quote_no_targets": "先启动一个智能体再引用",
   "toast.quote_not_shell": "引用只能发给智能体，不能发给 shell",
   "toast.quote_nothing_selected": "选择一段文本、差异块或 Markdown 回合来引用",

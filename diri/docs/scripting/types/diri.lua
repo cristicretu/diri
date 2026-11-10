@@ -844,10 +844,6 @@ function diri.actions.close_session(args) end
 ---@param args? table
 function diri.actions.reopen_session(args) end
 
----Open the new session picker
----@param args? table
-function diri.actions.open_launcher(args) end
-
 ---Start a session with the default agent
 ---@param args? table
 function diri.actions.new_default(args) end
