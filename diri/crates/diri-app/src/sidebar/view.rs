@@ -1961,8 +1961,9 @@ impl Sidebar {
     }
 
     fn can_show_hover_card(&self, window: &Window) -> bool {
+        // A window that is not key still previews: with Diri visible on
+        // another display, hovering a row answers before it is clicked.
         (self.ui.visible || self.peek_open)
-            && window.is_window_active()
             && self.settings_nav.is_none()
             && !self.peek_interaction_active()
             && self.ui.hovered_session.as_ref().is_some_and(|id| {
@@ -11740,6 +11741,30 @@ mod tests {
         cx.executor().advance_clock(Duration::from_secs(1));
         cx.run_until_parked();
         assert!(sidebar.read_with(cx, |sidebar, _| sidebar.ui.hover_card.is_none()));
+    }
+
+    #[gpui::test]
+    fn session_preview_opens_while_the_window_is_not_key(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        cx.deactivate_window();
+        cx.run_until_parked();
+        assert!(!cx.update(|window, _| window.is_window_active()));
+        let row = row_bounds(&sidebar, cx, "preview-claude");
+        cx.simulate_mouse_move(row.center(), None, Modifiers::default());
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.ui.hover_card.clone()),
+            Some(SessionId::new("preview-claude")),
+            "hovering a row in a visible window that is not key previews it"
+        );
     }
 
     #[gpui::test]
