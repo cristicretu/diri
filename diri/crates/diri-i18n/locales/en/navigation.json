@@ -208,6 +208,7 @@
   "notes.image.insert": "Insert",
   "notes.image.missing": "This picture's file is missing",
   "notes.image.web": "Picture on the web · {url}",
+  "notes.image.web_failed": "Couldn't load this picture · {url}",
   "notes.link.insert": "Insert {target}",
   "notes.link.link_to": "Link to {target}",
   "notes.link.open": "Open {target}",

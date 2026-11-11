@@ -1006,7 +1006,9 @@ pub fn image_size(path: &Path) -> Option<(u32, u32)> {
     image_size_of(&head)
 }
 
-fn image_size_of(b: &[u8]) -> Option<(u32, u32)> {
+/// [`image_size`] for bytes already in memory: `None` when they do not
+/// start like a PNG, GIF, JPEG or WebP.
+pub fn image_size_of(b: &[u8]) -> Option<(u32, u32)> {
     let be16 = |i: usize| Some(u32::from(u16::from_be_bytes([*b.get(i)?, *b.get(i + 1)?])));
     let le16 = |i: usize| Some(u32::from(u16::from_le_bytes([*b.get(i)?, *b.get(i + 1)?])));
     let be32 = |i: usize| Some(u32::from_be_bytes(b.get(i..i + 4)?.try_into().ok()?));

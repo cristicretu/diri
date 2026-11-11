@@ -208,6 +208,7 @@
   "notes.image.insert": "Insertar",
   "notes.image.missing": "Falta el archivo de esta imagen",
   "notes.image.web": "Imagen de la web · {url}",
+  "notes.image.web_failed": "No se pudo cargar esta imagen · {url}",
   "notes.link.insert": "Insertar {target}",
   "notes.link.link_to": "Enlazar a {target}",
   "notes.link.open": "Abrir {target}",

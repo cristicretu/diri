@@ -19,6 +19,7 @@ pub(crate) mod search;
 pub(crate) mod tests;
 pub(crate) mod todos;
 mod versions;
+pub(crate) mod web_image;
 pub(crate) mod work_item;
 #[cfg(test)]
 pub(crate) mod work_item_tests;
