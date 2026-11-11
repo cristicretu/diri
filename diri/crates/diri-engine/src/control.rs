@@ -289,12 +289,16 @@ fn local_session_uses_worktree(record: &diri_proto::SessionRecord, target: &Path
 }
 
 impl ControlServer {
-    /// One-time, at Engine start: pre-split `⌘J` terminals become panes of
-    /// their parent's tab. Later starts only read the marker.
+    /// At Engine start: once, pre-split `⌘J` terminals become panes of their
+    /// parent's tab (later starts only read the marker); every start drops
+    /// tabs whose sessions are all gone.
     pub fn adopt_pane_shells(&self) {
         let records = self.registry.lock().expect("registry").records();
         self.workspaces
             .adopt_pane_shells(&live_pane_shells(&records));
+        // Tabs left by sessions removed before every removal closed its tab.
+        let sessions = records.iter().map(|record| record.id.clone()).collect();
+        self.workspaces.reclaim_unavailable(&sessions);
     }
 
     /// Configure private power endpoints before starting the scheduler.
