@@ -1197,14 +1197,12 @@ pub(crate) struct InputRateTracker {
     inputs_per_second: u32,
     sustain_until: Instant,
     sustain_duration: Duration,
-    // DIRI PATCH (6): when input last changed this window, so a visible but
-    // inactive window the pointer is driving skips the inactive throttle.
-    last_input: Option<Instant>,
+    // DIRI PATCH (6): when the pointer last drove this window (scroll, click,
+    // drag), so a visible but inactive window skips the inactive throttle.
+    // Hover-only moves never set it: a pointer crossing a background window
+    // must not lift its streaming panes to full rate.
+    last_drive: Option<Instant>,
 }
-
-/// How long after input changed an inactive window it still draws at full
-/// rate. Covers trackpad momentum and the gap between mouse-wheel notches.
-const INACTIVE_INTERACTION_GRACE: Duration = Duration::from_secs(1);
 
 impl Default for InputRateTracker {
     fn default() -> Self {
@@ -1214,15 +1212,17 @@ impl Default for InputRateTracker {
             inputs_per_second: 60,
             sustain_until: Instant::now(),
             sustain_duration: Duration::from_secs(1),
-            last_input: None,
+            last_drive: None,
         }
     }
 }
 
 impl InputRateTracker {
-    pub fn record_input(&mut self) {
+    pub fn record_input(&mut self, drives: bool) {
         let now = Instant::now();
-        self.last_input = Some(now);
+        if drives {
+            self.last_drive = Some(now);
+        }
         self.timestamps.push(now);
         self.prune_old_timestamps(now);
 
@@ -1236,10 +1236,11 @@ impl InputRateTracker {
         Instant::now() < self.sustain_until
     }
 
-    /// Whether input changed this window within `INACTIVE_INTERACTION_GRACE`.
-    pub fn recently_interacted(&self, now: Instant) -> bool {
-        self.last_input
-            .is_some_and(|last| now.duration_since(last) < INACTIVE_INTERACTION_GRACE)
+    /// Whether the pointer drove this window within the sustain duration
+    /// (1 s), which covers trackpad momentum and gaps between wheel notches.
+    pub fn recently_driven(&self, now: Instant) -> bool {
+        self.last_drive
+            .is_some_and(|last| now.duration_since(last) < self.sustain_duration)
     }
 
     fn prune_old_timestamps(&mut self, now: Instant) {
@@ -1626,9 +1627,10 @@ impl Window {
                 // - Inactive window (not focused): cap to ~30fps to save energy
                 //
                 // DIRI PATCH (6): an inactive window the pointer is driving
-                // (scrolling, hovering on another monitor) draws at full rate.
+                // (scrolling, clicking, dragging on another monitor) draws at
+                // full rate.
                 let now = Instant::now();
-                let interacting = input_rate_tracker.borrow().recently_interacted(now);
+                let interacting = input_rate_tracker.borrow().recently_driven(now);
                 let min_frame_interval = if !request_frame_options.force_render
                     && !request_frame_options.require_presentation
                     && next_frame_callbacks.borrow().is_empty()
@@ -5238,6 +5240,19 @@ impl Window {
         // Handlers may set this to true by calling `prevent_default`.
         self.default_prevented = false;
 
+        // DIRI PATCH (6): input that drives the window (as opposed to a hover
+        // move) lifts the inactive-window frame cap for a moment.
+        let drives = matches!(
+            &event,
+            PlatformInput::ScrollWheel(_)
+                | PlatformInput::Pinch(_)
+                | PlatformInput::MouseDown(_)
+                | PlatformInput::MouseUp(_)
+                | PlatformInput::MouseMove(MouseMoveEvent {
+                    pressed_button: Some(_),
+                    ..
+                })
+        );
         let event = match event {
             // Track the mouse position with our own state, since accessing the platform
             // API for the mouse position can only occur on the main thread.
@@ -5331,7 +5346,7 @@ impl Window {
         }
 
         if self.invalidator.update_count() > update_count_before {
-            self.input_rate_tracker.borrow_mut().record_input();
+            self.input_rate_tracker.borrow_mut().record_input(drives);
             #[cfg(feature = "input-latency-histogram")]
             if self.invalidator.not_drawing() {
                 self.input_latency_tracker.record_input(dispatch_time);

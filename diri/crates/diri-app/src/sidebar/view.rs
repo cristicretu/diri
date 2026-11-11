@@ -903,6 +903,21 @@ impl Focusable for Sidebar {
     }
 }
 
+/// A session row's fill. Hover lights a row whether or not its window is
+/// key: a visible window on another display answers the pointer before it is
+/// clicked (only the selection pill steps back, see `chrome_focus`).
+fn session_row_fill(selected: bool, multi: bool, focused: bool, hovered: bool) -> RowFill {
+    if selected {
+        RowFill::Selected
+    } else if multi {
+        RowFill::MultiSelected
+    } else if focused || hovered {
+        RowFill::Hover
+    } else {
+        RowFill::Clear
+    }
+}
+
 impl Sidebar {
     pub(crate) fn set_initial_session(&mut self, selected: Option<SessionId>) {
         self.store = self.store.with_initial_selection(selected);
@@ -4158,15 +4173,7 @@ impl Sidebar {
         } else {
             colors.primary.alpha(0.90)
         };
-        let fill = if selected {
-            RowFill::Selected
-        } else if multi {
-            RowFill::MultiSelected
-        } else if focused || hovered {
-            RowFill::Hover
-        } else {
-            RowFill::Clear
-        };
+        let fill = session_row_fill(selected, multi, focused, hovered);
         let mut fill_color = match fill {
             RowFill::Selected => look.pill_fill(colors),
             fill => fill.color(colors),
@@ -11758,6 +11765,16 @@ mod tests {
         let row = row_bounds(&sidebar, cx, "preview-claude");
         cx.simulate_mouse_move(row.center(), None, Modifiers::default());
         cx.run_until_parked();
+        let fill = sidebar.read_with(cx, |sidebar, cx| {
+            sidebar.session_row_views[&SessionId::new("preview-claude")]
+                .read(cx)
+                .fill_for_test()
+        });
+        assert_eq!(
+            fill,
+            RowFill::Hover,
+            "a hovered row lights in a visible window that is not key"
+        );
         cx.executor().advance_clock(Duration::from_secs(1));
         cx.run_until_parked();
         assert_eq!(

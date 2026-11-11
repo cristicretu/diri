@@ -6,8 +6,8 @@
 //! steps its chrome back the way a native window does: the selection loses
 //! its lift and the title row's text and glyphs fade. Hover keeps lighting
 //! rows and tabs, so a visible window on another monitor still answers the
-//! pointer before it is clicked. How far is one table per interface style and density, so a design
-//! pass edits numbers, not view code.
+//! pointer before it is clicked. How far is one table per interface style
+//! and density, so a design pass edits numbers, not view code.
 //!
 //! Cost: nothing while key status holds. GPUI refreshes the whole window when
 //! it becomes or stops being key (`Window::refresh` in the activation
@@ -69,7 +69,6 @@ impl ChromeLook {
             Pill::Flat(_) => lifted.alpha(0.0),
         }
     }
-
 }
 
 /// The look for `key`, under a style, density and appearance.

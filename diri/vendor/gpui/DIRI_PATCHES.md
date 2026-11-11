@@ -171,21 +171,31 @@ build on a loaded machine): about 3.5 to 6 ms per capture, about 15 ms for the
 first capture in a process. Capturing never presents or disturbs the next
 frame.
 
-## 6. An inactive window the pointer is driving draws at full rate
+## 6. An inactive window the pointer is driving draws at full rate and hovers
 
 **Upstream behavior.** The inactive-window cap from patch 3 also holds a
-normal window to ~30 fps while the user scrolls or hovers it without giving it
-the keyboard, which is common with a second monitor: scrolling the sidebar of
-a visible but unfocused Diri window stutters. Upstream also only keeps
-presenting through high-rate input while the window is active.
+normal window to ~30 fps while the user scrolls it without giving it the
+keyboard, which is common with a second monitor: scrolling the sidebar of a
+visible but unfocused Diri window stutters whenever anything in it animates.
+Upstream also only keeps presenting through high-rate input while the window
+is active. And AppKit sends `mouseMoved:` only to the key window, so a Normal
+window that is not key never sees the pointer: no hover, no exit.
 
-**Patch.** `InputRateTracker` remembers when input last changed the window
-(`record_input` already runs only when dispatch invalidated something).
-For `INACTIVE_INTERACTION_GRACE` (1 s) after that, the inactive cap is skipped
+**Patch.** `InputRateTracker::record_input` takes whether the input drove the
+window (scroll, pinch, click, drag) and remembers when that last happened.
+For the tracker's sustain duration (1 s) after it, the inactive cap is skipped
 and high-rate input keeps presenting as it does for the key window. The 1 s
-grace covers trackpad momentum and the gap between mouse-wheel notches. An
-unattended inactive window, such as a streaming terminal on another monitor,
-keeps the ~30 fps cap. Files: `src/window.rs`.
+covers trackpad momentum and the gap between mouse-wheel notches. Hover-only
+moves never count, so a pointer crossing a background window that streams
+agent output leaves it at ~30 fps, as does an unattended one. Files:
+`src/window.rs`.
+
+In `gpui_macos`, Normal and Floating windows hold an `NSTrackingActiveAlways`
+tracking area (moves, enter/exit) only while they are not key
+(`MacWindowState::track_pointer_while_inactive`, toggled from
+`window_did_change_key_status` and at creation). A key window keeps upstream's
+event stream exactly, and no move is ever delivered twice. Files:
+`gpui_macos/src/window.rs`.
 
 ## Re-applying on a GPUI bump
 
@@ -201,7 +211,7 @@ keeps the ~30 fps cap. Files: `src/window.rs`.
    `relative_to`/`rebased_on`, `CachedViewBase*`, base stacks, deferred-draw
    bases, `insert_debug_bounds`, `debug_bounds_history` replay, the
    `exempt_from_inactive_throttle` frame-rate exemption, the
-   `INACTIVE_INTERACTION_GRACE` input exemption, and the window
+   `recently_driven` input exemption, and the window
    control hitbox reuse and `window_control_area_for`),
    `text_system/line_layout.rs` (`LineLayoutIndex` arithmetic),
    `elements/div.rs` (prepaint opacity, `insert_debug_bounds`), and the scene

@@ -112,3 +112,10 @@ second `CGTextStroke` pass when `RenderGlyphParams::stroke` is non-zero, with
 one more device pixel of raster margin, and a `font_faces` listing plus a
 sub-1.0 weight snap in `font_id`. With `stroke == 0` the rasterizer runs
 upstream's single fill unchanged.
+
+The inactive-window pointer patch (patch 6 in `vendor/gpui/DIRI_PATCHES.md`)
+adds an `NSTrackingActiveAlways` tracking area (moves, enter/exit) to Normal
+and Floating windows while they are not key, and removes it when they become
+key. AppKit sends `mouseMoved:` only to the key window, so without it a
+visible but unfocused window never hovers and never learns the pointer left.
+A key window keeps upstream's event stream exactly.

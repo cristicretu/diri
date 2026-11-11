@@ -555,9 +555,48 @@ struct MacWindowState {
     accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
     // The parent window if this window is a sheet (Dialog kind)
     sheet_parent: Option<id>,
+    // DIRI PATCH (6): Normal and Floating windows get pointer moves and exits
+    // while they are not key. AppKit sends `mouseMoved:` only to the key
+    // window, so without this a visible but unfocused window never hovers.
+    tracks_pointer_while_inactive: bool,
+    // The tracking area that delivers them, held only while the window is not
+    // key, so a key window keeps upstream's event stream exactly.
+    inactive_pointer_tracking: Option<id>,
 }
 
 impl MacWindowState {
+    /// DIRI PATCH (6): add the inactive pointer tracking area while the
+    /// window is not key, and remove it once it is. The key window already
+    /// receives moves through `setAcceptsMouseMovedEvents`, so holding the area
+    /// only while inactive never delivers a move twice.
+    fn track_pointer_while_inactive(&mut self, inactive: bool) {
+        if !self.tracks_pointer_while_inactive {
+            return;
+        }
+        let view = self.native_view.as_ptr();
+        match (inactive, self.inactive_pointer_tracking) {
+            (true, None) => unsafe {
+                let area: id = msg_send![class!(NSTrackingArea), alloc];
+                let area: id = msg_send![
+                    area,
+                    initWithRect: NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.))
+                    options: NSTrackingMouseEnteredAndExited | NSTrackingMouseMoved | NSTrackingActiveAlways | NSTrackingInVisibleRect
+                    owner: view
+                    userInfo: nil
+                ];
+                let _: () = msg_send![view, addTrackingArea: area];
+                // Keep the +1 from `alloc` so the area can be removed later.
+                self.inactive_pointer_tracking = Some(area);
+            },
+            (false, Some(area)) => unsafe {
+                let _: () = msg_send![view, removeTrackingArea: area];
+                let _: () = msg_send![area, release];
+                self.inactive_pointer_tracking = None;
+            },
+            _ => {}
+        }
+    }
+
     fn is_visible(&self) -> bool {
         unsafe {
             self.native_window
@@ -974,6 +1013,11 @@ impl MacWindow {
                 closed: Arc::new(AtomicBool::new(false)),
                 accesskit_adapter: None,
                 sheet_parent: None,
+                tracks_pointer_while_inactive: matches!(
+                    kind,
+                    WindowKind::Normal | WindowKind::Floating
+                ),
+                inactive_pointer_tracking: None,
             })));
 
             (*native_window).set_ivar(
@@ -1134,6 +1178,8 @@ impl MacWindow {
                 let mut window_state = window.0.lock();
                 window_state.move_traffic_light();
                 window_state.sheet_parent = sheet_parent;
+                let key = window_state.native_window.isKeyWindow() == YES;
+                window_state.track_pointer_while_inactive(!key);
             }
 
             pool.drain();
@@ -1217,6 +1263,7 @@ impl Drop for MacWindow {
             this.native_window.setDelegate_(nil);
         }
         this.input_handler.take();
+        this.track_pointer_while_inactive(false);
         // The adapter retains the content view, whose GPUIView subview owns
         // this state through its ivar. Left in place that cycle outlives the
         // NSWindow and strands the renderer: Metal layer, drawables, atlases.
@@ -2675,7 +2722,7 @@ extern "C" fn window_did_change_screen(this: &Object, _: Sel, _: id) {
 
 extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
-    let lock = window_state.lock();
+    let mut lock = window_state.lock();
     let is_active = unsafe { lock.native_window.isKeyWindow() == YES };
 
     // AppKit also unhides the cursor on activation changes, so mirror that here.
@@ -2699,6 +2746,7 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
         return;
     }
 
+    lock.track_pointer_while_inactive(!is_active);
     let executor = lock.foreground_executor.clone();
     drop(lock);
 
