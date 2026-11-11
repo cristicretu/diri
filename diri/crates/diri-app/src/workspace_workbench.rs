@@ -1496,21 +1496,16 @@ impl Render for WorkspaceWorkbench {
                                 .cached(StyleRefinement::default().size_full()),
                         ),
                 );
-            } else if self.closing.contains(&pane.identity.session) {
-                surface = surface.bg(colors.terminal_surface());
             } else {
-                surface = surface.child(
-                    div()
-                        .debug_selector(|| "workspace-pane-unavailable".into())
-                        .p(px(18.0))
-                        .text_color(colors.secondary)
-                        .child("Session unavailable")
-                        .child(
-                            div()
-                                .text_size(px(12.0))
-                                .child("This saved pane stays in the layout."),
-                        ),
-                );
+                // A pane whose session is closing, or has not reached this
+                // window yet, is an empty terminal for that moment. Never
+                // text: a placement whose session is gone for good is closed
+                // by the Engine, so any message here would only ever flash.
+                surface = surface
+                    .when(!self.closing.contains(&pane.identity.session), |surface| {
+                        surface.debug_selector(|| "workspace-pane-unavailable".into())
+                    })
+                    .bg(colors.terminal_surface());
             }
             let pane_id = pane.identity.pane.clone();
             // The pane's own title bar makes the same room (`TerminalPane`).

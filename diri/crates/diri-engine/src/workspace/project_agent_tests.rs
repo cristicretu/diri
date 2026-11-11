@@ -354,16 +354,17 @@ fn placing_a_spawned_agent_at_the_tab_limit_drops_tabs_of_deleted_sessions() {
 }
 
 #[test]
-fn below_the_limit_unavailable_tabs_are_retained_and_can_be_closed() {
+fn any_edit_drops_unavailable_tabs_and_can_still_target_one() {
     let mut f = Fixture::new();
     full_of_deleted_sessions(&mut f);
     f.apply(WorkspaceMutation::RemoveTab {
         tab_id: TabId::new("tab_7"),
     });
-    // Below the limit unavailable placements are retained as they were.
+    // Only the split that keeps a live pane remains; no tab is left to show
+    // as "Session unavailable".
     let tabs = &f.snapshot.workspaces[0].tabs;
-    assert_eq!(tabs.len(), MAX_WORKSPACE_TABS - 1);
-    assert!(!tabs.iter().any(|tab| tab.id.0 == "tab_7"));
+    assert_eq!(tabs.len(), 1);
+    assert!(matches!(tabs[0].layout, LayoutNode::Split { .. }));
 }
 
 #[test]

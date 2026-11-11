@@ -104,16 +104,41 @@ impl WorkspaceStore {
     }
 
     /// A removed session's panes leave every tab they share with another
-    /// pane, so closing a pane collapses its split instead of leaving a
-    /// "Session unavailable" hole. A one-pane tab is left to its owner.
+    /// pane, so closing a pane collapses its split, and a tab it was the only
+    /// pane of closes with it. Neither may stay behind as a pane with no
+    /// session: the window would show it as an empty "Session unavailable"
+    /// hole, and they piled up by the hundred. Reopening the session (⇧⌘T)
+    /// places it again like any session without a tab.
     pub(crate) fn prune_session(&self, session: &SessionId) -> Option<WorkspaceSnapshot> {
         let result = self.transact(|next| {
             let mut changed = false;
-            for tab in next.workspaces.iter_mut().flat_map(|w| &mut w.tabs) {
-                changed |= tree::prune(&mut tab.layout, session);
+            for workspace in &mut next.workspaces {
+                for tab in &mut workspace.tabs {
+                    changed |= tree::prune(&mut tab.layout, session);
+                }
+                let before = workspace.tabs.len();
+                workspace
+                    .tabs
+                    .retain(|tab| tree::panes_of(&tab.layout, session).is_empty());
+                changed |= workspace.tabs.len() != before;
             }
             Ok(changed)
         });
+        match result {
+            Ok((snapshot, true)) => Some(snapshot),
+            _ => None,
+        }
+    }
+
+    /// Drops every tab with no pane whose session is in `sessions`, the
+    /// Engine's whole inventory. Run at Engine start: placements of sessions
+    /// removed before `prune_session` closed one-pane tabs, or removed by a
+    /// path that never pruned, would otherwise stay forever.
+    pub(crate) fn reclaim_unavailable(
+        &self,
+        sessions: &HashSet<SessionId>,
+    ) -> Option<WorkspaceSnapshot> {
+        let result = self.transact(|next| Ok(drop_unavailable_tabs(next, sessions)));
         match result {
             Ok((snapshot, true)) => Some(snapshot),
             _ => None,
@@ -476,17 +501,21 @@ fn existing(session: &SessionId, sessions: &HashSet<SessionId>) -> Result<(), Co
         ))
     }
 }
-/// A placement outlives its deleted session and stays visible as unavailable.
-/// Nothing removes those tabs, so a long-used install fills the tab limit with
-/// them and then rejects every new placement (opening an agent, or placing a
-/// spawned child). Only when an edit would exceed the limit are the tabs whose
-/// every pane is unavailable dropped; this runs after the edit, so it can still
-/// target them. A split that keeps one live pane is never dropped.
+/// A tab whose every session is gone has nothing to show but a "Session
+/// unavailable" hole, and a long-used install once held 115 of them (and
+/// before that, a tab limit full of them rejected every new placement). Every
+/// edit drops them; this runs after the edit, so it can still target them. A
+/// split that keeps one live pane is never dropped.
 ///
 /// The inventory was read before the file lock, but the revision check makes
 /// that sound: a session created after the read can only be placed by an edit
 /// that commits first, and that commit rejects this edit's expected revision.
 fn reclaim_unavailable_tabs(state: &mut WorkspaceSnapshot, sessions: &HashSet<SessionId>) {
+    drop_unavailable_tabs(state, sessions);
+}
+
+/// Whether any tab was dropped.
+fn drop_unavailable_tabs(state: &mut WorkspaceSnapshot, sessions: &HashSet<SessionId>) -> bool {
     fn available(node: &LayoutNode, sessions: &HashSet<SessionId>) -> bool {
         match node {
             LayoutNode::Pane { session_id, .. } => sessions.contains(session_id),
@@ -495,14 +524,15 @@ fn reclaim_unavailable_tabs(state: &mut WorkspaceSnapshot, sessions: &HashSet<Se
             }
         }
     }
-    if state.workspaces.iter().map(|w| w.tabs.len()).sum::<usize>() <= MAX_WORKSPACE_TABS {
-        return;
-    }
+    let mut dropped = false;
     for workspace in &mut state.workspaces {
+        let before = workspace.tabs.len();
         workspace
             .tabs
             .retain(|tab| available(&tab.layout, sessions));
+        dropped |= workspace.tabs.len() != before;
     }
+    dropped
 }
 /// Every project that ever opened an agent got a workspace, and closing its
 /// last tab leaves that workspace behind, empty. A long-used install (one
@@ -1386,7 +1416,7 @@ mod tests {
     }
 
     #[test]
-    fn removal_race_keeps_unavailable_reference_and_never_recreates_session() {
+    fn removal_race_never_recreates_session_and_the_next_edit_drops_its_tab() {
         let mut f = Fixture::new();
         let workspace = f.create_workspace("Work");
         // The inventory was captured immediately before session removal wins.
@@ -1410,7 +1440,7 @@ mod tests {
         assert_eq!(f.store.snapshot().unwrap(), f.snapshot);
         f.apply(RenameWorkspace {
             workspace_id: workspace.clone(),
-            name: "Unavailable work is retained".into(),
+            name: "Renamed".into(),
         });
         f.reject(
             CreateTab {
@@ -1422,7 +1452,8 @@ mod tests {
             "workspace_session_unavailable",
         );
         assert!(!f.sessions.contains(&SessionId::new("session_0")));
-        assert_eq!(f.snapshot.workspaces[0].tabs.len(), 1);
+        // The rename's commit dropped the placement the race left behind.
+        assert!(f.snapshot.workspaces[0].tabs.is_empty());
     }
 
     #[test]
@@ -1651,7 +1682,7 @@ mod tests {
     }
 
     #[test]
-    fn closing_a_pane_collapses_its_parent_split_but_keeps_a_one_pane_tab() {
+    fn closing_a_pane_collapses_its_parent_split_and_closes_a_one_pane_tab() {
         let mut f = Fixture::new();
         let workspace = f.create_workspace("Project");
         let (tab, a) = f.create_tab(workspace.clone(), 0);
@@ -1671,17 +1702,60 @@ mod tests {
         assert!(matches!(&**second, LayoutNode::Pane { id, .. } if *id == b));
         // Focus left the removed pane.
         assert!(tree::panes(layout).contains(&snapshot.workspaces[0].tabs[0].focused_pane));
-        // The only pane of a tab stays: closing that tab is its owner's call.
+        // A tab whose only pane it was closes with it: no "Session
+        // unavailable" placement is left behind.
+        let snapshot = f
+            .store
+            .prune_session(&SessionId::new("session_3"))
+            .expect("closed");
+        assert_eq!(snapshot.workspaces[0].tabs.len(), 1);
         assert!(
-            f.store
-                .prune_session(&SessionId::new("session_3"))
-                .is_none()
+            snapshot.workspaces[0].tabs.iter().all(|tab| tree::panes_of(
+                &tab.layout,
+                &SessionId::new("session_3")
+            )
+            .is_empty())
         );
         assert!(
             f.store
                 .prune_session(&SessionId::new("session_7"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn engine_start_drops_tabs_whose_sessions_are_all_gone() {
+        let mut f = Fixture::new();
+        let workspace = f.create_workspace("Project");
+        let (tab, a) = f.create_tab(workspace.clone(), 0);
+        split_at(&mut f, &tab, &a, 1, DockEdge::Right);
+        f.create_tab(workspace.clone(), 2);
+        f.create_tab(workspace, 3);
+        // session_1 (half of a split) and session_2 (a one-pane tab) were
+        // removed while removal still left their placements behind.
+        let live = ["session_0", "session_3"]
+            .into_iter()
+            .map(SessionId::new)
+            .collect();
+        let snapshot = f.store.reclaim_unavailable(&live).expect("reclaimed");
+        let tabs = &snapshot.workspaces[0].tabs;
+        assert_eq!(
+            tabs.len(),
+            2,
+            "the split keeps a live pane; one tab dropped"
+        );
+        assert!(
+            tabs.iter()
+                .all(|tab| tree::panes_of(&tab.layout, &SessionId::new("session_2")).is_empty())
+        );
+        // Selection never points at a dropped tab.
+        let selected = snapshot.workspaces[0]
+            .selected_tab
+            .as_ref()
+            .expect("selected");
+        assert!(tabs.iter().any(|tab| &tab.id == selected));
+        // A second start finds nothing to do.
+        assert!(f.store.reclaim_unavailable(&live).is_none());
     }
 
     #[test]
