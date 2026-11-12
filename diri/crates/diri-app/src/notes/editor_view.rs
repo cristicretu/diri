@@ -2236,6 +2236,9 @@ impl NoteEditorView {
             self.ticked.push((id, Instant::now()));
         }
         self.edited(cx);
+        // A tick from the checkbox or the work panel leaves the caret where
+        // it was, so the view stays put instead of jumping back to it.
+        self.autoscroll = false;
     }
 
     // -----------------------------------------------------------------------
@@ -4176,6 +4179,7 @@ impl NoteEditorView {
                 let popping = self.ticked.iter().any(|(b, _)| *b == id);
                 let box_el = div()
                     .id(("todo-box", id))
+                    .debug_selector(move || format!("note-todo-{id}"))
                     .size(px(16.0))
                     .rounded(px(5.0))
                     .flex()
