@@ -38,6 +38,7 @@
   "session.close.title_project": "关闭“{project}”中的所有会话？",
   "session.close.title_untitled": "关闭会话？",
   "session.close_session": "关闭会话",
+  "session.foreground_revoke": "可以把窗口调到前台。点击撤销。",
   "session.hover.done_days": "{count} 天前完成",
   "session.hover.done_hours": "{count} 小时前完成",
   "session.hover.done_minutes": "{count} 分钟前完成",

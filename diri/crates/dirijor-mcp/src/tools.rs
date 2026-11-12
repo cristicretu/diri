@@ -608,9 +608,13 @@ type_text {text}, set_value, set_state {state: checked|expanded|focused...}, cle
 {key}, hotkey {keys}, scroll) or with pixel x,y from that screenshot; (4) re-read with \
 get_window_state {since:\"latest\"} and check the change before going on. run_steps runs several \
 actions in one call; wait blocks until an element, window or dialog appears or goes. Everything \
-stays in the background while the person keeps working: delivery_mode \"foreground\", scope \
-\"desktop\", bring_to_front and activate_app are refused with computer_foreground_denied, even when \
-a driver hint recommends them; if no background route reaches a control, tell the person instead. A failed \
+stays in the background while the person keeps working: scope \"desktop\", bring_to_front and \
+activate_app are always refused with computer_foreground_denied, even when a driver hint recommends \
+them. When no background route reaches a control (a file picker, a system dialog, a sheet), retry \
+that one action with delivery_mode \"foreground\": it fronts the window for a moment, then gives \
+the person's app back. It needs the person's leave (Diri Settings › Agents › Computer use › \
+Foreground actions; under Ask the call waits for their answer); if it is refused, tell the person \
+what you need instead. A failed \
 action's disposition.retry says whether retrying is safe; a stale_element_token means read again. Act only on apps you launched or the person pointed you \
 to: an app another agent is driving returns computer_app_busy. computer_unavailable or \
 computer_permissions means only the person can finish setup (Diri Settings › Agents › Computer use): \

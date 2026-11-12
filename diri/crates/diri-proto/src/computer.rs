@@ -17,6 +17,76 @@ pub struct ComputerActParams {
     pub args: Value,
 }
 
+/// Whether Agents may use the driver's foreground rung
+/// (`delivery_mode:"foreground"`): briefly front the target window, act,
+/// then restore the app that was frontmost. Persistent focus
+/// (`bring_to_front`, `activate_app`) and desktop scope stay refused.
+/// Ordered from strictest to most open.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub enum ComputerForeground {
+    /// Background only.
+    #[default]
+    Off,
+    /// The first foreground action of each session asks the person; the
+    /// answer holds for the rest of that session's life.
+    Ask,
+    /// Allowed without asking. The person can still revoke a session.
+    Always,
+}
+
+/// `computer.configure`: the person's computer use settings.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ComputerConfigureParams {
+    #[serde(default)]
+    pub foreground: ComputerForeground,
+}
+
+/// `computer.foreground_answer`: the person's answer to a
+/// [`ComputerForegroundRequestedEvent`].
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ComputerForegroundAnswerParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    pub allow: bool,
+}
+
+/// `computer.foreground_revoke`: take foreground back from one session, or
+/// from every session when `sessionID` is absent. A revoked session is
+/// refused for the rest of its life, without asking again.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ComputerForegroundRevokeParams {
+    #[serde(rename = "sessionID", default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+}
+
+/// `computer.foreground_requested` event: under
+/// [`ComputerForeground::Ask`], an Agent's first foreground action waits for
+/// the person to answer with `computer.foreground_answer`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ComputerForegroundRequestedEvent {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    /// "Claude · signup flow": who asked.
+    pub badge: String,
+    /// How long the action waits for an answer before it is refused.
+    #[serde(rename = "timeoutMs")]
+    pub timeout_ms: u64,
+}
+
+/// `computer.foreground_changed` event: the sessions that may use the
+/// foreground rung now, so the app can mark them. Also in
+/// [`ComputerStatus::foreground_sessions`].
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ComputerForegroundChangedEvent {
+    pub sessions: Vec<SessionId>,
+}
+
 /// `computer.status`: whether Cua Driver is installed and allowed.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -80,6 +150,12 @@ pub struct ComputerStatus {
     /// The last install's output, for "Show log".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_log: Option<String>,
+    /// The foreground setting (`computer.configure`).
+    #[serde(default)]
+    pub foreground: ComputerForeground,
+    /// Sessions that may use the foreground rung now.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub foreground_sessions: Vec<SessionId>,
 }
 
 impl ComputerStatus {

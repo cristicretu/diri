@@ -607,6 +607,24 @@ mod catalog {
                 "Install or restart computer use."
             ),
             entry!(
+                Method::COMPUTER_CONFIGURE,
+                ComputerConfigureParams,
+                "ComputerStatus",
+                "Save the person's computer use settings."
+            ),
+            entry!(
+                Method::COMPUTER_FOREGROUND_ANSWER,
+                ComputerForegroundAnswerParams,
+                "Value",
+                "Answer an Agent's request to bring windows forward."
+            ),
+            entry!(
+                Method::COMPUTER_FOREGROUND_REVOKE,
+                ComputerForegroundRevokeParams,
+                "ComputerStatus",
+                "Stop a session, or all, bringing windows forward."
+            ),
+            entry!(
                 Method::HOST_SYNC_PREFS,
                 HostSyncPrefsParams,
                 "PrefsSyncReport",

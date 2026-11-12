@@ -30,6 +30,14 @@ pub const RESERVED: &[(&str, &str)] = &[
     ("client.set_active", "only the window reports its focus"),
     ("hook.report", "only Agents' hooks report"),
     (
+        "computer.configure",
+        "only the person changes computer use settings",
+    ),
+    (
+        "computer.foreground_answer",
+        "only the person answers a foreground request",
+    ),
+    (
         "daemon.prepare_shutdown",
         "stopping the Engine ends every session",
     ),
