@@ -4,9 +4,10 @@
 //!
 //! A key window keeps the shipped look exactly. A window that is not key
 //! steps its chrome back the way a native window does: the selection loses
-//! its lift, hover stops lighting rows, and the title row's text and glyphs
-//! fade. How far is one table per interface style and density, so a design
-//! pass edits numbers, not view code.
+//! its lift and the title row's text and glyphs fade. Hover keeps lighting
+//! rows and tabs, so a visible window on another monitor still answers the
+//! pointer before it is clicked. How far is one table per interface style
+//! and density, so a design pass edits numbers, not view code.
 //!
 //! Cost: nothing while key status holds. GPUI refreshes the whole window when
 //! it becomes or stops being key (`Window::refresh` in the activation
@@ -37,8 +38,6 @@ pub(crate) enum Pill {
 pub(crate) struct ChromeLook {
     pub(crate) key: bool,
     pub(crate) pill: Pill,
-    /// Whether pointer hover lights rows and tabs.
-    pub(crate) hover: bool,
     /// Opacity of the title row's text and glyphs.
     pub(crate) title: f32,
 }
@@ -48,7 +47,6 @@ impl ChromeLook {
     pub(crate) const KEY: Self = Self {
         key: true,
         pill: Pill::Lifted,
-        hover: true,
         title: 1.0,
     };
 
@@ -70,11 +68,6 @@ impl ChromeLook {
             Pill::Dimmed { stroke, .. } => lifted.alpha(lifted.a * stroke),
             Pill::Flat(_) => lifted.alpha(0.0),
         }
-    }
-
-    /// `color` where hover lights a row, clear where it does not.
-    pub(crate) fn hover(self, color: Rgba) -> Rgba {
-        if self.hover { color } else { color.alpha(0.0) }
     }
 }
 
@@ -121,7 +114,6 @@ pub(crate) const fn look(
     ChromeLook {
         key: false,
         pill,
-        hover: false,
         title: match style {
             // The native style dims its title row like a native window.
             InterfaceStyle::System => 0.5,
@@ -187,8 +179,6 @@ mod tests {
             let colors = palette(appearance);
             assert_eq!(look.pill_fill(colors), Glass::fill(colors));
             assert_eq!(look.pill_stroke(colors), Glass::stroke(colors));
-            let hover = colors.primary.alpha(0.06);
-            assert_eq!(look.hover(hover), hover);
         }
     }
 
@@ -209,7 +199,6 @@ mod tests {
                 other.pill_stroke(colors).a < key.pill_stroke(colors).a,
                 "{what}: hairline"
             );
-            assert_eq!(other.hover(colors.primary.alpha(0.06)).a, 0.0, "{what}");
             assert!(other.title < 1.0 && other.title >= 0.5, "{what}: title");
         }
     }

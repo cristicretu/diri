@@ -903,6 +903,21 @@ impl Focusable for Sidebar {
     }
 }
 
+/// A session row's fill. Hover lights a row whether or not its window is
+/// key: a visible window on another display answers the pointer before it is
+/// clicked (only the selection pill steps back, see `chrome_focus`).
+fn session_row_fill(selected: bool, multi: bool, focused: bool, hovered: bool) -> RowFill {
+    if selected {
+        RowFill::Selected
+    } else if multi {
+        RowFill::MultiSelected
+    } else if focused || hovered {
+        RowFill::Hover
+    } else {
+        RowFill::Clear
+    }
+}
+
 impl Sidebar {
     pub(crate) fn set_initial_session(&mut self, selected: Option<SessionId>) {
         self.store = self.store.with_initial_selection(selected);
@@ -1961,8 +1976,9 @@ impl Sidebar {
     }
 
     fn can_show_hover_card(&self, window: &Window) -> bool {
+        // A window that is not key still previews: with Diri visible on
+        // another display, hovering a row answers before it is clicked.
         (self.ui.visible || self.peek_open)
-            && window.is_window_active()
             && self.settings_nav.is_none()
             && !self.peek_interaction_active()
             && self.ui.hovered_session.as_ref().is_some_and(|id| {
@@ -2464,7 +2480,7 @@ impl Sidebar {
                 if selected {
                     style
                 } else {
-                    style.bg(look.hover(Fill::hover(colors, true)))
+                    style.bg(Fill::hover(colors, true))
                 }
             })
             .on_click(cx.listener(move |_, _, _, cx| {
@@ -4157,24 +4173,14 @@ impl Sidebar {
         } else {
             colors.primary.alpha(0.90)
         };
-        // Keyboard focus still lights its row in a window that is not key;
-        // only pointer hover stands down there (`chrome_focus`).
-        let fill = if selected {
-            RowFill::Selected
-        } else if multi {
-            RowFill::MultiSelected
-        } else if focused || (hovered && look.hover) {
-            RowFill::Hover
-        } else {
-            RowFill::Clear
-        };
+        let fill = session_row_fill(selected, multi, focused, hovered);
         let mut fill_color = match fill {
             RowFill::Selected => look.pill_fill(colors),
             fill => fill.color(colors),
         };
         if fill == RowFill::Clear {
             // The row the pointer just left keeps a fading hover fill.
-            fill_color.a = look.hover(RowFill::Hover.color(colors)).a * hover_linger;
+            fill_color.a = RowFill::Hover.color(colors).a * hover_linger;
         }
 
         if renaming {
@@ -4928,10 +4934,10 @@ impl Sidebar {
         let look = self.chrome_look;
         let fill_color = if selected {
             look.pill_fill(colors)
-        } else if focused || (hovered && look.hover) {
+        } else if focused || hovered {
             RowFill::Hover.color(colors)
         } else {
-            let mut trail = look.hover(RowFill::Hover.color(colors));
+            let mut trail = RowFill::Hover.color(colors);
             trail.a *= self.session_hover_linger(&id);
             trail
         };
@@ -11369,7 +11375,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn selection_and_hover_step_back_while_the_window_is_not_key(cx: &mut TestAppContext) {
+    fn selection_steps_back_while_the_window_is_not_key(cx: &mut TestAppContext) {
         let (sidebar, _, cx) = drag_harness(cx);
         sidebar.update(cx, |sidebar, cx| {
             sidebar
@@ -11402,7 +11408,6 @@ mod tests {
         let colors = sidebar.read_with(cx, |sidebar, _| sidebar.colors());
         for (id, _, look) in looks(&sidebar, cx) {
             assert!(!look.key, "{id} still wears the key look");
-            assert!(!look.hover, "{id} lights on hover");
             assert!(look.pill_fill(colors).a < diri_ui::Glass::fill(colors).a, "{id}");
         }
         let title = sidebar.read_with(cx, |sidebar, _| sidebar.title_opacity);
@@ -11743,6 +11748,40 @@ mod tests {
         cx.executor().advance_clock(Duration::from_secs(1));
         cx.run_until_parked();
         assert!(sidebar.read_with(cx, |sidebar, _| sidebar.ui.hover_card.is_none()));
+    }
+
+    #[gpui::test]
+    fn session_preview_opens_while_the_window_is_not_key(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        cx.deactivate_window();
+        cx.run_until_parked();
+        assert!(!cx.update(|window, _| window.is_window_active()));
+        let row = row_bounds(&sidebar, cx, "preview-claude");
+        cx.simulate_mouse_move(row.center(), None, Modifiers::default());
+        cx.run_until_parked();
+        let fill = sidebar.read_with(cx, |sidebar, cx| {
+            sidebar.session_row_views[&SessionId::new("preview-claude")]
+                .read(cx)
+                .fill_for_test()
+        });
+        assert_eq!(
+            fill,
+            RowFill::Hover,
+            "a hovered row lights in a visible window that is not key"
+        );
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.ui.hover_card.clone()),
+            Some(SessionId::new("preview-claude")),
+            "hovering a row in a visible window that is not key previews it"
+        );
     }
 
     #[gpui::test]

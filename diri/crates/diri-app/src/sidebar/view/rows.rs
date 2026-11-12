@@ -76,7 +76,7 @@ pub(in crate::sidebar) struct SessionRowProps {
     /// How much of the hover fill a row the pointer just left still wears.
     /// It changes every frame of the fade, so only fading rows re-render.
     pub(super) hover_linger: f32,
-    /// The selection and hover look for the window's key status.
+    /// The selection look for the window's key status.
     pub(super) look: crate::chrome_focus::ChromeLook,
 }
 
@@ -92,7 +92,6 @@ impl SessionRowView {
     pub(super) fn held_hint_for_test(&self) -> f32 {
         self.props.held_hint
     }
-
 }
 
 // The window-key test that reads these compiles on every platform (Linux and
@@ -105,6 +104,13 @@ impl SessionRowView {
 
     pub(super) fn selected_for_test(&self) -> bool {
         self.props.selected
+    }
+
+    /// The fill the row renders with, through the same choice `session_row`
+    /// makes.
+    pub(super) fn fill_for_test(&self) -> RowFill {
+        let props = &self.props;
+        session_row_fill(props.selected, props.multi, props.focused, props.hovered)
     }
 }
 

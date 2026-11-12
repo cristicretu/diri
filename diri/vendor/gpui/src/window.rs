@@ -1197,6 +1197,11 @@ pub(crate) struct InputRateTracker {
     inputs_per_second: u32,
     sustain_until: Instant,
     sustain_duration: Duration,
+    // DIRI PATCH (6): when the pointer last drove this window (scroll, click,
+    // drag), so a visible but inactive window skips the inactive throttle.
+    // Hover-only moves never set it: a pointer crossing a background window
+    // must not lift its streaming panes to full rate.
+    last_drive: Option<Instant>,
 }
 
 impl Default for InputRateTracker {
@@ -1207,13 +1212,17 @@ impl Default for InputRateTracker {
             inputs_per_second: 60,
             sustain_until: Instant::now(),
             sustain_duration: Duration::from_secs(1),
+            last_drive: None,
         }
     }
 }
 
 impl InputRateTracker {
-    pub fn record_input(&mut self) {
+    pub fn record_input(&mut self, drives: bool) {
         let now = Instant::now();
+        if drives {
+            self.last_drive = Some(now);
+        }
         self.timestamps.push(now);
         self.prune_old_timestamps(now);
 
@@ -1225,6 +1234,13 @@ impl InputRateTracker {
 
     pub fn is_high_rate(&self) -> bool {
         Instant::now() < self.sustain_until
+    }
+
+    /// Whether the pointer drove this window within the sustain duration
+    /// (1 s), which covers trackpad momentum and gaps between wheel notches.
+    pub fn recently_driven(&self, now: Instant) -> bool {
+        self.last_drive
+            .is_some_and(|last| now.duration_since(last) < self.sustain_duration)
     }
 
     fn prune_old_timestamps(&mut self, now: Instant) {
@@ -1609,12 +1625,18 @@ impl Window {
                 // Throttle frame rate based on conditions:
                 // - Thermal pressure (Serious/Critical): cap to ~60fps
                 // - Inactive window (not focused): cap to ~30fps to save energy
+                //
+                // DIRI PATCH (6): an inactive window the pointer is driving
+                // (scrolling, clicking, dragging on another monitor) draws at
+                // full rate.
+                let now = Instant::now();
+                let interacting = input_rate_tracker.borrow().recently_driven(now);
                 let min_frame_interval = if !request_frame_options.force_render
                     && !request_frame_options.require_presentation
                     && next_frame_callbacks.borrow().is_empty()
                 {
                     None
-                } else if !active.get() && !exempt_from_inactive_throttle {
+                } else if !active.get() && !exempt_from_inactive_throttle && !interacting {
                     Some(Duration::from_micros(33333))
                 } else if let Some(ThermalState::Critical | ThermalState::Serious) = thermal_state {
                     Some(Duration::from_micros(16667))
@@ -1622,7 +1644,6 @@ impl Window {
                     None
                 };
 
-                let now = Instant::now();
                 if let Some(min_interval) = min_frame_interval {
                     if let Some(last_frame) = last_frame_time.get()
                         && now.duration_since(last_frame) < min_interval
@@ -1655,7 +1676,8 @@ impl Window {
                 // to prevent display underclocking during active input.
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
-                    || (active.get() && input_rate_tracker.borrow_mut().is_high_rate());
+                    || ((active.get() || interacting)
+                        && input_rate_tracker.borrow_mut().is_high_rate());
 
                 if invalidator.is_dirty() || request_frame_options.force_render {
                     measure("frame duration", || {
@@ -5218,6 +5240,19 @@ impl Window {
         // Handlers may set this to true by calling `prevent_default`.
         self.default_prevented = false;
 
+        // DIRI PATCH (6): input that drives the window (as opposed to a hover
+        // move) lifts the inactive-window frame cap for a moment.
+        let drives = matches!(
+            &event,
+            PlatformInput::ScrollWheel(_)
+                | PlatformInput::Pinch(_)
+                | PlatformInput::MouseDown(_)
+                | PlatformInput::MouseUp(_)
+                | PlatformInput::MouseMove(MouseMoveEvent {
+                    pressed_button: Some(_),
+                    ..
+                })
+        );
         let event = match event {
             // Track the mouse position with our own state, since accessing the platform
             // API for the mouse position can only occur on the main thread.
@@ -5311,7 +5346,7 @@ impl Window {
         }
 
         if self.invalidator.update_count() > update_count_before {
-            self.input_rate_tracker.borrow_mut().record_input();
+            self.input_rate_tracker.borrow_mut().record_input(drives);
             #[cfg(feature = "input-latency-histogram")]
             if self.invalidator.not_drawing() {
                 self.input_latency_tracker.record_input(dispatch_time);

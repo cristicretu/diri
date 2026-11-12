@@ -695,12 +695,11 @@ impl Sidebar {
             .when_some(self.pane_drop_fill(&id, cx), |tab, fill| tab.bg(fill))
             // The tab the pointer just left keeps a fading fill; the
             // declarative hover below still lights the new tab at once.
-            // Neither lights a tab while the window is not key.
-            .when(!active && look.hover && hover_linger > 0.0, |row| {
+            .when(!active && hover_linger > 0.0, |row| {
                 row.bg(colors.primary.alpha(0.06 * hover_linger))
             })
             .hover(move |row| {
-                if active || !look.hover {
+                if active {
                     row
                 } else {
                     row.bg(colors.primary.alpha(0.06))
