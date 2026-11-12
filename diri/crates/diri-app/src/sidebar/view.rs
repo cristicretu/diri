@@ -4112,6 +4112,7 @@ impl Sidebar {
             panes,
             progress,
             marked,
+            foreground,
             hovered,
             focused,
             lineage,
@@ -4154,6 +4155,7 @@ impl Sidebar {
             !hovered && focused && shortcut.is_some(),
         ) - if loading { 60.0 } else { 0.0 }
             - if scheduled_run.is_some() { 18.0 } else { 0.0 }
+            - if foreground { 18.0 } else { 0.0 }
             - if panes > 1 {
                 split_mark::WIDTH + 8.0
             } else {
@@ -4612,6 +4614,11 @@ impl Sidebar {
                     colors.secondary,
                     colors,
                 ))
+            })
+            .when(foreground, |element| {
+                // This session may bring windows forward; a click takes
+                // that back for the rest of its life.
+                element.child(self.foreground_mark(&id, colors, cx))
             })
             .when_some(scheduled_run, |element, run| {
                 // A schedule opened this session, perhaps after waking the Mac.
@@ -9601,6 +9608,47 @@ fn pin_mark(colors: SemanticColors) -> AnyElement {
 /// explains why it appeared while nobody was at the keyboard. The mark has no
 /// tooltip of its own: it sits inside the row, so a tooltip here opened on
 /// top of that card.
+impl Sidebar {
+    fn foreground_mark(
+        &self,
+        id: &SessionId,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let revoke_id = id.clone();
+        div()
+            .id(format!("foreground-mark:{}", id.0))
+            .debug_selector(|| "foreground-mark".to_owned())
+            .role(Role::Button)
+            .aria_label(t("session.foreground_revoke"))
+            .warm_tooltip(move |_, cx| {
+                cx.new(|_| {
+                    crate::palette_chrome::PaletteTooltip(
+                        t("session.foreground_revoke").to_owned(),
+                        colors,
+                    )
+                })
+                .into()
+            })
+            .flex_none()
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            // A press on the mark must not start a row drag or select it.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .revoke_computer_foreground(Some(revoke_id.clone()));
+                cx.notify();
+            }))
+            .child(sf_symbol("cursorarrow.rays", 10.0, Palette::CLAY))
+            .into_any_element()
+    }
+}
+
 fn scheduled_mark(
     id: &SessionId,
     run: &diri_proto::schedules::ScheduledRunInfo,

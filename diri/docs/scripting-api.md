@@ -81,6 +81,7 @@ Call one as `diri.call("session.list")` or through its generated function, `diri
 | `diri.computer.act` | `sessionID, tool, args?` | `Value` | One Cua Driver step under the caller's own cursor. |
 | `diri.computer.status` | `probe?` | `ComputerStatus` | Whether computer use is installed and allowed. |
 | `diri.computer.setup` | `action` | `ComputerStatus` | Install or restart computer use. |
+| `diri.computer.foreground_revoke` | `sessionID?` | `ComputerStatus` | Stop a session, or all, bringing windows forward. |
 | `diri.session.migrate` | `sessionID, targetHost?` | `SessionRecord` | Move a Claude session between this Mac and a host. |
 | `diri.session.reparent_worktree` | `sessionID, projectRoot, worktreePath` | `SessionRecord` | Record that a session now works in another worktree. |
 | `diri.session.set_project` | `sessionID, projectID?, projectRoot?` | `SessionRecord` | File a session and its children under another project. |
@@ -141,6 +142,8 @@ Not callable from scripts:
 - `app.reply`: only the window answers its actions.
 - `client.set_active`: only the window reports its focus.
 - `hook.report`: only Agents' hooks report.
+- `computer.configure`: only the person changes computer use settings.
+- `computer.foreground_answer`: only the person answers a foreground request.
 - `daemon.prepare_shutdown`: stopping the Engine ends every session.
 - `daemon.shutdown`: stopping the Engine ends every session.
 - `daemon.shutdown_if_idle`: stopping the Engine ends every session.

@@ -123,6 +123,28 @@ const TERMINAL_ONLY_METHODS: &[&str] = &[
 /// Engine starts before the app connects follow it too.
 const TERMINAL_SETTINGS_FILE: &str = "terminal.json";
 
+/// Sessions computer use treats as alive: open, with a running process.
+fn live_sessions(registry: &Registry) -> std::collections::HashSet<String> {
+    registry
+        .records()
+        .into_iter()
+        .filter(|record| !record.is_archived() && registry.is_live(&record.id.0))
+        .map(|record| record.id.0)
+        .collect()
+}
+
+/// The last `computer.configure`, in the config directory: the person's
+/// computer use settings outlive an Engine restart. Grants do not.
+const COMPUTER_SETTINGS_FILE: &str = "computer-use.json";
+
+/// Missing or unreadable settings are the defaults: foreground off.
+fn computer_settings(config_dir: &Path) -> diri_proto::ComputerConfigureParams {
+    std::fs::read(config_dir.join(COMPUTER_SETTINGS_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
 /// Missing or unreadable settings are the defaults: integration on.
 fn terminal_settings(config_dir: &Path) -> diri_proto::TerminalConfigureParams {
     std::fs::read(config_dir.join(TERMINAL_SETTINGS_FILE))
@@ -336,6 +358,7 @@ impl ControlServer {
             .parent()
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
         load_terminal_palette(&config_dir, &registry);
+
         let state_dir = config_dir.clone();
         let remote_bindings = remote_binding_store(&config_dir);
         let (agent_catalog, accounts) = agent_config_stores(&config_dir);
@@ -347,6 +370,9 @@ impl ControlServer {
         if let Err(error) = events.enable_activity_log(activity_path) {
             eprintln!("diri-engine: activity history unavailable: {error}");
         }
+        let computer = crate::computer::ComputerUse::default();
+        computer.set_events(events.clone());
+        computer.configure_foreground(computer_settings(&config_dir).foreground);
         Self {
             engine_instance_id: {
                 let mut bytes = [0_u8; 16];
@@ -369,7 +395,7 @@ impl ControlServer {
             cli_versions: Default::default(),
             governor: std::sync::Arc::new(Mutex::new(crate::governor::GovernorConfig::default())),
             browser: std::sync::OnceLock::new(),
-            computer: Default::default(),
+            computer,
             active_connections: Arc::new(AtomicUsize::new(0)),
             background_requests: Arc::new(AtomicUsize::new(0)),
             worktree_scan: Default::default(),
@@ -621,6 +647,8 @@ impl ControlServer {
     pub fn with_config_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.config_dir = dir.into();
         load_terminal_palette(&self.config_dir, &self.registry);
+        self.computer
+            .configure_foreground(computer_settings(&self.config_dir).foreground);
         let (agent_catalog, accounts) = agent_config_stores(&self.config_dir);
         self.agent_catalog = Arc::new(Mutex::new(agent_catalog));
         self.accounts = Mutex::new(accounts);
@@ -1424,7 +1452,19 @@ impl ControlServer {
             Method::COMPUTER_ACT => self.computer_act(params),
             Method::COMPUTER_STATUS => {
                 let p: diri_proto::ComputerStatusParams = decode(params)?;
-                encode(&self.computer.status(p.probe))
+                encode(&self.computer_status(p.probe)?)
+            }
+            Method::COMPUTER_CONFIGURE => self.computer_configure(params),
+            Method::COMPUTER_FOREGROUND_ANSWER => {
+                let p: diri_proto::ComputerForegroundAnswerParams = decode(params)?;
+                let answered = self.computer.answer_foreground(&p.session_id.0, p.allow);
+                Ok(json!({ "answered": answered }))
+            }
+            Method::COMPUTER_FOREGROUND_REVOKE => {
+                let p: diri_proto::ComputerForegroundRevokeParams = decode(params)?;
+                self.computer
+                    .revoke_foreground(p.session_id.as_ref().map(|id| id.0.as_str()));
+                encode(&self.computer_status(false)?)
             }
             Method::COMPUTER_SETUP => {
                 let p: diri_proto::ComputerSetupParams = decode(params)?;
@@ -2460,6 +2500,37 @@ impl ControlServer {
         })
     }
 
+    /// `computer.status`, with the foreground setting and the sessions that
+    /// hold it.
+    fn computer_status(&self, probe: bool) -> Result<diri_proto::ComputerStatus, ControlError> {
+        let mut status = self.computer.status(probe);
+        let live = live_sessions(&*self.registry.lock().map_err(poisoned)?);
+        status.foreground = self.computer.foreground_policy();
+        status.foreground_sessions = self
+            .computer
+            .foreground_sessions(&|id| live.contains(id))
+            .into_iter()
+            .map(diri_proto::SessionId)
+            .collect();
+        Ok(status)
+    }
+
+    /// `computer.configure`: saves the person's setting, then applies it.
+    fn computer_configure(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::ComputerConfigureParams = decode(params)?;
+        if computer_settings(&self.config_dir) != p {
+            let bytes = serde_json::to_vec_pretty(&p)
+                .map_err(|error| ControlError::internal(error.to_string()))?;
+            crate::shell_integration::write_private(
+                &self.config_dir.join(COMPUTER_SETTINGS_FILE),
+                &bytes,
+            )
+            .map_err(io_control_error)?;
+        }
+        self.computer.configure_foreground(p.foreground);
+        encode(&self.computer_status(false)?)
+    }
+
     /// `computer.act`: one Cua Driver call on behalf of a live session, under
     /// that session's own cursor badge and app leases.
     fn computer_act(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
@@ -2479,13 +2550,7 @@ impl ControlServer {
                 .filter(|name| !name.is_empty())
                 .unwrap_or_else(|| record.kind.id().to_owned());
             let badge = cursor_badge(&agent, &record.title);
-            let live: std::collections::HashSet<String> = registry
-                .records()
-                .into_iter()
-                .filter(|record| !record.is_archived() && registry.is_live(&record.id.0))
-                .map(|record| record.id.0)
-                .collect();
-            (badge, live)
+            (badge, live_sessions(&registry))
         };
         let caller = crate::computer::Caller {
             session_id: &id,
@@ -3848,6 +3913,7 @@ impl ControlServer {
         // Search notes (as a closed note) and opening it there brings its tab
         // back, the way closed chats stay in conversation search.
         drop(registry);
+        self.computer.forget_foreground(&p.session_id.0);
         self.events.record_removed(&removed);
         self.events.publish(
             diri_proto::EventName::SESSION_REMOVED,
@@ -4014,6 +4080,8 @@ impl ControlServer {
             .archive_record(original)
             .map_err(io_control_error)?;
         self.publish_updated(&registry, &p.session_id.0);
+        drop(registry);
+        self.computer.forget_foreground(&p.session_id.0);
         Ok(json!({}))
     }
 
@@ -8599,6 +8667,54 @@ mod tests {
         let registry = Registry::new(engine(), temp.path().join("state.json"));
         let bare = ControlServer::new(Arc::new(Mutex::new(registry)), temp.path().join("socket"));
         assert!(bare.terminal_shell_integration().is_none());
+    }
+
+    #[test]
+    fn computer_configure_keeps_the_foreground_setting_across_a_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let start = || {
+            let registry = Registry::new(engine(), temp.path().join("state.json"));
+            ControlServer::new(Arc::new(Mutex::new(registry)), temp.path().join("socket"))
+        };
+        let server = start();
+        assert_eq!(
+            server.computer.foreground_policy(),
+            diri_proto::ComputerForeground::Off,
+            "off until the person allows it"
+        );
+        let status: diri_proto::ComputerStatus = serde_json::from_value(
+            server
+                .dispatch(
+                    Method::COMPUTER_CONFIGURE,
+                    Some(json!({ "foreground": "ask" })),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status.foreground, diri_proto::ComputerForeground::Ask);
+        assert!(status.foreground_sessions.is_empty());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let settings = temp.path().join(COMPUTER_SETTINGS_FILE);
+            let mode = std::fs::metadata(&settings).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert_eq!(
+            start().computer.foreground_policy(),
+            diri_proto::ComputerForeground::Ask
+        );
+        // Nothing was asked, so there is nothing to answer.
+        let answered = server
+            .dispatch(
+                Method::COMPUTER_FOREGROUND_ANSWER,
+                Some(json!({ "sessionID": "s-missing", "allow": true })),
+            )
+            .unwrap();
+        assert_eq!(answered["answered"], false);
+        server
+            .dispatch(Method::COMPUTER_FOREGROUND_REVOKE, Some(json!({})))
+            .unwrap();
     }
 
     #[test]

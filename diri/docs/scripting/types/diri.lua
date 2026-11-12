@@ -520,6 +520,12 @@ function diri.computer.status(params, opts) end
 ---@return table # ComputerStatus
 function diri.computer.setup(params, opts) end
 
+---Stop a session, or all, bringing windows forward.
+---@param params? {sessionID?: string}
+---@param opts? {timeout?: number}
+---@return table # ComputerStatus
+function diri.computer.foreground_revoke(params, opts) end
+
 ---Move a Claude session between this Mac and a host.
 ---@param params {sessionID: string, targetHost?: string}
 ---@param opts? {timeout?: number}

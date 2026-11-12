@@ -19,6 +19,10 @@ pub(super) struct ComputerSetupState {
     /// The person clicked Set up: once installed, guide them through the
     /// grants without another click.
     guide_after_install: bool,
+    /// Sessions that may use foreground computer use now, for their
+    /// sidebar marks. Kept apart from `status`, which is only polled while
+    /// Settings shows it.
+    foreground_sessions: HashSet<SessionId>,
 }
 
 impl SessionStore {
@@ -85,17 +89,94 @@ impl SessionStore {
         false
     }
 
+    /// Whether this session may bring windows forward for computer use.
+    pub fn computer_foreground_held(&self, id: &SessionId) -> bool {
+        self.computer.foreground_sessions.contains(id)
+    }
+
+    /// The sessions that may bring windows forward, in sidebar order.
+    pub fn computer_foreground_sessions(&self) -> Vec<SessionId> {
+        let mut ids: Vec<SessionId> = self.computer.foreground_sessions.iter().cloned().collect();
+        ids.sort_by(|a, b| a.0.cmp(&b.0));
+        ids
+    }
+
+    /// Settings › Agents › Computer use › Foreground actions.
+    pub fn set_computer_foreground(&mut self, foreground: diri_proto::ComputerForeground) {
+        if let Some(status) = self.computer.status.as_mut() {
+            status.foreground = foreground;
+        }
+        self.emit(StoreEffect::ConfigureComputer(
+            diri_proto::ComputerConfigureParams { foreground },
+        ));
+    }
+
+    /// Takes foreground back from one session, or every session.
+    pub fn revoke_computer_foreground(&mut self, id: Option<SessionId>) {
+        match &id {
+            Some(id) => {
+                self.computer.foreground_sessions.remove(id);
+            }
+            None => self.computer.foreground_sessions.clear(),
+        }
+        self.emit(StoreEffect::RevokeComputerForeground(id));
+    }
+
+    /// The person answered an Agent's foreground request.
+    pub fn answer_computer_foreground(&mut self, session_id: SessionId, allow: bool) {
+        self.emit(StoreEffect::AnswerComputerForeground(
+            diri_proto::ComputerForegroundAnswerParams { session_id, allow },
+        ));
+    }
+
+    pub(super) fn set_computer_foreground_sessions(&mut self, sessions: Vec<SessionId>) {
+        self.computer.foreground_sessions = sessions.into_iter().collect();
+    }
+
+    /// An Agent's first foreground action waits for the person.
+    pub(super) fn computer_foreground_requested(
+        &mut self,
+        event: diri_proto::ComputerForegroundRequestedEvent,
+    ) {
+        let toast = foreground_toast(&event);
+        let title = toast.message.clone();
+        self.emit(StoreEffect::StatusTransition(StatusTransition {
+            dismiss: Vec::new(),
+            sound: None,
+            // The person is likely in another app: the one being driven.
+            notification: Some(crate::notifications::NotificationRequest {
+                session_event: false,
+                guard: None,
+                identifier: format!("computer-foreground:{}", event.session_id.0),
+                title,
+                body: crate::i18n::t("notification.computer_foreground_body").to_owned(),
+                thread_identifier: Some(event.session_id.0.clone()),
+                action_data: None,
+                use_system_sound: false,
+                reply: false,
+            }),
+            in_app_banner: Some(toast),
+        }));
+    }
+
     #[cfg(test)]
     pub fn seed_computer_status(&mut self, status: diri_proto::ComputerStatus) {
         self.set_computer_status(Ok(status));
     }
 
     fn set_computer_status(&mut self, status: Result<diri_proto::ComputerStatus, String>) -> bool {
+        let mut changed = false;
+        if let Ok(status) = &status {
+            let sessions: HashSet<SessionId> = status.foreground_sessions.iter().cloned().collect();
+            changed = sessions != self.computer.foreground_sessions;
+            self.computer.foreground_sessions = sessions;
+        }
         let (status, error) = match status {
             Ok(status) => (Some(status), None),
             Err(error) => (self.computer.status.clone(), Some(error)),
         };
-        let changed = status != self.computer.status || error != self.computer.error;
+        let changed =
+            changed || status != self.computer.status || error != self.computer.error;
         self.computer.status = status;
         self.computer.error = error;
         changed
@@ -165,6 +246,46 @@ pub(super) async fn watch(
             return;
         }
         tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// The prompt an Agent's first foreground action shows under Ask.
+pub fn foreground_toast(event: &diri_proto::ComputerForegroundRequestedEvent) -> crate::toast::Toast {
+    crate::toast::Toast::new(
+        crate::toast::ToastTone::Warning,
+        crate::i18n::tf("toast.computer_foreground", &[("agent", &event.badge)]),
+    )
+    .detail(crate::i18n::t("toast.computer_foreground_detail"))
+    .action(
+        crate::i18n::t("toast.computer_foreground_allow"),
+        crate::toast::ToastCommand::AnswerComputerForeground {
+            session_id: event.session_id.clone(),
+            allow: true,
+        },
+    )
+    .action(
+        crate::i18n::t("toast.computer_foreground_deny"),
+        crate::toast::ToastCommand::AnswerComputerForeground {
+            session_id: event.session_id.clone(),
+            allow: false,
+        },
+    )
+    // Shown until the Agent stops waiting.
+    .hold(Duration::from_millis(event.timeout_ms))
+}
+
+/// Applies a status the Engine answered with outside the poller.
+pub(super) fn apply_status(
+    status: Result<diri_proto::ComputerStatus, String>,
+    store: &Arc<RwLock<SessionStore>>,
+    change_tx: &broadcast::Sender<()>,
+) {
+    let changed = store
+        .write()
+        .expect("session store lock poisoned")
+        .set_computer_status(status);
+    if changed {
+        let _ = change_tx.send(());
     }
 }
 
@@ -294,5 +415,92 @@ mod tests {
             toast.actions[0].command,
             crate::toast::ToastCommand::OpenComputerSetup
         );
+    }
+
+    #[test]
+    fn a_foreground_request_asks_and_the_answer_reaches_the_engine() {
+        let (mut store, mut rx) = SessionStore::headless(Prefs::default());
+        store.handle_event(EventEnvelope {
+            name: diri_proto::EventName::COMPUTER_FOREGROUND_REQUESTED.into(),
+            params: serde_json::json!({"sessionID": "s1", "badge": "Codex · mail", "timeoutMs": 60000}),
+            seq: 1,
+        });
+        let transition = effects(&mut rx)
+            .into_iter()
+            .find_map(|effect| match effect {
+                StoreEffect::StatusTransition(transition) => Some(transition),
+                _ => None,
+            })
+            .expect("a prompt");
+        assert!(transition.notification.is_some(), "the person may be in another app");
+        let toast = transition.in_app_banner.expect("a toast");
+        assert!(toast.message.contains("Codex · mail"), "{}", toast.message);
+        assert_eq!(toast.hold, Some(Duration::from_secs(60)));
+        let session_id = SessionId("s1".into());
+        assert_eq!(
+            toast.actions[0].command,
+            crate::toast::ToastCommand::AnswerComputerForeground {
+                session_id: session_id.clone(),
+                allow: true
+            }
+        );
+        assert_eq!(
+            toast.actions[1].command,
+            crate::toast::ToastCommand::AnswerComputerForeground {
+                session_id: session_id.clone(),
+                allow: false
+            }
+        );
+        store.answer_computer_foreground(session_id, true);
+        assert!(effects(&mut rx).iter().any(|effect| matches!(
+            effect,
+            StoreEffect::AnswerComputerForeground(params) if params.allow
+        )));
+    }
+
+    #[test]
+    fn foreground_marks_follow_the_engine_and_revoke_clears_them() {
+        let (mut store, mut rx) = SessionStore::headless(Prefs::default());
+        let a = SessionId("a".into());
+        let b = SessionId("b".into());
+        store.handle_event(EventEnvelope {
+            name: diri_proto::EventName::COMPUTER_FOREGROUND_CHANGED.into(),
+            params: serde_json::json!({"sessions": ["b", "a"]}),
+            seq: 1,
+        });
+        assert!(store.computer_foreground_held(&a));
+        assert_eq!(store.computer_foreground_sessions(), [a.clone(), b.clone()]);
+
+        store.revoke_computer_foreground(Some(a.clone()));
+        assert!(!store.computer_foreground_held(&a));
+        assert!(store.computer_foreground_held(&b));
+        store.revoke_computer_foreground(None);
+        assert!(store.computer_foreground_sessions().is_empty());
+        let revokes: Vec<Option<SessionId>> = effects(&mut rx)
+            .into_iter()
+            .filter_map(|effect| match effect {
+                StoreEffect::RevokeComputerForeground(id) => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(revokes, [Some(a), None]);
+
+        // A status read (on connect, or from Settings) replaces the marks.
+        let mut status = status(true, (true, true));
+        status.foreground = diri_proto::ComputerForeground::Ask;
+        status.foreground_sessions = vec![b.clone()];
+        assert!(store.set_computer_status(Ok(status)));
+        assert_eq!(store.computer_foreground_sessions(), [b]);
+
+        store.set_computer_foreground(diri_proto::ComputerForeground::Always);
+        assert_eq!(
+            store.computer_status().map(|status| status.foreground),
+            Some(diri_proto::ComputerForeground::Always)
+        );
+        assert!(effects(&mut rx).iter().any(|effect| matches!(
+            effect,
+            StoreEffect::ConfigureComputer(params)
+                if params.foreground == diri_proto::ComputerForeground::Always
+        )));
     }
 }

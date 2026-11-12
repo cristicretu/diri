@@ -1,6 +1,7 @@
 //! Headless application state and the thin asynchronous daemon adapter.
 
 mod computer;
+pub use computer::foreground_toast;
 mod herdr;
 mod terminal_setup;
 mod prefs;
@@ -222,6 +223,12 @@ pub enum StoreEffect {
     WatchComputer,
     /// Install Cua Driver, or restart it.
     ComputerSetup(diri_proto::ComputerSetupAction),
+    /// Save the person's computer use settings in the Engine.
+    ConfigureComputer(diri_proto::ComputerConfigureParams),
+    /// The person's answer to an Agent's foreground request.
+    AnswerComputerForeground(diri_proto::ComputerForegroundAnswerParams),
+    /// Take foreground back from one session, or from all.
+    RevokeComputerForeground(Option<SessionId>),
     /// Rescan this Mac until the Agent the user is installing appears.
     WatchAgentInstall {
         kind: AgentKind,
@@ -2217,6 +2224,24 @@ impl SessionStore {
                     self.agent_acted(event);
                 }
                 return StoreEventChange::None;
+            }
+            EventName::COMPUTER_FOREGROUND_REQUESTED => {
+                if let Ok(event) = serde_json::from_value::<
+                    diri_proto::ComputerForegroundRequestedEvent,
+                >(event.params)
+                {
+                    self.computer_foreground_requested(event);
+                }
+                return StoreEventChange::None;
+            }
+            EventName::COMPUTER_FOREGROUND_CHANGED => {
+                if let Ok(event) = serde_json::from_value::<
+                    diri_proto::ComputerForegroundChangedEvent,
+                >(event.params)
+                {
+                    self.set_computer_foreground_sessions(event.sessions);
+                }
+                return StoreEventChange::Model;
             }
             EventName::COMPUTER_SETUP_NEEDED => {
                 if let Ok(event) =
@@ -4446,6 +4471,16 @@ impl StoreRuntime {
                         let _ = state_client.set_active(active).await;
                         let _ = state_client.configure_governor(governor).await;
                         let _ = state_client.configure_terminal(terminal).await;
+                        // Which sessions hold foreground computer use, for
+                        // their sidebar marks. No probe: it starts nothing.
+                        computer::apply_status(
+                            state_client
+                                .computer_status(false)
+                                .await
+                                .map_err(|error| error.to_string()),
+                            &state_store,
+                            &state_changes,
+                        );
                         // On this connection: the Engine sends this app the
                         // actions Agents and scripts ask its windows to run.
                         let _ = state_client
@@ -5037,6 +5072,27 @@ async fn run_effects(
                 ));
                 Ok(())
             }
+            StoreEffect::ConfigureComputer(params) => {
+                let status = client
+                    .computer_configure(params)
+                    .await
+                    .map_err(|error| error.to_string());
+                computer::apply_status(status, &store, &change_tx);
+                Ok(())
+            }
+            StoreEffect::AnswerComputerForeground(params) => {
+                client.computer_foreground_answer(params).await.map(|_| ())
+            }
+            StoreEffect::RevokeComputerForeground(session_id) => {
+                let status = client
+                    .computer_foreground_revoke(diri_proto::ComputerForegroundRevokeParams {
+                        session_id,
+                    })
+                    .await
+                    .map_err(|error| error.to_string());
+                computer::apply_status(status, &store, &change_tx);
+                Ok(())
+            }
             StoreEffect::WatchAgentInstall { kind, display_name } => {
                 let client = Arc::clone(&client);
                 let store = Arc::clone(&store);
@@ -5248,7 +5304,11 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         | StoreEffect::ConfigureAgent(_)
         | StoreEffect::WatchAgentInstall { .. } => return None,
         // Setup outcomes render in place in Settings › Agents.
-        StoreEffect::WatchComputer | StoreEffect::ComputerSetup(_) => return None,
+        StoreEffect::WatchComputer
+        | StoreEffect::ComputerSetup(_)
+        | StoreEffect::ConfigureComputer(_)
+        | StoreEffect::RevokeComputerForeground(_) => return None,
+        StoreEffect::AnswerComputerForeground(_) => ("Answer to computer use failed", None),
         // Import outcomes, failures included, arrive as one summary banner.
         StoreEffect::ScanHerdr { .. } | StoreEffect::ImportHerdr(_) => return None,
         // Applying happens in the store; the scan only reads.

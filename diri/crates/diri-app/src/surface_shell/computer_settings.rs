@@ -216,6 +216,20 @@ impl UtilitySurfaces {
                 status.accessibility = Some(true);
                 status.screen_recording = Some(true);
             }
+            // Foreground actions on Ask, two sessions allowed; `-menu` also
+            // opens the setting's choices.
+            "foreground" | "foreground-menu" => {
+                status.accessibility = Some(true);
+                status.screen_recording = Some(true);
+                status.foreground = diri_proto::ComputerForeground::Ask;
+                status.foreground_sessions = vec![
+                    diri_proto::SessionId("s-mail".into()),
+                    diri_proto::SessionId("s-upload".into()),
+                ];
+                if state == "foreground-menu" {
+                    self.settings_menu = Some(SettingsMenu::ComputerForeground);
+                }
+            }
             _ => {}
         }
         self.store
@@ -335,6 +349,37 @@ impl UtilitySurfaces {
                     .child(self.grant_row(step, status, colors, cx));
             }
         }
+        if let Some(status) = status.as_ref().filter(|status| status.installed()) {
+            body = body
+                .child(setting_divider(colors))
+                .child(self.foreground_row(status, colors, cx));
+            let held = self
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .computer_foreground_sessions()
+                .len();
+            if held > 0 {
+                body = body.child(setting_divider(colors)).child(setting_row(
+                    t("settings.computer.foreground_held"),
+                    tf("settings.computer.foreground_held_detail", &[("count", &held)]),
+                    surface_button(
+                        t("settings.computer.foreground_revoke_all"),
+                        "computer-foreground-revoke-all",
+                        colors,
+                        cx,
+                        |this, cx| {
+                            this.store
+                                .write()
+                                .expect("session store lock poisoned")
+                                .revoke_computer_foreground(None);
+                            cx.notify();
+                        },
+                    ),
+                    colors,
+                ));
+            }
+        }
         if let Some(log) = status
             .as_ref()
             .filter(|status| status.install_error.is_some())
@@ -376,6 +421,73 @@ impl UtilitySurfaces {
             }
         }
         Some(setting_section(t("settings.computer.section"), body, colors).into_any_element())
+    }
+
+    /// Settings › Agents › Computer use › Foreground actions: whether
+    /// Agents may bring a window forward for a moment to reach what
+    /// background input can't (a file picker, a system dialog).
+    fn foreground_row(
+        &self,
+        status: &diri_proto::ComputerStatus,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let open = self.settings_menu == Some(SettingsMenu::ComputerForeground);
+        let mut control = div().relative().min_w(px(132.0)).child(settings_select_button(
+            foreground_title(status.foreground),
+            "computer-foreground-dropdown",
+            open,
+            SettingsMenu::ComputerForeground,
+            colors,
+            cx,
+        ));
+        if open {
+            control = control.child(self.settings_menu_host(cx));
+        }
+        setting_row(
+            t("settings.computer.foreground"),
+            t("settings.computer.foreground_detail"),
+            control,
+            colors,
+        )
+        .into_any_element()
+    }
+
+    pub(super) fn computer_foreground_options(
+        &self,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let current = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .computer_status()
+            .map(|status| status.foreground)
+            .unwrap_or_default();
+        let mut options = div().p(px(4.0)).flex().flex_col();
+        for choice in [
+            diri_proto::ComputerForeground::Off,
+            diri_proto::ComputerForeground::Ask,
+            diri_proto::ComputerForeground::Always,
+        ] {
+            options = options.child(settings_choice_row(
+                format!("computer-foreground-option-{choice:?}"),
+                foreground_title(choice),
+                choice == current,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.settings_menu = None;
+                    this.store
+                        .write()
+                        .expect("session store lock poisoned")
+                        .set_computer_foreground(choice);
+                    cx.notify();
+                },
+            ));
+        }
+        options.into_any_element()
     }
 
     fn grant_row(
@@ -423,6 +535,14 @@ impl UtilitySurfaces {
             .into_any_element()
         };
         setting_row(label, detail, control, colors).into_any_element()
+    }
+}
+
+fn foreground_title(foreground: diri_proto::ComputerForeground) -> &'static str {
+    match foreground {
+        diri_proto::ComputerForeground::Off => t("settings.computer.foreground_off"),
+        diri_proto::ComputerForeground::Ask => t("settings.computer.foreground_ask"),
+        diri_proto::ComputerForeground::Always => t("settings.computer.foreground_always"),
     }
 }
 

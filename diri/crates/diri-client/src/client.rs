@@ -140,13 +140,15 @@ impl ClientCore {
     /// IF YOU ADD AN EVENT KIND THAT DIRI NEEDS, ADD IT HERE TOO. Server-side
     /// filtering means an unlisted kind never reaches `route_message`, and the
     /// symptom is silence, not an error.
-    const EVENT_KINDS: [&'static str; 12] = [
+    const EVENT_KINDS: [&'static str; 14] = [
         EventName::SESSION_UPDATED,
         // `dirijor note open` / `start_from_note` ask every window to show a
         // Session; without it the app's reveal handler never runs.
         EventName::SESSION_REVEAL,
         EventName::AGENT_ACTION,
         EventName::COMPUTER_SETUP_NEEDED,
+        EventName::COMPUTER_FOREGROUND_REQUESTED,
+        EventName::COMPUTER_FOREGROUND_CHANGED,
         EventName::SESSION_API_REQUEST,
         EventName::SESSION_NOTIFICATION,
         EventName::SESSION_CLIPBOARD,
@@ -1168,6 +1170,51 @@ impl DaemonClient {
                 Method::COMPUTER_SETUP,
                 Some(&diri_proto::ComputerSetupParams { action }),
                 Some(Duration::from_secs(30)),
+            )
+            .await
+    }
+
+    /// `computer.configure`: saves the person's computer use settings and
+    /// answers with the status (probe off).
+    pub async fn computer_configure(
+        &self,
+        params: diri_proto::ComputerConfigureParams,
+    ) -> Result<diri_proto::ComputerStatus, ClientError> {
+        self.core
+            .request_typed(
+                Method::COMPUTER_CONFIGURE,
+                Some(&params),
+                Some(Duration::from_secs(10)),
+            )
+            .await
+    }
+
+    /// `computer.foreground_answer`: the person's answer to a foreground
+    /// request.
+    pub async fn computer_foreground_answer(
+        &self,
+        params: diri_proto::ComputerForegroundAnswerParams,
+    ) -> Result<JsonValue, ClientError> {
+        self.core
+            .request_typed(
+                Method::COMPUTER_FOREGROUND_ANSWER,
+                Some(&params),
+                Some(Duration::from_secs(10)),
+            )
+            .await
+    }
+
+    /// `computer.foreground_revoke`: takes foreground back from one session,
+    /// or from all; answers with the status (probe off).
+    pub async fn computer_foreground_revoke(
+        &self,
+        params: diri_proto::ComputerForegroundRevokeParams,
+    ) -> Result<diri_proto::ComputerStatus, ClientError> {
+        self.core
+            .request_typed(
+                Method::COMPUTER_FOREGROUND_REVOKE,
+                Some(&params),
+                Some(Duration::from_secs(10)),
             )
             .await
     }

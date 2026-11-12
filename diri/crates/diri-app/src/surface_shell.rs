@@ -180,6 +180,7 @@ enum SettingsMenu {
     TalkVoice,
     TalkAnswer,
     TalkTabs,
+    ComputerForeground,
 }
 
 /// Update channels, in menu order.
@@ -5948,6 +5949,7 @@ impl UtilitySurfaces {
             SettingsMenu::TalkVoice => (self.talk_voice_options(colors, cx), 400.0),
             SettingsMenu::TalkAnswer => (self.talk_answer_options(colors, cx), 204.0),
             SettingsMenu::TalkTabs => (self.talk_tabs_options(colors, cx), 204.0),
+            SettingsMenu::ComputerForeground => (self.computer_foreground_options(colors, cx), 172.0),
         })
     }
 
@@ -10996,7 +10998,8 @@ mod tests {
             .expect("switch language");
             cx.run_until_parked();
         }
-        // `DIRI_VISUAL_COMPUTER=missing|installing|failed|allow|waiting|ready`
+        // `DIRI_VISUAL_COMPUTER=missing|installing|failed|allow|waiting|ready|
+        // foreground|foreground-menu`
         // seeds Settings › Agents › Computer use with that setup state.
         if let Ok(state) = std::env::var("DIRI_VISUAL_COMPUTER") {
             cx.update_window(window.into(), |root, _, cx| {

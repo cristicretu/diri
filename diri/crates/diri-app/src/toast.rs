@@ -39,6 +39,11 @@ pub enum ToastCommand {
     UndoTerminalImport,
     /// Never show the ⌘B-in-a-note hint again.
     DismissBoldHint,
+    /// Answer an Agent's request to bring windows forward for computer use.
+    AnswerComputerForeground {
+        session_id: diri_proto::SessionId,
+        allow: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
