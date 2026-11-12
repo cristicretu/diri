@@ -21,14 +21,20 @@ use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
 use sha2::{Digest as _, Sha256};
 
 /// The largest picture fetched: the same bound a pasted picture has.
 const MAX_BYTES: usize = diri_notes::store::MAX_ASSET_BYTES;
-/// The cache folder is trimmed to this, oldest pictures first.
+/// The cache folder is trimmed to this, least recently shown first.
 const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+/// A failed picture is tried again after this, doubling up to the last.
+const FIRST_RETRY: Duration = Duration::from_secs(30);
+const LAST_RETRY: Duration = Duration::from_secs(60 * 60);
+/// A temporary older than this is a crashed download, not one in flight.
+const STALE_TEMPORARY: Duration = Duration::from_secs(10 * 60);
 const TIMEOUT_SECONDS: u32 = 30;
 const CONNECT_TIMEOUT_SECONDS: u32 = 10;
 const MAX_REDIRECTS: u32 = 5;
@@ -42,33 +48,86 @@ pub(crate) enum WebImage {
     Failed,
 }
 
+/// What one editor knows about one web picture.
+struct Known {
+    state: WebImage,
+    /// After a failure: when the next draw may try again, and the wait
+    /// after that one fails too.
+    retry: Option<(Instant, Duration)>,
+}
+
 /// What one editor knows about the web pictures in its note, by address.
 #[derive(Default)]
 pub(crate) struct WebImages {
-    known: HashMap<String, WebImage>,
+    known: HashMap<String, Known>,
 }
 
 impl WebImages {
     /// The picture's state, and whether the caller must start its download.
     /// A picture already in the cache is ready at once, with no request.
+    /// A failed one is tried again when it is drawn after its back-off,
+    /// so a note opened offline loads once the network is back; nothing
+    /// wakes an idle editor to do it.
     pub(crate) fn look(&mut self, url: &str, cache: &Path) -> (WebImage, bool) {
-        if let Some(state) = self.known.get(url) {
-            return (state.clone(), false);
+        self.look_at(url, cache, Instant::now())
+    }
+
+    fn look_at(&mut self, url: &str, cache: &Path, now: Instant) -> (WebImage, bool) {
+        if let Some(known) = self.known.get_mut(url) {
+            return match known.retry {
+                Some((at, _)) if known.state == WebImage::Failed && now >= at => {
+                    known.state = WebImage::Loading;
+                    (WebImage::Loading, true)
+                }
+                _ => (known.state.clone(), false),
+            };
         }
         let file = cache_file(cache, url);
         let (state, start) = if file.is_file() {
+            // Shown again: it is the newest, so trimming takes others first.
+            touch(&file);
             (WebImage::Ready(file), false)
         } else {
             (WebImage::Loading, true)
         };
-        self.known.insert(url.to_owned(), state.clone());
+        self.known.insert(
+            url.to_owned(),
+            Known {
+                state: state.clone(),
+                retry: None,
+            },
+        );
         (state, start)
     }
 
     /// Records how a download ended.
     pub(crate) fn landed(&mut self, url: &str, file: Option<PathBuf>) {
-        let state = file.map_or(WebImage::Failed, WebImage::Ready);
-        self.known.insert(url.to_owned(), state);
+        self.landed_at(url, file, Instant::now());
+    }
+
+    fn landed_at(&mut self, url: &str, file: Option<PathBuf>, now: Instant) {
+        let previous = self.known.get(url).and_then(|known| known.retry);
+        let known = match file {
+            Some(file) => Known {
+                state: WebImage::Ready(file),
+                retry: None,
+            },
+            None => {
+                let wait = previous.map_or(FIRST_RETRY, |(_, wait)| (wait * 2).min(LAST_RETRY));
+                Known {
+                    state: WebImage::Failed,
+                    retry: Some((now + wait, wait)),
+                }
+            }
+        };
+        self.known.insert(url.to_owned(), known);
+    }
+}
+
+/// Marks a cached picture as just shown, for [`trim`]'s order.
+fn touch(file: &Path) {
+    if let Ok(handle) = std::fs::File::options().write(true).open(file) {
+        let _ = handle.set_modified(SystemTime::now());
     }
 }
 
@@ -145,10 +204,14 @@ fn fetch_with(curl: &Path, cache: &Path, url: &str) -> Option<PathBuf> {
     // truncated transfer is refused here rather than cached.
     diri_notes::store::image_size_of(&bytes)?;
     diri_platform::private::create_dir_all(cache).ok()?;
+    // One temporary per download: two editors fetching the same address
+    // at once must not truncate or rename each other's file.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let temporary = cache.join(format!(
-        ".{}.{}.tmp",
+        ".{}.{}.{}.tmp",
         file.file_name()?.to_str()?,
-        std::process::id()
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     diri_platform::private::replace_via(&temporary, &file, &bytes).ok()?;
     trim(cache, MAX_CACHE_BYTES, &file);
@@ -190,23 +253,29 @@ fn download(curl: &Path, url: &str) -> Option<Vec<u8>> {
     (complete && !bytes.is_empty()).then_some(bytes)
 }
 
-/// Deletes the oldest cached pictures until the folder fits in `limit`,
-/// keeping `keep` (the one just written).
+/// Deletes the least recently shown pictures until the folder fits in
+/// `limit`, keeping `keep` (the one just written). A download still in
+/// flight keeps its temporary; one left by a crash is cleared.
 fn trim(cache: &Path, limit: u64, keep: &Path) {
     let Ok(entries) = std::fs::read_dir(cache) else {
         return;
     };
+    let now = SystemTime::now();
     let mut files: Vec<(SystemTime, u64, PathBuf)> = entries
         .flatten()
         .filter_map(|entry| {
             let meta = entry.metadata().ok()?;
-            meta.is_file().then(|| {
-                (
-                    meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                    meta.len(),
-                    entry.path(),
-                )
-            })
+            if !meta.is_file() {
+                return None;
+            }
+            let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                if now.duration_since(modified).unwrap_or_default() > STALE_TEMPORARY {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+                return None;
+            }
+            Some((modified, meta.len(), entry.path()))
         })
         .collect();
     let mut total: u64 = files.iter().map(|(_, size, _)| size).sum();
@@ -256,8 +325,12 @@ mod tests {
                 let _ = stream.read(&mut request);
                 count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let head = format!("HTTP/1.1 {status}\r\n{headers}Connection: close\r\n\r\n");
-                let _ = stream.write_all(head.as_bytes());
-                let _ = stream.write_all(&body);
+                let body = body.clone();
+                // One thread per request, so concurrent downloads overlap.
+                std::thread::spawn(move || {
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(&body);
+                });
             }
         });
         (address, served)
@@ -393,5 +466,140 @@ mod tests {
         // Over the limit: the oldest goes first, but never the one just written.
         trim(cache.path(), 20, &kept);
         assert!(!old.exists() && new.exists() && kept.exists());
+    }
+
+    fn age(path: &Path, seconds: u64) {
+        let when = SystemTime::now() - Duration::from_secs(seconds);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_picture_shown_again_outlives_newer_downloads() {
+        let cache = tempfile::tempdir().unwrap();
+        let url = "https://example.com/shown.png";
+        let shown = cache_file(cache.path(), url);
+        let other = cache.path().join("other");
+        let fresh = cache.path().join("fresh");
+        for (path, seconds) in [(&shown, 300), (&other, 200), (&fresh, 0)] {
+            std::fs::write(path, [0u8; 10]).unwrap();
+            age(path, seconds);
+        }
+        // A note opens and shows the oldest picture from the cache.
+        assert_eq!(
+            WebImages::default().look(url, cache.path()),
+            (WebImage::Ready(shown.clone()), false)
+        );
+        trim(cache.path(), 20, &fresh);
+        assert!(shown.exists() && !other.exists() && fresh.exists());
+    }
+
+    #[test]
+    fn trimming_spares_downloads_in_flight_and_clears_crashed_ones() {
+        let cache = tempfile::tempdir().unwrap();
+        let in_flight = cache.path().join(".abc.1.0.tmp");
+        let crashed = cache.path().join(".abc.1.1.tmp");
+        let kept = cache.path().join("kept");
+        for path in [&in_flight, &crashed, &kept] {
+            std::fs::write(path, [0u8; 10]).unwrap();
+        }
+        age(&crashed, STALE_TEMPORARY.as_secs() + 60);
+        trim(cache.path(), 0, &kept);
+        assert!(in_flight.exists() && !crashed.exists() && kept.exists());
+    }
+
+    #[test]
+    fn a_failed_picture_is_tried_again_with_a_growing_wait() {
+        let cache = tempfile::tempdir().unwrap();
+        let url = "https://example.com/offline.png";
+        let start = Instant::now();
+        let mut images = WebImages::default();
+        assert_eq!(
+            images.look_at(url, cache.path(), start),
+            (WebImage::Loading, true)
+        );
+        images.landed_at(url, None, start);
+
+        let mut now = start;
+        for wait in [30, 60, 120] {
+            let before = now + Duration::from_secs(wait - 1);
+            assert_eq!(
+                images.look_at(url, cache.path(), before),
+                (WebImage::Failed, false),
+                "still waiting {wait}s"
+            );
+            now += Duration::from_secs(wait);
+            assert_eq!(
+                images.look_at(url, cache.path(), now),
+                (WebImage::Loading, true)
+            );
+            // Drawn again while that retry runs: no second download.
+            assert_eq!(
+                images.look_at(url, cache.path(), now),
+                (WebImage::Loading, false)
+            );
+            images.landed_at(url, None, now);
+        }
+
+        // The network is back: the next retry lands and stays.
+        now += Duration::from_secs(240);
+        assert_eq!(
+            images.look_at(url, cache.path(), now),
+            (WebImage::Loading, true)
+        );
+        let file = cache.path().join("landed");
+        images.landed_at(url, Some(file.clone()), now);
+        let later = now + LAST_RETRY * 2;
+        assert_eq!(
+            images.look_at(url, cache.path(), later),
+            (WebImage::Ready(file), false)
+        );
+    }
+
+    #[test]
+    fn the_wait_between_retries_stops_growing() {
+        let cache = tempfile::tempdir().unwrap();
+        let url = "https://example.com/gone.png";
+        let mut now = Instant::now();
+        let mut images = WebImages::default();
+        images.look_at(url, cache.path(), now);
+        for _ in 0..20 {
+            images.landed_at(url, None, now);
+            now += LAST_RETRY;
+            assert_eq!(
+                images.look_at(url, cache.path(), now),
+                (WebImage::Loading, true)
+            );
+        }
+    }
+
+    #[test]
+    fn two_editors_fetching_one_address_at_once_both_get_it() {
+        let cache = tempfile::tempdir().unwrap();
+        // A body large enough that the writes overlap.
+        let mut body = png();
+        body.resize(4 * 1024 * 1024, 0);
+        let (address, _) = serve("200 OK", String::new(), body.clone());
+        let url = format!("{address}/same.png");
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| fetch_with(curl(), cache.path(), &url)))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for result in &results {
+            let file = result.as_ref().expect("every editor gets the picture");
+            assert_eq!(std::fs::read(file).unwrap(), body);
+        }
+        let leftovers = std::fs::read_dir(cache.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
+            .count();
+        assert_eq!(leftovers, 0);
     }
 }
