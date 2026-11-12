@@ -68,7 +68,10 @@ after Diri and its daemon are stopped.
 ## Network activity
 
 Diri connects to GitHub Releases to check for and download updates, and to the
-project's diagnostics service unless you turn sharing off (see above). It may also
+project's diagnostics service unless you turn sharing off (see above). When a
+note shows a picture linked by web address, Diri downloads that picture from
+its address once and keeps it in a local cache; the request carries no cookies
+or credentials, and the address is not recorded in diagnostics. It may also
 make network connections when you explicitly use remote hosts, PR monitoring,
 browser automation, or a tool/agent that uses the network. Those tools and
 services have their own privacy practices. Diri does not proxy their traffic

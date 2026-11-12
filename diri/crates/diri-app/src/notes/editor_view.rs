@@ -48,6 +48,7 @@ use find_bar::{FIND_EDITOR_CONTEXT, FindBar};
 #[path = "diagram.rs"]
 mod diagram;
 use diagram::{Diagrams, Drawing, Look};
+use super::web_image::WebImage;
 
 pub(crate) const EDITOR_CONTEXT: &str = "DiriNoteEditor";
 /// The editor's context while the ⌘K link panel owns the keyboard: none of
@@ -616,6 +617,10 @@ pub(crate) struct NoteEditorView {
     /// final size before it loads.
     image_sizes:
         std::cell::RefCell<std::collections::HashMap<std::path::PathBuf, Option<(u32, u32)>>>,
+    /// Pictures the note links by web address: downloading, cached or failed.
+    web_images: std::cell::RefCell<super::web_image::WebImages>,
+    /// Where those are cached. `None` shows the address instead.
+    web_cache: Option<std::path::PathBuf>,
     /// Each Mermaid block's drawing.
     diagrams: Diagrams,
     /// Each Mermaid block's redraw in flight, by block id. Replacing one
@@ -688,6 +693,8 @@ impl NoteEditorView {
             assets: None,
             image_rects: Rc::default(),
             image_sizes: Default::default(),
+            web_images: Default::default(),
+            web_cache: super::web_image::cache_dir(),
             diagrams: Diagrams::default(),
             diagram_draws: Default::default(),
             diagram_clips: Rc::default(),
@@ -3681,8 +3688,31 @@ impl Render for NoteEditorView {
 }
 
 impl NoteEditorView {
+    /// Where the web picture `src` stands, starting its download the first
+    /// time its row is drawn. `None` when `src` is not a web address.
+    fn web_image(&self, src: &str, cx: &mut Context<Self>) -> Option<WebImage> {
+        let cache = self.web_cache.clone()?;
+        let url = super::web_image::web_url(src)?;
+        let (state, start) = self.web_images.borrow_mut().look(&url, &cache);
+        if start {
+            cx.spawn(async move |this, cx| {
+                let fetch = url.clone();
+                let file = cx
+                    .background_spawn(async move { super::web_image::fetch(&cache, &fetch) })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.web_images.borrow_mut().landed(&url, file);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+        Some(state)
+    }
+
     /// A picture: the file fitted to the column, a ring while selected, and
-    /// a quiet placeholder when the file is missing or lives on the web.
+    /// a quiet placeholder when the file is missing or a web picture has not
+    /// loaded.
     fn image_row(
         &self,
         index: usize,
@@ -3694,11 +3724,22 @@ impl NoteEditorView {
     ) -> gpui::AnyElement {
         use gpui::StyledImage as _;
         let colors = self.colors;
-        let _ = cx;
+        let mut waiting = None;
         let path = self
             .assets
             .as_ref()
-            .and_then(|home| home.store.resolve_asset(&block.src));
+            .and_then(|home| home.store.resolve_asset(&block.src))
+            .or_else(|| match self.web_image(&block.src, cx)? {
+                WebImage::Ready(path) => Some(path),
+                WebImage::Loading => {
+                    waiting = Some("notes.image.web");
+                    None
+                }
+                WebImage::Failed => {
+                    waiting = Some("notes.image.web_failed");
+                    None
+                }
+            });
         let placeholder = |label: String| {
             div()
                 .h(px(44.0))
@@ -3740,12 +3781,13 @@ impl NoteEditorView {
                     .into_any_element()
             }
             None => {
-                let label = if block.src.contains("://") {
-                    crate::i18n::tf("notes.image.web", &[("url", &short_url(&block.src))])
-                } else {
-                    crate::i18n::t("notes.image.missing").to_owned()
-                };
-                placeholder(label)
+                // An address that is not a web picture (`file:`, `data:`)
+                // is named too, and never requested.
+                let key = waiting.or(block.src.contains("://").then_some("notes.image.web"));
+                placeholder(match key {
+                    Some(key) => crate::i18n::tf(key, &[("url", &short_url(&block.src))]),
+                    None => crate::i18n::t("notes.image.missing").to_owned(),
+                })
             }
         };
         let rects = Rc::clone(&self.image_rects);

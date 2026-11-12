@@ -208,6 +208,7 @@
   "notes.image.insert": "插入",
   "notes.image.missing": "找不到这张图片的文件",
   "notes.image.web": "网络图片 · {url}",
+  "notes.image.web_failed": "无法加载这张图片 · {url}",
   "notes.link.insert": "插入 {target}",
   "notes.link.link_to": "链接到 {target}",
   "notes.link.open": "打开 {target}",
