@@ -164,7 +164,6 @@ fn paths_are_validated_as_components() {
 
 #[test]
 fn a_saved_skill_round_trips_owner_only() {
-    use std::os::unix::fs::PermissionsExt as _;
     let (_temp, skills) = skills();
     let fake = Fake::new();
     let reply = save(&skills, &fake, add_item_skill());
@@ -180,14 +179,18 @@ fn a_saved_skill_round_trips_owner_only() {
     assert_eq!(stored.app_version.as_deref(), Some("1.0"));
 
     let root = skills.store.root();
-    let mode =
-        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode(root), 0o700);
-    assert_eq!(mode(&root.join(PROBE)), 0o700);
-    assert_eq!(mode(&root.join(PROBE).join("skills")), 0o700);
-    assert_eq!(mode(&root.join(PROBE).join("skills/add_item.json")), 0o600);
-    assert_eq!(mode(&root.join(PROBE).join("app.json")), 0o600);
-    assert_eq!(mode(&root.join(PROBE).join("runs.jsonl")), 0o600);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(root), 0o700);
+        assert_eq!(mode(&root.join(PROBE)), 0o700);
+        assert_eq!(mode(&root.join(PROBE).join("skills")), 0o700);
+        assert_eq!(mode(&root.join(PROBE).join("skills/add_item.json")), 0o600);
+        assert_eq!(mode(&root.join(PROBE).join("app.json")), 0o600);
+        assert_eq!(mode(&root.join(PROBE).join("runs.jsonl")), 0o600);
+    }
 
     // The run log never holds argument values.
     let log = std::fs::read_to_string(root.join(PROBE).join("runs.jsonl")).unwrap();
@@ -204,6 +207,7 @@ fn a_saved_skill_round_trips_owner_only() {
     assert_eq!(listed["apps"][0]["skills"][0]["name"], "add_item");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_symlinked_app_directory_is_refused() {
     let (temp, skills) = skills();

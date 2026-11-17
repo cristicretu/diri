@@ -81,6 +81,7 @@ Call one as `diri.call("session.list")` or through its generated function, `diri
 | `diri.computer.act` | `sessionID, tool, args?` | `Value` | One Cua Driver step under the caller's own cursor. |
 | `diri.computer.status` | `probe?` | `ComputerStatus` | Whether computer use is installed and allowed. |
 | `diri.computer.setup` | `action` | `ComputerStatus` | Install or restart computer use. |
+| `diri.computer.skills` | `action, sessionID?, args?` | `Value` | App Skills: list, learn, trace, save, run, forget, history, rollback. |
 | `diri.session.migrate` | `sessionID, targetHost?` | `SessionRecord` | Move a Claude session between this Mac and a host. |
 | `diri.session.reparent_worktree` | `sessionID, projectRoot, worktreePath` | `SessionRecord` | Record that a session now works in another worktree. |
 | `diri.session.set_project` | `sessionID, projectID?, projectRoot?` | `SessionRecord` | File a session and its children under another project. |

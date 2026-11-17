@@ -279,7 +279,8 @@ pub(super) fn bundle_info_for_pid(_pid: i64) -> Option<BundleInfo> {
     None
 }
 
-pub(super) fn bundle_info_at(bundle: &std::path::Path) -> Option<BundleInfo> {
+#[cfg(target_os = "macos")]
+fn bundle_info_at(bundle: &std::path::Path) -> Option<BundleInfo> {
     let plist = plist::Value::from_file(bundle.join("Contents/Info.plist")).ok()?;
     let dict = plist.as_dictionary()?;
     let string = |key: &str| {
