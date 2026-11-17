@@ -101,6 +101,8 @@ impl Method {
     pub const COMPUTER_STATUS: &'static str = "computer.status";
     /// Install it or restart it (`ComputerSetupParams`); answers a status.
     pub const COMPUTER_SETUP: &'static str = "computer.setup";
+    /// App Skills: learned, replayable app tasks (`ComputerSkillsParams`).
+    pub const COMPUTER_SKILLS: &'static str = "computer.skills";
     pub const SESSION_MIGRATE: &'static str = "session.migrate";
     pub const SESSION_REPARENT_WORKTREE: &'static str = "session.reparent_worktree";
     /// Files a session (and the sessions it spawned) under another project on
@@ -238,6 +240,7 @@ impl Method {
         Self::COMPUTER_ACT,
         Self::COMPUTER_STATUS,
         Self::COMPUTER_SETUP,
+        Self::COMPUTER_SKILLS,
         Self::SESSION_MIGRATE,
         Self::SESSION_REPARENT_WORKTREE,
         Self::SESSION_SET_PROJECT,

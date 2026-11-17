@@ -1426,6 +1426,7 @@ impl ControlServer {
                 let p: diri_proto::ComputerStatusParams = decode(params)?;
                 encode(&self.computer.status(p.probe))
             }
+            Method::COMPUTER_SKILLS => self.computer_skills(params),
             Method::COMPUTER_SETUP => {
                 let p: diri_proto::ComputerSetupParams = decode(params)?;
                 self.computer
@@ -2465,28 +2466,7 @@ impl ControlServer {
     fn computer_act(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::ComputerActParams = decode(params)?;
         let id = p.session_id.0.clone();
-        let (badge, live) = {
-            let registry = self.registry.lock().map_err(poisoned)?;
-            let record = registry
-                .record(&id)
-                .filter(|record| !record.is_archived())
-                .ok_or_else(|| ControlError::not_found(format!("no session {id}")))?;
-            let agent = registry
-                .engine()
-                .manifest(record.kind.id())
-                .and_then(|manifest| manifest.agent.as_ref())
-                .and_then(|agent| agent.display_name.clone())
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| record.kind.id().to_owned());
-            let badge = cursor_badge(&agent, &record.title);
-            let live: std::collections::HashSet<String> = registry
-                .records()
-                .into_iter()
-                .filter(|record| !record.is_archived() && registry.is_live(&record.id.0))
-                .map(|record| record.id.0)
-                .collect();
-            (badge, live)
-        };
+        let (badge, live, _) = self.computer_caller(&id)?;
         let caller = crate::computer::Caller {
             session_id: &id,
             badge: &badge,
@@ -2512,6 +2492,101 @@ impl ControlServer {
             );
         }
         result.map_err(|error| ControlError::new(error.code, error.message))
+    }
+
+    /// `computer.skills`: App Skills. With a session, actions run as that
+    /// session (its badge and leases); Settings lists and deletes without.
+    fn computer_skills(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::ComputerSkillsParams = decode(params)?;
+        let Some(session_id) = p.session_id.clone() else {
+            let live = self.live_session_ids()?;
+            return self
+                .computer
+                .skills(None, &p.action, &p.args, &|session| live.contains(session))
+                .map_err(|error| ControlError::new(error.code, error.message));
+        };
+        let id = session_id.0.clone();
+        let (badge, live, created_at) = self.computer_caller(&id)?;
+        let caller = crate::computer::Caller {
+            session_id: &id,
+            badge: &badge,
+        };
+        let result = self
+            .computer
+            .skills(Some(&caller), &p.action, &p.args, &|session| {
+                live.contains(session)
+            });
+        if let Err(error) = &result
+            && error.code == crate::computer::SKILL_CONFIRM
+        {
+            // The Agent must ask before a destructive batch; tell the person
+            // too, in case it doesn't.
+            self.events.publish_encoded(
+                diri_proto::EventName::SESSION_NOTIFICATION,
+                &diri_proto::SessionNotificationEvent {
+                    id: format!(
+                        "app-skill-confirm-{id}-{}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis()
+                    ),
+                    session_id: session_id.clone(),
+                    session_created_at: created_at,
+                    occurred_at: diri_proto::DateMillis::from(std::time::SystemTime::now()),
+                    title: format!("{badge} wants to repeat an App Skill"),
+                    body: error.message.clone(),
+                },
+                Some(&id),
+            );
+        }
+        result.map_err(|error| ControlError::new(error.code, error.message))
+    }
+
+    fn live_session_ids(&self) -> Result<std::collections::HashSet<String>, ControlError> {
+        let registry = self.registry.lock().map_err(poisoned)?;
+        Ok(registry
+            .records()
+            .into_iter()
+            .filter(|record| !record.is_archived() && registry.is_live(&record.id.0))
+            .map(|record| record.id.0)
+            .collect())
+    }
+
+    /// A live session's cursor badge, every live session, and its creation
+    /// time, or not found.
+    fn computer_caller(
+        &self,
+        id: &str,
+    ) -> Result<
+        (
+            String,
+            std::collections::HashSet<String>,
+            diri_proto::DateMillis,
+        ),
+        ControlError,
+    > {
+        let registry = self.registry.lock().map_err(poisoned)?;
+        let record = registry
+            .record(id)
+            .filter(|record| !record.is_archived())
+            .ok_or_else(|| ControlError::not_found(format!("no session {id}")))?;
+        let agent = registry
+            .engine()
+            .manifest(record.kind.id())
+            .and_then(|manifest| manifest.agent.as_ref())
+            .and_then(|agent| agent.display_name.clone())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| record.kind.id().to_owned());
+        let badge = cursor_badge(&agent, &record.title);
+        let created_at = record.created_at;
+        let live: std::collections::HashSet<String> = registry
+            .records()
+            .into_iter()
+            .filter(|record| !record.is_archived() && registry.is_live(&record.id.0))
+            .map(|record| record.id.0)
+            .collect();
+        Ok((badge, live, created_at))
     }
 
     /// The aggregated staleness view: every worktree of every project,
@@ -3814,6 +3889,7 @@ impl ControlServer {
 
     fn session_kill(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::SessionIdParams = decode(params)?;
+        self.computer.end_skill_learning(&p.session_id.0);
         let exit = self.terminate_session_unlocked(&p.session_id.0, Duration::from_secs(3))?;
         let mut registry = self.registry.lock().map_err(poisoned)?;
         if exit.is_none() {
@@ -3830,6 +3906,7 @@ impl ControlServer {
     fn session_remove(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::SessionIdParams = decode(params)?;
         self.stop_remote_before_lifecycle(&p.session_id.0)?;
+        self.computer.end_skill_learning(&p.session_id.0);
         let mut registry = self.registry.lock().map_err(poisoned)?;
         let removed = registry
             .record(&p.session_id.0)

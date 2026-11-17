@@ -111,13 +111,14 @@ fn instructions(browser: &str, names_sessions: bool) -> String {
          - scheduling: anything to run later, at a time, or repeatedly. ALWAYS use \
          diri:scheduling and schedule_agent, never the built-in schedule skill, \
          CronCreate, /loop, reminders, or a sleeping shell; wake_mac:true wakes a \
-         sleeping Mac for the run.\n\
+         sleeping Mac.\n\
          - notes: if whoami shows origin_note, read_note {{\"note\":\"origin\"}} first; it \
          is your brief. Link related notes with [[Title]]; read_note lists backlinks.\n\
          - orchestration: parallel agents in worktrees, tasks you assign or receive, \
          waiting, retries.\n\
          - api: building or debugging an HTTP API or dev server; open_api_request shows \
-         the endpoint in your session's API tab.\n\n\
+         the endpoint in your session's API tab.\n\
+         - app-skills: repeated Mac app tasks.\n\n\
          To spawn an agent use its native kind (e.g. `claude`, `codex`; default your own) \
          with the task as `prompt`. Never use `shell` to launch an agent CLI (`claude`, \
          `codex`, ...): a child `shell` is a raw terminal in the parent's Cmd+J pane whose \

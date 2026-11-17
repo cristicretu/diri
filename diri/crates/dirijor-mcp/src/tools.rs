@@ -35,8 +35,8 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
     let mut tools = vec![
         ToolDefinition::new(
             "get_skill",
-            "Read one of Diri's skills: the detailed rules for a Diri capability, as Markdown. Read the matching skill before acting: scheduling (run anything later, at a time, or repeatedly; waking the Mac), notes (work started from or written to a Diri note), orchestration (parallel agents, tasks, waiting, retries), api (HTTP APIs and dev servers: show endpoints in the API tab). Claude Code sessions also have them as skills named diri:<name>.",
-            json!({"type":"object","properties":{"name":{"type":"string","enum":["scheduling","notes","orchestration","api"]}},"required":["name"]}),
+            "Read one of Diri's skills: the detailed rules for a Diri capability, as Markdown. Read the matching skill before acting: scheduling (run anything later, at a time, or repeatedly; waking the Mac), notes (work started from or written to a Diri note), orchestration (parallel agents, tasks, waiting, retries), api (HTTP APIs and dev servers: show endpoints in the API tab), app-skills (learn a Mac app task once with computer use, replay it later). Claude Code sessions also have them as skills named diri:<name>.",
+            json!({"type":"object","properties":{"name":{"type":"string","enum":["scheduling","notes","orchestration","api","app-skills"]}},"required":["name"]}),
         ),
         ToolDefinition::new(
             "submit_task",
@@ -340,6 +340,27 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
             }),
         ),
         ToolDefinition::new(
+            "app_skills",
+            APP_SKILLS_DESCRIPTION,
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["list", "learn", "trace", "save", "run", "forget", "history", "rollback", "abandon"]},
+                    "app": {"type": "string", "description": "App name or bundle id (learn, run, forget, history, rollback; list filter)."},
+                    "goal": {"type": "string", "description": "learn: the task in one sentence."},
+                    "skill": {"description": "run/forget/history/rollback: the skill name. save: the skill object {name, goal, params:[{name,type,description}], steps, preconditions?, postconditions?, destructive?}."},
+                    "example_args": {"type": "object", "description": "save: param values to verify the skill with."},
+                    "verify": {"type": "string", "enum": ["full", "until_last", "none"], "description": "save: how far verification replays. Default full; until_last for destructive skills."},
+                    "args": {"type": "object", "description": "run: param values for one run."},
+                    "args_list": {"type": "array", "items": {"type": "object"}, "description": "run: one args object per item; each runs in turn."},
+                    "continue_on_error": {"type": "boolean", "description": "run with args_list: keep going after a failed item."},
+                    "confirm": {"type": "boolean", "description": "run: required for a destructive skill over several items, only after the person agreed."},
+                    "version": {"type": "integer", "description": "rollback: the version to restore."}
+                },
+                "required": ["action"]
+            }),
+        ),
+        ToolDefinition::new(
             "open_api_request",
             "Open an HTTP request in the API tab of YOUR session's right panel in Diri, prefilled, so the person can inspect, edit and send it. Use it whenever you build, run or debug an HTTP API: after starting a dev server, open the endpoint you just added or changed (e.g. GET http://localhost:3000/api/health) instead of only pasting a curl command. Put {{name}} placeholders in url/headers/body and pass their values in variables (marking tokens in secrets so they are masked); they land in the project's environment (environment names it, default the active one or \"Local\"). json sets a JSON body and its Content-Type; body sends text as written. auto_send:true sends a GET immediately and shows the response; any other method is never sent until the person presses Send. The call returns once the tab is open, without the response.",
             json!({
@@ -598,6 +619,14 @@ fn string_array() -> Value {
     json!({"type": "array", "items": {"type": "string"}})
 }
 
+const APP_SKILLS_DESCRIPTION: &str = "App Skills: tasks computer use learned once in a Mac app, \
+saved per app and replayed later without a model (fast, no screenshots). Before doing a repeated app task \
+by hand with the computer tool, call list. To teach one: learn {app, goal}, do the task once with the \
+computer tool, trace, edit the draft (params as {name} placeholders, one intent per step), then save {skill, \
+example_args}, which replays it to verify. run {app, skill, args} or args_list for many items. A failed run \
+returns the failing step, its intent, the driver error and the current window: fix the steps and save \
+again. Read get_skill {\"name\":\"app-skills\"} first.";
+
 const COMPUTER_DESCRIPTION: &str = "Use this Mac's apps the way a person would, in the background: \
 any native app (Simulator, TextEdit, Xcode, Finder, the app you are building) and browser pages. \
 The person's cursor, keyboard and focus stay theirs; your actions show as your own labelled cursor. \
@@ -614,7 +643,8 @@ a driver hint recommends them; if no background route reaches a control, tell th
 action's disposition.retry says whether retrying is safe; a stale_element_token means read again. Act only on apps you launched or the person pointed you \
 to: an app another agent is driving returns computer_app_busy. computer_unavailable or \
 computer_permissions means only the person can finish setup (Diri Settings › Agents › Computer use): \
-tell them, and don't try to install or grant anything yourself. tool \"tools\" lists every tool.";
+tell them, and don't try to install or grant anything yourself. tool \"tools\" lists every tool. \
+A task you'll repeat: check app_skills, which replays learned app tasks without a model.";
 
 fn browser_schema() -> Value {
     json!({

@@ -14,7 +14,8 @@ pub use api_request::{
     SessionOpenApiRequestParams,
 };
 pub use computer::{
-    ComputerActParams, ComputerSetupAction, ComputerSetupNeededEvent, ComputerSetupParams,
+    AppSkillStatus, AppSkillSummary, AppSkillsApp, AppSkillsList, ComputerActParams,
+    ComputerSetupAction, ComputerSetupNeededEvent, ComputerSetupParams, ComputerSkillsParams,
     ComputerStatus, ComputerStatusParams,
 };
 pub mod control;

@@ -222,6 +222,8 @@ pub enum StoreEffect {
     WatchComputer,
     /// Install Cua Driver, or restart it.
     ComputerSetup(diri_proto::ComputerSetupAction),
+    /// Delete one learned App Skill (Settings › Computer use).
+    ForgetAppSkill { app: String, skill: String },
     /// Rescan this Mac until the Agent the user is installing appears.
     WatchAgentInstall {
         kind: AgentKind,
@@ -5037,6 +5039,16 @@ async fn run_effects(
                 ));
                 Ok(())
             }
+            StoreEffect::ForgetAppSkill { app, skill } => {
+                tokio::spawn(computer::forget_skill(
+                    app,
+                    skill,
+                    Arc::clone(&client),
+                    Arc::clone(&store),
+                    change_tx.clone(),
+                ));
+                Ok(())
+            }
             StoreEffect::WatchAgentInstall { kind, display_name } => {
                 let client = Arc::clone(&client);
                 let store = Arc::clone(&store);
@@ -5248,7 +5260,9 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         | StoreEffect::ConfigureAgent(_)
         | StoreEffect::WatchAgentInstall { .. } => return None,
         // Setup outcomes render in place in Settings › Agents.
-        StoreEffect::WatchComputer | StoreEffect::ComputerSetup(_) => return None,
+        StoreEffect::WatchComputer
+        | StoreEffect::ComputerSetup(_)
+        | StoreEffect::ForgetAppSkill { .. } => return None,
         // Import outcomes, failures included, arrive as one summary banner.
         StoreEffect::ScanHerdr { .. } | StoreEffect::ImportHerdr(_) => return None,
         // Applying happens in the store; the scan only reads.

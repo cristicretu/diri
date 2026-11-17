@@ -10996,7 +10996,7 @@ mod tests {
             .expect("switch language");
             cx.run_until_parked();
         }
-        // `DIRI_VISUAL_COMPUTER=missing|installing|failed|allow|waiting|ready`
+        // `DIRI_VISUAL_COMPUTER=missing|installing|failed|allow|waiting|ready|learned`
         // seeds Settings › Agents › Computer use with that setup state.
         if let Ok(state) = std::env::var("DIRI_VISUAL_COMPUTER") {
             cx.update_window(window.into(), |root, _, cx| {
