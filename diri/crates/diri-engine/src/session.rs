@@ -1772,6 +1772,62 @@ fn accept_markerless_exit(shared: &Shared, client: &HolderClient) -> Option<Exit
     Some(exit)
 }
 
+/// Stops the Agent of a Holder that can never be reached again.
+///
+/// Something outside Diri can delete the Holder directory (`/tmp` cleanup
+/// tools, a wiped `$TMPDIR`) while the Holder and its Agent keep running. The
+/// follower then reads the missing socket as a markerless death, but the
+/// Agent pid is still alive, so [`accept_markerless_exit`] fails closed and
+/// the session can neither close nor resume. A briefly missing socket must
+/// still fail closed, so this acts only when the socket AND the pid file are
+/// both gone (no retry can ever reach that Holder) and the live pid is still
+/// the exact process this Session bound at launch. It then stops that
+/// process group the way the Holder's group guard would: TERM, then KILL.
+#[cfg(unix)]
+fn stop_stranded_child(shared: &Shared, client: &HolderClient, grace: Duration) -> Option<Exit> {
+    if !shared.exited.load(Ordering::SeqCst) {
+        return None;
+    }
+    let present = |path: &std::path::Path| {
+        !std::fs::symlink_metadata(path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    };
+    if present(&client.socket_path) || present(&client.socket_path.with_extension("pid")) {
+        return None;
+    }
+    let (expected, _) = *shared.holder_identity.get()?;
+    if diri_pty::process_identity::observe(expected.pid()).ok()? != expected {
+        return None;
+    }
+    let group = libc::pid_t::try_from(expected.pid()).ok()?;
+    if group <= 1 {
+        return None;
+    }
+    let gone = || held_child_gone(shared) == Some(true);
+    for (signal, wait) in [
+        (libc::SIGTERM, grace),
+        (libc::SIGKILL, Duration::from_secs(1)),
+    ] {
+        // SAFETY: the group leader was just verified to be the bound child.
+        unsafe { libc::killpg(group, signal) };
+        let deadline = Instant::now() + wait;
+        while !gone() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if gone() {
+            let exit = Exit::Signal(signal);
+            *shared.exit.lock().expect("exit") = Some(exit);
+            return Some(exit);
+        }
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn stop_stranded_child(_: &Shared, _: &HolderClient, _: Duration) -> Option<Exit> {
+    None
+}
+
 /// The destructive stop channel revokes the prior controller. Its observed
 /// exit must reach the projection even when that controller never saw ProcessExit.
 /// TERM, a grace period, then the Helper `kill` that also ends the Holder.
@@ -4014,6 +4070,7 @@ impl Session {
                 let confirmed = *self.shared.exit.lock().expect("exit");
                 confirmed
                     .or_else(|| accept_markerless_exit(&self.shared, client))
+                    .or_else(|| stop_stranded_child(&self.shared, client, grace))
                     .ok_or_else(|| {
                         std::io::Error::new(
                             std::io::ErrorKind::TimedOut,

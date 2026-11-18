@@ -433,6 +433,40 @@ fn failed_holder_stop_keeps_the_live_session_tracked_until_retry() {
 }
 
 #[test]
+fn a_wiped_holder_directory_over_a_live_agent_can_still_be_closed() {
+    let root = holders_dir("wiped");
+    let logs = root.join("logs");
+    let holder = holder_config(&root);
+    let mut registry = Registry::new(engine(), root.join("state.json"));
+    registry
+        .spawn(
+            shell_spec("s_wiped", "cat", &logs, Some(holder.clone())),
+            record("s_wiped"),
+        )
+        .unwrap();
+    let child = registry.get("s_wiped").unwrap().child_pid();
+    let paths = HolderPaths::new(&holder.holders_dir, "s_wiped");
+
+    // A /tmp cleaner deletes the Holder's files; the Holder and its Agent
+    // keep running, so the follower sees a markerless death over a live pid.
+    std::fs::remove_file(paths.socket()).unwrap();
+    std::fs::remove_file(paths.pid_file()).unwrap();
+    wait_until("markerless exit observed", Duration::from_secs(30), || {
+        registry.get("s_wiped").unwrap().view().exited
+    });
+    assert_eq!(unsafe { libc::kill(child, 0) }, 0, "agent still running");
+
+    registry
+        .terminate("s_wiped", Duration::from_millis(500))
+        .expect("an unreachable Holder's verified Agent must still close");
+    assert!(registry.get("s_wiped").is_none());
+    wait_until("agent stopped", Duration::from_secs(5), || unsafe {
+        libc::kill(child, 0) != 0
+    });
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn a_markerless_holder_death_can_still_be_closed() {
     let root = holders_dir("markerless");
     let logs = root.join("logs");
