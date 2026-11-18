@@ -1448,6 +1448,10 @@ impl Sidebar {
 }
 
 impl Sidebar {
+    pub(crate) fn workspace_open_settled(&self, workspace: Option<&WorkspaceId>) -> bool {
+        self.workspace_nav.project_agent.is_none() && self.workspace_nav.active.as_ref() == workspace
+    }
+
     #[cfg(test)]
     pub(super) fn project_agent_open_pending(&self) -> bool {
         self.workspace_nav.project_agent.is_some()

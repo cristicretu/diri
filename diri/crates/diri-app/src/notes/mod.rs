@@ -177,8 +177,19 @@ pub(crate) enum NotePaneEvent {
 
 impl gpui::EventEmitter<NotePaneEvent> for NotePane {}
 
+/// Supplies the same temporary notes directory to panes mounted later by a workspace.
+#[cfg(test)]
+pub(crate) struct TestNoteStore(pub Arc<NoteStore>);
+
+#[cfg(test)]
+impl gpui::Global for TestNoteStore {}
+
 impl NotePane {
     pub(crate) fn new(runtime: Arc<StoreRuntime>, cx: &mut Context<Self>) -> Self {
+        #[cfg(test)]
+        if let Some(store) = cx.try_global::<TestNoteStore>() {
+            return Self::with_store(runtime, Some(store.0.clone()), false, cx);
+        }
         let store = NoteStore::resolve_dir()
             .and_then(|dir| NoteStore::open(dir).ok())
             .map(Arc::new);

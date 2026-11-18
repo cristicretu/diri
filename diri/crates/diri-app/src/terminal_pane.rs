@@ -3287,6 +3287,14 @@ impl TerminalPane {
         self.pending_note_block = Some((Some(note_id), block));
     }
 
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn note_editor_for_test(
+        &self,
+        cx: &gpui::App,
+    ) -> Option<Entity<crate::notes::editor_view::NoteEditorView>> {
+        self.note.as_ref()?.read(cx).editor_for_test()
+    }
+
     /// Hosts a fixture note pane: the macOS window screenshots, and the
     /// cross-platform note-selection tests.
     #[cfg(test)]
