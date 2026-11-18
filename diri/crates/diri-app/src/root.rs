@@ -349,6 +349,7 @@ pub struct RootView {
     /// The To-dos page covers the workbench while open; selecting any
     /// session closes it.
     todos_open: bool,
+    pending_live_note_block: Option<(SessionId, String, usize)>,
     todos_page: Option<Entity<crate::notes::todos::TodosPage>>,
     auxiliary_id: Option<SessionId>,
     auxiliary_parent: Option<SessionId>,
@@ -1565,6 +1566,7 @@ impl RootView {
             tabs_target: tabs_seam,
             auxiliary_terminal: None,
             todos_open: false,
+            pending_live_note_block: None,
             todos_page: None,
             auxiliary_id: None,
             auxiliary_parent: None,
@@ -3330,6 +3332,14 @@ impl RootView {
         cx: &mut Context<Self>,
     ) {
         self.close_todos(cx);
+        self.pending_live_note_block = None;
+        if let Some(session) = &opened.live_session {
+            self.pending_live_note_block = opened
+                .block
+                .map(|block| (session.clone(), opened.note_id.clone(), block));
+            self.open_workspace_launch_session(session.clone(), window, cx);
+            return;
+        }
         if let (Some(block), Some(terminal)) = (opened.block, &self.terminal) {
             terminal.update(cx, |terminal, _| {
                 terminal.reveal_block_in_note(opened.note_id.clone(), block)
@@ -5247,6 +5257,21 @@ impl RootView {
             {
                 body = body.child(scrim.when(card_island, |scrim| scrim.rounded(px(Radius::CARD))));
             }
+        }
+
+        // Workspace activation may mount a different editor after the palette closes.
+        // Deliver the jump once its destination pane has been resolved for this frame.
+        if self.pending_live_note_block.is_some()
+            && self.sidebar.read(cx).workspace_open_settled(self.active_workspace.as_ref())
+            && !self.todos_open
+            && let Some(pane) = self.active_terminal(cx)
+            && let Some((session, note_id, block)) = self.pending_live_note_block.take()
+            && self.active_session_id(cx).as_ref() == Some(&session)
+        {
+            pane.update(cx, |pane, cx| {
+                pane.reveal_block_in_note(note_id, block);
+                cx.notify();
+            });
         }
 
         if let Some(auxiliary) = &self.auxiliary_terminal {
@@ -9926,7 +9951,9 @@ mod tests {
     /// opens that Session on Enter, not only in the store.
     #[cfg(target_os = "macos")]
     #[gpui::test]
-    fn command_palette_note_row_shows_its_session(cx: &mut gpui::TestAppContext) {
+    fn command_palette_note_row_reveals_matched_block_in_workspace(cx: &mut gpui::TestAppContext) {
+        use diri_proto::workspace::*;
+
         cx.update(|cx| {
             cx.set_reduce_motion(true);
             commands::bind_keys(cx, &Default::default());
@@ -9934,7 +9961,9 @@ mod tests {
         let notes_dir = tempfile::tempdir().unwrap();
         let note_store =
             Arc::new(diri_notes::store::NoteStore::open(notes_dir.path().join("notes")).unwrap());
-        let (_, doc) = diri_notes::markdown::parse("# Launch brief\n\nMind the zebra crossing.\n");
+        let (_, doc) = diri_notes::markdown::parse(
+            "# Launch brief\n\nStart at the gate.\n\nMind the zebra crossing.\n",
+        );
         let (note_id, _) = note_store.create(doc, None).unwrap();
         let services = test_services();
         let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
@@ -9963,6 +9992,29 @@ mod tests {
             .unwrap()
             .id
             .clone();
+        let workspace = WorkspaceId::new("brief-workspace");
+        let tab = TabId::new("brief-tab");
+        let pane = PaneId::new("brief-pane");
+        let mut snapshot = WorkspaceSnapshot {
+            revision: 1,
+            workspaces: vec![WorkspaceRecord {
+                id: workspace.clone(),
+                project_id: Some(note.project_id.clone()),
+                name: "Briefs".into(),
+                selected_tab: Some(tab.clone()),
+                tabs: vec![WorkspaceTab {
+                    id: tab,
+                    title: None,
+                    focused_pane: pane.clone(),
+                    zoomed_pane: None,
+                    layout: LayoutNode::Pane {
+                        id: pane,
+                        session_id: note.id.clone(),
+                    },
+                }],
+            }],
+            ..Default::default()
+        };
         let folded = note.project_id.clone();
         fixture.list.sessions.push(note);
         let runtime = Arc::clone(&services.store);
@@ -9970,9 +10022,11 @@ mod tests {
             let mut store = services.store.store.write().unwrap();
             store.hydrate(fixture.list);
             store.select(current.clone());
+            store.seed_workspace_snapshot_for_test(snapshot.clone());
             store.toggle_project_collapsed(folded).unwrap();
         }
         let (root, cx) = cx.add_window_view(move |window, cx| {
+            cx.set_global(crate::notes::TestNoteStore(note_store.clone()));
             let model = cx.new(|cx| {
                 crate::notes::todos::TodosModel::with_store(runtime, Some(note_store), false, cx)
             });
@@ -9987,6 +10041,20 @@ mod tests {
         cx.run_until_parked();
         cx.simulate_keystrokes("enter");
         cx.run_until_parked();
+        // The Engine acknowledges the requested tab after the palette has closed.
+        snapshot.revision += 1;
+        root.update_in(cx, |root, _, cx| {
+            let mut store = root.window_store.write().unwrap();
+            assert!(matches!(store.in_flight_workspace_edit_for_test(),
+                Some(WorkspaceMutation::OpenProjectAgent { session_id, .. })
+                    if session_id == &SessionId::new("s_note_brief")
+            ));
+            store.finish_workspace_edit_for_test(snapshot);
+            drop(store);
+            root.services.store.publish_local_change();
+            cx.notify();
+        });
+        cx.run_until_parked();
         let target = SessionId::new("s_note_brief");
         root.read_with(cx, |root, cx| {
             assert_eq!(
@@ -9994,17 +10062,14 @@ mod tests {
                 Some(&target),
                 "enter selects the note's session"
             );
-            // The pane tracks only agent grids; a shown note reads as none.
-            // Without the window's select it stays on the previous agent.
-            assert_eq!(
-                root.terminal
-                    .as_ref()
-                    .unwrap()
-                    .read(cx)
-                    .observed_session_for_test(),
-                None,
-                "the pane leaves the previous session for the note"
-            );
+            assert_eq!(root.active_workspace.as_ref(), Some(&workspace));
+            let terminal = root.active_terminal(cx).unwrap();
+            let editor = terminal.read(cx).note_editor_for_test(cx).expect("open note");
+            let editor = &editor.read(cx).editor;
+            assert_eq!(editor.title(), "Launch brief");
+            let caret = editor.selection.head;
+            assert_eq!(editor.block(caret.block).text, "Mind the zebra crossing.");
+            assert_eq!(caret.offset, editor.block(caret.block).text.len());
         });
     }
 

@@ -41,6 +41,7 @@ impl NoteHome {
 /// Asks the window to put the caret on a block of a note it just showed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NoteOpened {
+    pub live_session: Option<SessionId>,
     pub note_id: String,
     pub block: Option<usize>,
 }
@@ -209,16 +210,16 @@ impl NavigationOverlay {
                 NoteHome::Orphan => store.open_note_file(note_id.clone()),
             }
         }
-        if let NoteHome::Live(id) = &home {
-            // `select` only records the id; the window shows it on this
-            // action, as for a session row.
-            self.store
-                .enqueue(crate::store::WindowAction::Select(id.clone()));
-            self._runtime.publish_local_change();
-        }
         crate::telemetry::notes_event("notes.search.result_opened", home.telemetry());
         self.close_overlay(window, cx);
-        cx.emit(NoteOpened { note_id, block });
+        cx.emit(NoteOpened {
+            live_session: match home {
+                NoteHome::Live(id) => Some(id),
+                _ => None,
+            },
+            note_id,
+            block,
+        });
     }
 
     /// The notes ⌘K shows above its commands for a non-empty query. Live
