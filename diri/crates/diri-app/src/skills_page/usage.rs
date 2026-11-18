@@ -157,6 +157,7 @@ impl SkillsPage {
                 let count = ((wave * weight as f32) + (seed % 3) as f32 - 1.0).max(0.0) as u32;
                 for run in 0..count {
                     runs.push(SkillRun {
+                        turn: runs.len() as u64,
                         at: now - i64::from(day) * 86_400 - i64::from(run) * 60,
                         name: name.into(),
                         source: SkillSource::Tool,
@@ -237,7 +238,11 @@ impl SkillsPage {
                 .parent()
                 .and_then(|folder| folder.file_name())
                 .map(|name| name.to_string_lossy().to_lowercase());
-            for key in [Some(diri_usage::transcripts::skills::normalize(&skill.name).to_lowercase()), folder]
+            for key in [
+                Some(skill.name.to_lowercase()),
+                Some(diri_usage::transcripts::skills::normalize(&skill.name).to_lowercase()),
+                folder,
+            ]
                 .into_iter()
                 .flatten()
             {
@@ -247,10 +252,12 @@ impl SkillsPage {
         let now = now();
         let today = (now + activity::system_offset(now)).div_euclid(86_400);
         // `/clear` and other built-in commands are not skills.
-        let keep = |run: &SkillRun| {
-            run.source != SkillSource::Slash || index.contains_key(&run.name.to_lowercase())
+        let canonical = |run: &SkillRun| {
+            index.get(&run.name.to_lowercase())
+                .map(|&position| self.catalog.skills[position].name.clone())
+                .or_else(|| (run.source != SkillSource::Slash).then(|| run.name.clone()))
         };
-        let summary = summarize(&runs, self.usage.days, today, &activity::system_offset, &keep);
+        let summary = summarize(&runs, self.usage.days, today, &activity::system_offset, &canonical);
         let used: Vec<usize> = summary
             .skills
             .iter()
@@ -629,6 +636,31 @@ fn curve_through(path: &mut PathBuilder, points: &[[f32; 2]], bottom: f32) {
 mod tests {
     use super::*;
     use diri_usage::transcripts::skills::SkillTally;
+
+    #[gpui::test]
+    fn folder_and_declared_name_share_one_usage_row(cx: &mut gpui::TestAppContext) {
+        let (store, _) = SessionStore::headless(Default::default());
+        let page = cx.new(|cx| SkillsPage::new(Arc::new(RwLock::new(store)), cx));
+        page.update(cx, |page, _| {
+            page.seed_preview(false);
+            page.catalog.skills.truncate(1);
+            page.catalog.skills[0].name = "release-checklist".into();
+            page.catalog.skills[0].path = "skills/release/SKILL.md".into();
+            let at = now();
+            page.usage.runs = Some(Arc::new(vec![
+                SkillRun { at, turn: 0, name: "release".into(), source: SkillSource::Read },
+                SkillRun { at, turn: 0, name: "release-checklist".into(), source: SkillSource::Tool },
+                SkillRun { at, turn: 1, name: "release".into(), source: SkillSource::Read },
+            ]));
+            page.recompute_usage();
+            let rows = &page.usage.summary.as_ref().unwrap().skills;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].name, "release-checklist");
+            assert_eq!(rows[0].total, 2);
+            assert_eq!(page.usage.index[&rows[0].name], 0);
+            assert!(page.usage.unused.is_empty());
+        });
+    }
 
     #[test]
     fn smoothing_keeps_mass_near_the_spike_and_busiest_weekday_reads_days() {

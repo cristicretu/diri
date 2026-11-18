@@ -18,6 +18,9 @@ use std::{
     time::UNIX_EPOCH,
 };
 
+mod shell;
+use shell::{shell_reads, skill_from_path, skills_read_by, wrapped_literal};
+
 use diri_proto::paths::DirijorPaths;
 use memchr::memmem;
 use serde::{Deserialize, Serialize};
@@ -32,7 +35,7 @@ use super::{
 
 /// Days of runs kept: the longest range Settings offers is a year.
 pub const RETENTION_DAYS: i64 = 366;
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 const CACHE_FILE_NAME: &str = "skill-usage-cache.json";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -47,6 +50,8 @@ pub enum SkillSource {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SkillRun {
+    /// Turn identity within a refresh result (file-local while cached).
+    pub turn: u64,
     /// Unix seconds.
     pub at: i64,
     /// The skill's name without a `plugin:` prefix.
@@ -64,11 +69,13 @@ struct FileEntry {
     tail_hash: u64,
     /// Skills already counted in the turn the file ended in.
     turn_skills: Vec<String>,
+    turn: u64,
     runs: Vec<SkillRun>,
 }
 
 impl FileEntry {
     fn new_turn(&mut self) {
+        self.turn += 1;
         self.turn_skills.clear();
     }
 
@@ -79,6 +86,7 @@ impl FileEntry {
         }
         self.turn_skills.push(name.to_owned());
         self.runs.push(SkillRun {
+            turn: self.turn,
             at,
             name: name.to_owned(),
             source,
@@ -104,11 +112,7 @@ impl SkillUsageStore {
         let home = home.as_ref();
         let cache_file = DirijorPaths::usage_cache_file(home).with_file_name(CACHE_FILE_NAME);
         Self::with_paths(
-            vec![
-                (home.join(".claude/projects"), UsageProvider::Claude),
-                (home.join(".config/claude/projects"), UsageProvider::Claude),
-                (home.join(".codex/sessions"), UsageProvider::Codex),
-            ],
+            transcript_roots(home, |key| std::env::var_os(key)),
             cache_file,
         )
     }
@@ -189,12 +193,44 @@ impl SkillUsageStore {
         if changed {
             let _ = cache::save(&self.cache_file, &self.cache);
         }
-        self.cache
-            .files
-            .values()
-            .flat_map(|entry| entry.runs.iter().cloned())
-            .collect()
+        let mut result = Vec::new();
+        let mut first_turn = 0;
+        for entry in self.cache.files.values() {
+            result.extend(entry.runs.iter().cloned().map(|mut run| {
+                run.turn += first_turn;
+                run
+            }));
+            first_turn += entry.turn + 1;
+        }
+        result
     }
+}
+
+fn transcript_roots(
+    home: &Path,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<(PathBuf, UsageProvider)> {
+    let mut roots = vec![
+        (home.join(".claude/projects"), UsageProvider::Claude),
+        (home.join(".config/claude/projects"), UsageProvider::Claude),
+        (home.join(".codex/sessions"), UsageProvider::Codex),
+    ];
+    for (key, child, provider) in [
+        ("CODEX_HOME", "sessions", UsageProvider::Codex),
+        ("CLAUDE_CONFIG_DIR", "projects", UsageProvider::Claude),
+    ] {
+        if let Some(base) = env(key).filter(|base| !base.is_empty()) {
+            roots.push((PathBuf::from(base).join(child), provider));
+        }
+    }
+    let mut seen = HashSet::new();
+    roots.retain_mut(|(root, _)| {
+        if let Ok(path) = fs::canonicalize(&root) {
+            *root = path;
+        }
+        seen.insert(root.clone())
+    });
+    roots
 }
 
 fn scan_file(path: &Path, provider: UsageProvider, entry: &mut FileEntry) -> io::Result<u64> {
@@ -303,7 +339,9 @@ fn codex_line(line: &[u8], entry: &mut FileEntry) {
         }
         return;
     }
-    if !contains(line, b"SKILL.md") || !contains(line, b"\"response_item\"") {
+    if !(contains(line, b"SKILL.md") || contains(line, b"get_skill"))
+        || !contains(line, b"\"response_item\"")
+    {
         return;
     }
     let Ok(object) = serde_json::from_slice::<Value>(line) else {
@@ -318,31 +356,44 @@ fn codex_line(line: &[u8], entry: &mut FileEntry) {
     let Some(payload) = object.get("payload") else {
         return;
     };
-    let command = match payload.get("type").and_then(Value::as_str) {
-        Some("function_call") => payload
-            .get("arguments")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        Some("custom_tool_call") => payload
-            .get("input")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        Some("local_shell_call") => payload
-            .pointer("/action/command")
-            .and_then(Value::as_array)
-            .map(|parts| {
-                parts
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            }),
-        _ => None,
-    };
-    if let Some(command) = command {
-        for name in skills_read_by(&command) {
+    let tool = payload["name"].as_str().unwrap_or_default();
+    let record = |names: Vec<String>, entry: &mut FileEntry| {
+        for name in names {
             entry.record(at, &name, SkillSource::Read);
         }
+    };
+    match payload["type"].as_str() {
+        Some("function_call") => {
+            let Some(args) = payload["arguments"]
+                .as_str()
+                .and_then(|json| serde_json::from_str::<Value>(json).ok())
+            else {
+                return;
+            };
+            match tool {
+                "get_skill" | "mcp__dirijor__get_skill" => {
+                    if let Some(name) = args["name"].as_str() {
+                        entry.record(at, name, SkillSource::Tool);
+                    }
+                }
+                "shell" | "shell_command" | "exec_command" => {
+                    let command = args.get("cmd").unwrap_or(&args["command"]);
+                    record(shell_reads(command), entry);
+                }
+                _ => {}
+            }
+        }
+        Some("local_shell_call") => record(shell_reads(&payload["action"]["command"]), entry),
+        Some("custom_tool_call") if tool == "exec" => {
+            match payload["input"].as_str().and_then(wrapped_literal) {
+                Some(("exec_command", cmd)) => record(skills_read_by(&cmd), entry),
+                Some(("mcp__dirijor__get_skill", name)) => {
+                    entry.record(at, &name, SkillSource::Tool)
+                }
+                _ => {}
+            }
+        }
+        _ => {}
     }
 }
 
@@ -358,81 +409,6 @@ fn slash_commands(text: &str) -> impl Iterator<Item = &str> {
         let name = rest.split("</command-name>").next()?.trim();
         let name = name.strip_prefix('/')?;
         (!name.is_empty() && !name.contains(char::is_whitespace)).then_some(name)
-    })
-}
-
-fn skill_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')
-}
-
-/// The skill folders named by `…/<name>/SKILL.md` in `text`, in order.
-fn skill_folders(text: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    for (index, _) in text.match_indices("/SKILL.md") {
-        let before = &text[..index];
-        let start = before
-            .char_indices()
-            .rev()
-            .find(|(_, c)| !skill_char(*c))
-            .map_or(0, |(i, c)| i + c.len_utf8());
-        let name = &before[start..];
-        if !name.is_empty() && name != "." && name != ".." && !names.iter().any(|n| n == name) {
-            names.push(name.to_owned());
-        }
-    }
-    names
-}
-
-fn skill_from_path(path: &str) -> Option<String> {
-    if !path.trim_end().ends_with("/SKILL.md") {
-        return None;
-    }
-    skill_folders(path).pop()
-}
-
-const READ_VERBS: [&str; 10] = [
-    "cat",
-    "sed",
-    "head",
-    "tail",
-    "nl",
-    "bat",
-    "less",
-    "more",
-    "awk",
-    "Get-Content",
-];
-const WRITE_MARKS: [&str; 8] = [
-    "apply_patch",
-    "sed -i",
-    "tee ",
-    "rm ",
-    "mv ",
-    "cp ",
-    "<<",
-    "perl -i",
-];
-
-/// Skills whose `SKILL.md` a shell command reads, or none when the command
-/// may write one or reads it in a way that is not loading it (`ls`, `rg`).
-fn skills_read_by(command: &str) -> Vec<String> {
-    let reads = command
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
-        .any(|word| READ_VERBS.contains(&word));
-    if !reads || WRITE_MARKS.iter().any(|mark| command.contains(mark)) || redirects(command) {
-        return Vec::new();
-    }
-    skill_folders(command)
-}
-
-/// An output redirection (`>`, `>>`), but not `2>`, `&>`, `=>` or `->`.
-fn redirects(command: &str) -> bool {
-    let bytes = command.as_bytes();
-    bytes.iter().enumerate().any(|(index, &byte)| {
-        byte == b'>'
-            && !index
-                .checked_sub(1)
-                .is_some_and(|before| matches!(bytes[before], b'2' | b'&' | b'=' | b'-' | b'>'))
     })
 }
 
@@ -461,22 +437,26 @@ pub fn summarize(
     days: usize,
     today: i64,
     offset: &dyn Fn(i64) -> i64,
-    keep: &dyn Fn(&SkillRun) -> bool,
+    canonical: &dyn Fn(&SkillRun) -> Option<String>,
 ) -> SkillUsage {
     let first_day = today - days as i64 + 1;
     let mut tallies: BTreeMap<String, SkillTally> = BTreeMap::new();
+    let mut counted = HashSet::new();
     for run in runs {
         let day = (run.at + offset(run.at)).div_euclid(86_400) - first_day;
-        if day < 0 || day >= days as i64 || !keep(run) {
+        if day < 0 || day >= days as i64 {
             continue;
         }
-        let tally = tallies
-            .entry(run.name.to_lowercase())
-            .or_insert_with(|| SkillTally {
-                name: run.name.clone(),
-                total: 0,
-                daily: vec![0; days],
-            });
+        let Some(name) = canonical(run) else { continue };
+        let key = name.to_lowercase();
+        if !counted.insert((run.turn, key.clone())) {
+            continue;
+        }
+        let tally = tallies.entry(key).or_insert_with(|| SkillTally {
+            name,
+            total: 0,
+            daily: vec![0; days],
+        });
         tally.total += 1;
         tally.daily[day as usize] += 1;
     }
@@ -604,6 +584,7 @@ mod tests {
     #[test]
     fn summary_bins_local_days_and_sorts_by_runs() {
         let run = |at, name: &str| SkillRun {
+            turn: at as u64,
             at,
             name: name.into(),
             source: SkillSource::Tool,
@@ -615,12 +596,94 @@ mod tests {
             run(NOW, "a"),
             run(NOW - 40 * 86_400, "a"),
         ];
-        let usage = summarize(&runs, 30, today, &|_| 0, &|_| true);
+        let usage = summarize(&runs, 30, today, &|_| 0, &|run| Some(run.name.clone()));
         assert_eq!(usage.skills.len(), 2);
         assert_eq!(usage.skills[0].name, "b");
         assert_eq!(usage.skills[0].daily[29], 1);
         assert_eq!(usage.skills[0].daily[28], 1);
         assert_eq!(usage.skills[1].total, 1);
+    }
+
+    #[test]
+    fn configured_homes_are_scanned_once_and_aliases_count_once_per_transcript_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let codex = home.join("custom-codex");
+        let claude = home.join("custom-claude");
+        let sessions = codex.join("sessions");
+        let projects = claude.join("projects");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::create_dir_all(&projects).unwrap();
+        let roots = transcript_roots(home, |key| {
+            Some(
+                if key == "CODEX_HOME" { &codex } else { &claude }
+                    .as_os_str()
+                    .to_owned(),
+            )
+        });
+        let t = stamp(10);
+        let call = |name, args: Value| {
+            serde_json::json!({"timestamp": t, "type": "response_item", "payload": {"type": "function_call", "name": name, "arguments": args.to_string()}}).to_string()
+        };
+        let lookup = call(
+            "mcp__dirijor__get_skill",
+            serde_json::json!({"name": "release-checklist"}),
+        );
+        let read = call(
+            "exec_command",
+            serde_json::json!({"cmd": r#"Get-Content "C:\my skills\release\SKILL.md""#}),
+        );
+        let other = call(
+            "edit_document",
+            serde_json::json!({"cmd":"cat skills/irrelevant/SKILL.md"}),
+        );
+        let turn = serde_json::json!({"timestamp":t,"type":"turn_context"}).to_string();
+        let rollout = sessions.join("session.jsonl");
+        fs::write(&rollout, format!("{lookup}\n")).unwrap();
+        fs::write(projects.join("session.jsonl"), serde_json::json!({"timestamp":t,"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":r"C:\skills\release\SKILL.md"}}]}}).to_string() + "\n").unwrap();
+        let cache = home.join("cache/store.json");
+        let mut store = SkillUsageStore::with_paths(roots.clone(), cache.clone());
+        assert_eq!(store.refresh(NOW).len(), 2);
+        fs::write(
+            rollout,
+            format!("{lookup}\n{read}\n{other}\n{turn}\n{read}\n"),
+        )
+        .unwrap();
+        let runs = SkillUsageStore::with_paths(roots, cache).refresh(NOW);
+        assert_eq!(runs.len(), 4);
+        let usage = summarize(&runs, 30, NOW / 86_400, &|_| 0, &|run| {
+            Some(match run.name.as_str() {
+                "release" | "release-checklist" => "release-checklist".to_owned(),
+                other => panic!("unexpected skill {other}"),
+            })
+        });
+        assert_eq!(usage.skills.len(), 1);
+        assert_eq!(usage.skills[0].total, 3);
+        fs::create_dir_all(home.join(".codex/sessions")).unwrap();
+        let roots = transcript_roots(home, |key| {
+            (key == "CODEX_HOME").then(|| home.join(".codex/.").into_os_string())
+        });
+        assert_eq!(roots.len(), 3);
+    }
+
+    #[test]
+    fn shell_mentions_and_other_command_operands_are_ignored() {
+        assert!(skills_read_by("echo 'cat skills/release/SKILL.md'").is_empty());
+        assert_eq!(
+            skills_read_by("cat skills/a/SKILL.md && echo skills/b/SKILL.md"),
+            ["a"]
+        );
+        assert!(skills_read_by("cat skills/a/SKILL.md.bak").is_empty());
+        assert!(skills_read_by("rg cat skills/release/SKILL.md").is_empty());
+        assert!(skills_read_by("sed -i s/a/b/ skills/release/SKILL.md").is_empty());
+        assert!(
+            wrapped_literal(r#"text("await tools.exec_command({cmd:'cat skills/a/SKILL.md'})")"#)
+                .is_none()
+        );
+        assert_eq!(
+            wrapped_literal(r#"text(await tools.mcp__dirijor__get_skill({name:"scheduling"}))"#),
+            Some(("mcp__dirijor__get_skill", "scheduling".into()))
+        );
     }
 
     #[test]
