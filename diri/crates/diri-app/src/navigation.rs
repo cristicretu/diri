@@ -1404,7 +1404,13 @@ impl NavigationOverlay {
                 self.active_workspace.as_ref(),
                 store.selected_session(),
             );
-            (actions, store.ordered_sessions(), fingerprint)
+            // Folded projects hide rows from the sidebar, not from search.
+            let sessions = store
+                .sidebar_projection()
+                .switchable_sessions(store.selected_session_id())
+                .map(|session| session.as_ref().clone())
+                .collect();
+            (actions, sessions, fingerprint)
         }
     }
 

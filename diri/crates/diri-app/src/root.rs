@@ -9857,6 +9857,157 @@ mod tests {
         });
     }
 
+    /// A folded project hides its rows in the sidebar, not from ⌘K: typing
+    /// a session's name still finds it, and Enter shows it.
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn command_palette_finds_sessions_in_a_collapsed_project(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            commands::bind_keys(cx, &Default::default());
+        });
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let current = fixture.selected_session_id.clone().unwrap();
+        let target = fixture
+            .list
+            .sessions
+            .iter()
+            .find(|session| session.title.contains("signed"))
+            .unwrap()
+            .clone();
+        assert_ne!(current, target.id);
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(current.clone());
+            store
+                .toggle_project_collapsed(target.project_id.clone())
+                .unwrap();
+            assert!(
+                store
+                    .ordered_sessions()
+                    .iter()
+                    .all(|session| session.id != target.id),
+                "the fold hides the row from the sidebar"
+            );
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes(&commands::test_chords("cmd-k"));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("s i g n e d");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            assert_eq!(
+                root.window_store.read().unwrap().selected_session_id(),
+                Some(&target.id),
+                "enter selects the folded session"
+            );
+            assert_eq!(
+                root.terminal
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .observed_session_for_test()
+                    .as_ref(),
+                Some(&target.id),
+                "the terminal follows that session"
+            );
+        });
+    }
+
+    /// A note ⌘K finds by its body, whose Session sits in a folded project,
+    /// opens that Session on Enter, not only in the store.
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn command_palette_note_row_shows_its_session(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            commands::bind_keys(cx, &Default::default());
+        });
+        let notes_dir = tempfile::tempdir().unwrap();
+        let note_store =
+            Arc::new(diri_notes::store::NoteStore::open(notes_dir.path().join("notes")).unwrap());
+        let (_, doc) = diri_notes::markdown::parse("# Launch brief\n\nMind the zebra crossing.\n");
+        let (note_id, _) = note_store.create(doc, None).unwrap();
+        let services = test_services();
+        let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let current = fixture.selected_session_id.clone().unwrap();
+        let mut note = fixture.list.sessions[0].clone();
+        note.id = SessionId::new("s_note_brief");
+        note.kind = AgentKind::NOTE;
+        note.title = "Launch brief".into();
+        note.note_id = Some(note_id);
+        note.parent = None;
+        note.archived_at = None;
+        // Fold a project the selected session is not in.
+        let current_project = fixture
+            .list
+            .sessions
+            .iter()
+            .find(|session| session.id == current)
+            .unwrap()
+            .project_id
+            .clone();
+        note.project_id = fixture
+            .list
+            .projects
+            .iter()
+            .find(|project| project.id != current_project)
+            .unwrap()
+            .id
+            .clone();
+        let folded = note.project_id.clone();
+        fixture.list.sessions.push(note);
+        let runtime = Arc::clone(&services.store);
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(current.clone());
+            store.toggle_project_collapsed(folded).unwrap();
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            let model = cx.new(|cx| {
+                crate::notes::todos::TodosModel::with_store(runtime, Some(note_store), false, cx)
+            });
+            crate::notes::todos::TodosModel::install(model, cx);
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes(&commands::test_chords("cmd-k"));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("z e b r a");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let target = SessionId::new("s_note_brief");
+        root.read_with(cx, |root, cx| {
+            assert_eq!(
+                root.window_store.read().unwrap().selected_session_id(),
+                Some(&target),
+                "enter selects the note's session"
+            );
+            // The pane tracks only agent grids; a shown note reads as none.
+            // Without the window's select it stays on the previous agent.
+            assert_eq!(
+                root.terminal
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .observed_session_for_test(),
+                None,
+                "the pane leaves the previous session for the note"
+            );
+        });
+    }
+
     #[gpui::test]
     fn palette_settings_clicks_reach_themes_and_full_settings(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
