@@ -31,22 +31,22 @@ use serde_json::Value;
 use super::{ComputerUse, Shared};
 
 /// The release Diri was tested with, and downloads: Diri's own build of Cua
-/// Driver, upstream main after the cua-driver-rs-v0.38.0 release plus the
-/// macOS 27 background-click fix (trycua/cua#5425), background element and
-/// keyboard actions on different apps in parallel, a proxy that answers
-/// tool calls as they finish, and the safety checks and commands ported from
-/// agent-desktop (token identity, actionability waits, retry disposition,
-/// set_state, wait, surfaces, close_app, window state, displays), and
-/// background typing, tapping and scrolling in iPhone Mirroring (real key
-/// codes after a real background tap, taps held long enough for the phone,
-/// pixel scrolls aimed by a press the scroll cancels).
+/// Driver, upstream main at the cua-driver 0.53.0 release with Diri's
+/// patches merged on top: background element and keyboard actions on
+/// different apps in parallel, a proxy that answers tool calls as they
+/// finish, the safety checks and commands ported from agent-desktop (token
+/// identity, actionability waits, retry disposition, set_state, wait,
+/// surfaces, close_app, window state, displays), and background typing,
+/// tapping and scrolling in iPhone Mirroring (real key codes after a real
+/// background tap, taps held long enough for the phone, pixel scrolls aimed
+/// by a press the scroll cancels).
 /// Source: github.com/cristicretu/cua, tag
-/// cua-driver-rs-v0.38.4-diri.
-pub const TESTED_VERSION: &str = "0.38.4";
+/// cua-driver-rs-v0.53.1-diri.
+pub const TESTED_VERSION: &str = "0.53.1";
 const ARCHIVE_URL: &str = "https://github.com/cristicretu/cua/releases/download/\
-     cua-driver-rs-v0.38.4-diri/cua-driver-rs-0.38.4-diri-darwin-universal-binary.tar.gz";
+     cua-driver-rs-v0.53.1-diri/cua-driver-rs-0.53.1-diri-darwin-universal-binary.tar.gz";
 /// From the release's SHA256SUMS.
-const ARCHIVE_SHA256: &str = "7e4ea7b4d27a60b600b7650a4f08478887741cb685f55c33bb1d313214a45520";
+const ARCHIVE_SHA256: &str = "5a249452d80cb6e5c7310eaac92298c11620a19abef8f5fb034602bbb7ec1eff";
 /// The Developer ID team that signs Diri's driver build. A binary signed by
 /// anyone else is not used.
 const DRIVER_TEAM_ID: &str = "A56RVNJ69X";
