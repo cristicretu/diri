@@ -599,14 +599,14 @@ impl FileRevision {
 }
 
 #[cfg(unix)]
-fn file_identity(metadata: &fs::Metadata) -> (Option<u64>, Option<u64>) {
+pub(super) fn file_identity(metadata: &fs::Metadata) -> (Option<u64>, Option<u64>) {
     use std::os::unix::fs::MetadataExt;
 
     (Some(metadata.dev()), Some(metadata.ino()))
 }
 
 #[cfg(not(unix))]
-fn file_identity(_: &fs::Metadata) -> (Option<u64>, Option<u64>) {
+pub(super) fn file_identity(_: &fs::Metadata) -> (Option<u64>, Option<u64>) {
     (None, None)
 }
 
@@ -639,7 +639,9 @@ fn provider_for_path(path: &Path, roots: &[(PathBuf, UsageProvider)]) -> Option<
         .find_map(|(root, provider)| path.starts_with(root).then_some(*provider))
 }
 
-fn transcript_files(roots: &[(PathBuf, UsageProvider)]) -> Vec<(PathBuf, UsageProvider)> {
+pub(super) fn transcript_files(
+    roots: &[(PathBuf, UsageProvider)],
+) -> Vec<(PathBuf, UsageProvider)> {
     let mut files = Vec::new();
     for (root, provider) in roots {
         walk(root, *provider, &mut files);

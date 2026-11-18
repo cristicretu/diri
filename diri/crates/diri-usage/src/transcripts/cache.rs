@@ -103,7 +103,7 @@ pub(crate) fn load(path: &Path) -> UsageCacheFile {
     }
 }
 
-pub(crate) fn save(path: &Path, cache: &UsageCacheFile) -> io::Result<()> {
+pub(crate) fn save<T: Serialize>(path: &Path, cache: &T) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
