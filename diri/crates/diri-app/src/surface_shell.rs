@@ -12597,7 +12597,11 @@ mod tests {
                 }
                 if tab == SettingsTab::Skills {
                     surfaces.skills.update(cx, |skills, _| {
-                        skills.seed_preview(std::env::var_os("DIRI_VISUAL_SKILL_DETAIL").is_some())
+                        if std::env::var_os("DIRI_VISUAL_SKILL_USAGE").is_some() {
+                            skills.seed_usage_preview();
+                        } else {
+                            skills.seed_preview(std::env::var_os("DIRI_VISUAL_SKILL_DETAIL").is_some());
+                        }
                     });
                 }
                 if tab == SettingsTab::Accounts {
