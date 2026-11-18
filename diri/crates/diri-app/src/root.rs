@@ -12776,7 +12776,7 @@ mod tests {
                 cx.update(|cx| {
                     editor.update(cx, |view, cx| {
                         view.editor.set_caret(Pos::new(posts, 0));
-                        view.guard_tick(posts, cx);
+                        view.guard_tick(posts, crate::notes::work_item::TickOrigin::Keyboard, cx);
                     })
                 });
             }

@@ -32,6 +32,7 @@ use gpui::{
     actions, anchored, canvas, deferred, div, fill, point, prelude::*, px, size,
 };
 
+use super::work_item::TickOrigin;
 use crate::floating;
 
 #[path = "table_view.rs"]
@@ -2131,7 +2132,8 @@ impl NoteEditorView {
 
     fn toggle_todo(&mut self, _: &ToggleTodo, _: &mut Window, cx: &mut Context<Self>) {
         let head = self.editor.selection.head.block;
-        if self.editor.selection.is_collapsed() && self.guard_tick(head, cx) {
+        if self.editor.selection.is_collapsed() && self.guard_tick(head, TickOrigin::Keyboard, cx) {
+            self.autoscroll = true;
             return;
         }
         let id = self.editor.block(head).id;
@@ -2223,13 +2225,19 @@ impl NoteEditorView {
         let BlockKind::Todo { checked } = block.kind else {
             return;
         };
-        if self.guard_tick(index, cx) {
+        if self.guard_tick(index, TickOrigin::Checkbox, cx) {
             return;
         }
-        self.set_todo_checked(index, !checked, cx);
+        self.set_todo_checked(index, !checked, TickOrigin::Checkbox, cx);
     }
 
-    pub(super) fn set_todo_checked(&mut self, index: usize, checked: bool, cx: &mut Context<Self>) {
+    pub(super) fn set_todo_checked(
+        &mut self,
+        index: usize,
+        checked: bool,
+        origin: TickOrigin,
+        cx: &mut Context<Self>,
+    ) {
         let Some(block) = self.editor.blocks().get(index) else {
             return;
         };
@@ -2243,6 +2251,7 @@ impl NoteEditorView {
             self.ticked.push((id, Instant::now()));
         }
         self.edited(cx);
+        self.autoscroll = origin == TickOrigin::Keyboard;
     }
 
     // -----------------------------------------------------------------------
@@ -4218,6 +4227,7 @@ impl NoteEditorView {
                 let popping = self.ticked.iter().any(|(b, _)| *b == id);
                 let box_el = div()
                     .id(("todo-box", id))
+                    .debug_selector(move || format!("note-todo-{id}"))
                     .size(px(16.0))
                     .rounded(px(5.0))
                     .flex()

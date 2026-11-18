@@ -1840,3 +1840,45 @@ fn find_without_matches_leaves_the_caret(cx: &mut gpui::TestAppContext) {
         assert_eq!(view.editor.selection.head, diri_notes::edit::Pos::new(1, 0));
     });
 }
+
+/// Ticking a to-do with the mouse leaves the view where it is: the caret
+/// did not move, so the view must not jump back to it.
+#[gpui::test]
+fn ticking_a_todo_keeps_the_scroll_away_from_the_caret(cx: &mut gpui::TestAppContext) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Arc::new(NoteStore::open(dir.path().join("notes")).expect("store"));
+    let filler = "A paragraph that takes up a line.\n\n".repeat(120);
+    let (_, doc) = markdown::parse(&format!("- [ ] tick me\n\n{filler}Last\n"));
+    let (id, _) = store.create(doc, None).expect("create");
+    let (pane, cx) = pane(cx, store.clone());
+    let session = SessionId::new("s_note");
+    pane.update_in(cx, |pane, window, cx| pane.show(&session, &id, window, cx));
+    let editor = editor(&pane, cx);
+    // The caret at the end of the note scrolls the view to the bottom.
+    editor.update_in(cx, |view, _, cx| {
+        let last = view.editor.blocks().len() - 1;
+        view.editor.set_caret(diri_notes::edit::Pos::new(last, 0));
+        view.moved(cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    let scroll = editor.read_with(cx, |view, _| view.scroll_for_test());
+    assert!(scroll.offset().y < gpui::px(0.0), "the caret scrolled down");
+    // Scroll back to the top, then tick the to-do.
+    editor.update(cx, |view, cx| view.scroll_by_for_test(gpui::px(1.0e6), cx));
+    cx.run_until_parked();
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    assert_eq!(scroll.offset().y, gpui::px(0.0));
+    let todo = editor.read_with(cx, |view, _| view.editor.block(1).id);
+    let selector: &'static str = format!("note-todo-{todo}").leak();
+    let checkbox = cx.debug_bounds(selector).expect("the to-do is on screen");
+    cx.simulate_click(checkbox.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    let checked = editor.read_with(cx, |view, _| view.editor.block(1).kind);
+    assert_eq!(checked, diri_notes::doc::BlockKind::Todo { checked: true });
+    assert_eq!(scroll.offset().y, gpui::px(0.0), "the view stayed put");
+}
