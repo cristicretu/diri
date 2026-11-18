@@ -75,7 +75,15 @@ pub(crate) struct StartPanel {
     scroll: ScrollHandle,
 }
 
+/// Preserve how the to-do was targeted even if the confirmation uses a different input.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TickOrigin {
+    Checkbox,
+    Keyboard,
+}
+
 struct TickPanel {
+    origin: TickOrigin,
     block: BlockId,
     session: String,
     selected: usize,
@@ -322,7 +330,12 @@ impl NoteEditorView {
 
     /// Ticking a to-do whose agent is still running asks first. Returns
     /// whether the tick was intercepted.
-    pub(crate) fn guard_tick(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn guard_tick(
+        &mut self,
+        index: usize,
+        origin: TickOrigin,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let block = self.editor.block(index);
         if block.kind != (BlockKind::Todo { checked: false })
             || !self.work.state(block).is_running()
@@ -335,6 +348,7 @@ impl NoteEditorView {
         self.work.start = None;
         // Return keeps the agent running; stopping it is a deliberate pick.
         self.work.tick = Some(TickPanel {
+            origin,
             block: block.id,
             session,
             selected: 1,
@@ -355,7 +369,7 @@ impl NoteEditorView {
                     session: panel.session,
                 }));
             }
-            self.set_todo_checked(index, true, cx);
+            self.set_todo_checked(index, true, panel.origin, cx);
         }
         cx.notify();
     }

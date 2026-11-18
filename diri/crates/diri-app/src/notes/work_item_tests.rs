@@ -12,7 +12,7 @@ use diri_proto::{
 };
 
 use super::editor_view::EditorEvent;
-use super::work_item::WorkRequest;
+use super::work_item::{TickOrigin, WorkRequest};
 use super::*;
 use crate::store::StoreRuntime;
 
@@ -339,7 +339,7 @@ fn a_todo_becomes_tracked_work_inside_its_note(cx: &mut gpui::TestAppContext) {
     // Ticking while the agent runs asks first; Escape keeps it open.
     editor.update(cx, |view, cx| {
         view.editor.set_caret(diri_notes::edit::Pos::new(posts, 0));
-        assert!(view.guard_tick(posts, cx));
+        assert!(view.guard_tick(posts, TickOrigin::Keyboard, cx));
         assert!(view.work.tick_panel_open());
         assert!(view.work_panel_key(super::work_item::PanelKey::Escape, cx));
     });
@@ -359,7 +359,7 @@ fn a_todo_becomes_tracked_work_inside_its_note(cx: &mut gpui::TestAppContext) {
     });
     pane.update(cx, |pane, cx| pane.push_work(cx));
     assert_eq!(state(&editor, cx, posts), WorkState::Review(None));
-    let intercepted = editor.update(cx, |view, cx| view.guard_tick(posts, cx));
+    let intercepted = editor.update(cx, |view, cx| view.guard_tick(posts, TickOrigin::Keyboard, cx));
     assert!(!intercepted, "a finished agent does not need asking");
 }
 
@@ -523,4 +523,42 @@ fn closing_a_note_releases_its_editor(cx: &mut gpui::TestAppContext) {
     assert!(weak.upgrade().is_none(), "the editor was dropped");
     let text = std::fs::read_to_string(fixture.store.path_for(&fixture.id).unwrap()).unwrap();
     assert!(text.contains("typed before closing"), "{text}");
+}
+
+#[gpui::test]
+fn confirming_a_keyboard_tick_reveals_the_running_todo(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| cx.bind_keys(key_bindings()));
+    let filler = "A paragraph.\n\n".repeat(120);
+    let fixture = launch_loop(&format!(
+        "# Plan\n\n{filler}- [ ] Finish [@Claude](diri://session/s_posts)\n"
+    ));
+    set_session(&fixture, |s| s.status = SessionStatus::Working);
+    let (_pane, editor, cx) = open(cx, &fixture);
+    let index = todo_index(&editor, cx, "Finish");
+    editor.update_in(cx, |view, window, cx| {
+        window.focus(&view.focus_handle(cx), cx);
+        view.editor.set_caret(diri_notes::edit::Pos::new(index, 0));
+        view.moved(cx);
+    });
+    cx.simulate_keystrokes("cmd-enter");
+    assert!(editor.read_with(cx, |view, _| view.work.tick_panel_open()));
+    // Scroll away while deciding; confirming from the keyboard should
+    // bring the edited to-do back into view.
+    editor.update(cx, |view, cx| view.scroll_by_for_test(gpui::px(1e6), cx));
+    cx.run_until_parked();
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    let scroll = editor.read_with(cx, |view, _| view.scroll_for_test());
+    assert_eq!(scroll.offset().y, gpui::px(0.0));
+    cx.simulate_keystrokes("enter");
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    assert_eq!(
+        editor.read_with(cx, |view, _| view.editor.block(index).kind),
+        diri_notes::doc::BlockKind::Todo { checked: true }
+    );
+    assert!(
+        scroll.offset().y < gpui::px(0.0),
+        "keyboard confirmation should reveal the caret"
+    );
 }
