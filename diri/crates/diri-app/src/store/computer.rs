@@ -19,6 +19,9 @@ pub(super) struct ComputerSetupState {
     /// The person clicked Set up: once installed, guide them through the
     /// grants without another click.
     guide_after_install: bool,
+    /// App Skills agents learned, read once each time the section shows
+    /// and after a delete.
+    skills: Option<diri_proto::AppSkillsList>,
 }
 
 impl SessionStore {
@@ -28,6 +31,28 @@ impl SessionStore {
 
     pub fn computer_status_error(&self) -> Option<&str> {
         self.computer.error.as_deref()
+    }
+
+    pub fn app_skills(&self) -> Option<&diri_proto::AppSkillsList> {
+        self.computer.skills.as_ref()
+    }
+
+    /// Deletes one learned skill; the list is read again afterwards.
+    pub fn forget_app_skill(&mut self, app: String, skill: String) {
+        if let Some(list) = self.computer.skills.as_mut() {
+            for entry in &mut list.apps {
+                if entry.bundle_id == app {
+                    entry.skills.retain(|known| known.name != skill);
+                }
+            }
+            list.apps.retain(|entry| !entry.skills.is_empty());
+        }
+        self.emit(StoreEffect::ForgetAppSkill { app, skill });
+    }
+
+    #[cfg(test)]
+    pub fn seed_app_skills(&mut self, list: diri_proto::AppSkillsList) {
+        self.computer.skills = Some(list);
     }
 
     pub fn computer_busy(&self) -> bool {
@@ -136,6 +161,8 @@ pub(super) async fn watch(
     store: Arc<RwLock<SessionStore>>,
     change_tx: broadcast::Sender<()>,
 ) {
+    // Skills change only when an Agent saves one: one read per showing.
+    refresh_skills(&client, &store, &change_tx).await;
     loop {
         let status = client
             .computer_status(true)
@@ -166,6 +193,34 @@ pub(super) async fn watch(
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+async fn refresh_skills(
+    client: &DaemonClient,
+    store: &RwLock<SessionStore>,
+    change_tx: &broadcast::Sender<()>,
+) {
+    // An older Engine has no App Skills: the section stays hidden.
+    let Ok(list) = client.app_skills().await else {
+        return;
+    };
+    let mut locked = store.write().expect("session store lock poisoned");
+    if locked.computer.skills.as_ref() != Some(&list) {
+        locked.computer.skills = Some(list);
+        drop(locked);
+        let _ = change_tx.send(());
+    }
+}
+
+pub(super) async fn forget_skill(
+    app: String,
+    skill: String,
+    client: Arc<DaemonClient>,
+    store: Arc<RwLock<SessionStore>>,
+    change_tx: broadcast::Sender<()>,
+) {
+    let _ = client.forget_app_skill(&app, &skill).await;
+    refresh_skills(&client, &store, &change_tx).await;
 }
 
 pub(super) async fn setup(
@@ -294,5 +349,36 @@ mod tests {
             toast.actions[0].command,
             crate::toast::ToastCommand::OpenComputerSetup
         );
+    }
+
+    #[test]
+    fn deleting_a_learned_skill_hides_it_at_once_and_asks_the_engine() {
+        let (mut store, mut rx) = SessionStore::headless(Prefs::default());
+        let skill = |name: &str| diri_proto::AppSkillSummary {
+            name: name.into(),
+            ..Default::default()
+        };
+        store.seed_app_skills(diri_proto::AppSkillsList {
+            apps: vec![
+                diri_proto::AppSkillsApp {
+                    bundle_id: "a.b".into(),
+                    name: "A".into(),
+                    skills: vec![skill("one"), skill("two")],
+                },
+                diri_proto::AppSkillsApp {
+                    bundle_id: "c.d".into(),
+                    name: "C".into(),
+                    skills: vec![skill("three")],
+                },
+            ],
+        });
+        store.forget_app_skill("c.d".into(), "three".into());
+        let list = store.app_skills().unwrap();
+        assert_eq!(list.apps.len(), 1, "an app with no skills left goes");
+        assert_eq!(list.apps[0].skills.len(), 2);
+        assert!(effects(&mut rx).iter().any(|effect| matches!(
+            effect,
+            StoreEffect::ForgetAppSkill { app, skill } if app == "c.d" && skill == "three"
+        )));
     }
 }

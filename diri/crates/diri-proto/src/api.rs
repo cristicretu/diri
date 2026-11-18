@@ -607,6 +607,12 @@ mod catalog {
                 "Install or restart computer use."
             ),
             entry!(
+                Method::COMPUTER_SKILLS,
+                ComputerSkillsParams,
+                "Value",
+                "App Skills: list, learn, trace, save, run, forget, history, rollback."
+            ),
+            entry!(
                 Method::HOST_SYNC_PREFS,
                 HostSyncPrefsParams,
                 "PrefsSyncReport",
