@@ -692,6 +692,9 @@ pub struct Prefs {
     /// Interface language, persisted as `"system"` or a catalog tag such as
     /// `"en"`, `"zh-Hans"` or `"es"`.
     pub ui_language: UiLanguage,
+    // Older builds saved confirmBeforeClosingSession=true even when untouched.
+    // A fresh key makes the warning opt-in for existing installations too.
+    #[serde(rename = "warnOnSessionClose")]
     pub confirm_before_closing_session: bool,
     /// Turn Diri's animations off even when macOS animates. Reduce Motion
     /// in System Settings turns them off as well; see `crate::motion`.
@@ -977,7 +980,7 @@ impl Default for Prefs {
             default_spawn_host: None,
             start_at_login: false,
             ui_language: UiLanguage::System,
-            confirm_before_closing_session: true,
+            confirm_before_closing_session: false,
             reduce_motion: false,
             phone_tailnet_identity: false,
             status_sounds: true,
