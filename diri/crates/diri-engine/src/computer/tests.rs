@@ -332,7 +332,8 @@ fn agents_share_one_driver_with_their_own_badges_and_apps() {
         BATCH_TOO_LONG
     );
     // Anything that would take the person's focus is refused before the
-    // driver sees it, nested batches and scripts included.
+    // driver sees it, nested batches and scripts included. The foreground
+    // rung is off until the person allows it.
     for (tool, args) in [
         (
             "click",
@@ -342,15 +343,7 @@ fn agents_share_one_driver_with_their_own_badges_and_apps() {
         ("bring_to_front", json!({"pid": 4242, "window_id": 1})),
         (
             "run_steps",
-            json!({"steps": [{"tool": "press_key", "args": {"pid": 4242, "key": "a", "delivery_mode": "foreground"}}]}),
-        ),
-        (
-            "run_steps",
             json!({"steps": [{"bring_to_front": {"pid": 4242}}]}),
-        ),
-        (
-            "run_steps",
-            json!({"delivery_mode": "foreground", "steps": [{"click": {"pid": 4242}}]}),
         ),
     ] {
         let refused = computer.act(&codex, tool, args.clone(), &live).unwrap_err();
@@ -358,7 +351,6 @@ fn agents_share_one_driver_with_their_own_badges_and_apps() {
             refused.code, FOREGROUND_DENIED,
             "{tool} {args}: {refused:?}"
         );
-        assert!(refused.message.contains("background only"));
     }
     assert_eq!(
         computer
@@ -1071,16 +1063,104 @@ fn only_focus_taking_calls_are_refused() {
         ("activate_app", json!({"pid": 1})),
         ("move_cursor", json!({"x": 1, "y": 1, "scope": "desktop"})),
         ("drag", json!({"target": {"kind": "desktop"}})),
-        (
-            "set_window_state",
-            json!({"pid": 1, "window_id": 2, "action": "zoom", "delivery_mode": "foreground"}),
-        ),
     ] {
         assert!(
             takes_focus(tool, &map(args.clone())).is_some(),
             "{tool} {args}"
         );
     }
+    // The brief foreground rung gives focus back: it is gated by the
+    // person's setting, not refused outright.
+    for (tool, args) in [
+        (
+            "set_window_state",
+            json!({"pid": 1, "window_id": 2, "action": "zoom", "delivery_mode": "foreground"}),
+        ),
+        (
+            "run_steps",
+            json!({"steps": [{"tool": "hotkey", "args": {"pid": 1, "window_id": 2, "keys": ["cmd", "shift", "g"], "delivery_mode": "foreground"}}]}),
+        ),
+    ] {
+        assert_eq!(takes_focus(tool, &map(args.clone())), None, "{tool} {args}");
+        assert!(uses_foreground(tool, &map(args.clone())), "{tool} {args}");
+    }
+    assert!(!uses_foreground(
+        "click",
+        &map(json!({"pid": 1, "delivery_mode": "background"}))
+    ));
+    assert!(!uses_foreground(
+        "get_window_state",
+        &map(json!({"pid": 1, "window_id": 2, "delivery_mode": "foreground"}))
+    ));
+}
+
+#[test]
+fn foreground_follows_the_setting_and_each_sessions_answer() {
+    let mut foreground = Foreground::default();
+    let open = |_: &str| Some("1:0".to_owned());
+    // Off by default: refused, pointing at the setting.
+    match foreground.gate("a", "1:0") {
+        Gate::Refuse(reason) => assert!(reason.contains("Foreground actions"), "{reason}"),
+        gate => panic!("{gate:?}"),
+    }
+    assert!(foreground.allowed().is_empty());
+
+    // Always: allowed, and recorded so the app can mark and revoke it.
+    foreground.configure(ComputerForeground::Always);
+    assert_eq!(foreground.gate("a", "1:0"), Gate::Allow);
+    assert_eq!(foreground.allowed(), ["a"]);
+    // A revoked session is refused for the rest of its life.
+    foreground.revoke(Some("a"), &open);
+    assert!(matches!(foreground.gate("a", "1:0"), Gate::Refuse(_)));
+    assert!(foreground.allowed().is_empty());
+    assert_eq!(foreground.gate("b", "1:0"), Gate::Allow);
+
+    // Stricter: Ask takes back what Always gave, keeps refusals.
+    foreground.configure(ComputerForeground::Ask);
+    assert!(matches!(foreground.gate("a", "1:0"), Gate::Refuse(_)));
+    assert_eq!(foreground.gate("b", "1:0"), Gate::Ask);
+    // Only an open question can be answered.
+    assert!(!foreground.answer("b", true));
+    foreground.asking.insert("b".into(), "1:0".into());
+    foreground.asking.insert("c".into(), "1:0".into());
+    // Saving the same setting again leaves open questions open.
+    foreground.configure(ComputerForeground::Ask);
+    assert_eq!(foreground.asking.len(), 2);
+    assert!(foreground.answer("b", true));
+    assert!(!foreground.answer("b", false), "answered once");
+    assert!(foreground.answer("c", false));
+    assert_eq!(foreground.gate("b", "1:0"), Gate::Allow);
+    assert!(matches!(foreground.gate("c", "1:0"), Gate::Refuse(_)));
+    // Another session is asked on its own.
+    assert_eq!(foreground.gate("d", "1:0"), Gate::Ask);
+
+    // A grant lasts as long as its session...
+    foreground.prune(&|id: &str| (id != "b").then(|| "1:0".to_owned()));
+    assert_eq!(foreground.gate("b", "1:0"), Gate::Ask);
+    // ...and as long as the Agent it was given to: a new life, after the
+    // Agent quit to its shell or the session was resumed, starts fresh,
+    // refusals included.
+    foreground.asking.insert("b".into(), "1:0".into());
+    assert!(foreground.answer("b", true));
+    let next = |_: &str| Some("1:1".to_owned());
+    foreground.prune(&next);
+    assert!(foreground.allowed().is_empty());
+    assert_eq!(foreground.gate("b", "1:1"), Gate::Ask);
+    assert_eq!(foreground.gate("c", "1:1"), Gate::Ask);
+
+    // Revoke all ends every grant and every open question.
+    foreground.asking.insert("b".into(), "1:1".into());
+    assert!(foreground.answer("b", true));
+    foreground.asking.insert("e".into(), "1:1".into());
+    foreground.revoke(None, &next);
+    assert!(matches!(foreground.gate("b", "1:1"), Gate::Refuse(_)));
+    assert!(matches!(foreground.gate("e", "1:1"), Gate::Refuse(_)));
+    assert!(foreground.asking.is_empty());
+
+    // Off forgets everything: turning it on again starts fresh.
+    foreground.configure(ComputerForeground::Off);
+    foreground.configure(ComputerForeground::Ask);
+    assert_eq!(foreground.gate("b", "1:1"), Gate::Ask);
 }
 
 #[test]
@@ -1144,6 +1224,171 @@ fn pointer_actions_wait_for_a_typing_pause() {
 #[test]
 fn the_keyboard_idle_time_is_readable_without_a_grant() {
     assert!(keyboard_idle().is_some());
+}
+
+#[test]
+fn a_foreground_action_waits_for_the_persons_answer() {
+    let temp = tempfile::tempdir().unwrap();
+    let computer = ComputerUse::with_binary(Some(fake_driver(temp.path())));
+    let events = crate::events::EventBus::new();
+    let stream = events.subscribe(
+        None,
+        crate::events::Filter::new(
+            None,
+            Some(vec![
+                diri_proto::EventName::COMPUTER_FOREGROUND_REQUESTED.to_owned(),
+                diri_proto::EventName::COMPUTER_FOREGROUND_CHANGED.to_owned(),
+            ]),
+        ),
+    );
+    computer.set_events(events);
+    // Each session's current Agent life; absent once it closes.
+    let lives = Arc::new(Mutex::new(HashMap::<String, String>::from_iter(
+        ["a", "b", "c", "d"].map(|id| (id.to_owned(), "1:0".to_owned())),
+    )));
+    computer.set_life({
+        let lives = Arc::clone(&lives);
+        Box::new(move |id: &str| lives.lock().unwrap().get(id).cloned())
+    });
+    let live = |_: &str| true;
+    let click = json!({"pid": 4242, "window_id": 1, "x": 5, "y": 5, "delivery_mode": "foreground"});
+
+    // Off: refused before the driver sees it, pointing at the setting.
+    let refused = computer
+        .act(&caller("a", "Codex · mail"), "click", click.clone(), &live)
+        .unwrap_err();
+    assert_eq!(refused.code, FOREGROUND_DENIED);
+    assert!(
+        refused.message.contains("Foreground actions"),
+        "{}",
+        refused.message
+    );
+
+    // Ask: the call waits; the person allows; the driver gets the rung.
+    computer.configure_foreground(ComputerForeground::Ask);
+    let acting = {
+        let computer = computer.clone();
+        let click = click.clone();
+        std::thread::spawn(move || {
+            computer.act(&caller("a", "Codex · mail"), "click", click, &|_: &str| {
+                true
+            })
+        })
+    };
+    let asked = stream
+        .recv(Duration::from_secs(10))
+        .expect("a foreground request");
+    assert_eq!(
+        asked.name,
+        diri_proto::EventName::COMPUTER_FOREGROUND_REQUESTED
+    );
+    assert!(computer.answer_foreground("a", true));
+    let done = acting.join().unwrap().unwrap();
+    let echo = &done["mcpToolResult"]["structuredContent"]["echo"];
+    assert_eq!(echo["params"]["arguments"]["delivery_mode"], "foreground");
+    let changed = stream.recv(Duration::from_secs(10)).expect("grant change");
+    assert_eq!(
+        changed.name,
+        diri_proto::EventName::COMPUTER_FOREGROUND_CHANGED
+    );
+    assert_eq!(computer.foreground_sessions(), ["a"]);
+    // Allowed for the rest of the session: no second question.
+    computer
+        .act(&caller("a", "Codex · mail"), "click", click.clone(), &live)
+        .unwrap();
+    // Persistent focus stays refused whatever the setting.
+    computer.configure_foreground(ComputerForeground::Always);
+    let kept = computer
+        .act(
+            &caller("a", "Codex · mail"),
+            "bring_to_front",
+            json!({"pid": 4242, "window_id": 1}),
+            &live,
+        )
+        .unwrap_err();
+    assert_eq!(kept.code, FOREGROUND_DENIED);
+    assert!(kept.message.contains("never"), "{}", kept.message);
+
+    // Nobody answers: refused once the wait runs out.
+    computer.configure_foreground(ComputerForeground::Ask);
+    computer.set_foreground_ask_timeout(Duration::from_millis(50));
+    let unanswered = computer
+        .act(
+            &caller("b", "Claude · upload"),
+            "click",
+            click.clone(),
+            &live,
+        )
+        .unwrap_err();
+    assert_eq!(unanswered.code, FOREGROUND_DENIED);
+    assert!(
+        unanswered.message.contains("did not answer"),
+        "{}",
+        unanswered.message
+    );
+    assert!(
+        !computer.answer_foreground("b", true),
+        "a late answer is dropped"
+    );
+
+    // An ended session's grant goes with it.
+    computer.configure_foreground(ComputerForeground::Always);
+    computer
+        .act(
+            &caller("c", "Claude · upload"),
+            "click",
+            json!({"pid": 5151, "window_id": 1, "x": 5, "y": 5, "delivery_mode": "foreground"}),
+            &live,
+        )
+        .unwrap();
+    computer
+        .act(&caller("a", "Codex · mail"), "click", click.clone(), &live)
+        .unwrap();
+    assert_eq!(computer.foreground_sessions(), ["a", "c"]);
+    // The Agent quits to its shell: its grant goes with it.
+    lives.lock().unwrap().insert("c".into(), "1:1".into());
+    assert_eq!(computer.foreground_sessions(), ["a"]);
+    // The session closes: its grant goes too.
+    lives.lock().unwrap().remove("a");
+    assert!(computer.foreground_sessions().is_empty());
+
+    // A tab closed while its Agent waits for the answer: refused at once,
+    // not asked again.
+    computer.configure_foreground(ComputerForeground::Ask);
+    computer.set_foreground_ask_timeout(Duration::from_secs(30));
+    let waiting = {
+        let computer = computer.clone();
+        let click = click.clone();
+        std::thread::spawn(move || {
+            computer.act(
+                &caller("d", "Claude · upload"),
+                "click",
+                click,
+                &|_: &str| true,
+            )
+        })
+    };
+    let asked = std::iter::from_fn(|| stream.recv(Duration::from_secs(10)))
+        .find(|event| {
+            event.name == diri_proto::EventName::COMPUTER_FOREGROUND_REQUESTED
+                && event.session_id.as_deref() == Some("d")
+        })
+        .expect("a request");
+    assert_eq!(asked.session_id.as_deref(), Some("d"));
+    let started = Instant::now();
+    lives.lock().unwrap().remove("d");
+    computer.forget_foreground("d");
+    let closed = waiting.join().unwrap().unwrap_err();
+    assert_eq!(closed.code, FOREGROUND_DENIED);
+    assert!(closed.message.contains("closed"), "{}", closed.message);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    while let Some(event) = stream.recv(Duration::from_millis(100)) {
+        assert_ne!(
+            event.name,
+            diri_proto::EventName::COMPUTER_FOREGROUND_REQUESTED,
+            "a closed session is not asked again"
+        );
+    }
 }
 
 #[test]

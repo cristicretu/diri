@@ -16,9 +16,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use diri_proto::ComputerForeground;
 use serde_json::{Map, Value, json};
 
 mod setup;
@@ -54,6 +55,9 @@ const MAX_RESULT_BYTES: usize = diri_proto::control::MAX_CONTROL_LINE_BYTES - 64
 /// through one queue, so one long batch of those would hold up every other
 /// Agent. Batches stay short enough to interleave.
 const MAX_BATCH_STEPS: usize = 20;
+/// How long a foreground action waits for the person to answer the Ask
+/// prompt before it is refused.
+const FOREGROUND_ASK_TIMEOUT: Duration = Duration::from_secs(60);
 /// Cua caps badge labels at 28 characters.
 const MAX_LABEL_CHARS: usize = 28;
 /// The driver binds a session name to the pipe that first used it and never
@@ -91,7 +95,9 @@ const HIDDEN_TOOLS: &[&str] = &[
     "run_script",
 ];
 
-/// Tools whose only job is to take the person's focus.
+/// Tools whose only job is to take the person's focus and keep it. Refused
+/// whatever the foreground setting: the setting covers only the brief
+/// foreground rung, which gives focus back.
 const FOCUS_TOOLS: &[&str] = &["bring_to_front", "activate_app"];
 
 /// Tools whose background route can still lend the target key focus for a
@@ -158,8 +164,9 @@ pub const APP_BUSY: &str = "computer_app_busy";
 pub const UNKNOWN_TOOL: &str = "computer_unknown_tool";
 /// A `run_steps` batch longer than other Agents should wait for.
 pub const BATCH_TOO_LONG: &str = "computer_batch_too_long";
-/// The call would take the person's focus, keyboard or pointer. Diri runs
-/// computer use in the background only.
+/// The call would take the person's focus, keyboard or pointer: persistent
+/// focus or desktop scope, which Diri never allows, or the brief foreground
+/// rung when the person has not allowed it for this session.
 pub const FOREGROUND_DENIED: &str = "computer_foreground_denied";
 /// The driver process failed, timed out, or answered out of protocol.
 pub const DRIVER_ERROR: &str = "computer_driver";
@@ -189,9 +196,28 @@ struct Shared {
     socket: PathBuf,
     download: Download,
     setup: Mutex<setup::SetupState>,
+    /// Who may use the foreground rung. Apart from `inner`: a call waiting
+    /// for the person's answer must not hold up the driver.
+    foreground: Mutex<Foreground>,
+    foreground_answered: Condvar,
+    /// Where foreground prompts and grant changes are published.
+    events: OnceLock<crate::events::EventBus>,
+    /// Which life of an open session is running now; see [`Life`].
+    life: OnceLock<Box<Life>>,
     /// Learned app tasks, under `root/app-skills`.
     skills: skills::AppSkills,
 }
+
+/// The current life of an open session: an opaque key that changes when its
+/// Agent process ends (exit then resume, or the Agent quitting back to its
+/// login shell), or `None` once the session is closed, archived or gone.
+/// Foreground grants are held per life, so they end with the Agent the person
+/// answered for. Looked up while the foreground lock is held: implementations
+/// may take the Registry lock, so no caller may hold the Registry while
+/// taking the foreground lock.
+pub type Life = dyn Fn(&str) -> Option<String> + Send + Sync;
+/// A [`Life`] lookup borrowed for one bookkeeping step.
+type LifeOf<'a> = &'a dyn Fn(&str) -> Option<String>;
 
 type Waiter = mpsc::Sender<Result<Value, String>>;
 
@@ -332,6 +358,153 @@ impl Sessions {
     }
 }
 
+/// A session's answer about the foreground rung, kept for its life.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Grant {
+    Allowed,
+    /// The person said no or revoked it: refused without asking again.
+    Denied,
+}
+
+/// What [`Foreground::gate`] decides for one foreground action.
+#[derive(Debug, PartialEq, Eq)]
+enum Gate {
+    Allow,
+    /// Ask the person and wait for the answer.
+    Ask,
+    Refuse(String),
+}
+
+/// The foreground setting and each session's grant. Pure bookkeeping, kept
+/// apart from the waiting so it can be tested directly.
+#[derive(Debug)]
+struct Foreground {
+    policy: ComputerForeground,
+    /// Each session's answer, with the life ([`Life`]) it was given for.
+    grants: HashMap<String, (Grant, String)>,
+    /// Sessions whose question is open, with the life that asked.
+    asking: HashMap<String, String>,
+    ask_timeout: Duration,
+}
+
+impl Default for Foreground {
+    fn default() -> Self {
+        Self {
+            policy: ComputerForeground::Off,
+            grants: HashMap::new(),
+            asking: Default::default(),
+            ask_timeout: FOREGROUND_ASK_TIMEOUT,
+        }
+    }
+}
+
+impl Foreground {
+    /// Decides for `session_id` in its current `life`. Answers given to an
+    /// earlier life must already be pruned.
+    fn gate(&mut self, session_id: &str, life: &str) -> Gate {
+        match (
+            self.policy,
+            self.grants.get(session_id).map(|(grant, _)| *grant),
+        ) {
+            (ComputerForeground::Off, _) => Gate::Refuse(FOREGROUND_OFF_MESSAGE.to_owned()),
+            (_, Some(Grant::Denied)) => Gate::Refuse(FOREGROUND_REFUSED_MESSAGE.to_owned()),
+            (_, Some(Grant::Allowed)) => Gate::Allow,
+            (ComputerForeground::Always, None) => {
+                // Recorded, so the app marks the session and it can be revoked.
+                self.grants
+                    .insert(session_id.to_owned(), (Grant::Allowed, life.to_owned()));
+                Gate::Allow
+            }
+            (ComputerForeground::Ask, None) => Gate::Ask,
+        }
+    }
+
+    /// A stricter setting takes back what the looser one gave; Off forgets
+    /// every answer, so turning it on again starts fresh. Re-saving the same
+    /// setting changes nothing. Open questions close when the setting moves:
+    /// their callers re-check the new one.
+    fn configure(&mut self, policy: ComputerForeground) {
+        if policy == self.policy {
+            return;
+        }
+        if policy == ComputerForeground::Off {
+            self.grants.clear();
+        } else if policy.rank() < self.policy.rank() {
+            self.grants.retain(|_, (grant, _)| *grant == Grant::Denied);
+        }
+        self.policy = policy;
+        self.asking.clear();
+    }
+
+    /// The person's answer to an open question. False when nothing was
+    /// asked (answered twice, or the caller gave up waiting).
+    fn answer(&mut self, session_id: &str, allow: bool) -> bool {
+        let Some(life) = self.asking.remove(session_id) else {
+            return false;
+        };
+        let grant = if allow { Grant::Allowed } else { Grant::Denied };
+        self.grants.insert(session_id.to_owned(), (grant, life));
+        true
+    }
+
+    /// Takes foreground back from one session, or from every session that
+    /// holds it. A revoked session is not asked again in this life.
+    fn revoke(&mut self, session_id: Option<&str>, life: LifeOf<'_>) {
+        match session_id {
+            Some(id) => {
+                let asked = self.asking.remove(id);
+                if let Some(life) = asked.or_else(|| life(id)) {
+                    self.grants.insert(id.to_owned(), (Grant::Denied, life));
+                }
+            }
+            None => {
+                for (grant, _) in self.grants.values_mut() {
+                    *grant = Grant::Denied;
+                }
+                for (id, life) in self.asking.drain() {
+                    self.grants.insert(id, (Grant::Denied, life));
+                }
+            }
+        }
+    }
+
+    /// Drops answers and questions of sessions that closed, or whose Agent
+    /// ended since.
+    fn prune(&mut self, life: LifeOf<'_>) {
+        self.grants
+            .retain(|id, (_, given)| life(id).as_deref() == Some(given.as_str()));
+        self.asking
+            .retain(|id, asked| life(id).as_deref() == Some(asked.as_str()));
+    }
+
+    /// The sessions that may use the foreground rung now.
+    fn allowed(&self) -> Vec<String> {
+        if self.policy == ComputerForeground::Off {
+            return Vec::new();
+        }
+        let mut ids: Vec<String> = self
+            .grants
+            .iter()
+            .filter(|(_, (grant, _))| *grant == Grant::Allowed)
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+}
+
+const FOREGROUND_OFF_MESSAGE: &str = "delivery_mode \"foreground\" briefly takes the person's \
+     focus, and foreground actions are off. Use the background route: an element_token from \
+     get_window_state, or pixel x,y with pid and window_id. If it can't reach the control (a \
+     file picker, a system dialog, a sheet), stop and tell the person: they can do that step \
+     themselves, or allow foreground actions in Diri Settings › Agents › Computer use › \
+     Foreground actions and ask you to retry.";
+const FOREGROUND_ENDED_MESSAGE: &str = "This session was closed or its Agent ended while \
+     waiting to be allowed foreground actions.";
+const FOREGROUND_REFUSED_MESSAGE: &str = "The person did not allow foreground actions for this \
+     session (they said no or revoked it). Use the background route, or stop and tell the person \
+     what you need them to do.";
+
 impl ComputerUse {
     pub fn new() -> Self {
         let home = diri_platform::home_dir().unwrap_or_else(std::env::temp_dir);
@@ -373,6 +546,10 @@ impl ComputerUse {
                 socket,
                 download,
                 setup: Mutex::new(setup::SetupState::default()),
+                foreground: Mutex::new(Foreground::default()),
+                foreground_answered: Condvar::new(),
+                events: OnceLock::new(),
+                life: OnceLock::new(),
                 skills: skills::AppSkills::new(root.join("app-skills")),
             }),
         }
@@ -525,6 +702,11 @@ impl ComputerUse {
             ));
         }
 
+        let foreground = uses_foreground(tool, &args);
+        if foreground {
+            self.admit_foreground(caller)?;
+        }
+
         let pids = mentioned_pids(&Value::Object(args.clone()));
         let (label, start) = {
             let mut inner = self.lock();
@@ -543,7 +725,9 @@ impl ComputerUse {
             None => self.start_driver_session(caller.session_id, &label),
         };
         bound_screenshot(tool, &mut args);
-        if !READ_ONLY_TOOLS.contains(&tool) && moves_pointer(tool, &args) {
+        // The foreground rung fronts the target for a moment: a keystroke
+        // the person types then would land there too.
+        if !READ_ONLY_TOOLS.contains(&tool) && (foreground || moves_pointer(tool, &args)) {
             wait_for_typing_pause(keyboard_idle, std::thread::sleep);
         }
 
@@ -662,6 +846,183 @@ impl ComputerUse {
     /// Lets go of a session's badge and leases (its tab closed).
     pub fn forget_session(&self, session_id: &str) {
         self.lock().state.forget_session(session_id);
+    }
+
+    /// Forgets a session's foreground answer (its tab closed). A call still
+    /// waiting for the person's answer wakes and is refused.
+    pub fn forget_foreground(&self, session_id: &str) {
+        self.change_foreground(|foreground, _| {
+            foreground.grants.remove(session_id);
+            foreground.asking.remove(session_id);
+        });
+    }
+
+    /// How the Engine tells which life of a session is running. Set once;
+    /// without it (tests) every session is open and never ends.
+    pub fn set_life(&self, life: Box<Life>) {
+        let _ = self.shared.life.set(life);
+    }
+
+    fn life_of(&self, session_id: &str) -> Option<String> {
+        match self.shared.life.get() {
+            Some(life) => life(session_id),
+            None => Some(String::new()),
+        }
+    }
+
+    /// Where foreground prompts and grant changes are published. Set once.
+    pub fn set_events(&self, events: crate::events::EventBus) {
+        let _ = self.shared.events.set(events);
+    }
+
+    fn foreground(&self) -> std::sync::MutexGuard<'_, Foreground> {
+        self.shared
+            .foreground
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub fn foreground_policy(&self) -> ComputerForeground {
+        self.foreground().policy
+    }
+
+    /// `computer.configure`.
+    pub fn configure_foreground(&self, policy: ComputerForeground) {
+        self.change_foreground(|foreground, _| foreground.configure(policy));
+    }
+
+    /// `computer.foreground_answer`. False when no question was open.
+    pub fn answer_foreground(&self, session_id: &str, allow: bool) -> bool {
+        let mut answered = false;
+        self.change_foreground(|foreground, _| answered = foreground.answer(session_id, allow));
+        answered
+    }
+
+    /// `computer.foreground_revoke`.
+    pub fn revoke_foreground(&self, session_id: Option<&str>) {
+        self.change_foreground(|foreground, life| foreground.revoke(session_id, life));
+    }
+
+    /// The sessions that may use the foreground rung, after dropping
+    /// answers given to sessions or Agents that have ended.
+    pub fn foreground_sessions(&self) -> Vec<String> {
+        self.change_foreground(|foreground, life| foreground.prune(life));
+        self.foreground().allowed()
+    }
+
+    /// Applies `change`, wakes callers waiting for an answer, and tells the
+    /// app when the set of allowed sessions moved.
+    fn change_foreground(&self, change: impl FnOnce(&mut Foreground, LifeOf<'_>)) {
+        let life = |id: &str| self.life_of(id);
+        let (before, after) = {
+            let mut foreground = self.foreground();
+            let before = foreground.allowed();
+            change(&mut foreground, &life);
+            (before, foreground.allowed())
+        };
+        self.shared.foreground_answered.notify_all();
+        if before != after {
+            self.publish_foreground(after);
+        }
+    }
+
+    fn publish_foreground(&self, sessions: Vec<String>) {
+        if let Some(events) = self.shared.events.get() {
+            events.publish_encoded(
+                diri_proto::EventName::COMPUTER_FOREGROUND_CHANGED,
+                &diri_proto::ComputerForegroundChangedEvent {
+                    sessions: sessions.into_iter().map(diri_proto::SessionId).collect(),
+                },
+                None,
+            );
+        }
+    }
+
+    /// Lets one foreground action through, or says why not. Under Ask, the
+    /// session's first one waits for the person's answer. The wait ends
+    /// early, refused, when the session closes or its Agent ends.
+    fn admit_foreground(&self, caller: &Caller<'_>) -> Result<(), ComputerError> {
+        let id = caller.session_id;
+        let life_of = |id: &str| self.life_of(id);
+        let mut deadline = None;
+        let mut asked_in: Option<String> = None;
+        let mut foreground = self.foreground();
+        loop {
+            let before = foreground.allowed();
+            let open = foreground.asking.len();
+            foreground.prune(&life_of);
+            if foreground.asking.len() != open {
+                // Someone else's question closed with its Agent: wake it.
+                self.shared.foreground_answered.notify_all();
+            }
+            let life = life_of(id);
+            let gate = match &life {
+                None => Gate::Refuse(FOREGROUND_ENDED_MESSAGE.to_owned()),
+                // The question was asked for an Agent that has since ended.
+                Some(now) if asked_in.as_ref().is_some_and(|asked| asked != now) => {
+                    Gate::Refuse(FOREGROUND_ENDED_MESSAGE.to_owned())
+                }
+                Some(now) => foreground.gate(id, now),
+            };
+            let after = foreground.allowed();
+            match gate {
+                Gate::Allow | Gate::Refuse(_) => {
+                    drop(foreground);
+                    if before != after {
+                        self.publish_foreground(after);
+                    }
+                    return match gate {
+                        Gate::Refuse(reason) => Err(ComputerError::new(FOREGROUND_DENIED, reason)),
+                        _ => Ok(()),
+                    };
+                }
+                Gate::Ask => {}
+            }
+            let life = life.expect("a closed session is refused above");
+            asked_in = Some(life.clone());
+            let timeout = foreground.ask_timeout;
+            let deadline = *deadline.get_or_insert_with(|| Instant::now() + timeout);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            // Another call from this session may already have asked.
+            if !foreground.asking.contains_key(id) {
+                foreground.asking.insert(id.to_owned(), life);
+                if let Some(events) = self.shared.events.get() {
+                    events.publish_encoded(
+                        diri_proto::EventName::COMPUTER_FOREGROUND_REQUESTED,
+                        &diri_proto::ComputerForegroundRequestedEvent {
+                            session_id: diri_proto::SessionId(id.to_owned()),
+                            badge: caller.badge.to_owned(),
+                            timeout_ms: remaining.as_millis() as u64,
+                        },
+                        Some(id),
+                    );
+                }
+            }
+            let (guard, waited) = self
+                .shared
+                .foreground_answered
+                .wait_timeout_while(foreground, remaining, |foreground| {
+                    foreground.asking.contains_key(id)
+                })
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            foreground = guard;
+            if waited.timed_out() && foreground.asking.remove(id).is_some() {
+                return Err(ComputerError::new(
+                    FOREGROUND_DENIED,
+                    format!(
+                        "The person did not answer the request to allow foreground actions \
+                         within {}s. Tell them what you need and why, then retry once they \
+                         are back.",
+                        timeout.as_secs()
+                    ),
+                ));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn set_foreground_ask_timeout(&self, timeout: Duration) {
+        self.foreground().ask_timeout = timeout;
     }
 
     /// Closes the driver pipe and wakes every pending caller.
@@ -1044,17 +1405,15 @@ fn needs_permission(result: &Value) -> bool {
     .any(|needle| code == *needle || text.contains(needle))
 }
 
-/// Why a call would take the person's focus, keyboard or pointer, if it would:
-/// a foreground rung, desktop scope (the frontmost app, the real pointer),
-/// or a tool that fronts a window. `run_steps` nests actions, so every level
-/// is checked. Reads never take focus.
+/// Why a call would take the person's focus, keyboard or pointer and keep
+/// it, if it would: desktop scope (the frontmost app, the real pointer), or a
+/// tool that fronts a window and leaves it there. Refused whatever the
+/// foreground setting. `run_steps` nests actions, so every level is checked.
+/// Reads never take focus. The brief foreground rung is [`uses_foreground`].
 fn takes_focus(tool: &str, args: &Map<String, Value>) -> Option<String> {
     fn walk(value: &Value) -> Option<&'static str> {
         match value {
             Value::Object(map) => {
-                if map.get("delivery_mode").and_then(Value::as_str) == Some("foreground") {
-                    return Some("delivery_mode \"foreground\"");
-                }
                 if map.get("scope").and_then(Value::as_str) == Some("desktop")
                     || map.get("kind").and_then(Value::as_str) == Some("desktop")
                 {
@@ -1083,11 +1442,28 @@ fn takes_focus(tool: &str, args: &Map<String, Value>) -> Option<String> {
         .copied()
         .or_else(|| walk(&Value::Object(args.clone())))?;
     Some(format!(
-        "{what} would take the person's focus, keyboard or pointer, and Diri runs computer use \
-         in the background only. Use the background route: an element_token from \
-         get_window_state, or pixel x,y with pid and window_id. If the background route can't \
-         reach the control, stop and tell the person what you need them to do."
+        "{what} would take the person's focus, keyboard or pointer and keep it, which Diri never \
+         allows. Use the background route: an element_token from get_window_state, or pixel x,y \
+         with pid and window_id. If the background route can't reach the control, retry that one \
+         action with delivery_mode \"foreground\" (it gives focus back, and needs the person \
+         to allow foreground actions), or stop and tell the person what you need them to do."
     ))
+}
+
+/// Whether a call asks for the brief foreground rung anywhere, batches
+/// included: front the target, act, restore the prior app. Reads never do.
+fn uses_foreground(tool: &str, args: &Map<String, Value>) -> bool {
+    fn walk(value: &Value) -> bool {
+        match value {
+            Value::Object(map) => {
+                map.get("delivery_mode").and_then(Value::as_str) == Some("foreground")
+                    || map.values().any(walk)
+            }
+            Value::Array(items) => items.iter().any(walk),
+            _ => false,
+        }
+    }
+    !READ_ONLY_TOOLS.contains(&tool) && walk(&Value::Object(args.clone()))
 }
 
 /// Whether a call may take the pixel route that lends the target key focus

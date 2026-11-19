@@ -1882,6 +1882,13 @@ impl RootView {
         cx.notify();
     }
 
+    /// Closes the toast; a question it covered comes back with its timer.
+    fn dismiss_toast(&mut self, cx: &mut Context<Self>) {
+        self.toast.dismiss();
+        let rearm = self.toast.take_rearm();
+        self.arm_toast_timer(rearm, cx);
+    }
+
     fn arm_toast_timer(&mut self, timer: Option<crate::toast::ToastTimer>, cx: &mut Context<Self>) {
         let Some(timer) = timer else {
             return;
@@ -1890,6 +1897,9 @@ impl RootView {
             cx.background_executor().timer(timer.after).await;
             let _ = this.update(cx, |this, cx| {
                 if this.toast.expire(timer.token) {
+                    // A question it covered comes back.
+                    let rearm = this.toast.take_rearm();
+                    this.arm_toast_timer(rearm, cx);
                     cx.notify();
                 }
             });
@@ -1905,7 +1915,7 @@ impl RootView {
     ) {
         match command {
             ToastCommand::OpenPrivacySettings => {
-                self.toast.dismiss();
+                self.dismiss_toast(cx);
                 if let Some(surfaces) = &self.utility_surfaces {
                     surfaces.update(cx, |surfaces, cx| {
                         surfaces.open_settings(cx);
@@ -1915,7 +1925,7 @@ impl RootView {
                 }
             }
             ToastCommand::OpenComputerSetup => {
-                self.toast.dismiss();
+                self.dismiss_toast(cx);
                 if let Some(surfaces) = &self.utility_surfaces {
                     surfaces.update(cx, |surfaces, cx| {
                         surfaces.open_settings(cx);
@@ -1940,11 +1950,18 @@ impl RootView {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(detail));
             }
             ToastCommand::UndoTerminalImport => {
-                self.toast.dismiss();
+                self.dismiss_toast(cx);
                 self.undo_terminal_import(cx);
             }
+            ToastCommand::AnswerComputerForeground { session_id, allow } => {
+                self.dismiss_toast(cx);
+                self.window_store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .answer_computer_foreground(session_id, allow);
+            }
             ToastCommand::DismissBoldHint => {
-                self.toast.dismiss();
+                self.dismiss_toast(cx);
                 let result = self
                     .window_store
                     .write()
@@ -5819,7 +5836,7 @@ impl RootView {
                     on_action: action(cx),
                     on_dismiss: Box::new(move |_, cx| {
                         let _ = view.update(cx, |this, cx| {
-                            this.toast.dismiss();
+                            this.dismiss_toast(cx);
                             cx.notify();
                         });
                     }),
@@ -12051,6 +12068,100 @@ mod tests {
                         for action in actions {
                             root.show_agent_notice(
                                 crate::agent_notice::notice(&actor, *action),
+                                cx,
+                            );
+                        }
+                        root
+                    })
+                })
+                .unwrap();
+            cx.run_until_parked();
+            cx.capture_screenshot(window.into())
+                .unwrap()
+                .save(dir.join(format!("{state}-{theme}.png")))
+                .unwrap();
+            cx.update_window(window.into(), |_, window, _| window.remove_window())
+                .unwrap();
+            cx.run_until_parked();
+        }
+    }
+
+    /// An Agent asks to bring a window forward (Ask), and the sidebar marks
+    /// the sessions that already may. `-plain` is the same window with no
+    /// foreground grant and no prompt.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes visual previews to DIRI_COMPUTER_FOREGROUND_SCREENSHOTS"]
+    fn render_computer_foreground_screenshots() {
+        use gpui::HeadlessAppContext;
+        let dir = std::path::PathBuf::from(
+            std::env::var("DIRI_COMPUTER_FOREGROUND_SCREENSHOTS").expect("output dir"),
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        for (state, theme) in [("plain", "dark"), ("asking", "dark"), ("asking", "light")] {
+            let platform = gpui_platform::current_platform(true);
+            let mut cx = HeadlessAppContext::with_platform(
+                platform.text_system(),
+                Arc::new(diri_ui::IconAssets),
+                gpui_platform::current_headless_renderer,
+            );
+            cx.update(|cx| {
+                crate::fonts::init(cx);
+                cx.set_reduce_motion(true);
+            });
+            let services = test_services();
+            let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+            let selected = fixture.selected_session_id.clone().unwrap();
+            let session = fixture
+                .list
+                .sessions
+                .iter_mut()
+                .find(|s| s.id == selected)
+                .unwrap();
+            session.kind = diri_proto::AgentKind::CODEX;
+            session.host = None;
+            session.title = "Send the invoices".into();
+            let granted: Vec<String> = fixture
+                .list
+                .sessions
+                .iter()
+                .filter(|s| s.id != selected && s.host.is_none() && !s.is_archived())
+                .take(1)
+                .map(|s| s.id.0.clone())
+                .collect();
+            {
+                let mut store = services.store.store.write().unwrap();
+                store.hydrate(fixture.list);
+                store.select(selected.clone());
+                store
+                    .update_preferences(|p| {
+                        p.terminal_theme = format!("dirijor-{theme}");
+                        p.sidebar_visible = true;
+                    })
+                    .unwrap();
+                if state == "asking" {
+                    store.handle_event(diri_client::EventEnvelope {
+                        name: diri_proto::EventName::COMPUTER_FOREGROUND_CHANGED.into(),
+                        params: serde_json::json!({ "sessions": granted }),
+                        seq: 1,
+                    });
+                }
+            }
+            let window = cx
+                .open_window(size(px(1000.0), px(650.0)), |window, cx| {
+                    cx.new(|cx| {
+                        let mut root =
+                            RootView::new(services.clone(), false, PreviewScenario::Empty, window, cx);
+                        root.preview = true;
+                        if state == "asking" {
+                            root.show_toast(
+                                crate::store::foreground_toast(
+                                    &diri_proto::ComputerForegroundRequestedEvent {
+                                        session_id: selected.clone(),
+                                        badge: "Codex · Send the invoices".into(),
+                                        timeout_ms: 60_000,
+                                    },
+                                ),
                                 cx,
                             );
                         }

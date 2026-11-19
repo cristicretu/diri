@@ -38,6 +38,7 @@
   "session.close.title_project": "¿Cerrar todas las sesiones de “{project}”?",
   "session.close.title_untitled": "¿Cerrar la sesión?",
   "session.close_session": "Cerrar sesión",
+  "session.foreground_revoke": "Puede traer ventanas al frente. Haz clic para revocarlo.",
   "session.hover.done_days": "Terminó hace {count} d",
   "session.hover.done_hours": "Terminó hace {count} h",
   "session.hover.done_minutes": "Terminó hace {count} min",

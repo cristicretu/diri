@@ -64,6 +64,8 @@ pub(in crate::sidebar) struct SessionRowProps {
     /// The tab's layout with each pane's state, when it is split.
     pub(super) split: Option<super::split_mark::SplitMark>,
     pub(super) marked: bool,
+    /// This session may bring windows forward for computer use.
+    pub(super) foreground: bool,
     pub(super) hovered: bool,
     pub(super) focused: bool,
     pub(super) lineage: Option<LineageRole>,
@@ -145,7 +147,17 @@ impl Sidebar {
     ) -> SessionRowProps {
         let session = &row.session;
         let id = &session.id;
-        let (selected, multi, drag_selection, migrating, activity_state, pane_group, unseen, split) = {
+        let (
+            selected,
+            multi,
+            drag_selection,
+            migrating,
+            activity_state,
+            pane_group,
+            unseen,
+            split,
+            foreground,
+        ) = {
             let mut store = self.store.write().expect("session store lock poisoned");
             (
                 // While the To-dos page covers the workbench, no row is the
@@ -161,6 +173,7 @@ impl Sidebar {
                     .then(|| store.notifications().latest_unread(id).cloned())
                     .flatten(),
                 super::split_mark::SplitMark::of(&store, id, colors),
+                store.computer_foreground_held(id),
             )
         };
         let (panes, shells) = pane_group.unwrap_or_default();
@@ -199,6 +212,7 @@ impl Sidebar {
             progress: crate::progress_mark::face(session, self.activity_frame, reduce_motion),
             split,
             marked: self.ui.delegation_mark.as_ref() == Some(id),
+            foreground,
             hovered: self.ui.hovered_session.as_ref() == Some(id),
             focused: self.focus_handle.is_focused(window)
                 && self.ui.renaming.is_none()

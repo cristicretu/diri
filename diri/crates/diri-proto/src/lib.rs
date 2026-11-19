@@ -15,8 +15,10 @@ pub use api_request::{
 };
 pub use computer::{
     AppSkillStatus, AppSkillSummary, AppSkillsApp, AppSkillsList, ComputerActParams,
-    ComputerSetupAction, ComputerSetupNeededEvent, ComputerSetupParams, ComputerSkillsParams,
-    ComputerStatus, ComputerStatusParams,
+    ComputerConfigureParams, ComputerForeground, ComputerForegroundAnswerParams,
+    ComputerForegroundChangedEvent, ComputerForegroundRequestedEvent,
+    ComputerForegroundRevokeParams, ComputerSetupAction, ComputerSetupNeededEvent,
+    ComputerSetupParams, ComputerSkillsParams, ComputerStatus, ComputerStatusParams,
 };
 pub mod control;
 pub mod find;

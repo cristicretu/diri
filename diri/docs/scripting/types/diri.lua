@@ -520,6 +520,12 @@ function diri.computer.status(params, opts) end
 ---@return table # ComputerStatus
 function diri.computer.setup(params, opts) end
 
+---Stop a session, or all, bringing windows forward.
+---@param params? {sessionID?: string}
+---@param opts? {timeout?: number}
+---@return table # ComputerStatus
+function diri.computer.foreground_revoke(params, opts) end
+
 ---App Skills: list, learn, trace, save, run, forget, history, rollback.
 ---@param params {sessionID?: string, action: string, args?: any}
 ---@param opts? {timeout?: number}

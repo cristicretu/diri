@@ -101,6 +101,15 @@ impl Method {
     pub const COMPUTER_STATUS: &'static str = "computer.status";
     /// Install it or restart it (`ComputerSetupParams`); answers a status.
     pub const COMPUTER_SETUP: &'static str = "computer.setup";
+    /// The person's computer use settings (`ComputerConfigureParams`),
+    /// kept by the Engine; answers a status.
+    pub const COMPUTER_CONFIGURE: &'static str = "computer.configure";
+    /// The person's answer to `computer.foreground_requested`
+    /// (`ComputerForegroundAnswerParams`).
+    pub const COMPUTER_FOREGROUND_ANSWER: &'static str = "computer.foreground_answer";
+    /// Take foreground back from a session or all
+    /// (`ComputerForegroundRevokeParams`).
+    pub const COMPUTER_FOREGROUND_REVOKE: &'static str = "computer.foreground_revoke";
     /// App Skills: learned, replayable app tasks (`ComputerSkillsParams`).
     pub const COMPUTER_SKILLS: &'static str = "computer.skills";
     pub const SESSION_MIGRATE: &'static str = "session.migrate";
@@ -240,6 +249,9 @@ impl Method {
         Self::COMPUTER_ACT,
         Self::COMPUTER_STATUS,
         Self::COMPUTER_SETUP,
+        Self::COMPUTER_CONFIGURE,
+        Self::COMPUTER_FOREGROUND_ANSWER,
+        Self::COMPUTER_FOREGROUND_REVOKE,
         Self::COMPUTER_SKILLS,
         Self::SESSION_MIGRATE,
         Self::SESSION_REPARENT_WORKTREE,
@@ -335,6 +347,12 @@ impl EventName {
     /// An Agent called `computer` before setup was finished
     /// (`ComputerSetupNeededEvent`). The app offers to finish it.
     pub const COMPUTER_SETUP_NEEDED: &'static str = "computer.setup_needed";
+    /// An Agent's first foreground action waits for the person
+    /// (`ComputerForegroundRequestedEvent`).
+    pub const COMPUTER_FOREGROUND_REQUESTED: &'static str = "computer.foreground_requested";
+    /// The sessions allowed the foreground rung changed
+    /// (`ComputerForegroundChangedEvent`).
+    pub const COMPUTER_FOREGROUND_CHANGED: &'static str = "computer.foreground_changed";
     /// An Agent changed what the window shows
     /// (`agent_action::AgentActionEvent`). The app names it in a notice.
     pub const AGENT_ACTION: &'static str = "agent.action";
