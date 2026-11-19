@@ -21,6 +21,7 @@ network a CLI attempts beyond the model API. Binds 127.0.0.1 only.
 """
 import json, re, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 PORT = int(sys.argv[1])
 LOG = open(sys.argv[2], "a", buffering=1)
@@ -118,6 +119,26 @@ class Handler(BaseHTTPRequestHandler):
         text = last_user(messages)
         tools = bool(body.get("tools"))
         LOG.write(f"POST {path} tools={tools} tool_result={tool_result} last_user={text[:80]!r}\n")
+        # The recovery test cuts only this private server's model connection.
+        # Close before sending any bytes, as when the connection disappears.
+        if path.endswith("/messages") and Path(LOG.name).with_suffix(".cut").exists():
+            LOG.write(f"CUT model request last_user={text[:80]!r}\n")
+            self.close_connection = True
+            return
+        # The delivery test holds one in-flight turn while the real TUI
+        # accepts more input. Count each marker in user content of each
+        # main-thread request; earlier turns reappear in later requests.
+        if path.endswith("/messages") and tools:
+            capture = Path(LOG.name).with_suffix(".delivery")
+            if capture.exists():
+                users = "\n".join(text_of(m.get("content")) for m in messages if m.get("role") == "user")
+                expected = json.loads(capture.with_suffix(".messages").read_text())
+                if expected["prompt"] in users:
+                    with capture.open("a") as out:
+                        print(json.dumps([users.count(text) for text in expected["followups"]]), file=out)
+                    deadline = time.monotonic() + 210
+                    while capture.with_suffix(".hold").exists() and time.monotonic() < deadline:
+                        time.sleep(0.05)
         call = tools and not tool_result and "RUNCMD" in text
         reply = "The command ran. DONECMD" if tool_result else reply_for(text, tools)
         time.sleep(0.3)

@@ -160,6 +160,142 @@ fn typed_input_reaches_the_child_and_the_session_moves_on() {
 }
 
 #[test]
+fn killing_the_agent_reports_its_status_and_keeps_the_same_shell_usable() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut launch = spec(
+        "s_killed_agent",
+        "",
+        temp.path(),
+        "claude-code",
+        Authority::HooksPrimary,
+    );
+    let agent = diri_engine::agent::AgentDescriptor {
+        binary: Some("/bin/sh".into()),
+        return_to_login_shell: true,
+        ..Default::default()
+    };
+    // The fixture kills only its own agent process on the test's cue.
+    launch.pty = agent
+        .spawn_spec(
+            temp.path(),
+            [
+                ("HOME".into(), temp.path().display().to_string()),
+                ("SHELL".into(), "/bin/sh".into()),
+            ],
+            &[
+                "-c".into(),
+                "printf 'agent-ready\\n'; read -r cue && kill -9 $$".into(),
+            ],
+        )
+        .unwrap();
+    let mut session = Session::spawn(launch, engine()).unwrap();
+    assert!(wait_until(Duration::from_secs(5), || session
+        .screen_lines()
+        .iter()
+        .any(|line| line.contains("agent-ready"))));
+    let shell_pid = session.child_pid();
+    session.write_input(b"go\r").unwrap();
+    assert!(wait_until(Duration::from_secs(5), || session.agent_exit() == Some(137)));
+    assert!(!session.view().exited);
+    assert_eq!(session.child_pid(), shell_pid);
+    // Echoing the command cannot produce the expanded marker.
+    session
+        .write_input(b"printf 'recovered-%s\\n' shell\r")
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(5), || session
+        .screen_lines()
+        .iter()
+        .any(|line| line.contains("recovered-shell"))));
+    session.terminate(Duration::from_secs(2)).unwrap();
+}
+
+#[test]
+fn a_model_connection_cut_preserves_the_agent_pty_and_its_pending_request() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    const UPSTREAM: &str = "DIRI_TEST_RECOVERY_SOCKET";
+    if let Some(socket) = std::env::var_os(UPSTREAM) {
+        // The child fixture owns retry, just as the model CLI does. Give
+        // it exactly one user submission through the real Engine PTY.
+        println!("Ready for a request");
+        let mut prompt = String::new();
+        std::io::stdin().read_line(&mut prompt).unwrap();
+        for status in ["Waiting for model", "Model connection lost, retrying"] {
+            let mut upstream = UnixStream::connect(&socket).unwrap();
+            upstream.write_all(prompt.as_bytes()).unwrap();
+            println!("{status}");
+            let mut reply = String::new();
+            if BufReader::new(upstream).read_line(&mut reply).unwrap() > 0 {
+                print!("Task completed: {reply}");
+                std::io::stdout().flush().unwrap();
+                std::io::stdin().read_line(&mut String::new()).unwrap();
+                return;
+            }
+        }
+        panic!("the private API did not recover");
+    }
+
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let socket = root.path().join("api.sock");
+    let upstream = UnixListener::bind(&socket).unwrap();
+    let mut launch = spec(
+        "s_model_retry",
+        "",
+        root.path(),
+        "shell",
+        Authority::ProcessOnly,
+    );
+    launch.pty = PtySpec::new(
+        vec![
+            std::env::current_exe()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            "--exact".into(),
+            "a_model_connection_cut_preserves_the_agent_pty_and_its_pending_request".into(),
+            "--nocapture".into(),
+        ],
+        root.path(),
+    )
+    .env(UPSTREAM, socket.to_str().unwrap());
+    let mut session = Session::spawn(launch, engine()).unwrap();
+    let pid = session.child_pid();
+    let wait_screen = |text: &str| {
+        assert!(
+            wait_until(Duration::from_secs(5), || session
+                .screen_lines()
+                .iter()
+                .any(|line| line.contains(text))),
+            "missing {text:?} in {:?}",
+            session.screen_lines()
+        );
+    };
+    let request = |status| {
+        // The fixture prints this marker only after connect and write.
+        wait_screen(status);
+        let (stream, _) = upstream.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+        assert_eq!(line, "summarize one turn\n");
+        stream
+    };
+    wait_screen("Ready for a request");
+    session.write_input(b"summarize one turn\r").unwrap();
+    drop(request("Waiting for model")); // connection loss before a reply
+    let mut retry = request("Model connection lost, retrying");
+    assert!(!session.view().exited);
+    retry.write_all(b"private response\n").unwrap();
+    wait_screen("Task completed: private response");
+    assert_eq!(session.child_pid(), pid);
+    session.terminate(Duration::from_secs(2)).unwrap();
+}
+
+#[test]
 fn a_child_that_exits_is_reported_with_its_code() {
     let temp = tempfile::tempdir().expect("temp");
     let session = Session::spawn(
