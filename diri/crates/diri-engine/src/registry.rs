@@ -3229,11 +3229,16 @@ fn can_reenter(engine: &ManifestEngine, record: &SessionRecord) -> bool {
         })
 }
 
-fn normalize_agent_title(title: &str) -> Option<String> {
+/// The part of an Agent's OSC title that can contribute to its record name.
+pub(crate) fn agent_title_line(title: &str) -> Option<&str> {
     let line = title.lines().map(str::trim).find(|line| !line.is_empty())?;
-    let line = line.trim_start_matches(|character: char| {
+    Some(line.trim_start_matches(|character: char| {
         character.is_whitespace() || (!character.is_alphanumeric() && character != '_')
-    });
+    }))
+}
+
+fn normalize_agent_title(title: &str) -> Option<String> {
+    let line = agent_title_line(title)?;
     let normalized = line
         .chars()
         .filter(|character| !character.is_control())
