@@ -8685,6 +8685,10 @@ mod tests {
             let mut store = runtime.store.write().unwrap();
             store.hydrate(fixture.list);
             store.select(selected.clone());
+            // Close warnings are opt-in (#1086).
+            store
+                .update_preferences(|prefs| prefs.confirm_before_closing_session = true)
+                .unwrap();
         }
         let (root, cx) = cx.add_window_view(move |window, cx| {
             RootView::new(services, false, PreviewScenario::Typical, window, cx)
@@ -8739,6 +8743,10 @@ mod tests {
             let mut store = runtime.store.write().unwrap();
             store.hydrate(fixture.list);
             store.select(selected.clone());
+            // Close warnings are opt-in (#1086).
+            store
+                .update_preferences(|prefs| prefs.confirm_before_closing_session = true)
+                .unwrap();
         }
         let (root, cx) = cx.add_window_view(move |window, cx| {
             RootView::new(services, false, PreviewScenario::Typical, window, cx)
