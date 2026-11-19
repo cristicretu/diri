@@ -108,9 +108,8 @@ impl DeferredDaemonStartup {
     /// Starts supervision away from GPUI's main thread, then releases the
     /// reconnecting client only after the live Engine is authoritative.
     ///
-    /// Call this after `open_main_window`: identity probes can consume two
-    /// one-second timeouts, upgrade shutdown can wait three seconds, and
-    /// hashing a universal bundled executable performs synchronous file I/O.
+    /// Call this after `open_main_window`: probes can wait for login PATH
+    /// capture, and checking a changed executable requires synchronous I/O.
     pub(super) fn after_window_open(&self, runtime: &Runtime, client: Arc<DaemonClient>) {
         let socket_path = self.socket_path.clone();
         self.start_after_window_open_with(runtime, client, move |cancelled| {
@@ -581,7 +580,7 @@ fn executable_sha256(path: &Path, _socket: &Path) -> io::Result<String> {
             meta.ctime(),
             meta.ctime_nsec()
         );
-        let cache = _socket.with_extension("engine-sha256");
+        let cache = _socket.with_added_extension("engine-sha256");
         let mut entry = String::new();
         if let Ok(saved) = diri_platform::security::read_owned(&cache, true)
             && saved.take(512).read_to_string(&mut entry).is_ok()
@@ -609,6 +608,7 @@ fn executable_sha256(path: &Path, _socket: &Path) -> io::Result<String> {
         .collect();
     #[cfg(unix)]
     if let Some(parent) = cache.0.parent()
+        && diri_platform::security::validate_directory(parent, 0o022).is_ok()
         && let Ok(mut tmp) = tempfile::NamedTempFile::new_in(parent)
         && write!(tmp, "{}{}", cache.1, hash).is_ok()
     {
@@ -1450,13 +1450,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let exe = temp.path().join("dirijord-rs");
         let replacement = temp.path().join("next");
-        let socket = temp.path().join("daemon.sock");
+        let socket = temp.path().join("fixture.engine-sha256");
+        std::fs::write(&socket, b"endpoint").unwrap();
         std::fs::write(&exe, b"old").unwrap();
         let first = executable_sha256(&exe, &socket).unwrap();
         assert_eq!(executable_sha256(&exe, &socket).unwrap(), first);
         std::fs::write(&replacement, b"new").unwrap();
         std::fs::rename(replacement, &exe).unwrap();
         assert_ne!(executable_sha256(&exe, &socket).unwrap(), first);
+        assert_eq!(std::fs::read(&socket).unwrap(), b"endpoint");
     }
 
     #[test]
