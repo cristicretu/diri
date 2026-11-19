@@ -363,7 +363,7 @@ impl PhoneDesktop {
     /// moves. Must run inside the app's Tokio runtime.
     pub fn start(runtime: Arc<crate::store::StoreRuntime>) -> Arc<Self> {
         let (changes, _) = tokio::sync::watch::channel(0_u64);
-        let mut store_changes = runtime.changes();
+        let mut store_changes = runtime.changes_without_memory();
         let sidebar = Arc::new(Self {
             cached: std::sync::Mutex::new(Arc::new(layout(&runtime))),
             runtime,

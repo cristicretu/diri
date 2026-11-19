@@ -2663,6 +2663,21 @@ fn compact_resource_events_patch_only_resource_fields() {
     assert_eq!(patched.title, original_title);
 }
 
+#[tokio::test]
+async fn a_memory_sample_wakes_only_views_that_display_it() {
+    let runtime = StoreRuntime::inert();
+    let mut pane = runtime.changes_without_memory();
+    let mut inspector = runtime.changes();
+    runtime.memory_tx.send(()).unwrap();
+    inspector.recv().await.unwrap();
+    assert_eq!(pane.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty));
+    runtime.publish_local_change();
+    pane.recv().await.unwrap();
+    inspector.recv().await.unwrap();
+    assert_eq!(StoreEventChange::MemoryOnly.merge(StoreEventChange::Resources), StoreEventChange::Resources);
+    assert_eq!(StoreEventChange::MemoryOnly.merge(StoreEventChange::Model), StoreEventChange::Model);
+}
+
 #[test]
 fn background_resource_samples_do_not_wake_views() {
     assert_eq!(

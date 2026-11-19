@@ -110,6 +110,7 @@ const AGENT_INSTALL_SCANS: u32 = 120;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StoreEventChange {
     None,
+    MemoryOnly,
     Resources,
     Model,
 }
@@ -150,6 +151,8 @@ impl StoreEventChange {
             Self::Model
         } else if self == Self::Resources || other == Self::Resources {
             Self::Resources
+        } else if self == Self::MemoryOnly || other == Self::MemoryOnly {
+            Self::MemoryOnly
         } else {
             Self::None
         }
@@ -2322,28 +2325,28 @@ impl SessionStore {
                     && let Some(existing) = self.sessions.get_mut(&resources.id)
                 {
                     let record = Arc::make_mut(existing);
-                    let mut changed = false;
+                    let mut change = StoreEventChange::None;
                     if let Some(memory) = resources.memory_bytes
                         && record.memory_bytes != Some(memory)
                     {
                         record.memory_bytes = Some(memory);
-                        changed = true;
+                        change = StoreEventChange::MemoryOnly;
                     }
                     if let Some(ports) = resources.listening_ports
                         && record.listening_ports.as_deref() != Some(ports.as_slice())
                     {
                         record.listening_ports = Some(ports);
-                        changed = true;
+                        change = StoreEventChange::Resources;
                     }
                     if let Some(artifacts) = resources.artifacts
                         && record.artifacts.as_deref() != Some(artifacts.as_slice())
                     {
                         record.artifacts = Some(artifacts);
-                        changed = true;
+                        change = StoreEventChange::Resources;
                     }
-                    if changed {
+                    if change != StoreEventChange::None {
                         self.invalidate_projection();
-                        return StoreEventChange::Resources;
+                        return change;
                     }
                 }
             }
@@ -4159,6 +4162,7 @@ pub struct StoreRuntime {
     client: Arc<DaemonClient>,
     detach_tx: broadcast::Sender<SessionId>,
     change_tx: broadcast::Sender<()>,
+    memory_tx: broadcast::Sender<()>,
     status_tx: broadcast::Sender<StatusTransition>,
     snapshot_tx: tokio::sync::watch::Sender<StoreSnapshot>,
     action_tx: mpsc::UnboundedSender<SendTextCommand>,
@@ -4172,6 +4176,21 @@ pub struct StoreRuntime {
 enum ClientStartup {
     Immediate,
     Deferred,
+}
+
+/// All view invalidations, including memory, port and artifact samples.
+pub struct StoreChanges {
+    model: broadcast::Receiver<()>,
+    memory: broadcast::Receiver<()>,
+}
+
+impl StoreChanges {
+    pub async fn recv(&mut self) -> Result<(), broadcast::error::RecvError> {
+        tokio::select! {
+            result = self.model.recv() => result,
+            result = self.memory.recv() => result,
+        }
+    }
 }
 
 impl StoreRuntime {
@@ -4213,6 +4232,7 @@ impl StoreRuntime {
         let store = Arc::new(RwLock::new(store));
         let (detach_tx, _) = broadcast::channel(1);
         let (change_tx, _) = broadcast::channel(1);
+        let (memory_tx, _) = broadcast::channel(1);
         let (status_tx, _) = broadcast::channel(1);
         let snapshot = store
             .read()
@@ -4226,6 +4246,7 @@ impl StoreRuntime {
             client: Arc::new(DaemonClient::new()),
             detach_tx,
             change_tx,
+            memory_tx,
             status_tx,
             snapshot_tx,
             action_tx,
@@ -4262,6 +4283,7 @@ impl StoreRuntime {
         let store = Arc::new(RwLock::new(store));
         let (detach_tx, _) = broadcast::channel(16);
         let (change_tx, _) = broadcast::channel(128);
+        let (memory_tx, _) = broadcast::channel(128);
         let (status_tx, _) = broadcast::channel(32);
         let initial_snapshot = store
             .read()
@@ -4274,6 +4296,7 @@ impl StoreRuntime {
         let (event_publish_tx, mut event_publish_rx) = mpsc::channel::<StoreEventChange>(128);
         let publish_store = Arc::clone(&store);
         let publish_changes = change_tx.clone();
+        let publish_memory = memory_tx.clone();
         let publish_snapshots = snapshot_tx.clone();
         tasks.push(tokio::spawn(async move {
             while let Some(mut change) = event_publish_rx.recv().await {
@@ -4284,19 +4307,21 @@ impl StoreRuntime {
                 while let Ok(next) = event_publish_rx.try_recv() {
                     change = change.merge(next);
                 }
-                let (active, snapshot) = {
+                let (snapshot, notify_views) = {
                     let store = publish_store.read().expect("session store lock poisoned");
-                    (store.app_is_active, store.snapshot())
+                    let (publish, notify) = event_publication_policy(change, store.app_is_active);
+                    (publish.then(|| store.snapshot()), notify)
                 };
-                // Full model changes still update the menu-bar snapshot while
-                // backgrounded. Resource samples are memory-only until the UI
-                // is active again, and neither wakes GPUI views in background.
-                let (publish_snapshot, notify_views) = event_publication_policy(change, active);
-                if publish_snapshot {
+                if let Some(snapshot) = snapshot {
                     publish_snapshots.send_replace(snapshot);
                 }
                 if notify_views {
-                    let _ = publish_changes.send(());
+                    let updates = if change == StoreEventChange::MemoryOnly {
+                        &publish_memory
+                    } else {
+                        &publish_changes
+                    };
+                    let _ = updates.send(());
                 }
             }
         }));
@@ -4323,7 +4348,7 @@ impl StoreRuntime {
                             .expect("session store lock poisoned")
                             .handle_event_change(event);
                         if changed != StoreEventChange::None {
-                            let _ = event_publish_tx.try_send(changed);
+                            let _ = event_publish_tx.send(changed).await;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -4568,6 +4593,7 @@ impl StoreRuntime {
             client,
             detach_tx,
             change_tx,
+            memory_tx,
             status_tx,
             snapshot_tx,
             action_tx,
@@ -4591,7 +4617,16 @@ impl StoreRuntime {
 
     /// Event-driven invalidation stream for GPUI views. No timer is needed
     /// while daemon/store state is unchanged.
-    pub fn changes(&self) -> broadcast::Receiver<()> {
+    pub fn changes(&self) -> StoreChanges {
+        StoreChanges {
+            model: self.changes_without_memory(),
+            memory: self.memory_tx.subscribe(),
+        }
+    }
+
+    /// For views that do not display the per-session memory sample. Port and
+    /// artifact updates still refresh links and switcher rows.
+    pub fn changes_without_memory(&self) -> broadcast::Receiver<()> {
         self.change_tx.subscribe()
     }
 

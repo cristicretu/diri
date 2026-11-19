@@ -435,7 +435,7 @@ impl NotePane {
     }
 
     fn follow_sessions(runtime: &Arc<StoreRuntime>, cx: &mut Context<Self>) -> Task<()> {
-        let mut changes = runtime.changes();
+        let mut changes = runtime.changes_without_memory();
         cx.spawn(async move |this, cx| {
             loop {
                 match changes.recv().await {
