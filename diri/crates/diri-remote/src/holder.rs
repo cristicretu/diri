@@ -1626,8 +1626,12 @@ impl Holder {
             .as_ref()
             .filter(|_| hello.protocol.minor >= GRID_RESUME_PROTOCOL_MINOR)
             .map(|request| (request.base_sequence, self.resume_grid(request)));
-        self.state.controller_epoch = self.state.controller_epoch.saturating_add(1);
-        let epoch = self.state.controller_epoch;
+        let epoch = self
+            .state
+            .controller_epoch
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("controller epoch exhausted"))?;
+        self.state.controller_epoch = epoch;
         connection.epoch = Some(epoch);
         connection.protocol_minor = hello.protocol.minor;
         self.controller_protocol_minor = hello.protocol.minor;
@@ -4048,6 +4052,48 @@ mod tests {
             last_acknowledged_output_offset: None,
             last_acknowledged_grid_sequence: None,
             grid_resume: None,
+        }
+    }
+
+    #[test]
+    fn controller_epoch_model_rejects_old_claims_and_exhaustion() {
+        let (_temp, mut holder, request) = waiting_holder();
+        initialize_auth(&holder.paths, &request.session_token).unwrap();
+        let hello = image_hello(
+            &request,
+            &holder.state.session_incarnation,
+            diri_proto::remote_pty::ProtocolVersion::CURRENT.minor,
+        );
+        // Run the same attach traces at ordinary and terminal u64 epochs.
+        for initial in [0, u64::MAX - 2] {
+            holder.state.controller_epoch = initial;
+            let mut model_epoch = u128::from(initial);
+            let mut attached = Vec::new();
+            for _ in 0..4 {
+                let (stream, _peer) = UnixStream::pair().unwrap();
+                let mut connection = Connection::new(stream);
+                let admission = holder.handshake(&mut connection, hello.clone());
+                if model_epoch < u128::from(u64::MAX) {
+                    model_epoch += 1;
+                    admission.unwrap();
+                    assert_eq!(connection.epoch.map(u128::from), Some(model_epoch));
+                    attached.push(connection);
+                } else {
+                    assert!(admission.is_err());
+                    assert!(connection.epoch.is_none());
+                }
+                assert_eq!(u128::from(holder.state.controller_epoch), model_epoch);
+                for prior in &mut attached {
+                    let epoch = prior.epoch.unwrap();
+                    let input = RemoteMessage::Terminal(Frame::input(Vec::new()));
+                    let result = holder.handle_message(prior, input);
+                    if u128::from(epoch) == model_epoch {
+                        result.unwrap();
+                    } else {
+                        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+                    }
+                }
+            }
         }
     }
 

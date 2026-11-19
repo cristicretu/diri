@@ -471,6 +471,74 @@ mod tests {
         }
     }
     #[test]
+    fn task_reports_match_lean_restart_traces() {
+        for line in include_str!("../../tests/fixtures/task-model.tsv").lines() {
+            let fields: Vec<_> = line.split('\t').collect();
+            let [a, b, c, acknowledged, terminal] = fields.as_slice() else {
+                panic!("invalid trace: {line}");
+            };
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("tasks.sqlite");
+            let (task, _) = reserve(&path, &submission()).unwrap();
+            let mut last = task.clone();
+            for command in [*a, *b, *c] {
+                let result = match command {
+                    "cancel" => cancel(
+                        &path,
+                        &TaskCancelParams {
+                            caller_id: task.sender_id.clone(),
+                            task_id: task.task_id.clone(),
+                            reason: None,
+                        },
+                    ),
+                    "ack" | "complete" => {
+                        let complete = command == "complete";
+                        report(
+                            &path,
+                            &TaskReportParams {
+                                caller_id: task.session_id.clone(),
+                                task_id: task.task_id.clone(),
+                                status: if complete {
+                                    TaskStatus::Completed
+                                } else {
+                                    TaskStatus::Acknowledged
+                                },
+                                result: complete.then(|| "verified".into()),
+                            },
+                        )
+                    }
+                    _ => panic!("invalid command {command}"),
+                };
+                // Reopen the journal through the caller-facing lookup each time.
+                let next = get(
+                    &path,
+                    &TaskGetParams {
+                        caller_id: task.sender_id.clone(),
+                        task_id: Some(task.task_id.clone()),
+                        request_id: None,
+                    },
+                )
+                .unwrap();
+                if let Ok(reported) = result {
+                    assert_eq!(reported, next);
+                } else {
+                    assert_eq!(next, last);
+                }
+                if last.status.is_terminal() {
+                    assert_eq!(next, last, "terminal record changed: {line}");
+                }
+                last = next;
+            }
+            assert_eq!(last.status.is_terminal(), *terminal == "true", "{line}");
+            let was_acknowledged = last
+                .updates
+                .iter()
+                .any(|update| update.status == Some(TaskStatus::Acknowledged));
+            assert_eq!(was_acknowledged, *acknowledged == "true", "{line}");
+        }
+    }
+
+    #[test]
     fn completion_requires_the_exact_task_acknowledgement_and_survives_restart() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("tasks.sqlite");
