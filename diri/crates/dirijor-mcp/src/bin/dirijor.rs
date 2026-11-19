@@ -420,7 +420,9 @@ fn mcp_stdio() -> Result<(), CliError> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let error = std::process::Command::new(&proxy).exec();
+        let error = std::process::Command::new(&proxy)
+            .args(std::env::args_os().skip(2))
+            .exec();
         Err(CliError::failure(format!(
             "could not exec {}: {error}",
             proxy.display()
@@ -429,6 +431,7 @@ fn mcp_stdio() -> Result<(), CliError> {
     #[cfg(not(unix))]
     {
         let status = std::process::Command::new(&proxy)
+            .args(std::env::args_os().skip(2))
             .status()
             .map_err(|error| CliError::failure(error.to_string()))?;
         if status.success() {

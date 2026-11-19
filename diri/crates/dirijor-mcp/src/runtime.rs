@@ -11,7 +11,7 @@ use dirijor_mcp::cancellation::Cancellation;
 use serde_json::Value;
 
 use dirijor_mcp::protocol::{
-    DirectBackend, error, handle_message, read_only, success, tool_content,
+    DirectBackend, error, expand_action, handle_profile, read_only, success, tool_content,
 };
 
 const MAX_READS: usize = 8;
@@ -35,6 +35,7 @@ enum Lifecycle {
 }
 
 struct Task {
+    compact: bool,
     message: Value,
     key: String,
     cancellation: Cancellation,
@@ -50,6 +51,7 @@ fn respond(output: &Output, response: &Value) {
 
 fn execute(task: Task, output: &Output, active: &Active) {
     let Task {
+        compact,
         message,
         key,
         cancellation,
@@ -67,7 +69,7 @@ fn execute(task: Task, output: &Output, active: &Active) {
         if cancellation.is_cancelled() {
             None
         } else {
-            handle_message(message, &mut backend)
+            handle_profile(message, &mut backend, compact)
         }
     }));
     drop(heartbeat);
@@ -116,6 +118,7 @@ fn progress_heartbeat(message: &Value, output: &Output) -> Option<mpsc::Sender<(
 }
 
 pub(super) fn serve() {
+    let compact = std::env::args().nth(1).as_deref() == Some("--skills-v1");
     let output: Output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
     let active: Active = Default::default();
     let (mutations, receiver) = mpsc::sync_channel::<Task>(MAX_QUEUED_MUTATIONS);
@@ -166,7 +169,7 @@ pub(super) fn serve() {
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let message: Value = match serde_json::from_slice(&line) {
+        let mut message: Value = match serde_json::from_slice(&line) {
             Ok(value) => value,
             Err(_) => {
                 respond(&output, &error(Value::Null, -32700, "Parse error"));
@@ -203,7 +206,7 @@ pub(super) fn serve() {
                 );
                 continue;
             }
-            if let Some(response) = handle_message(message, &mut immediate) {
+            if let Some(response) = handle_profile(message, &mut immediate, compact) {
                 respond(&output, &response);
             }
             lifecycle = Lifecycle::Initializing;
@@ -251,10 +254,13 @@ pub(super) fn serve() {
             )
             || message.get("id").is_none()
         {
-            if let Some(response) = handle_message(message, &mut immediate) {
+            if let Some(response) = handle_profile(message, &mut immediate, compact) {
                 respond(&output, &response);
             }
             continue;
+        }
+        if compact {
+            expand_action(&mut message);
         }
         let key = message["id"].to_string();
         let cancellable = read_only(&message);
@@ -292,6 +298,7 @@ pub(super) fn serve() {
         );
         drop(running);
         let task = Task {
+            compact,
             message,
             key: key.clone(),
             cancellation,

@@ -1,5 +1,7 @@
 # App Skills
 
+When the client lists `act`, pass the action names below to Diri’s `act` tool with an `arguments` object. Use `get_skill` with `action` for its schema, or with no arguments to list actions and guides. In a Diri terminal, `"$DIRIJOR_CLI" mcp-tools` prints the CLI catalog.
+
 An App Skill is a task in a Mac app that computer use learned once and saved, per app, as a parameterized list of `run_steps` steps. Diri replays it later with no model in the loop: no screenshots, no reasoning, a few hundred milliseconds per step instead of a read-think-act loop. You are the model: you teach, edit and repair skills; the Engine stores, verifies and replays them through the same background path as the `computer` tool (your cursor badge, your app leases, never the person's focus).
 
 All of it is one tool, `app_skills`, with an `action`.

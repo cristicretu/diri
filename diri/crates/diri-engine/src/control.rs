@@ -8166,7 +8166,11 @@ fn codex_developer_args(
         parts.push(diri_proto::voice::SPOKEN_INSTRUCTION);
     }
     if injection.codex_mcp && names_sessions {
-        parts.push(diri_proto::session_naming::INSTRUCTION);
+        parts.push(if crate::inject::compact_mcp_catalog() {
+            diri_proto::session_naming::ACTION_INSTRUCTION
+        } else {
+            diri_proto::session_naming::INSTRUCTION
+        });
     }
     if parts.is_empty() {
         return Vec::new();
