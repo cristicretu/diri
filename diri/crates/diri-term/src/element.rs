@@ -1187,6 +1187,14 @@ impl TerminalElement {
         }
     }
 
+    /// Drop derived paint data when this view leaves the recent tab cache.
+    /// Both live and history rows can be shaped from the retained viewport
+    /// on the first frame back, even before the Engine attach completes.
+    pub fn release_parked_shapes(&self) {
+        *mutex_lock(&self.shared.row_cache) = Vec::new();
+        mutex_lock(&self.shared.history_lines).release();
+    }
+
     /// This terminal's inline-image cache, for the host to install a
     /// requester and deliver decoded images. Clones share it.
     #[must_use]
@@ -6193,6 +6201,45 @@ mod history_cache_tests {
     use gpui::{FontId, ShapedLine};
 
     use super::{HistoryLineCache, HistoryShapeKey, digest_cells, digest_row};
+
+    #[test]
+    fn parking_releases_derived_shapes_and_retains_the_grid() {
+        use std::sync::{Arc, RwLock};
+
+        let mut grid = crate::buffer::GridBuffer::new(120, 40);
+        grid.cells[0].scalar = '界' as u32;
+        let element = super::TerminalElement::new(Arc::new(RwLock::new(grid)));
+        let before = {
+            let mut history = element.shared.history_lines.lock().unwrap();
+            for row in 0..512 {
+                history.insert(row, 1, ShapedLine::default());
+            }
+            history.lines.len() * std::mem::size_of::<(i64, (u64, ShapedLine))>()
+        };
+        element
+            .shared
+            .row_cache
+            .lock()
+            .unwrap()
+            .resize_with(40, || None);
+        element.release_parked_shapes();
+        assert_eq!(
+            element
+                .shared
+                .history_lines
+                .lock()
+                .unwrap()
+                .lines
+                .capacity(),
+            0
+        );
+        assert_eq!(element.shared.row_cache.lock().unwrap().capacity(), 0);
+        assert_eq!(
+            element.buffer().read().unwrap().cells[0].scalar,
+            '界' as u32
+        );
+        println!("512 history shapes: {before} inline entry bytes before parking, 0 after");
+    }
 
     #[test]
     fn combining_only_changes_invalidate_history_shapes() {

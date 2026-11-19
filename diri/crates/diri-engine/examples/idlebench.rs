@@ -255,6 +255,11 @@ fn main() {
     );
     print_point("empty engine", baseline, Sample::default());
     print_point("quiet 2s", transition.0, transition.1);
+    if std::env::var_os("IDLE_APP_DISCONNECT").is_some() {
+        for session in &fleet.0 {
+            session.request_idle_history_page_out();
+        }
+    }
     let first = (sample(engine_pid), sample(manager_pid));
     print_window("engine settling", 3.0, transition.0, first.0);
     print_window("manager settling", 3.0, transition.1, first.1);
