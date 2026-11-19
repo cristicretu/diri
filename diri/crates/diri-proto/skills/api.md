@@ -1,5 +1,7 @@
 # HTTP APIs in Diri
 
+When the client lists `act`, pass the action names below to Diri’s `act` tool with an `arguments` object. Use `get_skill` with `action` for its schema, or with no arguments to list actions and guides. In a Diri terminal, `"$DIRIJOR_CLI" mcp-tools` prints the CLI catalog.
+
 Diri's right panel has an **API** tab: a request builder (method, URL, params, headers, body, auth), a response viewer (status, time, size, headers, folding JSON), saved collections, history and environments with `{{variables}}`. Each project keeps its own.
 
 ## Show the person the endpoint
