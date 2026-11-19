@@ -471,6 +471,7 @@ struct Shared {
     /// registry watcher compares this instead of cloning and JSON-serializing
     /// every record on every poll.
     state_version: AtomicU64,
+    state_watcher: std::sync::OnceLock<Arc<crate::events::StateWake>>,
     /// Seconds since UNIX_EPOCH of the last attach-pump poll or input write.
     /// Keeps interactive sessions on the fast quiet-tick.
     last_hot: AtomicU64,
@@ -838,6 +839,13 @@ impl Shared {
 
     fn bump_state_version(&self) {
         self.state_version.fetch_add(1, Ordering::SeqCst);
+        self.wake_state_watcher();
+    }
+
+    fn wake_state_watcher(&self) {
+        if let Some(watcher) = self.state_watcher.get() {
+            watcher.notify();
+        }
     }
 
     fn note_hot(&self) {
@@ -2863,7 +2871,7 @@ impl Session {
 
     /// Whether a program rang the bell since the last call.
     pub fn take_bell(&self) -> bool {
-        self.shared.bell.swap(false, Ordering::Relaxed)
+        self.shared.bell.swap(false, Ordering::Acquire)
     }
 
     /// The newest OSC 52 clipboard write since the last call, decoded.
@@ -2875,6 +2883,12 @@ impl Session {
             .expect("screen")
             .take_clipboard()?;
         decode_clipboard(&data)
+    }
+
+    pub(crate) fn set_state_watcher(&self, watcher: &Arc<crate::events::StateWake>) {
+        self.shared
+            .state_watcher
+            .get_or_init(|| Arc::clone(watcher));
     }
 
     pub fn state_version(&self) -> u64 {
@@ -4264,6 +4278,7 @@ fn new_shared(
         exited: AtomicBool::new(false),
         stop: AtomicBool::new(false),
         state_version: AtomicU64::new(0),
+        state_watcher: Default::default(),
         last_hot: AtomicU64::new(unix_secs()),
         last_interaction: AtomicU64::new(0),
         artifacts: Mutex::new(Vec::new()),
@@ -4893,7 +4908,10 @@ fn idle_work_pending(
     last_scan_at: Option<Instant>,
     last_scan_seq: u64,
 ) -> bool {
-    if shared.wants_fast_tick() || shared.reducer.lock().expect("reducer").wants_tick() {
+    // The streaming subscription and the input doorbell wake a parked
+    // reader. Its caller already allows the PTY facts settle after activity;
+    // recent interaction alone needs no further 100 ms timer.
+    if shared.reducer.lock().expect("reducer").wants_tick() {
         return true;
     }
     let sampling = if manifest_id == "shell" {
@@ -5660,7 +5678,8 @@ fn apply_remote_output(
             shared.bump_state_version();
         }
         if screen.take_bell() {
-            shared.bell.store(true, Ordering::Relaxed);
+            shared.bell.store(true, Ordering::Release);
+            shared.wake_state_watcher();
         }
         // The Holder answers its program's queries from its own emulator;
         // this mirror's would otherwise pile up unread for the session's
@@ -6411,7 +6430,8 @@ fn feed_output_batch(
                 shared.bump_state_version();
             }
             if screen.take_bell() {
-                shared.bell.store(true, Ordering::Relaxed);
+                shared.bell.store(true, Ordering::Release);
+                shared.wake_state_watcher();
             }
             if let Some(status) = screen.take_agent_exit() {
                 note_agent_exit(shared, status, &mut screen);
@@ -7653,7 +7673,8 @@ fn held_turn(state: Box<HeldPump>, mut resumed: bool, may_park: bool) -> HeldTur
                     shared.bump_state_version();
                 }
                 if screen.take_bell() {
-                    shared.bell.store(true, Ordering::Relaxed);
+                    shared.bell.store(true, Ordering::Release);
+                    shared.wake_state_watcher();
                 }
                 if let Some(status) = screen.take_agent_exit() {
                     note_agent_exit(&shared, status, &mut screen);
@@ -8757,6 +8778,20 @@ mod quiet_tick_tests {
         // Input or an attach makes it interactive again at once.
         shared.note_hot();
         assert_eq!(shared.quiet_tick(), TICK_INTERVAL);
+
+        // A local streaming shell whose foreground and reducer are settled
+        // can park on its input/output descriptors even during that window.
+        assert!(
+            shared
+                .reducer
+                .lock()
+                .unwrap()
+                .seed(&SessionStatus::Idle, None)
+        );
+        shared.foreground_job.store(1, Ordering::SeqCst);
+        assert!(!idle_work_pending(&shared, "shell", None, 0));
+        shared.foreground_job.store(0, Ordering::SeqCst);
+        assert!(idle_work_pending(&shared, "shell", None, 0));
     }
 }
 

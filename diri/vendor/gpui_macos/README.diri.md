@@ -119,3 +119,14 @@ and Floating windows while they are not key, and removes it when they become
 key. AppKit sends `mouseMoved:` only to the key window, so without it a
 visible but unfocused window never hovers and never learns the pointer left.
 A key window keeps upstream's event stream exactly.
+
+A visible window now releases its display-link subscription after three frames
+without drawing, presentation, callbacks or live sprite animation. GPUI wakes
+it on dirty state, input or a next-frame callback. A covered or closed window
+ignores these wakes. To compare the continuous and parked clocks without
+opening a window, run from the Rust workspace on a Mac with an active display:
+
+```sh
+cargo build -p diri-term -p gpui_macos --example idle_display_clock
+"${CARGO_TARGET_DIR:-target}/debug/examples/idle_display_clock"
+```

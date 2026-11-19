@@ -231,6 +231,10 @@ fn unsubscribe(display_id: CGDirectDisplayID, subscriber_id: SubscriberId) {
 pub struct WindowFrameSource {
     frame_requests: DispatchRetained<DispatchSource>,
     registration: Option<(CGDirectDisplayID, SubscriberId)>,
+    /// Set only for a visible window whose display link we paused.
+    parked: std::rc::Rc<std::cell::Cell<Option<CGDirectDisplayID>>>,
+    wake_queued: std::rc::Rc<std::cell::Cell<bool>>,
+    idle_frames: u8,
 }
 
 impl WindowFrameSource {
@@ -252,6 +256,9 @@ impl WindowFrameSource {
         Self {
             frame_requests,
             registration: None,
+            parked: Default::default(),
+            wake_queued: Default::default(),
+            idle_frames: 0,
         }
     }
 
@@ -266,14 +273,56 @@ impl WindowFrameSource {
     /// would, while the source is subscribed (the window is visible). Pending
     /// requests coalesce, so this and a tick already queued run one frame.
     pub fn request_now(&self) -> bool {
-        if self.registration.is_none() {
+        if self.registration.is_none() && self.parked.get().is_none() {
             return false;
+        }
+        if self.parked.get().is_some() {
+            self.wake_queued.set(true);
         }
         self.frame_requests.merge_data(1);
         true
     }
 
+    pub fn idle_waker(&self) -> std::rc::Rc<dyn Fn()> {
+        let parked = self.parked.clone();
+        let source = self.frame_requests.clone();
+        let queued = self.wake_queued.clone();
+        std::rc::Rc::new(move || {
+            if parked.get().is_some() && !queued.replace(true) {
+                source.merge_data(1);
+            }
+        })
+    }
+
+    pub fn accept_frame(&mut self) -> bool {
+        if let Some(display) = self.parked.get() {
+            // A final vsync can arrive after unsubscribe. Only actual work
+            // restarts the link, even if that tick was already queued.
+            if !self.wake_queued.replace(false) {
+                return false;
+            }
+            self.start(display).log_err();
+        }
+        self.registration.is_some()
+    }
+
+    pub fn frame_demand(&mut self, active: bool) {
+        if active {
+            self.idle_frames = 0;
+        } else if let Some((display, id)) = self.registration {
+            self.idle_frames += 1;
+            if self.idle_frames == 3 {
+                self.registration = None;
+                self.parked.set(Some(display));
+                unsubscribe(display, id);
+            }
+        }
+    }
+
     pub fn stop(&mut self) {
+        self.parked.set(None);
+        self.wake_queued.set(false);
+        self.idle_frames = 0;
         if let Some((display_id, subscriber_id)) = self.registration.take() {
             unsubscribe(display_id, subscriber_id);
         }
