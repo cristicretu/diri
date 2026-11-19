@@ -151,7 +151,7 @@ pub(crate) struct PersistBatch {
 }
 
 impl PersistBatch {
-    fn commit(self) -> std::io::Result<()> {
+    pub(crate) fn commit(self) -> std::io::Result<()> {
         self.file
             .commit_sections("registry", self.sequence, self.sections)
     }
@@ -555,6 +555,20 @@ impl Registry {
     /// [`persist_now`](Self::persist_now).
     pub fn persist_deferred(&mut self) {
         self.dirty = true;
+    }
+
+    /// Take a due write for an ordinary spawn. Commit it after dropping the
+    /// registry lock. The section sequence rejects stale writes if a later
+    /// mutation reaches disk first.
+    pub(crate) fn take_spawn_persist(&mut self) -> Option<PersistBatch> {
+        self.dirty = true;
+        if self
+            .last_persist
+            .is_some_and(|last| last.elapsed() < PERSIST_DEBOUNCE)
+        {
+            return None;
+        }
+        self.take_dirty_batch()
     }
 
     /// Writes out a deferred persist, if one is pending.
