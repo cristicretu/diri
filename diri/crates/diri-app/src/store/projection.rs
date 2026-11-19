@@ -129,6 +129,15 @@ pub(super) fn build_projection(
             .or_default()
             .push(Arc::clone(session));
     }
+    // A pinned project is a place the user works, not a byproduct of what is
+    // running: it keeps its row after its last session closes, so killing
+    // every agent does not throw away the sidebar layout. Only projects the
+    // Engine still lists qualify; a pin on an unknown id has no root to show.
+    for id in &prefs.sidebar_pinned_projects {
+        if projects.contains_key(id) {
+            grouped.entry(id.clone()).or_default();
+        }
+    }
 
     let session_rank = rank_map(&prefs.sidebar_session_order);
     let project_rank = rank_map(&prefs.sidebar_project_order);
