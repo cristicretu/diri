@@ -116,6 +116,30 @@ impl ControlClient {
         deadline: Instant,
     ) -> Result<Value, ControlFailure> {
         let id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        self.write_request_until(id, method, params, deadline)?;
+        loop {
+            match self.read_message_until(deadline)? {
+                ControlMessage::Response {
+                    id: response_id,
+                    result,
+                } if response_id == id => return result.map_err(ControlFailure::Daemon),
+                ControlMessage::Event { .. } => continue,
+                _ => {
+                    return Err(ControlFailure::Protocol(
+                        "unexpected daemon message while waiting for a response".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn write_request_until(
+        &mut self,
+        id: u64,
+        method: String,
+        params: Value,
+        deadline: Instant,
+    ) -> Result<(), ControlFailure> {
         let request = ControlMessage::Request {
             id,
             method,
@@ -144,20 +168,7 @@ impl ControlClient {
                 Err(error) => return Err(self.io_failure(error)),
             }
         }
-        loop {
-            match self.read_message_until(deadline)? {
-                ControlMessage::Response {
-                    id: response_id,
-                    result,
-                } if response_id == id => return result.map_err(ControlFailure::Daemon),
-                ControlMessage::Event { .. } => continue,
-                _ => {
-                    return Err(ControlFailure::Protocol(
-                        "unexpected daemon message while waiting for a response".into(),
-                    ));
-                }
-            }
-        }
+        Ok(())
     }
 
     pub fn subscribe(

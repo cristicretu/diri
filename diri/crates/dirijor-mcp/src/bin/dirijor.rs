@@ -195,16 +195,12 @@ fn hook(event: Option<&str>) -> Result<(), CliError> {
     let event = event.unwrap_or_default();
     let payload = stdin_json(HOOK_PAYLOAD_CAP, Duration::from_millis(500));
     persist_hook_activity("claude-hook", Some(event), &payload);
-    let result = bridge().request(
-        Method::HOOK_REPORT,
-        json!({
+    let result = bridge().report_hook(json!({
             "kind": "claude-hook",
             "dirijorSessionID": std::env::var("DIRIJOR_SESSION_ID").ok(),
             "event": event,
             "payload": forwarded_hook_payload(event, payload),
-        }),
-        Duration::from_secs(3),
-    );
+    }));
     // Hooks are deliberately fail-open: an unavailable UI must never prevent
     // an agent from starting or completing its own action.
     if event == "SessionStart"
@@ -292,16 +288,12 @@ fn notify(arguments: &[String]) -> Result<(), CliError> {
             inputs.truncate(1);
         }
     }
-    let _ = bridge().request(
-        Method::HOOK_REPORT,
-        json!({
+    let _ = bridge().report_hook(json!({
             "kind": "codex-notify",
             "dirijorSessionID": std::env::var("DIRIJOR_SESSION_ID").ok(),
             "event": null,
             "payload": payload,
-        }),
-        Duration::from_secs(3),
-    );
+    }));
     Ok(())
 }
 

@@ -4,7 +4,7 @@
 Run from diri/ with python3 scripts/claude-submit-bench.py. Each sample starts
 a fresh Claude PTY with an empty temporary HOME. The model, MCP HTTP endpoint
 and Engine control socket are loopback fixtures. The actual Diri CLI reads
-Claude's stdin, writes recovery state, verifies Hello and calls hook.report.
+Claude's stdin, writes recovery state, verifies Hello and delivers the report.
 This measures injection overhead independently of Diri's renderer and Engine
 load. Only synthetic requests are used. No request bodies are logged.
 
@@ -107,6 +107,18 @@ class Control(socketserver.StreamRequestHandler):
             if method == 'hello':
                 hello = time.monotonic_ns()
                 result = {'proto': 1, 'engineKind': 'diri-rust-engine'}
+                if self.server.reserved and 'reserveHook' in message['params']:
+                    intent = message['params']['reserveHook']
+                    sequence = self.server.sequences.setdefault(intent['event'], len(self.server.sequences) + 1)
+                    result['hookReservation'] = {'sequence': sequence, 'response':
+                        {'additionalContext': CONTEXT} if intent['event'] == 'UserPromptSubmit' else {}}
+            elif method == 'hook.commit':
+                event = message['params']['event']
+                if message['id'] != sequence or event != intent['event']:
+                    raise RuntimeError('commit mismatched its reservation')
+                self.server.times[event + '.hello'] = hello
+                self.server.times[event] = time.monotonic_ns()
+                return
             elif method == 'agent.readiness':
                 result = {'agents': []}
             elif method == 'hook.report':
@@ -140,6 +152,12 @@ class Control(socketserver.StreamRequestHandler):
                         self.server.times[event + '.hello'] = hello
                         self.server.times[event] = time.monotonic_ns()
                     engine.sendall(line)
+                    if message['method'] == 'hook.commit':
+                        event = message['params']['event']
+                        self.server.times[event + '.hello'] = hello
+                        self.server.times[event] = time.monotonic_ns()
+                        self.server.times[event + '.sent'] = self.server.times[event]
+                        return
                     reply = responses.readline()
                     if not reply or 'ok' not in json.loads(reply):
                         raise RuntimeError('private Engine rejected fixture RPC')
@@ -221,6 +239,8 @@ def measure(args, mode):
         control = stack.enter_context(serving(socketserver.ThreadingUnixStreamServer(sock, Control)))
         api = stack.enter_context(serving(ThreadingHTTPServer(('127.0.0.1', 0), Replay)))
         times = api.times = control.times = {}
+        control.reserved = mode == 'reserved-voice'
+        control.sequences = {}
         control.stall = mode == 'stall'
         control.voice = mode.startswith('delayed-')
         control.engine = None
@@ -238,10 +258,12 @@ def measure(args, mode):
         hooks = mode not in ('bare', 'mcp')
         mcp = mode not in ('bare', 'hooks')
         if hooks:
-            settings = json.loads((args.inject / 'claude-hooks.json').read_text())
+            inject_dir = home / 'diri/inject' if control.engine else args.inject
+            filename = 'claude-exec-hooks.json' if mode == 'direct' and control.engine else 'claude-hooks.json'
+            settings = json.loads((inject_dir / filename).read_text())
             for event, groups in settings['hooks'].items():
                 hook = groups[0]['hooks'][0]
-                if mode == 'direct':
+                if mode == 'direct' and not control.engine:
                     hook.update(command=args.dirijor, args=['hook', event])
                 if mode in ('async', 'delayed-async'):
                     hook['async'] = True
@@ -255,7 +277,7 @@ def measure(args, mode):
             if not api.catalog['tools']:
                 raise RuntimeError('empty Diri tool catalog')
             config = {'mcpServers': {'dirijor': {'type': 'http', 'url': url + '/mcp'}}}
-            command.extend(['--mcp-config', json.dumps(config), '--plugin-dir', str(args.inject / 'claude-skills-plugin')])
+            command.extend(['--mcp-config', json.dumps(config), '--plugin-dir', str((home / 'diri/inject' if control.engine else args.inject) / 'claude-skills-plugin')])
         master, slave = pty.openpty()
         stack.callback(os.close, master)
         try:
@@ -280,8 +302,9 @@ def measure(args, mode):
             os.write(master, b'\r')
             await_text(master, WORD.encode(), 15)
             deadline = time.monotonic() + 5
-            expected = {'SessionStart', 'UserPromptSubmit', 'Stop.reply' if control.engine else 'Stop'}
-            while hooks and not expected <= times.keys():
+            expected = {'SessionStart', 'UserPromptSubmit', 'Stop'}
+            while hooks and (not expected <= times.keys() or
+                             (control.engine and not {'Stop.sent', 'Stop.reply'}.intersection(times))):
                 if time.monotonic() > deadline:
                     raise RuntimeError('missing callback in injected trial')
                 time.sleep(.01)
@@ -291,7 +314,7 @@ def measure(args, mode):
             proc.wait()
         elapsed = {k: round((v - times['enter']) / 1e6, 3) for k, v in times.copy().items()}
         print(json.dumps({'mode': mode, 'ms_from_enter': elapsed, 'same_turn_context': api.context_seen}), flush=True)
-        if mode == 'delayed-sync' and not api.context_seen:
+        if mode in ('delayed-sync', 'reserved-voice') and not api.context_seen:
             raise RuntimeError('blocking submit lost its response context')
         return elapsed['request']
 
@@ -313,7 +336,7 @@ def main():
         parser.error('the contract and stall experiments require the fixture Engine')
     if not args.claude or not args.dirijor or args.runs < 1:
         parser.error('provide both CLI paths and a positive run count')
-    modes = ['delayed-sync', 'delayed-async'] if args.contract else ['stall'] if args.stall else args.modes
+    modes = ['delayed-sync', 'delayed-async', 'reserved-voice'] if args.contract else ['stall'] if args.stall else args.modes
     results = {mode: [] for mode in modes}
     for i in range(args.runs):
         for mode in (reversed(modes) if i % 2 else modes):

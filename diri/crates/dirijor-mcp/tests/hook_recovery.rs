@@ -186,6 +186,15 @@ fn deliver_hook(event: &str, payload: &[u8]) -> (serde_json::Value, HookActivity
 }
 
 fn deliver(args: &[&str], payload: &[u8], stdout: &[u8]) -> (serde_json::Value, HookActivitySeed) {
+    deliver_with_protocol(args, payload, stdout, false)
+}
+
+fn deliver_with_protocol(
+    args: &[&str],
+    payload: &[u8],
+    stdout: &[u8],
+    reserved: bool,
+) -> (serde_json::Value, HookActivitySeed) {
     use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixListener;
 
@@ -202,9 +211,24 @@ fn deliver(args: &[&str], payload: &[u8], stdout: &[u8]) -> (serde_json::Value, 
             reader.read_line(&mut line).unwrap();
             let request: serde_json::Value = serde_json::from_str(&line).unwrap();
             let result = if request["method"] == "hello" {
-                serde_json::json!({"proto": diri_proto::WIRE_VERSION, "engineKind": diri_proto::RUST_ENGINE_KIND})
+                let mut hello = serde_json::json!({"proto": diri_proto::WIRE_VERSION, "engineKind": diri_proto::RUST_ENGINE_KIND});
+                if reserved {
+                    assert_eq!(request["params"]["reserveHook"]["sessionID"], "s_hook");
+                    hello["hookReservation"] = serde_json::json!({"sequence": 73, "response": {"additionalContext": "speak now"}});
+                }
+                hello
             } else {
                 delivered = Some(request["params"].clone());
+                if reserved {
+                    assert_eq!(request["method"], "hook.commit");
+                    assert_eq!(request["id"], 73);
+                    // Wait for the CLI to close without replying. A synchronous
+                    // client would time out and lose the current-turn context.
+                    line.clear();
+                    assert_eq!(reader.read_line(&mut line).unwrap(), 0);
+                    break;
+                }
+                assert_eq!(request["method"], "hook.report");
                 serde_json::json!({})
             };
             let response = serde_json::json!({"id": request["id"], "ok": result});
@@ -289,4 +313,16 @@ fn large_tool_payloads_are_read_whole_but_not_forwarded() {
     });
     let (delivered, _) = deliver_hook("PermissionRequest", payload.to_string().as_bytes());
     assert_eq!(delivered["payload"]["tool_input"]["command"], "cargo test");
+}
+
+#[test]
+fn reserved_submit_exits_with_current_context_before_any_commit_reply() {
+    let (report, seed) = deliver_with_protocol(
+        &["hook", "UserPromptSubmit"],
+        br#"{"session_id":"conversation","prompt":"test"}"#,
+        b"{\"hookSpecificOutput\":{\"additionalContext\":\"speak now\",\"hookEventName\":\"UserPromptSubmit\"}}\n",
+        true,
+    );
+    assert_eq!(report["event"], "UserPromptSubmit");
+    assert_eq!(seed.agent_session_id.as_deref(), Some("conversation"));
 }
