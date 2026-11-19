@@ -8,7 +8,7 @@ The server ships inside the app. Claude Code, Codex and Cursor get it automatica
 
 Claude Code and Codex can use the versioned compact MCP profile. It advertises two tools. Call `get_skill` with `{"name":"orchestration"}` for the guide, with `{"action":"submit_task"}` for the argument schema, or with `{}` to list available actions and skills. Pass the chosen action and its arguments to `act`. For example, `{"action":"whoami","arguments":{}}` returns the calling session. Claude Code also exposes the guides as native `diri:` skills.
 
-The Engine authenticates HTTP calls with the session token and applies its usual lineage checks. Client permission rules match the advertised MCP tool name. A standing approval for `act` applies to every action reachable by that session. Installations with individual action rules can use the full catalog at `/mcp` or start `dirijor-mcp` without arguments. The compact endpoint uses `/mcp/skills-v1` and its stdio counterpart uses `--skills-v1`.
+The Engine authenticates HTTP calls with the session token and applies its usual lineage checks. Client permission rules match the advertised MCP tool name. A standing approval for `act` applies to every action reachable by that session. Set `DIRI_MCP_CATALOG=full` in the Engine environment before startup to retain individual permission names in automatically launched clients. Manually configured clients can use the full catalog at `/mcp` or start `dirijor-mcp` without arguments. The compact endpoint uses `/mcp/skills-v1` and its stdio counterpart uses `--skills-v1`.
 
 ## What agents can do
 
