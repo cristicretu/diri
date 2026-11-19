@@ -15,6 +15,7 @@ session record. The measured Claude still runs directly in the test PTY.
 """
 import argparse
 from contextlib import ExitStack, contextmanager
+from copy import copy
 import fcntl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -324,6 +325,8 @@ def main():
     parser.add_argument('--claude', default=shutil.which('claude'))
     parser.add_argument('--dirijor', default=shutil.which('dirijor'))
     parser.add_argument('--engine', help='path to an optional real dirijord-rs binary')
+    parser.add_argument('--before-engine', type=Path,
+                        help='compare bare, the previous Engine and its sibling CLI, and --engine in alternating triples')
     parser.add_argument('--inject', type=Path, default=Path.home() / 'Library/Application Support/Dirijor/inject')
     parser.add_argument('--modes', nargs='+', choices=['bare', 'hooks', 'mcp', 'full', 'direct', 'async'],
                         default=['bare', 'hooks', 'mcp', 'full'])
@@ -337,11 +340,24 @@ def main():
     if not args.claude or not args.dirijor or args.runs < 1:
         parser.error('provide both CLI paths and a positive run count')
     modes = ['delayed-sync', 'delayed-async', 'reserved-voice'] if args.contract else ['stall'] if args.stall else args.modes
-    results = {mode: [] for mode in modes}
+    trials = {mode: (args, mode) for mode in modes}
+    if args.before_engine:
+        if not args.engine or args.stall or args.contract:
+            parser.error('--before-engine requires --engine and a timing run')
+        before = copy(args)
+        before.engine = str(args.before_engine.resolve())
+        before.dirijor = str(Path(before.engine).with_name('dirijor'))
+        trials = {'bare': (args, 'bare'), 'packaged': (before, 'full'), 'candidate': (args, 'direct')}
+    results = {label: [] for label in trials}
     for i in range(args.runs):
-        for mode in (reversed(modes) if i % 2 else modes):
-            results[mode].append(measure(args, mode))
-    print(json.dumps({'median_ms': {k: statistics.median(v) for k, v in results.items()}}))
+        for label in (reversed(trials) if i % 2 else trials):
+            config, mode = trials[label]
+            results[label].append(measure(config, mode))
+    summary = {'median_ms': {k: statistics.median(v) for k, v in results.items()}}
+    if args.before_engine:
+        summary['paired_overhead_ms'] = statistics.median(
+            candidate - bare for candidate, bare in zip(results['candidate'], results['bare']))
+    print(json.dumps(summary))
 
 
 if __name__ == '__main__':

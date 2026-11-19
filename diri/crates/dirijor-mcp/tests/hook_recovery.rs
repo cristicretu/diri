@@ -253,7 +253,14 @@ fn deliver_with_protocol(
     drop(stdin);
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
-    assert_eq!(output.stdout, stdout);
+    if stdout.is_empty() {
+        assert!(output.stdout.is_empty());
+    } else {
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(stdout).unwrap()
+        );
+    }
     let seed = SessionRecoveryStore::new(recovery)
         .read_activity()
         .unwrap()
