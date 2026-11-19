@@ -194,3 +194,70 @@ pub struct ComputerSetupNeededEvent {
     /// "Claude · signup flow": who asked.
     pub badge: String,
 }
+
+/// `computer.skills`: App Skills, tasks computer use learned once in a Mac
+/// app and replays without a model. `action` is one of list, learn, trace,
+/// save, run, forget, history, rollback; `args` are that action's arguments.
+/// Only `list`, `history` and `forget` work without a session.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ComputerSkillsParams {
+    #[serde(rename = "sessionID", default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    pub action: String,
+    #[serde(default)]
+    pub args: Value,
+}
+
+/// How far a saved App Skill can be trusted.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AppSkillStatus {
+    /// Replayed cleanly on the app version it was last run on.
+    Verified,
+    /// Saved without a full replay, or the app changed version since.
+    #[default]
+    Unverified,
+    /// Failed three runs in a row; an Agent has to repair it.
+    Broken,
+}
+
+/// One App Skill as `computer.skills` `list` reports it.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSkillSummary {
+    pub name: String,
+    pub goal: String,
+    #[serde(default)]
+    pub params: Vec<String>,
+    pub status: AppSkillStatus,
+    pub version: u32,
+    #[serde(default)]
+    pub destructive: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
+    #[serde(default)]
+    pub runs: u64,
+    /// Unix milliseconds of the last run that succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_ok_at: Option<u64>,
+    /// Unix milliseconds of the last run, ok or not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_at: Option<u64>,
+}
+
+/// One app with learned skills.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSkillsApp {
+    pub bundle_id: String,
+    pub name: String,
+    pub skills: Vec<AppSkillSummary>,
+}
+
+/// `computer.skills` `list`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSkillsList {
+    pub apps: Vec<AppSkillsApp>,
+}

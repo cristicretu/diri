@@ -10999,7 +10999,7 @@ mod tests {
             cx.run_until_parked();
         }
         // `DIRI_VISUAL_COMPUTER=missing|installing|failed|allow|waiting|ready|
-        // foreground|foreground-menu`
+        // learned|foreground|foreground-menu`
         // seeds Settings › Agents › Computer use with that setup state.
         if let Ok(state) = std::env::var("DIRI_VISUAL_COMPUTER") {
             cx.update_window(window.into(), |root, _, cx| {
@@ -12600,7 +12600,11 @@ mod tests {
                 }
                 if tab == SettingsTab::Skills {
                     surfaces.skills.update(cx, |skills, _| {
-                        skills.seed_preview(std::env::var_os("DIRI_VISUAL_SKILL_DETAIL").is_some())
+                        if std::env::var_os("DIRI_VISUAL_SKILL_USAGE").is_some() {
+                            skills.seed_usage_preview();
+                        } else {
+                            skills.seed_preview(std::env::var_os("DIRI_VISUAL_SKILL_DETAIL").is_some());
+                        }
                     });
                 }
                 if tab == SettingsTab::Accounts {

@@ -20,11 +20,16 @@
       "description": "Building, running or debugging an HTTP API or dev server inside Diri: open the endpoint, prefilled, in the person's API tab with open_api_request (GET can auto-send; other methods wait for Send).",
       "markdown": "# HTTP APIs in Diri\n\nDiri's right panel has an **API** tab: a request builder (method, URL, params, headers, body, auth), a response viewer (status, time, size, headers, folding JSON), saved collections, history and environments with `{{variables}}`. Each project keeps its own.\n\n## Show the person the endpoint\n\nWhen you build, run or debug an HTTP API, open the request in **your** session's API tab with `open_api_request` instead of only printing a curl command:\n\n- After starting a dev server, open the endpoint you added or changed, e.g. `{\"url\": \"http://localhost:3000/api/health\", \"auto_send\": true}`.\n- After changing a handler, open the request that exercises it, prefilled: `{\"method\": \"POST\", \"url\": \"{{baseUrl}}/items\", \"json\": {\"name\": \"tea\"}, \"variables\": {\"baseUrl\": \"http://localhost:3000\"}}`.\n- Reproducing a bug report: open the failing request with its headers and body so the person can send it and see the response.\n\n## Rules\n\n- `auto_send: true` is honoured for `GET` only. `POST`, `PUT`, `PATCH`, `DELETE` and the rest always wait for the person to press Send: never ask for them to be sent on your behalf through other means to get around this.\n- Put tokens in `variables` and list them in `secrets`, then refer to them as `{{token}}` (for example `\"headers\": {\"Authorization\": \"Bearer {{token}}\"}`). Secrets are masked in the panel. Never paste a real production credential you were not given for this purpose.\n- `variables` merge into the project's environment named by `environment` (default: the active one, or `Local`), so later requests can reuse them.\n- The tool opens the tab; it does not return the response. To check an endpoint yourself, use your own tools (for example `curl`) and use the API tab for the person.\n- Prefer `localhost` URLs for local servers; a URL without a scheme gets `http://` for local hosts and `https://` otherwise.\n",
       "name": "api"
+    },
+    {
+      "description": "Doing a task in a Mac app with Diri's computer tool, especially one you'll repeat: check app_skills for a saved skill first; teach one (learn, trace, save), replay it with args or args_list, and repair it when a run breaks.",
+      "markdown": "# App Skills\n\nAn App Skill is a task in a Mac app that computer use learned once and saved, per app, as a parameterized list of `run_steps` steps. Diri replays it later with no model in the loop: no screenshots, no reasoning, a few hundred milliseconds per step instead of a read-think-act loop. You are the model: you teach, edit and repair skills; the Engine stores, verifies and replays them through the same background path as the `computer` tool (your cursor badge, your app leases, never the person's focus).\n\nAll of it is one tool, `app_skills`, with an `action`.\n\n## Check before you click\n\nBefore doing a task in an app by hand, and always before doing one more than once, call `app_skills {\"action\": \"list\"}` (or `{\"action\": \"list\", \"app\": \"Numbers\"}`). If a skill fits, run it:\n\n```json\n{\"action\": \"run\", \"app\": \"com.example.Invoices\", \"skill\": \"create_invoice\", \"args\": {\"customer\": \"Ada Lovelace\", \"amount\": 120}}\n```\n\nMany items: pass `args_list` (one args object per item, at most 50). Each item runs in turn and reports its own outcome; by default the run stops at the first failed item (`continue_on_error: true` keeps going). A skill marked `destructive` (it deletes, sends, pays, submits) over more than one item is refused until you pass `confirm: true`, and you may only pass that after the person agreed to that exact batch.\n\n## Teach one: learn, trace, save\n\n1. `{\"action\": \"learn\", \"app\": \"Invoices\", \"goal\": \"Create an invoice for a customer and amount\"}` puts your session in learn mode for that app.\n2. Do the task once with the `computer` tool, exactly as you normally would (`get_window_state`, then act with element tokens or `run_steps`). Only successful actions are recorded; reads are not. Use real example values for whatever varies.\n3. `{\"action\": \"trace\"}` returns the recorded actions as a draft: element tokens are already turned into selectors (`role`, `name`, `nth`, `window`), every typed or set literal is listed in `candidate_params`, and `warnings` names steps that still need you (an unlabeled element, a pixel click).\n4. Edit the draft into a skill and save it:\n\n```json\n{\"action\": \"save\",\n \"skill\": {\n   \"name\": \"create_invoice\",\n   \"goal\": \"Create an invoice for a customer and amount\",\n   \"params\": [{\"name\": \"customer\", \"type\": \"string\", \"description\": \"Customer name as shown in the list\"},\n              {\"name\": \"amount\", \"type\": \"number\", \"description\": \"Total in the account currency\"}],\n   \"steps\": [\n     {\"tool\": \"click\", \"args\": {\"role\": \"button\", \"name\": \"New Invoice\"}, \"intent\": \"Open a blank invoice\",\n      \"expect\": [{\"role\": \"textfield\", \"name\": \"Customer\"}]},\n     {\"tool\": \"set_value\", \"args\": {\"role\": \"textfield\", \"name\": \"Customer\", \"value\": \"{customer}\"}, \"intent\": \"Fill in the customer\"},\n     {\"tool\": \"set_value\", \"args\": {\"role\": \"textfield\", \"name\": \"Amount\", \"value\": \"{amount}\"}, \"intent\": \"Fill in the amount\"},\n     {\"tool\": \"click\", \"args\": {\"role\": \"button\", \"name\": \"Save\"}, \"intent\": \"Save the invoice\",\n      \"expect\": [{\"text\": \"Saved\"}]}\n   ],\n   \"destructive\": false},\n \"example_args\": {\"customer\": \"Ada Lovelace\", \"amount\": 120}}\n```\n\n`save` validates (every param used, every `{placeholder}` declared, only batchable tools, selectors not tokens or pids, at most 64 steps), then **verifies** by replaying the skill with `example_args`. It is saved as `verified` only if that replay passes; otherwise you get the failing step and the driver's error, and nothing is saved. A destructive skill is verified `until_last` by default: every step but the final one, leaving the app mid-flow, which you then cancel or finish (or tell the person). `verify: \"none\"` saves it `unverified`. Saving under an existing name keeps the old version for `rollback` and bumps the version.\n\nWriting good steps:\n\n- Target by `role` + `name` (add `nth` when several match, `window` for a dialog or second window). Never element tokens, `pid` or `window_id`: they only last one launch.\n- Give every step an `intent` sentence. It is never sent to the app; it tells whoever repairs the skill what the step was for.\n- Add `expect` checks after steps whose effect matters (a dialog opened, a row appeared), and `wait_for` before steps that need something to load. Skill-wide `preconditions` and `postconditions` are check objects too.\n- `{param}` placeholders go in any string value; `{{` and `}}` are literal braces. A value that is exactly `\"{amount}\"` with a number param is sent as a number.\n- Pixel clicks (`x`, `y`) only when no selector reaches the control; mark the step `\"pixel\": true`. Such a skill never counts as verified.\n- Never save passwords, tokens, card numbers or other secrets as literals. Make them params, and don't pass secrets in `args` unless the person gave them to you for this.\n- Keep it to one task. Compose bigger jobs from several skills, or loop with `args_list`.\n\n`{\"action\": \"abandon\"}` leaves learn mode without saving.\n\n## When a run breaks: repair\n\nA failed run answers with `ok: false`, `failed_step`, that step's `intent`, `driver_error`, the skill's `goal`, a compact read of the app's current `window`, and `saved_skill` (the whole skill as saved). Apps change: a button gets renamed, a dialog appears, a field moves into a sheet.\n\n1. Read the payload; if you need more, look at the window with the `computer` tool.\n2. Fix the step(s) in `saved_skill` (selector, an added `wait_for`, a dismissed dialog), and call `save` with it and `example_args`. Verification replays it; the version goes up.\n3. If the run failed because of this account or this data (no permission, a record that doesn't exist), not because the app changed, don't overwrite the skill: report it.\n\nAfter three failed runs in a row a skill is marked `broken`. When the app's version changes, its skills turn `unverified` until their next clean run. `history` shows versions and recent runs (never argument values); `rollback {app, skill, version}` restores an earlier version; `forget {app, skill}` deletes one.\n\n## Rules\n\n- Skills run in the background like every `computer` call: no foreground, no desktop scope, never the person's cursor or keyboard. An app another Agent is driving returns `computer_app_busy`.\n- Act only in apps the person pointed you to or you launched. A skill is not permission to run it on someone else's data.\n- The person sees every skill under Settings › Agents › Computer use › Learned apps, and can delete them there.\n",
+      "name": "app-skills"
     }
   ],
   "tools": [
     {
-      "description": "Read one of Diri's skills: the detailed rules for a Diri capability, as Markdown. Read the matching skill before acting: scheduling (run anything later, at a time, or repeatedly; waking the Mac), notes (work started from or written to a Diri note), orchestration (parallel agents, tasks, waiting, retries), api (HTTP APIs and dev servers: show endpoints in the API tab). Claude Code sessions also have them as skills named diri:<name>.",
+      "description": "Read one of Diri's skills: the detailed rules for a Diri capability, as Markdown. Read the matching skill before acting: scheduling (run anything later, at a time, or repeatedly; waking the Mac), notes (work started from or written to a Diri note), orchestration (parallel agents, tasks, waiting, retries), api (HTTP APIs and dev servers: show endpoints in the API tab), app-skills (learn a Mac app task once with computer use, replay it later). Claude Code sessions also have them as skills named diri:<name>.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -33,7 +38,8 @@
               "scheduling",
               "notes",
               "orchestration",
-              "api"
+              "api",
+              "app-skills"
             ],
             "minLength": 1,
             "type": "string"
@@ -1107,7 +1113,7 @@
       "name": "browser"
     },
     {
-      "description": "Use this Mac's apps the way a person would, in the background: any native app (Simulator, TextEdit, Xcode, Finder, the app you are building) and browser pages. The person's cursor, keyboard and focus stay theirs; your actions show as your own labelled cursor. Pass tool and args. Loop: (1) launch_app {bundle_id or name, creates_new_application_instance:true} returns your own pid and windows (or list_windows {pid}); (2) get_window_state {pid, window_id} returns accessibility rows [N] plus a screenshot; (3) act with element_token \"<snapshot_id>:N\" (click, type_text {text}, set_value, set_state {state: checked|expanded|focused...}, clear_value, press_key {key}, hotkey {keys}, scroll) or with pixel x,y from that screenshot; (4) re-read with get_window_state {since:\"latest\"} and check the change before going on. run_steps runs several actions in one call; wait blocks until an element, window or dialog appears or goes. Everything stays in the background while the person keeps working: scope \"desktop\", bring_to_front and activate_app are always refused with computer_foreground_denied, even when a driver hint recommends them. When no background route reaches a control (a file picker, a system dialog, a sheet), retry that one action with delivery_mode \"foreground\": it fronts the window for a moment, then gives the person's app back. It needs the person's leave (Diri Settings › Agents › Computer use › Foreground actions; under Ask the call waits for their answer); if it is refused, tell the person what you need instead. A failed action's disposition.retry says whether retrying is safe; a stale_element_token means read again. Act only on apps you launched or the person pointed you to: an app another agent is driving returns computer_app_busy. computer_unavailable or computer_permissions means only the person can finish setup (Diri Settings › Agents › Computer use): tell them, and don't try to install or grant anything yourself. tool \"tools\" lists every tool.",
+      "description": "Use this Mac's apps the way a person would, in the background: any native app (Simulator, TextEdit, Xcode, Finder, the app you are building) and browser pages. The person's cursor, keyboard and focus stay theirs; your actions show as your own labelled cursor. Pass tool and args. Loop: (1) launch_app {bundle_id or name, creates_new_application_instance:true} returns your own pid and windows (or list_windows {pid}); (2) get_window_state {pid, window_id} returns accessibility rows [N] plus a screenshot; (3) act with element_token \"<snapshot_id>:N\" (click, type_text {text}, set_value, set_state {state: checked|expanded|focused...}, clear_value, press_key {key}, hotkey {keys}, scroll) or with pixel x,y from that screenshot; (4) re-read with get_window_state {since:\"latest\"} and check the change before going on. run_steps runs several actions in one call; wait blocks until an element, window or dialog appears or goes. Everything stays in the background while the person keeps working: scope \"desktop\", bring_to_front and activate_app are always refused with computer_foreground_denied, even when a driver hint recommends them. When no background route reaches a control (a file picker, a system dialog, a sheet), retry that one action with delivery_mode \"foreground\": it fronts the window for a moment, then gives the person's app back. It needs the person's leave (Diri Settings › Agents › Computer use › Foreground actions; under Ask the call waits for their answer); if it is refused, tell the person what you need instead. A failed action's disposition.retry says whether retrying is safe; a stale_element_token means read again. Act only on apps you launched or the person pointed you to: an app another agent is driving returns computer_app_busy. computer_unavailable or computer_permissions means only the person can finish setup (Diri Settings › Agents › Computer use): tell them, and don't try to install or grant anything yourself. tool \"tools\" lists every tool. A task you'll repeat: check app_skills, which replays learned app tasks without a model.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -1127,6 +1133,80 @@
         "type": "object"
       },
       "name": "computer"
+    },
+    {
+      "description": "App Skills: tasks computer use learned once in a Mac app, saved per app and replayed later without a model (fast, no screenshots). Before doing a repeated app task by hand with the computer tool, call list. To teach one: learn {app, goal}, do the task once with the computer tool, trace, edit the draft (params as {name} placeholders, one intent per step), then save {skill, example_args}, which replays it to verify. run {app, skill, args} or args_list for many items. A failed run returns the failing step, its intent, the driver error and the current window: fix the steps and save again. Read get_skill {\"name\":\"app-skills\"} first.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "list",
+              "learn",
+              "trace",
+              "save",
+              "run",
+              "forget",
+              "history",
+              "rollback",
+              "abandon"
+            ],
+            "type": "string"
+          },
+          "app": {
+            "description": "App name or bundle id (learn, run, forget, history, rollback; list filter).",
+            "type": "string"
+          },
+          "args": {
+            "description": "run: param values for one run.",
+            "type": "object"
+          },
+          "args_list": {
+            "description": "run: one args object per item; each runs in turn.",
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "confirm": {
+            "description": "run: required for a destructive skill over several items, only after the person agreed.",
+            "type": "boolean"
+          },
+          "continue_on_error": {
+            "description": "run with args_list: keep going after a failed item.",
+            "type": "boolean"
+          },
+          "example_args": {
+            "description": "save: param values to verify the skill with.",
+            "type": "object"
+          },
+          "goal": {
+            "description": "learn: the task in one sentence.",
+            "type": "string"
+          },
+          "skill": {
+            "description": "run/forget/history/rollback: the skill name. save: the skill object {name, goal, params:[{name,type,description}], steps, preconditions?, postconditions?, destructive?}."
+          },
+          "verify": {
+            "description": "save: how far verification replays. Default full; until_last for destructive skills.",
+            "enum": [
+              "full",
+              "until_last",
+              "none"
+            ],
+            "type": "string"
+          },
+          "version": {
+            "description": "rollback: the version to restore.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      },
+      "name": "app_skills"
     },
     {
       "description": "Open an HTTP request in the API tab of YOUR session's right panel in Diri, prefilled, so the person can inspect, edit and send it. Use it whenever you build, run or debug an HTTP API: after starting a dev server, open the endpoint you just added or changed (e.g. GET http://localhost:3000/api/health) instead of only pasting a curl command. Put {{name}} placeholders in url/headers/body and pass their values in variables (marking tokens in secrets so they are masked); they land in the project's environment (environment names it, default the active one or \"Local\"). json sets a JSON body and its Content-Type; body sends text as written. auto_send:true sends a GET immediately and shows the response; any other method is never sent until the person presses Send. The call returns once the tab is open, without the response.",

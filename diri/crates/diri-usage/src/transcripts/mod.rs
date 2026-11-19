@@ -5,6 +5,7 @@ pub mod dashboard;
 mod model;
 mod parser;
 mod pricing;
+pub mod skills;
 mod store;
 pub mod timestamp;
 pub use model::{

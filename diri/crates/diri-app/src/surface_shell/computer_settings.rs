@@ -152,9 +152,9 @@ impl UtilitySurfaces {
             }
         }
         if self
-                .computer_guide
-                .last_restart
-                .is_none_or(|at| at.elapsed() >= RESTART_EVERY)
+            .computer_guide
+            .last_restart
+            .is_none_or(|at| at.elapsed() >= RESTART_EVERY)
         {
             self.computer_guide.last_restart = Some(Instant::now());
             self.store
@@ -197,9 +197,8 @@ impl UtilitySurfaces {
             }
             "failed" => {
                 status.version = None;
-                status.install_error = Some(
-                    "Couldn't reach the download. Check the connection and try again.".into(),
-                );
+                status.install_error =
+                    Some("Couldn't reach the download. Check the connection and try again.".into());
                 status.install_log = Some(
                     "==> downloading https://github.com/cristicretu/cua/releases/download/\
                      cua-driver-rs-v0.36.1-diri/cua-driver-rs-0.36.1-diri-darwin-universal-binary.tar.gz\n\
@@ -229,6 +228,14 @@ impl UtilitySurfaces {
                 if state == "foreground-menu" {
                     self.settings_menu = Some(SettingsMenu::ComputerForeground);
                 }
+            }
+            "learned" => {
+                status.accessibility = Some(true);
+                status.screen_recording = Some(true);
+                self.store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .seed_app_skills(learned_preview());
             }
             _ => {}
         }
@@ -340,9 +347,10 @@ impl UtilitySurfaces {
         };
         body = body.child(headline);
 
-        if let Some(status) = status.as_ref().filter(|status| {
-            status.installed() && !status.installing && !status.outdated
-        }) {
+        if let Some(status) = status
+            .as_ref()
+            .filter(|status| status.installed() && !status.installing && !status.outdated)
+        {
             for step in [GrantStep::Accessibility, GrantStep::ScreenRecording] {
                 body = body
                     .child(setting_divider(colors))
@@ -420,7 +428,150 @@ impl UtilitySurfaces {
                 );
             }
         }
-        Some(setting_section(t("settings.computer.section"), body, colors).into_any_element())
+        let setup = setting_section(t("settings.computer.section"), body, colors);
+        let Some(skills) = self.learned_apps(cx) else {
+            return Some(setup.into_any_element());
+        };
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(SETTINGS_SECTION_GAP))
+                .child(setup)
+                .child(skills)
+                .into_any_element(),
+        )
+    }
+
+    /// Learned apps: each app's App Skills, with how far each can be
+    /// trusted and when it last ran. Hidden until an Agent saves one.
+    fn learned_apps(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let colors = self.settings_colors();
+        let list = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .app_skills()
+            .cloned()?;
+        if list.apps.is_empty() {
+            return None;
+        }
+        let mut body = div().flex().flex_col();
+        for (index, app) in list.apps.iter().enumerate() {
+            if index > 0 {
+                body = body.child(setting_divider(colors));
+            }
+            body = body.child(
+                div()
+                    .px(px(12.0))
+                    .pt(px(9.0))
+                    .pb(px(3.0))
+                    .flex()
+                    .items_baseline()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(colors.primary)
+                            .child(app.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(colors.tertiary)
+                            .child(app.bundle_id.clone()),
+                    ),
+            );
+            for skill in &app.skills {
+                body = body.child(self.learned_skill_row(&app.bundle_id, skill, colors, cx));
+            }
+        }
+        Some(
+            setting_section(t("settings.computer.skills_section"), body, colors).into_any_element(),
+        )
+    }
+
+    fn learned_skill_row(
+        &self,
+        app: &str,
+        skill: &diri_proto::AppSkillSummary,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (status, dot) = match skill.status {
+            diri_proto::AppSkillStatus::Verified => (
+                t("settings.computer.skill_verified"),
+                gpui::Hsla::from(Ink::FRESH),
+            ),
+            diri_proto::AppSkillStatus::Unverified => (
+                t("settings.computer.skill_unverified"),
+                gpui::Hsla::from(Ink::ATTENTION),
+            ),
+            diri_proto::AppSkillStatus::Broken => (
+                t("settings.computer.skill_broken"),
+                gpui::Hsla::from(Ink::DANGER),
+            ),
+        };
+        let version = skill.version.to_string();
+        let detail = match skill.last_run_at {
+            Some(at) => tf(
+                "settings.computer.skill_detail",
+                &[
+                    ("status", &status),
+                    ("version", &version),
+                    ("when", &crate::details_ui::relative_time(at as f64)),
+                ],
+            ),
+            None => tf(
+                "settings.computer.skill_never_run",
+                &[("status", &status), ("version", &version)],
+            ),
+        };
+        let (app, name) = (app.to_owned(), skill.name.clone());
+        div()
+            .id(SharedString::from(format!("app-skill-{app}-{name}")))
+            .min_h(px(SETTINGS_ROW_HEIGHT))
+            .px(px(12.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(12.0))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(div().flex_none().size(px(6.0)).rounded_full().bg(dot))
+                    .child(setting_text_stack(
+                        skill.name.replace('_', " ").into(),
+                        skill.goal.clone().into(),
+                        colors,
+                    )),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(11.0))
+                    .text_color(colors.tertiary)
+                    .child(detail),
+            )
+            .child(surface_button(
+                t("settings.computer.skill_delete"),
+                format!("app-skill-delete-{app}-{name}"),
+                colors,
+                cx,
+                move |this, cx| {
+                    this.store
+                        .write()
+                        .expect("session store lock poisoned")
+                        .forget_app_skill(app.clone(), name.clone());
+                    cx.notify();
+                },
+            ))
+            .into_any_element()
     }
 
     /// Settings › Agents › Computer use › Foreground actions: whether
@@ -529,9 +680,15 @@ impl UtilitySurfaces {
                 ))
                 .into_any_element()
         } else {
-            surface_button(t("settings.computer.allow"), id, colors, cx, move |this, cx| {
-                this.open_grant_guide(step, cx);
-            })
+            surface_button(
+                t("settings.computer.allow"),
+                id,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.open_grant_guide(step, cx);
+                },
+            )
             .into_any_element()
         };
         setting_row(label, detail, control, colors).into_any_element()
@@ -543,6 +700,59 @@ fn foreground_title(foreground: diri_proto::ComputerForeground) -> &'static str 
         diri_proto::ComputerForeground::Off => t("settings.computer.foreground_off"),
         diri_proto::ComputerForeground::Ask => t("settings.computer.foreground_ask"),
         diri_proto::ComputerForeground::Always => t("settings.computer.foreground_always"),
+    }
+}
+
+/// Screenshot fixtures: three skills in two apps, one of each status.
+#[cfg(test)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn learned_preview() -> diri_proto::AppSkillsList {
+    use diri_proto::{AppSkillStatus, AppSkillSummary, AppSkillsApp};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64);
+    let skill = |name: &str, goal: &str, status, version, ago_min: Option<u64>| AppSkillSummary {
+        name: name.into(),
+        goal: goal.into(),
+        status,
+        version,
+        last_run_at: ago_min.map(|min| now - min * 60_000),
+        ..Default::default()
+    };
+    diri_proto::AppSkillsList {
+        apps: vec![
+            AppSkillsApp {
+                bundle_id: "com.apple.Numbers".into(),
+                name: "Numbers".into(),
+                skills: vec![
+                    skill(
+                        "add_expense_row",
+                        "Add an expense row with a date, payee and amount",
+                        AppSkillStatus::Verified,
+                        3,
+                        Some(12),
+                    ),
+                    skill(
+                        "export_pdf",
+                        "Export the open spreadsheet as a PDF",
+                        AppSkillStatus::Unverified,
+                        1,
+                        None,
+                    ),
+                ],
+            },
+            AppSkillsApp {
+                bundle_id: "com.apple.reminders".into(),
+                name: "Reminders".into(),
+                skills: vec![skill(
+                    "add_reminder",
+                    "Add a reminder to a list",
+                    AppSkillStatus::Broken,
+                    2,
+                    Some(60 * 26),
+                )],
+            },
+        ],
     }
 }
 

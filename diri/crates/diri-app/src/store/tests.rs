@@ -1357,6 +1357,13 @@ fn cold_boot_only_auto_resumes_the_selected_session() {
     );
 }
 
+fn prefs_with_close_confirmation() -> Prefs {
+    Prefs {
+        confirm_before_closing_session: true,
+        ..Prefs::default()
+    }
+}
+
 #[test]
 fn close_confirmation_only_gates_running_sessions() {
     let running = session("running", "p", 2.0);
@@ -1371,7 +1378,7 @@ fn close_confirmation_only_gates_running_sessions() {
     let (mut store, mut effects) = hydrated(
         vec![running, exited],
         vec![project("p", "P")],
-        Prefs::default(),
+        prefs_with_close_confirmation(),
     );
     drain(&mut effects);
 
@@ -1429,7 +1436,7 @@ fn closing_an_exited_parent_confirms_for_its_running_auxiliary_terminal() {
     let (mut store, mut effects) = hydrated(
         exited_parent_with_terminal(true),
         vec![project("p", "P")],
-        Prefs::default(),
+        prefs_with_close_confirmation(),
     );
     drain(&mut effects);
 
@@ -1465,7 +1472,7 @@ fn closed_terminal_tab_is_not_counted_when_closing_its_parent() {
     let (mut store, mut effects) = hydrated(
         vec![parent, terminal],
         vec![project("p", "P")],
-        Prefs::default(),
+        prefs_with_close_confirmation(),
     );
     drain(&mut effects);
 
@@ -1489,7 +1496,7 @@ fn closing_an_exited_parent_with_an_exited_terminal_needs_no_confirmation() {
     let (mut store, mut effects) = hydrated(
         exited_parent_with_terminal(false),
         vec![project("p", "P")],
-        Prefs::default(),
+        prefs_with_close_confirmation(),
     );
     drain(&mut effects);
 
@@ -1511,7 +1518,7 @@ fn idle_shells_close_without_confirmation() {
     let (mut store, mut effects) = hydrated(
         vec![idle, busy],
         vec![project("p", "P")],
-        Prefs::default(),
+        prefs_with_close_confirmation(),
     );
     drain(&mut effects);
 
@@ -1790,10 +1797,7 @@ fn a_closing_row_leaves_at_once_and_ignores_further_clicks() {
     let (mut store, mut effects) = hydrated(
         vec![session("one", "p", 2.0), session("two", "p", 1.0)],
         vec![project("p", "P")],
-        Prefs {
-            confirm_before_closing_session: false,
-            ..Prefs::default()
-        },
+        Prefs::default(),
     );
     drain(&mut effects);
 
@@ -1979,7 +1983,7 @@ fn a_pending_confirmation_hides_the_row_only_once_confirmed() {
     let (mut store, mut effects) = hydrated(
         vec![session("one", "p", 2.0)],
         vec![project("p", "P")],
-        Prefs::default(),
+        prefs_with_close_confirmation(),
     );
     drain(&mut effects);
 
@@ -2042,6 +2046,19 @@ fn additional_windows_round_trip_and_drop_unusable_placements() {
     assert_eq!(prefs.additional_windows.len(), 1);
     let placement = &prefs.additional_windows[0].placement;
     assert_eq!((placement.width, placement.height), (900.0, 560.0));
+}
+
+#[test]
+fn upgraded_prefs_disable_close_warnings_and_remember_a_new_opt_in() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("prefs.json");
+    std::fs::write(&path, r#"{"confirmBeforeClosingSession":true}"#).unwrap();
+
+    let mut prefs = Prefs::load(&path).unwrap();
+    assert!(!prefs.confirm_before_closing_session);
+    prefs.confirm_before_closing_session = true;
+    prefs.save(&path).unwrap();
+    assert!(Prefs::load(&path).unwrap().confirm_before_closing_session);
 }
 
 #[test]

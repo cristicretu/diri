@@ -89,6 +89,23 @@ impl SidebarProjection {
     pub fn first_active(&self) -> Option<&Arc<SessionRecord>> {
         self.projects.iter().find_map(|group| group.active.first())
     }
+
+    /// Every session ⌘K can switch to, in sidebar order: each project's
+    /// active rows whether or not a fold hides them, and an archived row only
+    /// while it is selected, as in `ordered_sessions`.
+    pub fn switchable_sessions<'a>(
+        &'a self,
+        selected: Option<&'a SessionId>,
+    ) -> impl Iterator<Item = &'a Arc<SessionRecord>> {
+        self.projects.iter().flat_map(move |group| {
+            group.active.iter().chain(
+                group
+                    .archived
+                    .iter()
+                    .filter(move |session| selected == Some(&session.id)),
+            )
+        })
+    }
 }
 
 pub(super) fn build_projection(

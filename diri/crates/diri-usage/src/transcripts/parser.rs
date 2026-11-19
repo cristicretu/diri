@@ -237,14 +237,14 @@ pub(crate) fn parse_codex(
 /// times that while `Vec` doubled. Only one line is buffered here. A trailing
 /// line without its newline is still being written: it is neither yielded
 /// nor counted, so the next scan resumes at its start.
-struct CompleteLines {
+pub(crate) struct CompleteLines {
     reader: BufReader<File>,
     line: Vec<u8>,
     consumed: u64,
 }
 
 impl CompleteLines {
-    fn open(path: &Path, offset: u64) -> io::Result<Self> {
+    pub(crate) fn open(path: &Path, offset: u64) -> io::Result<Self> {
         let mut file = File::open(path)?;
         file.seek(SeekFrom::Start(offset))?;
         Ok(Self {
@@ -256,7 +256,7 @@ impl CompleteLines {
 
     /// The next complete line without its newline, or `None` at the end of
     /// the complete lines.
-    fn next_line(&mut self) -> io::Result<Option<&[u8]>> {
+    pub(crate) fn next_line(&mut self) -> io::Result<Option<&[u8]>> {
         self.line.clear();
         let read = match self.reader.read_until(b'\n', &mut self.line) {
             Ok(read) => read,
@@ -274,7 +274,7 @@ impl CompleteLines {
     }
 
     /// Bytes of the complete lines yielded so far.
-    fn consumed(&self) -> u64 {
+    pub(crate) fn consumed(&self) -> u64 {
         self.consumed
     }
 }

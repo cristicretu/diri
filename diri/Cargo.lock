@@ -1908,6 +1908,7 @@ dependencies = [
  "diri-platform",
  "diri-proto",
  "libc",
+ "memchr",
  "serde",
  "serde_json",
  "tempfile",

@@ -1189,6 +1189,21 @@ impl DaemonClient {
             .await
     }
 
+    /// `computer.skills` `summary`: every App Skill, for Settings.
+    pub async fn app_skills(&self) -> Result<diri_proto::AppSkillsList, ClientError> {
+        self.core
+            .request_typed(
+                Method::COMPUTER_SKILLS,
+                Some(&diri_proto::ComputerSkillsParams {
+                    session_id: None,
+                    action: "summary".into(),
+                    args: serde_json::Value::Null,
+                }),
+                Some(Duration::from_secs(10)),
+            )
+            .await
+    }
+
     /// `computer.foreground_answer`: the person's answer to a foreground
     /// request.
     pub async fn computer_foreground_answer(
@@ -1217,6 +1232,22 @@ impl DaemonClient {
                 Some(Duration::from_secs(10)),
             )
             .await
+    }
+
+    /// `computer.skills` `forget`: deletes one App Skill and its versions.
+    pub async fn forget_app_skill(&self, app: &str, skill: &str) -> Result<(), ClientError> {
+        self.core
+            .request_typed::<_, serde_json::Value>(
+                Method::COMPUTER_SKILLS,
+                Some(&diri_proto::ComputerSkillsParams {
+                    session_id: None,
+                    action: "forget".into(),
+                    args: serde_json::json!({"app": app, "skill": skill}),
+                }),
+                Some(Duration::from_secs(10)),
+            )
+            .await
+            .map(|_| ())
     }
 
     /// `agent.configure`: writes the preference, then answers with the same

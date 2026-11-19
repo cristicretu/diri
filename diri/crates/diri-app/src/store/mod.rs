@@ -229,6 +229,8 @@ pub enum StoreEffect {
     AnswerComputerForeground(diri_proto::ComputerForegroundAnswerParams),
     /// Take foreground back from one session, or from all.
     RevokeComputerForeground(Option<SessionId>),
+    /// Delete one learned App Skill (Settings › Computer use).
+    ForgetAppSkill { app: String, skill: String },
     /// Rescan this Mac until the Agent the user is installing appears.
     WatchAgentInstall {
         kind: AgentKind,
@@ -5093,6 +5095,16 @@ async fn run_effects(
                 computer::apply_status(status, &store, &change_tx);
                 Ok(())
             }
+            StoreEffect::ForgetAppSkill { app, skill } => {
+                tokio::spawn(computer::forget_skill(
+                    app,
+                    skill,
+                    Arc::clone(&client),
+                    Arc::clone(&store),
+                    change_tx.clone(),
+                ));
+                Ok(())
+            }
             StoreEffect::WatchAgentInstall { kind, display_name } => {
                 let client = Arc::clone(&client);
                 let store = Arc::clone(&store);
@@ -5306,6 +5318,7 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         // Setup outcomes render in place in Settings › Agents.
         StoreEffect::WatchComputer
         | StoreEffect::ComputerSetup(_)
+        | StoreEffect::ForgetAppSkill { .. }
         | StoreEffect::ConfigureComputer(_)
         | StoreEffect::RevokeComputerForeground(_) => return None,
         StoreEffect::AnswerComputerForeground(_) => ("Answer to computer use failed", None),

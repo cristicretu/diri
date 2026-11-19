@@ -23,7 +23,9 @@ use diri_proto::ComputerForeground;
 use serde_json::{Map, Value, json};
 
 mod setup;
+mod skills;
 pub use setup::{Download, TESTED_VERSION};
+pub use skills::{SKILL_CONFIRM, SKILL_INVALID, SKILL_NEEDS_SESSION, SKILL_NOT_FOUND};
 
 /// No calls for this long → close the driver pipe. Matches the daemon's own
 /// session expiry, so cursors and the pipe go away together.
@@ -202,6 +204,8 @@ struct Shared {
     events: OnceLock<crate::events::EventBus>,
     /// Which life of an open session is running now; see [`Life`].
     life: OnceLock<Box<Life>>,
+    /// Learned app tasks, under `root/app-skills`.
+    skills: skills::AppSkills,
 }
 
 /// The current life of an open session: an opaque key that changes when its
@@ -538,7 +542,7 @@ impl ComputerUse {
                 pending: Mutex::new(HashMap::new()),
                 incarnation: AtomicU64::new(0),
                 binary,
-                root,
+                root: root.clone(),
                 socket,
                 download,
                 setup: Mutex::new(setup::SetupState::default()),
@@ -546,6 +550,7 @@ impl ComputerUse {
                 foreground_answered: Condvar::new(),
                 events: OnceLock::new(),
                 life: OnceLock::new(),
+                skills: skills::AppSkills::new(root.join("app-skills")),
             }),
         }
     }
@@ -608,6 +613,27 @@ impl ComputerUse {
     /// `tools` for the catalog. `is_live` answers whether a session exists,
     /// so leases held by ended sessions are reclaimed.
     pub fn act(
+        &self,
+        caller: &Caller<'_>,
+        tool: &str,
+        args: Value,
+        is_live: &dyn Fn(&str) -> bool,
+    ) -> Result<Value, ComputerError> {
+        // A session learning an App Skill has its actions written down;
+        // every other call skips this with one atomic load.
+        if !self.shared.skills.is_learning(caller.session_id) {
+            return self.act_unrecorded(caller, tool, args, is_live);
+        }
+        let recorded = args.as_object().cloned().unwrap_or_default();
+        let result = self.act_unrecorded(caller, tool, args, is_live);
+        self.shared
+            .skills
+            .observe(caller.session_id, tool, &recorded, result.as_ref().ok());
+        result
+    }
+
+    /// [`Self::act`] without learn-mode recording: App Skills replay here.
+    fn act_unrecorded(
         &self,
         caller: &Caller<'_>,
         tool: &str,

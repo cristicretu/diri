@@ -17,6 +17,9 @@ use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
 use crate::skills_catalog::{self, Catalog, Scope};
 use crate::store::SessionStore;
 
+mod usage;
+use usage::View;
+
 pub struct SkillsPage {
     store: Arc<RwLock<SessionStore>>,
     focus: FocusHandle,
@@ -40,6 +43,8 @@ pub struct SkillsPage {
     copy_feedback_task: Option<Task<()>>,
     list_scroll: UniformListScrollHandle,
     detail_scroll: ScrollHandle,
+    view: View,
+    usage: usage::UsageState,
 }
 
 impl SkillsPage {
@@ -90,6 +95,8 @@ impl SkillsPage {
             copy_feedback_task: None,
             list_scroll: UniformListScrollHandle::new(),
             detail_scroll: ScrollHandle::new(),
+            view: View::Catalog,
+            usage: usage::UsageState::default(),
         }
     }
 
@@ -97,6 +104,17 @@ impl SkillsPage {
         if !self.loaded || self.project != project {
             self.project = project;
             self.refresh(cx);
+        }
+        if self.view == View::Usage {
+            self.refresh_usage(cx);
+        }
+    }
+
+    /// Where focus returns when a skill's detail closes.
+    fn list_target(&self) -> usize {
+        match self.view {
+            View::Catalog => 6,
+            View::Usage => 0,
         }
     }
 
@@ -107,7 +125,7 @@ impl SkillsPage {
         self.clear_copy_feedback();
         // Detail-view targets (Back/Copy/Show file) mean nothing in the list.
         if self.selected.take().is_some() {
-            self.keyboard_target = 6;
+            self.keyboard_target = self.list_target();
         }
         self.document = None;
         self.instructions = None;
@@ -137,6 +155,7 @@ impl SkillsPage {
                     ..Catalog::default()
                 });
                 this.refilter();
+                this.recompute_usage();
                 cx.notify();
             });
         }));
@@ -232,7 +251,7 @@ impl SkillsPage {
         self.document = None;
         self.instructions = None;
         self.detail_task = None;
-        self.keyboard_target = 6;
+        self.keyboard_target = self.list_target();
         cx.notify();
     }
 
@@ -240,7 +259,11 @@ impl SkillsPage {
         let key = &event.keystroke;
         let handled = match key.key.as_str() {
             "tab" => {
-                let count = if self.selected.is_some() { 3 } else { 7 };
+                let count = match (self.selected.is_some(), self.view) {
+                    (true, _) => 3,
+                    (false, View::Usage) => 4,
+                    (false, View::Catalog) => 8,
+                };
                 self.keyboard_target = (self.keyboard_target
                     + if key.modifiers.shift { count - 1 } else { 1 })
                     % count;
@@ -267,7 +290,19 @@ impl SkillsPage {
                 }
                 true
             }
-            "up" | "down" if self.selected.is_none() && self.keyboard_target == 6 => {
+            "enter" | "space" if self.selected.is_none() && self.view == View::Usage => {
+                match self.keyboard_target {
+                    0 => self.set_view(View::Catalog, cx),
+                    target @ 1..=3 => self.set_usage_days(usage::RANGES[target - 1], cx),
+                    _ => {}
+                }
+                true
+            }
+            "up" | "down"
+                if self.selected.is_none()
+                    && self.view == View::Catalog
+                    && self.keyboard_target == 6 =>
+            {
                 if key.key == "up" {
                     self.highlighted = self.highlighted.saturating_sub(1);
                 } else {
@@ -284,6 +319,7 @@ impl SkillsPage {
                 match self.keyboard_target {
                     1..=4 => self.select_scope(Scope::ALL[self.keyboard_target - 1], cx),
                     5 => self.refresh(cx),
+                    7 => self.set_view(View::Usage, cx),
                     _ => {
                         if let Some(&index) = self.matches.get(self.highlighted) {
                             self.open_skill(index, cx);
@@ -292,7 +328,10 @@ impl SkillsPage {
                 }
                 true
             }
-            _ if self.selected.is_none() && self.keyboard_target == 0 => {
+            _ if self.selected.is_none()
+                && self.view == View::Catalog
+                && self.keyboard_target == 0 =>
+            {
                 if let Some(edit) = query_editor::edit_for(key) {
                     match edit {
                         Edit::Local(local) => {
@@ -396,9 +435,19 @@ impl Render for SkillsPage {
             .text_color(colors.primary)
             .child(
                 div()
-                    .text_size(px(20.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(t("settings.tab.skills")),
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .text_size(px(20.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(t("settings.tab.skills")),
+                    )
+                    .when(self.selected.is_none(), |row| {
+                        row.child(self.view_switch(colors, cx))
+                    }),
             );
         if let Some(index) = self.selected {
             let skill = &self.catalog.skills[index];
@@ -496,6 +545,9 @@ impl Render for SkillsPage {
                     .track_scroll(&self.detail_scroll)
                     .child(content),
             );
+        }
+        if self.view == View::Usage {
+            return self.render_usage(page, body_height, colors, cx);
         }
         page = page.child(
             div()

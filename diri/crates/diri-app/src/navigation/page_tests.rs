@@ -1097,6 +1097,7 @@ fn search_notes_opens_live_archived_and_orphan_notes(cx: &mut TestAppContext) {
     assert_eq!(
         opened.borrow().last(),
         Some(&NoteOpened {
+            live_session: Some(SessionId::new("s_live_note")),
             note_id: live.clone(),
             block: Some(1),
         })
@@ -1119,6 +1120,7 @@ fn search_notes_opens_live_archived_and_orphan_notes(cx: &mut TestAppContext) {
     assert_eq!(
         opened.borrow().last(),
         Some(&NoteOpened {
+            live_session: None,
             note_id: archived.clone(),
             block: None,
         })

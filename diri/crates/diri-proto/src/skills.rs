@@ -55,7 +55,13 @@ pub const API: Skill = Skill {
     markdown: include_str!("../skills/api.md"),
 };
 
-pub const ALL: [Skill; 4] = [SCHEDULING, NOTES, ORCHESTRATION, API];
+pub const APP_SKILLS: Skill = Skill {
+    name: "app-skills",
+    description: "Doing a task in a Mac app with Diri's computer tool, especially one you'll repeat: check app_skills for a saved skill first; teach one (learn, trace, save), replay it with args or args_list, and repair it when a run breaks.",
+    markdown: include_str!("../skills/app-skills.md"),
+};
+
+pub const ALL: [Skill; 5] = [SCHEDULING, NOTES, ORCHESTRATION, API, APP_SKILLS];
 
 pub fn find(name: &str) -> Option<Skill> {
     let name = name.trim().trim_start_matches("diri:");

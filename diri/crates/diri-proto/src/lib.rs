@@ -14,10 +14,11 @@ pub use api_request::{
     SessionOpenApiRequestParams,
 };
 pub use computer::{
-    ComputerActParams, ComputerConfigureParams, ComputerForeground, ComputerForegroundAnswerParams,
+    AppSkillStatus, AppSkillSummary, AppSkillsApp, AppSkillsList, ComputerActParams,
+    ComputerConfigureParams, ComputerForeground, ComputerForegroundAnswerParams,
     ComputerForegroundChangedEvent, ComputerForegroundRequestedEvent,
     ComputerForegroundRevokeParams, ComputerSetupAction, ComputerSetupNeededEvent,
-    ComputerSetupParams, ComputerStatus, ComputerStatusParams,
+    ComputerSetupParams, ComputerSkillsParams, ComputerStatus, ComputerStatusParams,
 };
 pub mod control;
 pub mod find;

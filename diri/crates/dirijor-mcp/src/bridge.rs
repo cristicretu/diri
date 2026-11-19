@@ -150,6 +150,7 @@ impl Bridge {
             "test_run" => self.test_run(arguments),
             "browser" => self.browser(arguments),
             "computer" => self.computer(arguments),
+            "app_skills" => self.app_skills(arguments),
             "open_api_request" => self.open_api_request(arguments),
             "list_actions" => self.list_actions(arguments),
             "perform_action" => self.perform_action(arguments),
@@ -662,6 +663,28 @@ impl Bridge {
         )
     }
 
+    /// App Skills: learned app tasks, replayed by the Engine through the
+    /// same path as `computer`, under the caller's badge and leases.
+    fn app_skills(&self, arguments: &Value) -> Result<Value, String> {
+        let snapshot = self.snapshot()?;
+        McpPolicy::new(
+            &snapshot.sessions,
+            &snapshot.projects,
+            self.caller.as_deref(),
+        )?
+        .authorize(WriteAction::Computer)?;
+        let caller = self.caller.as_ref().expect("policy requires a caller");
+        let action = required_string(arguments, "action")?;
+        let mut args = arguments.as_object().cloned().unwrap_or_default();
+        args.remove("action");
+        self.request(
+            Method::COMPUTER_SKILLS,
+            json!({"sessionID": caller, "action": action, "args": Value::Object(args)}),
+            // A run of many items stops starting new ones after ten minutes.
+            Duration::from_secs(15 * 60),
+        )
+    }
+
     fn test_run(&self, arguments: &Value) -> Result<Value, String> {
         let snapshot = self.snapshot()?;
         McpPolicy::new(
@@ -1128,7 +1151,7 @@ fn render_failure(error: ControlFailure) -> String {
 fn get_skill(arguments: &Value) -> Result<Value, String> {
     let name = required_string(arguments, "name")?;
     let skill = diri_proto::skills::find(&name).ok_or_else(|| {
-        format!("unknown skill {name:?}; use scheduling, notes, or orchestration")
+        format!("unknown skill {name:?}; use scheduling, notes, orchestration, api, or app-skills")
     })?;
     Ok(json!({
         "name": skill.name,

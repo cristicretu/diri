@@ -147,7 +147,7 @@ fn summaries_end_at_the_first_sentence() {
 /// catalog, and echoes each call's request line back as structured content.
 const FAKE_DRIVER: &str = r#"#!/bin/sh
 case "$1" in
-  --version) printf 'cua-driver %s\n' "$(cat "$0.version" 2>/dev/null || echo 0.38.4)"; exit 0 ;;
+  --version) printf 'cua-driver %s\n' "$(cat "$0.version" 2>/dev/null || echo 0.53.1)"; exit 0 ;;
   call)
     [ "$2" = check_permissions ] || exit 2
     cat "$0.grants" 2>/dev/null || printf '{"accessibility":true,"screen_recording":true}\n'
@@ -1389,4 +1389,312 @@ fn a_foreground_action_waits_for_the_persons_answer() {
             "a closed session is not asked again"
         );
     }
+}
+
+#[test]
+fn only_a_learning_session_has_its_actions_recorded() {
+    let temp = tempfile::tempdir().unwrap();
+    let computer = ComputerUse::with_paths(
+        Some(fake_driver(temp.path())),
+        temp.path().join("root"),
+        temp.path().join("cua-driver.sock"),
+        Download::default(),
+    );
+    let live = |_: &str| true;
+    let learner = caller("s-learn", "Codex · learn");
+    let other = caller("s-other", "Claude · other");
+    let learned = computer
+        .skills(
+            Some(&learner),
+            "learn",
+            &json!({"app": "com.apple.TextEdit", "goal": "Type a note"}),
+            &live,
+        )
+        .unwrap();
+    assert_eq!(learned["app"]["bundle_id"], "com.apple.TextEdit");
+
+    computer
+        .act(&learner, "type_text", json!({"text": "hello"}), &live)
+        .unwrap();
+    computer
+        .act(&other, "type_text", json!({"text": "not mine"}), &live)
+        .unwrap();
+    let trace = computer
+        .skills(Some(&learner), "trace", &json!({}), &live)
+        .unwrap();
+    let steps = trace["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 1, "{trace}");
+    assert_eq!(steps[0]["args"]["text"], "hello");
+    assert!(
+        computer
+            .skills(Some(&other), "trace", &json!({}), &live)
+            .is_err()
+    );
+    computer.end_skill_learning("s-learn");
+    assert!(
+        computer
+            .skills(Some(&learner), "trace", &json!({}), &live)
+            .is_err()
+    );
+    // Settings lists without a session.
+    let listed = computer.skills(None, "summary", &json!({}), &live).unwrap();
+    assert_eq!(listed["apps"], json!([]));
+}
+
+/// Opt-in live check against the real driver and a throwaway accessory probe
+/// app (never the person's apps): learn a 3-step skill, save it (verified),
+/// "update" the app so the first button is renamed, watch the run fail with
+/// a repair payload, repair it, then run three items.
+///
+/// `DIRI_LIVE_CUA_DRIVER=<path to cua-driver>` and
+/// `DIRI_LIVE_SKILLS_PROBE=<dir with build.sh and SkillProbe.app>`. Must run
+/// from a process that holds Accessibility (a Diri terminal). The probe is
+/// killed and the temporary skills store removed at the end.
+#[test]
+#[ignore = "drives a real Cua Driver and a probe app"]
+fn live_app_skills_round_trip() {
+    use std::process::Command;
+    let driver =
+        PathBuf::from(std::env::var("DIRI_LIVE_CUA_DRIVER").expect("DIRI_LIVE_CUA_DRIVER"));
+    let probe_dir =
+        PathBuf::from(std::env::var("DIRI_LIVE_SKILLS_PROBE").expect("DIRI_LIVE_SKILLS_PROBE"));
+    const BUNDLE: &str = "dev.diri.skillprobe";
+    let launch = |version: &str, title: &str| {
+        let built = Command::new(probe_dir.join("build.sh"))
+            .args([version, title])
+            .status()
+            .unwrap();
+        assert!(built.success());
+        let child = Command::new(probe_dir.join("SkillProbe.app/Contents/MacOS/probe"))
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+        child
+    };
+    let temp = tempfile::tempdir().unwrap();
+    // Laid out as setup installs it, so Diri starts and stops its own daemon.
+    let installed = temp.path().join("root").join(TESTED_VERSION);
+    std::fs::create_dir_all(&installed).unwrap();
+    std::os::unix::fs::symlink(&driver, installed.join("cua-driver")).unwrap();
+    let computer = ComputerUse::with_paths(
+        None,
+        temp.path().join("root"),
+        PathBuf::from("/tmp/diri-skl/s.sock"),
+        Download::default(),
+    );
+    let live = |_: &str| true;
+    let me = caller("s-live", "Diri · skills probe");
+    let mut probe = launch("1.0", "Add Item");
+
+    // Learning pass, as an Agent would do it.
+    let learning = Instant::now();
+    computer
+        .skills(
+            Some(&me),
+            "learn",
+            &json!({"app": BUNDLE, "goal": "Add an item with a title"}),
+            &live,
+        )
+        .unwrap();
+    let windows = computer
+        .act(&me, "list_windows", json!({"app": BUNDLE}), &live)
+        .unwrap();
+    let window = &windows["mcpToolResult"]["structuredContent"]["windows"][0];
+    let (pid, window_id) = (
+        window["pid"].as_i64().unwrap(),
+        window["window_id"].as_i64().unwrap(),
+    );
+    let read = computer
+        .act(
+            &me,
+            "get_window_state",
+            json!({"pid": pid, "window_id": window_id, "include_screenshot": false}),
+            &live,
+        )
+        .unwrap();
+    let state = &read["mcpToolResult"]["structuredContent"];
+    let snapshot = state["snapshot_id"].as_str().unwrap().to_owned();
+    let tree = state["tree_markdown"].as_str().unwrap().to_owned();
+    eprintln!("tree:\n{tree}");
+    let row = |role: &str, label: &str| -> String {
+        let line = tree
+            .lines()
+            .find(|line| {
+                line.contains(role) && line.contains(&format!("\"{label}\""))
+                    || line.contains(role) && line.contains(&format!("({label})"))
+            })
+            .unwrap_or_else(|| panic!("no {role} {label}"));
+        let index = line.split('[').nth(1).unwrap().split(']').next().unwrap();
+        format!("{snapshot}:{index}")
+    };
+    let add = row("AXButton", "Add Item");
+    let save_before: i64 = row("AXButton", "Save")
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    computer
+        .act(
+            &me,
+            "click",
+            json!({"element_token": add, "pid": pid, "window_id": window_id}),
+            &live,
+        )
+        .unwrap();
+    // The field only takes a token once enabled: read again, as a diff.
+    let reread = computer
+        .act(
+            &me,
+            "get_window_state",
+            json!({"pid": pid, "window_id": window_id, "include_screenshot": false, "since": "latest"}),
+            &live,
+        )
+        .unwrap();
+    let state = &reread["mcpToolResult"]["structuredContent"];
+    eprintln!(
+        "reread: {}",
+        state["tree_diff"]
+            .as_str()
+            .or(state["tree_markdown"].as_str())
+            .unwrap_or("")
+    );
+    let snapshot = state["snapshot_id"].as_str().unwrap().to_owned();
+    let tree = state["tree_diff"]
+        .as_str()
+        .or(state["tree_markdown"].as_str())
+        .unwrap()
+        .to_owned();
+    let row = |role: &str, label: &str| -> String {
+        let line = tree
+            .lines()
+            .find(|line| line.contains(role) && line.contains(label) && line.contains('['))
+            .unwrap_or_else(|| panic!("no {role} {label} in {tree}"));
+        let index = line.split('[').nth(1).unwrap().split(']').next().unwrap();
+        format!("{snapshot}:{index}")
+    };
+    let field = row("AXTextField", "Title");
+    let save = tree
+        .lines()
+        .find(|line| line.contains("AXButton") && line.contains("Save") && line.contains('['))
+        .map_or_else(
+            || {
+                // Unchanged but shifted: follow the `reindexed: [a-b] -> [c-d]` line.
+                let shift = tree
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("reindexed: ["))
+                    .filter_map(|run| {
+                        let (old, new) = run.split_once("] -> [")?;
+                        let (a, b) = old.split_once('-')?;
+                        let (c, _) = new.split_once('-')?;
+                        let (a, b, c): (i64, i64, i64) =
+                            (a.parse().ok()?, b.parse().ok()?, c.parse().ok()?);
+                        (a..=b).contains(&save_before).then_some(c - a)
+                    })
+                    .next()
+                    .unwrap_or(0);
+                format!("{snapshot}:{}", save_before + shift)
+            },
+            |_| row("AXButton", "Save"),
+        );
+    for (tool, args) in [
+        (
+            "set_value",
+            json!({"element_token": field, "value": "Milk", "pid": pid, "window_id": window_id}),
+        ),
+        (
+            "click",
+            json!({"element_token": save, "pid": pid, "window_id": window_id}),
+        ),
+    ] {
+        let result = computer.act(&me, tool, args, &live).unwrap();
+        eprintln!("{tool}: {}", result["mcpToolResult"]["content"][0]["text"]);
+    }
+    let learn_ms = learning.elapsed().as_millis();
+    let trace = computer
+        .skills(Some(&me), "trace", &json!({}), &live)
+        .unwrap();
+    eprintln!("trace: {trace:#}");
+    let mut steps = trace["steps"].as_array().unwrap().clone();
+    assert_eq!(steps.len(), 3);
+    steps[1]["args"]["value"] = json!("{title}");
+    steps[2]["expect"] = json!([{"text": "{title}"}]);
+    let mut skill = json!({
+        "name": "add_item",
+        "goal": "Add an item with a title",
+        "params": [{"name": "title", "type": "string", "description": "Item title"}],
+        "steps": steps,
+    });
+    let saved = computer
+        .skills(
+            Some(&me),
+            "save",
+            &json!({"skill": skill, "example_args": {"title": "Milk"}}),
+            &live,
+        )
+        .unwrap();
+    eprintln!("save: {saved:#}");
+    assert_eq!(saved["saved"], true, "{saved:#}");
+    assert_eq!(saved["status"], "verified");
+
+    // The app "updates": its first button is renamed and its version moves.
+    let _ = probe.kill();
+    let _ = probe.wait();
+    probe = launch("1.1", "New Item");
+    let broken = computer
+        .skills(
+            Some(&me),
+            "run",
+            &json!({"app": BUNDLE, "skill": "add_item", "args": {"title": "Eggs"}}),
+            &live,
+        )
+        .unwrap();
+    let mut shown = broken.clone();
+    shown["saved_skill"] = json!("(elided)");
+    eprintln!("broken run: {shown:#}");
+    assert_eq!(broken["ok"], false);
+    assert_eq!(broken["failed_step"], 0);
+
+    // Repair, as the calling Agent would.
+    skill = broken["saved_skill"].clone();
+    skill["steps"][0]["args"]["name"] = json!("New Item");
+    let repaired = computer
+        .skills(
+            Some(&me),
+            "save",
+            &json!({"skill": skill, "example_args": {"title": "Bread"}}),
+            &live,
+        )
+        .unwrap();
+    eprintln!("repair save: {repaired:#}");
+    assert_eq!(repaired["saved"], true);
+    assert_eq!(repaired["version"], 2);
+
+    let batch = computer
+        .skills(
+            Some(&me),
+            "run",
+            &json!({"app": BUNDLE, "skill": "add_item",
+                    "args_list": [{"title": "Tea"}, {"title": "Jam"}, {"title": "Rice"}]}),
+            &live,
+        )
+        .unwrap();
+    eprintln!("batch: {batch:#}");
+    assert_eq!(batch["ok"], true);
+    let history = computer
+        .skills(
+            None,
+            "history",
+            &json!({"app": BUNDLE, "skill": "add_item"}),
+            &live,
+        )
+        .unwrap();
+    eprintln!("history: {history:#}");
+    eprintln!(
+        "LEARN_MS={learn_ms} VERIFY_MS={} REPAIR_VERIFY_MS={} BATCH_MS={} BROKEN_MS={}",
+        saved["verify_ms"], repaired["verify_ms"], batch["duration_ms"], broken["duration_ms"]
+    );
+    let _ = probe.kill();
+    let _ = probe.wait();
+    computer.shutdown();
 }

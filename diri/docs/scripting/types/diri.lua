@@ -526,6 +526,12 @@ function diri.computer.setup(params, opts) end
 ---@return table # ComputerStatus
 function diri.computer.foreground_revoke(params, opts) end
 
+---App Skills: list, learn, trace, save, run, forget, history, rollback.
+---@param params {sessionID?: string, action: string, args?: any}
+---@param opts? {timeout?: number}
+---@return table # Value
+function diri.computer.skills(params, opts) end
+
 ---Move a Claude session between this Mac and a host.
 ---@param params {sessionID: string, targetHost?: string}
 ---@param opts? {timeout?: number}
