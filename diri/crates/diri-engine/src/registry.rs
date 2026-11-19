@@ -2517,6 +2517,13 @@ impl Registry {
         self.sessions.contains_key(id)
     }
 
+    #[cfg(unix)]
+    pub fn has_resumable_local_session(&self) -> bool {
+        self.records
+            .values()
+            .any(|r| r.host.is_none() && !r.is_archived() && r.can_resume())
+    }
+
     pub fn record_count(&self) -> usize {
         self.records.len()
     }

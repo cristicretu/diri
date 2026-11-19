@@ -57,6 +57,9 @@ struct ControlState {
     owner: u64,
     ownership_revision: u64,
     writer: Option<SessionAttachmentHandle>,
+    /// Admission ends at the first connection attempt. Never replay across a
+    /// reconnect: the same session id may then refer to a resumed agent.
+    startup_input: Option<Vec<u8>>,
     last_resize: Option<(u16, u16)>,
     pending_resize: Option<(u16, u16)>,
     /// The size most recently asked of the PTY by any view. Unlike
@@ -273,6 +276,15 @@ impl AttachmentControl {
             // worker reserves capacity and admits only the latest owned size.
             return Ok(());
         }
+        if let AttachmentCommand::Input(bytes) = &command
+            && let Some(pending) = &mut state.startup_input
+        {
+            if pending.len().saturating_add(bytes.len()) > 4096 {
+                return Err(InputRejection::Overloaded);
+            }
+            pending.extend_from_slice(bytes);
+            return Ok(());
+        }
         let writer = state.writer.as_ref().ok_or(InputRejection::Disconnected)?;
         let typed = matches!(command, AttachmentCommand::Input(_));
         let result = match command {
@@ -445,6 +457,7 @@ impl ControllerLease {
                 owner: 0,
                 ownership_revision: 0,
                 writer: None,
+                startup_input: Some(Vec::new()),
                 last_resize: None,
                 pending_resize: None,
                 requested_size: None,
@@ -720,8 +733,9 @@ fn spawn_transport(
         let _finished = finished;
         // A rapid unmount/remount cannot open a replacement attachment ahead
         // of the previous controller's accepted-input drain.
+        let mut cancelled = false;
+        let has_startup_input = || control.lock().unwrap().startup_input.as_ref().is_some_and(|bytes| !bytes.is_empty());
         if let Some(mut previous) = previous {
-            let mut cancelled = false;
             while !*previous.borrow_and_update() {
                 tokio::select! {
                     _ = &mut shutdown, if !cancelled => cancelled = true,
@@ -730,7 +744,7 @@ fn spawn_transport(
             }
             // A cancelled intermediate mount still carries its predecessor's
             // drain barrier. Otherwise A→B→C could let C attach ahead of A.
-            if cancelled { return; }
+            if cancelled && !has_startup_input() { return; }
         }
         let mut trace = crate::telemetry::TransportTrace::new(&id);
         let (echo, retry) = {
@@ -749,9 +763,15 @@ fn spawn_transport(
                     enhanced_keyboard: true,
                 },
             );
+            let attempt = tokio::time::timeout(Duration::from_secs(2), connect);
+            tokio::pin!(attempt);
             let connected = tokio::select! {
-                _ = &mut shutdown => return,
-                result = tokio::time::timeout(Duration::from_secs(2), connect) => result,
+                _ = &mut shutdown, if !cancelled => {
+                    if !has_startup_input() { return; }
+                    cancelled = true;
+                    attempt.await
+                }
+                result = &mut attempt => result,
             };
             match &connected {
                 Ok(Ok(_)) => {}
@@ -775,12 +795,20 @@ fn spawn_transport(
                     state.writer = Some(writer.clone());
                     // Only this attachment's typing can be lost with it.
                     state.input_at_risk = InputAtRisk::default();
+                    if let Some(bytes) = state.startup_input.take().filter(|bytes| !bytes.is_empty()) {
+                        if writer.send_input(bytes).is_ok() {
+                            state.input_at_risk.sent(Instant::now());
+                        } else {
+                            let _ = events.send(PaneEvent::InputFeedback(id.clone(), InputRejection::Disconnected.message().into()));
+                        }
+                    }
                     state.resize_wake.clone()
                 };
                 trace.live();
                 let _ = events.send(PaneEvent::AttachmentState(id.clone(), 0, AttachmentState::Live));
                 let mut resize_wait = None;
                 let stopping = loop {
+                    if cancelled { break true; }
                     let pending_resize = {
                         let state = control.lock().unwrap();
                         state.owner != 0 && state.pending_resize.is_some()
@@ -843,7 +871,6 @@ fn spawn_transport(
                 if !matches!(tokio::time::timeout(Duration::from_secs(2), attachment.close_checked()).await, Ok(Ok(()))) && rejected.is_none() {
                     // Payload-free diagnostic also covers EOF/write failure
                     // during last-view close, when no view remains to notify.
-                    // A refused attach never accepted input, so it has none to lose.
                     eprintln!("diri: terminal attachment drain interrupted; queued input may not have reached the session");
                     trace.drain_interrupted();
                 }
@@ -852,6 +879,9 @@ fn spawn_transport(
                     // The same request would be refused again: wait for the
                     // pane to report that the session changed (resumed,
                     // relaunched) instead of asking every half second.
+                    if input_at_risk {
+                        let _ = events.send(PaneEvent::InputFeedback(id.clone(), InputRejection::Disconnected.message().into()));
+                    }
                     trace.rejected(reason);
                     let _ = events.send(PaneEvent::AttachmentState(id.clone(), 0, AttachmentState::Unavailable));
                     tokio::select! {
@@ -872,6 +902,10 @@ fn spawn_transport(
                     backoff = REATTACH_DELAY;
                 }
             }
+            if control.lock().unwrap().startup_input.take().is_some_and(|bytes| !bytes.is_empty()) {
+                let _ = events.send(PaneEvent::InputFeedback(id.clone(), InputRejection::Disconnected.message().into()));
+            }
+            if cancelled { return; }
             let _ = events.send(PaneEvent::AttachmentState(id.clone(), 0, AttachmentState::Reconnecting));
             let delay = backoff.min(ceiling);
             backoff = (delay * 2).min(REATTACH_MAX_EMPTY);
@@ -1034,6 +1068,7 @@ mod tests {
                 owner: 1,
                 ownership_revision: 0,
                 writer: None,
+                startup_input: None,
                 last_resize: None,
                 pending_resize: None,
                 requested_size: None,
@@ -1147,6 +1182,7 @@ mod tests {
             owner: 1,
             ownership_revision: 0,
             writer: None,
+            startup_input: None,
             last_resize: None,
             pending_resize: None,
             requested_size: None,
@@ -1365,6 +1401,7 @@ mod tests {
                 owner: 1,
                 ownership_revision: 0,
                 writer: None,
+                startup_input: None,
                 last_resize: None,
                 pending_resize: None,
                 requested_size: None,
@@ -1530,6 +1567,48 @@ mod tests {
             "motion alone never claims: a stale frame routes it to panes \
              that are already gone"
         );
+    }
+
+    #[gpui::test]
+    fn initial_typing_arrives_in_order_once_the_attachment_opens(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut engine = FakeEngine::start(&runtime);
+        let (events, _rx) = pane_event_channel();
+        let (lease, control, _) = cx.update(|cx| {
+            ControllerLease::mount(
+                engine.path.clone(),
+                SessionId("shared-session".into()),
+                runtime.handle(),
+                events,
+                1,
+                None,
+                cx,
+            )
+        });
+        control.claim();
+        for bytes in [b"foo", b"bar"] {
+            control
+                .submit(AttachmentCommand::Input(bytes.to_vec()))
+                .unwrap();
+        }
+        assert_eq!(
+            control.submit(AttachmentCommand::Input(vec![0; 4096])),
+            Err(InputRejection::Overloaded)
+        );
+        // Closing the last view still drains already accepted input.
+        drop(lease);
+        let frame = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), engine.frames.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(frame.frame_type, diri_proto::frames::FrameType::Input);
+        assert_eq!(frame.payload, b"foobar");
+        assert!(control.state.lock().unwrap().startup_input.is_none());
     }
 
     #[gpui::test]
