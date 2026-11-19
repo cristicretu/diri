@@ -1,5 +1,37 @@
 [
   {
+    "version": "0.11.6",
+    "date": "November 19, 2026",
+    "headline": "App Skills for computer use",
+    "summary": "diri 0.11.6 lets computer use learn a Mac app task once and replay it without a model, keeps pinned projects in the sidebar, and cuts interruptions.",
+    "items": [
+      {
+        "title": "App Skills",
+        "text": "An agent learns a task in a Mac app once and replays it later with new arguments, with no model in the loop. A broken step is reported so the agent can fix the skill."
+      },
+      {
+        "title": "Foreground actions",
+        "text": "When background input can't reach a file picker or system dialog, an agent can bring the window forward for one action. Off by default; choose Ask each session or Always in Settings."
+      },
+      {
+        "title": "Pinned projects stay put",
+        "text": "A pinned project keeps its place in the sidebar after its last session closes, so closing every agent no longer erases your layout."
+      },
+      {
+        "title": "Fewer interruptions",
+        "text": "Closing a session no longer asks first, toasts that confirmed what you just did are gone, and ⌘T starts a session directly."
+      },
+      {
+        "title": "Skill usage",
+        "text": "Settings › Skills shows how often each skill runs, which you use most, and which you never use."
+      },
+      {
+        "title": "And more",
+        "text": "⌘K finds sessions in collapsed projects, notes show pictures linked by web address, and the sidebar stays smooth in an unfocused window."
+      }
+    ]
+  },
+  {
     "version": "0.11.5",
     "date": "November 9, 2026",
     "headline": "Mermaid diagrams in notes",
