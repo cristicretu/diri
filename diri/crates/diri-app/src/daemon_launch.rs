@@ -318,7 +318,7 @@ fn ensure_daemon_running_with_cancellation(
                 // compare. Keep it running rather than guessing ownership.
                 return StartupOutcome::EngineExpected;
             };
-            let expected_hash = match executable_sha256(daemon) {
+            let expected_hash = match executable_sha256(daemon, socket_path) {
                 Ok(hash) => hash,
                 Err(error) => {
                     eprintln!(
@@ -487,7 +487,10 @@ fn release_daemon_if_idle(socket_path: &Path) {
             Err(error)
                 if matches!(
                     error.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::ConnectionRefused
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::WouldBlock
                 ) && std::time::Instant::now() < publication_deadline =>
             {
                 // A detached Engine may not have published its socket yet.
@@ -560,8 +563,36 @@ fn process_is_alive(pid: i32) -> bool {
     unsafe { WaitForSingleObject(process.as_raw_handle(), 0) == WAIT_TIMEOUT }
 }
 
-fn executable_sha256(path: &Path) -> io::Result<String> {
+fn executable_sha256(path: &Path, _socket: &Path) -> io::Result<String> {
     let mut file = std::fs::File::open(path)?;
+    // Cache a local digest only for the exact file version we read. Rename,
+    // in-place updates and replacement with the same size/mtime all miss.
+    #[cfg(unix)]
+    let cache = {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()?;
+        let stamp = format!(
+            "v1 {} {} {} {} {} {} {} ",
+            meta.dev(),
+            meta.ino(),
+            meta.len(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+            meta.ctime(),
+            meta.ctime_nsec()
+        );
+        let cache = _socket.with_extension("engine-sha256");
+        let mut entry = String::new();
+        if let Ok(saved) = diri_platform::security::read_owned(&cache, true)
+            && saved.take(512).read_to_string(&mut entry).is_ok()
+            && let Some(hash) = entry.strip_prefix(&stamp)
+            && hash.len() == 64
+            && hash.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Ok(hash.to_owned());
+        }
+        (cache, stamp)
+    };
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -571,11 +602,19 @@ fn executable_sha256(path: &Path) -> io::Result<String> {
         }
         digest.update(&buffer[..read]);
     }
-    Ok(digest
+    let hash: String = digest
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect())
+        .collect();
+    #[cfg(unix)]
+    if let Some(parent) = cache.0.parent()
+        && let Ok(mut tmp) = tempfile::NamedTempFile::new_in(parent)
+        && write!(tmp, "{}{}", cache.1, hash).is_ok()
+    {
+        let _ = tmp.persist(cache.0);
+    }
+    Ok(hash)
 }
 
 /// True when something is listening on the daemon socket right now.
@@ -586,7 +625,14 @@ fn socket_is_live(socket_path: &Path) -> bool {
 fn probe_daemon(socket_path: &Path) -> io::Result<HelloResult> {
     let params =
         serde_json::to_value(HelloParams::new("diri-launch-probe")).map_err(io::Error::other)?;
-    let value = control_request(socket_path, 1, Method::HELLO, Some(params))?;
+    // An Engine may be bound and still capturing its five-second login PATH.
+    let value = control_request_with_timeout(
+        socket_path,
+        1,
+        Method::HELLO,
+        Some(params),
+        Duration::from_secs(8),
+    )?;
     serde_json::from_value(value).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1400,6 +1446,20 @@ mod tests {
     }
 
     #[test]
+    fn warm_digest_cache_tracks_file_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let exe = temp.path().join("dirijord-rs");
+        let replacement = temp.path().join("next");
+        let socket = temp.path().join("daemon.sock");
+        std::fs::write(&exe, b"old").unwrap();
+        let first = executable_sha256(&exe, &socket).unwrap();
+        assert_eq!(executable_sha256(&exe, &socket).unwrap(), first);
+        std::fs::write(&replacement, b"new").unwrap();
+        std::fs::rename(replacement, &exe).unwrap();
+        assert_ne!(executable_sha256(&exe, &socket).unwrap(), first);
+    }
+
+    #[test]
     fn daemon_refresh_requires_an_exact_executable_hash() {
         let hello = |hash: Option<&str>| {
             serde_json::from_value::<HelloResult>(serde_json::json!({
@@ -1423,7 +1483,7 @@ mod tests {
         let executable = tmp.path().join("engine");
         std::fs::write(&executable, b"abc").unwrap();
         assert_eq!(
-            executable_sha256(&executable).unwrap(),
+            executable_sha256(&executable, &executable.with_extension("sock")).unwrap(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }

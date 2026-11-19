@@ -86,6 +86,19 @@ impl HolderLauncher {
         }
     }
 
+    /// Warm the local manager while the Engine finishes restoring resumable sessions.
+    pub fn prestart(executable: &Path, directory: &Path) -> HolderResult<()> {
+        let paths = HolderManagerPaths::new(directory);
+        diri_platform::private::create_dir_all(&paths.directory)
+            .map_err(|error| HolderError::io("create holders directory", error))?;
+        let _lock = LaunchLock::acquire(&paths.launch_lock())?;
+        let manager = HolderManagerClient::new(paths.socket());
+        if !manager.is_alive() {
+            start_manager(executable, &paths.directory, &manager)?;
+        }
+        Ok(())
+    }
+
     /// Where the holder binary lives: the `DIRIJOR_HOLDER_PATH` override, or
     /// next to the running executable.
     pub fn default_executable_path() -> PathBuf {
