@@ -1097,8 +1097,9 @@ fn only_focus_taking_calls_are_refused() {
 #[test]
 fn foreground_follows_the_setting_and_each_sessions_answer() {
     let mut foreground = Foreground::default();
+    let open = |_: &str| Some("1:0".to_owned());
     // Off by default: refused, pointing at the setting.
-    match foreground.gate("a") {
+    match foreground.gate("a", "1:0") {
         Gate::Refuse(reason) => assert!(reason.contains("Foreground actions"), "{reason}"),
         gate => panic!("{gate:?}"),
     }
@@ -1106,47 +1107,60 @@ fn foreground_follows_the_setting_and_each_sessions_answer() {
 
     // Always: allowed, and recorded so the app can mark and revoke it.
     foreground.configure(ComputerForeground::Always);
-    assert_eq!(foreground.gate("a"), Gate::Allow);
+    assert_eq!(foreground.gate("a", "1:0"), Gate::Allow);
     assert_eq!(foreground.allowed(), ["a"]);
     // A revoked session is refused for the rest of its life.
-    foreground.revoke(Some("a"));
-    assert!(matches!(foreground.gate("a"), Gate::Refuse(_)));
+    foreground.revoke(Some("a"), &open);
+    assert!(matches!(foreground.gate("a", "1:0"), Gate::Refuse(_)));
     assert!(foreground.allowed().is_empty());
-    assert_eq!(foreground.gate("b"), Gate::Allow);
+    assert_eq!(foreground.gate("b", "1:0"), Gate::Allow);
 
     // Stricter: Ask takes back what Always gave, keeps refusals.
     foreground.configure(ComputerForeground::Ask);
-    assert!(matches!(foreground.gate("a"), Gate::Refuse(_)));
-    assert_eq!(foreground.gate("b"), Gate::Ask);
+    assert!(matches!(foreground.gate("a", "1:0"), Gate::Refuse(_)));
+    assert_eq!(foreground.gate("b", "1:0"), Gate::Ask);
     // Only an open question can be answered.
     assert!(!foreground.answer("b", true));
-    foreground.asking.insert("b".into());
-    foreground.asking.insert("c".into());
+    foreground.asking.insert("b".into(), "1:0".into());
+    foreground.asking.insert("c".into(), "1:0".into());
+    // Saving the same setting again leaves open questions open.
+    foreground.configure(ComputerForeground::Ask);
+    assert_eq!(foreground.asking.len(), 2);
     assert!(foreground.answer("b", true));
     assert!(!foreground.answer("b", false), "answered once");
     assert!(foreground.answer("c", false));
-    assert_eq!(foreground.gate("b"), Gate::Allow);
-    assert!(matches!(foreground.gate("c"), Gate::Refuse(_)));
+    assert_eq!(foreground.gate("b", "1:0"), Gate::Allow);
+    assert!(matches!(foreground.gate("c", "1:0"), Gate::Refuse(_)));
     // Another session is asked on its own.
-    assert_eq!(foreground.gate("d"), Gate::Ask);
+    assert_eq!(foreground.gate("d", "1:0"), Gate::Ask);
 
-    // A grant lasts as long as its session.
-    foreground.prune(&|id: &str| id != "b");
-    assert_eq!(foreground.gate("b"), Gate::Ask);
+    // A grant lasts as long as its session...
+    foreground.prune(&|id: &str| (id != "b").then(|| "1:0".to_owned()));
+    assert_eq!(foreground.gate("b", "1:0"), Gate::Ask);
+    // ...and as long as the Agent it was given to: a new life, after the
+    // Agent quit to its shell or the session was resumed, starts fresh,
+    // refusals included.
+    foreground.asking.insert("b".into(), "1:0".into());
+    assert!(foreground.answer("b", true));
+    let next = |_: &str| Some("1:1".to_owned());
+    foreground.prune(&next);
+    assert!(foreground.allowed().is_empty());
+    assert_eq!(foreground.gate("b", "1:1"), Gate::Ask);
+    assert_eq!(foreground.gate("c", "1:1"), Gate::Ask);
 
     // Revoke all ends every grant and every open question.
-    foreground.asking.insert("b".into());
+    foreground.asking.insert("b".into(), "1:1".into());
     assert!(foreground.answer("b", true));
-    foreground.asking.insert("e".into());
-    foreground.revoke(None);
-    assert!(matches!(foreground.gate("b"), Gate::Refuse(_)));
-    assert!(matches!(foreground.gate("e"), Gate::Refuse(_)));
+    foreground.asking.insert("e".into(), "1:1".into());
+    foreground.revoke(None, &next);
+    assert!(matches!(foreground.gate("b", "1:1"), Gate::Refuse(_)));
+    assert!(matches!(foreground.gate("e", "1:1"), Gate::Refuse(_)));
     assert!(foreground.asking.is_empty());
 
     // Off forgets everything: turning it on again starts fresh.
     foreground.configure(ComputerForeground::Off);
     foreground.configure(ComputerForeground::Ask);
-    assert_eq!(foreground.gate("b"), Gate::Ask);
+    assert_eq!(foreground.gate("b", "1:1"), Gate::Ask);
 }
 
 #[test]
@@ -1228,6 +1242,14 @@ fn a_foreground_action_waits_for_the_persons_answer() {
         ),
     );
     computer.set_events(events);
+    // Each session's current Agent life; absent once it closes.
+    let lives = Arc::new(Mutex::new(HashMap::<String, String>::from_iter(
+        ["a", "b", "c", "d"].map(|id| (id.to_owned(), "1:0".to_owned())),
+    )));
+    computer.set_life({
+        let lives = Arc::clone(&lives);
+        Box::new(move |id: &str| lives.lock().unwrap().get(id).cloned())
+    });
     let live = |_: &str| true;
     let click = json!({"pid": 4242, "window_id": 1, "x": 5, "y": 5, "delivery_mode": "foreground"});
 
@@ -1269,7 +1291,7 @@ fn a_foreground_action_waits_for_the_persons_answer() {
         changed.name,
         diri_proto::EventName::COMPUTER_FOREGROUND_CHANGED
     );
-    assert_eq!(computer.foreground_sessions(&live), ["a"]);
+    assert_eq!(computer.foreground_sessions(), ["a"]);
     // Allowed for the rest of the session: no second question.
     computer
         .act(&caller("a", "Codex · mail"), "click", click.clone(), &live)
@@ -1319,8 +1341,52 @@ fn a_foreground_action_waits_for_the_persons_answer() {
             &live,
         )
         .unwrap();
-    assert_eq!(
-        computer.foreground_sessions(&|id: &str| id != "c"),
-        Vec::<String>::new()
-    );
+    computer
+        .act(&caller("a", "Codex · mail"), "click", click.clone(), &live)
+        .unwrap();
+    assert_eq!(computer.foreground_sessions(), ["a", "c"]);
+    // The Agent quits to its shell: its grant goes with it.
+    lives.lock().unwrap().insert("c".into(), "1:1".into());
+    assert_eq!(computer.foreground_sessions(), ["a"]);
+    // The session closes: its grant goes too.
+    lives.lock().unwrap().remove("a");
+    assert!(computer.foreground_sessions().is_empty());
+
+    // A tab closed while its Agent waits for the answer: refused at once,
+    // not asked again.
+    computer.configure_foreground(ComputerForeground::Ask);
+    computer.set_foreground_ask_timeout(Duration::from_secs(30));
+    let waiting = {
+        let computer = computer.clone();
+        let click = click.clone();
+        std::thread::spawn(move || {
+            computer.act(
+                &caller("d", "Claude · upload"),
+                "click",
+                click,
+                &|_: &str| true,
+            )
+        })
+    };
+    let asked = std::iter::from_fn(|| stream.recv(Duration::from_secs(10)))
+        .find(|event| {
+            event.name == diri_proto::EventName::COMPUTER_FOREGROUND_REQUESTED
+                && event.session_id.as_deref() == Some("d")
+        })
+        .expect("a request");
+    assert_eq!(asked.session_id.as_deref(), Some("d"));
+    let started = Instant::now();
+    lives.lock().unwrap().remove("d");
+    computer.forget_foreground("d");
+    let closed = waiting.join().unwrap().unwrap_err();
+    assert_eq!(closed.code, FOREGROUND_DENIED);
+    assert!(closed.message.contains("closed"), "{}", closed.message);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    while let Some(event) = stream.recv(Duration::from_millis(100)) {
+        assert_ne!(
+            event.name,
+            diri_proto::EventName::COMPUTER_FOREGROUND_REQUESTED,
+            "a closed session is not asked again"
+        );
+    }
 }

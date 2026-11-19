@@ -1880,6 +1880,13 @@ impl RootView {
         cx.notify();
     }
 
+    /// Closes the toast; a question it covered comes back with its timer.
+    fn dismiss_toast(&mut self, cx: &mut Context<Self>) {
+        self.toast.dismiss();
+        let rearm = self.toast.take_rearm();
+        self.arm_toast_timer(rearm, cx);
+    }
+
     fn arm_toast_timer(&mut self, timer: Option<crate::toast::ToastTimer>, cx: &mut Context<Self>) {
         let Some(timer) = timer else {
             return;
@@ -1888,6 +1895,9 @@ impl RootView {
             cx.background_executor().timer(timer.after).await;
             let _ = this.update(cx, |this, cx| {
                 if this.toast.expire(timer.token) {
+                    // A question it covered comes back.
+                    let rearm = this.toast.take_rearm();
+                    this.arm_toast_timer(rearm, cx);
                     cx.notify();
                 }
             });
@@ -1903,7 +1913,7 @@ impl RootView {
     ) {
         match command {
             ToastCommand::OpenPrivacySettings => {
-                self.toast.dismiss();
+                self.dismiss_toast(cx);
                 if let Some(surfaces) = &self.utility_surfaces {
                     surfaces.update(cx, |surfaces, cx| {
                         surfaces.open_settings(cx);
@@ -1913,7 +1923,7 @@ impl RootView {
                 }
             }
             ToastCommand::OpenComputerSetup => {
-                self.toast.dismiss();
+                self.dismiss_toast(cx);
                 if let Some(surfaces) = &self.utility_surfaces {
                     surfaces.update(cx, |surfaces, cx| {
                         surfaces.open_settings(cx);
@@ -1938,18 +1948,18 @@ impl RootView {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(detail));
             }
             ToastCommand::UndoTerminalImport => {
-                self.toast.dismiss();
+                self.dismiss_toast(cx);
                 self.undo_terminal_import(cx);
             }
             ToastCommand::AnswerComputerForeground { session_id, allow } => {
-                self.toast.dismiss();
+                self.dismiss_toast(cx);
                 self.window_store
                     .write()
                     .expect("session store lock poisoned")
                     .answer_computer_foreground(session_id, allow);
             }
             ToastCommand::DismissBoldHint => {
-                self.toast.dismiss();
+                self.dismiss_toast(cx);
                 let result = self
                     .window_store
                     .write()
@@ -5801,7 +5811,7 @@ impl RootView {
                     on_action: action(cx),
                     on_dismiss: Box::new(move |_, cx| {
                         let _ = view.update(cx, |this, cx| {
-                            this.toast.dismiss();
+                            this.dismiss_toast(cx);
                             cx.notify();
                         });
                     }),

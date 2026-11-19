@@ -52,6 +52,8 @@ use crate::status::{Authority, ClaudeHook, ReducerOutcome, StatusReducer, Status
 /// How often the pump ticks when the child is quiet, so debounce timers still
 /// advance and staleness is noticed.
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
+/// Source of [`Shared::life`].
+static NEXT_LIFE: AtomicU64 = AtomicU64::new(1);
 
 /// Quiet-tick interval for a session that is neither attached, recently
 /// touched, nor Working. Reducer ticks are no-ops outside Working, so with 30
@@ -542,6 +544,10 @@ struct Shared {
     /// Anything the agent reported about its own live work (background
     /// shells) went with it.
     agent_ended: AtomicBool,
+    /// Wrapped Agents that have ended in this process, for [`Session::agent_life`].
+    agent_exits: AtomicU64,
+    /// Unique per launch or adoption, for [`Session::agent_life`].
+    life: u64,
     /// The latest keystroke whose echo the held pump has not published yet.
     echo_request: Mutex<Option<EchoRequest>>,
     /// Rings the held pump out of an idle park; see [`PumpWake`].
@@ -2824,6 +2830,18 @@ impl Session {
         *self.shared.agent_exit.lock().expect("agent exit")
     }
 
+    /// Which Agent this session is running: changes when the process is
+    /// replaced (exit then resume, relaunch) and when a wrapped Agent quits
+    /// back to its login shell. Stable across hibernation, which only
+    /// pauses the same process.
+    pub fn agent_life(&self) -> String {
+        format!(
+            "{}:{}",
+            self.shared.life,
+            self.shared.agent_exits.load(Ordering::SeqCst)
+        )
+    }
+
     /// Whether the wrapped agent exited since the last call, once.
     pub fn take_agent_ended(&self) -> bool {
         self.shared.agent_ended.swap(false, Ordering::SeqCst)
@@ -4219,6 +4237,8 @@ fn new_shared(
             .filter(|notice| !notice.is_empty()),
         relaunch_requested: AtomicBool::new(false),
         agent_ended: AtomicBool::new(false),
+        agent_exits: AtomicU64::new(0),
+        life: NEXT_LIFE.fetch_add(1, Ordering::Relaxed),
         echo_request: Mutex::new(None),
         pump_wake: PumpWake::default(),
         history_swap: Mutex::new(None),
@@ -7927,6 +7947,7 @@ fn split_shell_status(status: i32) -> (Option<i32>, Option<i32>) {
 fn note_agent_exit(shared: &Shared, status: i32, screen: &mut HeadlessScreen) {
     *shared.agent_exit.lock().expect("agent exit") = Some(status);
     shared.agent_ended.store(true, Ordering::SeqCst);
+    shared.agent_exits.fetch_add(1, Ordering::SeqCst);
     shared.bump_state_version();
     if screen.end_program_status(diri_terminal_state::ProgramRemoval::ChildExited) {
         observe_program_status(shared, screen);
@@ -7992,6 +8013,7 @@ fn shows_relaunch_notice(screen: &HeadlessScreen, notice: &str) -> bool {
 const RELAUNCH_NOTICE_LINES: usize = 4;
 
 fn record_returned_to_shell(shared: &Shared, early: bool, source: &'static str) {
+    shared.agent_exits.fetch_add(1, Ordering::SeqCst);
     let left = terminal_modes_left(shared);
     let runtime = shared.launched_at.map(|launched| launched.elapsed());
     if early {

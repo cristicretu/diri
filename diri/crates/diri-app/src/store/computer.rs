@@ -270,8 +270,9 @@ pub fn foreground_toast(event: &diri_proto::ComputerForegroundRequestedEvent) ->
             allow: false,
         },
     )
-    // Shown until the Agent stops waiting.
+    // Shown until the Agent stops waiting, and not lost under a newer toast.
     .hold(Duration::from_millis(event.timeout_ms))
+    .awaits_answer()
 }
 
 /// Applies a status the Engine answered with outside the poller.

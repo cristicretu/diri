@@ -656,8 +656,9 @@ impl Bridge {
                 "tool": tool,
                 "args": arguments.get("args").cloned().unwrap_or_else(|| json!({})),
             }),
-            // The Engine waits up to two minutes for a batched action.
-            Duration::from_secs(130),
+            // The Engine waits up to two minutes for a batched action, after
+            // up to a minute for the person to allow a foreground action.
+            Duration::from_secs(190),
         )
     }
 

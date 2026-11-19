@@ -30,10 +30,23 @@ pub enum ComputerForeground {
     #[default]
     Off,
     /// The first foreground action of each session asks the person; the
-    /// answer holds for the rest of that session's life.
+    /// answer holds until that session's Agent ends (it exits, is resumed as
+    /// a new process, or quits to its shell) or the tab closes.
     Ask,
     /// Allowed without asking. The person can still revoke a session.
     Always,
+}
+
+impl ComputerForeground {
+    /// How open the setting is, strictest first. Explicit, so reordering the
+    /// variants can never turn a stricter setting into a looser one.
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Ask => 1,
+            Self::Always => 2,
+        }
+    }
 }
 
 /// `computer.configure`: the person's computer use settings.

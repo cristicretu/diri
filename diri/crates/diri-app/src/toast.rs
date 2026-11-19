@@ -5,7 +5,7 @@
 //! (replacement, auto-dismiss per tone, hover-to-pause) as pure state so it
 //! is testable without a window; [`toast_element`] paints it.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use diri_ui::{FloatingSurface, Ink, Radius, SemanticColors, Typo, rgba_f32};
 use gpui::{
@@ -69,6 +69,10 @@ pub struct Toast {
     /// pointer, offers no ✕, and a newer ambient notice rewrites its text in
     /// place instead of entering again.
     pub ambient: bool,
+    /// Something is waiting for the person's answer (an Agent asking to
+    /// bring a window forward). A newer toast parks it instead of dropping
+    /// it, and it comes back, for the rest of its hold, once that one closes.
+    pub awaits_answer: bool,
 }
 
 /// How long an ambient notice stays: long enough to read a few words.
@@ -84,6 +88,7 @@ impl Toast {
             dismissible: true,
             hold: None,
             ambient: false,
+            awaits_answer: false,
         }
     }
 
@@ -129,6 +134,13 @@ impl Toast {
     #[must_use]
     pub const fn hold(mut self, hold: Duration) -> Self {
         self.hold = Some(hold);
+        self
+    }
+
+    /// See [`Toast::awaits_answer`].
+    #[must_use]
+    pub const fn awaits_answer(mut self) -> Self {
+        self.awaits_answer = true;
         self
     }
 
@@ -187,10 +199,17 @@ fn sanitize(text: &str, limit: usize) -> String {
 
 /// One transient toast at a time; a newer toast replaces the older one.
 /// The generation keys the entry animation and every timer, so a stale timer
-/// can never close a newer toast.
+/// can never close a newer toast. A toast that awaits an answer is parked
+/// rather than replaced, and shown again when the slot frees up.
 #[derive(Default)]
 pub struct ToastSlot {
     toast: Option<Toast>,
+    /// When the current toast's hold runs out, if it has one.
+    deadline: Option<Instant>,
+    /// Questions a newer toast covered, oldest first, with their deadlines.
+    parked: Vec<(Toast, Option<Instant>)>,
+    /// The timer for a parked question shown again; see [`Self::take_rearm`].
+    rearm: Option<ToastTimer>,
     generation: u64,
     timer: u64,
     hovered: bool,
@@ -221,6 +240,15 @@ impl ToastSlot {
     /// notice replacing an ambient notice keeps the capsule and swaps its
     /// text, so a burst reads as one notice that updates.
     pub fn show(&mut self, toast: Toast) -> Option<ToastTimer> {
+        // A question asked again replaces its parked copy.
+        if toast.awaits_answer {
+            self.parked.retain(|(parked, _)| parked.actions != toast.actions);
+        }
+        if let Some(current) = self.toast.take_if(|current| {
+            current.awaits_answer && current.actions != toast.actions
+        }) {
+            self.parked.push((current, self.deadline));
+        }
         let in_place = toast.ambient && self.toast.as_ref().is_some_and(|current| current.ambient);
         if !in_place && self.toast.as_ref() != Some(&toast) {
             self.generation = self.generation.wrapping_add(1);
@@ -228,15 +256,38 @@ impl ToastSlot {
         }
         self.expired_while_hovered = false;
         let after = toast.visible_for();
+        self.deadline = after.and_then(|after| Instant::now().checked_add(after));
         self.toast = Some(toast);
         self.arm(after)
     }
 
+    /// Closes the current toast. A parked question that is still open comes
+    /// back; its timer is then waiting in [`Self::take_rearm`].
     pub fn dismiss(&mut self) {
         self.toast = None;
+        self.deadline = None;
         self.hovered = false;
         self.expired_while_hovered = false;
         self.timer = self.timer.wrapping_add(1);
+        let now = Instant::now();
+        while let Some((mut toast, deadline)) = self.parked.pop() {
+            let remaining = match deadline {
+                Some(deadline) if deadline <= now => continue,
+                Some(deadline) => Some(deadline - now),
+                None => None,
+            };
+            if let Some(remaining) = remaining {
+                toast.hold = Some(remaining);
+            }
+            self.rearm = self.show(toast);
+            break;
+        }
+    }
+
+    /// The timer a toast shown again by [`Self::dismiss`] or [`Self::expire`]
+    /// needs. The owner arms it after every close.
+    pub fn take_rearm(&mut self) -> Option<ToastTimer> {
+        self.rearm.take()
     }
 
     /// A timer fired. Returns true when the toast closed.
@@ -812,6 +863,52 @@ fn composite_opaque(color: Rgba) -> Rgba {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn question(session: &str) -> Toast {
+        Toast::warning(format!("{session} wants to bring a window forward"))
+            .action(
+                "Allow",
+                ToastCommand::CopyDetails(format!("allow {session}")),
+            )
+            .hold(Duration::from_secs(60))
+            .awaits_answer()
+    }
+
+    #[test]
+    fn a_question_is_parked_under_a_newer_toast_not_lost() {
+        let mut slot = ToastSlot::default();
+        let _ = slot.show(question("a"));
+        // An unrelated toast covers it, then a second Agent asks.
+        let _ = slot.show(Toast::success("Done"));
+        assert_eq!(slot.current().unwrap().message, "Done");
+        let _ = slot.show(question("b"));
+        // Answering b brings a back, with a timer for what is left of it.
+        slot.dismiss();
+        let back = slot.current().expect("a comes back");
+        assert!(back.message.starts_with("a "), "{}", back.message);
+        let rearm = slot.take_rearm().expect("a timer");
+        assert!(rearm.after <= Duration::from_secs(60));
+        assert!(rearm.after > Duration::from_secs(50));
+        // The question timing out closes it for good.
+        assert!(slot.expire(rearm.token));
+        assert!(slot.current().is_none());
+        assert!(slot.take_rearm().is_none());
+    }
+
+    #[test]
+    fn a_parked_question_that_ran_out_does_not_come_back() {
+        let mut slot = ToastSlot::default();
+        let _ = slot.show(question("a").hold(Duration::ZERO));
+        let _ = slot.show(Toast::info("Copied"));
+        slot.dismiss();
+        assert!(slot.current().is_none());
+        // Asked again: replaces its parked copy instead of stacking.
+        let _ = slot.show(question("a"));
+        let _ = slot.show(Toast::info("Copied"));
+        let _ = slot.show(question("a"));
+        slot.dismiss();
+        assert!(slot.current().is_none(), "one copy only");
+    }
 
     #[test]
     fn copy_is_one_paragraph_and_bounded() {

@@ -133,6 +133,19 @@ fn live_sessions(registry: &Registry) -> std::collections::HashSet<String> {
         .collect()
 }
 
+/// Which Agent an open session runs, for foreground grants: `None` once it is
+/// archived or has no process. Takes the Registry lock, so it must never be
+/// called with the Registry held.
+fn computer_life(registry: Arc<Mutex<Registry>>) -> Box<crate::computer::Life> {
+    Box::new(move |id: &str| {
+        let registry = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.record(id).filter(|record| !record.is_archived())?;
+        registry.get(id).map(crate::session::Session::agent_life)
+    })
+}
+
 /// The last `computer.configure`, in the config directory: the person's
 /// computer use settings outlive an Engine restart. Grants do not.
 const COMPUTER_SETTINGS_FILE: &str = "computer-use.json";
@@ -372,6 +385,7 @@ impl ControlServer {
         }
         let computer = crate::computer::ComputerUse::default();
         computer.set_events(events.clone());
+        computer.set_life(computer_life(Arc::clone(&registry)));
         computer.configure_foreground(computer_settings(&config_dir).foreground);
         Self {
             engine_instance_id: {
@@ -2504,11 +2518,10 @@ impl ControlServer {
     /// hold it.
     fn computer_status(&self, probe: bool) -> Result<diri_proto::ComputerStatus, ControlError> {
         let mut status = self.computer.status(probe);
-        let live = live_sessions(&*self.registry.lock().map_err(poisoned)?);
         status.foreground = self.computer.foreground_policy();
         status.foreground_sessions = self
             .computer
-            .foreground_sessions(&|id| live.contains(id))
+            .foreground_sessions()
             .into_iter()
             .map(diri_proto::SessionId)
             .collect();

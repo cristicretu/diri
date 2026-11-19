@@ -200,7 +200,20 @@ struct Shared {
     foreground_answered: Condvar,
     /// Where foreground prompts and grant changes are published.
     events: OnceLock<crate::events::EventBus>,
+    /// Which life of an open session is running now; see [`Life`].
+    life: OnceLock<Box<Life>>,
 }
+
+/// The current life of an open session: an opaque key that changes when its
+/// Agent process ends (exit then resume, or the Agent quitting back to its
+/// login shell), or `None` once the session is closed, archived or gone.
+/// Foreground grants are held per life, so they end with the Agent the person
+/// answered for. Looked up while the foreground lock is held: implementations
+/// may take the Registry lock, so no caller may hold the Registry while
+/// taking the foreground lock.
+pub type Life = dyn Fn(&str) -> Option<String> + Send + Sync;
+/// A [`Life`] lookup borrowed for one bookkeeping step.
+type LifeOf<'a> = &'a dyn Fn(&str) -> Option<String>;
 
 type Waiter = mpsc::Sender<Result<Value, String>>;
 
@@ -363,9 +376,10 @@ enum Gate {
 #[derive(Debug)]
 struct Foreground {
     policy: ComputerForeground,
-    grants: HashMap<String, Grant>,
-    /// Sessions whose question is open.
-    asking: std::collections::HashSet<String>,
+    /// Each session's answer, with the life ([`Life`]) it was given for.
+    grants: HashMap<String, (Grant, String)>,
+    /// Sessions whose question is open, with the life that asked.
+    asking: HashMap<String, String>,
     ask_timeout: Duration,
 }
 
@@ -381,14 +395,20 @@ impl Default for Foreground {
 }
 
 impl Foreground {
-    fn gate(&mut self, session_id: &str) -> Gate {
-        match (self.policy, self.grants.get(session_id)) {
+    /// Decides for `session_id` in its current `life`. Answers given to an
+    /// earlier life must already be pruned.
+    fn gate(&mut self, session_id: &str, life: &str) -> Gate {
+        match (
+            self.policy,
+            self.grants.get(session_id).map(|(grant, _)| *grant),
+        ) {
             (ComputerForeground::Off, _) => Gate::Refuse(FOREGROUND_OFF_MESSAGE.to_owned()),
             (_, Some(Grant::Denied)) => Gate::Refuse(FOREGROUND_REFUSED_MESSAGE.to_owned()),
             (_, Some(Grant::Allowed)) => Gate::Allow,
             (ComputerForeground::Always, None) => {
                 // Recorded, so the app marks the session and it can be revoked.
-                self.grants.insert(session_id.to_owned(), Grant::Allowed);
+                self.grants
+                    .insert(session_id.to_owned(), (Grant::Allowed, life.to_owned()));
                 Gate::Allow
             }
             (ComputerForeground::Ask, None) => Gate::Ask,
@@ -396,13 +416,17 @@ impl Foreground {
     }
 
     /// A stricter setting takes back what the looser one gave; Off forgets
-    /// every answer, so turning it on again starts fresh. Open questions
-    /// close: their callers re-check the new setting.
+    /// every answer, so turning it on again starts fresh. Re-saving the same
+    /// setting changes nothing. Open questions close when the setting moves:
+    /// their callers re-check the new one.
     fn configure(&mut self, policy: ComputerForeground) {
+        if policy == self.policy {
+            return;
+        }
         if policy == ComputerForeground::Off {
             self.grants.clear();
-        } else if policy < self.policy {
-            self.grants.retain(|_, grant| *grant == Grant::Denied);
+        } else if policy.rank() < self.policy.rank() {
+            self.grants.retain(|_, (grant, _)| *grant == Grant::Denied);
         }
         self.policy = policy;
         self.asking.clear();
@@ -411,36 +435,42 @@ impl Foreground {
     /// The person's answer to an open question. False when nothing was
     /// asked (answered twice, or the caller gave up waiting).
     fn answer(&mut self, session_id: &str, allow: bool) -> bool {
-        if !self.asking.remove(session_id) {
+        let Some(life) = self.asking.remove(session_id) else {
             return false;
-        }
+        };
         let grant = if allow { Grant::Allowed } else { Grant::Denied };
-        self.grants.insert(session_id.to_owned(), grant);
+        self.grants.insert(session_id.to_owned(), (grant, life));
         true
     }
 
     /// Takes foreground back from one session, or from every session that
-    /// holds it. A revoked session is not asked again.
-    fn revoke(&mut self, session_id: Option<&str>) {
+    /// holds it. A revoked session is not asked again in this life.
+    fn revoke(&mut self, session_id: Option<&str>, life: LifeOf<'_>) {
         match session_id {
             Some(id) => {
-                self.asking.remove(id);
-                self.grants.insert(id.to_owned(), Grant::Denied);
+                let asked = self.asking.remove(id);
+                if let Some(life) = asked.or_else(|| life(id)) {
+                    self.grants.insert(id.to_owned(), (Grant::Denied, life));
+                }
             }
             None => {
-                for grant in self.grants.values_mut() {
+                for (grant, _) in self.grants.values_mut() {
                     *grant = Grant::Denied;
                 }
-                for id in self.asking.drain() {
-                    self.grants.insert(id, Grant::Denied);
+                for (id, life) in self.asking.drain() {
+                    self.grants.insert(id, (Grant::Denied, life));
                 }
             }
         }
     }
 
-    /// Drops the answers of sessions that are no longer alive.
-    fn prune(&mut self, is_live: &dyn Fn(&str) -> bool) {
-        self.grants.retain(|id, _| is_live(id));
+    /// Drops answers and questions of sessions that closed, or whose Agent
+    /// ended since.
+    fn prune(&mut self, life: LifeOf<'_>) {
+        self.grants
+            .retain(|id, (_, given)| life(id).as_deref() == Some(given.as_str()));
+        self.asking
+            .retain(|id, asked| life(id).as_deref() == Some(asked.as_str()));
     }
 
     /// The sessions that may use the foreground rung now.
@@ -451,7 +481,7 @@ impl Foreground {
         let mut ids: Vec<String> = self
             .grants
             .iter()
-            .filter(|(_, grant)| **grant == Grant::Allowed)
+            .filter(|(_, (grant, _))| *grant == Grant::Allowed)
             .map(|(id, _)| id.clone())
             .collect();
         ids.sort();
@@ -465,6 +495,8 @@ const FOREGROUND_OFF_MESSAGE: &str = "delivery_mode \"foreground\" briefly takes
      file picker, a system dialog, a sheet), stop and tell the person: they can do that step \
      themselves, or allow foreground actions in Diri Settings › Agents › Computer use › \
      Foreground actions and ask you to retry.";
+const FOREGROUND_ENDED_MESSAGE: &str = "This session was closed or its Agent ended while \
+     waiting to be allowed foreground actions.";
 const FOREGROUND_REFUSED_MESSAGE: &str = "The person did not allow foreground actions for this \
      session (they said no or revoked it). Use the background route, or stop and tell the person \
      what you need them to do.";
@@ -513,6 +545,7 @@ impl ComputerUse {
                 foreground: Mutex::new(Foreground::default()),
                 foreground_answered: Condvar::new(),
                 events: OnceLock::new(),
+                life: OnceLock::new(),
             }),
         }
     }
@@ -645,7 +678,7 @@ impl ComputerUse {
 
         let foreground = uses_foreground(tool, &args);
         if foreground {
-            self.admit_foreground(caller, is_live)?;
+            self.admit_foreground(caller)?;
         }
 
         let pids = mentioned_pids(&Value::Object(args.clone()));
@@ -789,12 +822,26 @@ impl ComputerUse {
         self.lock().state.forget_session(session_id);
     }
 
-    /// Forgets a session's foreground answer (its tab closed).
+    /// Forgets a session's foreground answer (its tab closed). A call still
+    /// waiting for the person's answer wakes and is refused.
     pub fn forget_foreground(&self, session_id: &str) {
-        self.change_foreground(|foreground| {
+        self.change_foreground(|foreground, _| {
             foreground.grants.remove(session_id);
             foreground.asking.remove(session_id);
         });
+    }
+
+    /// How the Engine tells which life of a session is running. Set once;
+    /// without it (tests) every session is open and never ends.
+    pub fn set_life(&self, life: Box<Life>) {
+        let _ = self.shared.life.set(life);
+    }
+
+    fn life_of(&self, session_id: &str) -> Option<String> {
+        match self.shared.life.get() {
+            Some(life) => life(session_id),
+            None => Some(String::new()),
+        }
     }
 
     /// Where foreground prompts and grant changes are published. Set once.
@@ -815,35 +862,36 @@ impl ComputerUse {
 
     /// `computer.configure`.
     pub fn configure_foreground(&self, policy: ComputerForeground) {
-        self.change_foreground(|foreground| foreground.configure(policy));
+        self.change_foreground(|foreground, _| foreground.configure(policy));
     }
 
     /// `computer.foreground_answer`. False when no question was open.
     pub fn answer_foreground(&self, session_id: &str, allow: bool) -> bool {
         let mut answered = false;
-        self.change_foreground(|foreground| answered = foreground.answer(session_id, allow));
+        self.change_foreground(|foreground, _| answered = foreground.answer(session_id, allow));
         answered
     }
 
     /// `computer.foreground_revoke`.
     pub fn revoke_foreground(&self, session_id: Option<&str>) {
-        self.change_foreground(|foreground| foreground.revoke(session_id));
+        self.change_foreground(|foreground, life| foreground.revoke(session_id, life));
     }
 
     /// The sessions that may use the foreground rung, after dropping
-    /// sessions that are no longer alive.
-    pub fn foreground_sessions(&self, is_live: &dyn Fn(&str) -> bool) -> Vec<String> {
-        self.change_foreground(|foreground| foreground.prune(is_live));
+    /// answers given to sessions or Agents that have ended.
+    pub fn foreground_sessions(&self) -> Vec<String> {
+        self.change_foreground(|foreground, life| foreground.prune(life));
         self.foreground().allowed()
     }
 
     /// Applies `change`, wakes callers waiting for an answer, and tells the
     /// app when the set of allowed sessions moved.
-    fn change_foreground(&self, change: impl FnOnce(&mut Foreground)) {
+    fn change_foreground(&self, change: impl FnOnce(&mut Foreground, LifeOf<'_>)) {
+        let life = |id: &str| self.life_of(id);
         let (before, after) = {
             let mut foreground = self.foreground();
             let before = foreground.allowed();
-            change(&mut foreground);
+            change(&mut foreground, &life);
             (before, foreground.allowed())
         };
         self.shared.foreground_answered.notify_all();
@@ -865,19 +913,31 @@ impl ComputerUse {
     }
 
     /// Lets one foreground action through, or says why not. Under Ask, the
-    /// session's first one waits for the person's answer.
-    fn admit_foreground(
-        &self,
-        caller: &Caller<'_>,
-        is_live: &dyn Fn(&str) -> bool,
-    ) -> Result<(), ComputerError> {
+    /// session's first one waits for the person's answer. The wait ends
+    /// early, refused, when the session closes or its Agent ends.
+    fn admit_foreground(&self, caller: &Caller<'_>) -> Result<(), ComputerError> {
         let id = caller.session_id;
+        let life_of = |id: &str| self.life_of(id);
         let mut deadline = None;
+        let mut asked_in: Option<String> = None;
         let mut foreground = self.foreground();
         loop {
             let before = foreground.allowed();
-            foreground.prune(is_live);
-            let gate = foreground.gate(id);
+            let open = foreground.asking.len();
+            foreground.prune(&life_of);
+            if foreground.asking.len() != open {
+                // Someone else's question closed with its Agent: wake it.
+                self.shared.foreground_answered.notify_all();
+            }
+            let life = life_of(id);
+            let gate = match &life {
+                None => Gate::Refuse(FOREGROUND_ENDED_MESSAGE.to_owned()),
+                // The question was asked for an Agent that has since ended.
+                Some(now) if asked_in.as_ref().is_some_and(|asked| asked != now) => {
+                    Gate::Refuse(FOREGROUND_ENDED_MESSAGE.to_owned())
+                }
+                Some(now) => foreground.gate(id, now),
+            };
             let after = foreground.allowed();
             match gate {
                 Gate::Allow | Gate::Refuse(_) => {
@@ -892,31 +952,35 @@ impl ComputerUse {
                 }
                 Gate::Ask => {}
             }
+            let life = life.expect("a closed session is refused above");
+            asked_in = Some(life.clone());
             let timeout = foreground.ask_timeout;
             let deadline = *deadline.get_or_insert_with(|| Instant::now() + timeout);
-            if foreground.asking.insert(id.to_owned())
-                && let Some(events) = self.shared.events.get()
-            {
-                events.publish_encoded(
-                    diri_proto::EventName::COMPUTER_FOREGROUND_REQUESTED,
-                    &diri_proto::ComputerForegroundRequestedEvent {
-                        session_id: diri_proto::SessionId(id.to_owned()),
-                        badge: caller.badge.to_owned(),
-                        timeout_ms: timeout.as_millis() as u64,
-                    },
-                    Some(id),
-                );
-            }
             let remaining = deadline.saturating_duration_since(Instant::now());
+            // Another call from this session may already have asked.
+            if !foreground.asking.contains_key(id) {
+                foreground.asking.insert(id.to_owned(), life);
+                if let Some(events) = self.shared.events.get() {
+                    events.publish_encoded(
+                        diri_proto::EventName::COMPUTER_FOREGROUND_REQUESTED,
+                        &diri_proto::ComputerForegroundRequestedEvent {
+                            session_id: diri_proto::SessionId(id.to_owned()),
+                            badge: caller.badge.to_owned(),
+                            timeout_ms: remaining.as_millis() as u64,
+                        },
+                        Some(id),
+                    );
+                }
+            }
             let (guard, waited) = self
                 .shared
                 .foreground_answered
                 .wait_timeout_while(foreground, remaining, |foreground| {
-                    foreground.asking.contains(id)
+                    foreground.asking.contains_key(id)
                 })
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             foreground = guard;
-            if waited.timed_out() && foreground.asking.remove(id) {
+            if waited.timed_out() && foreground.asking.remove(id).is_some() {
                 return Err(ComputerError::new(
                     FOREGROUND_DENIED,
                     format!(
