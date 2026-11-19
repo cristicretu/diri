@@ -4344,8 +4344,9 @@ fn child_record_stat(paths: &HolderPaths, floor: u64) -> Option<HolderStat> {
     (record.epoch_offset == floor && record.child_identity.is_some()).then(|| record.as_stat())
 }
 
-/// Waits for a freshly launched holder and returns the exit-marker floor:
-/// 250 × 20ms.
+/// Waits for a freshly launched holder and returns the exit-marker floor.
+/// A directory event wakes the next probe when the control socket appears.
+/// Keep the bounded timer for older holders and platforms without kqueue.
 ///
 /// Any stat answer attaches — `alive: false` just means the child already
 /// exited, and the pump will find its marker. A child so short-lived that the
@@ -4359,6 +4360,10 @@ fn wait_for_holder(
     pre_spawn_tail: u64,
 ) -> Result<(u64, Option<HolderStat>), crate::holder::HolderError> {
     let deadline = Instant::now() + HOLDER_READY_TIMEOUT;
+    let mut directory = client
+        .socket_path
+        .parent()
+        .and_then(log_watch::LogWatcher::new);
     for delay in crate::holder::readiness_delays() {
         if Instant::now() >= deadline {
             break;
@@ -4372,7 +4377,11 @@ fn wait_for_holder(
                 return Ok((pre_spawn_tail, None));
             }
         }
-        std::thread::sleep(delay);
+        if let Some(watch) = directory.as_mut() {
+            watch.wait(delay);
+        } else {
+            std::thread::sleep(delay);
+        }
     }
     Err(crate::holder::HolderError::Launch(
         "holder did not become ready".into(),

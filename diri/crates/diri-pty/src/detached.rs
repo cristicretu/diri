@@ -205,7 +205,7 @@ pub fn spawn(spec: &PtySpec, launcher: &Launcher) -> Result<super::Pty, Detached
     let _socket = RemoveOnDrop(&socket_path);
     let label = format!("{LABEL_PREFIX}{nonce:x}");
     bootstrap(&label, &launcher.helper, &socket_path, &launcher.rendezvous).map_err(Unavailable)?;
-    let _job = BootoutOnDrop(&label);
+    let mut job = BootoutOnDrop(Some(&label));
 
     let mut stream = accept_within(&listener, CONNECT_TIMEOUT).map_err(Unavailable)?;
     drop(listener);
@@ -250,6 +250,7 @@ pub fn spawn(spec: &PtySpec, launcher: &Launcher) -> Result<super::Pty, Detached
         changed: Condvar::new(),
     };
     let identity = crate::process_identity::observe(pid).ok();
+    job.finish_after_exec();
     Ok(super::Pty::detached(master, leader, identity))
 }
 
@@ -264,11 +265,48 @@ impl Drop for RemoveOnDrop<'_> {
 /// The job's own process exits as soon as it has forked, so the job is
 /// finished by the time anything is decided here; booting it out never
 /// touches the Agent.
-struct BootoutOnDrop<'a>(&'a str);
+struct BootoutOnDrop<'a>(Option<&'a str>);
+
+impl BootoutOnDrop<'_> {
+    /// Once exec succeeded the job's leader is gone. Its registration can be
+    /// removed while the Holder starts draining the master. On a failed
+    /// handshake Drop still waits for launchd before a caller may retry.
+    fn finish_after_exec(&mut self) {
+        let Some(label) = self.0 else { return };
+        let Ok(mut cleanup) = Command::new(LAUNCHCTL)
+            .args(["bootout", &format!("{}/{label}", gui_domain())])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return; // Drop retries synchronously.
+        };
+        self.0 = None;
+        // launchctl now owns the request even if the manager exits immediately.
+        // Its child status still needs collecting if the manager stays alive.
+        let pid = cleanup.id() as libc::pid_t;
+        if std::thread::Builder::new()
+            .name("diri-agent-bootout".into())
+            .spawn(move || {
+                let _ = cleanup.wait();
+            })
+            .is_err()
+        {
+            // SAFETY: the failed spawn dropped the Child without reaping it;
+            // only this caller owns its wait. A null status discards the result.
+            while unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) } < 0
+                && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+            {}
+        }
+    }
+}
 
 impl Drop for BootoutOnDrop<'_> {
     fn drop(&mut self) {
-        let _ = launchctl(&["bootout", &format!("{}/{}", gui_domain(), self.0)]);
+        if let Some(label) = self.0 {
+            let _ = bootout_job(label);
+        }
     }
 }
 
