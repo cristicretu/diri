@@ -182,6 +182,10 @@ fn a_hook_records_its_safe_seed_before_unreachable_daemon_delivery() {
 /// Answers Hello like the Engine, then returns the one `hook.report` params
 /// the CLI delivered.
 fn deliver_hook(event: &str, payload: &[u8]) -> (serde_json::Value, HookActivitySeed) {
+    deliver(&["hook", event], payload, b"{}\n")
+}
+
+fn deliver(args: &[&str], payload: &[u8], stdout: &[u8]) -> (serde_json::Value, HookActivitySeed) {
     use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixListener;
 
@@ -212,7 +216,7 @@ fn deliver_hook(event: &str, payload: &[u8]) -> (serde_json::Value, HookActivity
     });
     let recovery = directory.path().join("s_hook");
     let mut child = Command::new(env!("CARGO_BIN_EXE_dirijor"))
-        .args(["hook", event])
+        .args(args)
         .env("DIRIJOR_SESSION_ID", "s_hook")
         .env("DIRIJOR_SESSION_RECOVERY_DIR", &recovery)
         .env("DIRIJOR_SOCKET", &socket)
@@ -225,12 +229,33 @@ fn deliver_hook(event: &str, payload: &[u8]) -> (serde_json::Value, HookActivity
     drop(stdin);
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
-    assert_eq!(output.stdout, b"{}\n");
+    assert_eq!(output.stdout, stdout);
     let seed = SessionRecoveryStore::new(recovery)
         .read_activity()
         .unwrap()
         .unwrap();
     (engine.join().unwrap(), seed)
+}
+
+#[test]
+fn codex_completion_keeps_the_identity_and_title_without_forwarding_the_answer() {
+    let original = serde_json::json!({
+        "type": "agent-turn-complete", "thread-id": "thread-1", "turn-id": "turn-4",
+        "cwd": "/repo", "input-messages": ["first prompt", "later message"],
+        "last-assistant-message": "x".repeat(32768),
+    });
+    let (report, seed) = deliver(&["notify", &original.to_string()], &[], b"");
+    let payload = &report["payload"];
+    assert!(payload.get("last-assistant-message").is_none());
+    assert_eq!(
+        payload["input-messages"],
+        serde_json::json!(["first prompt"])
+    );
+    let (_, expected) = diri_engine::hooks::parse_codex_notify(&original).unwrap();
+    let (_, actual) = diri_engine::hooks::parse_codex_notify(payload).unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(seed.native_turn_id.as_deref(), Some("turn-4"));
+    assert_eq!(seed.agent_session_id.as_deref(), Some("thread-1"));
 }
 
 #[test]

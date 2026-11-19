@@ -274,9 +274,23 @@ fn notify(arguments: &[String]) -> Result<(), CliError> {
     let Some(raw) = arguments.last() else {
         return Ok(());
     };
-    let payload = serde_json::from_str(raw).unwrap_or_else(|_| json!({"raw": raw}));
-    if payload.get("type").and_then(Value::as_str) == Some("agent-turn-complete") {
-        persist_hook_activity("codex-notify", None, &payload);
+    let Ok(mut payload) = serde_json::from_str::<Value>(raw) else {
+        return Ok(());
+    };
+    if payload.get("type").and_then(Value::as_str) != Some("agent-turn-complete") {
+        return Ok(());
+    }
+    persist_hook_activity("codex-notify", None, &payload);
+    // parse_codex_notify uses the first input for the title. The answer and
+    // later inputs can be large and do not contribute to the completion.
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("last-assistant-message");
+        if let Some(inputs) = object
+            .get_mut("input-messages")
+            .and_then(Value::as_array_mut)
+        {
+            inputs.truncate(1);
+        }
     }
     let _ = bridge().request(
         Method::HOOK_REPORT,
