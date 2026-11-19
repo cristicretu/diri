@@ -21,13 +21,22 @@ C4–C6 poll for changes to repository files or the agent session log every two 
 
 The official CLI dry run finished with 14 rows for these six tests. All three C6 variants returned `not calibrated: returnToThread`. A measured run requires the dedicated macOS account named `ademark`. The official adapter opens and quits Diri by bundle identity and resets user-specific data. Its network fault changes the machine firewall. This experiment used private sockets, temporary state, PTYs and loopback replay. A terminal grid observation covers Engine parsing and attach delivery. Desktop focus, OCR, live-model work and hidden grading require a separate benchmark machine.
 
-- **C2/C3.** The `composer_delivery` test sends binary attach frames through the production key and paste encoders. A PTY repaints a progress row while a separate file records delivered input. It checks all three echo deadlines and exact submitted bytes, including order, delimiters and multiplicity. The fixture passed 20 repeated runs on the baseline.
+- **C2/C3.** The `composer_delivery` test sends binary attach frames through the production key and paste encoders. A PTY repaints a progress row while a separate file records delivered input. It checks all three echo deadlines and exact submitted bytes, including order, delimiters and multiplicity. The fixture passed 20 repeated runs. With the worktree-built Holder, Claude Code 2.1.328 and the upstream task wording, the three follow-ups appeared above the composer 514, 511 and 512 ms after paste, including the profile’s 500 ms paste-to-submit delay. The next main-thread model request contained each exactly once. All 69 C2 probes echoed in the desktop attachment’s grid within two seconds (maximum 713 ms). A separate diagnostic that cleared each probe individually missed one echo. C1 probes and native window/OCR timing were outside this run.
 - **C4.** A fixture kills the wrapped child inside a real PTY. The Engine records status 137 and the original login shell accepts a command on the same PID. Real Claude Code also returned exit status 0 on `/exit`. The Registry still reported a live session and the same shell executed a command. Continuing the interrupted Claude task automatically would change the existing exit policy.
-- **C5.** The opt-in Claude Code test uses a fresh home and an Anthropic-compatible loopback server. It drops model connections for 30 seconds and checks for a visible retry or connection-error message. The known reply arrived on the same session and PID without another prompt.
+- **C5.** The default PTY regression drops a private Unix connection after one prompt, observes the retry screen, and checks the pending request and PID at recovery. The opt-in Claude Code test uses a fresh home and an Anthropic-compatible loopback server. It drops model connections for 30 seconds and checks for a visible retry or connection-error message. The known reply arrived on the same session and PID without another prompt.
 - **C6.** A held child finishes work while all app clients are closed. A fresh control client sees the original session ID, PID and result. The desktop store also has a test that reloads its persisted selection. A separate interrupted-Holder-probe reproducer covers an Engine restart, which is a different fault from quitting the desktop app.
-- **A12.** The deterministic allocator test feeds 7,200 unique, linked composer repaints at fixed geometry, requesting a grid update for each. It bounds live heap growth after warm-up at 64 KiB and checks the final composer and primary screen. This catches per-repaint retention without relying on wall-clock timing.
+- **A12.** The deterministic allocator test feeds 7,200 unique, linked composer repaints at fixed geometry, applying each grid update to the desktop render buffer and requesting its row damage. It bounds live heap growth after warm-up at 64 KiB and checks the final composer and primary screen. With the optional page-based core enabled, Linux CI measured 640,128 additional live bytes on the initial PR. The page kept each superseded OSC 8 URL in its lookup table. The fix periodically discards targets that no cell maps to and preserves shared links. The same allocator bound applies to both cores.
 
 The formal model, counterexamples and Rust trace comparisons are documented in [the formal verification README](../../formal/README.md).
+
+## Thirty-minute memory sample
+
+| Private Engine and Holder | Physical-footprint slope, MiB/hour | 95% interval | Peak MiB | Raw samples |
+| --- | ---: | ---: | ---: | --- |
+| Before checkpoint allocation change | +19.44 | −5.99 to +44.86 | 49.27 | [Baseline CSV, gzip](ademark-track-c/before.csv.gz) |
+| After checkpoint allocation change | +7.01 | +2.48 to +11.53 | 18.45 | [Patched CSV, gzip](ademark-track-c/after.csv.gz) |
+
+Each 30-minute run recorded 7,201 samples. ADEMark’s original `firstWindowMinutes`, `minuteMedians` and `leakSlope` functions selected 7,200 ticks and 29 complete minute medians per run. The observed workload accumulated bounded scrollback. The two runs started at different times, overlapped other builds, and their intervals overlap. The patched trace still has a positive slope. One pair of observations cannot establish a leak-free steady state or predict the official desktop A12 result. The workload used plain text and did not exercise the optional core’s hyperlink fix.
 
 ## Reproduction
 
@@ -38,7 +47,9 @@ cargo test -p diri-engine --test composer_delivery
 cargo test -p diri-engine --test session killing_the_agent
 cargo test -p diri-engine --test session a_model_connection_cut
 cargo test -p diri-engine --test holder_session work_finishes_in_the_original_session
-cargo test -p diri-terminal-state --test composer_heap_growth --test growing_checkpoints
+cargo test -p diri-term --test composer_heap_growth
+cargo test -p diri-term --features diri-terminal-state/core-v2-screen --test composer_heap_growth
+cargo test -p diri-terminal-state --test growing_checkpoints
 ```
 
 The optional real-CLI tests need Claude Code and Python 3 on PATH. Each test runs a temporary home and a loopback model server. Run them individually with one test thread. To use the upstream task wording for the delivery test, set `DIRI_DELIVERY_TASK_DIR` to the harness clone’s `tasks/C2-message-delivery` directory. The synthetic response exercises queued input and retry. It supplies no solution to the graded task.
