@@ -260,16 +260,21 @@ def measure(args, mode):
         stack.callback(os.close, master)
         try:
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 30, 120, 0, 0))
+            times['spawn'] = time.monotonic_ns()
             proc = subprocess.Popen(command, env=env, cwd=project, stdin=slave, stdout=slave,
                                     stderr=slave, start_new_session=True)
         finally:
             os.close(slave)
         try:
             await_text(master, '❯'.encode(), 15)
+            times['composer'] = time.monotonic_ns()
             if mcp and not api.listed.wait(5):
                 raise RuntimeError('Claude did not load fixture MCP tools')
             time.sleep(.6)
             os.write(master, PROMPT.encode())
+            if mode == 'stall':
+                await_text(master, PROMPT.encode(), 5)
+                times['echo'] = time.monotonic_ns()
             time.sleep(.2)
             times['enter'] = time.monotonic_ns()
             os.write(master, b'\r')
