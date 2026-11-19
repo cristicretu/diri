@@ -1,0 +1,6 @@
+name = "diri-formal"
+version = "0.1.0"
+defaultTargets = ["Reliability"]
+
+[[lean_lib]]
+name = "Reliability"

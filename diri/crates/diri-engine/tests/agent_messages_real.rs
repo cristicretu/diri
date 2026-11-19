@@ -49,6 +49,9 @@ use diri_proto::ControlMessage;
 use diri_proto::grid::{GridCell, GridRowCodec, TermColor, TermStyle};
 use serde_json::{Value, json};
 
+#[path = "support/composer.rs"]
+mod composer;
+
 #[path = "support/teardown.rs"]
 mod teardown;
 
@@ -215,7 +218,8 @@ impl Drop for Fixture {
 }
 
 fn fixture() -> Fixture {
-    let temp = tempfile::tempdir().unwrap();
+    // macOS limits a Unix socket path to 103 bytes; Holders append a session ID.
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
     let home = temp.path().join("home");
     let project = temp.path().join("project");
     std::fs::create_dir_all(&project).unwrap();
@@ -242,7 +246,42 @@ fn fixture() -> Fixture {
     let proxy = format!("http://127.0.0.1:{port}");
     // SAFETY: --test-threads=1, and set before the Engine spawns anything.
     unsafe {
+        // A caller running inside Diri can carry its live socket, session,
+        // CLI, recovery paths and MCP token; an Agent can carry its own
+        // config/credential directory and provider overrides. Keep only
+        // this suite's selectors before building the isolated environment.
+        for (name, _) in std::env::vars_os() {
+            let Some(key) = name.to_str() else { continue };
+            if key.starts_with("DIRIJOR_")
+                || key.starts_with("CLAUDE_")
+                || key.starts_with("ANTHROPIC_")
+                || (key.starts_with("DIRI_")
+                    && !matches!(
+                        key,
+                        "DIRI_AGENTS" | "DIRI_DUMP_DIR" | "DIRI_INLINE" | "DIRI_DELIVERY_TASK_DIR"
+                    ))
+            {
+                std::env::remove_var(name);
+            }
+        }
+        std::env::remove_var("CLAUDECODE");
+        // Without CLAUDE_CONFIG_DIR, Claude uses the fixture HOME/.claude
+        // and its onboarding seed in HOME/.claude.json.
         std::env::set_var("HOME", &home);
+        std::env::set_var("ZDOTDIR", &home);
+        std::env::set_var(
+            "SHELL",
+            if cfg!(target_os = "macos") {
+                "/bin/zsh"
+            } else {
+                "/bin/bash"
+            },
+        );
+        std::env::set_var("DIRIJOR_APP_SUPPORT", temp.path());
+        std::env::set_var("DIRIJOR_SOCKET", temp.path().join("daemon.sock"));
+        std::env::set_var("DIRIJOR_AGENT_LAUNCHER", "0");
+        std::env::set_var("DIRI_HOLDER_IDLE_SECONDS", "1");
+        std::env::set_var("DIRI_TELEMETRY", "off");
         std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
         std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
         std::env::set_var("XDG_STATE_HOME", home.join(".local/state"));
@@ -372,8 +411,136 @@ fn which(name: &str) -> Result<PathBuf, ()> {
         .ok_or(())
 }
 
+/// Claude Code owns API retry. Interrupt only its private Anthropic socket,
+/// then check that the actual reply is drawn in the still-live PTY without
+/// another submit. Use `--test-threads=1` as for the other real CLI tests.
+#[test]
+#[ignore = "needs Claude Code and python3 on PATH; includes a 30-second outage"]
+fn claude_finishes_after_a_model_connection_cut_without_manual_continue() {
+    let mut fixture = fixture();
+    let cut = fixture.temp.path().join("api.cut");
+    let log = fixture.temp.path().join("api.log");
+    let (mut client, registry) = start_with_registry(&mut fixture);
+    let record = client
+        .call(
+            "session.spawn",
+            json!({
+                "kind": {"claude-code":{}}, "cwd": fixture.project,
+                "initialCols": 120, "initialRows": 40
+            }),
+        )
+        .unwrap();
+    let id = record["id"].as_str().unwrap();
+    let screen = client.wait_screen(id, Duration::from_secs(40), |s| s.contains("❯"));
+    assert!(screen.contains("❯"), "Claude startup: {screen}");
+    let pid = registry.lock().unwrap().get(id).unwrap().child_pid();
+    std::fs::write(&cut, []).unwrap();
+    client
+        .call(
+            "session.send_text",
+            json!({
+                "sessionID": id, "text": "Show LINES 3", "submit": true
+            }),
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let events = std::fs::read_to_string(&log).unwrap_or_default();
+        if events.contains("CUT model request last_user='Show LINES 3'") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "model never attempted the test request: {}",
+            client.screen(id)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let cut_ends = Instant::now() + Duration::from_secs(30);
+    let mut showed_retry = false;
+    let mut during = String::new();
+    while Instant::now() < cut_ends {
+        during = client.screen(id);
+        let lower = during.to_lowercase();
+        showed_retry |= lower.contains("retry") || lower.contains("connection error");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    std::fs::remove_file(&cut).unwrap();
+    let screen = client.wait_screen(id, Duration::from_secs(60), |s| {
+        s.contains("Reply line 3 for this turn.")
+    });
+    assert!(
+        screen.contains("Reply line 3 for this turn."),
+        "Claude recovery: {screen}"
+    );
+    assert!(
+        showed_retry,
+        "no retry or connection error visible during the outage: {during}"
+    );
+    let registry = registry.lock().unwrap();
+    let session = registry.get(id).unwrap();
+    assert_eq!(session.child_pid(), pid);
+    assert!(!session.view().exited);
+}
+
+/// A user quitting Claude keeps the same tab and gets a working login shell.
+#[test]
+#[ignore = "needs Claude Code and python3 on PATH"]
+fn claude_exit_returns_to_a_live_shell_in_the_original_session() {
+    let mut fixture = fixture();
+    let (mut client, registry) = start_with_registry(&mut fixture);
+    let record = client.call("session.spawn", json!({
+        "kind": {"claude-code":{}}, "cwd": fixture.project, "initialCols": 100, "initialRows": 30
+    })).unwrap();
+    let id = record["id"].as_str().unwrap();
+    assert!(
+        client
+            .wait_screen(id, Duration::from_secs(40), |s| s.contains("❯"))
+            .contains("❯")
+    );
+    let pid = registry.lock().unwrap().get(id).unwrap().child_pid();
+    client
+        .call(
+            "session.send_text",
+            json!({"sessionID": id, "text": "/exit", "submit": true}),
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while registry.lock().unwrap().get(id).unwrap().agent_exit() != Some(0) {
+        assert!(
+            Instant::now() < deadline,
+            "Claude did not exit cleanly: {}",
+            client.screen(id)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    {
+        let mut registry = registry.lock().unwrap();
+        let changes = registry.changed_since(&mut Default::default());
+        let (_, published) = changes.iter().find(|(key, _)| key == id).unwrap();
+        assert!(!matches!(
+            published.status,
+            diri_proto::SessionStatus::Exited(_)
+        ));
+        let session = registry.get(id).unwrap();
+        assert_eq!(session.child_pid(), pid);
+        session
+            .write_input(b"printf 'returned-%s\\n' shell\r")
+            .unwrap();
+    }
+    let screen = client.wait_screen(id, Duration::from_secs(5), |s| s.contains("returned-shell"));
+    assert!(screen.contains("returned-shell"), "login shell: {screen}");
+}
+
 /// Starts a private Engine in the fixture, which ends its sessions on drop.
 fn start_with_registry(fixture: &mut Fixture) -> (Client, Arc<Mutex<Registry>>) {
+    start_engine(fixture, None)
+}
+
+fn start_engine(
+    fixture: &mut Fixture,
+    holder: Option<diri_engine::session::HolderConfig>,
+) -> (Client, Arc<Mutex<Registry>>) {
     let temp = fixture.temp.path();
     let dir = diri_engine::detect::bundled_manifest_dir()
         .canonicalize()
@@ -385,10 +552,14 @@ fn start_with_registry(fixture: &mut Fixture) -> (Client, Arc<Mutex<Registry>>) 
     )));
     fixture.registry = Some(Arc::clone(&registry));
     let shared = Arc::clone(&registry);
-    let server = Arc::new(
-        ControlServer::new(Arc::clone(&registry), temp.join("daemon.sock"))
-            .with_logs_dir(temp.join("logs")),
-    );
+    let mut server = ControlServer::new(Arc::clone(&registry), temp.join("daemon.sock"))
+        .with_logs_dir(temp.join("logs"));
+    if let Some(config) = holder {
+        // The daemon creates this before the first Holder opens its log.
+        diri_platform::private::create_dir_all(&temp.join("logs")).unwrap();
+        server = server.with_holder(config);
+    }
+    let server = Arc::new(server);
     let listener = server.bind().unwrap();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
@@ -886,4 +1057,186 @@ fn measure_claude_page_keys() {
     // Cursor keys move within a draft and must not reach it from a jump.
     println!("long: draft before keys {:?}", draft(&mut client));
     let _ = client.call("session.kill", json!({ "sessionID": id }));
+}
+
+/// C2/C3 with a real composer and a replayed in-flight model request. As in
+/// the GUI profile, paste and Ctrl+M are separate terminal input frames. Each
+/// probe segment is cleared without submitting. Optionally point DIRI_DELIVERY_TASK_DIR
+/// at the local C2 task folder to replay its real prompt and follow-ups.
+/// Run only with --test-threads=1.
+#[test]
+#[ignore = "needs Claude Code and python3 on PATH; includes 150 seconds of live input probes"]
+fn claude_queues_followups_while_a_model_request_is_in_flight() {
+    use composer::Composer;
+
+    let mut fixture = fixture();
+    let (prompt, followups) = match std::env::var_os("DIRI_DELIVERY_TASK_DIR") {
+        Some(dir) => {
+            let load = |name: &str| {
+                std::fs::read_to_string(Path::new(&dir).join(name))
+                    .unwrap()
+                    .trim()
+                    .to_owned()
+            };
+            (
+                load("prompt.md"),
+                ["followups/F1.md", "followups/F2.md", "followups/F3.md"].map(load),
+            )
+        }
+        None => (
+            "Respond when ready.".into(),
+            ["First follow-up", "Second follow-up", "Third follow-up"].map(str::to_owned),
+        ),
+    };
+    std::fs::write(
+        fixture.temp.path().join("api.messages"),
+        serde_json::to_vec(&json!({"prompt":prompt,"followups":followups})).unwrap(),
+    )
+    .unwrap();
+    let hold = fixture.temp.path().join("api.hold");
+    let capture = fixture.temp.path().join("api.delivery");
+    std::fs::write(&hold, []).unwrap();
+    std::fs::write(&capture, []).unwrap();
+    let holder = diri_engine::session::HolderConfig {
+        holders_dir: fixture.temp.path().join("holders"),
+        executable: env!("CARGO_BIN_EXE_diri-holder").into(),
+    };
+    let (mut client, _) = start_engine(&mut fixture, Some(holder));
+    let record = client
+        .call(
+            "session.spawn",
+            json!({
+                "kind": {"claude-code": {}},
+                "cwd": fixture.project,
+                "initialCols": 140,
+                "initialRows": 45,
+            }),
+        )
+        .unwrap();
+    let id = record["id"].as_str().unwrap();
+    let data = UnixStream::connect(fixture.temp.path().join("daemon.sock")).unwrap();
+    let mut composer = Composer::attach(data, id);
+    assert!(
+        composer.wait(Duration::from_secs(40), |rows| rows
+            .iter()
+            .any(|r| r.contains('❯'))),
+        "Claude startup: {:?}",
+        composer.rows
+    );
+    let start = Instant::now();
+    composer.paste(&prompt);
+    std::thread::sleep(Duration::from_millis(500));
+    composer.key("m", true);
+    while std::fs::metadata(&capture).unwrap().len() == 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "initial turn never reached the replay server: {}",
+            client.screen(id)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let mut probes = 0;
+    let mut missed = Vec::new();
+    let mut max_echo = Duration::ZERO;
+    for (followup, at) in followups.iter().zip([30, 90, 150]) {
+        let deadline = start + Duration::from_secs(at);
+        let mut typed = String::new();
+        let mut letters = ["a", "d", "e", "m", "a", "r", "k", "q", "z"]
+            .into_iter()
+            .cycle();
+        while Instant::now() + Duration::from_millis(3500) < deadline {
+            // ADEMark's native lag instrument accumulates "ademarkqz"
+            // through each segment and clears it before the next follow-up.
+            let ch = letters.next().unwrap();
+            typed.push_str(ch);
+            let posted = Instant::now();
+            composer.key(ch, false);
+            let has_echo = |rows: &[String]| {
+                rows.iter().any(|row| {
+                    row.trim()
+                        .strip_prefix('❯')
+                        .is_some_and(|draft| draft.trim() == typed)
+                })
+            };
+            let echoed = composer.wait(Duration::from_secs(2), has_echo);
+            let elapsed = posted.elapsed();
+            probes += 1;
+            if echoed && elapsed <= Duration::from_secs(2) {
+                max_echo = max_echo.max(elapsed);
+            } else {
+                missed.push(posted.duration_since(start));
+                eprintln!(
+                    "no echo for probe {probes} at {:?} (sampled after {elapsed:?})",
+                    posted.duration_since(start)
+                );
+                // Match later probes against the actual composer after a
+                // missing key, so one miss does not mask all subsequent echoes.
+                if let Some(draft) = composer
+                    .rows
+                    .iter()
+                    .rev()
+                    .find_map(|r| r.trim().strip_prefix('❯'))
+                {
+                    typed = draft
+                        .trim()
+                        .chars()
+                        .take_while(|c| "ademarkqz".contains(*c))
+                        .collect();
+                }
+            }
+            std::thread::sleep(Duration::from_secs(2).saturating_sub(elapsed));
+        }
+        composer.key("u", true);
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        let sent = Instant::now();
+        composer.paste(followup);
+        std::thread::sleep(Duration::from_millis(500));
+        composer.key("m", true);
+        // The last rows contain the active composer and its footer. Count
+        // only an appearance in the thread above those rows as acceptance.
+        let prefix: String = followup.chars().take(24).collect();
+        let in_thread =
+            |rows: &[String]| rows.iter().rev().skip(5).any(|row| row.contains(&prefix));
+        assert!(
+            composer.wait(Duration::from_secs(5), in_thread),
+            "follow-up at {at}s did not appear in the thread: {:?}",
+            composer.rows
+        );
+        eprintln!(
+            "follow-up at {at}s appeared above the composer after {:?}",
+            sent.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(1500).saturating_sub(sent.elapsed()));
+    }
+    std::fs::remove_file(hold).unwrap();
+    let waited = Instant::now();
+    loop {
+        let counts: Vec<[u64; 3]> = std::fs::read_to_string(&capture)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            counts.iter().flatten().all(|&n| n <= 1),
+            "duplicate in model history: {counts:?}"
+        );
+        if counts.contains(&[1, 1, 1]) {
+            eprintln!("model request marker counts in capture order: {counts:?}");
+            break;
+        }
+        assert!(
+            waited.elapsed() < Duration::from_secs(60),
+            "follow-ups missing from capture: {counts:?}; {}",
+            client.screen(id)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!(
+        "3/3 follow-ups in model user history exactly once, {probes} probes, missed {missed:?}, maximum observed echo {max_echo:?}"
+    );
+    assert!(
+        missed.is_empty(),
+        "composer probes missed the two-second deadline"
+    );
 }
