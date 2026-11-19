@@ -443,7 +443,13 @@ fn fake_cli(dir: &Path, name: &str, version_line: &str, out: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn launch(engine: &Engine, cli: &str, cwd: &Path, out: &Path) -> Vec<String> {
+fn observe_launch<T>(
+    engine: &Engine,
+    cli: &str,
+    cwd: &Path,
+    out: &Path,
+    observe: impl FnOnce(&str, Vec<String>) -> T,
+) -> T {
     let bridge = dirijor_mcp::Bridge::new(engine.server.socket_path().to_owned(), None);
     bridge
         .request(
@@ -466,13 +472,18 @@ fn launch(engine: &Engine, cli: &str, cwd: &Path, out: &Path) -> Vec<String> {
         std::thread::sleep(Duration::from_millis(50));
     }
     let recorded = std::fs::read_to_string(&file).expect("the fake CLI ran");
+    let observed = observe(&id, recorded.lines().map(str::to_owned).collect());
     engine
         .registry
         .lock()
         .unwrap()
         .terminate(&id, Duration::from_secs(2))
         .unwrap();
-    recorded.lines().map(str::to_owned).collect()
+    observed
+}
+
+fn launch(engine: &Engine, cli: &str, cwd: &Path, out: &Path) -> Vec<String> {
+    observe_launch(engine, cli, cwd, out, |_, argv| argv)
 }
 
 fn mcp_config(argv: &[String]) -> &str {
@@ -511,4 +522,77 @@ fn only_a_verified_cli_release_is_pointed_at_the_endpoint() {
     };
     assert_eq!(mcp_config(&argv), "claude-mcp-http.json", "{argv:?}");
     assert_eq!(argv.last().unwrap(), "TOKEN=set", "{argv:?}");
+}
+
+/// Compare the files and server discovery Claude consumes, under two different
+/// live leases. A new conversation UUID must still reach the CLI on every spawn.
+#[test]
+fn fresh_claude_spawns_share_prompt_visible_injection() {
+    let engine = start();
+    let work = tempfile::tempdir().unwrap();
+    let out = work.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    let cli = fake_cli(work.path(), "claude", "2.1.303 (Claude Code)", &out);
+    let spawn = || {
+        observe_launch(&engine, &cli, work.path(), &out, |id, mut argv| {
+            let value = |flag: &str| {
+                let i = argv.iter().position(|a| a == flag).unwrap();
+                Path::new(&argv[i + 1])
+            };
+            let hooks = std::fs::read(value("--settings")).unwrap();
+            let mcp_config = std::fs::read(value("--mcp-config")).unwrap();
+            let config: Value = serde_json::from_slice(&mcp_config).unwrap();
+            let endpoint = config["mcpServers"]["dirijor"]["url"].as_str()?;
+            let plugin = value("--plugin-dir");
+            let manifest = std::fs::read(plugin.join(".claude-plugin/plugin.json")).unwrap();
+            let skills: std::collections::BTreeMap<_, _> = std::fs::read_dir(plugin.join("skills"))
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (
+                        entry.file_name(),
+                        std::fs::read(entry.path().join("SKILL.md")).unwrap(),
+                    )
+                })
+                .collect();
+            let token = engine.server.mcp_http_token(id).unwrap();
+            let discovery = [
+                (
+                    "initialize",
+                    json!({"protocolVersion":"2025-06-18","capabilities":{},
+                    "clientInfo":{"name":"test","version":"1"}}),
+                ),
+                ("tools/list", json!({})),
+            ]
+            .map(|(method, params)| {
+                let reply = post(
+                    endpoint,
+                    Some(&token),
+                    &json!({
+                        "jsonrpc": "2.0", "id": 1, "method": method, "params": params
+                    }),
+                );
+                assert_eq!(reply.status, 200);
+                assert!(reply.message()["result"].is_object());
+                reply.body
+            });
+            let index = argv.iter().position(|arg| arg == "--session-id").unwrap();
+            let uuid = argv.remove(index + 1);
+            Some((uuid, (argv, hooks, mcp_config, manifest, skills, discovery)))
+        })
+    };
+    // The first spawn may use stdio while the CLI version probe runs.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let first = loop {
+        if let Some(observed) = spawn() {
+            break observed;
+        }
+        assert!(Instant::now() < deadline, "Claude version probe timed out");
+    };
+    let second = spawn().expect("verified Claude uses HTTP");
+    assert_ne!(first.0, second.0);
+    assert!(
+        first.1 == second.1,
+        "Claude injection changed between fresh sessions"
+    );
 }
