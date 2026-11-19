@@ -15,7 +15,7 @@
 # regression.
 #
 # Usage: latency-probe.sh --app <diri.app>
-# Env: DIRI_LATENCY_MEDIAN_MS (default 75), DIRI_LATENCY_P90_MS (default 150),
+# Env: DIRI_LATENCY_MEDIAN_MS (default 25), DIRI_LATENCY_P90_MS (default 50),
 #      DIRI_LATENCY_SAMPLES (default 10)
 
 set -euo pipefail
@@ -70,8 +70,8 @@ done
 }
 
 DIRI_LATENCY_SOCK="$support/daemon.sock" \
-DIRI_LATENCY_MEDIAN_MS="${DIRI_LATENCY_MEDIAN_MS:-75}" \
-DIRI_LATENCY_P90_MS="${DIRI_LATENCY_P90_MS:-150}" \
+DIRI_LATENCY_MEDIAN_MS="${DIRI_LATENCY_MEDIAN_MS:-25}" \
+DIRI_LATENCY_P90_MS="${DIRI_LATENCY_P90_MS:-50}" \
 DIRI_LATENCY_SAMPLES="${DIRI_LATENCY_SAMPLES:-10}" \
 python3 - <<'PROBE'
 import json
@@ -136,9 +136,13 @@ samples = []
 for index in range(int(os.environ["DIRI_LATENCY_SAMPLES"])):
     marker = f"probe-{index}-{int(time.time() * 1000)}"
     started = time.monotonic()
+    # Raw keystrokes, Enter included, the way a typing user reaches the PTY.
+    # `submit: True` would frame a prompt paste and then wait PASTE_SUBMIT_GAP
+    # (80 ms, for Gemini's paste protection) before its Enter, so every sample
+    # measured that deliberate pause instead of the pipeline.
     request(
         "session.send_text",
-        {"sessionID": session, "text": f"echo {marker}", "submit": True},
+        {"sessionID": session, "text": f"echo {marker}\r", "submit": False},
     )
     while True:
         # The echoed command AND its output line both carry the marker.
