@@ -1,5 +1,7 @@
 # Working in Diri Notes
 
+In Claude Code and Codex, pass the action names below to Diri’s `act` tool with an `arguments` object. Use `get_skill` with `action` for its schema, or with no arguments to list actions and guides. In a Diri terminal, `"$DIRIJOR_CLI" mcp-tools` prints the CLI catalog.
+
 Diri Notes are the person's plans, briefs, and to-do lists. People who are not developers read them, so write plainly.
 
 - If whoami shows origin_note, you were started from a note: read it first with read_note {"note":"origin"}. It is your brief.

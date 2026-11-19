@@ -5,6 +5,12 @@ lead: Agents running in diri can start other agents, hand them tasks, wait for t
 ---
 The server ships inside the app. Claude Code, Codex and Cursor get it automatically when diri starts them, so most people never configure anything. This page covers what it can do, how to connect other agents, and the rules it enforces. Every tool and argument is listed in the [MCP tool reference](/docs/mcp-tools/).
 
+## Discovering an action
+
+Claude Code and Codex can use the versioned compact MCP profile. It advertises two tools. Call `get_skill` with `{"name":"orchestration"}` for the guide, with `{"action":"submit_task"}` for the argument schema, or with `{}` to list available actions and skills. Pass the chosen action and its arguments to `act`. For example, `{"action":"whoami","arguments":{}}` returns the calling session. Claude Code also exposes the guides as native `diri:` skills.
+
+The Engine authenticates HTTP calls with the session token and applies its usual lineage checks. Client permission rules match the advertised MCP tool name. A standing approval for `act` applies to every action reachable by that session. Installations with individual action rules can use the full catalog at `/mcp` or start `dirijor-mcp` without arguments. The compact endpoint uses `/mcp/skills-v1` and its stdio counterpart uses `--skills-v1`.
+
 ## What agents can do
 
 | Area | Tools | For example |

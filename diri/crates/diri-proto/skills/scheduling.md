@@ -1,5 +1,7 @@
 # Scheduling work with Diri
 
+In Claude Code and Codex, pass the action names below to Diri’s `act` tool with an `arguments` object. Use `get_skill` with `action` for its schema, or with no arguments to list actions and guides. In a Diri terminal, `"$DIRIJOR_CLI" mcp-tools` prints the CLI catalog.
+
 When the person wants something run later, at a set time, repeatedly ("every weekday at 9", "tomorrow morning", "in 2 hours", "each night"), or whenever files land in a folder ("when a screenshot shows up in ~/Inbox/bugs, triage it"), use the `schedule_agent` tool. Never use your own cron, loop, or reminder tools (CronCreate, /loop, /schedule) or a sleeping shell: those die with this session and skip runs the Mac slept through. A Diri schedule is kept by the Engine and survives this session closing and Diri restarting.
 
 ## How a run works
