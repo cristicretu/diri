@@ -9,10 +9,9 @@
 //!
 //! An uncontended report still applies inline, before the reply. A report
 //! that finds the Registry busy, or reports still queued ahead of it, is
-//! queued in arrival order to one applier thread and answered at once. Per
-//! Agent, arrival order is callback order (the provider waits for each hook
-//! process to exit before the next), so a session's reports are never
-//! reordered. Before delivery the CLI already wrote the report's lifecycle
+//! queued in submission order to one applier thread. The connection's
+//! reservation in `hook_order` sequences submissions before they reach this
+//! queue, including callbacks whose CLI already exited. Before delivery the CLI already wrote the report's lifecycle
 //! facts to the session's recovery store, which is what restart recovery
 //! reads; the Registry's own write stays on the persistence flusher.
 

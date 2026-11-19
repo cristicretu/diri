@@ -1,0 +1,6 @@
+name = "hook_order"
+version = "0.1.0"
+defaultTargets = ["HookOrder"]
+
+[[lean_lib]]
+name = "HookOrder"

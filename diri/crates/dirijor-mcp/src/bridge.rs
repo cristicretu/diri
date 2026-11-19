@@ -73,20 +73,67 @@ impl Bridge {
     }
 
     fn connect(&self, timeout: Duration) -> Result<ControlClient, ControlFailure> {
+        self.connect_hello(timeout, None).map(|(client, _)| client)
+    }
+
+    fn connect_hello(
+        &self,
+        timeout: Duration,
+        intent: Option<Value>,
+    ) -> Result<(ControlClient, Value), ControlFailure> {
         if self.cancellation.is_cancelled() {
             return Err(ControlFailure::Cancelled);
         }
         let mut client = ControlClient::connect(&self.socket_path, timeout)?
             .with_cancellation(self.cancellation.clone())?;
-        let hello = client.request(Method::HELLO, json!({
+        let mut params = json!({
             "proto":diri_proto::WIRE_VERSION, "build":concat!("dirijor-mcp-", env!("CARGO_PKG_VERSION")),
-        }))?;
+        });
+        if let Some(intent) = intent {
+            params["reserveHook"] = intent;
+        }
+        let hello = client.request(Method::HELLO, params)?;
         if hello["proto"].as_u64() != Some(u64::from(diri_proto::WIRE_VERSION))
             || hello["engineKind"].as_str() != Some(diri_proto::RUST_ENGINE_KIND)
         {
             return Err(ControlFailure::Protocol("unsupported Engine identity or control protocol; update/restart Diri before using MCP".into()));
         }
-        Ok(client)
+        Ok((client, hello))
+    }
+
+    /// Reserve the callback's Engine order before returning to the provider.
+    /// A previous Engine ignores the Hello extension and answers the ordinary
+    /// RPC on this same verified connection.
+    pub fn report_hook(&self, params: Value) -> Result<Value, ControlFailure> {
+        let deadline = Instant::now() + DEFAULT_TIMEOUT;
+        let intent = params["dirijorSessionID"].as_str().map(|id| {
+            json!({
+                "sessionID": id, "kind": params["kind"], "event": params["event"],
+            })
+        });
+        let (mut client, hello) = self.connect_hello(DEFAULT_TIMEOUT, intent)?;
+        let Some(reservation) = hello.get("hookReservation") else {
+            return client.request_until(Method::HOOK_REPORT.into(), params, deadline);
+        };
+        let sequence = reservation["sequence"]
+            .as_u64()
+            .ok_or_else(|| ControlFailure::Protocol("invalid hook reservation".into()))?;
+        let mismatched_event = params["payload"]["hook_event_name"]
+            .as_str()
+            .is_some_and(|event| params["event"].as_str() != Some(event));
+        client.write_request_until(
+            sequence,
+            diri_proto::control::HOOK_COMMIT.into(),
+            params,
+            deadline,
+        )?;
+        // The kernel owns the complete frame before the provider can start
+        // its next callback or tear down the hook process.
+        Ok(if mismatched_event {
+            json!({})
+        } else {
+            reservation["response"].clone()
+        })
     }
 
     pub fn tool_definitions(&self) -> Result<Vec<ToolDefinition>, String> {

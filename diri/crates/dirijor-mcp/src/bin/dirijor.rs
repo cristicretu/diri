@@ -195,16 +195,12 @@ fn hook(event: Option<&str>) -> Result<(), CliError> {
     let event = event.unwrap_or_default();
     let payload = stdin_json(HOOK_PAYLOAD_CAP, Duration::from_millis(500));
     persist_hook_activity("claude-hook", Some(event), &payload);
-    let result = bridge().request(
-        Method::HOOK_REPORT,
-        json!({
+    let result = bridge().report_hook(json!({
             "kind": "claude-hook",
             "dirijorSessionID": std::env::var("DIRIJOR_SESSION_ID").ok(),
             "event": event,
             "payload": forwarded_hook_payload(event, payload),
-        }),
-        Duration::from_secs(3),
-    );
+    }));
     // Hooks are deliberately fail-open: an unavailable UI must never prevent
     // an agent from starting or completing its own action.
     if event == "SessionStart"
@@ -274,20 +270,30 @@ fn notify(arguments: &[String]) -> Result<(), CliError> {
     let Some(raw) = arguments.last() else {
         return Ok(());
     };
-    let payload = serde_json::from_str(raw).unwrap_or_else(|_| json!({"raw": raw}));
-    if payload.get("type").and_then(Value::as_str) == Some("agent-turn-complete") {
-        persist_hook_activity("codex-notify", None, &payload);
+    let Ok(mut payload) = serde_json::from_str::<Value>(raw) else {
+        return Ok(());
+    };
+    if payload.get("type").and_then(Value::as_str) != Some("agent-turn-complete") {
+        return Ok(());
     }
-    let _ = bridge().request(
-        Method::HOOK_REPORT,
-        json!({
+    persist_hook_activity("codex-notify", None, &payload);
+    // parse_codex_notify uses the first input for the title. The answer and
+    // later inputs can be large and do not contribute to the completion.
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("last-assistant-message");
+        if let Some(inputs) = object
+            .get_mut("input-messages")
+            .and_then(Value::as_array_mut)
+        {
+            inputs.truncate(1);
+        }
+    }
+    let _ = bridge().report_hook(json!({
             "kind": "codex-notify",
             "dirijorSessionID": std::env::var("DIRIJOR_SESSION_ID").ok(),
             "event": null,
             "payload": payload,
-        }),
-        Duration::from_secs(3),
-    );
+    }));
     Ok(())
 }
 

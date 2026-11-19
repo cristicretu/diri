@@ -14,7 +14,7 @@
 //! the Registry.
 
 use std::fs::{DirBuilder, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -209,13 +209,30 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<Option<T>>
 
 fn write_json_atomic<T: Serialize>(directory: &Path, name: &str, value: &T) -> io::Result<()> {
     create_private_directory(directory)?;
+    let body = serde_json::to_vec(value)?;
+    // A first-prompt title, changed workspace or background-shell count
+    // updates the record without necessarily changing its recovery identity.
+    // Compare the actual private file so a missing or corrupt capsule is
+    // repaired even when the identity in memory is unchanged.
+    if name == RECOVERY_CAPSULE_FILE
+        && let Ok(file) = diri_platform::security::read_owned(&directory.join(name), true)
+    {
+        let mut existing = Vec::with_capacity(body.len());
+        if file
+            .take(body.len() as u64 + 1)
+            .read_to_end(&mut existing)
+            .is_ok()
+            && existing == body
+        {
+            return Ok(());
+        }
+    }
     static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
     let temporary = directory.join(format!(
         ".{name}.tmp-{}-{}",
         std::process::id(),
         NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed)
     ));
-    let body = serde_json::to_vec(value)?;
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
     #[cfg(unix)]
@@ -224,7 +241,18 @@ fn write_json_atomic<T: Serialize>(directory: &Path, name: &str, value: &T) -> i
         options.mode(0o600);
     }
     let mut file = options.open(&temporary)?;
-    if let Err(error) = file.write_all(&body).and_then(|()| file.sync_all()) {
+    // The Engine consumes last-activity only after adopting a still-live
+    // Holder. Publishing the complete file before the RPC survives an Engine
+    // or CLI crash. A reboot ends that Holder, so this one file never needs
+    // a disk-cache flush on the provider's callback path.
+    let write = file.write_all(&body).and_then(|()| {
+        if name == LAST_ACTIVITY_FILE {
+            Ok(())
+        } else {
+            file.sync_all()
+        }
+    });
+    if let Err(error) = write {
         drop(file);
         let _ = std::fs::remove_file(&temporary);
         return Err(error);
@@ -263,6 +291,30 @@ mod tests {
             agent_session_id: Some("conversation".into()),
             transcript_path: None,
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn identical_capsule_keeps_its_inode_and_a_damaged_one_is_replaced() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionRecoveryStore::new(directory.path());
+        let path = directory.path().join(RECOVERY_CAPSULE_FILE);
+        let capsule = capsule();
+        store.write_capsule(&capsule).unwrap();
+        let original = std::fs::File::open(&path).unwrap();
+        store.write_capsule(&capsule).unwrap();
+        assert_eq!(
+            original.metadata().unwrap().ino(),
+            std::fs::metadata(&path).unwrap().ino()
+        );
+        std::fs::write(&path, b"{").unwrap();
+        store.write_capsule(&capsule).unwrap();
+        assert_ne!(
+            original.metadata().unwrap().ino(),
+            std::fs::metadata(&path).unwrap().ino()
+        );
+        assert_eq!(store.read_capsule().unwrap(), Some(capsule));
     }
 
     #[test]

@@ -33,6 +33,7 @@ mod agent_sign_in;
 mod app_actions;
 mod claude_accounts;
 mod codex_accounts;
+mod hook_order;
 mod hook_queue;
 mod message_delivery;
 mod operations;
@@ -255,6 +256,7 @@ pub struct ControlServer {
     session_operations: Mutex<std::collections::HashSet<String>>,
     agent_scans: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>>,
     hook_reports: hook_queue::HookQueue,
+    hook_order: hook_order::HookOrder,
     /// Each session's spoken summary (Diri's `speak` tool) and the turn it
     /// was given in, until the app's reader collects it.
     spoken: Mutex<SpokenSummaries>,
@@ -412,6 +414,7 @@ impl ControlServer {
             session_operations: Mutex::new(std::collections::HashSet::new()),
             agent_scans: Arc::new(Mutex::new(std::collections::HashMap::new())),
             hook_reports: hook_queue::HookQueue::new(),
+            hook_order: Default::default(),
             spoken: Mutex::new(SpokenSummaries::default()),
             phone_reads_aloud: std::sync::atomic::AtomicBool::new(false),
             notes_dir: None,
@@ -425,6 +428,7 @@ impl ControlServer {
     /// to future spawns.
     pub fn with_injection(mut self, config: InjectionConfig) -> Self {
         let _ = crate::inject::write_claude_hooks_file(&config.inject_dir);
+        let _ = crate::inject::write_claude_exec_hooks_file(&config.inject_dir, &config.cli_path);
         let _ = crate::inject::write_claude_mcp_file(&config.inject_dir, &config.cli_path);
         let _ = crate::inject::write_claude_skills_plugin(&config.inject_dir);
         match crate::shell_integration::ShellIntegration::install(&config.inject_dir) {
@@ -941,8 +945,16 @@ impl ControlServer {
             }
             if first {
                 first = false;
-                if serde_json::from_slice::<serde_json::Value>(&line)
-                    .is_ok_and(|value| value.get("preview_set").is_some())
+                let first_frame = serde_json::from_slice::<Value>(&line).ok();
+                if let Some(frame) = first_frame.as_ref()
+                    && frame["method"] == Method::HELLO
+                    && frame["params"].get("reserveHook").is_some()
+                {
+                    return self.serve_reserved_hook(frame, &mut reader, &writer);
+                }
+                if first_frame
+                    .as_ref()
+                    .is_some_and(|value| value.get("preview_set").is_some())
                 {
                     if let Ok(request) =
                         serde_json::from_slice::<diri_proto::preview_set::PreviewSetRequest>(&line)
@@ -960,8 +972,9 @@ impl ControlServer {
                 }
                 // Route by the distinct key before normal attach decoding. Mixed
                 // or unsupported requests fail closed without visibility effects.
-                if serde_json::from_slice::<serde_json::Value>(&line)
-                    .is_ok_and(|value| value.get("preview").is_some())
+                if first_frame
+                    .as_ref()
+                    .is_some_and(|value| value.get("preview").is_some())
                 {
                     if let Ok(request) =
                         serde_json::from_slice::<diri_proto::preview::PreviewRequest>(&line)
@@ -4187,8 +4200,31 @@ impl ControlServer {
     /// fed to the session's reducer.
     fn hook_report(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::HookReportParams = decode(params)?;
-        let Some(session_id) = p.dirijor_session_id else {
+        let Some(session_id) = p.dirijor_session_id.as_ref() else {
             return Ok(json!({}));
+        };
+        let slot = self.hook_order.reserve(&session_id.0);
+        let context = self.hook_response(&p.kind, p.event.as_deref(), &session_id.0);
+        if slot.finish(|| self.apply_hook_report(p))? {
+            Ok(context)
+        } else {
+            Ok(json!({}))
+        }
+    }
+
+    fn hook_response(&self, kind: &str, event: Option<&str>, session_id: &str) -> Value {
+        if kind == "claude-hook" && event == Some("UserPromptSubmit") {
+            let phone = self.phone_reads_aloud.load(Ordering::Relaxed);
+            if let Some(context) = prompt_hook_context(phone, app_prefs().as_deref(), session_id) {
+                return json!({"additionalContext": context});
+            }
+        }
+        json!({})
+    }
+
+    fn apply_hook_report(&self, p: diri_proto::HookReportParams) -> Result<bool, ControlError> {
+        let Some(session_id) = p.dirijor_session_id else {
+            return Ok(false);
         };
         let parsed = match p.kind.as_str() {
             "claude-hook" => p.event.as_deref().and_then(|event| {
@@ -4205,18 +4241,9 @@ impl ControlServer {
             parsed = parsed.is_some(),
         );
         let Some((signal, meta)) = parsed else {
-            return Ok(json!({}));
+            return Ok(false);
         };
         let session_end = p.kind == "claude-hook" && p.event.as_deref() == Some("SessionEnd");
-        let prompt = p.kind == "claude-hook" && p.event.as_deref() == Some("UserPromptSubmit");
-        let context = prompt
-            .then(|| {
-                let phone = self
-                    .phone_reads_aloud
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                prompt_hook_context(phone, app_prefs().as_deref(), &session_id.0)
-            })
-            .flatten();
         // Never wait on the Registry here: the Agent is blocked on this reply.
         self.hook_reports
             .submit(
@@ -4230,10 +4257,7 @@ impl ControlServer {
                 },
             )
             .map_err(poisoned)?;
-        if let Some(context) = context {
-            return Ok(json!({ "additionalContext": context }));
-        }
-        Ok(json!({}))
+        Ok(true)
     }
 
     /// Keeps an Agent's spoken summary for the turn it is in, for the app to
@@ -6465,8 +6489,16 @@ fn idle_shutdown_refusal(live_sessions: usize, connections: usize) -> Option<&'s
 }
 
 fn read_bounded_control_line<R: BufRead>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>> {
+    read_bounded_control_line_with(reader, |_| Ok(()))
+}
+
+fn read_bounded_control_line_with<R: BufRead>(
+    reader: &mut R,
+    before_read: impl Fn(&R) -> std::io::Result<()>,
+) -> std::io::Result<Option<Vec<u8>>> {
     let mut line = Vec::new();
     loop {
+        before_read(reader)?;
         let available = reader.fill_buf()?;
         if available.is_empty() {
             return if line.is_empty() {
@@ -11304,6 +11336,61 @@ mod tests {
                 .agent_session_id
                 .as_deref(),
             Some("uuid-3")
+        );
+    }
+
+    #[test]
+    fn hook_commit_consumes_only_its_own_reservation_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = server(temp.path());
+        server
+            .registry
+            .lock()
+            .unwrap()
+            .insert_record(test_record("s_hook"));
+        let send = |offset: u64, conversation: &str| {
+            let (mut client, peer) = UnixStream::pair().unwrap();
+            let endpoint = server.clone();
+            let handler = std::thread::spawn(move || endpoint.serve(peer));
+            let intent =
+                json!({"kind":"claude-hook", "sessionID":"s_hook", "event":"SessionStart"});
+            writeln!(
+                client,
+                "{}",
+                json!({"id":1,"method":"hello","params":{"reserveHook":intent}})
+            )
+            .unwrap();
+            let mut response = String::new();
+            BufReader::new(&client).read_line(&mut response).unwrap();
+            let hello: Value = serde_json::from_str(&response).unwrap();
+            let sequence = hello["ok"]["hookReservation"]["sequence"].as_u64().unwrap();
+            let frame = |conversation: &str| {
+                json!({
+                    "id":sequence - offset, "method":"hook.commit", "params":{
+                        "kind":"claude-hook", "dirijorSessionID":"s_hook", "event":"SessionStart",
+                        "payload":{"session_id":conversation,"hook_event_name":"SessionStart"}
+                    }
+                })
+            };
+            // Both frames are buffered in a single write. A second dispatch
+            // would replace the first conversation identity in the Registry.
+            client
+                .write_all(format!("{}\n{}\n", frame(conversation), frame("duplicate")).as_bytes())
+                .unwrap();
+            handler.join().unwrap().unwrap();
+        };
+        send(0, "first");
+        send(1, "stale");
+        assert_eq!(
+            server
+                .registry
+                .lock()
+                .unwrap()
+                .record("s_hook")
+                .unwrap()
+                .agent_session_id
+                .as_deref(),
+            Some("first")
         );
     }
 
