@@ -14065,6 +14065,24 @@ mod tests {
                         }
                         store.upsert_session(session);
                     }
+                    // `DIRI_VISUAL_PINNED_EMPTY=1` adds a pinned project whose
+                    // sessions have all closed: it keeps its row.
+                    if std::env::var_os("DIRI_VISUAL_PINNED_EMPTY").is_some() {
+                        let id = ProjectId::new("preview-personal");
+                        store.handle_event(diri_client::EventEnvelope {
+                            name: diri_proto::EventName::PROJECT_UPDATED.to_owned(),
+                            seq: 0,
+                            params: serde_json::to_value(diri_proto::Project {
+                                id: id.clone(),
+                                root: "/Users/preview/personal-site".into(),
+                                name: "personal-site".into(),
+                                pinned_order: None,
+                                host: None,
+                            })
+                            .expect("preview project"),
+                        });
+                        store.toggle_project_pin(id).expect("pin preview project");
+                    }
                     // `DIRI_VISUAL_TERMINALS=1` adds terminals the Engine has
                     // named: one at a prompt, one running a program, and one
                     // running Claude Code typed at its prompt.

@@ -812,6 +812,44 @@ fn pinned_rows_lead_their_siblings() {
     assert!(projection.projects[1].sessions[0].pinned);
 }
 
+/// A pinned project is a place, not a byproduct of what is running: closing
+/// its last session keeps the row. Unpinned empty projects still leave, and
+/// a pin on a project the Engine no longer lists draws nothing.
+#[test]
+fn pinned_project_outlives_its_last_session() {
+    let prefs = Prefs {
+        sidebar_pinned_projects: vec![pid("b"), pid("ghost")],
+        ..Prefs::default()
+    };
+    let (mut store, _) = hydrated(
+        vec![session("work", "a", 1.0), session("only", "b", 2.0)],
+        vec![
+            project("a", "Alpha"),
+            project("b", "Beta"),
+            project("c", "Gamma"),
+        ],
+        prefs,
+    );
+
+    store.remove_session_record(&id("only"));
+    store.remove_session_record(&id("work"));
+
+    let projection = store.sidebar_projection();
+    assert_eq!(
+        projection
+            .projects
+            .iter()
+            .map(|group| group.project.id.clone())
+            .collect::<Vec<_>>(),
+        vec![pid("b")],
+        "only the pinned project survives losing every session"
+    );
+    let pinned = &projection.projects[0];
+    assert!(pinned.pinned);
+    assert!(pinned.sessions.is_empty() && pinned.active.is_empty());
+    assert!(projection.first_active().is_none());
+}
+
 fn rows(projection: &SidebarProjection, group: usize) -> Vec<SessionId> {
     projection.projects[group]
         .sessions
