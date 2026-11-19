@@ -1,12 +1,13 @@
 //! Retained heap while a terminal agent continuously redraws its composer.
 //! One test per binary because the allocator measures all Rust allocations.
 
-#[path = "../benches/support/allocation.rs"]
+#[path = "../../diri-terminal-state/benches/support/allocation.rs"]
 mod allocation;
 
 use std::sync::atomic::Ordering::Relaxed;
 
 use allocation::LIVE;
+use diri_term::buffer::GridBuffer;
 use diri_terminal_state::HeadlessScreen;
 
 #[test]
@@ -15,7 +16,9 @@ fn repeated_composer_repaints_release_superseded_text_and_frames() {
         .with_notifications()
         .with_inline_images();
     screen.feed(b"primary transcript\x1b[?1049h");
-    let repaint = |screen: &mut HeadlessScreen, tick| {
+    let mut grid = GridBuffer::default();
+    let mut generations = Vec::new();
+    let mut repaint = |screen: &mut HeadlessScreen, tick| {
         // Unique text and OSC 8 targets on a fixed set of rows. A cached
         // copy per generation leaks even though history never advances.
         let output = format!(
@@ -23,7 +26,9 @@ fn repeated_composer_repaints_release_superseded_text_and_frames() {
         );
         screen.feed(output.as_bytes());
         let frame = screen.grid_update(false);
-        assert!(!frame.changed_rows.is_empty());
+        assert!(grid.apply(frame).changed);
+        let damage = grid.snapshot_damage(&mut generations, 40, 120, false);
+        assert!(!damage.changed_rows.is_empty());
     };
 
     for tick in 0..256 {

@@ -1623,6 +1623,29 @@ impl Page {
         match links.table.iter().position(|l| l == link) {
             Some(i) => i as u32,
             None => {
+                // A repaint can put arbitrarily many URLs in the same cell.
+                // Cell indices bound the map even when overwritten cells leave
+                // stale entries. Keep every mapped id, including those entries.
+                if links.table.len() >= 64 && links.table.len() / 2 > links.map.len() {
+                    let mut remap = vec![None; links.table.len()];
+                    for &id in links.map.values() {
+                        remap[id as usize] = Some(0);
+                    }
+                    let mut next = 0;
+                    let mut slots = remap.iter_mut();
+                    links.table.retain(|_| {
+                        if let Some(slot) = slots.next().unwrap() {
+                            *slot = next;
+                            next += 1;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    for id in links.map.values_mut() {
+                        *id = remap[*id as usize].unwrap();
+                    }
+                }
                 links.table.push(link.clone());
                 (links.table.len() - 1) as u32
             }
@@ -2746,6 +2769,27 @@ impl Pages {
 #[cfg(test)]
 mod cluster_tests {
     use super::*;
+
+    #[test]
+    fn repainting_links_reclaims_obsolete_targets_and_preserves_shared_links() {
+        let mut page = Page::new(1, 3, 1, None, false);
+        let link = |generation| Link {
+            id: None,
+            uri: format!("https://example.invalid/{generation}"),
+        };
+        for generation in 0..7200 {
+            let id = page.link_id(&link(generation));
+            page.set_link(0, id);
+            if generation == 1 {
+                page.set_link(1, id);
+                page.set_link(2, id);
+            }
+        }
+        assert_eq!(page.link_at(0), Some(&link(7199)));
+        assert_eq!(page.link_at(1), Some(&link(1)));
+        assert_eq!(page.link_at(2), Some(&link(1)));
+        assert!(page.links.as_ref().unwrap().table.len() <= 64);
+    }
 
     /// Compacting reads only live cells: a recycled page keeps its old
     /// cells, whose cluster bits name clusters of an arena long gone.
