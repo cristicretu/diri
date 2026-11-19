@@ -435,9 +435,10 @@ impl AttachHub {
             return Admission::Unavailable;
         };
         let id = &sink.member.session_id.0;
-        let Some(session) = guard.get(id) else {
+        let Some(session) = guard.pin(id) else {
             return Admission::Missing;
         };
+        let _publication = session.publication();
         let count = self
             .sessions
             .lock()
@@ -483,7 +484,7 @@ impl AttachHub {
             seed,
             true,
         );
-        // Seed and registration share the same Registry sequencing boundary as
+        // Seed and registration share the same per-run sequencing boundary as
         // normal publications. Neither queue admission nor registration writes.
         wake.notify();
         Admission::Added(sink_id)
@@ -651,20 +652,20 @@ impl AttachHub {
         output.reseedable = true;
         let attach_started = Instant::now();
         let seed_bytes;
-        // Snapshot, seed queueing and registration share the publisher's
-        // Registry sequencing boundary. No update can slip between a new
-        // sink's snapshot and admission, and no socket write holds this lock.
+        // Hold this run's publication boundary from snapshot through
+        // membership admission, including the keyboard capability check.
         let (sink_id, output, wake) = {
             let Ok(guard) = registry.lock() else {
                 return;
             };
-            let Some(session) = guard.get(session_id) else {
+            let Some(session) = guard.pin(session_id) else {
                 drop(guard);
                 if !preview {
                     self.reject(&writer, session_id, AttachRejection::SessionNotFound);
                 }
                 return;
             };
+            let _publication = session.publication();
             if preview
                 && self
                     .sessions
@@ -966,21 +967,28 @@ impl AttachHub {
         let Ok(mut guard) = registry.lock() else {
             return false;
         };
+        if matches!(frame.frame_type, FrameType::Input | FrameType::Mouse)
+            && guard.session_is_hibernated(session_id)
+        {
+            // An incompatible keyboard must not wake a frozen session.
+            if frame.frame_type == FrameType::Input
+                && guard
+                    .get(session_id)
+                    .is_some_and(|session| !session.accepts_keyboard_input(enhanced_keyboard))
+            {
+                return false;
+            }
+            let _ = guard.ensure_session_awake(session_id);
+        }
+        let Some(session) = guard.pin(session_id) else {
+            return true; // session ended; swallow input quietly, as Swift does
+        };
+        drop(guard);
         if frame.frame_type == FrameType::Input
-            && guard
-                .get(session_id)
-                .is_some_and(|session| !session.accepts_keyboard_input(enhanced_keyboard))
+            && !session.accepts_keyboard_input(enhanced_keyboard)
         {
             return false;
         }
-        if matches!(frame.frame_type, FrameType::Input | FrameType::Mouse) {
-            // Input to a frozen session wakes it; write_input's queue covers
-            // the race where the governor froze it mid-keystroke.
-            let _ = guard.wake_session(session_id);
-        }
-        let Some(session) = guard.get(session_id) else {
-            return true; // session ended; swallow input quietly, as Swift does
-        };
         // Guards would move the failed-write check into the patterns; the
         // explicit form keeps every input arm reading the same way.
         #[allow(clippy::collapsible_match)]
@@ -1098,8 +1106,8 @@ impl AttachHub {
             .unwrap_or_default()
     }
 
-    /// Recipients were captured with the grid under Registry. Looking them
-    /// up after encoding could send an older diff behind a newer client's seed.
+    /// Recipients were captured with the grid under the run's publication
+    /// lock. Looking them up later could send an old diff behind a new seed.
     #[cfg(all(test, unix))]
     fn enqueue_publication(
         &self,
@@ -1222,9 +1230,8 @@ impl AttachHub {
     }
 
     /// Sends each ready lagging sink the current screen and modes. The
-    /// snapshot is taken under the Registry, the publication sequencing
-    /// boundary, by the pump that publishes every later diff — the same
-    /// ordering a fresh attach's seed gets.
+    /// snapshot is taken by the pump that publishes every later diff, so
+    /// these sinks get their reseed before the next publication.
     fn reseed_sinks(
         &self,
         registry: &Arc<Mutex<Registry>>,
@@ -1433,7 +1440,10 @@ impl AttachHub {
             // the sinks, send nothing until it is back.
             let observed = if changed {
                 let Ok(guard) = registry.lock() else { break };
-                guard.get(session_id).map(|session| {
+                let pinned = guard.pin(session_id);
+                drop(guard);
+                pinned.map(|session| {
+                    let _publication = session.publication();
                     (
                         session.terminal_publication(&mut signature),
                         self.sink_outputs(session_id),

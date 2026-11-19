@@ -155,7 +155,7 @@ impl SessionSurfaces {
         tokio: Option<tokio::runtime::Handle>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut changes = runtime.changes();
+        let mut changes = runtime.changes_without_memory();
         let store_changes = cx.spawn(async move |this, cx| {
             loop {
                 match changes.recv().await {

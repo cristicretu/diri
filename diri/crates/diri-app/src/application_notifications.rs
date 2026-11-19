@@ -147,7 +147,7 @@ pub(crate) fn install(
     #[cfg(not(any(target_os = "macos", windows)))]
     let _ = (preview, scenario);
     let mut events = services.store.status_events();
-    let mut changes = services.store.changes();
+    let mut changes = services.store.changes_without_memory();
     cx.spawn(async move |cx| {
         let mut sound_gate = SoundGate::default();
         loop {

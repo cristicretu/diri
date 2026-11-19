@@ -1281,7 +1281,7 @@ impl RootView {
                 .map(|(terminal, surfaces)| {
                     let terminal = terminal.clone();
                     let surfaces = surfaces.clone();
-                    let mut changes = services.store.changes();
+                    let mut changes = services.store.changes_without_memory();
                     cx.spawn(async move |this, cx| {
                         loop {
                             match changes.recv().await {
@@ -1307,7 +1307,7 @@ impl RootView {
                         }
                     })
                 });
-        let mut workbench_changes = services.store.changes();
+        let mut workbench_changes = services.store.changes_without_memory();
         let workbench_sync = cx.spawn_in(window, async move |this, cx| {
             loop {
                 match workbench_changes.recv().await {

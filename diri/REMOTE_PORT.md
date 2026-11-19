@@ -1486,10 +1486,17 @@ writer closes the connection instead of splicing or discarding terminal patches.
 These queue sizes are subject to the same capacity measurements as the admission
 limit.
 
-Seed capture, queue admission, and publisher registration share the Registry
-sequencing boundary. When queue capacity is unavailable, admission releases
-Registry and retries with a newly captured seed; no old snapshot survives the
-wait. Admission has a two-second bound for a complete membership update, and
+The Registry grants a borrow of one Session incarnation. Attach input holds
+that borrow while writing to the Holder. A mutable reconnect or removal waits
+for outstanding borrows before the session ID can name a new run. A slow
+write therefore leaves the Registry available to unrelated sessions.
+
+Each run also serializes seed capture, queue admission and publisher registration
+with the publisher's grid and recipient capture. This replaces the former
+Registry-wide sequencing boundary and keeps the grid walk outside Registry.
+Preview admission still holds Registry across the shared preview-count check
+and registration. If the queue lacks capacity, admission releases both locks
+and retries with a fresh seed. Admission has a two-second bound for a complete membership update, and
 connection closure cancels it. Socket I/O takes place outside Registry and queue
 locks. Empty writers sleep until a publication or cancellation, with no idle
 timer. Tests cover fresh seeds after capacity waits, retained partial-frame

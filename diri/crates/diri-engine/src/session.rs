@@ -6676,9 +6676,19 @@ fn evaluate_if_screen_changed(
         let title = screen.title();
         let mut stored = shared.title.lock().expect("title");
         if stored.as_deref() != title {
-            *stored = title.map(str::to_string);
+            // Claude animates the prefix of its OSC title. The Registry
+            // strips that prefix from the record; raw title readers still
+            // see each frame and detection still evaluates the whole screen.
+            let record_may_change = manifest_id != "claude-code"
+                || stored
+                    .as_deref()
+                    .and_then(crate::registry::agent_title_line)
+                    != title.and_then(crate::registry::agent_title_line);
+            *stored = title.map(str::to_owned);
             drop(stored);
-            shared.bump_state_version();
+            if record_may_change {
+                shared.bump_state_version();
+            }
         }
     }
     // A shell whose foreground program is a recognised Agent is read with
@@ -9334,6 +9344,27 @@ mod progress_tests {
     /// shares from the parsed screen onward.
     fn feed(engine: &ManifestEngine, shared: &Shared, seq: &mut u64, end: &mut u64, bytes: &[u8]) {
         *end = apply_remote_output(shared, engine, "shell", seq, *end, bytes, false, None).unwrap();
+    }
+
+    #[test]
+    fn claude_spinner_titles_publish_only_a_changed_name() {
+        let (_temp, engine, shared) = remote_shell("claude-title");
+        let mut screen = shared.screen.lock().unwrap();
+        let mut seq = 0;
+        let start = shared.state_version.load(Ordering::SeqCst);
+        for name in ["Task one", "Task two"] {
+            for glyph in ["✻", "✽", "✢", "✳", "✶"].into_iter().cycle().take(100) {
+                let title = format!("{glyph} {name}");
+                screen.feed(format!("\x1b]0;{title}\x07").as_bytes());
+                evaluate_if_screen_changed(&shared, &mut screen, &engine, "claude-code", &mut seq);
+                assert_eq!(
+                    shared.title.lock().unwrap().as_deref(),
+                    Some(title.as_str())
+                );
+            }
+        }
+        let changes = shared.state_version.load(Ordering::SeqCst) - start;
+        assert_eq!(changes, 2, "record version changes across 200 OSC titles");
     }
 
     /// `OSC 9;4` maps only busy and a percent onto a program; once it
