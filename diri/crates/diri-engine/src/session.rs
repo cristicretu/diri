@@ -555,6 +555,7 @@ struct Shared {
     /// This session's idle history swap, made at its first page-out (see
     /// [`crate::history_swap`]) and kept so later page-outs add to it.
     history_swap: Mutex<Option<Arc<crate::history_swap::SwapFile>>>,
+    page_out_requested: AtomicBool,
     /// Set while a held pump runs or is parked; see [`HeldPumpLatch`].
     held_pump: HeldPumpLatch,
     /// What the last foreground sample of a shell found: 0 unknown, 1 the
@@ -3510,6 +3511,17 @@ impl Session {
             });
     }
 
+    /// Expedite the normal encrypted history page-out once this pump parks.
+    /// The pump keeps draining a streaming child before doing any cold work.
+    pub fn request_idle_history_page_out(&self) {
+        if self.is_held() && crate::history_swap::page_out_idle().is_some() {
+            self.shared
+                .page_out_requested
+                .store(true, Ordering::Release);
+            self.shared.pump_wake.ring();
+        }
+    }
+
     /// Whether a local Holder owns this session's PTY.
     pub fn is_held(&self) -> bool {
         matches!(self.transport, Transport::Held(_))
@@ -4299,6 +4311,7 @@ fn new_shared(
         echo_request: Mutex::new(None),
         pump_wake: PumpWake::default(),
         history_swap: Mutex::new(None),
+        page_out_requested: AtomicBool::new(false),
         held_pump: HeldPumpLatch::default(),
         foreground_job: std::sync::atomic::AtomicU8::new(0),
         foreground: Mutex::new(ForegroundProgram::default()),
@@ -4928,6 +4941,7 @@ fn page_out_idle_history(
     checkpoint_path: &Path,
     quiet: &mut Option<(Instant, u64)>,
     paged: &mut bool,
+    expedite: bool,
 ) -> Duration {
     let Some(idle) = crate::history_swap::page_out_idle() else {
         *paged = true;
@@ -4947,7 +4961,7 @@ fn page_out_idle_history(
         *seen = reads;
     }
     let quiet_for = now.saturating_duration_since(*since);
-    if quiet_for < idle {
+    if !expedite && quiet_for < idle {
         return idle - quiet_for;
     }
     *paged = true;
@@ -7528,14 +7542,27 @@ fn held_turn(state: Box<HeldPump>, mut resumed: bool, may_park: bool) -> HeldTur
                 // decoded or allocated before sleeping. Cheap when there is
                 // nothing to give back, and parks are rare.
                 shared.screen.lock().expect("screen").compact_idle();
+                let expedite = shared.page_out_requested.swap(false, Ordering::AcqRel);
                 if !history_paged {
                     park_for = page_out_idle_history(
                         &shared,
                         &checkpoint_path,
                         &mut history_quiet,
                         &mut history_paged,
+                        expedite,
                     )
                     .min(IDLE_PARK);
+                }
+                #[cfg(target_os = "macos")]
+                if expedite {
+                    unsafe extern "C" {
+                        fn malloc_zone_pressure_relief(
+                            zone: *mut std::ffi::c_void,
+                            goal: usize,
+                        ) -> usize;
+                    }
+                    // SAFETY: a null zone and zero goal release unused pages from all zones.
+                    unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
                 }
                 if !park_next {
                     // Output just went quiet: its buffers are not needed

@@ -748,7 +748,6 @@ pub struct Sidebar {
     /// hide it before GPUI lets go of the gesture.
     drag_preview: Option<Entity<DragPreview>>,
     directory_scroll: ScrollHandle,
-    glyphs: HashMap<SessionId, Entity<StatusGlyph>>,
     activity_frame: usize,
     activity_tick: Option<Task<()>>,
     activity_activation: Option<gpui::Subscription>,
@@ -1027,7 +1026,6 @@ impl Sidebar {
             weak_self: cx.entity().downgrade(),
             drag_preview: None,
             directory_scroll: ScrollHandle::new(),
-            glyphs: HashMap::new(),
             activity_frame: 0,
             activity_tick: None,
             activity_activation: None,
@@ -4090,7 +4088,7 @@ impl Sidebar {
     fn session_row(
         &mut self,
         props: &rows::SessionRowProps,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         #[cfg(test)]
@@ -4251,7 +4249,7 @@ impl Sidebar {
                 .when(row.has_children, |element| {
                     element.child(div().w(px(SIDEBAR_TRAILING_SLOT)).flex_none())
                 })
-                .child(self.status_glyph(session, migrating, colors, window, cx))
+                .child(Self::status_glyph(session, migrating, colors))
                 .into_any_element();
         }
 
@@ -4697,7 +4695,7 @@ impl Sidebar {
                 })
                 .size(px(16.0))
                 .flex_none()
-                .child(self.status_glyph(session, migrating, colors, window, cx))
+                .child(Self::status_glyph(session, migrating, colors))
                 .into_any_element();
             row.child(crate::held_hints::in_slot(
                 logo,
@@ -7632,14 +7630,7 @@ impl Sidebar {
         self.ui.visible || self.peek_open || self.horizontal_tabs_visible()
     }
 
-    fn status_glyph(
-        &mut self,
-        session: &SessionRecord,
-        migrating: bool,
-        colors: SemanticColors,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<StatusGlyph> {
+    fn status_glyph(session: &SessionRecord, migrating: bool, colors: SemanticColors) -> AnyElement {
         let kind = ui_agent_kind(session.effective_kind());
         // Activity and unread attention have one home: the leading mark.
         // Keep provider identity neutral instead of repeating the same signal.
@@ -7648,19 +7639,8 @@ impl Sidebar {
             StatusState::None => StatusState::None,
             _ => StatusState::IdleSeen,
         };
-        let entity = self
-            .glyphs
-            .entry(session.id.clone())
-            .or_insert_with(|| cx.new(|_| StatusGlyph::new(kind, state, 16.0, colors)))
-            .clone();
-        let program = crate::session_presentation::program_glyph(session);
-        entity.update(cx, |glyph, cx| {
-            glyph.set_kind(kind, cx);
-            glyph.set_glyph(program, cx);
-            glyph.set_state(state, window, cx);
-            glyph.set_colors(colors, cx);
-        });
-        entity
+        StatusGlyph::new(kind, state, 16.0, colors)
+            .sized_mark(crate::session_presentation::program_glyph(session))
     }
 
     /// ⌘1–⌘8 address the first eight rows; ⌘9 always jumps to the last one,
@@ -9065,7 +9045,6 @@ impl Sidebar {
             })
             .unwrap_or_default();
         self.lineage_roles = lineage_roles;
-        retain_live_glyphs(&mut self.glyphs, &projection.display_order);
         self.question_lines.retain(&projection.display_order);
         self.end_lift_if_released(cx);
         self.row_trade_unrendered = false;
@@ -10615,11 +10594,6 @@ fn sidebar_activity_state(state: StatusState, unread: bool) -> StatusState {
     }
 }
 
-fn retain_live_glyphs<T>(glyphs: &mut HashMap<SessionId, T>, live: &[SessionId]) {
-    let live: std::collections::HashSet<_> = live.iter().collect();
-    glyphs.retain(|id, _| live.contains(id));
-}
-
 fn clamp_path(path: &str) -> String {
     if path.chars().count() <= 40 {
         return path.into();
@@ -11635,25 +11609,6 @@ mod tests {
                 assert!(sidebar.activity_tick.is_none());
             });
         }
-    }
-
-    #[test]
-    fn status_glyph_lifecycle_follows_sidebar_projection() {
-        let first = SessionId("first".into());
-        let second = SessionId("second".into());
-        let stale = SessionId("stale".into());
-        let mut glyphs = HashMap::from([
-            (first.clone(), ()),
-            (second.clone(), ()),
-            (stale.clone(), ()),
-        ]);
-
-        retain_live_glyphs(&mut glyphs, &[first.clone(), second.clone()]);
-
-        assert_eq!(glyphs.len(), 2);
-        assert!(glyphs.contains_key(&first));
-        assert!(glyphs.contains_key(&second));
-        assert!(!glyphs.contains_key(&stale));
     }
 
     #[gpui::test]

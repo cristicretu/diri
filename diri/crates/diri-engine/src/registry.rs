@@ -1265,6 +1265,12 @@ impl Registry {
         session.restart_failed_remote(Arc::clone(&self.engine), inspected)
     }
 
+    pub(crate) fn page_out_on_app_disconnect(&self) {
+        for session in self.sessions.values() {
+            session.request_idle_history_page_out();
+        }
+    }
+
     pub fn get(&self, id: &str) -> Option<&Session> {
         self.sessions.get(id)
     }
