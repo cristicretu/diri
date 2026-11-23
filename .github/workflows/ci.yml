@@ -165,7 +165,7 @@ jobs:
       # Pinned like every other action; the signing round-trip below uses a
       # throwaway key and never touches the Sigstore transparency log.
       - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
       - name: Validate shell and release scripts
         run: |
           bash -n ../scripts/*.sh scripts/*.sh
