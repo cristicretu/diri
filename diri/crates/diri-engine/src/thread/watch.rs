@@ -84,36 +84,39 @@ impl ThreadWatches {
         if watching.watcher.is_none() {
             let leases = Arc::clone(&self.leases);
             let notify = Arc::clone(&self.notify);
-            let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-                let Ok(event) = event else { return };
-                if std::env::var_os("DIRI_THREAD_WATCH_DEBUG").is_some() {
-                    eprintln!("thread watch event {event:?}");
-                }
-                if !(event.kind.is_modify() || event.kind.is_create()) {
-                    return;
-                }
-                let targets: Vec<(String, PathBuf)> = {
-                    let Ok(leases) = leases.lock() else { return };
-                    let now = Instant::now();
-                    event
-                        .paths
-                        .iter()
-                        .filter_map(|path| {
-                            let lease = leases.get(path)?;
-                            (now.duration_since(lease.renewed) < LEASE)
-                                .then(|| (lease.session_id.clone(), path.clone()))
-                        })
-                        .collect()
-                };
-                for (session_id, path) in targets {
-                    let length = std::fs::symlink_metadata(&path).map_or(0, |m| m.len());
-                    notify(&session_id, length);
-                }
-            });
+            let watcher =
+                notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                    let Ok(event) = event else { return };
+                    if std::env::var_os("DIRI_THREAD_WATCH_DEBUG").is_some() {
+                        eprintln!("thread watch event {event:?}");
+                    }
+                    if !(event.kind.is_modify() || event.kind.is_create()) {
+                        return;
+                    }
+                    let targets: Vec<(String, PathBuf)> = {
+                        let Ok(leases) = leases.lock() else { return };
+                        let now = Instant::now();
+                        event
+                            .paths
+                            .iter()
+                            .filter_map(|path| {
+                                let lease = leases.get(path)?;
+                                (now.duration_since(lease.renewed) < LEASE)
+                                    .then(|| (lease.session_id.clone(), path.clone()))
+                            })
+                            .collect()
+                    };
+                    for (session_id, path) in targets {
+                        let length = std::fs::symlink_metadata(&path).map_or(0, |m| m.len());
+                        notify(&session_id, length);
+                    }
+                });
             match watcher {
                 Ok(watcher) => watching.watcher = Some(watcher),
                 Err(error) => {
-                    eprintln!("diri-engine: thread watch unavailable ({error}); GUI Lens refreshes on status changes only");
+                    eprintln!(
+                        "diri-engine: thread watch unavailable ({error}); GUI Lens refreshes on status changes only"
+                    );
                     return;
                 }
             }
@@ -216,7 +219,9 @@ mod tests {
     #[ignore = "FSEvents stream start is timing-dependent under parallel test load"]
     fn an_append_to_a_leased_transcript_notifies_its_session() {
         let dir = tempfile::tempdir().unwrap();
-        let path = diri_platform::canonicalize(dir.path()).unwrap().join("t.jsonl");
+        let path = diri_platform::canonicalize(dir.path())
+            .unwrap()
+            .join("t.jsonl");
         std::fs::write(&path, b"").unwrap();
         let (tx, rx) = mpsc::channel();
         let tx = Mutex::new(tx);
@@ -228,7 +233,10 @@ mod tests {
         assert_eq!(watches.leased(), 1);
         // FSEvents starts its stream asynchronously after `watch` returns, so
         // keep appending (as an Agent does) until the first event lands.
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
         let session = loop {
             file.write_all(b"{\"type\":\"user\"}\n").unwrap();

@@ -205,12 +205,7 @@ pub(crate) fn open_validated_in(
     Ok((file, metadata))
 }
 
-fn validate_in_root(
-    root: &Path,
-    path: &Path,
-    kind: &AgentKind,
-    agent_id: &str,
-) -> io::Result<()> {
+fn validate_in_root(root: &Path, path: &Path, kind: &AgentKind, agent_id: &str) -> io::Result<()> {
     if agent_id.is_empty()
         || agent_id.len() > 128
         || !agent_id

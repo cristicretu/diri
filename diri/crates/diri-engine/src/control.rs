@@ -3454,7 +3454,10 @@ impl ControlServer {
 
     /// Reads the whole thread (bounded windows) and the working diff, and
     /// renders the capsule. Nothing is written to any Agent.
-    fn session_handoff_capsule(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+    fn session_handoff_capsule(
+        &self,
+        params: Option<JsonValue>,
+    ) -> Result<JsonValue, ControlError> {
         let p: diri_proto::thread::HandoffCapsuleParams = decode(params)?;
         let record = self.record_for(&p.session_id.0)?;
         let home = diri_platform::home_dir()
@@ -8813,6 +8816,45 @@ mod tests {
                 "bad_request"
             );
         }
+    }
+
+    /// The GUI Lens's Approve/Deny reaches the PTY only while the very
+    /// prompt the user saw is still live; a changed or cleared prompt is
+    /// refused before any byte is written.
+    #[test]
+    fn answer_blocker_refuses_a_prompt_that_is_no_longer_live() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut record = new_record("s_blocked", "claude", "/tmp");
+        record.needs_input = Some(diri_proto::NeedsInputDetail {
+            kind: diri_proto::NeedsInputKind::Permission,
+            source: diri_proto::NeedsInputSource::ClaudePermissionHook,
+            tool_name: Some("Bash".into()),
+            summary: "git push".into(),
+            prompt_excerpt: None,
+            options: None,
+            risk_hint: diri_proto::RiskHint::Network,
+            occurred_at: diri_proto::DateMillis(5.0),
+            secret: false,
+        });
+        registry.insert_record(record);
+        let server = ControlServer::new(Arc::new(Mutex::new(registry)), temp.path().join("socket"));
+        let answer = |occurred_at: f64| {
+            server.dispatch(
+                Method::SESSION_ANSWER_BLOCKER,
+                Some(json!({"sessionID": "s_blocked", "occurredAt": occurred_at, "choice": "approve"})),
+            )
+        };
+        assert_eq!(answer(4.0).unwrap_err().code, "blocker_changed");
+        // The live prompt passes the freshness check; this record has no
+        // process, so the write itself is what fails.
+        assert_ne!(answer(5.0).unwrap_err().code, "blocker_changed");
+        server
+            .registry
+            .lock()
+            .unwrap()
+            .update_record("s_blocked", |record| record.needs_input = None);
+        assert_eq!(answer(5.0).unwrap_err().code, "blocker_changed");
     }
 
     #[test]

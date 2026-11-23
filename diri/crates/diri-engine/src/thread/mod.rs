@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 
 use diri_proto::thread::{
     ItemKey, THREAD_IMAGE_MAX_BYTES, THREAD_READ_DEFAULT_BYTES, THREAD_READ_MAX_BYTES,
-    THREAD_WIRE_VERSION, ThreadBody, ThreadCursor, ThreadItem, ThreadReadParams,
-    ThreadReadResult, ThreadSegment,
+    THREAD_WIRE_VERSION, ThreadBody, ThreadCursor, ThreadItem, ThreadReadParams, ThreadReadResult,
+    ThreadSegment,
 };
 use diri_proto::{AgentKind, SessionRecord};
 
@@ -145,11 +145,9 @@ pub fn read(
     let length = metadata.len();
     let mut offset = params.from.offset;
     let mut reset = false;
-    if params.from.generation != generation && (offset > 0 || !params.from.generation.is_empty())
-    {
-        reset = true;
-        offset = 0;
-    } else if !tail::cursor_is_boundary(&mut file, offset, length).unwrap_or(false) {
+    let foreign =
+        params.from.generation != generation && (offset > 0 || !params.from.generation.is_empty());
+    if foreign || !tail::cursor_is_boundary(&mut file, offset, length).unwrap_or(false) {
         reset = true;
         offset = 0;
     }
@@ -344,5 +342,104 @@ mod tests {
         let result = read_from(home.path(), &record, ThreadCursor::default());
         assert!(result.structured);
         assert!(result.items.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use std::io::Write;
+    use std::time::Instant;
+
+    fn percentile(samples: &mut [f64], p: f64) -> f64 {
+        samples.sort_by(f64::total_cmp);
+        samples[((samples.len() as f64 - 1.0) * p).round() as usize]
+    }
+
+    /// `cargo test -p diri-engine --release --lib thread::bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark; prints throughput and append latency"]
+    fn bench_thread_tail() {
+        let home = tempfile::tempdir().unwrap();
+        let (record, path) = tests_support::claude_record(home.path());
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let assistant = r#"{"type":"assistant","timestamp":"2026-11-23T10:00:00.000Z","message":{"model":"claude-opus-5-5","content":[{"type":"text","text":"Here is a paragraph of assistant prose that is long enough to look like a real answer, with `code` and **bold** spans and a path like src/main.rs:42."},{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cargo test -p diri-engine"}}],"usage":{"input_tokens":2,"output_tokens":300,"cache_read_input_tokens":40000,"cache_creation_input_tokens":300}}}"#;
+        let result = r#"{"type":"user","timestamp":"2026-11-23T10:00:01.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"test result: ok. 18 passed; 0 failed"}]}}"#;
+        for _ in 0..25_000 {
+            writeln!(file, "{assistant}\n{result}").unwrap();
+        }
+        file.sync_all().unwrap();
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        let read = |from: ThreadCursor| {
+            super::read(
+                &record,
+                &ThreadReadParams {
+                    session_id: record.id.clone(),
+                    from,
+                    max_bytes: Some(diri_proto::thread::THREAD_READ_MAX_BYTES),
+                    watch: false,
+                },
+                ReadContext {
+                    home: home.path(),
+                    segments: Vec::new(),
+                },
+            )
+            .0
+        };
+        let started = Instant::now();
+        let mut cursor = ThreadCursor::default();
+        let mut items = 0;
+        loop {
+            let page = read(cursor.clone());
+            items += page.items.len();
+            cursor = page.next;
+            if !page.more {
+                break;
+            }
+        }
+        let cold = started.elapsed();
+        let mut appends = Vec::new();
+        for _ in 0..200 {
+            writeln!(file, "{assistant}").unwrap();
+            let started = Instant::now();
+            let page = read(cursor.clone());
+            appends.push(started.elapsed().as_secs_f64() * 1e6);
+            assert_eq!(page.items.len(), 3);
+            cursor = page.next;
+        }
+        println!(
+            "thread tail: cold {:.1} MiB, {items} items in {:.1} ms ({:.0} MiB/s); one-record append read p50 {:.0} µs p95 {:.0} µs",
+            bytes as f64 / 1048576.0,
+            cold.as_secs_f64() * 1e3,
+            bytes as f64 / 1048576.0 / cold.as_secs_f64(),
+            percentile(&mut appends, 0.5),
+            percentile(&mut appends, 0.95),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_support {
+    use super::*;
+    pub fn claude_record(home: &Path) -> (SessionRecord, PathBuf) {
+        let agent = "11111111-1111-4111-8111-111111111111";
+        let path = home
+            .join(".claude/projects/-tmp-project")
+            .join(format!("{agent}.jsonl"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        let record: SessionRecord = serde_json::from_value(serde_json::json!({
+            "id": "s-1", "kind": "claude-code", "cwd": "/tmp/project", "projectID": "p",
+            "title": "t", "titleSource": serde_json::to_value(diri_proto::TitleSource::UserRename).unwrap(),
+            "status": serde_json::to_value(diri_proto::SessionStatus::Idle).unwrap(),
+            "resumability": serde_json::to_value(diri_proto::Resumability::Resumable).unwrap(),
+            "createdAt": 0.0, "updatedAt": 0.0, "pinned": false,
+            "agentSessionID": agent, "transcriptPath": path.to_string_lossy(),
+        }))
+        .unwrap();
+        (record, path)
     }
 }

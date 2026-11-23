@@ -6,8 +6,7 @@
 //! record kind degrades to "not shown", never to a wrong item.
 
 use diri_proto::thread::{
-    EditHunk, ItemKey, ThreadBody, ThreadImage, ThreadItem, ToolDetail,
-    TurnUsage,
+    EditHunk, ItemKey, ThreadBody, ThreadImage, ThreadItem, ToolDetail, TurnUsage,
 };
 use serde_json::Value;
 
@@ -481,9 +480,7 @@ fn codex_tool_detail(name: &str, arguments: &Value) -> ToolDetail {
                     let argv: Vec<&str> = argv.iter().filter_map(Value::as_str).collect();
                     // `bash -lc "<script>"` reads best as the script.
                     match argv.as_slice() {
-                        [shell, flag, script]
-                            if shell.ends_with("sh") && flag.starts_with('-') =>
-                        {
+                        [shell, flag, script] if shell.ends_with("sh") && flag.starts_with('-') => {
                             (*script).to_owned()
                         }
                         _ => argv.join(" "),
@@ -593,7 +590,12 @@ pub fn bounded(text: &str, limit: usize) -> String {
 /// `2026-11-23T10:15:30.123Z` (or with a numeric offset) → Unix milliseconds.
 pub fn parse_rfc3339_ms(value: &str) -> Option<i64> {
     let b = value.as_bytes();
-    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':'
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
     {
         return None;
     }
@@ -602,7 +604,11 @@ pub fn parse_rfc3339_ms(value: &str) -> Option<i64> {
     };
     let (year, month, day) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
     let (hour, minute, second) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
     {
         return None;
     }
@@ -706,11 +712,23 @@ mod tests {
     #[test]
     fn claude_bookkeeping_is_hidden_and_commands_become_chips() {
         assert!(items(Provider::Claude, json!({"type":"api-request-blob","message":{"content":[{"type":"text","text":"dup"}]}})).is_empty());
-        assert!(items(Provider::Claude, json!({"type":"user","isSidechain":true,"message":{"content":"sub"}})).is_empty());
+        assert!(
+            items(
+                Provider::Claude,
+                json!({"type":"user","isSidechain":true,"message":{"content":"sub"}})
+            )
+            .is_empty()
+        );
         assert!(items(Provider::Claude, json!({"type":"user","message":{"content":"<local-command-stdout>ok</local-command-stdout>"}})).is_empty());
         assert_eq!(
-            items(Provider::Claude, json!({"type":"user","message":{"content":"<command-name>/model</command-name>\n<command-args>sonnet</command-args>"}})),
-            vec![ThreadBody::Command { name: "/model".into(), args: "sonnet".into() }]
+            items(
+                Provider::Claude,
+                json!({"type":"user","message":{"content":"<command-name>/model</command-name>\n<command-args>sonnet</command-args>"}})
+            ),
+            vec![ThreadBody::Command {
+                name: "/model".into(),
+                args: "sonnet".into()
+            }]
         );
     }
 
@@ -731,7 +749,9 @@ mod tests {
         .map(|item| (item.key, item.body))
         .collect();
         assert_eq!(bodies[0].0, ItemKey { offset: 7, part: 0 });
-        assert!(matches!(&bodies[0].1, ThreadBody::ToolResult { is_error: true, preview, .. } if preview == "boom"));
+        assert!(
+            matches!(&bodies[0].1, ThreadBody::ToolResult { is_error: true, preview, .. } if preview == "boom")
+        );
         let ThreadBody::User { images, .. } = &bodies[1].1 else {
             panic!("user images expected")
         };
@@ -752,7 +772,9 @@ mod tests {
             vec![ThreadBody::ToolCall {
                 call_id: "c1".into(),
                 name: "shell".into(),
-                detail: ToolDetail::Command { command: "cargo test".into() }
+                detail: ToolDetail::Command {
+                    command: "cargo test".into()
+                }
             }]
         );
         let output = items(
@@ -760,12 +782,16 @@ mod tests {
             json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"c1",
                 "output":"{\"output\":\"1 failed\",\"metadata\":{\"exit_code\":101}}"}}),
         );
-        assert!(matches!(&output[0], ThreadBody::ToolResult { is_error: true, preview, .. } if preview == "1 failed"));
+        assert!(
+            matches!(&output[0], ThreadBody::ToolResult { is_error: true, preview, .. } if preview == "1 failed")
+        );
         let context = items(
             Provider::Codex,
             json!({"type":"turn_context","timestamp":"2026-11-23T10:00:00Z","payload":{"model":"gpt-5.5-codex"}}),
         );
-        assert!(matches!(&context[0], ThreadBody::Usage(usage) if usage.model.as_deref() == Some("gpt-5.5-codex")));
+        assert!(
+            matches!(&context[0], ThreadBody::Usage(usage) if usage.model.as_deref() == Some("gpt-5.5-codex"))
+        );
         assert!(items(Provider::Codex, json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>"}]}})).is_empty());
     }
 

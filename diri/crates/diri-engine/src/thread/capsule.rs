@@ -204,24 +204,64 @@ mod tests {
 
     fn thread() -> Vec<ThreadItem> {
         vec![
-            item(0, ThreadBody::User { text: "Make the parser streaming".into(), images: vec![] }),
-            item(1, ThreadBody::ToolCall {
-                call_id: "e".into(),
-                name: "Edit".into(),
-                detail: ToolDetail::Edit { path: "src/z.rs".into(), hunks: vec![EditHunk { old: "a".into(), new: "b".into() }] },
-            }),
-            item(2, ThreadBody::ToolCall {
-                call_id: "p".into(),
-                name: "apply_patch".into(),
-                detail: ToolDetail::Patch { patch: "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-x\n+y\n*** End Patch".into() },
-            }),
-            item(3, ThreadBody::ToolCall {
-                call_id: "t".into(),
-                name: "Bash".into(),
-                detail: ToolDetail::Command { command: "cargo test -p parser\necho done".into() },
-            }),
-            item(4, ThreadBody::ToolResult { call_id: "t".into(), is_error: true, preview: "1 failed".into(), images: vec![] }),
-            item(5, ThreadBody::Assistant { text: "One test still fails.".into() }),
+            item(
+                0,
+                ThreadBody::User {
+                    text: "Make the parser streaming".into(),
+                    images: vec![],
+                },
+            ),
+            item(
+                1,
+                ThreadBody::ToolCall {
+                    call_id: "e".into(),
+                    name: "Edit".into(),
+                    detail: ToolDetail::Edit {
+                        path: "src/z.rs".into(),
+                        hunks: vec![EditHunk {
+                            old: "a".into(),
+                            new: "b".into(),
+                        }],
+                    },
+                },
+            ),
+            item(
+                2,
+                ThreadBody::ToolCall {
+                    call_id: "p".into(),
+                    name: "apply_patch".into(),
+                    detail: ToolDetail::Patch {
+                        patch:
+                            "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-x\n+y\n*** End Patch"
+                                .into(),
+                    },
+                },
+            ),
+            item(
+                3,
+                ThreadBody::ToolCall {
+                    call_id: "t".into(),
+                    name: "Bash".into(),
+                    detail: ToolDetail::Command {
+                        command: "cargo test -p parser\necho done".into(),
+                    },
+                },
+            ),
+            item(
+                4,
+                ThreadBody::ToolResult {
+                    call_id: "t".into(),
+                    is_error: true,
+                    preview: "1 failed".into(),
+                    images: vec![],
+                },
+            ),
+            item(
+                5,
+                ThreadBody::Assistant {
+                    text: "One test still fails.".into(),
+                },
+            ),
         ]
     }
 
@@ -239,8 +279,18 @@ mod tests {
         assert_eq!(first.outcomes, vec!["✗ `cargo test -p parser`"]);
         let rendered = first.render();
         assert_eq!(rendered, build(&thread(), &inputs).render());
-        let order = ["## Goal", "## Branch", "## Files touched", "## Recent checks", "## Recent conversation", "## Uncommitted changes"];
-        let positions: Vec<_> = order.iter().map(|heading| rendered.find(heading).unwrap()).collect();
+        let order = [
+            "## Goal",
+            "## Branch",
+            "## Files touched",
+            "## Recent checks",
+            "## Recent conversation",
+            "## Uncommitted changes",
+        ];
+        let positions: Vec<_> = order
+            .iter()
+            .map(|heading| rendered.find(heading).unwrap())
+            .collect();
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(!rendered.contains("toolu_"), "no provider identities");
     }
@@ -254,9 +304,22 @@ mod tests {
     #[test]
     fn only_the_latest_turns_are_carried() {
         let items: Vec<_> = (0..20)
-            .map(|n| item(n, ThreadBody::Assistant { text: format!("turn {n}") }))
+            .map(|n| {
+                item(
+                    n,
+                    ThreadBody::Assistant {
+                        text: format!("turn {n}"),
+                    },
+                )
+            })
             .collect();
-        let capsule = build(&items, &CapsuleInputs { from_agent: "Codex", ..CapsuleInputs::default() });
+        let capsule = build(
+            &items,
+            &CapsuleInputs {
+                from_agent: "Codex",
+                ..CapsuleInputs::default()
+            },
+        );
         assert_eq!(capsule.recent.len(), RECENT_TURNS);
         assert_eq!(capsule.recent.last().unwrap().1, "turn 19");
     }

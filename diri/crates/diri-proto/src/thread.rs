@@ -34,7 +34,9 @@ pub const THREAD_IMAGE_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 /// Where an item came from: the record's first byte, then its index among
 /// the items that record produced.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ItemKey {
     pub offset: u64,
@@ -427,13 +429,14 @@ pub fn segment_chain(stored: &[ThreadSegment], items: &[ThreadItem]) -> Vec<Thre
     let mut chain: Vec<ThreadSegment> = Vec::with_capacity(stored.len() + 2);
     let mut stored_iter = stored.iter().peekable();
     let mut current_model: Option<String> = None;
-    let push_stored = |chain: &mut Vec<ThreadSegment>, segment: &ThreadSegment, model: &Option<String>| {
-        let mut segment = segment.clone();
-        if segment.model.is_none() {
-            segment.model = model.clone();
-        }
-        chain.push(segment);
-    };
+    let push_stored =
+        |chain: &mut Vec<ThreadSegment>, segment: &ThreadSegment, model: &Option<String>| {
+            let mut segment = segment.clone();
+            if segment.model.is_none() {
+                segment.model = model.clone();
+            }
+            chain.push(segment);
+        };
     if let Some(first) = stored_iter.next() {
         push_stored(&mut chain, first, &None);
     }
@@ -525,10 +528,12 @@ mod tests {
 
     #[test]
     fn model_spellings_collapse_dates_and_context_tags() {
-        assert!(same_model("claude-sonnet-5-5-20261001", "claude-sonnet-5-5[1m]"));
+        assert!(same_model(
+            "claude-sonnet-5-5-20261001",
+            "claude-sonnet-5-5[1m]"
+        ));
         assert!(!same_model("claude-sonnet-5-5", "claude-opus-5-5"));
     }
-
 
     #[test]
     fn segment_chain_adds_model_boundaries_inside_stored_segments() {
@@ -578,7 +583,10 @@ mod tests {
     #[test]
     fn item_bodies_round_trip_with_stable_tags() {
         let item = ThreadItem {
-            key: ItemKey { offset: 42, part: 1 },
+            key: ItemKey {
+                offset: 42,
+                part: 1,
+            },
             at_ms: Some(7),
             body: ThreadBody::ToolCall {
                 call_id: "toolu_1".into(),
