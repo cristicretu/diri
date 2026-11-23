@@ -440,6 +440,9 @@ string_enum! {
         DaemonRestart => "daemonRestart",
         External => "external",
         Archived => "archived",
+        // Brought in from an Agent's own history and never run in Diri:
+        // opening it resumes the conversation.
+        Imported => "imported",
     }
 }
 
@@ -471,6 +474,22 @@ pub struct ExitInfo {
 }
 
 impl ExitInfo {
+    /// A conversation imported from an Agent's history that has not run in
+    /// Diri yet.
+    pub fn imported() -> Self {
+        Self {
+            reason: ExitReason::Imported,
+            code: None,
+            signal: None,
+            system_restart: false,
+            interrupted: false,
+        }
+    }
+
+    pub fn is_imported(&self) -> bool {
+        self.reason == ExitReason::Imported
+    }
+
     /// A session whose holder an Engine restart found gone: `system_restart`
     /// when the machine rebooted under it.
     pub fn restart(system_restart: bool) -> Self {

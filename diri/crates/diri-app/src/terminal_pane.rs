@@ -3031,6 +3031,28 @@ impl TerminalPane {
                     .plans()
                     .first()
                     .map(|plan| plan.source.name()),
+                import: store.conversation_import_visible().then(|| {
+                    let agents = match crate::agent_setup::AgentSetupState::from_catalog(
+                        store.agent_catalog(None),
+                    ) {
+                        crate::agent_setup::AgentSetupState::Ready(ready) => ready
+                            .iter()
+                            .filter(|option| !option.kind.is_terminal())
+                            .map(|option| {
+                                (option.kind.clone(), option.display_name.clone().into())
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    crate::import_onboarding::ImportView::from_state(
+                        store.conversation_import(),
+                        agents,
+                        crate::import_onboarding::now_ms(),
+                    )
+                }),
+                fresh: store.first_launch_import_pending()
+                    && store.conversation_import().scan.is_some()
+                    && !store.conversation_import().has_candidates(),
             }
         };
         let canonical = Arc::clone(&self.runtime.store);
@@ -3134,6 +3156,31 @@ impl TerminalPane {
             }
             cx.refresh_windows();
         });
+        let import = state
+            .import
+            .is_some()
+            .then(|| crate::import_onboarding::actions(&self.runtime.store));
+        let canonical = Arc::clone(&self.runtime.store);
+        let moving: crate::agent_setup::ActionHandler = Rc::new(move |window, cx| {
+            let answer = window.prompt(
+                gpui::PromptLevel::Info,
+                t("import.moving.title"),
+                Some(t("import.moving.body")),
+                &[t("import.moving.look_again"), t("import.moving.close")],
+                cx,
+            );
+            let canonical = Arc::clone(&canonical);
+            cx.spawn(async move |cx| {
+                if answer.await == Ok(0) {
+                    canonical
+                        .write()
+                        .expect("session store lock poisoned")
+                        .open_conversation_import();
+                    cx.update(|cx| cx.refresh_windows());
+                }
+            })
+            .detach();
+        });
         crate::empty_workbench::render(
             state,
             crate::empty_workbench::EmptyWorkbenchActions {
@@ -3142,6 +3189,8 @@ impl TerminalPane {
                 start_in_folder,
                 import_herdr,
                 start_agent,
+                import,
+                moving,
             },
             colors,
         )
@@ -3278,6 +3327,80 @@ impl TerminalPane {
         f: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) {
         crate::floating::in_main_window(self, window, cx, f);
+    }
+
+    /// The conversation import page owns this pane: on a first launch with
+    /// nothing open, or when File › Import Conversations… asked for it. Only
+    /// the pane that follows the selection shows it.
+    fn import_page_shown(&self) -> bool {
+        if !matches!(self.session_source, SessionSource::FollowSelection) {
+            return false;
+        }
+        // Read the selection first: it may take the store lock itself.
+        let nothing_selected = self.selected_id().is_none();
+        let store = self
+            .runtime
+            .store
+            .read()
+            .expect("session store lock poisoned");
+        store.conversation_import_visible() && (store.conversation_import().open || nothing_selected)
+    }
+
+    /// Keys for the import page. Returns whether the key was consumed.
+    fn handle_import_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if !self.import_page_shown() {
+            return false;
+        }
+        let keystroke = &event.keystroke;
+        let plain = !keystroke.modifiers.platform
+            && !keystroke.modifiers.control
+            && !keystroke.modifiers.alt;
+        let mut store = self
+            .runtime
+            .store
+            .write()
+            .expect("session store lock poisoned");
+        let browsing = store.conversation_import().browsing;
+        let handled = match keystroke.key.as_str() {
+            "enter" if plain => {
+                store.import_selected_conversations();
+                true
+            }
+            "up" if plain => {
+                store.move_conversation_focus(false);
+                true
+            }
+            "down" if plain => {
+                store.move_conversation_focus(true);
+                true
+            }
+            "space" if plain && (!browsing || store.conversation_import().query.is_empty()) => {
+                store.toggle_focused_conversation();
+                true
+            }
+            "escape" if browsing => {
+                store.set_conversation_browsing(false);
+                true
+            }
+            "escape" if store.conversation_import().open => {
+                store.dismiss_conversation_import();
+                true
+            }
+            _ if browsing => match crate::query_editor::edit_for(keystroke) {
+                Some(crate::query_editor::Edit::Local(edit)) => {
+                    store.conversation_query_mut().apply(edit);
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        drop(store);
+        if handled {
+            cx.notify();
+            cx.refresh_windows();
+        }
+        handled
     }
 
     fn selected_session(&self) -> Option<Arc<SessionRecord>> {
@@ -4291,6 +4414,10 @@ impl TerminalPane {
             return;
         }
 
+        if self.handle_import_key(event, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if self.handle_qol_key(event, window, cx) {
             cx.stop_propagation();
             return;
@@ -6118,7 +6245,11 @@ impl TerminalPane {
         self.held_hint = crate::held_hints::opacity(window, cx);
         self.title_opacity = crate::window_chrome::title_row_opacity(window, chrome_look);
 
-        let selected = self.selected_session();
+        let selected = if self.import_page_shown() {
+            None
+        } else {
+            self.selected_session()
+        };
 
         let content = if let Some(session) = selected {
             let mut pane = div()
@@ -7111,7 +7242,7 @@ fn exit_description(session: &SessionRecord) -> String {
             "terminal.exit.exited_code",
             &[("code", &info.code.unwrap_or(-1))],
         ),
-        ExitReason::External => t("terminal.exit.imported").to_owned(),
+        ExitReason::External | ExitReason::Imported => t("terminal.exit.imported").to_owned(),
         ExitReason::Archived => t("terminal.archived").to_owned(),
         ExitReason::Unknown => t("terminal.exit.session_ended").to_owned(),
     }

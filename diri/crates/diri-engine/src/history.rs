@@ -473,7 +473,7 @@ pub(crate) fn same_cwd(recorded: &str, expected: &str) -> bool {
     }
 }
 
-fn safe_agent_id(id: &str) -> bool {
+pub(crate) fn safe_agent_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
         && id
@@ -615,7 +615,7 @@ fn scan_claude(root: &Path) -> Vec<HistoryEntry> {
     result
 }
 
-fn claude_entry(path: &Path) -> Option<HistoryEntry> {
+pub(crate) fn claude_entry(path: &Path) -> Option<HistoryEntry> {
     // The filename stem is the id `claude --resume` resolves against.
     let uuid = path.file_stem()?.to_string_lossy().to_string();
     if uuid.len() < 32 {
@@ -658,7 +658,7 @@ fn claude_entry(path: &Path) -> Option<HistoryEntry> {
 }
 
 /// The user prompt text from a Claude `user` line, if it is one.
-fn claude_user_text(object: &Value) -> Option<String> {
+pub(crate) fn claude_user_text(object: &Value) -> Option<String> {
     if object.get("type").and_then(Value::as_str) != Some("user") {
         return None;
     }
@@ -1449,7 +1449,7 @@ fn scan_codex(root: &Path) -> Vec<HistoryEntry> {
     result
 }
 
-fn codex_entry(path: &Path) -> Option<HistoryEntry> {
+pub(crate) fn codex_entry(path: &Path) -> Option<HistoryEntry> {
     let mut handle = open_regular_readonly(path)?;
     let thread = codex_metadata_from(&mut handle)?;
     if thread.is_subagent() {
@@ -1572,7 +1572,7 @@ fn read_first_line_from(handle: &mut File, cap: usize) -> Option<String> {
 /// Provider history is local user data. A nonblocking, no-follow open keeps a
 /// malformed or raced path from turning any history/metadata read into a FIFO
 /// wait or symlink traversal; metadata and bytes come from the same handle.
-fn open_regular_readonly(path: &Path) -> Option<File> {
+pub(crate) fn open_regular_readonly(path: &Path) -> Option<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -1600,7 +1600,7 @@ fn timestamps(path: &Path) -> (SystemTime, Option<SystemTime>) {
 }
 
 /// One line, trimmed, for a sidebar row.
-fn title_from(prompt: &str) -> String {
+pub(crate) fn title_from(prompt: &str) -> String {
     let first_line = prompt
         .lines()
         .map(str::trim)

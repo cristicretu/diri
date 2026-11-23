@@ -66,6 +66,7 @@ pub mod local_path;
 pub mod log;
 pub mod mcp_http;
 pub mod migrate;
+pub mod onboarding_import;
 pub mod pr_monitor;
 mod preview_mux;
 pub mod pty;

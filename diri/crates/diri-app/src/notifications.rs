@@ -145,6 +145,18 @@ pub fn herdr_import_transition(
     })
 }
 
+/// The one summary a conversation import posts. Nothing started, so it says
+/// where the sessions are rather than that they are running.
+pub fn conversation_import_transition(imported: usize, failure: Option<&str>) -> StatusTransition {
+    let args: &[(&str, &dyn std::fmt::Display)] = &[("count", &imported)];
+    foreground_banner(match failure {
+        Some(reason) => Toast::warning(t("toast.conversations_import_failed"))
+            .detail(tf("toast.herdr_some_failed", &[("reason", &reason)])),
+        None if imported == 1 => Toast::success(tf("toast.conversations_imported_one", args)),
+        None => Toast::success(tf("toast.conversations_imported_other", args)),
+    })
+}
+
 /// The one summary a "Resume all" batch posts: how many sessions came back,
 /// and the first reason any did not.
 pub fn resume_all_transition(

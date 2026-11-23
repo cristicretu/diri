@@ -178,6 +178,7 @@ diri.search = {}
 diri.computer = {}
 diri.host = {}
 diri.activity = {}
+diri.history = {}
 diri.worktree = {}
 diri.project = {}
 diri.governor = {}
@@ -603,6 +604,18 @@ function diri.activity.list(params, opts) end
 ---@param opts? {timeout?: number}
 ---@return table # SessionRecord
 function diri.session.resume_from_history(params, opts) end
+
+---Recent local Claude Code and Codex conversations worth importing.
+---@param params? table
+---@param opts? {timeout?: number}
+---@return table # HistoryImportCandidatesResult
+function diri.history.import_candidates(params, opts) end
+
+---Add past conversations as resumable sessions without starting them.
+---@param params {entries: any[]}
+---@param opts? {timeout?: number}
+---@return table # SessionImportHistoryResult
+function diri.session.import_history(params, opts) end
 
 ---Create a git worktree.
 ---@param params {repoPath: string, branch?: string, base?: string}

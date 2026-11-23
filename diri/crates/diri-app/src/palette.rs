@@ -382,6 +382,7 @@ fn append_management_actions(
                             | CommandId::CheckForUpdates
                             | CommandId::ShowWhatsNew
                             | CommandId::ImportTerminalSetup
+                            | CommandId::ImportConversations
                             | CommandId::TogglePerfOverlay
                             | CommandId::ToggleRenderCounters
                             | CommandId::ReloadScripts
@@ -766,6 +767,7 @@ pub fn actions_for_default_host(
         registered_action(CommandId::CheckForUpdates),
         registered_action(CommandId::ShowWhatsNew),
         registered_action(CommandId::ImportTerminalSetup),
+        registered_action(CommandId::ImportConversations),
         registered_action(CommandId::TogglePerfOverlay),
         registered_action(CommandId::ToggleRenderCounters),
         registered_action(CommandId::ReloadScripts),
@@ -1425,6 +1427,7 @@ mod tests {
                 "check-for-updates",
                 "whats-new",
                 "import-terminal-setup",
+                "import-conversations",
                 "toggle-perf-overlay",
                 "toggle-render-counters",
                 "reload-scripts",

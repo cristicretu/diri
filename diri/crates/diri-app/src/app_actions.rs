@@ -50,6 +50,8 @@ pub fn exposure(id: CommandId) -> Exposure {
         ExportScrollback => Exposure::Hidden,
         // Reads other terminals' settings files from disk.
         ImportTerminalSetup => Exposure::Hidden,
+        // Reads Agents' conversation history from disk.
+        ImportConversations => Exposure::Hidden,
         // Bringing Diri forward or hiding it moves the person's focus.
         HideApp | ShowApp => Exposure::Hidden,
         Quit | CloseWindow | CloseSession | ArchiveSelectedSession | DeleteNote | RemoveFocusedPane
