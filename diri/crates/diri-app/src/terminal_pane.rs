@@ -51,7 +51,7 @@ use diri_term::keys::{
 #[cfg(test)]
 use diri_term::keys::{TermInputModes, encode_key};
 use diri_term::metrics::CellMetrics;
-use diri_term::scrollback::{HorizontalWheel, WheelDelta, WheelEvent, WheelRoute};
+use diri_term::scrollback::{HorizontalWheel, ScrollbackPage, WheelDelta, WheelEvent, WheelRoute};
 use diri_term::theme::TermTheme;
 use diri_ui::{
     AgentKind as UiAgentKind, Fill, FloatingSurface, Ink, Metrics, Radius, SemanticColors,
@@ -391,7 +391,7 @@ enum PaneEvent {
     ScrollbackCells(
         SessionId,
         AttachmentGeneration,
-        diri_proto::ReadScrollbackCellsResult,
+        ScrollbackPage,
         usize,
     ),
     ScrollbackFailed(SessionId, AttachmentGeneration),
@@ -2326,7 +2326,7 @@ impl TerminalPane {
                 if let Some(resident) = self.residents.get_mut(&id) {
                     let _ = resident
                         .element
-                        .complete_scrollback_fetch(result, visible_rows);
+                        .complete_scrollback_page(result, visible_rows);
                 }
                 self.pump_scrollback_fetch(&id, visible_rows);
                 if self.selected_id().as_ref() == Some(&id) {
@@ -4654,7 +4654,7 @@ impl TerminalPane {
                     let _ = pane_tx.send(PaneEvent::ScrollbackCells(
                         fetch_id,
                         generation,
-                        result,
+                        ScrollbackPage::decode(result),
                         visible_rows,
                     ));
                 }
@@ -12509,7 +12509,7 @@ mod tests {
                 PaneEvent::ScrollbackCells(
                     reselected.id.clone(),
                     old_generation,
-                    scrollback_reply(80, 100, 1),
+                    ScrollbackPage::decode(scrollback_reply(80, 100, 1)),
                     ROWS,
                 ),
                 window,
@@ -12534,7 +12534,7 @@ mod tests {
                 PaneEvent::ScrollbackCells(
                     reselected.id.clone(),
                     new_generation,
-                    scrollback_reply(180, 200, 2),
+                    ScrollbackPage::decode(scrollback_reply(180, 200, 2)),
                     ROWS,
                 ),
                 window,
