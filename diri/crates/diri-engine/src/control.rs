@@ -931,7 +931,7 @@ impl ControlServer {
         let writer = Arc::new(Mutex::new(stream));
         // Whatever ends this connection, an app that published actions on it
         // stops being the performer.
-        let _performer = self.app_actions.guard(&writer);
+        let _performer = self.app_actions.guard(&writer, &self.registry);
         let mut subscription: Option<SubscriptionHandle> = None;
 
         let mut first = true;

@@ -994,7 +994,6 @@ pub struct TerminalPane {
     /// stale UI/search completions from their predecessor.
     next_attachment_generation: AttachmentGeneration,
     focus: FocusHandle,
-    glyphs: HashMap<SessionId, Entity<StatusGlyph>>,
     session_links: SessionLinks,
     /// The main window's viewport, for content that sizes to it while a
     /// panel paints it elsewhere.
@@ -1134,7 +1133,6 @@ impl TerminalPane {
     pub(crate) fn show_session(
         &mut self,
         id: SessionId,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if matches!(&self.session_source, SessionSource::Fixed(current) if current == &id) {
@@ -1148,7 +1146,6 @@ impl TerminalPane {
         self.pending_resizes.clear();
         self.session_source = SessionSource::Fixed(id);
         self.reconcile_residency(cx);
-        self.sync_status_glyphs(self.current_colors(), window, cx);
         cx.notify();
     }
 
@@ -1312,7 +1309,6 @@ impl TerminalPane {
             next_attachment_generation: 1,
             focus,
             covered: false,
-            glyphs: HashMap::new(),
             session_links: SessionLinks::new(cx),
             main_viewport: gpui::Size::default(),
             qol: QolState::default(),
@@ -1361,7 +1357,6 @@ impl TerminalPane {
             _telemetry: crate::telemetry::Live::pane(),
         };
         pane.reconcile_residency(cx);
-        pane.sync_status_glyphs(pane.current_colors(), window, cx);
         pane
     }
 
@@ -1435,6 +1430,11 @@ impl TerminalPane {
                 continue;
             }
             self.parked_terminals.retain(|(parked, _)| parked != id);
+            // Keep the most recently visited tab shaped for a quick switch
+            // back. Older parked tabs retain their grid and reading position.
+            if let Some((_, previous)) = self.parked_terminals.last() {
+                previous.release_parked_shapes();
+            }
             self.parked_terminals
                 .push((id.clone(), resident.element.clone()));
             if resident.last_size != (0, 0) {
@@ -1643,7 +1643,6 @@ impl TerminalPane {
             }
         }
         self.discard_stale_held_uploads(window, cx);
-        self.sync_status_glyphs(self.current_colors(), window, cx);
 
         // Explicit sidebar clicks already focus through SessionActivated, but
         // successful spawns select their daemon-assigned id on the async store
@@ -2029,60 +2028,6 @@ impl TerminalPane {
     #[must_use]
     pub fn quote_focus_handle(&self) -> FocusHandle {
         self.focus.clone()
-    }
-
-    fn sync_status_glyphs(
-        &mut self,
-        colors: SemanticColors,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let fixed_id = match &self.session_source {
-            SessionSource::Fixed(id) => Some(id),
-            SessionSource::FollowSelection => None,
-        };
-        let snapshots: Vec<_> = {
-            let store = self
-                .runtime
-                .store
-                .read()
-                .expect("session store lock poisoned");
-            store
-                .sessions()
-                .iter()
-                .filter(|(id, _)| fixed_id.is_none_or(|fixed| fixed == *id))
-                .map(|(id, session)| {
-                    (
-                        id.clone(),
-                        ui_agent_kind(session.effective_kind()),
-                        status_state(session),
-                    )
-                })
-                .collect()
-        };
-        self.glyphs
-            .retain(|id, _| snapshots.iter().any(|(live, _, _)| live == id));
-        for (id, kind, state) in snapshots {
-            if let Some(glyph) = self.glyphs.get(&id) {
-                glyph.update(cx, |glyph, cx| {
-                    glyph.set_kind(kind, cx);
-                    glyph.set_state(state, window, cx);
-                    glyph.set_colors(colors, cx);
-                });
-            } else {
-                let glyph = StatusGlyph::entity(kind, state, 16.0, colors, cx);
-                self.glyphs.insert(id, glyph);
-            }
-        }
-    }
-
-    fn current_colors(&self) -> SemanticColors {
-        let store = self
-            .runtime
-            .store
-            .read()
-            .expect("session store lock poisoned");
-        crate::app_theme::colors_in(&store)
     }
 
     fn handle_pane_event(&mut self, event: PaneEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -5129,7 +5074,6 @@ impl TerminalPane {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let glyph = self.glyphs.get(&session.id).cloned();
         let identity_selector = format!("terminal-session-identity-{}", session.id.0);
         let shell_controls = matches!(self.session_source, SessionSource::FollowSelection);
         let show_sidebar = self.shows_navigation_control();
@@ -5161,7 +5105,8 @@ impl TerminalPane {
                     .overflow_hidden()
                     .opacity(self.title_opacity)
                     .when_some(sidebar_reveal, |title, control| title.child(control))
-                    .when_some(glyph.filter(|_| header_width >= 280.0), |title, glyph| {
+                    .when(header_width >= 280.0, |title| {
+                        let glyph = StatusGlyph::new(ui_agent_kind(session.effective_kind()), status_state(session), 16.0, colors).sized_mark(None);
                         title.child(
                             div()
                                 .debug_selector(move || identity_selector.clone())
@@ -6168,7 +6113,6 @@ impl TerminalPane {
                 crate::chrome_focus::look_in(&store, colors.appearance, window),
             )
         };
-        self.sync_status_glyphs(colors, window, cx);
         self.update_selected_geometry(window, cx);
         self.main_viewport = window.viewport_size();
         self.held_hint = crate::held_hints::opacity(window, cx);
