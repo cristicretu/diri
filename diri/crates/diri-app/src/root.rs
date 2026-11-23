@@ -13164,15 +13164,25 @@ mod tests {
             let mut store = services.store.store.write().unwrap();
             store.hydrate(fixture.list);
             store.select(SessionId::new("s_note_plan"));
+            let surface_shot = std::env::var_os("DIRI_VISUAL_SURFACE").is_some();
+            if surface_shot {
+                // A connected Engine and an opaque window, so the shot shows
+                // the surface rather than the reconnect notice over glass.
+                store.mark_connected_for_test();
+            }
             store
                 .update_preferences(|prefs| {
                     prefs.sidebar_visible = true;
                     prefs.terminal_theme = std::env::var("DIRI_VISUAL_THEME")
                         .unwrap_or_else(|_| "dirijor-light".into());
+                    if surface_shot {
+                        prefs.window_material = crate::store::WindowMaterial::Opaque;
+                    }
                 })
                 .unwrap();
         }
         let runtime = Arc::clone(&services.store);
+        let services_store = Arc::clone(&services.store);
         cx.update(|cx| {
             let model = cx.new(|cx| {
                 crate::notes::todos::TodosModel::with_store(
@@ -13187,24 +13197,40 @@ mod tests {
         // `DIRI_VISUAL_SURFACE=1` pins "What's for Today" in the sidebar and
         // opens it over the main pane.
         let surface_dir = tempfile::tempdir().unwrap();
+        let panel_shot = std::env::var("DIRI_VISUAL_SURFACE").is_ok_and(|v| v == "panel");
         let surface_id = std::env::var_os("DIRI_VISUAL_SURFACE").map(|_| {
             use diri_proto::surface::{Interaction, Scope, template};
             let store = Arc::new(
                 diri_surfaces::SurfaceStore::open(surface_dir.path().join("surfaces")).unwrap(),
             );
-            let sessions: Vec<String> = runtime
+            let mut sessions: Vec<String> = runtime
                 .store
                 .read()
                 .unwrap()
                 .sessions()
                 .values()
                 .filter(|record| !record.is_note() && !record.is_archived())
-                .take(3)
                 .map(|record| record.id.0.clone())
                 .collect();
+            sessions.sort();
+            sessions.truncate(3);
+            // `DIRI_VISUAL_SURFACE=panel` makes it the first session's own
+            // surface, shown in its right panel; otherwise a saved one.
+            let scope = if panel_shot {
+                Scope::Session {
+                    session: sessions[0].clone(),
+                }
+            } else {
+                Scope::Global
+            };
+            let mut doc = template::whats_for_today("", scope, &sessions);
+            if panel_shot {
+                doc.title = "Checkout retry: review".into();
+                doc.subtitle = Some("What this agent is doing and what it needs from you".into());
+            }
             let doc = store
                 .create(
-                    template::whats_for_today("", Scope::Global, &sessions),
+                    doc,
                     &diri_surfaces::Author::Agent(history_agent.clone()),
                 )
                 .unwrap();
@@ -13232,8 +13258,13 @@ mod tests {
             doc.id
         });
         let note_pane = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let window_size = if panel_shot {
+            size(px(1440.0), px(900.0))
+        } else {
+            size(px(1240.0), px(780.0))
+        };
         let window = cx
-            .open_window(size(px(1240.0), px(780.0)), {
+            .open_window(window_size, {
                 let note_pane = note_pane.clone();
                 move |window, cx| {
                     cx.new(|cx| {
@@ -13264,11 +13295,60 @@ mod tests {
             })
             .unwrap();
             cx.run_until_parked();
+            let session = panel_shot.then(|| {
+                let store = services_store.store.read().unwrap();
+                let mut ids: Vec<_> = store
+                    .sessions()
+                    .values()
+                    .filter(|record| !record.is_note() && !record.is_archived())
+                    .map(|record| record.id.clone())
+                    .collect();
+                ids.sort_by(|a, b| a.0.cmp(&b.0));
+                ids[0].clone()
+            });
+            if let Some(session) = &session {
+                cx.update_window(window.into(), |root, window, cx| {
+                    let root = root.downcast::<RootView>().unwrap();
+                    root.update(cx, |root, cx| {
+                        root.window_store.write().unwrap().select(session.clone());
+                        root.services.store.store.write().unwrap().select(session.clone());
+                        root.set_inspector_open(true, cx);
+                        // The fixture pins the main pane to the note; the
+                        // panel follows the agent the surface belongs to.
+                        if let Some(inspector) = &root.inspector {
+                            inspector.update(cx, |inspector, cx| {
+                                inspector.set_session_context(Some(Some(session.clone())), cx)
+                            });
+                        }
+                    });
+                    window.refresh();
+                })
+                .unwrap();
+                for _ in 0..3 {
+                    cx.run_until_parked();
+                    cx.update_window(window.into(), |_, window, _| window.refresh())
+                        .unwrap();
+                }
+            }
             cx.update_window(window.into(), |root, window, cx| {
                 let root = root.downcast::<RootView>().unwrap();
-                root.update(cx, |root, cx| root.open_surface_page(id, window, cx));
+                root.update(cx, |root, cx| match &session {
+                    Some(session) => {
+                        root.on_surfaces_event(
+                            &crate::surfaces::SurfacesEvent::SessionSurfaceCreated {
+                                session: session.clone(),
+                                surface: id.clone(),
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                    None => root.open_surface_page(id, window, cx),
+                });
             })
             .unwrap();
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(400));
             cx.run_until_parked();
         }
         // `DIRI_VISUAL_TODOS=1` opens the To-dos page from the sidebar row.

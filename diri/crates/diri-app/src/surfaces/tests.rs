@@ -263,14 +263,15 @@ fn render_live_surface_screenshot() {
     let fixture = crate::sidebar::SidebarPreviewFixture::make(
         crate::sidebar::PreviewScenario::Typical,
     );
-    let sessions: Vec<String> = fixture
+    let mut sessions: Vec<String> = fixture
         .list
         .sessions
         .iter()
-        .filter(|record| !record.is_note())
-        .take(3)
+        .filter(|record| !record.is_note() && !record.is_archived())
         .map(|record| record.id.0.clone())
         .collect();
+    sessions.sort();
+    sessions.truncate(3);
     let runtime = Arc::new(StoreRuntime::inert());
     runtime.store.write().unwrap().hydrate(fixture.list);
 
@@ -294,6 +295,12 @@ fn render_live_surface_screenshot() {
     store
         .interact(&doc.id, &Interaction::Select { id: "focus".into(), value: "review".into() })
         .unwrap();
+    // `DIRI_VISUAL_SURFACE_TICK=<item>` ticks one more item, as a click would.
+    if let Ok(item) = std::env::var("DIRI_VISUAL_SURFACE_TICK") {
+        store
+            .interact(&doc.id, &Interaction::Check { checklist: "today".into(), item, checked: true })
+            .unwrap();
+    }
     let (width, height) = if panel { (420.0, 980.0) } else { (1240.0, 1120.0) };
     let window = cx
         .open_window(size(px(width), px(height)), {
