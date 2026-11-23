@@ -22,6 +22,73 @@ use crate::session::{HolderConfig, RemoteAdoptSpec, Session, SessionSpec, Sessio
 use crate::state_file::JsonStateFile;
 use crate::status::StatusSignal;
 
+/// The Registry owns the Session lifecycle. A pin borrows that exact run
+/// across a blocking write or grid walk. Termination, removal and mutable
+/// reconnect wait for pins so a late write cannot reopen a reused socket.
+pub(crate) struct RegisteredSession {
+    session: Arc<Session>,
+    access: Arc<parking_lot::RwLock<parking_lot::Mutex<()>>>,
+}
+
+pub(crate) struct SessionPin {
+    // Release the Session before releasing the read guard: an exclusive
+    // owner can then recover its unique mutable reference immediately.
+    session: Arc<Session>,
+    access: parking_lot::ArcRwLockReadGuard<parking_lot::RawRwLock, parking_lot::Mutex<()>>,
+}
+
+impl From<Session> for RegisteredSession {
+    fn from(session: Session) -> Self {
+        Self {
+            session: Arc::new(session),
+            access: Arc::default(),
+        }
+    }
+}
+
+impl RegisteredSession {
+    fn pin(&self) -> SessionPin {
+        SessionPin {
+            session: Arc::clone(&self.session),
+            access: self.access.read_arc(),
+        }
+    }
+}
+
+impl std::ops::Deref for RegisteredSession {
+    type Target = Session;
+    fn deref(&self) -> &Session {
+        &self.session
+    }
+}
+
+impl std::ops::DerefMut for RegisteredSession {
+    fn deref_mut(&mut self) -> &mut Session {
+        let _exclusive = self.access.write();
+        Arc::get_mut(&mut self.session).expect("all session pins were released")
+    }
+}
+
+impl Drop for RegisteredSession {
+    fn drop(&mut self) {
+        drop(self.access.write());
+    }
+}
+
+impl SessionPin {
+    /// Serialize a seed plus sink admission with a diff plus its recipients.
+    pub(crate) fn publication(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.access.lock()
+    }
+}
+
+impl std::ops::Deref for SessionPin {
+    type Target = Session;
+    fn deref(&self) -> &Session {
+        &self.session
+    }
+}
+
 /// The versioned on-disk snapshot.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct PersistedState {
@@ -159,7 +226,7 @@ impl PersistBatch {
 
 pub struct Registry {
     engine: Arc<ManifestEngine>,
-    sessions: HashMap<String, Session>,
+    sessions: HashMap<String, RegisteredSession>,
     pending_launches: std::collections::HashSet<String>,
     /// Records for sessions that are no longer live but still listed.
     records: HashMap<String, SessionRecord>,
@@ -703,6 +770,12 @@ impl Registry {
     /// Starts a session and takes ownership of it.
     pub fn spawn(&mut self, spec: SessionSpec, record: SessionRecord) -> std::io::Result<String> {
         let id = spec.id.clone();
+        if self.sessions.contains_key(&id) || self.pending_launches.contains(&id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "session already has an owner or pending launch",
+            ));
+        }
         let recoverable = spec.holder.is_some() && record.host.is_none();
         if recoverable {
             self.write_recovery_capsule(&record)?;
@@ -951,7 +1024,7 @@ impl Registry {
         id: &str,
         stop: &crate::session::RemoteStop,
         exit: crate::pty::Exit,
-    ) -> Option<Session> {
+    ) -> Option<RegisteredSession> {
         if !self
             .sessions
             .get(id)
@@ -960,6 +1033,11 @@ impl Registry {
             return None;
         }
         let session = self.sessions.remove(id);
+        // The pump join happens outside the Registry. End any borrow of
+        // this run before a same-ID replacement can be admitted.
+        if let Some(session) = &session {
+            drop(session.access.write());
+        }
         self.record_exit(id, exit);
         session
     }
@@ -1288,7 +1366,11 @@ impl Registry {
     }
 
     pub fn get(&self, id: &str) -> Option<&Session> {
-        self.sessions.get(id)
+        self.sessions.get(id).map(|session| &**session)
+    }
+
+    pub(crate) fn pin(&self, id: &str) -> Option<SessionPin> {
+        self.sessions.get(id).map(RegisteredSession::pin)
     }
 
     /// Local terminals answer color queries from `palette` from now on; see
@@ -1305,7 +1387,7 @@ impl Registry {
     }
 
     pub fn views(&self) -> Vec<SessionView> {
-        let mut views: Vec<_> = self.sessions.values().map(Session::view).collect();
+        let mut views: Vec<_> = self.sessions.values().map(|s| s.view()).collect();
         views.sort_by(|a, b| a.id.cmp(&b.id));
         views
     }
@@ -1369,7 +1451,8 @@ impl Registry {
         }))
     }
 
-    fn insert_session(&mut self, id: String, session: Session) {
+    fn insert_session(&mut self, id: String, session: impl Into<RegisteredSession>) {
+        let session = session.into();
         if let Some(watcher) = &self.state_watcher {
             session.set_state_watcher(watcher);
             watcher.notify();
@@ -1822,15 +1905,17 @@ impl Registry {
     /// metadata and in-memory state both say awake, so hot input paths can
     /// call it unconditionally.
     pub fn wake_session(&mut self, id: &str) -> std::io::Result<()> {
-        let hibernated = self
-            .records
-            .get(id)
-            .is_some_and(|record| record.hibernation.is_some())
-            || self.sessions.get(id).is_some_and(Session::is_hibernated);
-        if !hibernated {
+        if !self.session_is_hibernated(id) {
             return Ok(());
         }
         self.ensure_session_awake(id)
+    }
+
+    pub(crate) fn session_is_hibernated(&self, id: &str) -> bool {
+        self.records
+            .get(id)
+            .is_some_and(|record| record.hibernation.is_some())
+            || self.get(id).is_some_and(Session::is_hibernated)
     }
 
     /// Reconciles a user-visible session with the OS process state even when
@@ -1839,11 +1924,7 @@ impl Registry {
     /// it repairs the otherwise permanent "live record, stopped process"
     /// state without putting a process-tree walk on every keystroke.
     pub fn ensure_session_awake(&mut self, id: &str) -> std::io::Result<()> {
-        let known_hibernated = self
-            .records
-            .get(id)
-            .is_some_and(|record| record.hibernation.is_some())
-            || self.sessions.get(id).is_some_and(Session::is_hibernated);
+        let known_hibernated = self.session_is_hibernated(id);
         if let Some(session) = self.sessions.get(id) {
             session.signal_tree(diri_platform::signals::SIGCONT)?;
             // Flush AFTER the CONT so the tree is drinking again.
@@ -3289,11 +3370,16 @@ fn can_reenter(engine: &ManifestEngine, record: &SessionRecord) -> bool {
         })
 }
 
-fn normalize_agent_title(title: &str) -> Option<String> {
+/// The part of an Agent's OSC title that can contribute to its record name.
+pub(crate) fn agent_title_line(title: &str) -> Option<&str> {
     let line = title.lines().map(str::trim).find(|line| !line.is_empty())?;
-    let line = line.trim_start_matches(|character: char| {
+    Some(line.trim_start_matches(|character: char| {
         character.is_whitespace() || (!character.is_alphanumeric() && character != '_')
-    });
+    }))
+}
+
+fn normalize_agent_title(title: &str) -> Option<String> {
+    let line = agent_title_line(title)?;
     let normalized = line
         .chars()
         .filter(|character| !character.is_control())
@@ -6032,6 +6118,37 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_pinned_run_releases_before_its_session_id_can_be_reused() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let spec = SessionSpec {
+            id: "pinned".into(),
+            pty: crate::PtySpec::new(vec!["/bin/cat".into()], "/tmp"),
+            manifest_id: "shell".into(),
+            authority: crate::Authority::ProcessOnly,
+            logs_dir: temp.path().join("logs"),
+            holder: None,
+            remote: None,
+            defer_launch: false,
+        };
+        registry.spawn(spec, record("pinned")).unwrap();
+        let pinned = registry.pin("pinned").unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (released_tx, released_rx) = std::sync::mpsc::channel();
+        let stop = std::thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            registry.forget("pinned");
+            released_tx.send(()).unwrap();
+        });
+        entered_rx.recv().unwrap();
+        assert!(released_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(pinned);
+        released_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        stop.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn respawn_never_replaces_a_live_or_launching_session() {
         let temp = tempfile::tempdir().unwrap();
         let mut registry = Registry::new(engine(), temp.path().join("state.json"));
@@ -6052,6 +6169,8 @@ mod tests {
         let pid = registry.sessions["live"].child_pid();
         let error = registry.respawn(spec()).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        let error = registry.spawn(spec(), record("live")).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(
             registry.sessions["live"].child_pid(),
             pid,
@@ -6063,6 +6182,8 @@ mod tests {
 
         registry.pending_launches.insert("live".into());
         let error = registry.respawn(spec()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        let error = registry.spawn(spec(), record("live")).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         assert!(!registry.sessions.contains_key("live"));
     }

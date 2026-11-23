@@ -381,6 +381,172 @@ fn drag_resize_measurement() {
     }
 }
 
+/// The Engine portion of A8, with five deterministic streaming programs and
+/// an actual input echo in the first one's published grid. No Claude, window
+/// or screen capture is involved. Each program updates a separate screen row
+/// at 80 Hz and preserves the prompt at the top.
+#[test]
+#[ignore = "headless throughput and keystroke measurement"]
+fn five_streams_key_to_grid() {
+    let mut harness = Harness::new("five-echo");
+    let script = r#"import os, select, time, tty
+tty.setraw(0)
+os.write(1, b'\x1b[2J\x1b[HR')
+tick = 0
+next_tick = time.monotonic()
+while True:
+    if select.select([0], [], [], max(0, next_tick - time.monotonic()))[0]:
+        data = os.read(0, 1024)
+        if not data: break
+        os.write(1, data)
+    if time.monotonic() >= next_tick:
+        tick += 1
+        os.write(1, ('\x1b7\x1b[4;1Hbackground output %08d\x1b8' % tick).encode())
+        next_tick = time.monotonic() + 0.0125
+"#;
+    let mut streams = Vec::new();
+    let mut ids = Vec::new();
+    for _ in 0..5 {
+        let id = harness.request(
+            "session.spawn",
+            json!({
+                "kind": { "shell": {} }, "cwd": "/tmp",
+                "argv": ["/usr/bin/python3", "-u", "-c", script],
+                "initialCols": 160, "initialRows": 50,
+            }),
+        )["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        streams.push(harness.attach(&id));
+        ids.push(id);
+    }
+    let mut active = streams.remove(0);
+    for stream in streams {
+        watch(stream);
+    }
+    let mut codec = FrameCodec::new();
+    let mut chunk = vec![0; 256 << 10];
+    let mut samples = Vec::new();
+    active
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    // R is the initial prompt. Each next grid must contain exactly the
+    // expected prefix rather than merely differ because of the stream.
+    for length in 0..=60 {
+        let sent = Instant::now();
+        if length > 0 {
+            active
+                .write_all(&FrameCodec::encode(&Frame::input(b"q".to_vec())).unwrap())
+                .unwrap();
+        }
+        let deadline = sent + Duration::from_secs(10);
+        loop {
+            assert!(Instant::now() < deadline, "missing prompt length {length}");
+            let n = active.read(&mut chunk).unwrap();
+            assert!(n > 0, "attach closed");
+            let found = codec
+                .feed(&chunk[..n])
+                .unwrap()
+                .into_iter()
+                .filter_map(|frame| frame.grid_payload().ok().flatten())
+                .any(|grid| {
+                    grid.changed_rows.iter().any(|row| {
+                        row.y == 0
+                            && row
+                                .cells
+                                .first()
+                                .is_some_and(|c| c.scalar == u32::from(b'R'))
+                            && row.cells.get(1..=length).is_some_and(|cells| {
+                                cells.iter().all(|c| c.scalar == u32::from(b'q'))
+                            })
+                    })
+                });
+            if found {
+                break;
+            }
+        }
+        if length > 0 {
+            samples.push(sent.elapsed());
+        }
+        std::thread::sleep(Duration::from_millis(200 + (length as u64 * 47) % 100));
+    }
+    for id in ids {
+        harness.request("session.kill", json!({ "sessionID": id }));
+    }
+    eprintln!(
+        "five streams, 60 key-to-decoded-grid echoes: p50 {:?} p95 {:?} max {:?}",
+        percentile(&mut samples, 0.5),
+        percentile(&mut samples, 0.95),
+        percentile(&mut samples, 1.0)
+    );
+}
+
+/// A real, backpressured Holder write must not own the Registry while a
+/// different terminal types. The slow child signals after it consumes the
+/// first byte, then waits another 350 ms before reading the rest.
+#[test]
+fn a_blocked_paste_leaves_another_terminal_interactive() {
+    let mut harness = Harness::new("paste-contention");
+    let started = harness.root.join("started");
+    let received = harness.root.join("received");
+    let bytes = 128 << 10;
+    let reader = harness.spawn(&format!(
+        "stty raw -echo; touch '{out}.ready'; dd bs=1 count=1 of='{out}' 2>/dev/null; touch '{started}'; sleep 0.35; head -c {rest} >> '{out}'; printf 'PASTED'; exec cat",
+        out = received.display(), started = started.display(), rest = bytes - 1,
+    ));
+    let typed = harness.spawn("printf 'ready\n'; exec cat");
+    let mut slow = harness.attach(&reader);
+    let mut fast = harness.attach(&typed);
+    let fast_watch = watch(fast.try_clone().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fast_watch.cursor.lock().unwrap().is_none() || !received.with_extension("ready").exists()
+    {
+        assert!(Instant::now() < deadline, "missing seed");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let payload = (0..bytes)
+        .map(|index| b'!' + (index % 82) as u8)
+        .collect::<Vec<_>>();
+    slow.write_all(&FrameCodec::encode(&Frame::input(payload.clone())).unwrap())
+        .unwrap();
+    while !started.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the paste never reached the child"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let sent = Instant::now();
+    fast.write_all(&FrameCodec::encode(&Frame::input(b"k".to_vec())).unwrap())
+        .unwrap();
+    let latency = loop {
+        if let Some((_, at)) = *fast_watch.cursor.lock().unwrap()
+            && at >= sent
+        {
+            break at.duration_since(sent);
+        }
+        assert!(Instant::now() < deadline, "missing echo");
+        std::thread::sleep(Duration::from_micros(200));
+    };
+    while std::fs::metadata(&received).map_or(0, |m| m.len()) < bytes as u64
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let actual = std::fs::read(&received).unwrap_or_default();
+    for id in [&reader, &typed] {
+        harness.request("session.kill", json!({ "sessionID": id }));
+    }
+    eprintln!("other-session echo during a backpressured Holder write: {latency:?}");
+    assert_eq!(actual.len(), payload.len(), "lost paste bytes");
+    assert!(actual == payload, "reordered paste");
+    assert!(
+        latency < Duration::from_millis(250),
+        "echo waited on the other Holder: {latency:?}"
+    );
+}
+
 /// A large paste into a program that reads it all, while another session is
 /// typed into: time until the program has consumed every byte, and the other
 /// session's echo latency meanwhile.
