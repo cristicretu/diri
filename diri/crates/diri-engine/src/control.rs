@@ -32,6 +32,7 @@ mod agent_relaunch;
 mod agent_sign_in;
 mod app_actions;
 mod claude_accounts;
+mod clips;
 mod codex_accounts;
 mod hook_order;
 mod hook_queue;
@@ -1470,6 +1471,13 @@ impl ControlServer {
             Method::TEST_RUN => self.browser_call("run", params),
             Method::BROWSER_ACT => self.browser_call("browser", params),
             Method::COMPUTER_ACT => self.computer_act(params),
+            Method::CLIP_SAVE => self.clip_save(params),
+            Method::CLIP_LIST => self.clip_list(params),
+            Method::CLIP_GET => self.clip_get(params),
+            Method::CLIP_DELETE => self.clip_delete(params),
+            Method::CLIP_TARGETS => self.clip_targets(params),
+            Method::CLIP_DISPATCH => self.clip_dispatch(params),
+            Method::CLIP_CAPTURE => self.clip_capture(params),
             Method::COMPUTER_STATUS => {
                 let p: diri_proto::ComputerStatusParams = decode(params)?;
                 encode(&self.computer_status(p.probe)?)

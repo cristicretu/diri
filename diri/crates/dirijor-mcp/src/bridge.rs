@@ -18,6 +18,7 @@ mod api;
 #[cfg(test)]
 mod audit_tests;
 pub mod cli;
+mod clips;
 mod layout;
 mod notes;
 pub use notes::NoteSpawn;
@@ -220,6 +221,10 @@ impl Bridge {
             "create_note" => self.create_note(arguments),
             "start_from_note" => self.start_from_note(arguments),
             "note_history" => self.note_history(arguments),
+            "list_clips" => self.list_clips(arguments),
+            "get_clip" => self.get_clip(arguments),
+            "capture_clip" => self.capture_clip(arguments),
+            "send_clip" => self.send_clip(arguments),
             diri_proto::voice::SPEAK_TOOL => self.speak(arguments),
             other => Err(format!("unknown tool: {other}")),
         }

@@ -7,6 +7,7 @@ pub mod api;
 pub mod api_request;
 pub mod app_actions;
 pub mod attention;
+pub mod clip;
 pub mod computer;
 pub use accounts::*;
 pub use api_request::{

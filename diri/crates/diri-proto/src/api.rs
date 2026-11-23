@@ -481,6 +481,51 @@ mod catalog {
                 "Open a prefilled HTTP request in a session's API tab."
             ),
             entry!(
+                Method::CLIP_SAVE,
+                clip::ClipSaveParams,
+                "ClipRecord",
+                "Add a capture (screenshot path, text, source page) to the Context Ring."
+            ),
+            entry!(
+                Method::CLIP_LIST,
+                clip::ClipListParams,
+                "ClipListResult",
+                "Recent Context Ring clips, newest first, without text bodies."
+            ),
+            entry!(
+                Method::CLIP_GET,
+                clip::ClipIdParams,
+                "ClipRecord",
+                "One clip with its extracted text, by id or latest.",
+                || json!({"id": "latest"})
+            ),
+            entry!(
+                Method::CLIP_DELETE,
+                clip::ClipIdParams,
+                "{}",
+                "Remove a clip and its screenshot from the ring."
+            ),
+            entry!(
+                Method::CLIP_TARGETS,
+                clip::ClipIdParams,
+                "ClipTargetsResult",
+                "Sessions a clip can go to: the one this page was sent to last first, each with its latest exchange.",
+                || json!({"id": "latest"})
+            ),
+            entry!(
+                Method::CLIP_DISPATCH,
+                clip::ClipDispatchParams,
+                "ClipDispatchResult",
+                "Send a clip with a prompt to a Session or a new Agent, or keep it in the ring; remembers the page's Session.",
+                || json!({"id": "latest", "prompt": "fix this padding", "destination": {"type": "ring"}})
+            ),
+            entry!(
+                Method::CLIP_CAPTURE,
+                clip::ClipCaptureParams,
+                "{}",
+                "Ask the app to open the capture overlay."
+            ),
+            entry!(
                 Method::SESSION_MIGRATE,
                 SessionMigrateParams,
                 "SessionRecord",

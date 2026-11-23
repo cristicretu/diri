@@ -1,6 +1,6 @@
 name = "DiriFormal"
 version = "0.1.0"
-defaultTargets = ["PromptCache", "HookOrder", "Reliability"]
+defaultTargets = ["PromptCache", "HookOrder", "Reliability", "ContextRing"]
 
 [[lean_lib]]
 name = "PromptCache"
@@ -10,3 +10,6 @@ name = "HookOrder"
 
 [[lean_lib]]
 name = "Reliability"
+
+[[lean_lib]]
+name = "ContextRing"

@@ -96,6 +96,21 @@ impl Method {
     /// (`SessionOpenApiRequestParams`); the Engine re-publishes it as the
     /// `session.api_request` event. Nothing is sent by the Engine.
     pub const SESSION_OPEN_API_REQUEST: &'static str = "session.open_api_request";
+    /// Context Ring: ingest a capture the app took (`clip::ClipSaveParams`).
+    pub const CLIP_SAVE: &'static str = "clip.save";
+    /// Recent clips, newest first, without text bodies.
+    pub const CLIP_LIST: &'static str = "clip.list";
+    /// One clip with its text, by id or `latest`.
+    pub const CLIP_GET: &'static str = "clip.get";
+    /// Remove one clip and its screenshot.
+    pub const CLIP_DELETE: &'static str = "clip.delete";
+    /// Sessions a clip can go to, remembered page first, with previews.
+    pub const CLIP_TARGETS: &'static str = "clip.targets";
+    /// Send a clip and a prompt to a Session, a new Agent, or the ring.
+    pub const CLIP_DISPATCH: &'static str = "clip.dispatch";
+    /// Ask the app to open the capture overlay; republished as
+    /// `clip.capture_requested`.
+    pub const CLIP_CAPTURE: &'static str = "clip.capture";
     pub const COMPUTER_ACT: &'static str = "computer.act";
     /// Whether Cua Driver is installed and allowed (`ComputerStatusParams`).
     pub const COMPUTER_STATUS: &'static str = "computer.status";
@@ -246,6 +261,13 @@ impl Method {
         Self::SESSION_DELETE_NOTE,
         Self::SESSION_REVEAL,
         Self::SESSION_OPEN_API_REQUEST,
+        Self::CLIP_SAVE,
+        Self::CLIP_LIST,
+        Self::CLIP_GET,
+        Self::CLIP_DELETE,
+        Self::CLIP_TARGETS,
+        Self::CLIP_DISPATCH,
+        Self::CLIP_CAPTURE,
         Self::COMPUTER_ACT,
         Self::COMPUTER_STATUS,
         Self::COMPUTER_SETUP,
@@ -339,6 +361,10 @@ impl EventName {
     /// A client asked for this Session to be shown (`{"sessionID"}`), e.g.
     /// an agent that just wrote a note. The app selects it without taking
     /// focus from another app.
+    /// The app should open the capture overlay (`clip::ClipCaptureParams`).
+    pub const CLIP_CAPTURE_REQUESTED: &'static str = "clip.capture_requested";
+    /// The ring changed: `{"id"}` of the clip added, sent or removed.
+    pub const CLIP_UPDATED: &'static str = "clip.updated";
     pub const SESSION_REVEAL: &'static str = "session.reveal";
     /// An agent asked for a request to be opened in its Session's API tab
     /// (`SessionOpenApiRequestParams`). The app prefills the tab; it sends

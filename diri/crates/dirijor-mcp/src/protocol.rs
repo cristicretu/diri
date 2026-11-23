@@ -218,7 +218,16 @@ fn discover(backend: &mut impl ToolBackend, args: &Value) -> Result<Value, Strin
         return backend.call("get_skill", args);
     }
     let result = backend.tools()?;
-    let tools = result["tools"].as_array().ok_or("invalid tool catalog")?;
+    let mut tools = result["tools"]
+        .as_array()
+        .ok_or("invalid tool catalog")?
+        .clone();
+    // Deferred actions are discoverable here and nowhere in tools/list.
+    tools.extend(
+        crate::tools::deferred_tool_definitions()
+            .iter()
+            .map(crate::tools::ToolDefinition::wire_value),
+    );
     match args.get("action") {
         None => Ok(
             json!({"skills":diri_proto::skills::ALL.map(|skill|skill.name),"actions":tools.iter().map(|t| &t["name"]).collect::<Vec<_>>()}),
@@ -328,6 +337,8 @@ pub fn read_only(message: &Value) -> bool {
                     | "read_note"
                     | "note_links"
                     | "list_actions"
+                    | "list_clips"
+                    | "get_clip"
             )
         )
 }
@@ -421,6 +432,50 @@ mod tests {
         .unwrap();
         assert_eq!(called["result"]["isError"], false);
         assert_eq!(called["result"]["content"][0]["text"], "{\"agents\":[]}");
+    }
+
+    #[test]
+    fn clip_actions_are_discoverable_and_callable_but_never_listed() {
+        let clips = ["list_clips", "get_clip", "capture_clip", "send_clip"];
+        for compact in [false, true] {
+            let listed = handle_profile(
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+                &mut Fake,
+                compact,
+            )
+            .unwrap();
+            let text = listed["result"].to_string();
+            for name in clips {
+                assert!(!text.contains(name), "{name} listed (compact {compact})");
+            }
+        }
+        let discovered = handle_profile(
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_skill","arguments":{}}}),
+            &mut Fake,
+            true,
+        )
+        .unwrap();
+        let text = discovered["result"]["content"][0]["text"].as_str().unwrap();
+        for name in clips {
+            assert!(text.contains(name), "{name} not discoverable");
+        }
+        let schema = handle_profile(
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_skill","arguments":{"action":"send_clip"}}}),
+            &mut Fake,
+            true,
+        )
+        .unwrap();
+        let text = schema["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"required\":[\"session_id\"]"), "{text}");
+        // `act` unwraps to the action itself before dispatch.
+        let mut message = json!({"method":"tools/call","params":{"name":"act","arguments":{"action":"get_clip","arguments":{"id":"latest"}}}});
+        expand_action(&mut message);
+        assert_eq!(message["params"]["name"], "get_clip");
+        assert!(read_only(&message));
+        crate::tools::validate_arguments("get_clip", &json!({"id":"latest"})).unwrap();
+        crate::tools::validate_arguments("send_clip", &json!({"session_id":"s"})).unwrap();
+        assert!(crate::tools::validate_arguments("send_clip", &json!({})).is_err());
+        assert!(crate::tools::validate_arguments("capture_clip", &json!({"mode":"all"})).is_err());
     }
 
     #[test]
