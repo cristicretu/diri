@@ -508,7 +508,7 @@ fn random_patches_preserve_invariants() {
         let existing = ids(&doc);
         let target = rng.pick(&existing).clone();
         let mut node = rng.pick(&kinds).clone();
-        if rng.next() % 2 == 0 && node.get("id").is_none() {
+        if rng.next().is_multiple_of(2) && node.get("id").is_none() {
             node["id"] = json!(format!("n{step}"));
         }
         let op = match rng.next() % 4 {

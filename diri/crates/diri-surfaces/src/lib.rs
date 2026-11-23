@@ -483,7 +483,7 @@ impl SurfaceStore {
                 });
             }
         }
-        versions.sort_by(|a, b| b.revision.cmp(&a.revision));
+        versions.sort_by_key(|v| std::cmp::Reverse(v.revision));
         Ok(versions)
     }
 

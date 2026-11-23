@@ -158,14 +158,11 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), CliError> {
                 request["scope"] = json!("global");
             } else if args.has("--project") {
                 request["scope"] = json!("project");
-                let dir = args.value("--project").map_or_else(
-                    || {
-                        std::env::current_dir()
-                            .map(|d| d.display().to_string())
-                            .unwrap_or_default()
-                    },
-                    |dir| dir,
-                );
+                let dir = args.value("--project").unwrap_or_else(|| {
+                    std::env::current_dir()
+                        .map(|d| d.display().to_string())
+                        .unwrap_or_default()
+                });
                 request["project"] = json!(dir);
             } else if let Some(session) = args.value("--session") {
                 request["scope"] = json!("session");

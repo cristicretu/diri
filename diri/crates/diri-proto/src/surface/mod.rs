@@ -289,7 +289,10 @@ impl SurfaceDoc {
     pub fn checklist_counts(&self, checklist: &str) -> Option<(usize, usize)> {
         match node::find(&self.root, checklist).map(|node| &node.kind) {
             Some(NodeKind::Checklist { items, .. }) => Some((
-                items.iter().filter(|item| self.is_checked(checklist, item)).count(),
+                items
+                    .iter()
+                    .filter(|item| self.is_checked(checklist, item))
+                    .count(),
                 items.len(),
             )),
             _ => None,

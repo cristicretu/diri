@@ -353,7 +353,7 @@ impl gpui::Render for Host {
         let fill = if self.panel {
             crate::right_panel::panel_background(self.colors)
         } else {
-            self.colors.background.into()
+            self.colors.background
         };
         div().size_full().bg(fill).child(self.view.clone())
     }

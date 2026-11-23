@@ -163,7 +163,7 @@ impl SurfacesModel {
             .filter(|s| s.doc.scope.is_saved() && s.doc.pinned)
             .map(|s| Arc::clone(&s.doc))
             .collect();
-        docs.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+        docs.sort_by_key(|doc| doc.title.to_lowercase());
         docs
     }
 
@@ -175,7 +175,7 @@ impl SurfacesModel {
             .filter(|s| s.doc.scope.is_saved())
             .map(|s| Arc::clone(&s.doc))
             .collect();
-        docs.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms));
+        docs.sort_by_key(|doc| std::cmp::Reverse(doc.updated_ms));
         docs
     }
 
@@ -187,7 +187,7 @@ impl SurfacesModel {
             .filter(|s| s.doc.scope.session() == Some(session))
             .map(|s| Arc::clone(&s.doc))
             .collect();
-        docs.sort_by(|a, b| b.created_ms.cmp(&a.created_ms));
+        docs.sort_by_key(|doc| std::cmp::Reverse(doc.created_ms));
         docs
     }
 
