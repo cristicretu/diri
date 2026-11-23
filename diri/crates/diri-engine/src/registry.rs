@@ -1944,7 +1944,6 @@ impl Registry {
         } else {
             meta
         };
-        let claimed = self.claimed_agent_ids(Some(id));
         let mut transcript = self.records.get(id).and_then(|record| {
             if record.host.is_some() {
                 return None;
@@ -2048,7 +2047,7 @@ impl Registry {
                     .as_deref()
                     .or(record.agent_session_id.as_deref()),
                 record.created_at.0,
-                &claimed,
+                &self.claimed_agent_ids(Some(id)),
             )
         });
         let record = self.records.get_mut(id)?;

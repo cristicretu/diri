@@ -10,6 +10,10 @@ pub const WIRE_VERSION: u32 = 1;
 /// Maximum byte length of one newline-delimited control message.
 pub const MAX_CONTROL_LINE_BYTES: usize = 4 * 1024 * 1024;
 
+/// One frame on a connection that negotiated a hook reservation in Hello.
+/// Its request ID is the Engine-issued sequence; it takes no response.
+pub const HOOK_COMMIT: &str = "hook.commit";
+
 /// Error code for a terminal or process request aimed at a note Session.
 pub const SESSION_HAS_NO_TERMINAL: &str = "session_has_no_terminal";
 
