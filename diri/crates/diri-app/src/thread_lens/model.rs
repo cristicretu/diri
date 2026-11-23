@@ -418,6 +418,10 @@ struct Builder {
     calls: HashMap<String, (usize, usize)>,
     /// A `/model` ran and its result has not printed yet.
     model_command: bool,
+    /// The CLI's permission mode, as last recorded.
+    mode: Option<String>,
+    /// When the latest user message was recorded.
+    last_user_at: Option<i64>,
     /// The model a `/model` divider already announced, so the next request's
     /// usage record does not draw a second divider for the same switch.
     announced: Option<String>,
@@ -444,6 +448,47 @@ impl ThreadModel {
 
     pub fn warmth_for(&self, model: &str, now_ms: i64) -> CacheWarmth {
         cache_warmth(self.usages.iter(), model, now_ms)
+    }
+
+    /// When the latest user message was recorded, or a pending one sent.
+    pub fn last_user_at(&self) -> Option<i64> {
+        let pending = self.pending.iter().map(|p| p.sent_ms).max();
+        pending.max(self.builder.last_user_at)
+    }
+
+    /// The thread ends on the user's message: the Agent owes a reply.
+    pub fn awaiting_reply(&self) -> bool {
+        !self.pending.is_empty() || matches!(self.rows.last(), Some(Row::User { .. }))
+    }
+
+    /// The permission mode the transcript last recorded.
+    pub fn mode(&self) -> Option<&str> {
+        self.builder.mode.as_deref()
+    }
+
+    /// How full the context window was at the last request: tokens sent
+    /// (fresh, cached and cache-written input plus the reply) and the
+    /// window. Codex reports its window; Claude's is 200k, or 1M for a
+    /// `[1m]` model or a request already past 200k.
+    pub fn context(&self) -> Option<(u64, u64)> {
+        let usage = self.usages.iter().rev().find(|u| u.input + u.cache_read + u.cache_write > 0)?;
+        let used = usage.input + usage.cache_read + usage.cache_write + usage.output;
+        let window = usage.context_window.unwrap_or_else(|| {
+            let long = usage.model.as_deref().is_some_and(|m| m.contains("[1m]"));
+            if long || used > 200_000 { 1_000_000 } else { 200_000 }
+        });
+        Some((used.min(window), window))
+    }
+
+    /// Every model this thread's requests went to, in first-use order.
+    pub fn usage_models(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for model in self.usages.iter().filter_map(|u| u.model.as_deref()) {
+            if !out.iter().any(|m| same_model(m, model)) {
+                out.push(model.to_owned());
+            }
+        }
+        out
     }
 
     pub fn last_usage(&self) -> Option<&TurnUsage> {
@@ -551,6 +596,7 @@ impl ThreadModel {
         let at = self.rows.len();
         match &item.body {
             ThreadBody::User { text, images } => {
+                self.builder.last_user_at = item.at_ms.or(self.builder.last_user_at);
                 if let Some(index) = self.pending.iter().position(|p| same_text(&p.text, text)) {
                     self.pending.remove(index);
                 } else if let Some(at_ms) = item.at_ms {
@@ -578,6 +624,10 @@ impl ThreadModel {
                     args: Arc::from(args.as_str()),
                     output: None,
                 });
+                at
+            }
+            ThreadBody::Mode { mode } => {
+                self.builder.mode = Some(mode.clone());
                 at
             }
             ThreadBody::CommandOutput { text, is_error } => {
@@ -1027,5 +1077,20 @@ mod tests {
             .collect();
         assert_eq!(blocks, vec![(0, false), (1, false), (2, false), (3, false), (4, true)]);
         assert_eq!(model.parsed_documents(), 1, "one parse for all its rows");
+    }
+
+    #[test]
+    fn mode_and_context_follow_the_latest_records() {
+        let mut model = ThreadModel::default();
+        let mut items = conversation();
+        items.push(item(30, ThreadBody::Mode { mode: "plan".into() }));
+        model.ingest(page(items, 31));
+        assert_eq!(model.mode(), Some("plan"));
+        // conversation(): cache_write 10 on the last request.
+        assert_eq!(model.context(), Some((10, 200_000)));
+        model.ingest(page(vec![item(40, ThreadBody::Usage(TurnUsage {
+            input: 1_000, cache_read: 99_000, context_window: Some(272_000), ..TurnUsage::default()
+        }))], 41));
+        assert_eq!(model.context(), Some((100_000, 272_000)));
     }
 }

@@ -3591,6 +3591,8 @@ After the polish pass (block-granularity rows, one text per paragraph, selection
 | Empty-window baseline on the same capture path, p50 | 3.13 ms |
 | Lens cost above that baseline, p50 / p90 | 0.74 / 1.88 ms |
 
+With the always-on composer toolbar (2026-11-24, load average ~7): lens cost above the empty-window baseline p50 0.90–1.29 ms, p90 2.2 ms. Tail-following a top-aligned list measured 1.3–1.7 ms p50 on the same thread, which is why the lens switches to a bottom-aligned list once a thread overflows.
+
 Commands:
 
 ```sh

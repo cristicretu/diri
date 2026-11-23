@@ -78,6 +78,9 @@ pub struct TurnUsage {
     /// The part of `cache_write` written with a one-hour TTL.
     #[serde(default)]
     pub cache_write_1h: u64,
+    /// The model's context window, when the provider reports it (Codex).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
 }
 
 /// A picture attached by the user or returned by a tool.
@@ -202,6 +205,11 @@ pub enum ThreadBody {
         text: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
+    },
+    /// The CLI's permission mode changed (Claude: `default`, `acceptEdits`,
+    /// `plan`, `auto`, `bypassPermissions`).
+    Mode {
+        mode: String,
     },
     /// Provider accounting for one request; folded into warmth, not drawn.
     Usage(TurnUsage),

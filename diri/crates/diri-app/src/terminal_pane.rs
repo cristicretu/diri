@@ -5654,7 +5654,16 @@ impl TerminalPane {
             });
         }
         let portal = picker.map(|rows| self.render_lens_portal(session, rows, state, theme, colors, typeface, window, cx));
-        lens.update(cx, |lens, cx| lens.dock_portal(portal, cx));
+        // Claude's footer names the permission mode; the lens's mode pill
+        // follows it the frame it changes.
+        let screen_mode = self
+            .residents
+            .get(&id)
+            .and_then(|r| crate::thread_lens::setup::screen_mode(&r.element.live_screen_text()));
+        lens.update(cx, |lens, cx| {
+            lens.set_screen_mode(screen_mode);
+            lens.dock_portal(portal, cx);
+        });
         div().size_full().child(lens).into_any_element()
     }
 
@@ -5711,7 +5720,7 @@ impl TerminalPane {
                 div()
                     .id("lens-pty-portal")
                     .w_full()
-                    .max_w(px(744.0))
+                    .max_w(px(720.0))
                     .flex()
                     .flex_col()
                     .rounded(px(Radius::PANEL))
@@ -5797,6 +5806,8 @@ impl TerminalPane {
             div()
                 .id("lens-toggle")
                 .debug_selector(|| "lens-toggle".into())
+                // Breathing room from the panel toggle beside it.
+                .mr(px(6.0))
                 .role(gpui::Role::Button)
                 .aria_label(label)
                 .size(px(Metrics::TOOLBAR_CONTROL_SIZE))

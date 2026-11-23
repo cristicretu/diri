@@ -8,6 +8,8 @@
 //! DIRI_VISUAL_LIVE=1 …       # the Agent working, a message just sent
 //! DIRI_VISUAL_SLASH=/co …    # the composer's `/` menu
 //! DIRI_VISUAL_EMPTY=1 …      # a session with no turns yet
+//! DIRI_VISUAL_ONE=1 …        # one message, just sent
+//! DIRI_VISUAL_MENU=1 …       # the model and effort picker open
 //! ```
 
 use diri_proto::thread::{
@@ -62,6 +64,7 @@ fn usage(model: &str, at_ms: i64, read: u64, write_1h: u64) -> ThreadBody {
         cache_read: read,
         cache_write: write_1h,
         cache_write_1h: write_1h,
+        context_window: None,
     })
 }
 
@@ -209,6 +212,9 @@ mod screenshots {
         let live = std::env::var_os("DIRI_VISUAL_LIVE").is_some();
         let empty = std::env::var_os("DIRI_VISUAL_EMPTY").is_some();
         let slash = std::env::var("DIRI_VISUAL_SLASH").ok();
+        let one = std::env::var_os("DIRI_VISUAL_ONE").is_some();
+        let menu = std::env::var_os("DIRI_VISUAL_MENU").is_some();
+        let empty = empty || one;
         if std::env::var_os("DIRI_VISUAL_LIGHT").is_some() {
             runtime
                 .store
@@ -241,6 +247,16 @@ mod screenshots {
             .open_window(size(px(1000.0), px(height)), move |_, cx| {
                 cx.new(|cx| {
                     let mut lens = ThreadLens::new(SessionId(SESSION.into()), runtime, handle, cx);
+                    lens.set_setup_for_test(crate::thread_lens::setup::AgentSetup {
+                        model: Some("opus".into()),
+                        effort: Some("high".into()),
+                        mode: Some("auto".into()),
+                        ..crate::thread_lens::setup::read(
+                            &AgentKind::CLAUDE_CODE,
+                            std::path::Path::new("/nonexistent"),
+                            std::path::Path::new("/nonexistent"),
+                        )
+                    });
                     if !empty {
                         let mut first = page(now_ms);
                         if live {
@@ -260,9 +276,15 @@ mod screenshots {
                         // Typing while it works: the action reads Steer.
                         lens.type_for_test("and keep the old fallback", cx);
                     }
+                    if one {
+                        lens.send_for_test("hi this is me just testing", cx);
+                    }
+                    if menu {
+                        lens.open_model_menu_for_test();
+                    }
                     match &slash {
                         Some(query) => lens.type_for_test(query, cx),
-                        None if !empty && !live => lens.type_for_test("Ship it — then open a PR with before/after screenshots", cx),
+                        None if !empty && !live && !menu => lens.type_for_test("Ship it — then open a PR with before/after screenshots", cx),
                         None => {}
                     }
                     lens
@@ -359,6 +381,16 @@ mod screenshots {
             .open_window(size(px(1000.0), px(900.0)), move |_, cx| {
                 let lens = cx.new(|cx| {
                     let mut lens = ThreadLens::new(SessionId(SESSION.into()), runtime, handle, cx);
+                    lens.set_setup_for_test(crate::thread_lens::setup::AgentSetup {
+                        model: Some("opus".into()),
+                        effort: Some("high".into()),
+                        mode: Some("auto".into()),
+                        ..crate::thread_lens::setup::read(
+                            &AgentKind::CLAUDE_CODE,
+                            std::path::Path::new("/nonexistent"),
+                            std::path::Path::new("/nonexistent"),
+                        )
+                    });
                     lens.ingest_for_test(big, cx);
                     lens
                 });

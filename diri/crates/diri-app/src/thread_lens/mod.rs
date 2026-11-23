@@ -6,6 +6,7 @@ pub mod diff;
 pub mod fixture;
 pub mod model;
 pub mod portal;
+pub mod setup;
 pub mod slash;
 pub mod view;
 

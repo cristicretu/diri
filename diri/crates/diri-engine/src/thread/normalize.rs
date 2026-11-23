@@ -61,6 +61,13 @@ fn claude(record: &Value, budget: &mut usize) -> Vec<ThreadBody> {
         || record.get("isMeta").and_then(Value::as_bool) == Some(true)
         || record.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
     {
+        if kind == Some("permission-mode")
+            && let Some(mode) = record.get("permissionMode").and_then(Value::as_str)
+        {
+            return vec![ThreadBody::Mode {
+                mode: mode.to_owned(),
+            }];
+        }
         if kind == Some("system")
             && record.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
         {
@@ -158,6 +165,7 @@ fn claude(record: &Value, budget: &mut usize) -> Vec<ThreadBody> {
                 .pointer("/cache_creation/ephemeral_1h_input_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or_default(),
+            context_window: None,
         }));
     }
     out
@@ -371,6 +379,9 @@ fn codex(record: &Value, budget: &mut usize) -> Vec<ThreadBody> {
                 .pointer("/info/last_token_usage")
                 .map(|usage| {
                     let cached = u64_at(usage, "cached_input_tokens");
+                    let window = payload
+                        .pointer("/info/model_context_window")
+                        .and_then(Value::as_u64);
                     vec![ThreadBody::Usage(TurnUsage {
                         model: None,
                         at_ms: record
@@ -383,6 +394,7 @@ fn codex(record: &Value, budget: &mut usize) -> Vec<ThreadBody> {
                         cache_read: cached,
                         cache_write: 0,
                         cache_write_1h: 0,
+                        context_window: window,
                     })]
                 })
                 .unwrap_or_default(),
@@ -755,6 +767,20 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn claude_permission_mode_changes_reach_the_thread() {
+        assert_eq!(
+            items(
+                Provider::Claude,
+                json!({"type":"permission-mode","permissionMode":"plan","sessionId":"s"})
+            ),
+            vec![ThreadBody::Mode {
+                mode: "plan".into()
+            }]
+        );
+        assert!(items(Provider::Claude, json!({"type":"mode","mode":"normal"})).is_empty());
     }
 
     #[test]

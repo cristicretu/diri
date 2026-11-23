@@ -40,6 +40,7 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use super::diff::{self, DiffCard, Side};
 pub use super::model::model_display;
 use super::model::{Call, RowChange, Row, ThreadModel, WorkStrip};
+use super::setup::AgentSetup;
 use super::slash::{self, SlashCommand};
 use crate::code_editor::EditorPalette;
 use crate::code_editor::syntax::{self, LexState, TokenKind};
@@ -66,12 +67,6 @@ const FADE_IN: Duration = Duration::from_millis(320);
 const COMPOSER_MAX: f32 = 240.0;
 /// macOS's caret period.
 const BLINK: Duration = Duration::from_millis(530);
-/// Claude Code's own model aliases; `/model <alias>` switches in place.
-const CLAUDE_MODELS: &[(&str, &str, &str)] = &[
-    ("opus", "Opus", "claude-opus-5-5"),
-    ("sonnet", "Sonnet", "claude-sonnet-5-5"),
-    ("haiku", "Haiku", "claude-haiku-5-5"),
-];
 
 pub enum ThreadLensEvent {
     /// A `path:line` pill was clicked.
@@ -129,6 +124,8 @@ pub struct ThreadLens {
     list: ListState,
     /// Rows drawn after the model's: pending sends, then the working line.
     shown_extra: usize,
+    /// The list is top-aligned until its rows overflow the viewport.
+    top_anchored: bool,
     focus: FocusHandle,
     composer: QueryEditor,
     expanded: HashSet<(ItemKey, u16)>,
@@ -161,6 +158,14 @@ pub struct ThreadLens {
     slash_index: usize,
     /// The composer text the `/` menu was dismissed for.
     slash_dismissed: Option<String>,
+    /// The CLI's own settings and model list, read on first use.
+    setup: Option<Arc<AgentSetup>>,
+    /// The effort chosen here, until the CLI's settings catch up.
+    effort: Option<String>,
+    /// The permission mode the terminal's footer shows right now.
+    screen_mode: Option<&'static str>,
+    /// Re-renders the working line's elapsed seconds while it shows.
+    ticker: Option<Task<()>>,
     /// Rows that arrived after the first page, by row id, for their fade-in.
     fresh: HashMap<(ItemKey, u16), std::time::Instant>,
     /// A live slice of the PTY the pane docks above the composer this frame
@@ -232,13 +237,7 @@ impl ThreadLens {
                 }
             }
         });
-        let list = ListState::new(0, ListAlignment::Bottom, px(600.0));
-        list.set_follow_mode(gpui::FollowMode::Tail);
-        // Scrolling away from the tail shows the jump-to-latest control.
-        let weak = cx.entity().downgrade();
-        list.set_scroll_handler(move |_, _, cx| {
-            let _ = weak.update(cx, |_, cx| cx.notify());
-        });
+        let list = new_list(ListAlignment::Top, 0, cx.entity().downgrade());
         let mut lens = Self {
             session_id,
             runtime,
@@ -246,6 +245,7 @@ impl ThreadLens {
             model: ThreadModel::default(),
             list,
             shown_extra: 0,
+            top_anchored: true,
             focus: cx.focus_handle(),
             composer: QueryEditor::default(),
             expanded: HashSet::new(),
@@ -271,6 +271,10 @@ impl ThreadLens {
             slash_dismissed: None,
             copied: None,
             fresh: HashMap::new(),
+            setup: None,
+            effort: None,
+            screen_mode: None,
+            ticker: None,
             dock: None,
             weak: cx.entity().downgrade(),
             messages,
@@ -340,6 +344,17 @@ impl ThreadLens {
         self.list.item_count()
     }
 
+    /// Fixtures pin the CLI setup instead of reading this Mac's settings.
+    #[cfg(test)]
+    pub(crate) fn set_setup_for_test(&mut self, setup: AgentSetup) {
+        self.setup = Some(Arc::new(setup));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_model_menu_for_test(&mut self) {
+        self.model_menu = true;
+    }
+
     #[cfg(test)]
     pub(crate) fn composer_is_empty(&self) -> bool {
         self.composer.is_empty()
@@ -357,6 +372,14 @@ impl ThreadLens {
     /// the terminal settles after output).
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         self.request_read(cx);
+    }
+
+    /// The permission mode the terminal's footer shows (the pane reads it
+    /// from the live screen), which beats the transcript's last record.
+    pub fn set_screen_mode(&mut self, mode: Option<&'static str>) {
+        if mode.is_some() {
+            self.screen_mode = mode;
+        }
     }
 
     /// The pane's live PTY slice for this frame, docked above the composer
@@ -429,10 +452,9 @@ impl ThreadLens {
     /// Rows after the model's own: one per pending send, then the working
     /// line when the Agent is busy and no live strip already says so.
     fn extra_rows(&self) -> usize {
-        let working = self.session().is_some_and(|s| is_working(&s));
         // A running strip already says what the Agent is doing.
         let live_strip = matches!(self.model.rows.last(), Some(Row::Work(strip)) if strip.pending());
-        self.model.pending.len() + usize::from((working || !self.model.pending.is_empty()) && !live_strip)
+        self.model.pending.len() + usize::from(self.busy() && !live_strip)
     }
 
     fn apply_change(&mut self, change: RowChange) {
@@ -458,6 +480,10 @@ impl ThreadLens {
                     .splice(from..old_len + self.shown_extra, rows.saturating_sub(from) + extra);
             }
             RowChange::Rebuilt => {
+                if !self.top_anchored && self.model.rows.len() < 4 {
+                    self.top_anchored = true;
+                    self.list = new_list(ListAlignment::Top, 0, self.weak.clone());
+                }
                 self.seg_text.clear();
                 self.selection = None;
                 self.list.reset(rows + extra);
@@ -537,14 +563,6 @@ impl ThreadLens {
             let _ = messages.send(LensMessage::Answered(result));
         });
         cx.notify();
-    }
-
-    /// Tier 1: the CLI's own in-session switch. Claude keeps its
-    /// conversation and the old model's cache stays warm until its TTL. The
-    /// thread shows it as one divider, never as a command bubble.
-    fn switch_model(&mut self, alias: &str, cx: &mut Context<Self>) {
-        self.model_menu = false;
-        self.send(format!("/model {alias}"), true, cx);
     }
 
     fn slash_matches(&mut self) -> Vec<SlashCommand> {
@@ -907,8 +925,8 @@ impl ThreadLens {
         let top = match row {
             Row::Work(_) | Row::Command { .. } => 4.0,
             Row::Divider(_) | Row::Notice { .. } => 14.0,
-            Row::User { .. } => 18.0,
-            Row::Assistant { block: 0, .. } => 10.0,
+            Row::User { .. } => 20.0,
+            Row::Assistant { block: 0, .. } => 16.0,
             Row::Assistant { .. } => 8.0,
         };
         let row_el = div()
@@ -935,7 +953,32 @@ impl ThreadLens {
     }
 
     /// Sent but not yet in the transcript, and the working line.
-    fn render_extra(&mut self, extra: usize, colors: SemanticColors, _cx: &mut Context<Self>) -> AnyElement {
+    /// Re-renders once a second while the working line shows, for its
+    /// elapsed time; ends the moment the line goes.
+    fn ensure_ticker(&mut self, cx: &mut Context<Self>) {
+        if self.ticker.is_some() {
+            return;
+        }
+        self.ticker = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let keep = this.update(cx, |this, cx| {
+                    let showing = this.shown_extra > this.model.pending.len();
+                    if !showing {
+                        this.ticker = None;
+                        return false;
+                    }
+                    cx.notify();
+                    true
+                });
+                if !matches!(keep, Ok(true)) {
+                    return;
+                }
+            }
+        }));
+    }
+
+    fn render_extra(&mut self, extra: usize, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
         let body = if let Some(pending) = self.model.pending.get(extra) {
             div()
                 .w_full()
@@ -959,10 +1002,17 @@ impl ThreadLens {
                 )
                 .into_any_element()
         } else {
-            let text = match self.model.rows.last() {
+            let mut text = match self.model.rows.last() {
                 Some(Row::Work(strip)) if strip.pending() => strip.activity(),
                 _ => t("thread_lens.work.thinking").to_owned(),
             };
+            if let Some(since) = self.model.last_user_at() {
+                let seconds = now_ms().saturating_sub(since) / 1000;
+                if seconds >= 1 {
+                    text.push_str(&format!(" · {seconds}s"));
+                }
+            }
+            self.ensure_ticker(cx);
             working_line(&text, colors)
         };
         div()
@@ -970,7 +1020,7 @@ impl ThreadLens {
             .flex()
             .justify_center()
             .px(px(28.0))
-            .pt(px(if extra < self.model.pending.len() { 18.0 } else { 10.0 }))
+            .pt(px(if extra < self.model.pending.len() { 20.0 } else { 14.0 }))
             .pb(px(4.0))
             .child(div().w_full().max_w(px(MEASURE)).child(body))
             .into_any_element()
@@ -1887,7 +1937,7 @@ impl ThreadLens {
             div().mx(px(28.0)).mb(px(10.0)).flex().justify_center().child(
                 div()
                     .w_full()
-                    .max_w(px(MEASURE + 40.0))
+                    .max_w(px(MEASURE))
                     .p(px(14.0))
                     .rounded(px(Radius::PANEL))
                     .bg(colors.floating_fill())
@@ -1950,15 +2000,17 @@ impl ThreadLens {
     /// The composer's text as one run list: the caret is a run of its own
     /// (accent, or transparent between blinks, so nothing reflows), the
     /// selection a background.
-    fn composer_text(&self, focused: bool, colors: SemanticColors) -> AnyElement {
+    fn composer_text(&self, focused: bool, kind: &AgentKind, colors: SemanticColors) -> AnyElement {
         let font = ui_font();
         if self.composer.is_empty() {
-            let placeholder = t("thread_lens.placeholder");
+            let agent = if kind == &AgentKind::CODEX { "Codex" } else { "Claude" };
+            let placeholder = tf("thread_lens.placeholder", &[("agent", &agent)]);
+            let placeholder = placeholder.as_str();
             let mut text = String::new();
             let mut runs = Vec::new();
             if focused {
                 text.push('▏');
-                runs.push(run('▏'.len_utf8(), &font, caret_color(self.caret_on)));
+                runs.push(run('▏'.len_utf8(), &font, caret_color(self.caret_on, colors)));
             }
             text.push_str(placeholder);
             runs.push(run(placeholder.len(), &font, colors.tertiary.alpha(0.8).into()));
@@ -1972,152 +2024,179 @@ impl ThreadLens {
         } else if focused {
             let at = self.composer.cursor();
             let caret_range = at..at + caret.len();
-            runs = split_runs(runs, caret_range, |run| run.color = caret_color(self.caret_on));
+            runs = split_runs(runs, caret_range, |run| run.color = caret_color(self.caret_on, colors));
         }
         StyledText::new(display).with_runs(runs).into_any_element()
+    }
+
+    /// The CLI's own setup (model, effort, mode, model list), read once.
+    fn setup(&mut self) -> Arc<AgentSetup> {
+        if let Some(setup) = &self.setup {
+            return Arc::clone(setup);
+        }
+        let session = self.session();
+        let kind = session.as_ref().map_or(AgentKind::CLAUDE_CODE, |s| s.effective_kind().clone());
+        let cwd = session.as_ref().map(|s| std::path::PathBuf::from(&s.cwd)).unwrap_or_default();
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+        let setup = Arc::new(super::setup::read(&kind, &cwd, &home));
+        self.setup = Some(Arc::clone(&setup));
+        setup
+    }
+
+    /// The Agent is busy with this thread: its status says so, or it owes a
+    /// reply to a message sent in the last half minute (the status lags the
+    /// keystroke by a hook round trip).
+    fn busy(&self) -> bool {
+        if self.session().is_some_and(|s| is_working(&s)) {
+            return true;
+        }
+        self.model.awaiting_reply()
+            && self
+                .model
+                .last_user_at()
+                .is_some_and(|at| now_ms().saturating_sub(at) < 30_000)
     }
 
     fn render_composer(&mut self, session: Option<&SessionRecord>, colors: SemanticColors, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let focused = self.focus.is_focused(window);
         self.ensure_blink(focused, cx);
+        let dark = colors.lightness() < 0.5;
         let empty = self.composer.is_empty();
-        let working = session.is_some_and(is_working);
-        let kind = session.map(|s| s.effective_kind().clone());
+        let busy = self.busy();
+        let kind = session.map_or(AgentKind::CLAUDE_CODE, |s| s.effective_kind().clone());
+        let claude = kind != AgentKind::CODEX;
+        let setup = self.setup();
         let now_ms = now_ms();
-        let warmth = self.model.warmth(now_ms);
-        // Until the first request names a model there is nothing to say.
-        let model_label = warmth.as_ref().map(|(model, _)| model_display(model));
-        let warmth_label = warmth.as_ref().map(|(_, warmth)| warmth_text(*warmth));
-        let warm = matches!(warmth, Some((_, CacheWarmth::Warm { .. })));
-        // Only a session Diri runs under a saved account names it; with one
-        // login there is nothing to switch to.
-        let account = session
-            .and_then(|s| s.account_profile.as_ref())
-            .map(|profile| profile.label.clone());
-        let claude = kind.as_ref() == Some(&AgentKind::CLAUDE_CODE);
-        let model_pill = div()
-            .id("lens-model-pill")
-            .h(px(24.0))
-            .px(px(8.0))
+        // The model: what the last request used, else what the CLI will use.
+        let model_id = self
+            .model
+            .current_model()
+            .map(str::to_owned)
+            .or_else(|| setup.model.clone());
+        let model_label = model_id
+            .as_deref()
+            .map_or_else(|| setup.label_for("default"), |id| setup.label_for(id));
+        let warm = matches!(self.model.warmth(now_ms), Some((_, CacheWarmth::Warm { .. })));
+        let effort = self.effort.clone().or_else(|| setup.effort.clone());
+        let mode = self
+            .screen_mode
+            .map(str::to_owned)
+            .or_else(|| self.model.mode().map(str::to_owned))
+            .or_else(|| setup.mode.clone());
+        let pill = |id: &'static str| {
+            div()
+                .id(id)
+                .h(px(26.0))
+                .px(px(8.0))
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .rounded(px(8.0))
+                .text_size(px(12.0))
+                .text_color(colors.secondary)
+                .cursor_pointer()
+                .hover(|pill| pill.bg(colors.primary.alpha(0.06)).text_color(colors.primary))
+        };
+        let icon_button = |id: &'static str, symbol: &'static str| {
+            div()
+                .id(id)
+                .size(px(26.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(8.0))
+                .cursor_pointer()
+                .hover(|button| button.bg(colors.primary.alpha(0.06)))
+                .child(crate::icons::sf_symbol(symbol, 13.0, colors.tertiary))
+        };
+        let attach = icon_button("lens-attach", "plus").on_click(cx.listener(|this, _, window, cx| this.attach(window, cx)));
+        let slash = div()
+            .id("lens-slash-button")
+            .size(px(26.0))
+            .flex_none()
             .flex()
             .items_center()
-            .gap(px(6.0))
-            .rounded(px(Radius::CHIP))
-            .hover(|pill| pill.bg(colors.primary.alpha(0.06)))
-            .when(claude, |pill| pill.cursor_pointer())
-            .child(
+            .justify_center()
+            .rounded(px(8.0))
+            .cursor_pointer()
+            .hover(|button| button.bg(colors.primary.alpha(0.06)))
+            .font_family(crate::fonts::mono_family())
+            .text_size(px(13.0))
+            .text_color(colors.tertiary)
+            .child("/")
+            .on_click(cx.listener(|this, _, window, cx| {
+            this.composer.clear();
+            this.composer.insert_multiline("/");
+            this.slash_dismissed = None;
+            this.focus.focus(window, cx);
+            this.typed(cx);
+        }));
+        let model_pill = pill("lens-model-pill")
+            .when(self.model_menu, |pill| pill.bg(colors.primary.alpha(0.07)).text_color(colors.primary))
+            .when(warm, |pill| pill.child(div().size(px(5.0)).rounded_full().bg(Ink::FRESH)))
+            .child(SharedString::from(model_label))
+            .children(effort.as_deref().map(|effort| {
                 div()
-                    .size(px(5.0))
-                    .rounded_full()
-                    .bg(if warm { Ink::FRESH } else { colors.tertiary.alpha(0.5) }),
-            )
-            .children(model_label.map(|label| {
-                div()
-                    .text_size(px(11.5))
-                    .text_color(colors.secondary)
-                    .child(SharedString::from(label))
+                    .text_color(colors.tertiary)
+                    .child(SharedString::from(effort_label(effort)))
             }))
-            .children(warmth_label.map(|label| {
-                div()
-                    .font_family(crate::fonts::mono_family())
-                    .text_size(px(10.0))
-                    .text_color(colors.tertiary.alpha(0.8))
-                    .child(SharedString::from(label))
-            }))
+            .child(crate::icons::sf_symbol("chevron.down", 8.0, colors.tertiary))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.model_menu = !this.model_menu;
                 cx.notify();
             }));
-        let account_pill = account.map(|account| {
-            div()
-                .id("lens-account-pill")
-                .h(px(24.0))
-                .px(px(8.0))
-                .flex()
-                .items_center()
-                .rounded(px(Radius::CHIP))
-                .hover(|pill| pill.bg(colors.primary.alpha(0.06)))
-                .cursor_pointer()
-                .text_size(px(11.5))
-                .text_color(colors.tertiary)
-                .child(SharedString::from(account))
-                .on_click(cx.listener(|_, _, _, cx| cx.emit(ThreadLensEvent::ContinueAccount)))
+        // Shift+Tab, the CLI's own mode key; the footer it redraws names
+        // the new mode on the next frame.
+        let mode_pill = (claude && mode.is_some()).then(|| {
+            let mode = mode.clone().unwrap_or_default();
+            pill("lens-mode-pill")
+                .child(div().size(px(5.0)).rounded_full().bg(mode_tint(&mode, colors)))
+                .child(SharedString::from(mode_label(&mode)))
+                .on_click(cx.listener(|this, _, _, cx| this.send("\u{1b}[Z".into(), false, cx)))
         });
-        let menu = (self.model_menu && claude).then(|| {
-            let mut menu = div()
-                .w(px(260.0))
-                .p(px(5.0))
-                .rounded(px(Radius::FLOATING_MENU - 4.0))
-                .bg(colors.floating_surface())
-                .border_1()
-                .border_color(colors.floating_stroke())
-                .shadow_lg()
-                .flex()
-                .flex_col();
-            for (alias, name, id) in CLAUDE_MODELS {
-                let state = warmth_text(self.model.warmth_for(id, now_ms));
-                let alias = *alias;
-                menu = menu.child(
-                    div()
-                        .id(SharedString::from(format!("lens-model-{alias}")))
-                        .h(px(30.0))
-                        .px(px(9.0))
-                        .flex()
-                        .items_center()
-                        .rounded(px(Radius::ROW))
-                        .hover(|row| row.bg(colors.primary.alpha(0.07)))
-                        .cursor_pointer()
-                        .child(div().flex_1().text_size(px(12.5)).text_color(colors.primary).child(*name))
-                        .child(
-                            div()
-                                .font_family(crate::fonts::mono_family())
-                                .text_size(px(10.5))
-                                .text_color(colors.tertiary)
-                                .child(SharedString::from(state)),
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| this.switch_model(alias, cx))),
-                );
-            }
-            menu.into_any_element()
-        });
-        let slash = self.render_slash(colors, cx);
+        let ring = self.model.context().map(|(used, window)| context_ring(used, window, colors));
         // The primary action follows the live state: Send when idle, Stop
         // (Esc into the PTY, as the terminal's own interrupt) while the Agent
         // works with nothing typed, Steer while it works and you type, which
         // delivers the message mid-turn the way the CLI queues it.
-        let action = match (working, empty) {
+        let action = match (busy, empty) {
             (true, true) => Action::Stop,
             (true, false) => Action::Steer,
             (false, _) => Action::Send,
         };
         let send = div()
             .id("lens-send")
-            .h(px(26.0))
-            .min_w(px(26.0))
+            .h(px(28.0))
+            .min_w(px(28.0))
             .flex_none()
             .rounded_full()
             .flex()
             .items_center()
             .justify_center()
             .gap(px(5.0))
-            .when(action == Action::Steer, |button| button.px(px(10.0)))
+            .when(action == Action::Steer, |button| button.px(px(11.0)))
             .bg(match action {
-                Action::Stop => colors.primary.alpha(0.1),
-                Action::Send if empty => colors.primary.alpha(0.06),
+                Action::Stop => colors.primary.alpha(0.9),
+                Action::Send if empty => colors.primary.alpha(0.08),
                 _ => rgba(ACCENT << 8 | 0xff),
             })
             .cursor_pointer()
             .child(match action {
-                Action::Stop => div().size(px(8.0)).rounded(px(2.0)).bg(colors.primary.alpha(0.75)).into_any_element(),
+                Action::Stop => div()
+                    .size(px(9.0))
+                    .rounded(px(2.0))
+                    .bg(colors.terminal_surface())
+                    .into_any_element(),
                 Action::Steer => div()
-                    .text_size(px(11.5))
+                    .text_size(px(12.0))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(rgba(0xffffffff))
                     .child(t("thread_lens.steer"))
                     .into_any_element(),
                 Action::Send => crate::icons::sf_symbol(
                     "arrow.up",
-                    12.0,
+                    13.0,
                     if empty { colors.tertiary } else { rgba(0xffffffff) },
                 ),
             })
@@ -2130,51 +2209,65 @@ impl ThreadLens {
             }))
             .with_animation(
                 SharedString::from(format!("lens-action-{action:?}")),
-                Animation::new(Duration::from_millis(180)).with_easing(gpui::ease_out_quint()),
-                |button, t| button.opacity(0.4 + 0.6 * t),
+                Animation::new(Duration::from_millis(160)).with_easing(gpui::ease_out_quint()),
+                |button, t| button.opacity(0.5 + 0.5 * t),
             );
+        let menu = self.model_menu.then(|| self.render_model_menu(claude, model_id.as_deref(), effort.as_deref(), colors, cx));
+        let slash_menu = self.render_slash(colors, cx);
+        let border = if focused {
+            colors.primary.alpha(if dark { 0.2 } else { 0.22 })
+        } else {
+            colors.primary.alpha(if dark { 0.09 } else { 0.1 })
+        };
         div()
             .relative()
             .px(px(28.0))
-            .pb(px(16.0))
+            .pb(px(18.0))
             .flex()
             .justify_center()
             .child(
                 div()
                     .id("lens-composer")
+                    .relative()
                     .w_full()
-                    .max_w(px(MEASURE + 24.0))
-                    .pl(px(14.0))
-                    .pr(px(8.0))
-                    .pt(px(11.0))
+                    .max_w(px(MEASURE))
+                    .px(px(14.0))
+                    .pt(px(12.0))
                     .pb(px(8.0))
-                    .rounded(px(18.0))
-                    .bg(colors.floating_fill())
+                    .rounded(px(16.0))
+                    .bg(if dark { colors.primary.alpha(0.045) } else { gpui::white().into() })
                     .border_1()
-                    .border_color(if focused { colors.primary.alpha(0.2) } else { colors.primary.alpha(0.08) })
-                    .when(focused, |composer| {
-                        composer.shadow(vec![
-                            gpui::BoxShadow {
-                                color: rgba(ACCENT << 8 | 0x24).into(),
-                                offset: gpui::point(px(0.0), px(0.0)),
-                                blur_radius: px(0.0),
-                                spread_radius: px(3.0),
-                                inset: false,
-                            },
-                            gpui::BoxShadow {
-                                color: gpui::black().opacity(0.10),
-                                offset: gpui::point(px(0.0), px(6.0)),
-                                blur_radius: px(18.0),
-                                spread_radius: px(0.0),
-                                inset: false,
-                            },
-                        ])
-                    })
-                    .when(!focused, |composer| composer.shadow_sm())
+                    .border_color(border)
+                    .shadow(vec![gpui::BoxShadow {
+                        color: gpui::black().opacity(if dark { 0.28 } else { 0.06 }),
+                        offset: gpui::point(px(0.0), px(4.0)),
+                        blur_radius: px(16.0),
+                        spread_radius: px(0.0),
+                        inset: false,
+                    }])
                     // Keys go to the picker while the portal is docked.
                     .when(self.portal_open, |composer| composer.opacity(0.45))
-                    .relative()
-                    .children(menu.or(slash).map(|menu| {
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .cursor_text()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.focus.focus(window, cx);
+                        this.typed(cx);
+                    }))
+                    // A hairline of light along the top edge, as a lit surface.
+                    .when(dark, |composer| {
+                        composer.child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left(px(14.0))
+                                .right(px(14.0))
+                                .h(px(1.0))
+                                .bg(gpui::white().opacity(0.05)),
+                        )
+                    })
+                    .children(menu.or(slash_menu).map(|menu| {
                         // Rises from the composer's own top-left corner.
                         div()
                             .absolute()
@@ -2183,36 +2276,218 @@ impl ThreadLens {
                             .pb(px(8.0))
                             .child(menu)
                     }))
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.0))
-                    .cursor_text()
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.focus.focus(window, cx);
-                        this.typed(cx);
-                    }))
                     .child(
                         div()
-                            .min_h(px(PROSE_LEADING))
+                            .min_h(px(22.0))
                             .max_h(px(COMPOSER_MAX))
                             .overflow_hidden()
                             .text_size(px(PROSE_SIZE))
-                            .line_height(px(PROSE_LEADING))
-                            .child(self.composer_text(focused, colors)),
+                            .line_height(px(22.0))
+                            .child(self.composer_text(focused, &kind, colors)),
                     )
                     .child(
                         div()
-                            .ml(px(-8.0))
+                            .h(px(28.0))
+                            .ml(px(-6.0))
                             .flex()
                             .items_center()
                             .gap(px(2.0))
-                            .when(warmth.is_some(), |row| row.child(model_pill))
-                            .children(account_pill)
+                            .child(attach)
+                            .child(slash)
+                            .child(model_pill)
+                            .children(mode_pill)
                             .child(div().flex_1())
+                            .children(ring)
+                            .child(div().w(px(6.0)))
                             .child(send),
                     ),
             )
             .into_any_element()
+    }
+
+    /// Models with their cache warmth, then effort, for the session's CLI.
+    /// Claude switches in place (`/model`, `/effort`); Codex switches in its
+    /// own picker, which docks here as the PTY portal.
+    fn render_model_menu(
+        &mut self,
+        claude: bool,
+        current: Option<&str>,
+        effort: Option<&str>,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let setup = self.setup();
+        let now_ms = now_ms();
+        let section = |label: &'static str| {
+            div()
+                .px(px(10.0))
+                .pt(px(6.0))
+                .pb(px(4.0))
+                .text_size(px(10.5))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(colors.tertiary)
+                .child(label)
+        };
+        let current_label = current.map(|id| setup.label_for(id));
+        let mut models = div().flex().flex_col().child(section(t("thread_lens.menu_model")));
+        // Models seen in this thread that the list does not name still show.
+        let mut choices = setup.models.clone();
+        for usage in self.model.usage_models() {
+            if !choices.iter().any(|c| c.label == setup.label_for(&usage)) {
+                choices.push(super::setup::ModelChoice { label: setup.label_for(&usage), id: usage, detail: String::new() });
+            }
+        }
+        for choice in choices.iter().take(12) {
+            let selected = current_label.as_deref() == Some(choice.label.as_str());
+            let warmth = (choice.id != "default").then(|| {
+                let id = if claude { claude_model_id(&choice.id) } else { choice.id.clone() };
+                self.model.warmth_for(&id, now_ms)
+            });
+            let warm = matches!(warmth, Some(CacheWarmth::Warm { .. }));
+            let id = choice.id.clone();
+            models = models.child(
+                div()
+                    .id(SharedString::from(format!("lens-model-{}", choice.id)))
+                    .min_h(px(32.0))
+                    .px(px(10.0))
+                    .py(px(5.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .rounded(px(8.0))
+                    .when(selected, |row| row.bg(colors.primary.alpha(0.06)))
+                    .hover(|row| row.bg(colors.primary.alpha(0.08)))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .child(div().text_size(px(13.0)).text_color(colors.primary).child(SharedString::from(choice.label.clone())))
+                            .when(!choice.detail.is_empty(), |col| {
+                                col.child(
+                                    div()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .text_size(px(11.0))
+                                        .text_color(colors.tertiary)
+                                        .child(SharedString::from(choice.detail.clone())),
+                                )
+                            }),
+                    )
+                    .children(warmth.filter(|_| claude).map(|warmth| {
+                        div()
+                            .flex_none()
+                            .px(px(6.0))
+                            .h(px(18.0))
+                            .flex()
+                            .items_center()
+                            .rounded(px(9.0))
+                            .when(warm, |badge| badge.bg(Ink::FRESH.alpha(0.12)))
+                            .text_size(px(10.5))
+                            .text_color(if warm { Ink::FRESH } else { colors.tertiary })
+                            .child(SharedString::from(warmth_text(warmth)))
+                    }))
+                    .child(
+                        div()
+                            .w(px(14.0))
+                            .flex_none()
+                            .when(selected, |slot| slot.child(crate::icons::sf_symbol("checkmark", 11.0, colors.primary))),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.model_menu = false;
+                        if claude {
+                            this.send(format!("/model {id}"), true, cx);
+                        } else {
+                            this.send("/model".into(), true, cx);
+                        }
+                    })),
+            );
+        }
+        let efforts = setup.efforts.clone();
+        let mut segments = div()
+            .mx(px(8.0))
+            .p(px(2.0))
+            .flex()
+            .rounded(px(9.0))
+            .bg(colors.primary.alpha(0.05));
+        for level in efforts {
+            let active = effort == Some(level.as_str());
+            let chosen = level.clone();
+            segments = segments.child(
+                div()
+                    .id(SharedString::from(format!("lens-effort-{level}")))
+                    .flex_1()
+                    .h(px(26.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(7.0))
+                    .text_size(px(11.5))
+                    .cursor_pointer()
+                    .when(active, |seg| {
+                        seg.bg(colors.terminal_surface())
+                            .shadow_sm()
+                            .text_color(colors.primary)
+                            .font_weight(FontWeight::MEDIUM)
+                    })
+                    .when(!active, |seg| seg.text_color(colors.tertiary).hover(|seg| seg.text_color(colors.primary)))
+                    .child(SharedString::from(effort_label(&level)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.model_menu = false;
+                        if claude {
+                            this.effort = Some(chosen.clone());
+                            this.send(format!("/effort {chosen}"), true, cx);
+                        } else {
+                            this.send("/model".into(), true, cx);
+                        }
+                    })),
+            );
+        }
+        div()
+            .w(px(360.0))
+            .p(px(6.0))
+            .rounded(px(14.0))
+            .bg(menu_surface(colors))
+            .border_1()
+            .border_color(colors.floating_stroke())
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(models)
+            .child(div().mx(px(10.0)).my(px(6.0)).h(px(1.0)).bg(colors.primary.alpha(0.07)))
+            .child(section(t("thread_lens.menu_effort")))
+            .child(segments)
+            .child(div().h(px(6.0)))
+            .into_any_element()
+    }
+
+    /// `+`: files become `@path` mentions the CLI reads itself.
+    fn attach(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cwd = self.session().map(|s| std::path::PathBuf::from(&s.cwd)).unwrap_or_default();
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: true,
+            multiple: true,
+            prompt: None,
+        });
+        let _ = window;
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                for path in paths {
+                    let shown = path.strip_prefix(&cwd).unwrap_or(&path);
+                    this.composer.insert_context(&format!("@{} ", shown.display()));
+                }
+                this.typed(cx);
+            });
+        })
+        .detach();
     }
 
     /// The `/` menu above the composer.
@@ -2226,7 +2501,7 @@ impl ThreadLens {
             .w(px(400.0))
             .p(px(5.0))
             .rounded(px(Radius::FLOATING_MENU - 4.0))
-            .bg(colors.floating_surface())
+            .bg(menu_surface(colors))
             .border_1()
             .border_color(colors.floating_stroke())
             .shadow_lg()
@@ -2318,6 +2593,16 @@ impl Render for ThreadLens {
         if extra != self.shown_extra {
             self.apply_change(RowChange::None);
         }
+        // A short thread starts under the header (top-aligned). Once it
+        // overflows, a bottom-aligned list looks the same but follows the
+        // tail at about half the layout cost on long threads, so switch.
+        if self.top_anchored
+            && self.list.is_following_tail()
+            && self.list.max_offset_for_scrollbar().y > px(0.0)
+        {
+            self.top_anchored = false;
+            self.list = new_list(ListAlignment::Bottom, self.list.item_count(), cx.entity().downgrade());
+        }
         // Rows re-register their text as the list lays them out.
         self.segments.clear();
         let empty = self.model.rows.is_empty() && self.shown_extra == 0;
@@ -2387,7 +2672,8 @@ impl Render for ThreadLens {
                     .relative()
                     .flex_1()
                     .min_h(px(0.0))
-                    .pt(px(8.0))
+                    .pt(px(12.0))
+                    .pb(px(16.0))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::select_down))
                     .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.select_drag(event, cx)))
                     .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.selecting = false))
@@ -2465,6 +2751,17 @@ fn inline_runs(content: &InlineText, weight: FontWeight, color: Hsla, colors: Se
     (text, runs, targets)
 }
 
+/// The thread's list, following the tail; scrolling away from it shows the
+/// jump-to-latest control.
+fn new_list(alignment: ListAlignment, count: usize, lens: WeakEntity<ThreadLens>) -> ListState {
+    let list = ListState::new(count, alignment, px(600.0));
+    list.set_follow_mode(gpui::FollowMode::Tail);
+    list.set_scroll_handler(move |_, _, cx| {
+        let _ = lens.update(cx, |_, cx| cx.notify());
+    });
+    list
+}
+
 fn ui_font() -> Font {
     gpui::font(crate::fonts::ui_family())
 }
@@ -2484,11 +2781,134 @@ fn run(len: usize, font: &Font, color: Hsla) -> TextRun {
     }
 }
 
-fn caret_color(on: bool) -> Hsla {
+/// A crisp caret in the text's own color, not the accent.
+fn caret_color(on: bool, colors: SemanticColors) -> Hsla {
     if on {
-        rgba(ACCENT << 8 | 0xff).into()
+        colors.primary.alpha(0.9).into()
     } else {
         gpui::transparent_black()
+    }
+}
+
+/// Popovers sit on the composer's own surface: white in light mode, the
+/// floating surface in dark.
+fn menu_surface(colors: SemanticColors) -> Rgba {
+    if colors.lightness() < 0.5 {
+        colors.floating_surface()
+    } else {
+        gpui::white().into()
+    }
+}
+
+fn effort_label(effort: &str) -> &'static str {
+    match effort {
+        "minimal" => t("thread_lens.effort.minimal"),
+        "low" => t("thread_lens.effort.low"),
+        "medium" => t("thread_lens.effort.medium"),
+        "high" => t("thread_lens.effort.high"),
+        "xhigh" => t("thread_lens.effort.xhigh"),
+        "max" => t("thread_lens.effort.max"),
+        "ultra" => t("thread_lens.effort.ultra"),
+        _ => t("thread_lens.effort.custom"),
+    }
+}
+
+fn mode_label(mode: &str) -> &'static str {
+    match mode {
+        "plan" => t("thread_lens.mode.plan"),
+        "acceptEdits" => t("thread_lens.mode.accept_edits"),
+        "auto" => t("thread_lens.mode.auto"),
+        "bypassPermissions" => t("thread_lens.mode.bypass"),
+        _ => t("thread_lens.mode.ask"),
+    }
+}
+
+fn mode_tint(mode: &str, colors: SemanticColors) -> Rgba {
+    match mode {
+        "plan" => rgba(0x5b9cf0ff),
+        "acceptEdits" | "auto" => rgba(ACCENT << 8 | 0xff),
+        "bypassPermissions" => Ink::DANGER,
+        _ => colors.tertiary.alpha(0.7),
+    }
+}
+
+/// Claude's aliases as the provider ids its usage records carry.
+fn claude_model_id(alias: &str) -> String {
+    match alias {
+        "opus" => "claude-opus-5-5".into(),
+        "sonnet" => "claude-sonnet-5-5".into(),
+        "haiku" => "claude-haiku-5-5".into(),
+        other => other.into(),
+    }
+}
+
+/// A 16 pt ring filling clockwise with the context window, and its
+/// percentage. Past 80% it turns amber, a cue to compact.
+fn context_ring(used: u64, window: u64, colors: SemanticColors) -> AnyElement {
+    let fraction = (used as f32 / window.max(1) as f32).clamp(0.0, 1.0);
+    let tint: Hsla = if fraction > 0.8 { Ink::ATTENTION.into() } else { colors.secondary.alpha(0.85).into() };
+    let track: Hsla = colors.primary.alpha(0.12).into();
+    let percent = (fraction * 100.0).round() as u32;
+    let label = tf(
+        "thread_lens.context",
+        &[("percent", &percent), ("used", &compact_tokens(used)), ("window", &compact_tokens(window))],
+    );
+    div()
+        .id("lens-context")
+        .h(px(26.0))
+        .px(px(6.0))
+        .flex()
+        .items_center()
+        .gap(px(5.0))
+        .rounded(px(8.0))
+        .hover(|ring| ring.bg(colors.primary.alpha(0.06)))
+        .child(
+            gpui::canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    let radius = px(6.0);
+                    let center = bounds.center();
+                    let point = |turn: f32| {
+                        let angle = turn * std::f32::consts::TAU;
+                        gpui::point(center.x + radius * angle.sin(), center.y - radius * angle.cos())
+                    };
+                    let mut circle = gpui::PathBuilder::stroke(px(2.0));
+                    circle.move_to(point(0.0));
+                    circle.arc_to(gpui::point(radius, radius), px(0.0), false, true, point(0.5));
+                    circle.arc_to(gpui::point(radius, radius), px(0.0), false, true, point(0.0));
+                    if let Ok(path) = circle.build() {
+                        window.paint_path(path, track);
+                    }
+                    if fraction > 0.005 {
+                        let mut arc = gpui::PathBuilder::stroke(px(2.0));
+                        arc.move_to(point(0.0));
+                        let end = fraction.min(0.999);
+                        arc.arc_to(gpui::point(radius, radius), px(0.0), end > 0.5, true, point(end));
+                        if let Ok(path) = arc.build() {
+                            window.paint_path(path, tint);
+                        }
+                    }
+                },
+            )
+            .size(px(16.0)),
+        )
+        .child(
+            div()
+                .text_size(px(11.0))
+                .text_color(colors.tertiary)
+                .child(SharedString::from(format!("{percent}%"))),
+        )
+        .shortcut_tooltip(label, None, colors)
+        .into_any_element()
+}
+
+fn compact_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1e6)
+    } else if tokens >= 1_000 {
+        format!("{}k", tokens / 1_000)
+    } else {
+        tokens.to_string()
     }
 }
 
@@ -2996,5 +3416,25 @@ mod tests {
         cx.run_until_parked();
         let copied = lens.update(cx, |lens, _| lens.select_all_text_for_test());
         assert_eq!(copied.as_deref(), Some("hi there\n\nOpen Settings, then click Set up. Done."));
+    }
+
+    /// A short thread sits under the header; once it overflows, the lens
+    /// switches to the cheaper bottom-aligned list, still on the tail.
+    #[gpui::test]
+    fn a_short_thread_is_top_anchored_until_it_overflows(cx: &mut gpui::TestAppContext) {
+        let (lens, cx) = lens_window(cx);
+        lens.update(cx, |lens, cx| lens.ingest_for_test(user_page(0, "hi"), cx));
+        cx.run_until_parked();
+        assert!(lens.read_with(cx, |lens, _| lens.top_anchored));
+        for n in 1..120u64 {
+            lens.update(cx, |lens, cx| lens.ingest_for_test(user_page(n * 10, "and another line"), cx));
+        }
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        lens.read_with(cx, |lens, _| {
+            assert!(!lens.top_anchored, "overflowing threads use the bottom-aligned list");
+            assert!(lens.list.is_following_tail());
+        });
     }
 }
