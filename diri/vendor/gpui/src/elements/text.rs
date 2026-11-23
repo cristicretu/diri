@@ -926,6 +926,13 @@ impl TextLayout {
             .unwrap_or_default()
     }
 
+    /// The bounds of this layout, or `None` before it was laid out (Diri:
+    /// hit-testing from an event handler must not panic on a row the list
+    /// has not painted).
+    pub fn try_bounds(&self) -> Option<Bounds<Pixels>> {
+        self.0.borrow().as_ref()?.bounds
+    }
+
     /// The bounds of this layout.
     pub fn bounds(&self) -> Bounds<Pixels> {
         self.0.borrow().as_ref().unwrap().bounds.unwrap()

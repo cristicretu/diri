@@ -3580,6 +3580,17 @@ Release builds on the development Mac (Apple silicon, other work running). See `
 | Same capture path on an empty window of the same size, p50 | 3.74 ms |
 | Lens cost above that baseline, p50 / p90 | 0.64 / 1.03 ms |
 
+After the polish pass (block-granularity rows, one text per paragraph, selection segments, caret; 2026-11-24, same machine):
+
+| Measure | Result |
+| --- | --- |
+| Lens model, 6,800 items → 3,200 block rows, cold ingest | 13.7 ms |
+| Lens model, one appended item, p50 / p95 | 2.8 / 4.7 µs |
+| Markdown parses for 800 assistant turns | 800 (each once; blocks are cut from that parse) |
+| Lens frame over 3,200 rows while scrolling, incl. readback, p50 / p90 / p99 | 3.87 / 5.01 / 7.35 ms |
+| Empty-window baseline on the same capture path, p50 | 3.13 ms |
+| Lens cost above that baseline, p50 / p90 | 0.74 / 1.88 ms |
+
 Commands:
 
 ```sh

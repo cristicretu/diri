@@ -52,79 +52,112 @@ pub struct WorkStrip {
 }
 
 impl WorkStrip {
-    /// `Explored 8 files · Edited 2 files · Ran 2 checks`.
+    /// What the strip did, by real tool and target: `Read view.rs · Ran
+    /// cargo test`, `Read 3 files · Edited model.rs`, `Used Computer, Browser`.
     pub fn summary(&self) -> String {
-        let mut explored = std::collections::BTreeSet::new();
-        let mut searches = 0usize;
-        let mut edited = std::collections::BTreeSet::new();
-        let mut runs = 0usize;
-        let mut delegated = 0usize;
-        let mut other = 0usize;
+        let mut read: Vec<&str> = Vec::new();
+        let mut searched: Vec<&str> = Vec::new();
+        let mut edited: Vec<&str> = Vec::new();
+        let mut ran: Vec<String> = Vec::new();
+        let mut delegated: Vec<&str> = Vec::new();
+        let mut used: Vec<String> = Vec::new();
         for call in &self.calls {
             match &call.detail {
                 ToolDetail::Read { path } => {
-                    explored.insert(path.as_str());
+                    if !read.contains(&path.as_str()) {
+                        read.push(path);
+                    }
                 }
-                ToolDetail::Search { .. } => searches += 1,
+                ToolDetail::Search { pattern, .. } => searched.push(pattern),
                 ToolDetail::Edit { path, .. } | ToolDetail::Write { path, .. } => {
-                    edited.insert(path.as_str());
+                    if !edited.contains(&path.as_str()) {
+                        edited.push(path);
+                    }
                 }
                 ToolDetail::Patch { patch } => {
-                    let paths = patch_paths(patch);
-                    if paths.is_empty() {
-                        other += 1;
-                    }
-                    for path in paths {
-                        edited.insert(path);
+                    for path in patch_paths(patch) {
+                        if !edited.contains(&path) {
+                            edited.push(path);
+                        }
                     }
                 }
-                ToolDetail::Command { .. } => runs += 1,
-                ToolDetail::Task { .. } => delegated += 1,
-                ToolDetail::Other { .. } => other += 1,
+                ToolDetail::Command { command } => ran.push(short_command(command)),
+                ToolDetail::Task { description } => delegated.push(description),
+                ToolDetail::Other { .. } => {
+                    let label = tool_label(&call.name);
+                    if !used.contains(&label) {
+                        used.push(label);
+                    }
+                }
             }
         }
-        let count = |n: usize, one: &'static str, many: &'static str| {
-            if n == 1 {
-                t(one).to_owned()
+        let mut parts = Vec::new();
+        let one_or_many = |items: usize, target: String, one: &'static str, many: &'static str| {
+            if items == 1 {
+                tf(one, &[("target", &target)])
             } else {
-                tf(many, &[("count", &n)])
+                tf(many, &[("count", &items)])
             }
         };
-        let mut parts = Vec::new();
-        if !explored.is_empty() {
-            let mut text = count(
-                explored.len(),
-                "thread_lens.work.explored_file",
-                "thread_lens.work.explored_files",
-            );
-            if searches > 0 {
-                text.push_str(", ");
-                text.push_str(&count(searches, "thread_lens.work.search", "thread_lens.work.searches"));
-            }
-            parts.push(text);
-        } else if searches > 0 {
-            parts.push(count(searches, "thread_lens.work.search", "thread_lens.work.searches"));
+        if !read.is_empty() {
+            parts.push(one_or_many(read.len(), file_name(read[0]), "thread_lens.work.read_one", "thread_lens.work.read_many"));
+        }
+        if !searched.is_empty() {
+            parts.push(one_or_many(searched.len(), clip(searched[0], 32), "thread_lens.work.searched_one", "thread_lens.work.searched_many"));
         }
         if !edited.is_empty() {
-            parts.push(count(
-                edited.len(),
-                "thread_lens.work.edited_file",
-                "thread_lens.work.edited_files",
-            ));
+            parts.push(one_or_many(edited.len(), file_name(edited[0]), "thread_lens.work.edited_one", "thread_lens.work.edited_many"));
         }
-        if runs > 0 {
-            parts.push(count(runs, "thread_lens.work.ran_command", "thread_lens.work.ran_commands"));
+        if !ran.is_empty() {
+            parts.push(one_or_many(ran.len(), ran[0].clone(), "thread_lens.work.ran_one", "thread_lens.work.ran_many"));
         }
-        if delegated > 0 {
-            parts.push(tf("thread_lens.work.delegated", &[("count", &delegated)]));
+        if !delegated.is_empty() {
+            parts.push(one_or_many(delegated.len(), clip(delegated[0], 40), "thread_lens.work.delegated_one", "thread_lens.work.delegated_many"));
         }
-        if other > 0 {
-            parts.push(count(other, "thread_lens.work.used_tool", "thread_lens.work.used_tools"));
+        if !used.is_empty() {
+            let mut tools = used.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+            if used.len() > 3 {
+                tools.push_str(&format!(" +{}", used.len() - 3));
+            }
+            parts.push(tf("thread_lens.work.used", &[("tools", &tools)]));
         }
         if parts.is_empty() {
             parts.push(t("thread_lens.work.thinking").to_owned());
         }
         parts.join(" · ")
+    }
+
+    /// While the strip runs: the tool working right now and its target,
+    /// `Reading view.rs`, `Running cargo test`, `Using Computer · Trash`.
+    pub fn activity(&self) -> String {
+        let Some(call) = self
+            .calls
+            .iter()
+            .rev()
+            .find(|call| call.result.is_none())
+        else {
+            return t("thread_lens.work.thinking").to_owned();
+        };
+        let (key, target): (&'static str, String) = match &call.detail {
+            ToolDetail::Read { path } => ("thread_lens.work.reading", file_name(path)),
+            ToolDetail::Search { pattern, .. } => ("thread_lens.work.searching", clip(pattern, 40)),
+            ToolDetail::Edit { path, .. } | ToolDetail::Write { path, .. } => ("thread_lens.work.editing", file_name(path)),
+            ToolDetail::Patch { patch } => (
+                "thread_lens.work.editing",
+                patch_paths(patch).first().map_or_else(String::new, |path| file_name(path)),
+            ),
+            ToolDetail::Command { command } => ("thread_lens.work.running", short_command(command)),
+            ToolDetail::Task { description } => ("thread_lens.work.delegating", clip(description, 40)),
+            ToolDetail::Other { input } => {
+                let label = tool_label(&call.name);
+                let target = match tool_subject(input) {
+                    Some(subject) => format!("{label} · {subject}"),
+                    None => label,
+                };
+                ("thread_lens.work.using", target)
+            }
+        };
+        tf(key, &[("target", &target)])
     }
 
     pub fn failures(&self) -> usize {
@@ -173,6 +206,111 @@ pub fn patch_paths(patch: &str) -> Vec<&str> {
         .collect()
 }
 
+/// The last path component: what a reader recognises a file by.
+pub fn file_name(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_owned()
+}
+
+fn clip(text: &str, limit: usize) -> String {
+    let line = text.lines().next().unwrap_or_default().trim();
+    if line.chars().count() <= limit {
+        return line.to_owned();
+    }
+    let mut out: String = line.chars().take(limit.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// `cd x && FOO=1 cargo test -p diri-engine --lib` → `cargo test -p diri-engine`.
+pub fn short_command(command: &str) -> String {
+    let line = command.lines().next().unwrap_or_default().trim();
+    let line = line.rsplit("&& ").next().unwrap_or(line).trim();
+    let mut out = String::new();
+    for (index, token) in line
+        .split_whitespace()
+        .skip_while(|token| token.contains('=') && !token.starts_with('-'))
+        .enumerate()
+    {
+        if index >= 2 && (token.starts_with("--") || out.len() + token.len() >= 28) {
+            break;
+        }
+        if index > 0 {
+            out.push(' ');
+        }
+        out.push_str(token);
+        if index >= 3 {
+            break;
+        }
+    }
+    clip(&out, 32)
+}
+
+/// `mcp__dirijor__computer` → `Computer`, `WebFetch` → `Web fetch`.
+pub fn tool_label(name: &str) -> String {
+    let base = name.rsplit("__").next().unwrap_or(name);
+    let mut words = String::new();
+    for (index, c) in base.chars().enumerate() {
+        if c == '_' || c == '-' {
+            words.push(' ');
+        } else if c.is_ascii_uppercase() && index > 0 && !words.ends_with(' ') {
+            words.push(' ');
+            words.push(c.to_ascii_lowercase());
+        } else {
+            words.push(c);
+        }
+    }
+    let mut chars = words.trim().chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => name.to_owned(),
+    }
+}
+
+/// The short noun a tool call acts on, from its JSON input.
+pub fn tool_subject(input: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(input).ok()?;
+    ["title", "target", "query", "url", "app", "element", "path", "file_path", "name", "description", "action"]
+        .iter()
+        .find_map(|key| value.get(key)?.as_str().map(str::trim).filter(|s| !s.is_empty()))
+        .map(|subject| clip(subject, 36))
+}
+
+/// Claude and OpenAI model ids as people say them: `claude-opus-5-5` → `Opus 5.5`.
+pub fn model_display(model: &str) -> String {
+    let lower = model.to_ascii_lowercase();
+    for family in ["opus", "sonnet", "haiku", "fable"] {
+        if let Some(rest) = lower.split(&format!("{family}-")).nth(1) {
+            let version: Vec<&str> = rest
+                .split(['-', '['])
+                .take_while(|p| p.len() <= 2 && p.chars().all(|c| c.is_ascii_digit()))
+                .collect();
+            let mut name = String::from(&family[..1]).to_ascii_uppercase() + &family[1..];
+            if !version.is_empty() {
+                name.push(' ');
+                name.push_str(&version.join("."));
+            }
+            return name;
+        }
+    }
+    model.to_owned()
+}
+
+/// `Set model to \`Opus 5.5\` and saved…` → `Opus 5.5`.
+fn announced_model(output: &str) -> Option<String> {
+    let rest = output.trim().strip_prefix("Set model to")?;
+    let name = match rest.split('`').nth(1) {
+        Some(quoted) => quoted.to_owned(),
+        None => rest.trim().split(" and ").next()?.trim_end_matches('.').to_owned(),
+    };
+    (!name.is_empty()).then(|| model_display(&name))
+}
+
+/// Whitespace-insensitive text identity, for matching a sent message to the
+/// transcript record it becomes.
+fn same_text(a: &str, b: &str) -> bool {
+    a.split_whitespace().eq(b.split_whitespace())
+}
+
 #[derive(Clone, Debug)]
 pub enum Row {
     User {
@@ -180,13 +318,23 @@ pub enum Row {
         text: Arc<str>,
         images: Arc<[ThreadImage]>,
     },
+    /// A CLI-local command and what it printed; `name` is empty for output
+    /// whose command line was not recorded.
     Command {
         key: ItemKey,
         name: Arc<str>,
         args: Arc<str>,
+        output: Option<(Arc<str>, bool)>,
     },
+    /// One block of an assistant turn (a paragraph, heading, list, quote,
+    /// code block or diagram). Long turns virtualize block by block, so a
+    /// 200-line reply lays out only the blocks on screen.
     Assistant {
         key: ItemKey,
+        /// Index into `document.blocks`.
+        block: u16,
+        /// The turn's last block, which carries its Copy control.
+        last: bool,
         text: Arc<str>,
         document: Arc<MarkdownDocument>,
     },
@@ -199,6 +347,15 @@ pub enum Row {
 }
 
 impl Row {
+    /// Stable identity of the row itself: its item key and, for an
+    /// assistant block, which block.
+    pub fn id(&self) -> (ItemKey, u16) {
+        match self {
+            Row::Assistant { key, block, .. } => (*key, *block),
+            row => (row.key(), u16::MAX),
+        }
+    }
+
     /// Stable identity for element ids, expansion state and list splices.
     pub fn key(&self) -> ItemKey {
         match self {
@@ -213,6 +370,14 @@ impl Row {
             },
         }
     }
+}
+
+/// A message sent from the composer that the transcript has not recorded
+/// yet, drawn at once and dropped when its record lands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pending {
+    pub text: Arc<str>,
+    pub sent_ms: i64,
 }
 
 /// What changed in `rows` after an ingest, for `ListState::splice`.
@@ -239,6 +404,7 @@ pub struct ThreadModel {
     builder: Builder,
     markdown: HashMap<(ItemKey, u64), Arc<MarkdownDocument>>,
     pub revision: u64,
+    pub pending: Vec<Pending>,
 }
 
 /// Incremental row construction state, so an append continues where the
@@ -250,6 +416,11 @@ struct Builder {
     next_stored: usize,
     model: Option<String>,
     calls: HashMap<String, (usize, usize)>,
+    /// A `/model` ran and its result has not printed yet.
+    model_command: bool,
+    /// The model a `/model` divider already announced, so the next request's
+    /// usage record does not draw a second divider for the same switch.
+    announced: Option<String>,
 }
 
 impl ThreadModel {
@@ -277,6 +448,14 @@ impl ThreadModel {
 
     pub fn last_usage(&self) -> Option<&TurnUsage> {
         self.usages.last()
+    }
+
+    /// Shows `text` as sent before the transcript has it.
+    pub fn push_pending(&mut self, text: &str, sent_ms: i64) {
+        self.pending.push(Pending {
+            text: Arc::from(text),
+            sent_ms,
+        });
     }
 
     /// Merges one page. Returns how the rows changed.
@@ -372,6 +551,13 @@ impl ThreadModel {
         let at = self.rows.len();
         match &item.body {
             ThreadBody::User { text, images } => {
+                if let Some(index) = self.pending.iter().position(|p| same_text(&p.text, text)) {
+                    self.pending.remove(index);
+                } else if let Some(at_ms) = item.at_ms {
+                    // A message the CLI rewrote (expanded a paste, trimmed a
+                    // mention) never matches; one older than this record is done.
+                    self.pending.retain(|p| p.sent_ms > at_ms);
+                }
                 self.rows.push(Row::User {
                     key: item.key,
                     text: Arc::from(text.as_str()),
@@ -380,20 +566,64 @@ impl ThreadModel {
                 at
             }
             ThreadBody::Command { name, args } => {
+                if name == "/model" {
+                    // The switch shows as one divider once the CLI confirms it.
+                    self.builder.model_command = true;
+                    return at;
+                }
+                self.builder.model_command = false;
                 self.rows.push(Row::Command {
                     key: item.key,
                     name: Arc::from(name.as_str()),
                     args: Arc::from(args.as_str()),
+                    output: None,
+                });
+                at
+            }
+            ThreadBody::CommandOutput { text, is_error } => {
+                if let Some(model) = announced_model(text) {
+                    self.builder.model_command = false;
+                    let segment = self.model_segment(item.key.offset, item.at_ms.unwrap_or_default(), model.clone());
+                    self.builder.announced = Some(model);
+                    // Switching twice with nothing between reads as one switch.
+                    if let Some(Row::Divider(last)) = self.rows.last_mut()
+                        && last.cause == SegmentCause::Model
+                    {
+                        *last = segment;
+                        return at.saturating_sub(1);
+                    }
+                    self.rows.push(Row::Divider(segment));
+                    return at;
+                }
+                if std::mem::take(&mut self.builder.model_command) {
+                    // "Kept model as …": nothing changed.
+                    return at;
+                }
+                if let Some(Row::Command { output: output @ None, .. }) = self.rows.last_mut() {
+                    *output = Some((Arc::from(text.as_str()), *is_error));
+                    return at.saturating_sub(1);
+                }
+                self.rows.push(Row::Command {
+                    key: item.key,
+                    name: Arc::from(""),
+                    args: Arc::from(""),
+                    output: Some((Arc::from(text.as_str()), *is_error)),
                 });
                 at
             }
             ThreadBody::Assistant { text } => {
                 let document = self.document(item.key, text);
-                self.rows.push(Row::Assistant {
-                    key: item.key,
-                    text: Arc::from(text.as_str()),
-                    document,
-                });
+                let text: Arc<str> = Arc::from(text.as_str());
+                let blocks = document.blocks.len().min(usize::from(u16::MAX));
+                for block in 0..blocks {
+                    self.rows.push(Row::Assistant {
+                        key: item.key,
+                        block: block as u16,
+                        last: block + 1 == blocks,
+                        text: Arc::clone(&text),
+                        document: Arc::clone(&document),
+                    });
+                }
                 at
             }
             ThreadBody::Notice { text } => {
@@ -460,30 +690,12 @@ impl ThreadModel {
                     Some(model) => {
                         if let Some(previous) = self.builder.model.as_deref()
                             && !same_model(previous, model)
+                            && self.builder.announced.as_deref() != Some(model_display(model).as_str())
                         {
-                            let segment = ThreadSegment {
-                                index: 0,
-                                kind: self
-                                    .stored_segments
-                                    .last()
-                                    .map(|s| s.kind.clone())
-                                    .unwrap_or(diri_proto::AgentKind::CLAUDE_CODE),
-                                session_id: self
-                                    .stored_segments
-                                    .last()
-                                    .map(|s| s.session_id.clone())
-                                    .unwrap_or_else(|| diri_proto::SessionId(String::new())),
-                                model: Some(model.clone()),
-                                account: self
-                                    .stored_segments
-                                    .get(self.builder.next_stored.saturating_sub(1))
-                                    .and_then(|s| s.account.clone()),
-                                start_offset: item.key.offset,
-                                started_at_ms: usage.at_ms,
-                                cause: SegmentCause::Model,
-                            };
+                            let segment = self.model_segment(item.key.offset, usage.at_ms, model.clone());
                             self.rows.push(Row::Divider(segment));
                         }
+                        self.builder.announced = None;
                         self.builder.model = Some(model.clone());
                     }
                     None => usage.model = self.builder.model.clone(),
@@ -491,6 +703,24 @@ impl ThreadModel {
                 self.usages.push(usage);
                 at
             }
+        }
+    }
+
+    fn model_segment(&self, start_offset: u64, started_at_ms: i64, model: String) -> ThreadSegment {
+        let current = self.stored_segments.get(self.builder.next_stored.saturating_sub(1));
+        ThreadSegment {
+            index: 0,
+            kind: current
+                .map(|s| s.kind.clone())
+                .unwrap_or(diri_proto::AgentKind::CLAUDE_CODE),
+            session_id: current
+                .map(|s| s.session_id.clone())
+                .unwrap_or_else(|| diri_proto::SessionId(String::new())),
+            model: Some(model),
+            account: current.and_then(|s| s.account.clone()),
+            start_offset,
+            started_at_ms,
+            cause: SegmentCause::Model,
         }
     }
 
@@ -598,6 +828,8 @@ mod tests {
         model
             .rows
             .iter()
+            // A turn's blocks read as one turn here.
+            .filter(|row| !matches!(row, Row::Assistant { block, .. } if *block > 0))
             .map(|row| match row {
                 Row::User { .. } => "user".into(),
                 Row::Command { .. } => "command".into(),
@@ -615,7 +847,8 @@ mod tests {
         model.ingest(page(conversation(), 30));
         assert_eq!(shape(&model), vec!["user", "work:3", "assistant"]);
         let Row::Work(strip) = &model.rows[1] else { unreachable!() };
-        assert_eq!(strip.summary(), "Explored 1 file · Edited 1 file · Ran 1 command");
+        assert_eq!(strip.summary(), "Read a.rs · Edited a.rs · Ran cargo test");
+        assert_eq!(strip.activity(), "Editing a.rs", "the edit is the call still running");
         assert_eq!(strip.failures(), 1);
         assert!(strip.pending(), "the edit has no result yet");
         assert_eq!(strip.duration_ms(), Some(400));
@@ -686,5 +919,113 @@ mod tests {
             model.warmth_for("claude-haiku-5-5", 0),
             CacheWarmth::Cold { ever: false }
         ));
+    }
+
+    /// The pill's `/model opus`, `/model sonnet`, `/model opus` from the
+    /// user's screenshot: no chips, one divider for the switch that stuck,
+    /// and no second divider when the next request confirms it.
+    #[test]
+    fn model_commands_collapse_into_one_divider() {
+        let command = |offset, args: &str| item(offset, ThreadBody::Command { name: "/model".into(), args: args.into() });
+        let output = |offset, model: &str| item(offset, ThreadBody::CommandOutput {
+            text: format!("Set model to `{model}` and saved as your default for new sessions"),
+            is_error: false,
+        });
+        let mut items = conversation();
+        items.extend([
+            command(30, "opus"), output(31, "Opus 5.5"),
+            command(32, "sonnet"), output(33, "Sonnet 5.5"),
+            command(34, "opus"), output(35, "Opus 5.5"),
+            command(36, "haiku"), output(37, "Haiku 5.5"),
+            item(40, ThreadBody::User { text: "hi there".into(), images: vec![] }),
+            item(41, usage("claude-haiku-5-5", 4_100)),
+            item(42, ThreadBody::Assistant { text: "Hi!".into() }),
+        ]);
+        let mut model = ThreadModel::default();
+        model.ingest(page(items.clone(), 50));
+        assert_eq!(shape(&model), vec!["user", "work:3", "assistant", "divider:Model", "user", "assistant"]);
+        let Row::Divider(segment) = &model.rows[3] else { unreachable!() };
+        assert_eq!(segment.model.as_deref(), Some("Haiku 5.5"));
+        // Incremental arrival draws the same rows.
+        let mut stepwise = ThreadModel::default();
+        for one in items {
+            stepwise.ingest(page(vec![one], 50));
+        }
+        assert_eq!(shape(&stepwise), shape(&model));
+    }
+
+    #[test]
+    fn local_command_output_stays_with_its_command() {
+        let mut model = ThreadModel::default();
+        model.ingest(page(vec![
+            item(0, ThreadBody::Command { name: "/cost".into(), args: String::new() }),
+            item(1, ThreadBody::CommandOutput { text: "Total cost: $0.42".into(), is_error: false }),
+            item(2, ThreadBody::Command { name: "/model".into(), args: String::new() }),
+            item(3, ThreadBody::CommandOutput { text: "Kept model as Opus 5.5".into(), is_error: false }),
+        ], 4));
+        assert_eq!(shape(&model), vec!["command"]);
+        let Row::Command { output: Some((text, false)), .. } = &model.rows[0] else { unreachable!() };
+        assert_eq!(&**text, "Total cost: $0.42");
+    }
+
+    /// Optimistic send: drawn at 0 ms, dropped exactly when its record lands.
+    #[test]
+    fn a_sent_message_is_pending_until_its_record_lands() {
+        let mut model = ThreadModel::default();
+        model.ingest(page(conversation(), 30));
+        model.push_pending("cool  it's fine.\n", 10_000);
+        model.push_pending("and another", 10_001);
+        assert_eq!(model.pending.len(), 2);
+        model.ingest(page(vec![item(40, ThreadBody::User { text: "cool it's fine.".into(), images: vec![] })], 41));
+        assert_eq!(model.pending.len(), 1);
+        assert_eq!(&*model.pending[0].text, "and another");
+        // A replay of the same record does not resurrect or eat anything.
+        model.ingest(page(conversation(), 41));
+        assert_eq!(model.pending.len(), 1);
+    }
+
+    #[test]
+    fn tool_names_read_the_way_people_say_them() {
+        assert_eq!(tool_label("mcp__dirijor__computer"), "Computer");
+        assert_eq!(tool_label("WebFetch"), "Web fetch");
+        assert_eq!(tool_label("mcp__browser__take_screenshot"), "Take screenshot");
+        assert_eq!(tool_subject(r#"{"action":"click","title":"Trash"}"#).as_deref(), Some("Trash"));
+        assert_eq!(short_command("cd /r && RUST_LOG=1 cargo test -p diri-engine --lib"), "cargo test -p diri-engine");
+        assert_eq!(short_command("git push origin feat/dual-lens-gui"), "git push origin");
+        let strip = WorkStrip {
+            key: key(0),
+            thoughts: 0,
+            calls: ["mcp__dirijor__computer", "mcp__dirijor__computer", "mcp__browser__navigate"]
+                .iter()
+                .enumerate()
+                .map(|(n, name)| Call {
+                    key: key(n as u64),
+                    call_id: n.to_string(),
+                    name: (*name).into(),
+                    detail: ToolDetail::Other { input: r#"{"title":"Trash"}"#.into() },
+                    at_ms: None,
+                    result: None,
+                })
+                .collect(),
+        };
+        assert_eq!(strip.summary(), "Used Computer, Navigate");
+        assert_eq!(strip.activity(), "Using Navigate · Trash");
+    }
+
+    #[test]
+    fn a_long_turn_is_one_row_per_block() {
+        let mut model = ThreadModel::default();
+        let text = "# Plan\n\nFirst.\n\n```rust\nfn a() {}\n```\n\n- one\n- two\n\nDone.";
+        model.ingest(page(vec![item(0, ThreadBody::Assistant { text: text.into() })], 1));
+        let blocks: Vec<(u16, bool)> = model
+            .rows
+            .iter()
+            .map(|row| match row {
+                Row::Assistant { block, last, .. } => (*block, *last),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(blocks, vec![(0, false), (1, false), (2, false), (3, false), (4, true)]);
+        assert_eq!(model.parsed_documents(), 1, "one parse for all its rows");
     }
 }

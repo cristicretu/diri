@@ -5,6 +5,9 @@
 //! DIRI_VISUAL_LIGHT=1 DIRI_VISUAL_OUTPUT=/tmp/lens-light.png cargo test -p diri-app render_thread_lens_screenshot -- --ignored
 //! DIRI_VISUAL_EXPAND=1 …   # every Work strip and call opened
 //! DIRI_VISUAL_PERMISSION=1 … # a pending permission card
+//! DIRI_VISUAL_LIVE=1 …       # the Agent working, a message just sent
+//! DIRI_VISUAL_SLASH=/co …    # the composer's `/` menu
+//! DIRI_VISUAL_EMPTY=1 …      # a session with no turns yet
 //! ```
 
 use diri_proto::thread::{
@@ -118,6 +121,9 @@ pub fn conversation(now_ms: i64) -> Vec<ThreadItem> {
         item(340, t0 + 16_000, usage("claude-opus-5-5", t0 + 16_000, 39_300, 1_200)),
         item(400, t0 + 17_000, ThreadBody::Assistant { text: "Fixed. A record split across two reads now waits for its newline instead of being skipped, and `close_mid_record` pins it.\n\n```rust\nif want < available {\n    return skip_oversized(file, offset, len);\n}\nreturn Ok(Window::waiting(offset));\n```\n\n```mermaid\ngraph LR\n  A[read_window] -->|newline| B[emit lines]\n  A -->|full, no newline| C[skip oversized]\n  A -->|partial| D[wait]\n```".into() }),
         item(500, t0 + 18_000, ThreadBody::Command { name: "/model".into(), args: "sonnet".into() }),
+        item(501, t0 + 18_000, ThreadBody::CommandOutput { text: "Set model to `Sonnet 5.5` and saved as your default for new sessions".into(), is_error: false }),
+        item(520, t0 + 19_000, ThreadBody::Command { name: "/cost".into(), args: String::new() }),
+        item(521, t0 + 19_000, ThreadBody::CommandOutput { text: "Total cost:            $0.84\nTotal duration (API):  1m 12s\nTotal code changes:    6 lines added, 2 removed".into(), is_error: false }),
         item(510, now_ms - 252_000 - 30_000, usage("claude-sonnet-5-5", now_ms - 48_000, 0, 9_400)),
         item(600, now_ms - 47_000, ThreadBody::User { text: "Now tighten the docs on `read_window`.".into(), images: vec![] }),
         item(610, now_ms - 46_000, ThreadBody::ToolCall { call_id: "e2".into(), name: "Edit".into(), detail: ToolDetail::Edit {
@@ -159,11 +165,11 @@ mod screenshots {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    fn record(permission: bool) -> serde_json::Value {
+    fn record(permission: bool, working: bool) -> serde_json::Value {
         let mut record = serde_json::json!({
             "id": SESSION, "kind": "claude-code", "cwd": env!("CARGO_MANIFEST_DIR"), "projectID": "p",
             "title": "Fix streaming parser", "titleSource": serde_json::to_value(diri_proto::TitleSource::UserRename).unwrap(),
-            "status": serde_json::to_value(diri_proto::SessionStatus::Idle).unwrap(),
+            "status": serde_json::to_value(if working { diri_proto::SessionStatus::Working } else { diri_proto::SessionStatus::Idle }).unwrap(),
             "resumability": serde_json::to_value(diri_proto::Resumability::Live).unwrap(),
             "createdAt": 0.0, "updatedAt": 0.0, "pinned": false,
         });
@@ -194,8 +200,15 @@ mod screenshots {
             Arc::new(diri_ui::IconAssets),
             gpui_platform::current_headless_renderer,
         );
-        cx.update(|cx| crate::fonts::init(cx));
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            // A solid caret: the blink must not decide what the capture shows.
+            cx.set_reduce_motion(true);
+        });
         let runtime = Arc::new(StoreRuntime::inert());
+        let live = std::env::var_os("DIRI_VISUAL_LIVE").is_some();
+        let empty = std::env::var_os("DIRI_VISUAL_EMPTY").is_some();
+        let slash = std::env::var("DIRI_VISUAL_SLASH").ok();
         if std::env::var_os("DIRI_VISUAL_LIGHT").is_some() {
             runtime
                 .store
@@ -208,7 +221,7 @@ mod screenshots {
         runtime.store.write().expect("store").handle_event(diri_client::EventEnvelope {
             name: diri_proto::EventName::SESSION_UPDATED.into(),
             seq: 1,
-            params: record(permission),
+            params: record(permission, live),
         });
         let tokio = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -228,15 +241,40 @@ mod screenshots {
             .open_window(size(px(1000.0), px(height)), move |_, cx| {
                 cx.new(|cx| {
                     let mut lens = ThreadLens::new(SessionId(SESSION.into()), runtime, handle, cx);
-                    lens.ingest_for_test(page(now_ms), cx);
+                    if !empty {
+                        let mut first = page(now_ms);
+                        if live {
+                            first.items.push(item(990, now_ms - 2_000, ThreadBody::ToolCall {
+                                call_id: "live".into(),
+                                name: "Bash".into(),
+                                detail: ToolDetail::Command { command: "cargo test -p diri-app thread_lens".into() },
+                            }));
+                        }
+                        lens.ingest_for_test(first, cx);
+                    }
                     if expand {
                         lens.expand_all_for_test(cx);
                     }
-                    lens.type_for_test("Ship it — then open a PR with before/after screenshots", cx);
+                    if live {
+                        lens.send_for_test("Also run clippy before you push", cx);
+                        // Typing while it works: the action reads Steer.
+                        lens.type_for_test("and keep the old fallback", cx);
+                    }
+                    match &slash {
+                        Some(query) => lens.type_for_test(query, cx),
+                        None if !empty && !live => lens.type_for_test("Ship it — then open a PR with before/after screenshots", cx),
+                        None => {}
+                    }
                     lens
                 })
             })
             .expect("open lens window");
+        window
+            .update(&mut cx, |lens, window, cx| {
+                let handle = gpui::Focusable::focus_handle(lens, cx);
+                window.focus(&handle, cx);
+            })
+            .expect("focus the composer");
         for _ in 0..3 {
             cx.run_until_parked();
             cx.update_window(window.into(), |_, window, _| window.refresh())

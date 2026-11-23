@@ -5,50 +5,67 @@
 //! `session.send_text`, permission answers through `session.answer_blocker`
 //! (which re-checks that the prompt is still live), model switches as the
 //! CLI's own `/model` command. The thread itself comes from the Engine's
-//! transcript tail, so this view never scrapes the terminal.
+//! transcript tail, so this view never scrapes the terminal; a picker the
+//! CLI draws instead shows as a live slice of the real grid (the pane's PTY
+//! portal) while this view hides its composer.
 //!
 //! Rendering stays inside the ADEMark budgets: rows are virtualized by
 //! GPUI's `list` (only visible rows lay out and shape text, so off-screen
 //! rows hold no glyph runs), assistant Markdown is parsed once per record
-//! ([`ThreadModel`]), diff cards and decoded images are cached per item key,
-//! and nothing animates or polls unless the Agent is working.
+//! ([`ThreadModel`]), every paragraph is one shaped text run list (so
+//! punctuation never wraps away from a bold word or a code span), diff
+//! cards and decoded images are cached per item key, and nothing animates
+//! or wakes unless the Agent works or the composer has focus.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
 use diri_proto::thread::{
-    BlockerChoice, CacheWarmth, ItemKey, SegmentCause, ThreadImage,
-    ThreadReadParams, ToolDetail,
+    BlockerChoice, CacheWarmth, ItemKey, SegmentCause, ThreadImage, ThreadReadParams, ToolDetail,
 };
 use diri_proto::{AgentKind, NeedsInputKind, SessionId, SessionRecord, SessionStatus};
 use diri_ui::{Ink, Radius, SemanticColors};
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, Context, EventEmitter, FocusHandle,
-    Focusable, FontWeight, Image, ImageFormat, KeyDownEvent, ListAlignment, ListState, Rgba,
-    SharedString, Task, Window, div, img, list, prelude::*, px, rgba,
+    Animation, AnimationExt as _, AnyElement, App, Context, ElementId, EventEmitter, FocusHandle,
+    Focusable, Font, FontStyle, FontWeight, Hsla, Image, ImageFormat, InteractiveText,
+    KeyDownEvent, ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels,
+    Point, Rgba, SharedString, StrikethroughStyle, StyledText, Task, TextLayout, TextRun,
+    UnderlineStyle, WeakEntity, Window, div, img, list, prelude::*, px, rgba,
 };
 use tokio::runtime::Handle;
+use unicode_segmentation::UnicodeSegmentation as _;
 
 use super::diff::{self, DiffCard, Side};
+pub use super::model::model_display;
 use super::model::{Call, RowChange, Row, ThreadModel, WorkStrip};
+use super::slash::{self, SlashCommand};
 use crate::code_editor::EditorPalette;
 use crate::code_editor::syntax::{self, LexState, TokenKind};
 use crate::code_intelligence::SourceLanguage;
 use crate::git_ui::palette::DiffPalette;
+use crate::i18n::{t, tf};
 use crate::markdown::{InlineText, MarkdownBlock, MarkdownDocument};
 use crate::notes::editor_view::diagram::{self, Diagrams, Look};
 use crate::query_editor::{ClipboardEdit, Edit, LocalEdit, QueryEditor};
-use crate::i18n::{t, tf};
 use crate::store::StoreRuntime;
+use crate::tooltip_warmth::WarmTooltip as _;
 
 /// Prose measure: about 75 characters at the body size.
 const MEASURE: f32 = 720.0;
 const PROSE_SIZE: f32 = 14.0;
-const PROSE_LEADING: f32 = 22.0;
+const PROSE_LEADING: f32 = 23.0;
 const MONO_SIZE: f32 = 12.0;
 const MONO_LEADING: f32 = 18.0;
 const ACCENT: u32 = 0xd97757;
+const LINK: u32 = 0x5b9cf0;
+/// How long a newly arrived row takes to fade in.
+const FADE_IN: Duration = Duration::from_millis(320);
+/// The composer grows with its text up to this, then scrolls.
+const COMPOSER_MAX: f32 = 240.0;
+/// macOS's caret period.
+const BLINK: Duration = Duration::from_millis(530);
 /// Claude Code's own model aliases; `/model <alias>` switches in place.
 const CLAUDE_MODELS: &[(&str, &str, &str)] = &[
     ("opus", "Opus", "claude-opus-5-5"),
@@ -73,12 +90,45 @@ enum LensMessage {
     Answered(Result<(), String>),
 }
 
+/// The composer's primary action, by the Agent's state and the draft.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Action {
+    Send,
+    Steer,
+    Stop,
+}
+
+/// One selectable run of text: a paragraph, a code block, a tool output, a
+/// diff row. Ordered as the thread reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct SegId {
+    key: ItemKey,
+    block: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TextPoint {
+    seg: SegId,
+    index: usize,
+}
+
+/// Clickable ranges of one text: links and file references.
+type Targets = Vec<(Range<usize>, Target)>;
+
+#[derive(Clone, Debug)]
+enum Target {
+    Url(String),
+    Path(String),
+}
+
 pub struct ThreadLens {
     session_id: SessionId,
     runtime: Arc<StoreRuntime>,
     tokio: Handle,
     pub(crate) model: ThreadModel,
     list: ListState,
+    /// Rows drawn after the model's: pending sends, then the working line.
+    shown_extra: usize,
     focus: FocusHandle,
     composer: QueryEditor,
     expanded: HashSet<(ItemKey, u16)>,
@@ -91,6 +141,34 @@ pub struct ThreadLens {
     diagrams: Diagrams,
     /// Wipe position per before/after pair, 0..1.
     wipes: HashMap<ItemKey, f32>,
+    /// Text laid out this frame, for hit-testing a selection.
+    segments: BTreeMap<SegId, TextLayout>,
+    /// Text of every segment drawn so far, so a selection that scrolled
+    /// past rows still copies them.
+    seg_text: BTreeMap<SegId, SharedString>,
+    /// Anchor, then head.
+    selection: Option<(TextPoint, TextPoint)>,
+    selecting: bool,
+    /// The caret's blink phase; solid while typing.
+    caret_on: bool,
+    typed: bool,
+    /// Focus as of the last frame, read by the blink timer.
+    focused: bool,
+    blink: Option<Task<()>>,
+    /// The pane shows the live PTY in place of the composer.
+    pub(crate) portal_open: bool,
+    slash: Option<Arc<Vec<SlashCommand>>>,
+    slash_index: usize,
+    /// The composer text the `/` menu was dismissed for.
+    slash_dismissed: Option<String>,
+    /// Rows that arrived after the first page, by row id, for their fade-in.
+    fresh: HashMap<(ItemKey, u16), std::time::Instant>,
+    /// A live slice of the PTY the pane docks above the composer this frame
+    /// (a picker the transcript never records).
+    dock: Option<AnyElement>,
+    /// What a copy button just copied, for its brief "Copied".
+    copied: Option<SharedString>,
+    weak: WeakEntity<Self>,
     messages: tokio::sync::mpsc::UnboundedSender<LensMessage>,
     _tasks: Vec<Task<()>>,
 }
@@ -136,12 +214,14 @@ impl ThreadLens {
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 };
                 let ours = match event.name.as_str() {
+                    // The file watch, and every Agent hook (tool start and
+                    // finish, stop, notification), announce new bytes.
                     diri_proto::EventName::SESSION_THREAD_APPENDED => {
                         event.params.get("sessionID").and_then(|v| v.as_str())
                             == Some(watched.0.as_str())
                     }
-                    // Hook-driven status changes precede and follow every
-                    // turn, so they also renew the Engine's watch lease.
+                    // Status changes precede and follow every turn, so they
+                    // also renew the Engine's watch lease.
                     diri_proto::EventName::SESSION_UPDATED => {
                         event.params.get("id").and_then(|v| v.as_str()) == Some(watched.0.as_str())
                     }
@@ -154,12 +234,18 @@ impl ThreadLens {
         });
         let list = ListState::new(0, ListAlignment::Bottom, px(600.0));
         list.set_follow_mode(gpui::FollowMode::Tail);
+        // Scrolling away from the tail shows the jump-to-latest control.
+        let weak = cx.entity().downgrade();
+        list.set_scroll_handler(move |_, _, cx| {
+            let _ = weak.update(cx, |_, cx| cx.notify());
+        });
         let mut lens = Self {
             session_id,
             runtime,
             tokio,
             model: ThreadModel::default(),
             list,
+            shown_extra: 0,
             focus: cx.focus_handle(),
             composer: QueryEditor::default(),
             expanded: HashSet::new(),
@@ -171,6 +257,22 @@ impl ThreadLens {
             cards: HashMap::new(),
             diagrams: Diagrams::default(),
             wipes: HashMap::new(),
+            segments: BTreeMap::new(),
+            seg_text: BTreeMap::new(),
+            selection: None,
+            selecting: false,
+            caret_on: true,
+            typed: false,
+            focused: false,
+            blink: None,
+            portal_open: false,
+            slash: None,
+            slash_index: 0,
+            slash_dismissed: None,
+            copied: None,
+            fresh: HashMap::new(),
+            dock: None,
+            weak: cx.entity().downgrade(),
             messages,
             _tasks: vec![inbox_task, events_task],
         };
@@ -200,7 +302,7 @@ impl ThreadLens {
                 }
             }
         }
-        self.list.reset(self.model.rows.len());
+        self.list.reset(self.model.rows.len() + self.shown_extra);
         cx.notify();
     }
 
@@ -215,12 +317,57 @@ impl ThreadLens {
         cx.notify();
     }
 
+    /// Sends like Enter would, minus the PTY: the optimistic row appears.
+    #[cfg(test)]
+    pub(crate) fn send_for_test(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.composer.insert_multiline(text);
+        self.submit_with(cx, false);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn select_all_text_for_test(&mut self) -> Option<String> {
+        let first = *self.seg_text.keys().next()?;
+        let (last, text) = self.seg_text.iter().next_back()?;
+        self.selection = Some((
+            TextPoint { seg: first, index: 0 },
+            TextPoint { seg: *last, index: text.len() },
+        ));
+        self.selection_text()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rows_for_test(&self) -> usize {
+        self.list.item_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn composer_is_empty(&self) -> bool {
+        self.composer.is_empty()
+    }
+
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
     }
 
     pub fn is_structured(&self) -> Option<bool> {
         self.model.structured
+    }
+
+    /// Re-reads the transcript from the cursor (the pane calls this once
+    /// the terminal settles after output).
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.request_read(cx);
+    }
+
+    /// The pane's live PTY slice for this frame, docked above the composer
+    /// in the same slot as a permission card; `None` once the picker closes.
+    pub fn dock_portal(&mut self, portal: Option<AnyElement>, cx: &mut Context<Self>) {
+        let open = portal.is_some();
+        self.dock = portal;
+        if self.portal_open != open {
+            self.portal_open = open;
+            cx.notify();
+        }
     }
 
     fn request_read(&mut self, cx: &mut Context<Self>) {
@@ -279,17 +426,44 @@ impl ThreadLens {
         }
     }
 
+    /// Rows after the model's own: one per pending send, then the working
+    /// line when the Agent is busy and no live strip already says so.
+    fn extra_rows(&self) -> usize {
+        let working = self.session().is_some_and(|s| is_working(&s));
+        // A running strip already says what the Agent is doing.
+        let live_strip = matches!(self.model.rows.last(), Some(Row::Work(strip)) if strip.pending());
+        self.model.pending.len() + usize::from((working || !self.model.pending.is_empty()) && !live_strip)
+    }
+
     fn apply_change(&mut self, change: RowChange) {
+        let rows = self.model.rows.len();
+        let extra = self.extra_rows();
         match change {
-            RowChange::None => {}
-            RowChange::Tail { from, old_len } => {
-                // Cached cards and images belong to immutable items; only the
-                // reopened tail row needs remeasuring.
-                self.list
-                    .splice(from..old_len, self.model.rows.len().saturating_sub(from));
+            RowChange::None => {
+                if extra != self.shown_extra {
+                    self.list.splice(rows..rows + self.shown_extra, extra);
+                }
             }
-            RowChange::Rebuilt => self.list.reset(self.model.rows.len()),
+            RowChange::Tail { from, old_len } => {
+                if old_len > 0 {
+                    let now = std::time::Instant::now();
+                    self.fresh.retain(|_, born| born.elapsed() < FADE_IN);
+                    for row in &self.model.rows[old_len.min(rows)..] {
+                        self.fresh.insert(row.id(), now);
+                    }
+                }
+                // Cached cards and images belong to immutable items; only the
+                // reopened tail rows need remeasuring.
+                self.list
+                    .splice(from..old_len + self.shown_extra, rows.saturating_sub(from) + extra);
+            }
+            RowChange::Rebuilt => {
+                self.seg_text.clear();
+                self.selection = None;
+                self.list.reset(rows + extra);
+            }
         }
+        self.shown_extra = extra;
     }
 
     fn session(&self) -> Option<Arc<SessionRecord>> {
@@ -322,13 +496,28 @@ impl ThreadLens {
     }
 
     fn submit(&mut self, cx: &mut Context<Self>) {
+        self.submit_with(cx, true);
+    }
+
+    /// Enter: the message shows in the thread this frame (optimistic), the
+    /// list re-follows the tail, then the PTY gets it. The transcript
+    /// record that lands a moment later replaces the pending row in place.
+    fn submit_with(&mut self, cx: &mut Context<Self>, to_pty: bool) {
         let text = self.composer.text().trim_end().to_owned();
-        if text.is_empty() {
+        if text.trim().is_empty() {
             return;
         }
         self.composer.clear();
-        self.send(text, true, cx);
-        self.list.scroll_to_end();
+        self.slash_dismissed = None;
+        if !text.starts_with('/') {
+            self.model.push_pending(&text, now_ms());
+            self.apply_change(RowChange::None);
+        }
+        self.list.set_follow_mode(gpui::FollowMode::Tail);
+        if to_pty {
+            self.send(text, true, cx);
+        }
+        cx.notify();
     }
 
     fn answer(&mut self, choice: BlockerChoice, occurred_at: f64, cx: &mut Context<Self>) {
@@ -351,18 +540,104 @@ impl ThreadLens {
     }
 
     /// Tier 1: the CLI's own in-session switch. Claude keeps its
-    /// conversation and the old model's cache stays warm until its TTL.
+    /// conversation and the old model's cache stays warm until its TTL. The
+    /// thread shows it as one divider, never as a command bubble.
     fn switch_model(&mut self, alias: &str, cx: &mut Context<Self>) {
         self.model_menu = false;
         self.send(format!("/model {alias}"), true, cx);
     }
 
+    fn slash_matches(&mut self) -> Vec<SlashCommand> {
+        let text = self.composer.text().to_owned();
+        let Some(query) = slash::query(&text) else {
+            return Vec::new();
+        };
+        if self.slash_dismissed.as_deref() == Some(text.as_str()) {
+            return Vec::new();
+        }
+        let catalog = match &self.slash {
+            Some(catalog) => Arc::clone(catalog),
+            None => {
+                let session = self.session();
+                let kind = session.as_ref().map_or(AgentKind::CLAUDE_CODE, |s| s.effective_kind().clone());
+                let cwd = session.as_ref().map(|s| std::path::PathBuf::from(&s.cwd)).unwrap_or_default();
+                let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+                let catalog = Arc::new(slash::catalog(&kind, &cwd, &home));
+                self.slash = Some(Arc::clone(&catalog));
+                catalog
+            }
+        };
+        slash::matching(&catalog, query, 8).into_iter().cloned().collect()
+    }
+
+    /// Takes the highlighted `/` choice into the composer. A command with
+    /// no argument runs straight away on Enter.
+    fn complete_slash(&mut self, run: bool, cx: &mut Context<Self>) -> bool {
+        let matches = self.slash_matches();
+        let Some(choice) = matches.get(self.slash_index.min(matches.len().saturating_sub(1))) else {
+            return false;
+        };
+        self.composer.clear();
+        if run && !choice.takes_args {
+            self.composer.insert_multiline(&choice.name);
+            self.submit(cx);
+        } else {
+            self.composer.insert_multiline(&format!("{} ", choice.name));
+        }
+        self.slash_index = 0;
+        self.typed(cx);
+        true
+    }
+
+    /// A keystroke landed: the caret stays solid until the next blink.
+    fn typed(&mut self, cx: &mut Context<Self>) {
+        self.caret_on = true;
+        self.typed = true;
+        cx.notify();
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // The docked PTY portal holds the focus inside this view's tree: its
+        // keys bubble through here on their way to the terminal. Let them.
+        if self.portal_open {
+            return;
+        }
         let keystroke = &event.keystroke;
         let modifiers = keystroke.modifiers;
         let session = self.session();
         let blocker = session.as_ref().and_then(|s| permission(s));
+        let slash_open = !self.slash_matches().is_empty();
         match keystroke.key.as_str() {
+            "up" | "down" if slash_open && !modifiers.platform => {
+                let count = self.slash_matches().len().max(1);
+                self.slash_index = if keystroke.key == "up" {
+                    (self.slash_index + count - 1) % count
+                } else {
+                    (self.slash_index + 1) % count
+                };
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            "tab" if slash_open => {
+                self.complete_slash(false, cx);
+                cx.stop_propagation();
+                return;
+            }
+            "enter" if slash_open && !modifiers.shift && !modifiers.alt && !modifiers.platform => {
+                // The exact command typed out runs; a prefix completes.
+                let exact = self
+                    .slash_matches()
+                    .first()
+                    .is_some_and(|c| c.name == self.composer.text().trim());
+                if exact && self.slash_index == 0 {
+                    self.submit(cx);
+                } else {
+                    self.complete_slash(true, cx);
+                }
+                cx.stop_propagation();
+                return;
+            }
             "enter" if modifiers.platform => {
                 if let Some(occurred_at) = blocker {
                     self.answer(BlockerChoice::Approve, occurred_at, cx);
@@ -372,18 +647,22 @@ impl ThreadLens {
             }
             "enter" if modifiers.shift || modifiers.alt => {
                 self.composer.insert_multiline("\n");
+                self.typed(cx);
                 cx.stop_propagation();
-                cx.notify();
                 return;
             }
             "enter" if !modifiers.control && !modifiers.platform => {
                 self.submit(cx);
+                self.typed(cx);
                 cx.stop_propagation();
                 return;
             }
             "escape" => {
-                if self.model_menu {
+                if slash_open {
+                    self.slash_dismissed = Some(self.composer.text().to_owned());
+                } else if self.model_menu {
                     self.model_menu = false;
+                } else if self.selection.take().is_some() {
                 } else if let Some(occurred_at) = blocker {
                     self.answer(BlockerChoice::Deny, occurred_at, cx);
                 } else if self.composer.is_empty() {
@@ -405,17 +684,24 @@ impl ThreadLens {
                 } else {
                     self.composer.apply(edit);
                 }
+                self.slash_index = 0;
+                self.selection = None;
+                self.typed(cx);
                 cx.stop_propagation();
-                cx.notify();
             }
             Some(Edit::Clipboard(ClipboardEdit::Copy)) => {
-                crate::query_editor::copy_selection(&self.composer, cx);
+                // A selection in the thread wins over the composer's.
+                if let Some(text) = self.selection_text() {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                } else {
+                    crate::query_editor::copy_selection(&self.composer, cx);
+                }
                 cx.stop_propagation();
             }
             Some(Edit::Clipboard(ClipboardEdit::Cut)) => {
                 crate::query_editor::cut_selection(&mut self.composer, cx);
+                self.typed(cx);
                 cx.stop_propagation();
-                cx.notify();
             }
             Some(Edit::Clipboard(ClipboardEdit::Paste)) => {
                 let item = cx.read_from_clipboard();
@@ -430,8 +716,8 @@ impl ThreadLens {
                 } else if let Some(text) = text {
                     self.composer.insert_context(&text);
                 }
+                self.typed(cx);
                 cx.stop_propagation();
-                cx.notify();
             }
             None => {
                 // Keys with no meaning here must not fall through to the
@@ -452,47 +738,245 @@ impl ThreadLens {
         cx.notify();
     }
 
+    fn open_target(&mut self, target: &Target, cx: &mut Context<Self>) {
+        if self.selection_text().is_some() {
+            // The click ended a drag that selected text, not a link click.
+            return;
+        }
+        match target {
+            Target::Url(url) => cx.open_url(url),
+            Target::Path(path) => cx.emit(ThreadLensEvent::OpenReference(path.clone())),
+        }
+    }
+
+    fn copy_text(&mut self, id: SharedString, text: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        self.copied = Some(id.clone());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(1200)).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.copied.as_ref() == Some(&id) {
+                    this.copied = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    // ── Selection ────────────────────────────────────────────────────────
+
+    /// The text point under `position`; with `nearest`, the closest one
+    /// even between paragraphs (a drag through a gap keeps selecting).
+    fn hit(&self, position: Point<Pixels>, nearest: bool) -> Option<TextPoint> {
+        let mut above: Option<TextPoint> = None;
+        for (seg, layout) in &self.segments {
+            let Some(bounds) = layout.try_bounds() else {
+                continue;
+            };
+            if position.y < bounds.top() {
+                if nearest {
+                    return Some(above.unwrap_or(TextPoint { seg: *seg, index: 0 }));
+                }
+                continue;
+            }
+            let len = self.seg_text.get(seg).map_or(0, |text| text.len());
+            if position.y <= bounds.bottom() {
+                if !nearest && (position.x < bounds.left() - px(8.0) || position.x > bounds.right() + px(8.0)) {
+                    continue;
+                }
+                let index = match layout.index_for_position(position) {
+                    Ok(index) | Err(index) => index.min(len),
+                };
+                return Some(TextPoint { seg: *seg, index });
+            }
+            above = Some(TextPoint { seg: *seg, index: len });
+        }
+        above.filter(|_| nearest)
+    }
+
+    fn ordered_selection(&self) -> Option<(TextPoint, TextPoint)> {
+        let (a, b) = self.selection?;
+        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+        (start != end).then_some((start, end))
+    }
+
+    /// The selected byte range inside `seg`, if the selection touches it.
+    fn selected_range(&self, seg: SegId, len: usize) -> Option<Range<usize>> {
+        let (start, end) = self.ordered_selection()?;
+        if seg < start.seg || seg > end.seg {
+            return None;
+        }
+        let from = if seg == start.seg { start.index.min(len) } else { 0 };
+        let to = if seg == end.seg { end.index.min(len) } else { len };
+        (from < to).then_some(from..to)
+    }
+
+    fn selection_text(&self) -> Option<String> {
+        let (start, end) = self.ordered_selection()?;
+        let mut out = String::new();
+        let mut previous: Option<ItemKey> = None;
+        for (seg, text) in self.seg_text.range(start.seg..=end.seg) {
+            let len = text.len();
+            let mut from = if *seg == start.seg { start.index.min(len) } else { 0 };
+            let mut to = if *seg == end.seg { end.index.min(len) } else { len };
+            while !text.is_char_boundary(from) {
+                from -= 1;
+            }
+            while !text.is_char_boundary(to) {
+                to += 1;
+            }
+            if let Some(key) = previous {
+                out.push('\n');
+                if key != seg.key {
+                    out.push('\n');
+                }
+            }
+            out.push_str(&text[from..to.max(from)]);
+            previous = Some(seg.key);
+        }
+        (!out.trim().is_empty()).then_some(out)
+    }
+
+    fn select_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus.focus(window, cx);
+        let Some(point) = self.hit(event.position, false) else {
+            if self.selection.take().is_some() {
+                cx.notify();
+            }
+            return;
+        };
+        let text = self.seg_text.get(&point.seg).cloned().unwrap_or_default();
+        self.selection = match event.click_count {
+            2 => {
+                let word = word_at(&text, point.index);
+                Some((
+                    TextPoint { seg: point.seg, index: word.start },
+                    TextPoint { seg: point.seg, index: word.end },
+                ))
+            }
+            n if n >= 3 => Some((
+                TextPoint { seg: point.seg, index: 0 },
+                TextPoint { seg: point.seg, index: text.len() },
+            )),
+            _ => Some((point, point)),
+        };
+        self.selecting = event.click_count < 2;
+        cx.notify();
+    }
+
+    fn select_drag(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if !self.selecting || event.pressed_button != Some(MouseButton::Left) {
+            self.selecting &= event.pressed_button == Some(MouseButton::Left);
+            return;
+        }
+        // Dragging past the list's edges scrolls it under the pointer.
+        let viewport = self.list.viewport_bounds();
+        if event.position.y < viewport.top() + px(8.0) {
+            self.list.scroll_by(px(-14.0));
+        } else if event.position.y > viewport.bottom() - px(8.0) {
+            self.list.scroll_by(px(14.0));
+        }
+        if let (Some(point), Some((anchor, _))) = (self.hit(event.position, true), self.selection) {
+            self.selection = Some((anchor, point));
+            cx.notify();
+        }
+    }
+
     // ── Rows ─────────────────────────────────────────────────────────────
 
     fn render_row(&mut self, index: usize, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let Some(row) = self.model.rows.get(index).cloned() else {
-            return div().into_any_element();
-        };
         let (colors, theme) = self.colors();
+        let Some(row) = self.model.rows.get(index).cloned() else {
+            return self.render_extra(index - self.model.rows.len(), colors, cx);
+        };
         let working = self.session().is_some_and(|s| is_working(&s));
         let last = index + 1 == self.model.rows.len();
+        let (key, part) = row.id();
         let body = match &row {
-            Row::User { key, text, images } => self.render_user(*key, text, images, colors, cx),
-            Row::Command { name, args, .. } => command_chip(name, args, colors),
-            Row::Assistant { key, document, .. } => {
-                self.render_document(*key, document, colors, &theme, cx)
+            Row::User { key, text, images } => self.render_user(*key, text, images, colors),
+            Row::Command { key, name, args, output } => self.render_command(*key, name, args, output.as_ref(), colors),
+            Row::Assistant { key, block, last, text, document } => {
+                self.render_assistant(*key, *block, *last, text, document, colors, &theme, cx)
             }
             Row::Work(strip) => self.render_strip(index, strip, last && working, colors, &theme, cx),
             Row::Notice { text, .. } => notice(text, colors),
             Row::Divider(segment) => divider(segment, colors),
         };
+        let top = match row {
+            Row::Work(_) | Row::Command { .. } => 4.0,
+            Row::Divider(_) | Row::Notice { .. } => 14.0,
+            Row::User { .. } => 18.0,
+            Row::Assistant { block: 0, .. } => 10.0,
+            Row::Assistant { .. } => 8.0,
+        };
+        let row_el = div()
+            .id(SharedString::from(format!("lens-row-{}-{}-{part}", key.offset, key.part)))
+            .w_full()
+            .flex()
+            .justify_center()
+            .px(px(28.0))
+            .pt(px(top))
+            .pb(px(4.0))
+            .child(div().w_full().max_w(px(MEASURE)).child(body));
+        // Rows that arrive while the lens is open fade in on the paint layer
+        // (opacity only: nothing re-lays out), once.
+        match self.fresh.get(&(key, part)) {
+            Some(born) if born.elapsed() < FADE_IN => row_el
+                .with_animation(
+                    SharedString::from(format!("lens-fresh-{}-{}-{part}", key.offset, key.part)),
+                    Animation::new(FADE_IN).with_easing(gpui::ease_out_quint()),
+                    |row, t| row.opacity(t),
+                )
+                .into_any_element(),
+            _ => row_el.into_any_element(),
+        }
+    }
+
+    /// Sent but not yet in the transcript, and the working line.
+    fn render_extra(&mut self, extra: usize, colors: SemanticColors, _cx: &mut Context<Self>) -> AnyElement {
+        let body = if let Some(pending) = self.model.pending.get(extra) {
+            div()
+                .w_full()
+                .flex()
+                .justify_end()
+                .child(
+                    bubble(colors)
+                        .opacity(0.72)
+                        .child(
+                            div()
+                                .text_size(px(PROSE_SIZE))
+                                .line_height(px(PROSE_LEADING))
+                                .text_color(colors.primary)
+                                .child(SharedString::from(pending.text.to_string())),
+                        ),
+                )
+                .with_animation(
+                    SharedString::from(format!("lens-pending-{}", pending.sent_ms)),
+                    Animation::new(Duration::from_millis(180)).with_easing(gpui::ease_out_quint()),
+                    |bubble, t| bubble.opacity(t).mt(px(6.0 * (1.0 - t))),
+                )
+                .into_any_element()
+        } else {
+            let text = match self.model.rows.last() {
+                Some(Row::Work(strip)) if strip.pending() => strip.activity(),
+                _ => t("thread_lens.work.thinking").to_owned(),
+            };
+            working_line(&text, colors)
+        };
         div()
             .w_full()
             .flex()
             .justify_center()
-            .px(px(24.0))
-            .py(px(match row {
-                Row::Work(_) | Row::Command { .. } => 3.0,
-                Row::Divider(_) | Row::Notice { .. } => 10.0,
-                _ => 8.0,
-            }))
+            .px(px(28.0))
+            .pt(px(if extra < self.model.pending.len() { 18.0 } else { 10.0 }))
+            .pb(px(4.0))
             .child(div().w_full().max_w(px(MEASURE)).child(body))
             .into_any_element()
     }
 
-    fn render_user(
-        &mut self,
-        key: ItemKey,
-        text: &str,
-        images: &[ThreadImage],
-        colors: SemanticColors,
-        _cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_user(&mut self, key: ItemKey, text: &str, images: &[ThreadImage], colors: SemanticColors) -> AnyElement {
         let thumbs: Vec<AnyElement> = images
             .iter()
             .enumerate()
@@ -507,64 +991,126 @@ impl ThreadLens {
                 )
             })
             .collect();
+        let text_el = (!text.is_empty()).then(|| {
+            let font = ui_font();
+            let runs = vec![run(text.len(), &font, colors.primary.into())];
+            self.segment(SegId { key, block: 0 }, SharedString::from(text.to_owned()), runs, Vec::new(), colors)
+        });
         div()
             .w_full()
             .flex()
             .justify_end()
             .child(
-                div()
-                    .max_w(px(MEASURE * 0.82))
-                    .px(px(14.0))
-                    .py(px(10.0))
-                    .rounded(px(14.0))
-                    .bg(colors.primary.alpha(0.055))
-                    .border_1()
-                    .border_color(colors.primary.alpha(0.06))
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.0))
+                bubble(colors)
                     .when(!thumbs.is_empty(), |bubble| {
                         bubble.child(div().flex().flex_wrap().gap(px(6.0)).children(thumbs))
                     })
-                    .when(!text.is_empty(), |bubble| {
-                        bubble.child(
-                            div()
-                                .text_size(px(PROSE_SIZE))
-                                .line_height(px(PROSE_LEADING))
-                                .text_color(colors.primary)
-                                .child(SharedString::from(text.to_owned())),
-                        )
-                    }),
+                    .children(text_el.map(|text| {
+                        div()
+                            .text_size(px(PROSE_SIZE))
+                            .line_height(px(PROSE_LEADING))
+                            .child(text)
+                    })),
             )
             .into_any_element()
     }
 
-    fn render_document(
+    /// `/cost` and its printout, quietly, as the terminal shows them.
+    fn render_command(&mut self, key: ItemKey, name: &str, args: &str, output: Option<&(Arc<str>, bool)>, colors: SemanticColors) -> AnyElement {
+        let mono = mono_font();
+        let output = output.map(|(text, is_error)| {
+            let color: Hsla = if *is_error { Ink::DANGER.into() } else { colors.secondary.into() };
+            let runs = vec![run(text.len(), &mono, color)];
+            self.segment(SegId { key, block: 1 }, SharedString::from(text.to_string()), runs, Vec::new(), colors)
+        });
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .font_family(crate::fonts::mono_family())
+            .text_size(px(MONO_SIZE))
+            .line_height(px(MONO_LEADING))
+            .when(!name.is_empty(), |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .gap(px(6.0))
+                        .child(div().text_color(colors.tertiary).child("›"))
+                        .child(div().text_color(rgba(ACCENT << 8 | 0xff)).child(SharedString::from(name.to_owned())))
+                        .when(!args.is_empty(), |el| el.child(div().text_color(colors.secondary).child(SharedString::from(args.to_owned())))),
+                )
+            })
+            .children(output.map(|output| {
+                div()
+                    .ml(px(4.0))
+                    .pl(px(12.0))
+                    .border_l_1()
+                    .border_color(colors.primary.alpha(0.08))
+                    .child(output)
+            }))
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_assistant(
         &mut self,
         key: ItemKey,
+        block: u16,
+        last: bool,
+        text: &str,
         document: &MarkdownDocument,
         colors: SemanticColors,
         theme: &diri_term::theme::TermTheme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let mut column = div().w_full().flex().flex_col().gap(px(12.0));
-        for (index, block) in document.blocks.iter().enumerate() {
-            column = column.child(self.render_block(key, index, block, colors, theme, cx));
+        let Some(markdown) = document.blocks.get(usize::from(block)) else {
+            return div().into_any_element();
+        };
+        // Segment numbers stay in reading order across a turn's rows.
+        let mut counter = u32::from(block) * 1000;
+        let body = self.render_block(key, &mut counter, markdown, colors, theme, cx);
+        if !last {
+            return body;
         }
-        column.into_any_element()
+        let group = SharedString::from(format!("lens-reply-{}-{}", key.offset, key.part));
+        let copy_id = SharedString::from(format!("lens-copy-reply-{}-{}", key.offset, key.part));
+        let copied = self.copied.as_ref() == Some(&copy_id);
+        let source = text.to_owned();
+        div()
+            .group(group.clone())
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .child(body)
+            .child(
+                div().h(px(20.0)).flex().items_center().child(
+                    quiet_button(copy_id.clone(), if copied { t("thread_lens.copied") } else { t("thread_lens.copy") }, colors)
+                        .opacity(if copied { 1.0 } else { 0.0 })
+                        .group_hover(group, |button| button.opacity(1.0))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.copy_text(copy_id.clone(), source.clone(), cx);
+                            cx.stop_propagation();
+                        })),
+                ),
+            )
+            .into_any_element()
     }
 
     #[allow(clippy::too_many_arguments)]
     fn render_block(
         &mut self,
         key: ItemKey,
-        index: usize,
-        block: &MarkdownBlock,
+        block: &mut u32,
+        markdown: &MarkdownBlock,
         colors: SemanticColors,
         theme: &diri_term::theme::TermTheme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        match block {
+        let seg = SegId { key, block: *block };
+        *block += 1;
+        match markdown {
             MarkdownBlock::Heading { level, content } => {
                 let size = match level {
                     1 => 20.0,
@@ -572,26 +1118,23 @@ impl ThreadLens {
                     _ => 15.0,
                 };
                 div()
-                    .pt(px(4.0))
+                    .pt(px(6.0))
                     .text_size(px(size))
                     .line_height(px(size * 1.35))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(colors.primary)
-                    .child(self.inline(content, colors, cx))
+                    .child(self.prose(seg, content, FontWeight::SEMIBOLD, colors.primary.into(), colors, cx))
                     .into_any_element()
             }
             MarkdownBlock::Paragraph(content) => div()
                 .text_size(px(PROSE_SIZE))
                 .line_height(px(PROSE_LEADING))
-                .text_color(colors.primary.alpha(0.92))
-                .child(self.inline(content, colors, cx))
+                .child(self.prose(seg, content, FontWeight::NORMAL, colors.primary.alpha(0.92).into(), colors, cx))
                 .into_any_element(),
             MarkdownBlock::List {
                 ordered,
                 start,
                 items,
             } => {
-                let mut list = div().flex().flex_col().gap(px(4.0));
+                let mut list = div().flex().flex_col().gap(px(5.0));
                 for (n, item) in items.iter().enumerate() {
                     let marker = match item.checked {
                         Some(true) => "✓".to_owned(),
@@ -599,24 +1142,27 @@ impl ThreadLens {
                         None if *ordered => format!("{}.", start + n),
                         None => "•".to_owned(),
                     };
+                    let item_seg = SegId { key, block: *block };
+                    *block += 1;
                     list = list.child(
                         div()
                             .flex()
                             .gap(px(10.0))
                             .text_size(px(PROSE_SIZE))
                             .line_height(px(PROSE_LEADING))
-                            .text_color(colors.primary.alpha(0.92))
                             .child(
                                 div()
                                     .w(px(18.0))
                                     .flex_none()
                                     .text_right()
-                                    .font_family(crate::fonts::mono_family())
                                     .text_color(colors.tertiary)
                                     .child(marker),
                             )
-                            .child(div().min_w(px(0.0)).flex_1().child(self.inline(
+                            .child(div().min_w(px(0.0)).flex_1().child(self.prose(
+                                item_seg,
                                 &item.content,
+                                FontWeight::NORMAL,
+                                colors.primary.alpha(0.92).into(),
                                 colors,
                                 cx,
                             ))),
@@ -632,16 +1178,16 @@ impl ThreadLens {
                     .flex()
                     .flex_col()
                     .gap(px(8.0));
-                for (n, block) in blocks.iter().enumerate() {
-                    quote = quote.child(self.render_block(key, index * 64 + n, block, colors, theme, cx));
+                for inner in blocks {
+                    quote = quote.child(self.render_block(key, block, inner, colors, theme, cx));
                 }
                 quote.into_any_element()
             }
             MarkdownBlock::CodeBlock { language, code } => {
                 if language.as_deref() == Some("mermaid") {
-                    return self.render_mermaid(key, index, code, colors, cx);
+                    return self.render_mermaid(key, seg.block as usize, code, colors, cx);
                 }
-                code_block(language.as_deref(), code, colors, theme)
+                self.code_block(seg, language.as_deref(), code, colors, theme, cx)
             }
             MarkdownBlock::ThematicBreak => div()
                 .h(px(1.0))
@@ -649,6 +1195,158 @@ impl ThreadLens {
                 .bg(colors.primary.alpha(0.08))
                 .into_any_element(),
         }
+    }
+
+    /// One selectable text run list. Registers its layout for this frame's
+    /// hit-testing and its text for copying.
+    fn segment(
+        &mut self,
+        seg: SegId,
+        text: SharedString,
+        runs: Vec<TextRun>,
+        targets: Targets,
+        colors: SemanticColors,
+    ) -> AnyElement {
+        let runs = match self.selected_range(seg, text.len()) {
+            Some(range) => select_runs(runs, range, selection_color(colors)),
+            None => runs,
+        };
+        let styled = StyledText::new(text.clone()).with_runs(runs);
+        self.segments.insert(seg, styled.layout().clone());
+        self.seg_text.insert(seg, text);
+        if targets.is_empty() {
+            return styled.into_any_element();
+        }
+        let ranges: Vec<Range<usize>> = targets.iter().map(|(range, _)| range.clone()).collect();
+        let targets = Arc::new(targets);
+        let lens = self.weak.clone();
+        let click_targets = Arc::clone(&targets);
+        let cwd = self.session().map(|s| s.cwd.clone()).unwrap_or_default();
+        InteractiveText::new(
+            ElementId::from(SharedString::from(format!("lens-text-{}-{}-{}", seg.key.offset, seg.key.part, seg.block))),
+            styled,
+        )
+        .on_click(ranges, move |index, _, cx| {
+            let target = click_targets[index].1.clone();
+            let _ = lens.update(cx, |this, cx| this.open_target(&target, cx));
+        })
+        .tooltip(move |at, _, cx| {
+            let (_, Target::Path(reference)) = targets.iter().find(|(range, _)| range.contains(&at))? else {
+                return None;
+            };
+            let preview = file_preview(&cwd, reference);
+            Some(cx.new(|_| PathPreview { preview, colors }).into())
+        })
+        .into_any_element()
+    }
+
+    /// Markdown inline spans as one shaped paragraph (see [`inline_runs`]).
+    fn prose(&mut self, seg: SegId, content: &InlineText, weight: FontWeight, color: Hsla, colors: SemanticColors, _cx: &mut Context<Self>) -> AnyElement {
+        let (text, runs, targets) = inline_runs(content, weight, color, colors);
+        self.segment(seg, SharedString::from(text), runs, targets, colors)
+    }
+
+    fn code_block(
+        &mut self,
+        seg: SegId,
+        language: Option<&str>,
+        code: &str,
+        colors: SemanticColors,
+        theme: &diri_term::theme::TermTheme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let palette = EditorPalette::from_theme(theme);
+        let source_language = language
+            .map(|lang| SourceLanguage::from_path(std::path::Path::new(&format!("x.{}", match lang {
+                "rust" => "rs",
+                "python" => "py",
+                "typescript" => "ts",
+                "javascript" => "js",
+                "bash" | "shell" | "console" | "sh" | "zsh" | "fish" => "sh",
+                other => other,
+            }))))
+            .unwrap_or(SourceLanguage::from_path(std::path::Path::new("x.txt")));
+        let grammar = syntax::grammar(source_language);
+        let mono = mono_font();
+        let mut state = LexState::default();
+        let mut text = String::new();
+        let mut runs = Vec::new();
+        for (n, line) in code.lines().take(400).enumerate() {
+            if n > 0 {
+                text.push('\n');
+                runs.push(run(1, &mono, palette.foreground.into()));
+            }
+            let (tokens, next) = syntax::lex_line(line, state, grammar);
+            state = next;
+            let mut at = 0;
+            for token in tokens {
+                if token.range.start > at {
+                    runs.push(run(token.range.start - at, &mono, palette.foreground.into()));
+                }
+                runs.push(run(token.range.len(), &mono, token_color(&palette, token.kind).into()));
+                at = token.range.end;
+            }
+            if at < line.len() {
+                runs.push(run(line.len() - at, &mono, palette.foreground.into()));
+            }
+            text.push_str(line);
+        }
+        let group = SharedString::from(format!("lens-code-{}-{}-{}", seg.key.offset, seg.key.part, seg.block));
+        let copy_id = SharedString::from(format!("{group}-copy"));
+        let copied = self.copied.as_ref() == Some(&copy_id);
+        let source = code.to_owned();
+        let body = self.segment(seg, SharedString::from(text), runs, Vec::new(), colors);
+        div()
+            .group(group.clone())
+            .relative()
+            .w_full()
+            .rounded(px(Radius::CARD))
+            .bg(palette.background)
+            .border_1()
+            .border_color(colors.primary.alpha(0.07))
+            .overflow_hidden()
+            .child(
+                div()
+                    .id(SharedString::from(format!("{group}-scroll")))
+                    .overflow_x_scroll()
+                    .child(
+                        div()
+                            .px(px(14.0))
+                            .pt(px(if language.is_some() { 26.0 } else { 12.0 }))
+                            .pb(px(12.0))
+                            .whitespace_nowrap()
+                            .font_family(crate::fonts::mono_family())
+                            .text_size(px(MONO_SIZE))
+                            .line_height(px(MONO_LEADING))
+                            .child(body),
+                    ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(6.0))
+                    .left(px(14.0))
+                    .right(px(8.0))
+                    .flex()
+                    .items_center()
+                    .children(language.map(|language| {
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(colors.tertiary)
+                            .child(SharedString::from(language.to_owned()))
+                    }))
+                    .child(div().flex_1())
+                    .child(
+                        quiet_button(copy_id.clone(), if copied { t("thread_lens.copied") } else { t("thread_lens.copy") }, colors)
+                            .opacity(if copied { 1.0 } else { 0.0 })
+                            .group_hover(group, |button| button.opacity(1.0))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.copy_text(copy_id.clone(), source.clone(), cx);
+                                cx.stop_propagation();
+                            })),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn render_mermaid(
@@ -678,11 +1376,11 @@ impl ThreadLens {
         }
         let frame = div()
             .w_full()
-            .p(px(14.0))
+            .p(px(16.0))
             .rounded(px(Radius::CARD))
             .border_1()
             .border_color(colors.primary.alpha(0.07))
-            .bg(colors.primary.alpha(0.025))
+            .bg(colors.primary.alpha(0.02))
             .flex()
             .justify_center();
         match look {
@@ -707,86 +1405,12 @@ impl ThreadLens {
                 .items_center()
                 .child(t("thread_lens.diagram_drawing"))
                 .into_any_element(),
-            Look::Failed(message, _) => code_block(Some("mermaid"), &format!("{code}\n\n%% {message}"), colors, &self.colors().1),
-        }
-    }
-
-    /// Inline spans. Code spans that read as `path:line` become pills that
-    /// open the file; a hover shows its first lines.
-    fn inline(&self, content: &InlineText, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
-        let mut line = div().min_w(px(0.0)).flex().flex_wrap().items_baseline();
-        for (index, span) in content.spans.iter().enumerate() {
-            if span.text.is_empty() {
-                continue;
+            Look::Failed(message, _) => {
+                let theme = self.colors().1;
+                let seg = SegId { key, block: 10_000 + index as u32 };
+                self.code_block(seg, Some("mermaid"), &format!("{code}\n\n%% {message}"), colors, &theme, cx)
             }
-            let style = span.style;
-            if style.code && looks_like_path(&span.text) {
-                line = line.child(self.path_pill(&span.text, index, colors, cx));
-                continue;
-            }
-            let link = span.link.clone();
-            line = line.child(
-                div()
-                    .id(SharedString::from(format!("lens-inline-{index}-{:p}", span)))
-                    .min_w(px(0.0))
-                    .max_w_full()
-                    .when(style.bold, |piece| piece.font_weight(FontWeight::SEMIBOLD))
-                    .when(style.italic, |piece| piece.italic())
-                    .when(style.strikethrough, |piece| piece.line_through())
-                    .when(style.code, |piece| {
-                        piece
-                            .px(px(4.0))
-                            .rounded(px(4.0))
-                            .bg(colors.primary.alpha(0.07))
-                            .font_family(crate::fonts::mono_family())
-                            .text_size(px(MONO_SIZE))
-                    })
-                    .when(link.is_some(), |piece| {
-                        piece.underline().cursor_pointer().text_color(rgba(0x6aa6e8ff))
-                    })
-                    .when_some(link, |piece, link| {
-                        piece.on_click(move |_, _, cx| {
-                            cx.open_url(&link);
-                            cx.stop_propagation();
-                        })
-                    })
-                    .child(SharedString::from(span.text.clone())),
-            );
         }
-        line.into_any_element()
-    }
-
-    fn path_pill(&self, reference: &str, index: usize, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
-        let reference = reference.to_owned();
-        let label = short_path(&reference);
-        let cwd = self.session().map(|s| s.cwd.clone()).unwrap_or_default();
-        let preview_reference = reference.clone();
-        div()
-            .id(SharedString::from(format!("lens-path-{index}-{reference}")))
-            .flex()
-            .items_center()
-            .gap(px(4.0))
-            .mx(px(1.0))
-            .px(px(6.0))
-            .h(px(20.0))
-            .rounded(px(Radius::CHIP))
-            .bg(colors.primary.alpha(0.07))
-            .hover(|pill| pill.bg(colors.primary.alpha(0.12)))
-            .cursor_pointer()
-            .font_family(crate::fonts::mono_family())
-            .text_size(px(MONO_SIZE))
-            .text_color(colors.primary)
-            .child(div().text_color(colors.tertiary).child("↗"))
-            .child(SharedString::from(label))
-            .tooltip(move |_, cx| {
-                let preview = file_preview(&cwd, &preview_reference);
-                cx.new(|_| PathPreview { preview, colors }).into()
-            })
-            .on_click(cx.listener(move |_, _, _, cx| {
-                cx.emit(ThreadLensEvent::OpenReference(reference.clone()));
-                cx.stop_propagation();
-            }))
-            .into_any_element()
     }
 
     fn render_strip(
@@ -801,24 +1425,26 @@ impl ThreadLens {
         let open_key = (strip.key, u16::MAX);
         let open = self.expanded.contains(&open_key);
         let failures = strip.failures();
-        let mut meta = strip.summary();
-        if let Some(ms) = strip.duration_ms()
+        let running = live && strip.pending();
+        let mut meta = if running { strip.activity() } else { strip.summary() };
+        if !running
+            && let Some(ms) = strip.duration_ms()
             && ms >= 100
         {
             meta.push_str(&format!(" · {}", duration(ms)));
         }
         let dot = div()
-            .size(px(7.0))
+            .size(px(6.0))
             .rounded_full()
             .bg(if failures > 0 {
                 Ink::DANGER
-            } else if live || strip.pending() {
+            } else if running {
                 rgba(ACCENT << 8 | 0xff)
             } else {
-                colors.tertiary.alpha(0.6)
+                colors.tertiary.alpha(0.55)
             });
         // Breathes only while the Agent works; a settled strip is static.
-        let dot = if live {
+        let dot = if running {
             dot.with_animation(
                 SharedString::from(format!("lens-breathe-{}", strip.key.offset)),
                 Animation::new(Duration::from_millis(1400)).repeat(),
@@ -845,51 +1471,57 @@ impl ThreadLens {
         let header = div()
             .id(SharedString::from(format!("lens-strip-{}", strip.key.offset)))
             .w_full()
-            .h(px(30.0))
-            .px(px(10.0))
+            .h(px(28.0))
+            .px(px(8.0))
+            .ml(px(-8.0))
             .flex()
             .items_center()
             .gap(px(9.0))
             .rounded(px(Radius::ROW))
             .cursor_pointer()
-            .hover(|header| header.bg(colors.primary.alpha(0.04)))
+            .hover(|header| header.bg(colors.primary.alpha(0.035)))
             .child(dot)
             .child(
                 div()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
                     .text_size(px(12.5))
-                    .text_color(colors.secondary)
+                    .text_color(if running { colors.primary.alpha(0.8) } else { colors.secondary })
                     .child(SharedString::from(meta)),
             )
             .when(failures > 0, |header| {
                 header.child(
                     div()
+                        .flex_none()
                         .text_size(px(11.5))
                         .text_color(Ink::DANGER)
                         .child(SharedString::from(tf("thread_lens.failed", &[("count", &failures)]))),
                 )
             })
             .child(div().flex_1())
-            .children(edited.iter().map(|path| {
-                div()
-                    .px(px(5.0))
-                    .rounded(px(Radius::CHIP))
-                    .bg(colors.primary.alpha(0.05))
-                    .font_family(crate::fonts::mono_family())
-                    .text_size(px(10.5))
-                    .text_color(colors.tertiary)
-                    .child(SharedString::from(file_name(path)))
-            }))
+            .when(!running, |header| {
+                header.children(edited.iter().map(|path| {
+                    div()
+                        .flex_none()
+                        .px(px(5.0))
+                        .rounded(px(Radius::CHIP))
+                        .bg(colors.primary.alpha(0.05))
+                        .font_family(crate::fonts::mono_family())
+                        .text_size(px(10.5))
+                        .text_color(colors.tertiary)
+                        .child(SharedString::from(file_name(path)))
+                }))
+            })
             .child(
-                div()
-                    .text_size(px(10.0))
-                    .text_color(colors.tertiary)
-                    .child(if open { "▾" } else { "▸" }),
+                crate::icons::sf_symbol(if open { "chevron.down" } else { "chevron.right" }, 9.0, colors.tertiary),
             )
             .on_click(cx.listener(move |this, _, _, cx| this.toggle(open_key, row, cx)));
         let mut strip_el = div().w_full().flex().flex_col().child(header);
         if open {
             let mut body = div()
-                .ml(px(13.0))
+                .ml(px(2.0))
                 .pl(px(14.0))
                 .border_l_1()
                 .border_color(colors.primary.alpha(0.08))
@@ -962,31 +1594,29 @@ impl ThreadLens {
             .on_click(cx.listener(move |this, _, _, cx| this.toggle(key, row, cx)));
         let mut el = div().flex().flex_col().child(line);
         let cards = self.cards_for(call);
-        if !cards.is_empty() {
-            for card in cards.iter() {
-                el = el.child(diff_card(card, colors, theme, cx));
-            }
+        for (n, card) in cards.iter().enumerate() {
+            el = el.child(self.diff_card(call.key, n, card, colors, theme, cx));
         }
         let is_edit = matches!(call.detail.work(), diri_proto::thread::WorkKind::Edit);
         if open && let Some(result) = &call.result {
             if !result.preview.trim().is_empty() && (!is_edit || result.is_error) {
+                let preview: String = result.preview.lines().take(40).collect::<Vec<_>>().join("\n");
+                let color: Hsla = if result.is_error { Ink::DANGER.into() } else { colors.secondary.into() };
+                let runs = vec![run(preview.len(), &mono_font(), color)];
+                let output = self.segment(SegId { key: call.key, block: 1 }, SharedString::from(preview), runs, Vec::new(), colors);
                 el = el.child(
                     div()
+                        .id(SharedString::from(format!("lens-output-{}-{}", call.key.offset, call.key.part)))
                         .my(px(4.0))
                         .p(px(10.0))
                         .rounded(px(Radius::BADGE))
-                        .bg(colors.primary.alpha(0.04))
+                        .bg(colors.primary.alpha(0.035))
+                        .overflow_x_scroll()
+                        .whitespace_nowrap()
                         .font_family(crate::fonts::mono_family())
                         .text_size(px(11.0))
                         .line_height(px(16.0))
-                        .text_color(if result.is_error { Ink::DANGER } else { colors.secondary })
-                        .children(result.preview.lines().take(40).map(|line| {
-                            div().whitespace_nowrap().child(SharedString::from(if line.is_empty() {
-                                " ".to_owned()
-                            } else {
-                                line.to_owned()
-                            }))
-                        })),
+                        .child(output),
                 );
             }
             let images: Vec<AnyElement> = result
@@ -1070,16 +1700,15 @@ impl ThreadLens {
                                 .h(px(height))
                                 .bg(rgba(0xffffffff).alpha(0.9)),
                         )
-                        .on_mouse_move(cx.listener(move |this, event: &gpui::MouseMoveEvent, window, cx| {
-                            if event.pressed_button != Some(gpui::MouseButton::Left) {
+                        .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
+                            if event.pressed_button != Some(MouseButton::Left) {
                                 return;
                             }
-                            let _ = window;
                             let x = f32::from(event.position.x);
                             // The wipe's own origin is not tracked; approximate
                             // from the measure-centred column.
                             let viewport = f32::from(window.viewport_size().width);
-                            let left = ((viewport - MEASURE) / 2.0).max(24.0) + 27.0;
+                            let left = ((viewport - MEASURE) / 2.0).max(28.0) + 27.0;
                             let next = ((x - left) / width).clamp(0.0, 1.0);
                             this.wipes.insert(strip_key, next);
                             cx.notify();
@@ -1117,6 +1746,131 @@ impl ThreadLens {
             .clone()
     }
 
+    /// A file change as a reviewer reads it: path, counts, unified rows with
+    /// the changed words washed, and quick actions. Each row's text is
+    /// selectable.
+    fn diff_card(
+        &mut self,
+        key: ItemKey,
+        index: usize,
+        card: &DiffCard,
+        colors: SemanticColors,
+        theme: &diri_term::theme::TermTheme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let palette = DiffPalette::new(colors, theme);
+        let path = card.path.clone();
+        let quote = format!("In `{}`: ", card.path);
+        let mono = mono_font();
+        let mut rows = div()
+            .flex()
+            .flex_col()
+            .font_family(crate::fonts::mono_family())
+            .text_size(px(11.5))
+            .line_height(px(17.0));
+        for (n, row) in card.rows.iter().take(80).enumerate() {
+            let (bg, sign, word_bg) = match row.side {
+                Side::Added => (Some(palette.added_line), "+", Some(palette.added_word)),
+                Side::Removed => (Some(palette.removed_line), "−", Some(palette.removed_word)),
+                Side::Context => (None, " ", None),
+                Side::Gap => (Some(palette.hunk), "⋯", None),
+            };
+            let text = if row.text.is_empty() { " ".to_owned() } else { row.text.clone() };
+            let mut runs = Vec::new();
+            let mut at = 0;
+            for range in &row.words {
+                if range.start > at {
+                    runs.push(run(range.start - at, &mono, palette.text.into()));
+                }
+                let mut word = run(range.len(), &mono, palette.text.into());
+                word.background_color = word_bg.map(Into::into);
+                runs.push(word);
+                at = range.end;
+            }
+            if at < text.len() {
+                runs.push(run(text.len() - at, &mono, palette.text.into()));
+            }
+            let seg = SegId { key, block: 100 + (index as u32) * 1000 + n as u32 };
+            let text_el = self.segment(seg, SharedString::from(text), runs, Vec::new(), colors);
+            rows = rows.child(
+                div()
+                    .flex()
+                    .when_some(bg, |row, bg| row.bg(bg))
+                    .child(
+                        div()
+                            .w(px(22.0))
+                            .flex_none()
+                            .text_center()
+                            .text_color(match row.side {
+                                Side::Added => palette.added,
+                                Side::Removed => palette.removed,
+                                _ => palette.muted,
+                            })
+                            .child(sign),
+                    )
+                    .child(div().whitespace_nowrap().child(text_el)),
+            );
+        }
+        let hidden = card.rows.len().saturating_sub(80) + card.hidden_rows;
+        div()
+            .my(px(4.0))
+            .rounded(px(Radius::CARD))
+            .border_1()
+            .border_color(colors.primary.alpha(0.08))
+            .bg(palette.surface)
+            .overflow_hidden()
+            .child(
+                div()
+                    .h(px(30.0))
+                    .px(px(10.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .border_b_1()
+                    .border_color(colors.primary.alpha(0.06))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("lens-card-open-{}-{index}", key.offset)))
+                            .font_family(crate::fonts::mono_family())
+                            .text_size(px(11.5))
+                            .text_color(colors.primary)
+                            .cursor_pointer()
+                            .hover(|p| p.underline())
+                            .child(SharedString::from(card.path.clone()))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(ThreadLensEvent::OpenReference(path.clone()));
+                            })),
+                    )
+                    .child(div().text_size(px(11.0)).text_color(palette.added).child(SharedString::from(format!("+{}", card.added))))
+                    .child(div().text_size(px(11.0)).text_color(palette.removed).child(SharedString::from(format!("−{}", card.removed))))
+                    .child(div().flex_1())
+                    .child(
+                        quiet_button(
+                            SharedString::from(format!("lens-card-quote-{}-{index}", key.offset)),
+                            t("thread_lens.quote"),
+                            colors,
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.composer.insert_context(&quote);
+                            this.focus.focus(window, cx);
+                            this.typed(cx);
+                        })),
+                    ),
+            )
+            .child(div().id(SharedString::from(format!("lens-card-rows-{}-{index}", key.offset))).overflow_x_scroll().child(rows))
+            .when(hidden > 0, |card_el| {
+                card_el.child(
+                    div()
+                        .px(px(10.0))
+                        .py(px(4.0))
+                        .text_size(px(10.5))
+                        .text_color(colors.tertiary)
+                        .child(SharedString::from(tf("thread_lens.more_lines", &[("count", &hidden)]))),
+                )
+            })
+            .into_any_element()
+    }
+
     // ── Chrome ───────────────────────────────────────────────────────────
 
     fn render_permission(&self, session: &SessionRecord, colors: SemanticColors, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -1130,164 +1884,171 @@ impl ThreadLens {
             .as_deref()
             .map_or_else(|| t("thread_lens.permission_needed").to_owned(), |tool| tf("thread_lens.allow_tool", &[("tool", &tool)]));
         Some(
-            div().mx(px(24.0)).mb(px(10.0)).flex().justify_center().child(
-            div()
-                .w_full()
-                .max_w(px(MEASURE + 40.0))
-                .p(px(14.0))
-                .rounded(px(Radius::PANEL))
-                .bg(colors.floating_fill())
-                .border_1()
-                .border_color(Ink::ATTENTION.alpha(0.45))
-                .shadow_md()
-                .flex()
-                .flex_col()
-                .gap(px(10.0))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(div().size(px(8.0)).rounded_full().bg(Ink::ATTENTION))
-                        .child(
-                            div()
-                                .text_size(px(13.5))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(colors.primary)
-                                .child(SharedString::from(title)),
-                        ),
-                )
-                .child(
-                    div()
-                        .font_family(crate::fonts::mono_family())
-                        .text_size(px(12.0))
-                        .line_height(px(17.0))
-                        .text_color(colors.secondary)
-                        .child(SharedString::from(
-                            detail
-                                .prompt_excerpt
-                                .clone()
-                                .unwrap_or_else(|| detail.summary.clone()),
-                        )),
-                )
-                .children(self.answer_error.clone().map(|error| {
-                    div().text_size(px(11.5)).text_color(Ink::DANGER).child(error)
-                }))
-                .child(
-                    div()
-                        .flex()
-                        .gap(px(8.0))
-                        .child(button("lens-approve", t("thread_lens.approve"), "⌘↩", true, colors).on_click(
-                            cx.listener(move |this, _, _, cx| {
-                                this.answer(BlockerChoice::Approve, occurred_at, cx)
-                            }),
-                        ))
-                        .child(button("lens-deny", t("thread_lens.deny"), "esc", false, colors).on_click(
-                            cx.listener(move |this, _, _, cx| {
-                                this.answer(BlockerChoice::Deny, occurred_at, cx)
-                            }),
-                        )),
-                ))
-                .into_any_element(),
+            div().mx(px(28.0)).mb(px(10.0)).flex().justify_center().child(
+                div()
+                    .w_full()
+                    .max_w(px(MEASURE + 40.0))
+                    .p(px(14.0))
+                    .rounded(px(Radius::PANEL))
+                    .bg(colors.floating_fill())
+                    .border_1()
+                    .border_color(Ink::ATTENTION.alpha(0.4))
+                    .shadow_md()
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(div().size(px(7.0)).rounded_full().bg(Ink::ATTENTION))
+                            .child(
+                                div()
+                                    .text_size(px(13.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(colors.primary)
+                                    .child(SharedString::from(title)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .font_family(crate::fonts::mono_family())
+                            .text_size(px(12.0))
+                            .line_height(px(17.0))
+                            .text_color(colors.secondary)
+                            .child(SharedString::from(
+                                detail
+                                    .prompt_excerpt
+                                    .clone()
+                                    .unwrap_or_else(|| detail.summary.clone()),
+                            )),
+                    )
+                    .children(self.answer_error.clone().map(|error| {
+                        div().text_size(px(11.5)).text_color(Ink::DANGER).child(error)
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.0))
+                            .child(button("lens-approve", t("thread_lens.approve"), "⌘↩", true, colors).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.answer(BlockerChoice::Approve, occurred_at, cx)
+                                }),
+                            ))
+                            .child(button("lens-deny", t("thread_lens.deny"), "esc", false, colors).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.answer(BlockerChoice::Deny, occurred_at, cx)
+                                }),
+                            )),
+                    ),
+            )
+            .into_any_element(),
         )
     }
 
-    fn render_composer(&self, session: Option<&SessionRecord>, colors: SemanticColors, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    /// The composer's text as one run list: the caret is a run of its own
+    /// (accent, or transparent between blinks, so nothing reflows), the
+    /// selection a background.
+    fn composer_text(&self, focused: bool, colors: SemanticColors) -> AnyElement {
+        let font = ui_font();
+        if self.composer.is_empty() {
+            let placeholder = t("thread_lens.placeholder");
+            let mut text = String::new();
+            let mut runs = Vec::new();
+            if focused {
+                text.push('▏');
+                runs.push(run('▏'.len_utf8(), &font, caret_color(self.caret_on)));
+            }
+            text.push_str(placeholder);
+            runs.push(run(placeholder.len(), &font, colors.tertiary.alpha(0.8).into()));
+            return StyledText::new(text).with_runs(runs).into_any_element();
+        }
+        let caret = if focused { "▏" } else { "" };
+        let (display, selection) = self.composer.display(caret);
+        let mut runs = vec![run(display.len(), &font, colors.primary.into())];
+        if let Some(range) = selection {
+            runs = select_runs(runs, range, selection_color(colors));
+        } else if focused {
+            let at = self.composer.cursor();
+            let caret_range = at..at + caret.len();
+            runs = split_runs(runs, caret_range, |run| run.color = caret_color(self.caret_on));
+        }
+        StyledText::new(display).with_runs(runs).into_any_element()
+    }
+
+    fn render_composer(&mut self, session: Option<&SessionRecord>, colors: SemanticColors, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let focused = self.focus.is_focused(window);
-        let (display, selection) = self.composer.display(if focused { "▏" } else { "" });
-        let placeholder = self.composer.is_empty();
+        self.ensure_blink(focused, cx);
+        let empty = self.composer.is_empty();
         let working = session.is_some_and(is_working);
         let kind = session.map(|s| s.effective_kind().clone());
         let now_ms = now_ms();
         let warmth = self.model.warmth(now_ms);
-        let model_label = warmth
-            .as_ref()
-            .map(|(model, _)| model_display(model))
-            .unwrap_or_else(|| t("thread_lens.model").into());
+        // Until the first request names a model there is nothing to say.
+        let model_label = warmth.as_ref().map(|(model, _)| model_display(model));
         let warmth_label = warmth.as_ref().map(|(_, warmth)| warmth_text(*warmth));
         let warm = matches!(warmth, Some((_, CacheWarmth::Warm { .. })));
+        // Only a session Diri runs under a saved account names it; with one
+        // login there is nothing to switch to.
         let account = session
             .and_then(|s| s.account_profile.as_ref())
             .map(|profile| profile.label.clone());
-        let text_el = if placeholder {
-            div()
-                .text_color(colors.tertiary)
-                .child(if focused { format!("▏{}  {}", t("thread_lens.placeholder"), t("thread_lens.placeholder_hint")) } else { t("thread_lens.placeholder").to_owned() })
-                .into_any_element()
-        } else {
-            let mut text = div().text_color(colors.primary);
-            match selection {
-                Some(range) => {
-                    let (a, rest) = display.split_at(range.start);
-                    let (b, c) = rest.split_at(range.end - range.start);
-                    text = text
-                        .flex()
-                        .flex_wrap()
-                        .child(SharedString::from(a.to_owned()))
-                        .child(div().bg(rgba(0x3d7ef099)).child(SharedString::from(b.to_owned())))
-                        .child(SharedString::from(c.to_owned()));
-                }
-                None => text = text.child(SharedString::from(display)),
-            }
-            text.into_any_element()
-        };
+        let claude = kind.as_ref() == Some(&AgentKind::CLAUDE_CODE);
         let model_pill = div()
             .id("lens-model-pill")
             .h(px(24.0))
-            .px(px(9.0))
+            .px(px(8.0))
             .flex()
             .items_center()
             .gap(px(6.0))
-            .rounded(px(12.0))
-            .bg(colors.primary.alpha(0.06))
-            .hover(|pill| pill.bg(colors.primary.alpha(0.1)))
-            .cursor_pointer()
+            .rounded(px(Radius::CHIP))
+            .hover(|pill| pill.bg(colors.primary.alpha(0.06)))
+            .when(claude, |pill| pill.cursor_pointer())
             .child(
                 div()
-                    .size(px(6.0))
+                    .size(px(5.0))
                     .rounded_full()
-                    .bg(if warm { Ink::FRESH } else { colors.tertiary.alpha(0.6) }),
+                    .bg(if warm { Ink::FRESH } else { colors.tertiary.alpha(0.5) }),
             )
-            .child(
+            .children(model_label.map(|label| {
                 div()
                     .text_size(px(11.5))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(colors.primary)
-                    .child(SharedString::from(model_label)),
-            )
+                    .text_color(colors.secondary)
+                    .child(SharedString::from(label))
+            }))
             .children(warmth_label.map(|label| {
                 div()
                     .font_family(crate::fonts::mono_family())
-                    .text_size(px(10.5))
-                    .text_color(colors.tertiary)
+                    .text_size(px(10.0))
+                    .text_color(colors.tertiary.alpha(0.8))
                     .child(SharedString::from(label))
             }))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.model_menu = !this.model_menu;
                 cx.notify();
             }));
-        let account_pill = div()
-            .id("lens-account-pill")
-            .h(px(24.0))
-            .px(px(9.0))
-            .flex()
-            .items_center()
-            .rounded(px(12.0))
-            .hover(|pill| pill.bg(colors.primary.alpha(0.06)))
-            .cursor_pointer()
-            .text_size(px(11.5))
-            .text_color(colors.secondary)
-            .child(SharedString::from(account.unwrap_or_else(|| t("thread_lens.default_account").into())))
-            .on_click(cx.listener(|_, _, _, cx| cx.emit(ThreadLensEvent::ContinueAccount)));
-        let menu = (self.model_menu && kind.as_ref() == Some(&AgentKind::CLAUDE_CODE)).then(|| {
+        let account_pill = account.map(|account| {
+            div()
+                .id("lens-account-pill")
+                .h(px(24.0))
+                .px(px(8.0))
+                .flex()
+                .items_center()
+                .rounded(px(Radius::CHIP))
+                .hover(|pill| pill.bg(colors.primary.alpha(0.06)))
+                .cursor_pointer()
+                .text_size(px(11.5))
+                .text_color(colors.tertiary)
+                .child(SharedString::from(account))
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(ThreadLensEvent::ContinueAccount)))
+        });
+        let menu = (self.model_menu && claude).then(|| {
             let mut menu = div()
-                .absolute()
-                .bottom(px(44.0))
-                .left(px(12.0))
                 .w(px(260.0))
                 .p(px(5.0))
                 .rounded(px(Radius::FLOATING_MENU - 4.0))
-                .bg(colors.floating_fill())
+                .bg(colors.floating_surface())
                 .border_1()
                 .border_color(colors.floating_stroke())
                 .shadow_lg()
@@ -1319,78 +2080,231 @@ impl ThreadLens {
             }
             menu.into_any_element()
         });
+        let slash = self.render_slash(colors, cx);
+        // The primary action follows the live state: Send when idle, Stop
+        // (Esc into the PTY, as the terminal's own interrupt) while the Agent
+        // works with nothing typed, Steer while it works and you type, which
+        // delivers the message mid-turn the way the CLI queues it.
+        let action = match (working, empty) {
+            (true, true) => Action::Stop,
+            (true, false) => Action::Steer,
+            (false, _) => Action::Send,
+        };
+        let send = div()
+            .id("lens-send")
+            .h(px(26.0))
+            .min_w(px(26.0))
+            .flex_none()
+            .rounded_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(px(5.0))
+            .when(action == Action::Steer, |button| button.px(px(10.0)))
+            .bg(match action {
+                Action::Stop => colors.primary.alpha(0.1),
+                Action::Send if empty => colors.primary.alpha(0.06),
+                _ => rgba(ACCENT << 8 | 0xff),
+            })
+            .cursor_pointer()
+            .child(match action {
+                Action::Stop => div().size(px(8.0)).rounded(px(2.0)).bg(colors.primary.alpha(0.75)).into_any_element(),
+                Action::Steer => div()
+                    .text_size(px(11.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgba(0xffffffff))
+                    .child(t("thread_lens.steer"))
+                    .into_any_element(),
+                Action::Send => crate::icons::sf_symbol(
+                    "arrow.up",
+                    12.0,
+                    if empty { colors.tertiary } else { rgba(0xffffffff) },
+                ),
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if action == Action::Stop {
+                    this.send("\u{1b}".into(), false, cx);
+                } else {
+                    this.submit(cx);
+                }
+            }))
+            .with_animation(
+                SharedString::from(format!("lens-action-{action:?}")),
+                Animation::new(Duration::from_millis(180)).with_easing(gpui::ease_out_quint()),
+                |button, t| button.opacity(0.4 + 0.6 * t),
+            );
         div()
             .relative()
-            .mx(px(24.0))
-            .mb(px(14.0))
+            .px(px(28.0))
+            .pb(px(16.0))
             .flex()
             .justify_center()
             .child(
                 div()
                     .id("lens-composer")
                     .w_full()
-                    .max_w(px(MEASURE + 40.0))
-                    .p(px(10.0))
-                    .rounded(px(16.0))
+                    .max_w(px(MEASURE + 24.0))
+                    .pl(px(14.0))
+                    .pr(px(8.0))
+                    .pt(px(11.0))
+                    .pb(px(8.0))
+                    .rounded(px(18.0))
                     .bg(colors.floating_fill())
                     .border_1()
-                    .border_color(if focused { colors.primary.alpha(0.16) } else { colors.primary.alpha(0.08) })
-                    .shadow_sm()
+                    .border_color(if focused { colors.primary.alpha(0.2) } else { colors.primary.alpha(0.08) })
+                    .when(focused, |composer| {
+                        composer.shadow(vec![
+                            gpui::BoxShadow {
+                                color: rgba(ACCENT << 8 | 0x24).into(),
+                                offset: gpui::point(px(0.0), px(0.0)),
+                                blur_radius: px(0.0),
+                                spread_radius: px(3.0),
+                                inset: false,
+                            },
+                            gpui::BoxShadow {
+                                color: gpui::black().opacity(0.10),
+                                offset: gpui::point(px(0.0), px(6.0)),
+                                blur_radius: px(18.0),
+                                spread_radius: px(0.0),
+                                inset: false,
+                            },
+                        ])
+                    })
+                    .when(!focused, |composer| composer.shadow_sm())
+                    // Keys go to the picker while the portal is docked.
+                    .when(self.portal_open, |composer| composer.opacity(0.45))
+                    .relative()
+                    .children(menu.or(slash).map(|menu| {
+                        // Rises from the composer's own top-left corner.
+                        div()
+                            .absolute()
+                            .left(px(-1.0))
+                            .bottom(gpui::relative(1.0))
+                            .pb(px(8.0))
+                            .child(menu)
+                    }))
                     .flex()
                     .flex_col()
-                    .gap(px(8.0))
+                    .gap(px(6.0))
                     .cursor_text()
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.focus.focus(window, cx);
-                        cx.notify();
+                        this.typed(cx);
                     }))
                     .child(
                         div()
                             .min_h(px(PROSE_LEADING))
-                            .px(px(4.0))
+                            .max_h(px(COMPOSER_MAX))
+                            .overflow_hidden()
                             .text_size(px(PROSE_SIZE))
                             .line_height(px(PROSE_LEADING))
-                            .child(text_el),
+                            .child(self.composer_text(focused, colors)),
                     )
                     .child(
                         div()
+                            .ml(px(-8.0))
                             .flex()
                             .items_center()
-                            .gap(px(6.0))
-                            .child(model_pill)
-                            .child(account_pill)
+                            .gap(px(2.0))
+                            .when(warmth.is_some(), |row| row.child(model_pill))
+                            .children(account_pill)
                             .child(div().flex_1())
-                            .when(working, |row| {
-                                row.child(
-                                    div()
-                                        .text_size(px(11.0))
-                                        .text_color(colors.tertiary)
-                                        .child(t("thread_lens.interrupt")),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .id("lens-send")
-                                    .size(px(26.0))
-                                    .rounded_full()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .bg(if placeholder {
-                                        colors.primary.alpha(0.08)
-                                    } else {
-                                        rgba(ACCENT << 8 | 0xff)
-                                    })
-                                    .text_color(if placeholder { colors.tertiary } else { rgba(0xffffffff) })
-                                    .text_size(px(13.0))
-                                    .cursor_pointer()
-                                    .child("↑")
-                                    .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
-                            ),
+                            .child(send),
                     ),
             )
-            .children(menu)
             .into_any_element()
+    }
+
+    /// The `/` menu above the composer.
+    fn render_slash(&mut self, colors: SemanticColors, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let matches = self.slash_matches();
+        if matches.is_empty() {
+            return None;
+        }
+        let selected = self.slash_index.min(matches.len() - 1);
+        let mut menu = div()
+            .w(px(400.0))
+            .p(px(5.0))
+            .rounded(px(Radius::FLOATING_MENU - 4.0))
+            .bg(colors.floating_surface())
+            .border_1()
+            .border_color(colors.floating_stroke())
+            .shadow_lg()
+            .flex()
+            .flex_col();
+        for (index, command) in matches.iter().enumerate() {
+            let active = index == selected;
+            menu = menu.child(
+                div()
+                    .id(SharedString::from(format!("lens-slash-{}", command.name)))
+                    .h(px(30.0))
+                    .px(px(9.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .rounded(px(Radius::ROW))
+                    .when(active, |row| row.bg(colors.primary.alpha(0.08)))
+                    .hover(|row| row.bg(colors.primary.alpha(0.06)))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_family(crate::fonts::mono_family())
+                            .text_size(px(12.0))
+                            .text_color(colors.primary)
+                            .child(SharedString::from(command.name.clone())),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_size(px(11.5))
+                            .text_color(colors.tertiary)
+                            .child(SharedString::from(command.description.clone())),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.slash_index = index;
+                        this.complete_slash(true, cx);
+                    })),
+            );
+        }
+        Some(menu.into_any_element())
+    }
+
+    /// The caret blinks at macOS's period while the composer has focus and
+    /// stops (no timer at all) once a frame drawn without focus says so.
+    fn ensure_blink(&mut self, focused: bool, cx: &mut Context<Self>) {
+        self.focused = focused;
+        if !focused || self.blink.is_some() || cx.reduce_motion() {
+            if !focused {
+                self.caret_on = true;
+            }
+            return;
+        }
+        self.blink = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(BLINK).await;
+                let keep = this.update(cx, |this, cx| {
+                    if !this.focused {
+                        this.blink = None;
+                        this.caret_on = true;
+                        return false;
+                    }
+                    if std::mem::take(&mut this.typed) {
+                        this.caret_on = true;
+                    } else {
+                        this.caret_on = !this.caret_on;
+                        cx.notify();
+                    }
+                    true
+                });
+                if !matches!(keep, Ok(true)) {
+                    return;
+                }
+            }
+        }));
     }
 }
 
@@ -1399,17 +2313,63 @@ impl Render for ThreadLens {
         crate::perf_overlay::rendered("thread-lens");
         let (colors, _) = self.colors();
         let session = self.session();
-        let rows = self.model.rows.len();
-        let empty = rows == 0;
+        // The working line follows the session's status.
+        let extra = self.extra_rows();
+        if extra != self.shown_extra {
+            self.apply_change(RowChange::None);
+        }
+        // Rows re-register their text as the list lays them out.
+        self.segments.clear();
+        let empty = self.model.rows.is_empty() && self.shown_extra == 0;
         let thread = list(
             self.list.clone(),
             cx.processor(|this, index, window, cx| this.render_row(index, window, cx)),
         )
         .size_full();
-        let permission = session
-            .as_deref()
-            .and_then(|session| self.render_permission(session, colors, cx));
+        // One docked slot above the composer: the live PTY portal while a
+        // picker is open, else a permission card.
+        let docked = self.dock.take().or_else(|| {
+            session
+                .as_deref()
+                .and_then(|session| self.render_permission(session, colors, cx))
+        });
         let composer = self.render_composer(session.as_deref(), colors, window, cx);
+        let behind = !self.list.is_following_tail() && !empty;
+        let jump = behind.then(|| {
+            div()
+                .absolute()
+                .bottom(px(12.0))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .id("lens-jump-latest")
+                        .size(px(30.0))
+                        .rounded_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(colors.floating_fill())
+                        .border_1()
+                        .border_color(colors.floating_stroke())
+                        .shadow_md()
+                        .cursor_pointer()
+                        .hover(|button| button.bg(colors.primary.alpha(0.08)))
+                        .child(crate::icons::sf_symbol("arrow.down", 12.0, colors.secondary))
+                        .shortcut_tooltip(t("thread_lens.jump_latest"), None, colors)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.list.set_follow_mode(gpui::FollowMode::Tail);
+                            cx.notify();
+                        }))
+                        .with_animation(
+                            "lens-jump-in",
+                            Animation::new(Duration::from_millis(160)).with_easing(gpui::ease_out_quint()),
+                            |button, t| button.opacity(t).mt(px(6.0 * (1.0 - t))),
+                        ),
+                )
+        });
         div()
             .id("thread-lens")
             .key_context("DiriThreadLens")
@@ -1423,12 +2383,16 @@ impl Render for ThreadLens {
             .font_family(crate::fonts::ui_family())
             .child(
                 div()
+                    .id("lens-thread")
                     .relative()
                     .flex_1()
                     .min_h(px(0.0))
                     .pt(px(8.0))
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::select_down))
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.select_drag(event, cx)))
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.selecting = false))
                     .child(thread)
-                    .when(empty, |area| {
+                    .when(empty && self.model.structured == Some(false), |area| {
                         area.child(
                             div()
                                 .absolute()
@@ -1438,24 +2402,194 @@ impl Render for ThreadLens {
                                 .justify_center()
                                 .text_size(px(13.0))
                                 .text_color(colors.tertiary)
-                                .child(match self.model.structured {
-                                    Some(false) => SharedString::from(
-                                        self.model
-                                            .reason
-                                            .clone()
-                                            .unwrap_or_else(|| t("thread_lens.unstructured").into()),
-                                    ),
-                                    _ => SharedString::from(t("thread_lens.empty")),
-                                }),
+                                .child(SharedString::from(
+                                    self.model
+                                        .reason
+                                        .clone()
+                                        .unwrap_or_else(|| t("thread_lens.unstructured").into()),
+                                )),
                         )
-                    }),
+                    })
+                    .children(jump),
             )
-            .children(permission)
+            .children(docked)
             .child(composer)
     }
 }
 
 // ── Pieces ───────────────────────────────────────────────────────────────
+
+/// Bold, italic, struck, `code`, links and `path:line` references as runs
+/// of one text, so they wrap together like any word: a period after a bold
+/// phrase or a code span stays on its line.
+fn inline_runs(content: &InlineText, weight: FontWeight, color: Hsla, colors: SemanticColors) -> (String, Vec<TextRun>, Targets) {
+    let base = Font { weight, ..ui_font() };
+    let mono = mono_font();
+    let mut text = String::new();
+    let mut runs = Vec::new();
+    let mut targets = Vec::new();
+    for span in &content.spans {
+        if span.text.is_empty() {
+            continue;
+        }
+        let style = span.style;
+        let start = text.len();
+        let path = style.code && looks_like_path(&span.text);
+        let shown = if path { short_path(&span.text) } else { span.text.clone() };
+        text.push_str(&shown);
+        let mut font = if style.code { mono.clone() } else { base.clone() };
+        if style.bold {
+            font.weight = FontWeight::SEMIBOLD;
+        }
+        if style.italic {
+            font.style = FontStyle::Italic;
+        }
+        let mut piece = run(shown.len(), &font, color);
+        if style.code {
+            piece.background_color = Some(colors.primary.alpha(if path { 0.09 } else { 0.07 }).into());
+            piece.color = if path { colors.primary.into() } else { colors.primary.alpha(0.88).into() };
+        }
+        if style.strikethrough {
+            piece.strikethrough = Some(StrikethroughStyle { thickness: px(1.0), color: Some(color) });
+        }
+        if let Some(link) = &span.link {
+            piece.color = rgba(LINK << 8 | 0xff).into();
+            piece.underline = Some(UnderlineStyle { thickness: px(1.0), color: Some(rgba(LINK << 8 | 0x66).into()), wavy: false });
+            targets.push((start..text.len(), Target::Url(link.clone())));
+        } else if path {
+            piece.underline = Some(UnderlineStyle { thickness: px(1.0), color: Some(colors.primary.alpha(0.22).into()), wavy: false });
+            targets.push((start..text.len(), Target::Path(span.text.clone())));
+        }
+        runs.push(piece);
+    }
+    (text, runs, targets)
+}
+
+fn ui_font() -> Font {
+    gpui::font(crate::fonts::ui_family())
+}
+
+fn mono_font() -> Font {
+    gpui::font(crate::fonts::mono_family())
+}
+
+fn run(len: usize, font: &Font, color: Hsla) -> TextRun {
+    TextRun {
+        len,
+        font: font.clone(),
+        color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    }
+}
+
+fn caret_color(on: bool) -> Hsla {
+    if on {
+        rgba(ACCENT << 8 | 0xff).into()
+    } else {
+        gpui::transparent_black()
+    }
+}
+
+fn selection_color(colors: SemanticColors) -> Hsla {
+    if colors.lightness() < 0.5 {
+        rgba(0x3d7ef066).into()
+    } else {
+        rgba(0x3d7ef040).into()
+    }
+}
+
+/// Splits `runs` at `range`'s ends and edits the runs inside it.
+fn split_runs(runs: Vec<TextRun>, range: Range<usize>, edit: impl Fn(&mut TextRun)) -> Vec<TextRun> {
+    let mut out = Vec::with_capacity(runs.len() + 2);
+    let mut at = 0;
+    for original in runs {
+        let end = at + original.len;
+        let cuts = [at, range.start.clamp(at, end), range.end.clamp(at, end), end];
+        for pair in cuts.windows(2) {
+            if pair[1] > pair[0] {
+                let mut piece = original.clone();
+                piece.len = pair[1] - pair[0];
+                if pair[0] >= range.start && pair[1] <= range.end {
+                    edit(&mut piece);
+                }
+                out.push(piece);
+            }
+        }
+        at = end;
+    }
+    out
+}
+
+fn select_runs(runs: Vec<TextRun>, range: Range<usize>, background: Hsla) -> Vec<TextRun> {
+    split_runs(runs, range, |run| run.background_color = Some(background))
+}
+
+/// The word (or run of punctuation, or space) around byte `index`.
+fn word_at(text: &str, index: usize) -> Range<usize> {
+    for (start, word) in text.split_word_bound_indices() {
+        let end = start + word.len();
+        if index < end || end == text.len() {
+            return start..end;
+        }
+    }
+    0..text.len()
+}
+
+fn bubble(colors: SemanticColors) -> gpui::Div {
+    div()
+        .max_w(px(MEASURE * 0.82))
+        .px(px(15.0))
+        .py(px(9.0))
+        .rounded(px(18.0))
+        .bg(colors.primary.alpha(0.06))
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+}
+
+/// The thread's tail while the Agent works and no strip says what on.
+fn working_line(text: &str, colors: SemanticColors) -> AnyElement {
+    div()
+        .h(px(28.0))
+        .flex()
+        .items_center()
+        .gap(px(9.0))
+        .child(
+            div()
+                .size(px(6.0))
+                .rounded_full()
+                .bg(rgba(ACCENT << 8 | 0xff))
+                .with_animation(
+                    "lens-working-dot",
+                    Animation::new(Duration::from_millis(1400)).repeat(),
+                    |dot, t| dot.opacity(0.35 + 0.65 * (0.5 - 0.5 * (t * std::f32::consts::TAU).cos())),
+                ),
+        )
+        .child(
+            div()
+                .text_size(px(12.5))
+                .text_color(colors.tertiary)
+                .child(SharedString::from(text.to_owned())),
+        )
+        .into_any_element()
+}
+
+fn quiet_button(id: SharedString, label: &'static str, colors: SemanticColors) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .h(px(20.0))
+        .px(px(7.0))
+        .flex()
+        .items_center()
+        .rounded(px(Radius::CHIP))
+        .text_size(px(10.5))
+        .text_color(colors.tertiary)
+        .cursor_pointer()
+        .hover(|b| b.bg(colors.primary.alpha(0.07)).text_color(colors.secondary))
+        .child(label)
+}
 
 fn permission(session: &SessionRecord) -> Option<f64> {
     session
@@ -1499,22 +2633,6 @@ pub fn warmth_text(warmth: CacheWarmth) -> String {
     }
 }
 
-pub fn model_display(model: &str) -> String {
-    let lower = model.to_ascii_lowercase();
-    for family in ["opus", "sonnet", "haiku", "fable"] {
-        if let Some(rest) = lower.split(&format!("{family}-")).nth(1) {
-            let version: Vec<&str> = rest.split(['-', '[']).take_while(|p| p.len() <= 2 && p.chars().all(|c| c.is_ascii_digit())).collect();
-            let mut name = String::from(&family[..1]).to_ascii_uppercase() + &family[1..];
-            if !version.is_empty() {
-                name.push(' ');
-                name.push_str(&version.join("."));
-            }
-            return name;
-        }
-    }
-    model.to_owned()
-}
-
 fn duration(ms: i64) -> String {
     if ms < 60_000 {
         format!("{:.1}s", ms as f64 / 1000.0)
@@ -1543,7 +2661,10 @@ fn call_title(call: &Call) -> (&'static str, String) {
         ToolDetail::Task { description } => (t("thread_lens.verb.delegated"), description.lines().next().unwrap_or_default().to_owned()),
         ToolDetail::Other { input } => (
             t("thread_lens.verb.used"),
-            format!("{}  {}", call.name, input.chars().take(80).collect::<String>()),
+            match super::model::tool_subject(input) {
+                Some(subject) => format!("{}  {subject}", super::model::tool_label(&call.name)),
+                None => super::model::tool_label(&call.name),
+            },
         ),
     }
 }
@@ -1636,30 +2757,6 @@ impl Render for PathPreview {
     }
 }
 
-fn command_chip(name: &str, args: &str, colors: SemanticColors) -> AnyElement {
-    div()
-        .w_full()
-        .flex()
-        .justify_end()
-        .child(
-            div()
-                .px(px(9.0))
-                .h(px(24.0))
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .rounded(px(12.0))
-                .border_1()
-                .border_color(colors.primary.alpha(0.1))
-                .font_family(crate::fonts::mono_family())
-                .text_size(px(11.5))
-                .child(div().text_color(rgba(ACCENT << 8 | 0xff)).child(SharedString::from(name.to_owned())))
-                .when(!args.is_empty(), |chip| {
-                    chip.child(div().text_color(colors.secondary).child(SharedString::from(args.to_owned())))
-                }),
-        )
-        .into_any_element()
-}
 
 fn notice(text: &str, colors: SemanticColors) -> AnyElement {
     div()
@@ -1743,81 +2840,6 @@ fn button(id: &'static str, label: &'static str, hint: &'static str, primary: bo
         .child(div().text_size(px(10.5)).opacity(0.7).child(hint))
 }
 
-fn code_block(language: Option<&str>, code: &str, colors: SemanticColors, theme: &diri_term::theme::TermTheme) -> AnyElement {
-    let palette = EditorPalette::from_theme(theme);
-    let source_language = language
-        .map(|lang| SourceLanguage::from_path(std::path::Path::new(&format!("x.{}", match lang {
-            "rust" => "rs",
-            "python" => "py",
-            "typescript" => "ts",
-            "javascript" => "js",
-            "bash" | "shell" | "console" => "sh",
-            other => other,
-        }))))
-        .unwrap_or(SourceLanguage::from_path(std::path::Path::new("x.txt")));
-    let grammar = syntax::grammar(source_language);
-    let mut state = LexState::default();
-    let mut lines = div()
-        .p(px(12.0))
-        .flex()
-        .flex_col()
-        .font_family(crate::fonts::mono_family())
-        .text_size(px(MONO_SIZE))
-        .line_height(px(MONO_LEADING))
-        .text_color(palette.foreground);
-    for line in code.lines().take(400) {
-        let (tokens, next) = syntax::lex_line(line, state, grammar);
-        state = next;
-        let mut row = div().flex().whitespace_nowrap();
-        let mut at = 0;
-        for token in tokens {
-            if token.range.start > at {
-                row = row.child(SharedString::from(line[at..token.range.start].to_owned()));
-            }
-            row = row.child(
-                div()
-                    .text_color(token_color(&palette, token.kind))
-                    .child(SharedString::from(line[token.range.clone()].to_owned())),
-            );
-            at = token.range.end;
-        }
-        if at < line.len() {
-            row = row.child(SharedString::from(line[at..].to_owned()));
-        }
-        if line.is_empty() {
-            row = row.child(" ");
-        }
-        lines = lines.child(row);
-    }
-    div()
-        .w_full()
-        .rounded(px(Radius::CARD))
-        .bg(palette.background)
-        .border_1()
-        .border_color(colors.primary.alpha(0.07))
-        .overflow_hidden()
-        .when_some(language.map(str::to_owned), |block, language| {
-            block.child(
-                div()
-                    .h(px(26.0))
-                    .px(px(12.0))
-                    .flex()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(colors.primary.alpha(0.06))
-                    .text_size(px(10.5))
-                    .text_color(colors.tertiary)
-                    .child(SharedString::from(language)),
-            )
-        })
-        .child(
-            div()
-                .id(SharedString::from(format!("lens-code-{:x}", fxhash(code))))
-                .overflow_x_scroll()
-                .child(lines),
-        )
-        .into_any_element()
-}
 
 fn token_color(palette: &EditorPalette, kind: TokenKind) -> Rgba {
     match kind {
@@ -1835,141 +2857,11 @@ fn token_color(palette: &EditorPalette, kind: TokenKind) -> Rgba {
     }
 }
 
-fn fxhash(text: &str) -> u64 {
-    text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
-    })
-}
-
-/// A file change as a reviewer reads it: path, counts, unified rows with the
-/// changed words washed, and quick actions.
-fn diff_card(card: &DiffCard, colors: SemanticColors, theme: &diri_term::theme::TermTheme, cx: &mut Context<ThreadLens>) -> AnyElement {
-    let palette = DiffPalette::new(colors, theme);
-    let path = card.path.clone();
-    let quote = format!("In `{}`: ", card.path);
-    let mut rows = div()
-        .flex()
-        .flex_col()
-        .font_family(crate::fonts::mono_family())
-        .text_size(px(11.5))
-        .line_height(px(17.0));
-    for row in card.rows.iter().take(80) {
-        let (bg, sign, word_bg) = match row.side {
-            Side::Added => (palette.added_line, "+", palette.added_word),
-            Side::Removed => (palette.removed_line, "−", palette.removed_word),
-            Side::Context => (gpui::transparent_black().into(), " ", gpui::transparent_black().into()),
-            Side::Gap => (palette.hunk, "⋯", gpui::transparent_black().into()),
-        };
-        let mut text = div().flex().whitespace_nowrap();
-        if row.words.is_empty() {
-            text = text.child(SharedString::from(if row.text.is_empty() { " ".to_owned() } else { row.text.clone() }));
-        } else {
-            let mut at = 0;
-            for range in &row.words {
-                if range.start > at {
-                    text = text.child(SharedString::from(row.text[at..range.start].to_owned()));
-                }
-                text = text.child(
-                    div()
-                        .bg(word_bg)
-                        .rounded(px(2.0))
-                        .child(SharedString::from(row.text[range.clone()].to_owned())),
-                );
-                at = range.end;
-            }
-            if at < row.text.len() {
-                text = text.child(SharedString::from(row.text[at..].to_owned()));
-            }
-        }
-        rows = rows.child(
-            div()
-                .flex()
-                .bg(bg)
-                .child(
-                    div()
-                        .w(px(22.0))
-                        .flex_none()
-                        .text_center()
-                        .text_color(match row.side {
-                            Side::Added => palette.added,
-                            Side::Removed => palette.removed,
-                            _ => palette.muted,
-                        })
-                        .child(sign),
-                )
-                .child(text.text_color(palette.text)),
-        );
-    }
-    let hidden = card.rows.len().saturating_sub(80) + card.hidden_rows;
-    div()
-        .my(px(4.0))
-        .rounded(px(Radius::CARD))
-        .border_1()
-        .border_color(colors.primary.alpha(0.08))
-        .bg(palette.surface)
-        .overflow_hidden()
-        .child(
-            div()
-                .h(px(30.0))
-                .px(px(10.0))
-                .flex()
-                .items_center()
-                .gap(px(8.0))
-                .border_b_1()
-                .border_color(colors.primary.alpha(0.06))
-                .child(
-                    div()
-                        .id(SharedString::from(format!("lens-card-open-{}", card.path)))
-                        .font_family(crate::fonts::mono_family())
-                        .text_size(px(11.5))
-                        .text_color(colors.primary)
-                        .cursor_pointer()
-                        .hover(|p| p.underline())
-                        .child(SharedString::from(card.path.clone()))
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            cx.emit(ThreadLensEvent::OpenReference(path.clone()));
-                        })),
-                )
-                .child(div().text_size(px(11.0)).text_color(palette.added).child(SharedString::from(format!("+{}", card.added))))
-                .child(div().text_size(px(11.0)).text_color(palette.removed).child(SharedString::from(format!("−{}", card.removed))))
-                .child(div().flex_1())
-                .child(
-                    div()
-                        .id(SharedString::from(format!("lens-card-quote-{}", card.path)))
-                        .px(px(7.0))
-                        .h(px(20.0))
-                        .flex()
-                        .items_center()
-                        .rounded(px(Radius::CHIP))
-                        .text_size(px(10.5))
-                        .text_color(colors.secondary)
-                        .cursor_pointer()
-                        .hover(|b| b.bg(colors.primary.alpha(0.07)))
-                        .child(t("thread_lens.quote"))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.composer.insert_context(&quote);
-                            this.focus.focus(window, cx);
-                            cx.notify();
-                        })),
-                ),
-        )
-        .child(div().id(SharedString::from(format!("lens-card-rows-{}", card.path))).overflow_x_scroll().child(rows))
-        .when(hidden > 0, |card_el| {
-            card_el.child(
-                div()
-                    .px(px(10.0))
-                    .py(px(4.0))
-                    .text_size(px(10.5))
-                    .text_color(colors.tertiary)
-                    .child(SharedString::from(tf("thread_lens.more_lines", &[("count", &hidden)]))),
-            )
-        })
-        .into_any_element()
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::Entity;
 
     #[test]
     fn path_detection_accepts_references_and_rejects_prose() {
@@ -1992,5 +2884,117 @@ mod tests {
             "warm 4m12s"
         );
         assert_eq!(warmth_text(CacheWarmth::Cold { ever: false }), "cold write");
+    }
+
+    fn runs_of(lens: &[usize]) -> Vec<TextRun> {
+        lens.iter().map(|len| run(*len, &ui_font(), gpui::black())).collect()
+    }
+
+    #[test]
+    fn a_selection_splits_runs_without_moving_text() {
+        let runs = select_runs(runs_of(&[5, 4, 6]), 3..11, gpui::red());
+        let lens: Vec<usize> = runs.iter().map(|r| r.len).collect();
+        assert_eq!(lens, vec![3, 2, 4, 2, 4]);
+        assert_eq!(lens.iter().sum::<usize>(), 15);
+        let marked: Vec<bool> = runs.iter().map(|r| r.background_color.is_some()).collect();
+        assert_eq!(marked, vec![false, true, true, true, false]);
+    }
+
+    #[test]
+    fn double_click_takes_the_word_under_the_pointer() {
+        let text = "open **Set up**. It takes";
+        assert_eq!(&text[word_at(text, 8)], "Set");
+        assert_eq!(&text[word_at(text, 0)], "open");
+    }
+
+    fn colors() -> SemanticColors {
+        diri_ui::SemanticColors::dark()
+    }
+
+    /// Screenshot 5: "click **Set up**" then a period wrapped onto its own
+    /// line, because every span was its own flex item. Now a paragraph is a
+    /// single text: the period follows "up" with no break opportunity.
+    #[test]
+    fn a_period_after_bold_stays_in_the_same_text() {
+        let document = MarkdownDocument::parse(
+            "To turn it on, open **Diri Settings › Agents › Computer use** and click **Set up**. It takes a few seconds, see `src/app.rs:42`.",
+        );
+        let MarkdownBlock::Paragraph(content) = &document.blocks[0] else {
+            panic!("one paragraph");
+        };
+        let (text, runs, targets) = inline_runs(content, FontWeight::NORMAL, gpui::white(), colors());
+        assert!(text.contains("click Set up. It takes"), "{text}");
+        assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), text.len());
+        let bold: Vec<&str> = {
+            let mut at = 0;
+            runs.iter()
+                .filter_map(|r| {
+                    let piece = &text[at..at + r.len];
+                    at += r.len;
+                    (r.font.weight == FontWeight::SEMIBOLD).then_some(piece)
+                })
+                .collect()
+        };
+        assert_eq!(bold, vec!["Diri Settings › Agents › Computer use", "Set up"]);
+        assert!(matches!(&targets[..], [(_, Target::Path(path))] if path == "src/app.rs:42"));
+    }
+
+    fn lens_window(cx: &mut gpui::TestAppContext) -> (Entity<ThreadLens>, &mut gpui::VisualTestContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap());
+        let handle = tokio.handle().clone();
+        std::mem::forget(tokio);
+        let (lens, cx) = cx.add_window_view(move |_, cx| {
+            ThreadLens::new(SessionId::new("lens-test"), runtime, handle, cx)
+        });
+        (lens, cx)
+    }
+
+    fn user_page(offset: u64, text: &str) -> diri_proto::thread::ThreadReadResult {
+        use diri_proto::thread::{ThreadBody, ThreadCursor, ThreadItem, THREAD_WIRE_VERSION};
+        diri_proto::thread::ThreadReadResult {
+            version: THREAD_WIRE_VERSION,
+            structured: true,
+            next: ThreadCursor { generation: "g".into(), offset: offset + 10 },
+            items: vec![
+                ThreadItem { key: ItemKey { offset, part: 0 }, at_ms: Some(now_ms() + 60_000), body: ThreadBody::User { text: text.into(), images: vec![] } },
+                ThreadItem {
+                    key: ItemKey { offset: offset + 1, part: 0 },
+                    at_ms: None,
+                    body: ThreadBody::Assistant { text: "Open **Settings**, then click **Set up**. Done.".into() },
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// Enter shows the message in the same frame, with the working line;
+    /// the transcript record replaces it without a duplicate.
+    #[gpui::test]
+    fn a_sent_message_shows_at_once_and_reconciles_with_its_record(cx: &mut gpui::TestAppContext) {
+        let (lens, cx) = lens_window(cx);
+        lens.update(cx, |lens, cx| lens.send_for_test("cool it's fine. /model", cx));
+        lens.read_with(cx, |lens, _| {
+            assert_eq!(lens.model.pending.len(), 1);
+            assert_eq!(lens.rows_for_test(), 2, "pending bubble + working line, at 0 ms");
+        });
+        lens.update(cx, |lens, cx| lens.ingest_for_test(user_page(100, "cool it's fine. /model"), cx));
+        cx.run_until_parked();
+        lens.read_with(cx, |lens, _| {
+            assert!(lens.model.pending.is_empty());
+            assert_eq!(lens.rows_for_test(), lens.model.rows.len(), "{:?}", lens.model.rows.len());
+            assert_eq!(lens.model.rows.len(), 2, "one user row, one reply, no duplicate");
+        });
+    }
+
+    /// Text drawn in the thread is selectable end to end and copies as the
+    /// reader sees it.
+    #[gpui::test]
+    fn selecting_the_thread_copies_its_text(cx: &mut gpui::TestAppContext) {
+        let (lens, cx) = lens_window(cx);
+        lens.update(cx, |lens, cx| lens.ingest_for_test(user_page(0, "hi there"), cx));
+        cx.run_until_parked();
+        let copied = lens.update(cx, |lens, _| lens.select_all_text_for_test());
+        assert_eq!(copied.as_deref(), Some("hi there\n\nOpen Settings, then click Set up. Done."));
     }
 }

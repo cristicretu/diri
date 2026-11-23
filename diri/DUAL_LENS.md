@@ -5,7 +5,7 @@ One live Agent session, two ways to look at it, both over the same PTY Holder:
 - **TUI Lens (Pilot Mode)** is the terminal grid Diri always had.
 - **GUI Lens (Conductor Mode)** is an editorial thread: prose, collapsible Work Strips, Diff Cards, images, diagrams, a composer, permission cards.
 
-⌥⌘L (`toggle-lens`, rebindable) or the pane header's *Conversation | Terminal* control flips between them. The binding was checked against the keymap: ⌘. is Activity, ⇧⌘L is the code editor's Select All Occurrences, and ⌥⌘L was free.
+⌥⌘L (`toggle-lens`, rebindable) or the pane header's lens icon (a speech bubble from the terminal, a prompt from the conversation) flips between them. The binding was checked against the keymap: ⌘. is Activity, ⇧⌘L is the code editor's Select All Occurrences, and ⌥⌘L was free.
 
 ## One PTY truth, two observation channels
 
@@ -29,25 +29,40 @@ Engine ◄── kernel watch ◄── Agent's own JSONL ◄────┼─�
   - It returns versioned `diri_proto::thread::ThreadItem`s keyed by `(record offset, part)`.
   - It is stateless per request, so Engine restarts, app restarts and reconnects resume from the client's cursor.
   - A cursor that is not a record boundary, or that belongs to another file (`generation` = device + inode), resets to 0. The client merges by key, so a replay is idempotent.
-- **Wakeups** come from `notify` (FSEvents/inotify) on the transcript's directory, published as `session.thread_appended`.
-  - A read with `watch: true` leases the watch for one hour, and every read renews it. Expired leases are pruned lazily, so nothing polls and there are no timers.
-  - The lens also re-reads on its session's `session.updated`. Hooks fire at every turn boundary, so a watch event lost to FSEvents' asynchronous stream start, or to an expired lease, is recovered on the next status change.
+- **Wakeups** have three independent sources, so one missed signal never leaves a turn unseen:
+  - `notify` (FSEvents/inotify) on the transcript's directory, published as `session.thread_appended`. A read with `watch: true` leases the watch for one hour, and every read renews it. Expired leases are pruned lazily.
+  - Every Agent hook (PreToolUse, PostToolUse, Stop, Notification, UserPromptSubmit) calls `ThreadWatches::poke`, which re-announces the leased transcript.
+  - PTY output in a session with the GUI Lens open schedules a re-read 120 ms and 900 ms after the screen goes quiet, for a CLI that flushes its JSONL after drawing the turn. A read with nothing new is a stat and a few bytes.
+  - None of these poll: an idle session with idle output schedules nothing.
+- **Local command output.** Claude records `/model`, `/cost`, `/status` output as `<local-command-stdout>`; it reaches the thread as `ThreadBody::CommandOutput`. `/model` never draws a chip: the CLI's confirmation becomes one *Switched to …* divider, repeated switches with nothing between collapse into one, and the next request's usage record does not draw a second divider for the same switch.
+- **Optimistic send.** Enter shows the message in the same frame (with the working line) and re-follows the tail; the transcript record replaces it when it lands (whitespace-insensitive match, so a replay never duplicates it).
 - **Toggle cost.** Flipping is a view-state change in `TerminalPane::lens_modes`. The grid's attachment keeps receiving diffs while the GUI Lens shows, and the lens keeps its thread, scroll and draft while the TUI shows. Neither side reconnects or replays anything.
-- **PTY portal.** When the Agent asks something only its terminal can answer (a non-permission `needsInput`, a password, a picker, an auth flow), the GUI Lens shows the real grid inline, clipped to its bottom rows. The grid keeps the pane's full size, so the PTY is never resized. Clicking the portal focuses the terminal.
+- **PTY portal.** Pickers never reach the transcript (Claude's `/model`, `/config`, `/mcp`, `/permissions`, `/login`; Codex's model and approval pickers; trust dialogs; `fzf`). `thread_lens::portal::picker_rows` reads the live screen and finds one by its footer (`Esc to cancel`, `Enter to confirm`, `↑/↓ to navigate`, …) or by a highlighted numbered list, bounded by the rule or blank rows above it. While one is open:
+  - a live slice of the real grid showing exactly the picker's rows docks above the (dimmed) composer, aligned on both axes from the terminal's painted geometry; the grid keeps the pane's full size, so the PTY is never resized;
+  - keyboard focus moves to the terminal and the lens lets every key bubble past it, so arrows, Enter, Esc and letter shortcuts (`s` for "this session only") go straight to the CLI;
+  - when the picker closes, the slice folds away and focus returns to the composer.
+  A non-permission `needsInput` with no picker shape (a password, a free-text question) shows the screen's last rows the same way.
 - **Scope.** Shells, unstructured Agents, Agents typed inside a shell (whose transcript identity Diri did not mint) and remote sessions stay in the TUI Lens. Remote transcripts live on the remote host. Serving them is a Helper enhancement outside the `REMOTE_PORT.md` baseline.
 
 ## Rendering
 
-- **Virtualized rows.** Rows render through GPUI's `list`, so only visible rows lay out and shape text, and off-viewport rows hold no glyph runs.
+- **Virtualized at block granularity.** Rows render through GPUI's `list`, so only visible rows lay out and shape text, and off-viewport rows hold no glyph runs. An assistant turn is one row per Markdown block (`(item key, block)`): a 200-line reply lays out only the paragraphs, code blocks and diagrams on screen. Transcript records are written whole, never as growing partial text, so there is no tail re-parse: each turn is parsed once and its blocks are cut from that parse.
+- **Arrivals fade in.** Rows that land while the lens is open fade in over 320 ms on opacity alone (a paint property; nothing re-lays out), once each.
 - **Parse once.** Transcript records are immutable once written, so each assistant turn is parsed to Markdown exactly once (`ThreadModel::markdown`, keyed by item key and text hash) and reused across resets.
 - **Splice the tail.** Appends splice only the tail rows (`RowChange::Tail`).
 - **Cached pieces.** Diff cards and decoded images are cached per item key. Mermaid blocks reuse the notes renderer (`notes/editor_view/diagram.rs`) off the main thread.
-- **No idle wakeups.** The only animation is the live Work Strip's breathing dot, and it exists only while the session is working.
+- **One text per paragraph.** Bold, italic, struck, `code`, links and `path:line` references are runs of a single shaped text, so a period after a bold phrase or code span never wraps onto its own line.
+- **Selection.** Every paragraph, code block, tool output and diff row is a selectable segment. Drag across rows (the list scrolls under the pointer), double-click a word, triple-click a block; ⌘C copies the selection as it reads. Code blocks and replies have a hover *Copy*.
+- **Composer.** A real caret (macOS's 530 ms blink, solid while typing, a timer only while focused), a focus ring, growth with its text up to 240 pt, a `/` menu of the Agent's own and the user's custom commands, the model pill (only once a model is known), the account pill only for a Diri-managed account. The primary action follows the live state: **Send** (↑) when idle, **Stop** (■, Esc into the PTY) while the Agent works with nothing typed, **Steer** while it works and you type (the message goes in mid-turn, as the CLI queues typed input). Drafts live in the session's lens entity, which the pane keeps for the session's lifetime, so a draft survives tab switches and lens flips.
+- **Docked slot.** A permission card and the PTY portal share one slot directly above the composer, so an interactive control never scrolls away with the thread.
+- **Tail.** The list follows the tail while streaming, stops the moment the user scrolls up, and offers a jump-to-latest control.
+- **The flip.** 240 ms on a lightly underdamped spring: the incoming lens rises 14 pt as it fades in, the outgoing one sinks and fades, with a soft bloom from the header control. One timer per flip removes the outgoing layer at t = 1; reduced motion cuts instantly. It is GPUI composition (opacity, offset, shadow), not a Metal blur pass: GPUI has no element blur, and the precompiled metallib would need a new render pass.
+- **No idle wakeups.** The only animations are the live Work Strip's breathing dot (while the session works) and the caret (while the composer has focus).
 - **Pieces:**
   - User bubbles with image thumbnails.
   - Proportional prose at a 720 pt measure, with tight mono for code, paths and metrics.
   - Clickable `path:line` pills with a hover preview of the file.
-  - Work Strips, for example `Explored 3 files · Ran 2 commands · 4.2s` with a failure count and edited-file chips.
+  - Work Strips named by real tools and targets: `Read view.rs · Ran cargo test · 3.4s`, `Read 3 files · Edited model.rs`, `Used Computer, Browser`; while running, the call in flight (`Running cargo test`, `Using Computer · Trash`).
   - Per-call rows with their output.
   - Diff Cards with word-level emphasis (`git_ui::words`) and *Quote in reply*.
   - Before/after wipes when two screenshots land in one strip.
@@ -91,6 +106,10 @@ Observation adds zero bytes to any prompt. Lens state, cursors and segment metad
   - `thread::tail::tests::tail_chunking_matches_one_read`;
   - `thread::tests::stale_cursor_replay_is_idempotent`;
   - `thread_lens::model::tests::chunked_and_replayed_ingest_matches_one_read`;
-  - `control::tests::answer_blocker_refuses_a_prompt_that_is_no_longer_live`.
-- Screenshots: `thread_lens::fixture::screenshots::render_thread_lens_screenshot` with `DIRI_VISUAL_LIGHT`, `DIRI_VISUAL_EXPAND`, `DIRI_VISUAL_PERMISSION` and `DIRI_VISUAL_HEIGHT`.
+  - `control::tests::answer_blocker_refuses_a_prompt_that_is_no_longer_live`;
+  - `thread::watch::tests::a_hook_poke_announces_only_the_leased_session`;
+  - `terminal_pane::tests::a_picker_on_screen_opens_the_portal_and_hands_back_the_keys`;
+  - `thread_lens::view::tests::a_sent_message_shows_at_once_and_reconciles_with_its_record`, `selecting_the_thread_copies_its_text`, `a_period_after_bold_stays_in_the_same_text`;
+  - `thread_lens::model::tests::model_commands_collapse_into_one_divider`, `local_command_output_stays_with_its_command`.
+- Screenshots: `thread_lens::fixture::screenshots::render_thread_lens_screenshot` with `DIRI_VISUAL_LIGHT`, `DIRI_VISUAL_EXPAND`, `DIRI_VISUAL_PERMISSION`, `DIRI_VISUAL_LIVE`, `DIRI_VISUAL_SLASH`, `DIRI_VISUAL_EMPTY` and `DIRI_VISUAL_HEIGHT`; the pane scenes `DIRI_QOL_SCENE=lens-tui|lens-gui|lens-portal` of `render_terminal_qol_screenshot`.
 - Benchmarks: `thread::bench::bench_thread_tail` and `thread_lens::fixture::screenshots::bench_thread_lens`. Results are in `PERF.md`.

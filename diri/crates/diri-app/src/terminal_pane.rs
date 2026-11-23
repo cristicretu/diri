@@ -58,7 +58,7 @@ use diri_ui::{
     StatusGlyph, StatusState, Typo,
 };
 use gpui::{
-    AnyElement, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, ExternalPaths,
+    Animation, AnimationExt as _, AnyElement, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, ExternalPaths,
     FocusHandle, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, Render, Role,
     ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Task, Window, div,
     prelude::*, px,
@@ -1078,6 +1078,44 @@ pub struct TerminalPane {
     lenses: HashMap<SessionId, (Entity<crate::thread_lens::ThreadLens>, gpui::Subscription)>,
     /// Which lens each session shows; absent means the TUI Lens.
     lens_modes: HashMap<SessionId, crate::thread_lens::Lens>,
+    /// Per session with a GUI Lens open: the re-read due once its terminal
+    /// goes quiet. Replacing it cancels the previous one.
+    lens_quiet: HashMap<SessionId, Task<()>>,
+    /// The PTY portal's alignment and whether it took keyboard focus.
+    lens_portals: HashMap<SessionId, LensPortal>,
+    /// Window-space origin (left, top) of the portal's viewport, measured
+    /// at paint.
+    lens_portal_top: Rc<std::cell::Cell<Option<(f32, f32)>>>,
+    /// The lens flip animating now: session, lens shown, flip number.
+    lens_flip: Option<(SessionId, crate::thread_lens::Lens, u64)>,
+    lens_flips: u64,
+}
+
+/// How long the TUI ↔ GUI lens flip takes.
+const LENS_FLIP: Duration = Duration::from_millis(240);
+
+/// A lightly underdamped spring (≈3% overshoot, settled by t = 1), the
+/// curve the lens flip, the toggle icon and the PTY portal share. Applied
+/// inside the style closures, not as a GPUI easing: GPUI requires an
+/// easing to stay within 0..=1, and the overshoot is the point.
+fn lens_spring(t: f32) -> f32 {
+    if t >= 1.0 {
+        return 1.0;
+    }
+    1.0 - (-6.0 * t).exp() * (5.5 * t).cos()
+}
+
+/// A live slice of the real terminal shown inside the GUI Lens while the
+/// Agent waits on a picker its transcript never records.
+#[derive(Clone, Copy, Debug, Default)]
+struct LensPortal {
+    /// Shift that puts the picker's first row and column at the slice's
+    /// inset.
+    offset: f32,
+    offset_x: f32,
+    /// The portal moved keyboard focus to the terminal, so closing it gives
+    /// focus back to the lens.
+    took_focus: bool,
 }
 
 impl EventEmitter<TerminalPaneEvent> for TerminalPane {}
@@ -1360,6 +1398,11 @@ impl TerminalPane {
             _store_changes: store_changes,
             lenses: HashMap::new(),
             lens_modes: HashMap::new(),
+            lens_quiet: HashMap::new(),
+            lens_portals: HashMap::new(),
+            lens_portal_top: Rc::new(std::cell::Cell::new(None)),
+            lens_flip: None,
+            lens_flips: 0,
             _refits: refits,
             _telemetry: crate::telemetry::Live::pane(),
         };
@@ -1806,7 +1849,24 @@ impl TerminalPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.lens_modes.insert(id.clone(), mode);
+        let previous = self.lens_modes.insert(id.clone(), mode).unwrap_or_default();
+        if previous != mode && !cx.reduce_motion() {
+            self.lens_flips += 1;
+            let flip = self.lens_flips;
+            self.lens_flip = Some((id.clone(), mode, flip));
+            // One timer per flip parks the transition at t = 1: the outgoing
+            // layer leaves the tree and nothing animates afterwards.
+            cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor().timer(LENS_FLIP + Duration::from_millis(30)).await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.lens_flip.as_ref().is_some_and(|(_, _, n)| *n == flip) {
+                        this.lens_flip = None;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
         if mode == crate::thread_lens::Lens::Gui {
             let lens = self.ensure_lens(id, window, cx);
             let handle = gpui::Focusable::focus_handle(lens.read(cx), cx);
@@ -1816,6 +1876,46 @@ impl TerminalPane {
         }
         diri_telemetry::event!("lens.toggle", gui = mode == crate::thread_lens::Lens::Gui);
         cx.notify();
+    }
+
+    /// New terminal output in a session whose GUI Lens is open. Agents
+    /// print a turn and write its transcript record within moments of each
+    /// other, so once the screen settles the lens re-reads: at 120 ms, and
+    /// again at 900 ms for a CLI that flushes its JSONL late. The file watch
+    /// and hooks usually got there first; then each read returns nothing.
+    fn lens_saw_output(&mut self, id: &SessionId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.lens_modes.get(id) != Some(&crate::thread_lens::Lens::Gui) {
+            return;
+        }
+        let Some((lens, _)) = self.lenses.get(id) else {
+            return;
+        };
+        let lens = lens.downgrade();
+        let task = cx.spawn_in(window, async move |_, cx| {
+            for delay in [120, 780] {
+                cx.background_executor().timer(Duration::from_millis(delay)).await;
+                if lens.update(cx, |lens, cx| lens.refresh(cx)).is_err() {
+                    return;
+                }
+            }
+        });
+        self.lens_quiet.insert(id.clone(), task);
+        // The picker detector reads the screen on the pane's next render.
+        cx.notify();
+    }
+
+    /// The screen rows of a picker the Agent is showing, if any.
+    fn lens_picker(&self, session: &SessionRecord) -> Option<std::ops::Range<usize>> {
+        let resident = self.residents.get(&session.id)?;
+        let rows = resident.element.live_screen_text();
+        crate::thread_lens::portal::picker_rows(&rows).or_else(|| {
+            // A prompt the hooks reported that no picker shape matched (a
+            // password, a free-text question): its bottom rows.
+            crate::thread_lens::needs_portal(session).then(|| {
+                let end = rows.iter().rposition(|row| !row.trim().is_empty()).map_or(rows.len(), |r| r + 1);
+                end.saturating_sub(10)..end
+            })
+        })
     }
 
     fn ensure_lens(
@@ -2872,6 +2972,9 @@ impl TerminalPane {
         }
         if !applied {
             return;
+        }
+        if changed {
+            self.lens_saw_output(&id, window, cx);
         }
         // A column change re-wrapped history under a reader; its view finds
         // its place again from the daemon's rows.
@@ -5428,105 +5531,300 @@ impl TerminalPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let gui = self.lens_modes.get(&session.id) == Some(&crate::thread_lens::Lens::Gui)
-            && Self::lens_capable(session);
-        if !gui {
-            return self.render_grid_and_overlays(session, theme, colors, typeface, window, cx);
-        }
-        let lens = self.ensure_lens(&session.id, window, cx);
-        let portal = crate::thread_lens::needs_portal(session).then(|| {
-            // The grid keeps the pane's full size (so the PTY is never
-            // resized), clipped to its bottom rows where prompts sit.
-            let full = self
-                .viewport
-                .map_or(480.0, |viewport| viewport.height - self.header_height())
-                .max(160.0);
-            let height = (full * 0.42).clamp(150.0, 320.0);
-            let grid = self.render_grid_and_overlays(session, theme, colors, typeface, window, cx);
-            div()
-                .id("lens-pty-portal")
-                .mx(px(24.0))
-                .mb(px(10.0))
-                .flex()
-                .flex_col()
-                .rounded(px(Radius::PANEL))
-                .border_1()
-                .border_color(Ink::ATTENTION.alpha(0.45))
-                .overflow_hidden()
-                .bg(colors.terminal_surface())
-                .child(
-                    div()
-                        .h(px(26.0))
-                        .px(px(10.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(6.0))
-                        .text_size(px(11.0))
-                        .text_color(colors.secondary)
-                        .child(div().size(px(6.0)).rounded_full().bg(Ink::ATTENTION))
-                        .child(t("thread_lens.portal_title")),
-                )
-                .child(
-                    div()
-                        .relative()
-                        .h(px(height))
-                        .overflow_hidden()
-                        .child(div().absolute().left_0().right_0().bottom_0().h(px(full)).child(grid)),
-                )
-                .on_click(cx.listener(|this, _, window, cx| {
-                    window.focus(&this.focus, cx);
-                    cx.notify();
-                }))
-                .into_any_element()
-        });
+        let capable = Self::lens_capable(session);
+        let gui = self.lens_modes.get(&session.id) == Some(&crate::thread_lens::Lens::Gui) && capable;
+        let flip = self
+            .lens_flip
+            .clone()
+            .filter(|(id, _, _)| id == &session.id && capable);
+        let content = if gui {
+            self.render_gui_lens(session, theme, colors, typeface, window, cx)
+        } else {
+            self.render_grid_and_overlays(session, theme, colors, typeface, window, cx)
+        };
+        let Some((_, shown, flip)) = flip else {
+            return content;
+        };
+        // The flip: the incoming lens rises 14 pt into place on a spring
+        // while the outgoing one sinks back and fades, both anchored toward
+        // the header control that asked for it. 240 ms, then one layer.
+        let outgoing = if gui {
+            self.render_grid_and_overlays(session, theme, colors, typeface, window, cx)
+        } else {
+            let lens = self.ensure_lens(&session.id, window, cx);
+            div().size_full().child(lens).into_any_element()
+        };
+        let _ = shown;
+        let duration = LENS_FLIP;
         div()
+            .relative()
             .size_full()
-            .flex()
-            .flex_col()
-            .child(div().flex_1().min_h(px(0.0)).child(lens))
-            .children(portal)
+            .overflow_hidden()
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .child(outgoing)
+                    .with_animation(
+                        SharedString::from(format!("lens-flip-out-{flip}")),
+                        Animation::new(duration),
+                        |layer, t| {
+                            let t = lens_spring(t).clamp(0.0, 1.0);
+                            layer
+                                .opacity((1.0 - t * 1.6).max(0.0))
+                                .top(px(-6.0 * t))
+                        },
+                    ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .child(content)
+                    .with_animation(
+                        SharedString::from(format!("lens-flip-in-{flip}")),
+                        Animation::new(duration),
+                        |layer, t| {
+                            let t = lens_spring(t);
+                            layer.opacity(t.clamp(0.0, 1.0)).top(px(14.0 * (1.0 - t)))
+                        },
+                    ),
+            )
+            .child(
+                // A soft bloom from the lens control, the "focus pull".
+                div()
+                    .absolute()
+                    .top(px(-60.0))
+                    .right(px(40.0))
+                    .size(px(60.0))
+                    .rounded_full()
+                    .shadow(vec![gpui::BoxShadow {
+                        color: colors.primary.alpha(0.10).into(),
+                        offset: gpui::point(px(0.0), px(0.0)),
+                        blur_radius: px(160.0),
+                        spread_radius: px(120.0),
+                        inset: false,
+                    }])
+                    .with_animation(
+                        SharedString::from(format!("lens-flip-bloom-{flip}")),
+                        Animation::new(duration),
+                        |bloom, t| bloom.opacity((1.0 - t).powi(2)),
+                    ),
+            )
             .into_any_element()
     }
 
-    /// The header's segmented Conversation | Terminal control.
+    /// The GUI Lens; while the Agent waits on a picker, a live slice of the
+    /// real grid docked above its composer. Keys go to the PTY until the
+    /// picker closes; then the slice folds away and focus returns to the
+    /// composer.
+    fn render_gui_lens(
+        &mut self,
+        session: &SessionRecord,
+        theme: TermTheme,
+        colors: SemanticColors,
+        typeface: &TerminalType,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let lens = self.ensure_lens(&session.id, window, cx);
+        let picker = self.lens_picker(session);
+        let id = session.id.clone();
+        let open = picker.is_some();
+        let state = self.lens_portals.get(&id).copied().unwrap_or_default();
+        let lens_focused = gpui::Focusable::focus_handle(lens.read(cx), cx).contains_focused(window, cx);
+        if open && lens_focused && !state.took_focus {
+            let id = id.clone();
+            cx.defer_in(window, move |this, window, cx| {
+                this.lens_portals.entry(id).or_default().took_focus = true;
+                window.focus(&this.focus, cx);
+                cx.notify();
+            });
+        } else if !open && state.took_focus {
+            let id = id.clone();
+            let lens = lens.clone();
+            cx.defer_in(window, move |this, window, cx| {
+                if let Some(state) = this.lens_portals.get_mut(&id) {
+                    state.took_focus = false;
+                }
+                if this.focus.is_focused(window) {
+                    let handle = gpui::Focusable::focus_handle(lens.read(cx), cx);
+                    window.focus(&handle, cx);
+                }
+            });
+        }
+        let portal = picker.map(|rows| self.render_lens_portal(session, rows, state, theme, colors, typeface, window, cx));
+        lens.update(cx, |lens, cx| lens.dock_portal(portal, cx));
+        div().size_full().child(lens).into_any_element()
+    }
+
+    /// A live slice of the real grid showing exactly the picker's rows,
+    /// docked in the lens above its composer. The grid keeps the pane's full
+    /// size (the PTY is sized from the viewport, never from this slice) and
+    /// is shifted, from its painted geometry, so the picker's first row and
+    /// column sit at the slice's inset.
+    #[allow(clippy::too_many_arguments)]
+    fn render_lens_portal(
+        &mut self,
+        session: &SessionRecord,
+        rows: std::ops::Range<usize>,
+        state: LensPortal,
+        theme: TermTheme,
+        colors: SemanticColors,
+        typeface: &TerminalType,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        const INSET: f32 = 10.0;
+        const INSET_X: f32 = 14.0;
+        let id = session.id.clone();
+        let viewport = self.viewport.unwrap_or(TerminalViewport { x: 0.0, y: 0.0, width: 800.0, height: 600.0 });
+        let full = (viewport.height - self.header_height()).max(160.0);
+        let geometry = self.residents.get(&id).and_then(|r| r.element.painted_geometry());
+        let line = geometry.map_or(17.0, |g| f32::from(g.line_height));
+        let (mut offset, mut offset_x) = (state.offset, state.offset_x);
+        if let (Some(geometry), Some((left, top))) = (geometry, self.lens_portal_top.get()) {
+            let inner = f32::from(geometry.origin.y) - top - offset;
+            let inner_x = f32::from(geometry.origin.x) - left - offset_x;
+            let want = INSET - rows.start as f32 * line - inner;
+            let want_x = INSET_X - inner_x;
+            if (want - offset).abs() > 0.5 || (want_x - offset_x).abs() > 0.5 {
+                offset = want;
+                offset_x = want_x;
+                let entry = self.lens_portals.entry(id.clone()).or_default();
+                entry.offset = want;
+                entry.offset_x = want_x;
+                cx.notify();
+            }
+        } else if offset == 0.0 {
+            offset = INSET - rows.start as f32 * line;
+        }
+        let height = rows.len() as f32 * line + INSET * 2.0;
+        let grid = self.render_grid_and_overlays(session, theme, colors, typeface, window, cx);
+        let measured = Rc::clone(&self.lens_portal_top);
+        div()
+            .px(px(28.0))
+            .mb(px(10.0))
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .id("lens-pty-portal")
+                    .w_full()
+                    .max_w(px(744.0))
+                    .flex()
+                    .flex_col()
+                    .rounded(px(Radius::PANEL))
+                    .border_1()
+                    .border_color(colors.primary.alpha(0.14))
+                    .shadow_lg()
+                    .overflow_hidden()
+                    .bg(colors.terminal_surface())
+                    .child(
+                        div()
+                            .h(px(28.0))
+                            .px(px(12.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(7.0))
+                            .border_b_1()
+                            .border_color(colors.primary.alpha(0.06))
+                            .text_size(px(11.5))
+                            .child(div().size(px(6.0)).rounded_full().bg(Ink::ATTENTION))
+                            .child(div().text_color(colors.primary).font_weight(gpui::FontWeight::MEDIUM).child(t("thread_lens.portal_title")))
+                            .child(div().flex_1())
+                            .child(div().text_color(colors.tertiary).child(t("thread_lens.portal_keys"))),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .h(px(height))
+                            .overflow_hidden()
+                            .child(
+                                gpui::canvas(
+                                    move |bounds, _, _| {
+                                        measured.set(Some((f32::from(bounds.origin.x), f32::from(bounds.origin.y))))
+                                    },
+                                    |_, _, _, _| {},
+                                )
+                                .absolute()
+                                .inset_0(),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top(px(offset))
+                                    .left(px(offset_x))
+                                    .w(px(viewport.width))
+                                    .h(px(full))
+                                    .flex()
+                                    .flex_col()
+                                    .child(grid),
+                            ),
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        window.focus(&this.focus, cx);
+                        cx.notify();
+                    }))
+                    .with_animation(
+                        SharedString::from(format!("lens-portal-{}-{}", id.0, rows.start)),
+                        Animation::new(Duration::from_millis(200)),
+                        |portal, t| {
+                            let t = lens_spring(t);
+                            portal.opacity(t.clamp(0.0, 1.0)).mt(px(10.0 * (1.0 - t)))
+                        },
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The header's lens control: one quiet icon that shows where it goes
+    /// (a speech bubble from the terminal, a prompt from the conversation)
+    /// and morphs when pressed. ⌥⌘L does the same.
     fn render_lens_toggle(&self, session: &SessionRecord, colors: SemanticColors, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !Self::lens_capable(session) {
             return None;
         }
         let gui = self.lens_modes.get(&session.id) == Some(&crate::thread_lens::Lens::Gui);
-        let segment = |id: &'static str, label: &'static str, active: bool, mode: crate::thread_lens::Lens| {
-            let session_id = session.id.clone();
-            div()
-                .id(id)
-                .h(px(20.0))
-                .px(px(8.0))
-                .flex()
-                .items_center()
-                .rounded(px(Radius::CHIP))
-                .text_size(px(11.0))
-                .font_weight(if active { gpui::FontWeight::MEDIUM } else { gpui::FontWeight::NORMAL })
-                .text_color(if active { colors.primary } else { colors.tertiary })
-                .when(active, |segment| segment.bg(colors.primary.alpha(0.1)))
-                .when(!active, |segment| segment.hover(|s| s.text_color(colors.secondary)))
-                .cursor_pointer()
-                .child(t(label))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.set_lens(&session_id, mode, window, cx);
-                    cx.stop_propagation();
-                }))
+        let (symbol, label, next) = if gui {
+            ("terminal", t("thread_lens.show_terminal"), crate::thread_lens::Lens::Tui)
+        } else {
+            ("bubble.left", t("thread_lens.show_conversation"), crate::thread_lens::Lens::Gui)
         };
+        let session_id = session.id.clone();
+        let flips = self.lens_flips;
         Some(
             div()
                 .id("lens-toggle")
+                .debug_selector(|| "lens-toggle".into())
+                .role(gpui::Role::Button)
+                .aria_label(label)
+                .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
                 .flex_none()
-                .p(px(2.0))
                 .flex()
-                .gap(px(1.0))
+                .items_center()
+                .justify_center()
                 .rounded(px(Radius::BADGE))
-                .bg(colors.primary.alpha(0.05))
-                .child(segment("lens-toggle-gui", "thread_lens.toggle_conversation", gui, crate::thread_lens::Lens::Gui))
-                .child(segment("lens-toggle-tui", "thread_lens.toggle_terminal", !gui, crate::thread_lens::Lens::Tui))
-                .shortcut_tooltip(t("command.toggle_lens.title"), Some(crate::commands::CommandId::ToggleLens), colors)
+                .cursor_pointer()
+                .hover(move |button| button.bg(diri_ui::Fill::subtle(colors)))
+                .child(
+                    div()
+                        .child(crate::icons::sf_symbol(symbol, 14.0, colors.secondary))
+                        .with_animation(
+                            SharedString::from(format!("lens-toggle-{flips}")),
+                            Animation::new(Duration::from_millis(220)),
+                            |icon, t| {
+                                let t = lens_spring(t);
+                                icon.opacity(t.clamp(0.0, 1.0)).mt(px(4.0 * (1.0 - t)))
+                            },
+                        ),
+                )
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.set_lens(&session_id, next, window, cx);
+                    cx.stop_propagation();
+                }))
+                .shortcut_tooltip(label, Some(crate::commands::CommandId::ToggleLens), colors)
                 .into_any_element(),
         )
     }
@@ -8514,6 +8812,78 @@ mod tests {
         });
     }
 
+    /// Screenshot 7: Claude's `/model` picker lives only on the terminal.
+    /// With the GUI Lens open, the picker's rows appear as a live portal in
+    /// place of the composer and take the keyboard; when the picker closes
+    /// the portal folds away and the composer gets the keys back.
+    #[gpui::test]
+    fn a_picker_on_screen_opens_the_portal_and_hands_back_the_keys(cx: &mut TestAppContext) {
+        use diri_proto::grid::{ChangedRow, GridCell};
+        let (runtime, tokio, id, _) = first_paint_fixture();
+        let (view, cx) = cx.add_window_view(move |window, cx| Coverable {
+            pane: cx.new(|cx| TerminalPane::new(runtime, tokio, window, cx)),
+            shown: true,
+        });
+        cx.simulate_resize(gpui::size(px(900.0), px(700.0)));
+        let pane = view.read_with(cx, |view, _| view.pane.clone());
+        pane.update(cx, |pane, cx| {
+            pane.reconcile_residency(cx);
+            land_screen(pane, &id, cx);
+        });
+        cx.run_until_parked();
+        let screen = |lines: &[(u16, &str)]| {
+            let mut grid = grid_frame(100, true);
+            for &(y, text) in lines {
+                let mut cells = vec![GridCell::BLANK; 100];
+                for (cell, ch) in cells.iter_mut().zip(text.chars()) {
+                    cell.scalar = ch as u32;
+                }
+                grid.changed_rows.push(ChangedRow::new(y, cells));
+            }
+            grid
+        };
+        let lens_id = id.clone();
+        cx.update(|window, cx| {
+            pane.update(cx, |pane, cx| pane.set_lens(&lens_id, crate::thread_lens::Lens::Gui, window, cx));
+        });
+        cx.run_until_parked();
+        let lens = pane.read_with(cx, |pane, _| pane.lenses[&id].0.clone());
+        let lens_focused = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| gpui::Focusable::focus_handle(lens.read(cx), cx).is_focused(window))
+        };
+        assert!(lens_focused(cx), "the composer has the keys");
+        let picker = screen(&[
+            (2, "✻ Cogitated for 1s · done 11:32 PM"),
+            (3, "────────────────────────────────────────────────────────────"),
+            (5, "  Select model"),
+            (7, "    1. Default (recommended)   Opus 5.5"),
+            (8, "  ❯ 2. Opus 5.5 ✔              For complex work"),
+            (9, "    3. Sonnet 5.5              Most efficient"),
+            (11, "  s to use this session only · Enter to save · Esc to cancel"),
+        ]);
+        let grid_id = id.clone();
+        cx.update(|window, cx| pane.update(cx, |pane, cx| pane.apply_grid_updates(grid_id.clone(), [picker], window, cx)));
+        cx.run_until_parked();
+        assert!(lens.read_with(cx, |lens, _| lens.portal_open), "the picker shows in the lens");
+        cx.simulate_keystrokes("s");
+        assert!(
+            lens.read_with(cx, |lens, _| lens.composer_is_empty()),
+            "the picker shortcut went past the composer to the terminal"
+        );
+        assert!(!lens_focused(cx), "arrows, Enter and Esc go to the terminal");
+        assert!(cx.update(|window, cx| pane.read(cx).focus.is_focused(window)));
+        let back = screen(&[
+            (2, "● Set model to Sonnet 5.5"),
+            (3, "────────────────────────────────────────────────────────────"),
+            (4, "❯ "),
+            (5, "────────────────────────────────────────────────────────────"),
+        ]);
+        cx.update(|window, cx| pane.update(cx, |pane, cx| pane.apply_grid_updates(grid_id.clone(), [back], window, cx)));
+        cx.run_until_parked();
+        assert!(!lens.read_with(cx, |lens, _| lens.portal_open), "the portal folds away");
+        assert!(lens_focused(cx), "the composer has the keys again");
+    }
+
     /// The real stall is still caught: a pane on screen whose screen landed
     /// without anything asking for the frame that shows it is reported with
     /// `content=true`, and the frame the watchdog asked for draws it.
@@ -9219,10 +9589,23 @@ mod tests {
                         }
                         // One Codex session, TUI Lens then GUI Lens; the
                         // header's Conversation | Terminal control flips them.
-                        "lens-tui" | "lens-gui" => {
+                        "lens-tui" | "lens-gui" | "lens-portal" => {
                             let mut grid = grid_frame(120, true);
                             grid.rows = 40;
-                            for (y, text) in [
+                            let picker: &[(u16, &str)] = &[
+                                (14, "✻ Cogitated for 1s · done 11:32 PM"),
+                                (16, "──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"),
+                                (18, "  Select model"),
+                                (19, "  Your pick is the default for new sessions. For other models, use --model."),
+                                (21, "    1. Default (recommended)   Opus 5.5 · Best for everyday, complex tasks"),
+                                (22, "  ❯ 2. Opus 5.5 ✔              For complex work and everyday tasks"),
+                                (23, "    3. Fable 5.2               For your toughest challenges"),
+                                (24, "    4. Sonnet 5.5              Most efficient for simpler tasks"),
+                                (25, "    5. Haiku 5.5               Fastest for quick answers"),
+                                (27, "  ◐ Medium effort (default) ←/→ to adjust"),
+                                (29, "  s to use this session only · Enter to save · Esc to cancel"),
+                            ];
+                            let conversation: &[(u16, &str)] = &[
                                 (1u16, "✳ Claude Code  ·  Sonnet 5.5  ·  ~/work/diri"),
                                 (3, "⏺ Fixed. A record split across two reads now waits for its newline instead"),
                                 (4, "  of being skipped, and close_mid_record pins it."),
@@ -9240,7 +9623,8 @@ mod tests {
                                 (34, "> Ship it — then open a PR with before/after screenshots"),
                                 (35, "──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"),
                                 (36, "  ⏵⏵ accept edits on (shift+tab to cycle)                    Work · Sonnet 5.5"),
-                            ] {
+                            ];
+                            for &(y, text) in if scene == "lens-portal" { picker } else { conversation } {
                                 let mut cells = vec![GridCell::BLANK; 120];
                                 for (cell, ch) in cells.iter_mut().zip(text.chars()) {
                                     cell.scalar = ch as u32;
@@ -9250,7 +9634,7 @@ mod tests {
                             grid.cursor_row = 34;
                             grid.cursor_col = 57;
                             pane.residents.get_mut(&id).unwrap().element.apply_damage(grid);
-                            if scene == "lens-gui" {
+                            if scene != "lens-tui" {
                                 pane.set_lens(&id, crate::thread_lens::Lens::Gui, window, cx);
                                 let lens = pane.ensure_lens(&id, window, cx);
                                 let now_ms = std::time::SystemTime::now()

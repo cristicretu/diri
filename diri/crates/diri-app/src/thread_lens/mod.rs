@@ -5,6 +5,8 @@ pub mod diff;
 #[cfg(test)]
 pub mod fixture;
 pub mod model;
+pub mod portal;
+pub mod slash;
 pub mod view;
 
 pub use view::{ThreadLens, ThreadLensEvent, needs_portal};
