@@ -618,3 +618,28 @@ How one Diri note connects to the others. links: the notes it links to. backlink
 | `note` | string | **Required.** |
 | `depth` | integer |  |
 | `unlinked` | boolean |  |
+
+### `surface`
+
+Diri Live Surfaces: native dashboards and mini-apps you build from JSON components (cards, metrics, checklists, tables, rich links to Slack/GitHub/Linear/sessions, buttons), drawn inside Diri and kept live. op schema returns the full component and patch reference; read it before your first create. Ops: create, update (patch components by id; the person's ticks are kept), get, list, events (what the person ticked or clicked), history, restore, promote (save a session surface to the sidebar), delete. A session surface (the default) shows in your session's right panel; scope global or project makes a saved surface in the sidebar that any agent or schedule may update.
+
+| Argument | Type | Notes |
+| --- | --- | --- |
+| `op` | `schema`, `create`, `update`, `get`, `list`, `events`, `history`, `restore`, `promote`, `delete` | **Required.** |
+| `after` | integer |  |
+| `agents` | string array |  |
+| `expected_revision` | integer |  |
+| `format` | `json`, `outline` |  |
+| `limit` | integer |  |
+| `ops` | array of objects |  |
+| `pinned` | boolean |  |
+| `project` | string |  |
+| `revision` | integer |  |
+| `root` | array of objects |  |
+| `scope` | `session`, `global`, `project`, `saved`, `all`, `mine` |  |
+| `session` | string |  |
+| `sessions` | string array |  |
+| `subtitle` | string |  |
+| `surface` | string |  |
+| `template` | `today`, `blank` |  |
+| `title` | string |  |
