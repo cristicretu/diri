@@ -890,26 +890,29 @@ impl ControlServer {
     /// A stale socket file from a dead daemon is replaced; a *live* one is not,
     /// which is what stops two engines fighting over the same endpoint.
     pub fn bind(&self) -> std::io::Result<UnixListener> {
-        if self.socket_path.exists() {
-            if UnixStream::connect(&self.socket_path).is_ok() {
+        Self::bind_path(&self.socket_path)
+    }
+
+    /// Reserves the socket under the daemon singleton lock. Connections wait
+    /// in the kernel backlog until initialization finishes and serving begins.
+    pub fn bind_path(path: &Path) -> std::io::Result<UnixListener> {
+        if path.exists() {
+            if UnixStream::connect(path).is_ok() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::AddrInUse,
-                    format!(
-                        "something is already serving {}",
-                        self.socket_path.display()
-                    ),
+                    format!("something is already serving {}", path.display()),
                 ));
             }
-            std::fs::remove_file(&self.socket_path)?;
+            std::fs::remove_file(path)?;
         }
-        if let Some(parent) = self.socket_path.parent() {
+        if let Some(parent) = path.parent() {
             diri_platform::private::create_dir_all(parent)?;
         }
-        let listener = UnixListener::bind(&self.socket_path)?;
+        let listener = UnixListener::bind(path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o600))?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         }
         Ok(listener)
     }
@@ -932,7 +935,7 @@ impl ControlServer {
         let writer = Arc::new(Mutex::new(stream));
         // Whatever ends this connection, an app that published actions on it
         // stops being the performer.
-        let _performer = self.app_actions.guard(&writer);
+        let _performer = self.app_actions.guard(&writer, &self.registry);
         let mut subscription: Option<SubscriptionHandle> = None;
 
         let mut first = true;
@@ -1930,11 +1933,12 @@ impl ControlServer {
                 registry.other_live_agent(&id),
             );
         }
-        if tracked {
+        let batch = if tracked {
             registry.persist_for_shutdown().map_err(io_control_error)?;
+            None
         } else {
-            let _ = registry.persist();
-        }
+            registry.take_spawn_persist()
+        };
         self.publish_updated(&registry, &id);
 
         // An initial prompt is typed once the TUI can actually receive input,
@@ -1949,6 +1953,11 @@ impl ControlServer {
             .record(&id)
             .ok_or_else(|| ControlError::internal("the new session vanished"))?;
         drop(registry);
+        if let Some(batch) = batch
+            && batch.commit().is_err()
+        {
+            self.registry.lock().map_err(poisoned)?.persist_deferred();
+        }
 
         // A supplied prompt is part of the spawn contract: do not acknowledge
         // the request until delivery is confirmed. With no prompt, Claude's
@@ -8198,7 +8207,11 @@ fn codex_developer_args(
         parts.push(diri_proto::voice::SPOKEN_INSTRUCTION);
     }
     if injection.codex_mcp && names_sessions {
-        parts.push(diri_proto::session_naming::INSTRUCTION);
+        parts.push(if crate::inject::compact_mcp_catalog() {
+            diri_proto::session_naming::ACTION_INSTRUCTION
+        } else {
+            diri_proto::session_naming::INSTRUCTION
+        });
     }
     if parts.is_empty() {
         return Vec::new();

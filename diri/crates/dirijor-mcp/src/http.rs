@@ -31,7 +31,9 @@ use serde_json::{Value, json};
 
 use crate::Bridge;
 use crate::cancellation::Cancellation;
-use crate::protocol::{DirectBackend, error, handle_message, read_only, success, tool_content};
+use crate::protocol::{
+    DirectBackend, error, expand_action, handle_profile, read_only, success, tool_content,
+};
 
 /// The only path the endpoint serves.
 pub const MCP_PATH: &str = "/mcp";
@@ -195,7 +197,8 @@ impl HttpServer {
 
     fn handle_request(&self, request: Request, out: &mut TcpStream) {
         let path = request.path.split('?').next().unwrap_or_default();
-        if path != MCP_PATH {
+        let compact = path == "/mcp/skills-v1";
+        if path != MCP_PATH && !compact {
             let _ = write_response(out, 404, "text/plain", b"not found");
             return;
         }
@@ -233,7 +236,7 @@ impl HttpServer {
             );
             return;
         }
-        let message: Value = match serde_json::from_slice(&request.body) {
+        let mut message: Value = match serde_json::from_slice(&request.body) {
             Ok(message) => message,
             Err(_) => {
                 let _ = write_json(out, 400, &error(Value::Null, -32700, "Parse error"));
@@ -251,7 +254,10 @@ impl HttpServer {
         let accepts_stream = request
             .header("accept")
             .is_some_and(|accept| accept.contains("text/event-stream"));
-        self.handle_message(&session, message, accepts_stream, out);
+        if compact {
+            expand_action(&mut message);
+        }
+        self.handle_message(&session, message, accepts_stream, out, compact);
     }
 
     fn handle_message(
@@ -260,6 +266,7 @@ impl HttpServer {
         message: Value,
         accepts_stream: bool,
         out: &mut TcpStream,
+        compact: bool,
     ) {
         let has_id = message.get("id").is_some();
         let method = message.get("method").and_then(Value::as_str);
@@ -304,12 +311,12 @@ impl HttpServer {
             }
         }
         if valid && matches!(method, Some("tools/list" | "tools/call")) {
-            self.dispatch(session, message, accepts_stream, out);
+            self.dispatch(session, message, accepts_stream, out, compact);
             return;
         }
         let mut immediate =
             DirectBackend::with_bridge(self.bridge(session, Cancellation::default()));
-        match handle_message(message, &mut immediate) {
+        match handle_profile(message, &mut immediate, compact) {
             Some(response) => {
                 let _ = write_json(out, 200, &response);
             }
@@ -341,7 +348,14 @@ impl HttpServer {
         }
     }
 
-    fn dispatch(&self, session: &str, message: Value, accepts_stream: bool, out: &mut TcpStream) {
+    fn dispatch(
+        &self,
+        session: &str,
+        message: Value,
+        accepts_stream: bool,
+        out: &mut TcpStream,
+        compact: bool,
+    ) {
         let id = message["id"].clone();
         let key = id.to_string();
         let reads_only = read_only(&message);
@@ -449,7 +463,7 @@ impl HttpServer {
                 DirectBackend::with_bridge(self.bridge(session, cancellation.clone()));
             let response_id = id.clone();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                handle_message(message, &mut backend)
+                handle_profile(message, &mut backend, compact)
             }))
             .unwrap_or_else(|_| Some(success(response_id, tool_content(Err(
                 "Tool failed unexpectedly. An action may already have reached the Engine; inspect its state before repeating it.".into()

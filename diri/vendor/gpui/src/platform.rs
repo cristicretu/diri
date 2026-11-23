@@ -842,6 +842,13 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// Runs the next frame request as soon as the main thread is free rather
     /// than at the display's next refresh. See [`crate::Window::request_immediate_frame`].
     fn request_immediate_frame(&self) {}
+    /// Schedules a frame when an idle platform frame clock has stopped.
+    fn idle_frame_waker(&self) -> Option<std::rc::Rc<dyn Fn()>> {
+        None
+    }
+    /// Reports whether more animation or presentation work is pending.
+    fn frame_demand(&self, _active: bool) {}
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
 

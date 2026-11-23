@@ -45,20 +45,6 @@ fn main() {
         None => eprintln!("dirijord-rs: file descriptor limit could not be read"),
     }
 
-    // The app launches us with launchd's generic SHELL and minimal PATH.
-    // Normalize both from the user's account before any session snapshots the
-    // inherited environment: wrapped agents must return to the user's actual
-    // shell (fish/zsh/…), and that shell owns the current tool PATH.
-    let user_shell = login_shell();
-    // SAFETY: single-threaded startup, before any spawn.
-    unsafe { std::env::set_var("SHELL", &user_shell) };
-    let capture_started = std::time::Instant::now();
-    let captured_path = login_path(&user_shell);
-    let capture_elapsed = capture_started.elapsed();
-    let path = diri_engine::local_path::search_path(captured_path.as_deref(), std::env::vars());
-    // SAFETY: single-threaded startup, before any spawn.
-    unsafe { std::env::set_var("PATH", &path) };
-
     let home = diri_platform::home_dir().expect("user home directory is unavailable");
     let app_support = DirijorPaths::app_support(&home);
     let state_dir = DirijorPaths::state_dir(&home);
@@ -84,13 +70,75 @@ fn main() {
         }
     }
 
-    // Recording starts after the environment is final: `set_var` above must
-    // run before any thread exists, and the recorder starts one.
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|exe| diri_platform::canonicalize(exe).ok())
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."));
+
+    // Singleton guard: hold an exclusive lock for our lifetime so a second
+    // daemon (a relaunching app whose probe raced) exits instead of stealing
+    // the live daemon's socket and orphaning its PTYs. The fd leaks on
+    // purpose — it must stay open until process exit.
+    let lock_path = runtime_dir.join("daemon.lock");
+    let lock = diri_platform::private::options()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap_or_else(|error| {
+            eprintln!("dirijord-rs: cannot open {}: {error}", lock_path.display());
+            std::process::exit(1);
+        });
+    // SAFETY: flock on an owned fd; non-blocking probe.
+    if lock.try_lock().is_err() {
+        eprintln!("dirijord-rs: another daemon owns the lock — exiting");
+        start_telemetry(&home, &state_dir, &exe_dir);
+        diri_telemetry::debug_event!("engine.duplicate_exit");
+        diri_telemetry::flush(std::time::Duration::from_millis(200));
+        std::process::exit(0);
+    }
+    std::mem::forget(lock);
+
+    let listener = match ControlServer::bind_path(&DirijorPaths::socket(&home)) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("dirijord-rs: bind: {error}");
+            if error.kind() != std::io::ErrorKind::AddrInUse {
+                start_telemetry(&home, &state_dir, &exe_dir);
+                diri_telemetry::incident!(
+                    "engine.bind_failed",
+                    io = diri_telemetry::io_error(&error)
+                );
+                diri_telemetry::flush(std::time::Duration::from_secs(1));
+            }
+            // A live socket means a daemon is already serving; that is the
+            // singleton working, not a failure.
+            std::process::exit(if error.kind() == std::io::ErrorKind::AddrInUse {
+                0
+            } else {
+                1
+            });
+        }
+    };
+
+    // The app launches us with launchd's generic SHELL and minimal PATH.
+    // Normalize both from the user's account before any session snapshots the
+    // inherited environment: wrapped agents must return to the user's actual
+    // shell (fish/zsh/…), and that shell owns the current tool PATH.
+    let user_shell = login_shell();
+    // SAFETY: single-threaded startup, before any spawn.
+    unsafe { std::env::set_var("SHELL", &user_shell) };
+    let capture_started = std::time::Instant::now();
+    let captured_path = login_path(&user_shell);
+    let capture_elapsed = capture_started.elapsed();
+    let path = diri_engine::local_path::search_path(captured_path.as_deref(), std::env::vars());
+    // SAFETY: single-threaded startup, before any spawn.
+    unsafe { std::env::set_var("PATH", &path) };
+
+    // Recording starts after the environment is final: `set_var` above must
+    // run before any thread exists, and the recorder starts one.
     start_telemetry(&home, &state_dir, &exe_dir);
     diri_telemetry::event!(
         "engine.start",
@@ -113,30 +161,6 @@ fn main() {
             .map(|name| diri_telemetry::id(name.to_string_lossy())),
         entries = std::env::split_paths(&path).count(),
     );
-
-    // Singleton guard: hold an exclusive lock for our lifetime so a second
-    // daemon (a relaunching app whose probe raced) exits instead of stealing
-    // the live daemon's socket and orphaning its PTYs. The fd leaks on
-    // purpose — it must stay open until process exit.
-    let lock_path = runtime_dir.join("daemon.lock");
-    let lock = diri_platform::private::options()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .unwrap_or_else(|error| {
-            eprintln!("dirijord-rs: cannot open {}: {error}", lock_path.display());
-            std::process::exit(1);
-        });
-    // SAFETY: flock on an owned fd; non-blocking probe.
-    if lock.try_lock().is_err() {
-        eprintln!("dirijord-rs: another daemon owns the lock — exiting");
-        diri_telemetry::debug_event!("engine.duplicate_exit");
-        diri_telemetry::flush(std::time::Duration::from_millis(200));
-        std::process::exit(0);
-    }
-    std::mem::forget(lock);
 
     // Under the lock, before any store opens: earlier Linux builds kept
     // configuration and remote bindings in the runtime tmpfs.
@@ -237,6 +261,14 @@ fn main() {
         diri_engine::holder::HolderManagerPaths::new(&holder.holders_dir).socket(),
     )
     .ping();
+    #[cfg(unix)]
+    if adopted.is_empty() && registry.has_resumable_local_session() {
+        let warm = holder.clone();
+        std::thread::spawn(move || {
+            let _ =
+                diri_engine::holder::HolderLauncher::prestart(&warm.executable, &warm.holders_dir);
+        });
+    }
     let registry = Arc::new(Mutex::new(registry));
     register_gauges(&registry);
 
@@ -273,27 +305,6 @@ fn main() {
             diri_telemetry::Value::from(attach.sink_count())
         });
     }
-    let listener = match server.bind() {
-        Ok(listener) => listener,
-        Err(error) => {
-            eprintln!("dirijord-rs: bind: {error}");
-            if error.kind() != std::io::ErrorKind::AddrInUse {
-                diri_telemetry::incident!(
-                    "engine.bind_failed",
-                    io = diri_telemetry::io_error(&error),
-                );
-                diri_telemetry::flush(std::time::Duration::from_secs(1));
-            }
-            // A live socket means a daemon is already serving; that is the
-            // singleton working, not a failure.
-            std::process::exit(if error.kind() == std::io::ErrorKind::AddrInUse {
-                0
-            } else {
-                1
-            });
-        }
-    };
-
     // Agents whose CLI speaks MCP over HTTP call this Engine directly instead
     // of each starting a `dirijor-mcp` process. Needs the bound socket (the
     // endpoint bridges to it); on failure every Agent keeps the stdio server.
@@ -389,13 +400,14 @@ fn main() {
         Arc::new(AtomicBool::new(false)),
     );
     let pr_monitor_wake = server.pr_monitor_wake();
+    let (_governor_shutdown, governor_stop) = std::sync::mpsc::channel();
     let _governor = diri_engine::governor::spawn_governor(
         Arc::clone(&registry),
         server.events(),
         server.attach_hub(),
         pr_monitor_wake.clone(),
         server.governor_config(),
-        Arc::new(AtomicBool::new(false)),
+        governor_stop,
     );
     let _pr_monitor = diri_engine::pr_monitor::spawn_pr_monitor(
         Arc::clone(&registry),

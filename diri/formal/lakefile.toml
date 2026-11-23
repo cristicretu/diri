@@ -1,6 +1,9 @@
-name = "hook_order"
+name = "DiriFormal"
 version = "0.1.0"
-defaultTargets = ["HookOrder"]
+defaultTargets = ["PromptCache", "HookOrder"]
+
+[[lean_lib]]
+name = "PromptCache"
 
 [[lean_lib]]
 name = "HookOrder"

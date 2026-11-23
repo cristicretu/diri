@@ -99,10 +99,32 @@ fn write_hook_settings(inject_dir: &Path, cli: Option<&Path>) -> io::Result<()> 
     )
 }
 
+/// Client permissions attach to MCP tool names. Keep the full catalog available
+/// to installations that rely on per-action client rules.
+pub(crate) fn compact_mcp_catalog() -> bool {
+    std::env::var("DIRI_MCP_CATALOG").as_deref() != Ok("full")
+}
+
+fn agent_mcp_launch(cli_path: &Path) -> (String, Vec<String>) {
+    let (command, mut args) = mcp_launch(cli_path);
+    if compact_mcp_catalog() {
+        args.push("--skills-v1".into());
+    }
+    (command, args)
+}
+
+fn agent_mcp_url(url: &str) -> String {
+    if compact_mcp_catalog() {
+        format!("{url}/skills-v1")
+    } else {
+        url.to_owned()
+    }
+}
+
 /// The Claude `--mcp-config` file: the `dirijor` stdio server backed by the
 /// CLI's sibling `dirijor-mcp` proxy (or the CLI itself as a fallback).
 pub fn write_claude_mcp_file(inject_dir: &Path, cli_path: &Path) -> io::Result<()> {
-    let (command, args) = mcp_launch(cli_path);
+    let (command, args) = agent_mcp_launch(cli_path);
     write_atomic(
         &inject_dir.join("claude-mcp.json"),
         &serde_json::to_vec_pretty(&json!({
@@ -123,7 +145,7 @@ pub fn write_claude_mcp_http_file(inject_dir: &Path, url: &str) -> io::Result<()
             "mcpServers": {
                 "dirijor": {
                     "type": "http",
-                    "url": url,
+                    "url": agent_mcp_url(url),
                     "headers": { "Authorization": format!("Bearer ${{{MCP_TOKEN_ENV}}}") },
                 }
             }
@@ -292,14 +314,17 @@ pub fn injection_args_full(
             // Codex reads the bearer token from the named variable itself.
             mcp_http = true;
             argv.push("-c".into());
-            argv.push(format!("mcp_servers.dirijor.url={}", toml_string(url)));
+            argv.push(format!(
+                "mcp_servers.dirijor.url={}",
+                toml_string(&agent_mcp_url(url))
+            ));
             argv.push("-c".into());
             argv.push(format!(
                 "mcp_servers.dirijor.bearer_token_env_var={}",
                 toml_string(MCP_TOKEN_ENV)
             ));
         } else {
-            let (command, args) = mcp_launch(cli_path);
+            let (command, args) = agent_mcp_launch(cli_path);
             let encoded_args = args
                 .iter()
                 .map(|arg| toml_string(arg))
@@ -628,7 +653,7 @@ mod tests {
             parsed["mcpServers"]["dirijor"]["args"]
                 .as_array()
                 .map(Vec::len),
-            Some(0)
+            Some(1)
         );
     }
 
@@ -779,7 +804,7 @@ mod tests {
             config["mcpServers"]["dirijor"],
             json!({
                 "type": "http",
-                "url": url,
+                "url": format!("{url}/skills-v1"),
                 "headers": {"Authorization": "Bearer ${DIRIJOR_MCP_TOKEN}"},
             })
         );
@@ -798,7 +823,7 @@ mod tests {
             injected.argv,
             [
                 "-c",
-                "mcp_servers.dirijor.url=\"http://127.0.0.1:4545/mcp\"",
+                "mcp_servers.dirijor.url=\"http://127.0.0.1:4545/mcp/skills-v1\"",
                 "-c",
                 "mcp_servers.dirijor.bearer_token_env_var=\"DIRIJOR_MCP_TOKEN\"",
             ]
@@ -838,11 +863,9 @@ mod tests {
         assert_eq!(mcp["mcpServers"]["dirijor"]["type"], "stdio");
     }
 
-    /// A launch kept on stdio (endpoint down, or a CLI below the verified
-    /// HTTP minimum) must get exactly what it got before the HTTP endpoint
-    /// existed. The expected values are spelled out as main produced them.
+    /// The compact catalog also works on launches gated to stdio.
     #[test]
-    fn gated_out_launches_get_main_s_stdio_injection_byte_for_byte() {
+    fn gated_out_launches_get_the_compact_stdio_profile() {
         let temp = tempfile::tempdir().expect("temp");
         let dir = temp.path();
         let cli = dir.join("bin/dirijor");
@@ -854,13 +877,12 @@ mod tests {
         let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
         let cli_text = cli.to_string_lossy().into_owned();
 
-        // main's exact expression for the stdio config (no sibling
-        // dirijor-mcp, so the CLI's `mcp-stdio` subcommand).
+        // With no sibling executable, the CLI forwards the profile switch.
         assert_eq!(
             std::fs::read(dir.join("claude-mcp.json")).unwrap(),
             serde_json::to_vec_pretty(&json!({
                 "mcpServers": {
-                    "dirijor": { "type": "stdio", "command": cli_text, "args": ["mcp-stdio"] }
+                    "dirijor": { "type": "stdio", "command": cli_text, "args": ["mcp-stdio", "--skills-v1"] }
                 }
             }))
             .unwrap()
@@ -901,7 +923,7 @@ mod tests {
                 "-c".to_owned(),
                 format!("mcp_servers.dirijor.command={}", toml_string(&cli_text)),
                 "-c".to_owned(),
-                "mcp_servers.dirijor.args=[\"mcp-stdio\"]".to_owned(),
+                "mcp_servers.dirijor.args=[\"mcp-stdio\",\"--skills-v1\"]".to_owned(),
             ]
         );
         assert_eq!(injected.argv, injection_args(&codex, dir, &cli));

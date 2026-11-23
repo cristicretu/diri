@@ -158,6 +158,22 @@ impl StatusGlyph {
         )
     }
 
+    /// A session mark laid out at its declared size, including the optional
+    /// foreground program icon for shell sessions.
+    pub fn sized_mark(&self, program: Option<crate::IconName>) -> gpui::AnyElement {
+        div()
+            .flex_none()
+            .size(px(self.size))
+            .child(static_mark(
+                self.kind,
+                program,
+                self.size,
+                static_status_color(self.kind, self.state, self.colors),
+                1.0,
+            ))
+            .into_any_element()
+    }
+
     pub fn entity(
         kind: AgentKind,
         state: StatusState,
@@ -183,10 +199,7 @@ fn static_status_color(kind: AgentKind, state: StatusState, colors: SemanticColo
 
 impl Render for StatusGlyph {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex_none()
-            .size(px(self.size))
-            .child(self.rendered_mark())
+        self.sized_mark(self.glyph)
     }
 }
 
