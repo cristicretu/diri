@@ -126,6 +126,145 @@ fn a_held_session_survives_its_session_object_and_is_adoptable() {
 }
 
 #[test]
+fn work_finishes_in_the_original_session_while_the_app_client_is_closed() {
+    use diri_engine::control::ControlServer;
+    use diri_proto::ControlMessage;
+    use serde_json::{Value, json};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::sync::Mutex;
+
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let logs = root.path().join("logs");
+    let holder = holder_config(root.path());
+    let id = "s_reopen";
+    let mut spec = shell_spec(
+        id,
+        "echo in-progress; while [ ! -f release ]; do sleep 0.02; done; echo task-finished; : > done; read -r keep",
+        &logs,
+        Some(holder),
+    );
+    spec.pty.cwd = root.path().to_path_buf();
+    let mut registry = Registry::new(engine(), root.path().join("state.json"));
+    registry.spawn(spec, record(id)).unwrap();
+    let pid = registry.get(id).unwrap().child_pid();
+    wait_until("started work", Duration::from_secs(5), || {
+        log_contains(&logs, id, b"in-progress")
+    });
+    let registry = Arc::new(Mutex::new(registry));
+    let server = Arc::new(
+        ControlServer::new(Arc::clone(&registry), root.path().join("control.sock"))
+            .with_logs_dir(logs),
+    );
+    let call = |method: &str, params: Value| {
+        // Each call connects as a new app client with no prior state.
+        let (mut app, engine) = UnixStream::pair().unwrap();
+        let server = Arc::clone(&server);
+        let worker = std::thread::spawn(move || server.serve(engine));
+        app.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        serde_json::to_writer(
+            &app,
+            &ControlMessage::Request {
+                id: 1,
+                method: method.into(),
+                params: Some(params),
+            },
+        )
+        .unwrap();
+        app.write_all(b"\n").unwrap();
+        let mut reply = String::new();
+        BufReader::new(&app).read_line(&mut reply).unwrap();
+        drop(app);
+        worker.join().unwrap().unwrap();
+        match serde_json::from_str(&reply).unwrap() {
+            ControlMessage::Response {
+                result: Ok(value), ..
+            } => value,
+            other => panic!("unexpected response {other:?}"),
+        }
+    };
+    let screen = || {
+        call("session.read_screen", json!({"sessionID": id}))["text"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert!(screen().contains("in-progress"));
+    std::fs::write(root.path().join("release"), []).unwrap();
+    wait_until(
+        "task finished without an app client",
+        Duration::from_secs(5),
+        || root.path().join("done").exists(),
+    );
+    let sessions = call("session.list", json!({}));
+    assert_eq!(sessions["sessions"][0]["id"], id);
+    wait_until(
+        "fresh client reads the completed turn",
+        Duration::from_secs(5),
+        || screen().contains("task-finished"),
+    );
+    let mut registry = registry.lock().unwrap();
+    assert_eq!(registry.get(id).unwrap().child_pid(), pid);
+    registry.terminate(id, Duration::from_secs(2)).unwrap();
+}
+
+#[test]
+#[ignore = "known failure: restore records a transient stat error as an exit"]
+fn ambiguous_stat_during_restore_cannot_end_a_surviving_holder() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let holder = holder_config(root.path());
+    let state = root.path().join("state.json");
+    let logs = root.path().join("logs");
+    let id = "s_stat_retry";
+    {
+        let mut registry = Registry::new(engine(), &state);
+        registry
+            .spawn(
+                shell_spec(id, "cat", &logs, Some(holder.clone())),
+                record(id),
+            )
+            .unwrap();
+        registry.persist().unwrap();
+    }
+    let mut reopened = Registry::new(engine(), &state);
+    reopened.load().unwrap();
+    let socket = HolderPaths::new(&holder.holders_dir, id).socket();
+    let live = socket.with_extension("parked");
+    std::fs::rename(&socket, &live).unwrap();
+    let real_holder = HolderClient::new(&live);
+    let before = real_holder.stat().unwrap();
+    assert!(before.alive);
+    // Inject a failed stat at the normal endpoint while the same real
+    // Holder still owns the PTY. No process or PID lookup is mocked.
+    let listener = UnixListener::bind(&socket).unwrap();
+    let failed_stat = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+        stream
+            .write_all(b"{\"ok\":false,\"error\":\"temporarily unavailable\"}\n")
+            .unwrap();
+    });
+    reopened.restore(&holder, &logs);
+    let reported = reopened.record(id).unwrap().status;
+    failed_stat.join().unwrap();
+    let after = real_holder.stat().unwrap();
+    assert!(after.alive);
+    assert_eq!(before.child_pid, after.child_pid);
+    std::fs::rename(live, socket).unwrap();
+    assert_eq!(reopened.restore(&holder, &logs), [id]);
+    reopened.terminate(id, Duration::from_secs(2)).unwrap();
+    assert!(
+        !matches!(reported, SessionStatus::Exited(_)),
+        "Holder child {0} survived but restore reported {reported:?}",
+        before.child_pid
+    );
+}
+
+#[test]
 fn a_registry_restore_adopts_live_holders_from_a_previous_life() {
     let root = holders_dir("registry");
     let logs = root.join("logs");

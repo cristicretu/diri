@@ -1693,8 +1693,16 @@ impl HeadlessScreen {
         // buffer resident in the macOS allocator after the read (~8 MB per
         // 10k-row checkpoint, per session, for good), while pages of the
         // reservation that the encoding never reaches are never touched.
+        // A transcript grows between checkpoints. Reserve in row-count bands
+        // so later checkpoints can reuse freed large allocations at the same
+        // width. Keep the ceiling of a full export even in the last band.
+        let reserve_rows = if history == 0 {
+            0
+        } else {
+            history.next_power_of_two().min(HISTORY_EXPORT_ROWS)
+        };
         let mut payload =
-            Vec::with_capacity(history * diri_proto::grid::GridRowCodec::max_row_len(cols));
+            Vec::with_capacity(reserve_rows * diri_proto::grid::GridRowCodec::max_row_len(cols));
         let mut row = Vec::with_capacity(cols);
         for index in 0..history {
             let line = Line(index as i32 - history as i32);

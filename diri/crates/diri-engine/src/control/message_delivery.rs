@@ -299,6 +299,10 @@ pub(super) fn open(path: &Path) -> Result<Connection, ControlError> {
 }
 
 #[cfg(test)]
+#[path = "receipt_model.rs"]
+mod receipt_model;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(unix)]
