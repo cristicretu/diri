@@ -345,7 +345,10 @@ unsafe fn parse_keystroke(native_event: id) -> Keystroke {
             .to_str()
             .to_string();
         let mut key_char = None;
-        let first_char = characters.chars().next().map(|ch| ch as u16);
+        let first_char = characters
+            .chars()
+            .next()
+            .and_then(|ch| u16::try_from(ch as u32).ok());
         let modifiers = native_event.modifierFlags();
 
         let control = modifiers.contains(NSEventModifierFlags::NSControlKeyMask);
@@ -465,7 +468,20 @@ unsafe fn parse_keystroke(native_event: id) -> Keystroke {
                         mods |= OPTION_MOD;
                     }
 
-                    key_char = Some(chars_for_modified_key(native_event.keyCode(), mods));
+                    // Input methods and accessibility clients can supply text
+                    // independent of the virtual key. Keep layout translation
+                    // for shortcuts and for a dead key with no event text.
+                    let delivered = native_event.characters();
+                    let text = if delivered.is_null() {
+                        ""
+                    } else {
+                        delivered.to_str()
+                    };
+                    key_char = Some(if text.is_empty() {
+                        chars_for_modified_key(native_event.keyCode(), mods)
+                    } else {
+                        text.to_owned()
+                    });
                 }
 
                 if shift
