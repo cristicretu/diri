@@ -2545,11 +2545,19 @@ impl WorkbenchInspector {
             .items_center()
             .gap(px(2.0));
 
+        // The Surface tab wears the app's own title and icon.
+        let live = self
+            .live_surface
+            .as_ref()
+            .and_then(|view| view.read(cx).shown_surface(cx));
         for tab in &self.workspace_tabs {
             let surface = tab.surface;
             let id = tab.id;
             let active = selected == Some(id);
-            let label = if surface == WorkspaceSurface::Browser {
+            let live_doc = live.as_ref().filter(|_| surface == WorkspaceSurface::Live);
+            let label = if let Some(doc) = live_doc {
+                doc.title.clone()
+            } else if surface == WorkspaceSurface::Browser {
                 (if active {
                     &self.browser_state
                 } else {
@@ -2607,6 +2615,10 @@ impl WorkbenchInspector {
                         .flex_none()
                         .with_fallback(move || sf_symbol("network", 10.5, tint))
                         .into_any_element()
+                } else if let Some(doc) = live_doc
+                    && let Some(icon) = &doc.icon
+                {
+                    crate::surfaces::view::icon_element(icon, 12.0, crate::surfaces::render::accent_of(doc.accent.as_deref()), None)
                 } else {
                     sf_symbol(surface.icon(), 10.5, tint)
                 }

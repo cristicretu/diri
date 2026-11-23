@@ -1,5 +1,7 @@
 {
   "panel.surface.live": "面板",
+  "surfaces.allow": "允许此应用",
+  "surfaces.app_error": "此应用的 Lua 已停止",
   "surfaces.ask_refresh": "让智能体刷新",
   "surfaces.asked": "已发送给智能体",
   "surfaces.days_ago": "{count} 天前",
@@ -9,12 +11,20 @@
   "surfaces.hours_ago": "{count} 小时前",
   "surfaces.just_now": "刚刚",
   "surfaces.minutes_ago": "{count} 分钟前",
+  "surfaces.needs_approval": "审核后允许",
+  "surfaces.not_now": "暂不",
   "surfaces.palette_detail": "面板",
   "surfaces.read_only": "此面板由更新版本的 Diri 创建。请更新 Diri 后再修改。",
+  "surfaces.review_body": "它的同步想运行程序或从网络获取数据。允许后仅此 app.lua（sha256 {digest}…）可以这样做；任何修改都会再次询问。",
+  "surfaces.review_title": "允许此应用运行命令并联网获取？",
   "surfaces.save": "保存",
   "surfaces.saved": "已将“{title}”保存到侧边栏",
   "surfaces.sent": "已发送给智能体",
   "surfaces.session_gone": "已关闭",
+  "surfaces.sync_failed": "同步失败",
+  "surfaces.sync_now": "同步",
+  "surfaces.synced": "已同步 {when}",
+  "surfaces.syncing": "正在同步…",
   "surfaces.unsupported": "此组件需要更新版本的 Diri",
   "surfaces.updated": "更新于{when}"
 }

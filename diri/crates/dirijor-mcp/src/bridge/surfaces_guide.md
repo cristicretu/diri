@@ -44,7 +44,9 @@ function sync(ctx)                                    -- refreshes data.json, no
 end
 ```
 event: {type = "action"|"check"|"toggle"|"select"|"checkbox"|"input"|"tab", id, name, value, payload}.
-ctx: {now (ms), theme ("dark"|"light"), width, sessions = {{id, title, status, kind}}, data (in sync)}.
+ctx: {now (ms), theme ("dark"|"light"), layout ("page"|"panel"), width (points, about), sessions =
+{{id, title, status, kind}}, data (in sync)}. Lay out for ctx.layout: a session app draws in a
+narrow right panel.
 
 ## ui
 Layout: ui.box/ui.row/ui.col{children..., gap, padding, padding_x, padding_y, bg, border,

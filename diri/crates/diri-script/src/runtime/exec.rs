@@ -448,29 +448,6 @@ fn split_lines(stream: Stream, partial: &mut Vec<u8>, flush: bool) -> Vec<(Strea
     lines
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn output_is_split_into_lines_and_flushed_at_the_end() {
-        let mut partial = b"one\r\ntwo\nthr".to_vec();
-        let lines = split_lines(Stream::Stdout, &mut partial, false);
-        assert_eq!(
-            lines
-                .iter()
-                .map(|(_, line)| line.as_str())
-                .collect::<Vec<_>>(),
-            ["one", "two"]
-        );
-        assert_eq!(partial, b"thr");
-        partial.extend_from_slice(b"ee");
-        let rest = split_lines(Stream::Stdout, &mut partial, true);
-        assert_eq!(rest[0].1, "three");
-        assert!(partial.is_empty());
-    }
-}
-
 /// Runs one process to its end (or its deadline), for a caller that has no
 /// event loop: a Lua app's `sync` on its worker thread. Same limits as
 /// `diri.exec`: bounded output, the whole process group killed on timeout.
@@ -492,5 +469,28 @@ pub(crate) fn run_blocking(spec: Spec) -> Result<Finished, String> {
         if let Some(finished) = execs.take(id) {
             return Ok(finished);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_is_split_into_lines_and_flushed_at_the_end() {
+        let mut partial = b"one\r\ntwo\nthr".to_vec();
+        let lines = split_lines(Stream::Stdout, &mut partial, false);
+        assert_eq!(
+            lines
+                .iter()
+                .map(|(_, line)| line.as_str())
+                .collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+        assert_eq!(partial, b"thr");
+        partial.extend_from_slice(b"ee");
+        let rest = split_lines(Stream::Stdout, &mut partial, true);
+        assert_eq!(rest[0].1, "three");
+        assert!(partial.is_empty());
     }
 }

@@ -8919,13 +8919,13 @@ mod tests {
 
     #[gpui::test]
     fn saved_surfaces_open_as_a_page_and_close_with_the_to_dos_slot(cx: &mut gpui::TestAppContext) {
-        use diri_proto::surface::{Scope, template};
+        use diri_proto::surface::{Scope, fixtures};
         let services = test_services();
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(diri_surfaces::SurfaceStore::open(dir.path().join("surfaces")).unwrap());
         let doc = store
             .create(
-                template::whats_for_today("", Scope::Global, &[]),
+                fixtures::whats_for_today("", Scope::Global, &[]),
                 &diri_surfaces::Author::User,
             )
             .unwrap();
@@ -13198,8 +13198,11 @@ mod tests {
         // opens it over the main pane.
         let surface_dir = tempfile::tempdir().unwrap();
         let panel_shot = std::env::var("DIRI_VISUAL_SURFACE").is_ok_and(|v| v == "panel");
+        // Two agent-written Lua apps, pinned in the sidebar: Focus Ledger
+        // opens over the main pane, or (`=panel`) Study Queue opens in an
+        // agent's right panel.
         let surface_id = std::env::var_os("DIRI_VISUAL_SURFACE").map(|_| {
-            use diri_proto::surface::{Interaction, Scope, template};
+            use diri_proto::surface::Scope;
             let store = Arc::new(
                 diri_surfaces::SurfaceStore::open(surface_dir.path().join("surfaces")).unwrap(),
             );
@@ -13213,52 +13216,49 @@ mod tests {
                 .map(|record| record.id.0.clone())
                 .collect();
             sessions.sort();
-            sessions.truncate(3);
-            // `DIRI_VISUAL_SURFACE=panel` makes it the first session's own
-            // surface, shown in its right panel; otherwise a saved one.
-            let scope = if panel_shot {
-                Scope::Session {
-                    session: sessions[0].clone(),
-                }
+            let focus = crate::surfaces::tests::example_app(&store, "focus-ledger", Scope::Global, true);
+            let queue_scope = if panel_shot {
+                Scope::Session { session: sessions[0].clone() }
             } else {
                 Scope::Global
             };
-            let mut doc = template::whats_for_today("", scope, &sessions);
+            let queue = crate::surfaces::tests::example_app(&store, "study-queue", queue_scope, true);
             if panel_shot {
-                doc.title = "Checkout retry: review".into();
-                doc.subtitle = Some("What this agent is doing and what it needs from you".into());
+                // Saved too, so the sidebar shows both apps' own icons.
+                crate::surfaces::tests::example_app(&store, "study-queue", Scope::Global, true);
             }
-            let doc = store
-                .create(
-                    doc,
-                    &diri_surfaces::Author::Agent(history_agent.clone()),
-                )
-                .unwrap();
-            store
-                .interact(
-                    &doc.id,
-                    &Interaction::Check {
-                        checklist: "today".into(),
-                        item: "review-812".into(),
-                        checked: true,
-                    },
-                )
-                .unwrap();
-            cx.update(|cx| {
+            let model = cx.update(|cx| {
                 let model = cx.new(|cx| {
                     crate::surfaces::SurfacesModel::with_store(
                         Arc::clone(&runtime),
-                        Some(store),
+                        Some(Arc::clone(&store)),
                         false,
                         cx,
                     )
                 });
-                crate::surfaces::SurfacesModel::install(model, cx);
+                crate::surfaces::SurfacesModel::install(model.clone(), cx);
+                model.update(cx, |model, cx| model.sync(cx));
+                model
             });
-            doc.id
+            for _ in 0..50 {
+                cx.run_until_parked();
+                if cx.update(|cx| model.read(cx).get(&queue).is_some()) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let synced = diri_surfaces::now_ms() - 120_000;
+            cx.update(|cx| {
+                model.update(cx, |model, cx| {
+                    for id in [&focus, &queue] {
+                        model.set_synced_for_test(id, synced, cx);
+                    }
+                })
+            });
+            if panel_shot { queue } else { focus }
         });
         let note_pane = std::rc::Rc::new(std::cell::RefCell::new(None));
-        let window_size = if panel_shot {
+        let window_size = if surface_id.is_some() {
             size(px(1440.0), px(900.0))
         } else {
             size(px(1240.0), px(780.0))

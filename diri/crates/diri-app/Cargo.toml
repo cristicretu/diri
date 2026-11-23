@@ -219,6 +219,10 @@ objc2-web-kit = { version = "=0.3.2", default-features = false, features = [
     "WKWebViewConfiguration",
 ] }
 
+[dev-dependencies.diri-proto]
+workspace = true
+features = ["fixtures"]
+
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 gpui_macos = { workspace = true, features = ["test-support"] }
 

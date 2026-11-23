@@ -3,7 +3,8 @@
 //! apart from the view so they are unit-tested without a window.
 
 use diri_proto::surface::link::{self, LinkKind};
-use diri_proto::surface::{Binding, Tone};
+use diri_proto::surface::node::Color;
+use diri_proto::surface::{Binding, Icon, Tone};
 use diri_proto::{SessionId, SessionRecord, SessionStatus};
 use diri_ui::{Ink, Palette, SemanticColors};
 use gpui::Rgba;
@@ -37,16 +38,24 @@ pub(crate) fn tone_fill(tone: Tone, colors: SemanticColors) -> Rgba {
     }
 }
 
-/// How a link presents itself: icon, badge word, label.
+/// How a link presents itself: the agent's glyph (or a generic one for
+/// its kind), the agent's badge word, and a label.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LinkLook {
-    pub icon: &'static str,
-    pub badge: &'static str,
+    pub icon: Option<Icon>,
+    pub default_symbol: &'static str,
+    pub badge: Option<String>,
     pub label: String,
     pub internal: bool,
 }
 
-pub(crate) fn link_look(url: &str, label: Option<&str>, store: Option<&SessionStore>) -> LinkLook {
+pub(crate) fn link_look(
+    url: &str,
+    label: Option<&str>,
+    icon: Option<&Icon>,
+    badge: Option<&str>,
+    store: Option<&SessionStore>,
+) -> LinkLook {
     let kind = if link::is_allowed(url) {
         link::classify(url)
     } else {
@@ -54,13 +63,7 @@ pub(crate) fn link_look(url: &str, label: Option<&str>, store: Option<&SessionSt
             host: String::new(),
         }
     };
-    let icon = match &kind {
-        LinkKind::Slack => "slack",
-        LinkKind::GithubPull { .. } => "arrow.triangle.pull",
-        LinkKind::GithubIssue { .. } | LinkKind::Github { .. } => "github",
-        LinkKind::Linear { .. } => "linear",
-        LinkKind::Notion => "notion",
-        LinkKind::Figma => "figma",
+    let default_symbol = match &kind {
         LinkKind::DiriSession { .. } => "terminal",
         LinkKind::DiriNote { .. } => "doc.text",
         LinkKind::DiriSurface { .. } => "square.grid.2x2",
@@ -76,14 +79,79 @@ pub(crate) fn link_look(url: &str, label: Option<&str>, store: Option<&SessionSt
         _ => None,
     };
     LinkLook {
-        icon,
-        badge: kind.badge(),
+        icon: icon.cloned(),
+        default_symbol,
+        badge: badge.map(str::to_owned).filter(|b| !b.trim().is_empty()),
         label: label
             .map(str::to_owned)
             .filter(|label| !label.trim().is_empty())
             .or(live)
             .unwrap_or_else(|| kind.default_label()),
         internal: kind.is_internal(),
+    }
+}
+
+/// `"🎧"` is an emoji, `"chart.bar"` a built-in icon, `"icon.svg"` an
+/// image in the app's folder.
+pub(crate) fn icon_shorthand(text: &str) -> Icon {
+    let lower = text.to_ascii_lowercase();
+    if diri_proto::surface::identity::IMAGE_EXTENSIONS
+        .iter()
+        .any(|ext| lower.ends_with(&format!(".{ext}")))
+    {
+        Icon::Asset(text.to_owned())
+    } else if !text.is_empty()
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.')
+    {
+        Icon::Symbol(text.to_owned())
+    } else {
+        Icon::Emoji(text.to_owned())
+    }
+}
+
+/// An agent's accent, parsed; Diri's clay when it set none.
+pub(crate) fn accent_of(accent: Option<&str>) -> Rgba {
+    accent
+        .and_then(diri_proto::surface::identity::parse_accent)
+        .map_or(crate::notes::editor_view::accent(), |(r, g, b)| Rgba {
+            r: f32::from(r) / 255.0,
+            g: f32::from(g) / 255.0,
+            b: f32::from(b) / 255.0,
+            a: 1.0,
+        })
+}
+
+/// A component color on this palette: a theme token (following light and
+/// dark), or the agent's own hex.
+pub(crate) fn color(color: &Color, colors: SemanticColors, accent: Rgba) -> Rgba {
+    if let Some((r, g, b, a)) = color.hex() {
+        return Rgba {
+            r: f32::from(r) / 255.0,
+            g: f32::from(g) / 255.0,
+            b: f32::from(b) / 255.0,
+            a: f32::from(a) / 255.0,
+        };
+    }
+    let faint = |a: f32| Rgba {
+        a: colors.primary.a * a,
+        ..colors.primary
+    };
+    match color.0.as_str() {
+        "primary" => colors.primary,
+        "secondary" => colors.secondary,
+        "tertiary" => colors.tertiary,
+        "accent" => accent,
+        "success" => Ink::FRESH,
+        "warning" => Ink::ATTENTION,
+        "danger" => Ink::DANGER,
+        "info" => Palette::GEMINI_BLUE,
+        "background" => colors.background,
+        "surface" => faint(0.035),
+        "fill" => faint(0.07),
+        "border" => faint(0.09),
+        _ => colors.primary,
     }
 }
 
@@ -192,16 +260,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn links_badge_by_kind() {
-        let look = link_look("https://github.com/acme/web/pull/812", None, None);
-        assert_eq!((look.icon, look.badge, look.label.as_str()), ("arrow.triangle.pull", "PR", "acme/web#812"));
-        let look = link_look("https://linear.app/a/issue/ENG-1/x", Some("Rollout"), None);
-        assert_eq!((look.icon, look.label.as_str()), ("linear", "Rollout"));
-        let look = link_look("diri://session/s1", None, None);
-        assert!(look.internal);
-        // A refused URL never classifies as anything it claims to be.
-        let look = link_look("javascript:alert(1)", None, None);
-        assert_eq!(look.badge, "Link");
+    fn links_look_as_the_agent_says() {
+        let look = link_look("https://github.com/acme/web/pull/812", None, None, None, None);
+        assert_eq!((look.default_symbol, look.badge.as_deref(), look.label.as_str()), ("link", None, "github.com"));
+        let icon = Icon::Symbol("arrow.triangle.pull".into());
+        let look = link_look("https://x.dev/1", Some("Retry PR"), Some(&icon), Some("PR"), None);
+        assert_eq!((look.icon.as_ref(), look.badge.as_deref(), look.label.as_str()), (Some(&icon), Some("PR"), "Retry PR"));
+        assert!(link_look("diri://session/s1", None, None, None, None).internal);
+        assert_eq!(link_look("javascript:alert(1)", None, None, None, None).default_symbol, "link");
+    }
+
+    #[test]
+    fn icons_and_colors_parse() {
+        assert_eq!(icon_shorthand("🎧"), Icon::Emoji("🎧".into()));
+        assert_eq!(icon_shorthand("chart.bar"), Icon::Symbol("chart.bar".into()));
+        assert_eq!(icon_shorthand("art/icon.svg"), Icon::Asset("art/icon.svg".into()));
+        let colors = SemanticColors::dark();
+        let accent = accent_of(Some("#ff0000"));
+        assert_eq!(color(&Color("accent".into()), colors, accent), accent);
+        assert_eq!(color(&Color("#00ff0080".into()), colors, accent).a, 128.0 / 255.0);
     }
 
     #[test]

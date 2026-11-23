@@ -2119,6 +2119,20 @@ impl Sidebar {
             .into_iter()
             .map(|doc| {
                 let active = self.surface_active.as_deref() == Some(doc.id.as_str());
+                // Each app wears the icon and accent its agent gave it.
+                let icon = doc
+                    .icon
+                    .clone()
+                    .unwrap_or_else(|| diri_proto::surface::Icon::Symbol("square.grid.2x2".into()));
+                let tint = if doc.accent.is_some() {
+                    crate::surfaces::render::accent_of(doc.accent.as_deref())
+                } else {
+                    colors.secondary
+                };
+                let folder = model
+                    .read(cx)
+                    .store()
+                    .and_then(|store| store.folder_for(&doc.id).ok());
                 let (done, total) = doc.checklist_progress();
                 let open = total - done;
                 let id = doc.id.clone();
@@ -2148,7 +2162,12 @@ impl Sidebar {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(sf_symbol("square.grid.2x2", 13.0, colors.secondary)),
+                            .child(crate::surfaces::view::icon_element(
+                                &icon,
+                                13.0,
+                                tint,
+                                folder.as_deref(),
+                            )),
                     )
                     .child(div().min_w(px(0.0)).flex_1().truncate().child(doc.title.clone()))
                     .when(open > 0, |row| {

@@ -347,3 +347,134 @@ fn errors_name_the_line() {
     assert_eq!(error.code, "lua");
     assert!(error.message.contains("app.lua:2"), "{}", error.message);
 }
+
+const FOCUS: &str = include_str!("../../../../docs/surfaces/examples/focus-ledger/app.lua");
+const FOCUS_DATA: &str = include_str!("../../../../docs/surfaces/examples/focus-ledger/data.json");
+const QUEUE: &str = include_str!("../../../../docs/surfaces/examples/study-queue/app.lua");
+const QUEUE_DATA: &str = include_str!("../../../../docs/surfaces/examples/study-queue/data.json");
+
+fn validates(root: Value) -> usize {
+    let nodes: Vec<diri_proto::surface::Node> = serde_json::from_value(root).unwrap();
+    let mut doc = diri_proto::surface::SurfaceDoc::new("a", "A", Default::default());
+    doc.root = nodes;
+    doc.validate().expect("example renders a valid surface")
+}
+
+#[test]
+fn the_example_apps_render_valid_native_trees() {
+    for (source, data) in [(FOCUS, FOCUS_DATA), (QUEUE, QUEUE_DATA)] {
+        let dir = tempfile::tempdir().unwrap();
+        let data: Value = serde_json::from_str(data).unwrap();
+        let started = Instant::now();
+        let rendered = render(
+            App {
+                source,
+                dir: dir.path(),
+            },
+            &Value::Null,
+            &data,
+            &ctx(),
+            INTERACTIVE,
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+        let nodes = validates(rendered.root);
+        assert!(nodes > 15, "{nodes}");
+        assert!(rendered.meta.unwrap()["icon"].is_string());
+        // Debug build, fresh sandbox, parse and run: still well under a frame.
+        assert!(elapsed < Duration::from_millis(100), "{elapsed:?}");
+    }
+}
+
+#[test]
+fn study_queue_handles_next_and_speed() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = App {
+        source: QUEUE,
+        dir: dir.path(),
+    };
+    let data: Value = serde_json::from_str(QUEUE_DATA).unwrap();
+    let state = init(app, &ctx(), INTERACTIVE).unwrap();
+    let next = handle_event(
+        app,
+        &state,
+        &json!({"type": "action", "name": "next"}),
+        &data,
+        &ctx(),
+        INTERACTIVE,
+    )
+    .unwrap();
+    assert_eq!(next.state["playing"], 2);
+    let speed = handle_event(
+        app,
+        &next.state,
+        &json!({"type": "select", "id": "speed", "value": "2x"}),
+        &data,
+        &ctx(),
+        INTERACTIVE,
+    )
+    .unwrap();
+    assert_eq!(speed.state["speed"], "2x");
+}
+
+#[test]
+fn focus_ledger_syncs_from_a_real_git_log_once_approved() {
+    let repo = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(["-C", repo.path().to_str().unwrap()])
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(
+            status.status.success(),
+            "{}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    for n in 0..3 {
+        git(&["commit", "-q", "--allow-empty", "-m", &format!("c{n}")]);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("repo.txt"), repo.path().to_str().unwrap()).unwrap();
+    let app = App {
+        source: FOCUS,
+        dir: dir.path(),
+    };
+    let mut context = ctx();
+    context["now"] = json!(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    );
+    let refused = sync(
+        app,
+        &context,
+        SyncCaps { approved: false },
+        sync_limits(Duration::from_secs(10)),
+    )
+    .unwrap();
+    assert!(refused.needs_approval && refused.data.is_none());
+    let synced = sync(
+        app,
+        &context,
+        SyncCaps { approved: true },
+        sync_limits(Duration::from_secs(10)),
+    )
+    .unwrap();
+    let data = synced.data.unwrap();
+    assert_eq!(data["commits_today"], 3, "{data}");
+    assert_eq!(data["days"].as_array().unwrap().len(), 140);
+    assert_eq!(data["streak"], 1);
+    validates(
+        render(app, &Value::Null, &data, &context, INTERACTIVE)
+            .unwrap()
+            .root,
+    );
+}

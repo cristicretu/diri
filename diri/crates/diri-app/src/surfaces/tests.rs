@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use diri_proto::surface::{Interaction, Scope, SurfaceDoc, template};
+use diri_proto::surface::{Interaction, Scope, SurfaceDoc, fixtures};
 use diri_surfaces::{Author, SurfaceStore};
 use gpui::{AppContext as _, Entity, TestAppContext};
 
@@ -13,7 +13,7 @@ fn seeded(cx: &mut TestAppContext) -> (tempfile::TempDir, Arc<SurfaceStore>, Ent
     let store = Arc::new(SurfaceStore::open(dir.path().join("surfaces")).unwrap());
     let doc = store
         .create(
-            template::whats_for_today("", Scope::Global, &[]),
+            fixtures::whats_for_today("", Scope::Global, &[]),
             &Author::Agent("owner-1".into()),
         )
         .unwrap();
@@ -176,6 +176,8 @@ fn the_largest_allowed_surfaces_draw(cx: &mut TestAppContext) {
             items: vec![diri_proto::surface::node::ChecklistItem {
                 id: "a".into(),
                 text: "deep".into(),
+                icon: None,
+                link_label: None,
                 checked: false,
                 link: Some("https://github.com/a/b/pull/1".into()),
                 detail: None,
@@ -282,7 +284,7 @@ fn render_live_surface_screenshot() {
     } else {
         Scope::Global
     };
-    let mut doc = template::whats_for_today("", scope, &sessions);
+    let mut doc = fixtures::whats_for_today("", scope, &sessions);
     if panel {
         doc.pinned = false;
         doc.title = "Checkout retry: review".into();
@@ -364,4 +366,230 @@ impl gpui::Render for Host {
         };
         div().size_full().bg(fill).child(self.view.clone())
     }
+}
+
+/// One of the example Lua apps, set up as an agent would leave it.
+pub(crate) fn example_app(store: &SurfaceStore, name: &str, scope: Scope, approve: bool) -> String {
+    use diri_proto::surface::{AppSpec, SyncSpec};
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/surfaces/examples").join(name);
+    let mut doc = SurfaceDoc::new("", name, scope);
+    doc.pinned = doc.scope.is_saved();
+    doc.app = Some(AppSpec {
+        sync: Some(SyncSpec { every_s: Some(900), ..SyncSpec::default() }),
+    });
+    let doc = store.create(doc, &Author::Agent("s-agent".into())).unwrap();
+    let source = std::fs::read_to_string(root.join("app.lua")).unwrap();
+    store.write_file(&doc.id, "app.lua", source.as_bytes()).unwrap();
+    for extra in ["repo.txt", "playlist.txt"] {
+        if let Ok(text) = std::fs::read(root.join(extra)) {
+            store.write_file(&doc.id, extra, &text).unwrap();
+        }
+    }
+    let data: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("data.json")).unwrap()).unwrap();
+    store.write_data(&doc.id, &data).unwrap();
+    if approve {
+        store.approve(&doc.id, &diri_script::app::digest(&source)).unwrap();
+    }
+    doc.id
+}
+
+/// Renders an example Lua app offscreen: `DIRI_VISUAL_OUTPUT=<png>`,
+/// `DIRI_VISUAL_APP=focus|queue`, `DIRI_VISUAL_DARK=1`,
+/// `DIRI_VISUAL_SURFACE=panel` for the right panel, `DIRI_VISUAL_REVIEW=1`
+/// for the approval review (an unapproved app whose sync asked to run git).
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "writes the Lua app screenshot artifact"]
+fn render_lua_app_screenshot() {
+    use gpui::{HeadlessAppContext, px, size};
+    let output = std::env::var("DIRI_VISUAL_OUTPUT").expect("DIRI_VISUAL_OUTPUT");
+    let dark = std::env::var_os("DIRI_VISUAL_DARK").is_some();
+    let panel = std::env::var("DIRI_VISUAL_SURFACE").is_ok_and(|v| v == "panel");
+    let review = std::env::var_os("DIRI_VISUAL_REVIEW").is_some();
+    let name = match std::env::var("DIRI_VISUAL_APP").as_deref() {
+        Ok("queue") => "study-queue",
+        _ => "focus-ledger",
+    };
+    let colors = if dark { diri_ui::SemanticColors::dark() } else { diri_ui::SemanticColors::light() };
+    let platform = gpui_platform::current_platform(true);
+    let mut cx = HeadlessAppContext::with_platform(
+        platform.text_system(),
+        Arc::new(diri_ui::IconAssets),
+        gpui_platform::current_headless_renderer,
+    );
+    cx.update(|cx| {
+        crate::fonts::init(cx);
+        cx.set_reduce_motion(true);
+    });
+    let runtime = Arc::new(StoreRuntime::inert());
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(SurfaceStore::open(dir.path().join("surfaces")).unwrap());
+    let scope = if panel { Scope::Session { session: "s-agent".into() } } else { Scope::Global };
+    let id = example_app(&store, name, scope, !review);
+    let model = cx.update(|cx| {
+        let model = cx.new(|cx| SurfacesModel::with_store(Arc::clone(&runtime), Some(Arc::clone(&store)), false, cx));
+        SurfacesModel::install(model.clone(), cx);
+        let todos = cx.new(|cx| crate::notes::todos::TodosModel::with_store(Arc::clone(&runtime), None, false, cx));
+        crate::notes::todos::TodosModel::install(todos, cx);
+        model.update(cx, |model, cx| {
+            model.set_dark(dark, cx);
+            model.sync(cx);
+        });
+        model
+    });
+    cx.run_until_parked();
+    for _ in 0..50 {
+        if cx.update(|cx| model.read(cx).get(&id).is_some()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        cx.run_until_parked();
+    }
+    let now = diri_surfaces::now_ms();
+    cx.update(|cx| {
+        model.update(cx, |model, cx| {
+            if review {
+                model.set_needs_approval_for_test(&id, cx);
+            } else {
+                model.set_synced_for_test(&id, now - 120_000, cx);
+            }
+        })
+    });
+    let (width, height) = if panel { (440.0, 1000.0) } else { (1240.0, if name == "study-queue" { 860.0 } else { 820.0 }) };
+    let window = cx
+        .open_window(size(px(width), px(height)), {
+            let runtime = Arc::clone(&runtime);
+            let model = model.clone();
+            let id = id.clone();
+            move |_, cx| {
+                let (mode, target) = if panel {
+                    (Mode::Panel, Target::Session(diri_proto::SessionId::new("s-agent")))
+                } else {
+                    (Mode::Page, Target::Surface(id))
+                };
+                let view = cx.new(|cx| {
+                    let mut view = SurfaceView::new(runtime, model, mode, target, cx);
+                    view.colors_override = Some(colors);
+                    view.now_override = Some(now);
+                    if review {
+                        view.open_review_for_test(cx);
+                    }
+                    view
+                });
+                cx.new(|_| Host { view, colors, panel })
+            }
+        })
+        .unwrap();
+    // Thumbnails arrive from the shared web-image cache off the main thread.
+    for _ in 0..40 {
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, _| window.refresh()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    cx.run_until_parked();
+    cx.capture_screenshot(window.into()).unwrap().save(&output).unwrap();
+    cx.update_window(window.into(), |_, window, _| window.remove_window()).unwrap();
+    cx.run_until_parked();
+}
+
+fn lua_model(cx: &mut TestAppContext, name: &str, approve: bool) -> (tempfile::TempDir, Arc<SurfaceStore>, Entity<SurfacesModel>, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(SurfaceStore::open(dir.path().join("surfaces")).unwrap());
+    let id = example_app(&store, name, Scope::Global, approve);
+    let runtime = Arc::new(StoreRuntime::inert());
+    let model = cx.update(|cx| {
+        let model = cx.new(|cx| SurfacesModel::with_store(runtime, Some(Arc::clone(&store)), false, cx));
+        SurfacesModel::install(model.clone(), cx);
+        model
+    });
+    model.update(cx, |model, cx| model.sync(cx));
+    cx.run_until_parked();
+    (dir, store, model, id)
+}
+
+#[gpui::test]
+fn lua_apps_render_natively_with_their_own_identity(cx: &mut TestAppContext) {
+    let (_dir, store, model, id) = lua_model(cx, "study-queue", true);
+    model.read_with(cx, |model, _| {
+        let surface = model.get(&id).unwrap();
+        let run = surface.app.as_ref().unwrap();
+        assert_eq!(run.error, None);
+        assert!(run.approved);
+        assert_eq!(surface.doc.title, "Study Queue", "the app's own title");
+        assert_eq!(surface.doc.icon, Some(diri_proto::surface::Icon::Emoji("🎧".into())));
+        assert_eq!(surface.doc.accent.as_deref(), Some("#f97316"));
+        let mut nodes = 0;
+        diri_proto::surface::node::walk(&surface.doc.root, &mut |_, _| nodes += 1);
+        assert!(nodes > 20, "{nodes}");
+    });
+    // A click runs on_event; the state it returns is kept and redrawn.
+    model.update(cx, |model, cx| {
+        model.app_event(&id, serde_json::json!({"type": "action", "name": "next"}), true, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(store.load(&id).unwrap().doc.state.app.unwrap()["playing"], 2);
+    model.read_with(cx, |model, _| {
+        assert_eq!(model.get(&id).unwrap().doc.state.app.as_ref().unwrap()["playing"], 2);
+    });
+}
+
+#[gpui::test]
+fn an_unapproved_sync_asks_and_changes_nothing(cx: &mut TestAppContext) {
+    let (_dir, store, model, id) = lua_model(cx, "focus-ledger", false);
+    let before = store.read_data(&id).unwrap();
+    model.update(cx, |model, cx| model.sync_app(&id, cx));
+    cx.run_until_parked();
+    model.read_with(cx, |model, _| {
+        let run = model.get(&id).unwrap().app.as_ref().unwrap();
+        assert!(run.sync.needs_approval, "{:?}", run.sync);
+        assert!(!run.approved);
+    });
+    assert_eq!(store.read_data(&id).unwrap(), before);
+}
+
+#[gpui::test]
+fn editing_the_app_withdraws_its_approval(cx: &mut TestAppContext) {
+    let (_dir, store, model, id) = lua_model(cx, "study-queue", false);
+    let digest = model.read_with(cx, |model, _| model.get(&id).unwrap().app.as_ref().unwrap().digest.clone());
+    store.approve(&id, &digest).unwrap();
+    model.update(cx, |model, cx| model.mark_dirty(cx));
+    cx.run_until_parked();
+    assert!(model.read_with(cx, |model, _| model.get(&id).unwrap().app.as_ref().unwrap().approved));
+    let source = store.app_source(&id).unwrap().unwrap();
+    store.write_file(&id, "app.lua", format!("{source}\n-- edited").as_bytes()).unwrap();
+    model.update(cx, |model, cx| model.mark_dirty(cx));
+    cx.run_until_parked();
+    assert!(!model.read_with(cx, |model, _| model.get(&id).unwrap().app.as_ref().unwrap().approved));
+}
+
+#[gpui::test]
+fn a_lua_error_shows_instead_of_freezing(cx: &mut TestAppContext) {
+    let (_dir, store, model, id) = lua_model(cx, "study-queue", true);
+    store.write_file(&id, "app.lua", b"function render() while true do end end").unwrap();
+    model.update(cx, |model, cx| model.mark_dirty(cx));
+    cx.run_until_parked();
+    model.read_with(cx, |model, _| {
+        let surface = model.get(&id).unwrap();
+        let error = surface.app.as_ref().unwrap().error.clone().unwrap();
+        assert!(error.starts_with("budget"), "{error}");
+        assert!(surface.doc.root.is_empty());
+    });
+}
+
+#[gpui::test]
+fn only_a_drawn_view_polls(cx: &mut TestAppContext) {
+    let (_dir, _store, model, id) = lua_model(cx, "study-queue", true);
+    let now = diri_surfaces::now_ms();
+    model.update(cx, |model, cx| model.set_synced_for_test(&id, now, cx));
+    // Nothing is scheduled by the model itself: polling belongs to a view.
+    assert!(model.read_with(cx, |model, _| model.poll_due(&id, now)).unwrap() > std::time::Duration::from_secs(800));
+    let runtime = Arc::new(StoreRuntime::inert());
+    let (view, cx) = cx.add_window_view({
+        let model = model.clone();
+        let id = id.clone();
+        move |_, cx| SurfaceView::new(runtime, model, Mode::Page, Target::Surface(id), cx)
+    });
+    cx.run_until_parked();
+    let scheduled = view.read_with(cx, |view, _| view.scheduled_poll().map(str::to_owned));
+    assert_eq!(scheduled.as_deref(), Some(id.as_str()), "a visible app waits for its next poll");
 }

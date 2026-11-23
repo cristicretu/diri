@@ -12,7 +12,7 @@ inductive Url where
   | external (scheme : String) (rest : String)
 
 def allowedSchemes : List String :=
-  ["https", "http", "diri", "slack", "linear", "notion", "figma", "mailto"]
+  ["https", "http", "mailto", "diri"]
 
 inductive Action where
   | openUrl (url : Url)
@@ -333,5 +333,187 @@ theorem applyAll_bounded {L : Limits} (ps : List (List Op)) :
     cases h : apply L d p with
     | none => simpa [commit, h] using hd
     | some d' => simpa [commit, h] using apply_bounded h
+
+/-! ## Lua apps (`diri_script::app`)
+
+An app is `app.lua`: `render` returns a tree, `on_event` returns new state and
+actions, `sync` returns new data. Each call runs in a fresh sandbox with an
+instruction budget, off the UI thread. -/
+
+section LuaApps
+
+/-- A program as a step function: each step either continues or finishes. -/
+structure Prog (S O : Type) where
+  start : S
+  step : S → S ⊕ O
+
+variable {S O : Type}
+
+/-- At most `fuel` steps; running out is a refusal, never a hang. -/
+def runFrom (step : S → S ⊕ O) : Nat → S → Option O
+  | 0, _ => none
+  | n + 1, s =>
+    match step s with
+    | .inr o => some o
+    | .inl s' => runFrom step n s'
+
+def run (fuel : Nat) (p : Prog S O) : Option O := runFrom p.step fuel p.start
+
+/-- How many steps a run takes before it finishes or runs out. -/
+def stepsUsed (step : S → S ⊕ O) : Nat → S → Nat
+  | 0, _ => 0
+  | n + 1, s =>
+    match step s with
+    | .inr _ => 1
+    | .inl s' => 1 + stepsUsed step n s'
+
+/-- The budget bounds the work: a run never takes more steps than its fuel. -/
+theorem run_bounded_steps (step : S → S ⊕ O) :
+    ∀ (fuel : Nat) (s : S), stepsUsed step fuel s ≤ fuel := by
+  intro fuel
+  induction fuel with
+  | zero => intro s; simp [stepsUsed]
+  | succ n ih =>
+    intro s
+    simp only [stepsUsed]
+    split
+    · omega
+    · have := ih ‹S›; omega
+
+theorem run_no_fuel (p : Prog S O) : run 0 p = none := rfl
+
+/-- `render`: whatever Lua returns is drawn only if it passes the same bounds
+as every other surface. -/
+def renderApp (fuel : Nat) (L : Limits) (p : Prog S (List Node)) : Option (List Node) :=
+  (run fuel p).bind fun t => if bounded L t then some t else none
+
+theorem render_result_bounded {fuel : Nat} {L : Limits} {p : Prog S (List Node)}
+    {t : List Node} (h : renderApp fuel L p = some t) : bounded L t := by
+  unfold renderApp at h
+  cases hr : run fuel p with
+  | none => simp [hr] at h
+  | some t' =>
+    simp only [hr, Option.bind_some] at h
+    split at h
+    · rename_i hb; simp at h; subst h; exact hb
+    · simp at h
+
+theorem render_no_fuel (L : Limits) (p : Prog S (List Node)) : renderApp 0 L p = none := rfl
+
+/-- `ctx.exec` and `ctx.fetch` run only for the approved digest of the
+current `app.lua`. -/
+def mayExec {Code D : Type} (approvals : Nat → Option D) (digest : Code → D) (id : Nat)
+    (code : Code) : Prop :=
+  approvals id = some (digest code)
+
+theorem no_approval_no_exec {Code D : Type} {approvals : Nat → Option D} {digest : Code → D}
+    {id : Nat} {code : Code} (h : approvals id = none) : ¬ mayExec approvals digest id code := by
+  intro hm; unfold mayExec at hm; rw [h] at hm; cases hm
+
+/-- Editing `app.lua` invalidates its approval, for a collision-free digest
+(stated as a premise, not assumed). -/
+theorem edit_invalidates_approval {Code D : Type} {approvals : Nat → Option D}
+    {digest : Code → D} {id : Nat} {code code' : Code} (hinj : Function.Injective digest)
+    (h : mayExec approvals digest id code) (hne : code' ≠ code) :
+    ¬ mayExec approvals digest id code' := by
+  intro h'
+  unfold mayExec at h h'
+  rw [h] at h'
+  exact hne (hinj (Option.some.inj h')).symm
+
+/-- What the view sees: shown, hidden, time passing, and its own draws. -/
+inductive Ev where
+  | shown
+  | hidden
+  | tick (t : Nat)
+  | render (t : Nat)
+
+structure Sched where
+  visible : Bool
+  nextDue : Nat
+
+/-- A sync run starts only from a draw of a visible view that is due; the
+draw schedules the next one. A hidden view is never drawn. -/
+def stepSched (every : Nat) (s : Sched) : Ev → Sched × Bool
+  | .shown => ({ s with visible := true }, false)
+  | .hidden => ({ s with visible := false }, false)
+  | .tick _ => (s, false)
+  | .render t =>
+    if s.visible && decide (s.nextDue ≤ t) then ({ s with nextDue := t + every }, true)
+    else (s, false)
+
+/-- The scheduler state at each sync run in a trace. -/
+def runs (every : Nat) : Sched → List Ev → List Sched
+  | _, [] => []
+  | s, e :: es =>
+    let r := stepSched every s e
+    (if r.2 then [s] else []) ++ runs every r.1 es
+
+theorem runs_only_while_visible (every : Nat) :
+    ∀ (evs : List Ev) (s : Sched), ∀ r ∈ runs every s evs, r.visible = true := by
+  intro evs
+  induction evs with
+  | nil => intro s r hr; simp [runs] at hr
+  | cons e es ih =>
+    intro s r hr
+    simp only [runs, List.mem_append] at hr
+    rcases hr with hr | hr
+    · cases e with
+      | shown => simp [stepSched] at hr
+      | hidden => simp [stepSched] at hr
+      | tick t => simp [stepSched] at hr
+      | render t =>
+        simp only [stepSched] at hr
+        split at hr
+        · rename_i hv
+          simp at hr; subst hr
+          simp at hv; exact hv.1
+        · simp at hr
+    · exact ih _ r hr
+
+/-- Hidden with no later show: nothing runs, whatever else happens. -/
+theorem hidden_schedules_nothing (every : Nat) :
+    ∀ (evs : List Ev) (s : Sched), s.visible = false → (∀ e ∈ evs, e ≠ .shown) →
+      runs every s evs = [] := by
+  intro evs
+  induction evs with
+  | nil => intro s _ _; rfl
+  | cons e es ih =>
+    intro s hs hno
+    have hrest : ∀ e' ∈ es, e' ≠ .shown := fun e' he' => hno e' (List.mem_cons_of_mem e he')
+    cases e with
+    | shown => exact absurd rfl (hno .shown (List.mem_cons_self))
+    | hidden => simp only [runs, stepSched]; simpa using ih _ rfl hrest
+    | tick t => simp only [runs, stepSched]; simpa using ih s hs hrest
+    | render t =>
+      simp only [runs, stepSched, hs, Bool.false_and]
+      simpa using ih s hs hrest
+
+theorem hide_then_nothing (every : Nat) (s : Sched) (evs : List Ev)
+    (hno : ∀ e ∈ evs, e ≠ .shown) : runs every s (.hidden :: evs) = [] := by
+  simp only [runs, stepSched]
+  simpa using hidden_schedules_nothing every evs _ rfl hno
+
+/-- Effects of one app: actions `on_event` returned for a click pass the gate
+as the person's; anything `render` or `sync` returns passes it as nobody's. -/
+def appEffects (a : Authority) (clicked rendered synced : List Action) : List Effect :=
+  clicked.filterMap (fun act => authorize act .user a) ++
+    (rendered ++ synced).filterMap (fun act => authorize act .programmatic a)
+
+theorem render_sync_mint_no_effects (a : Authority) (rendered synced : List Action) :
+    (rendered ++ synced).filterMap (fun act => authorize act .programmatic a) = [] := by
+  simp [authorize_requires_gesture]
+
+theorem event_effects_gated {a : Authority} {clicked rendered synced : List Action} {e : Effect}
+    (h : e ∈ appEffects a clicked rendered synced) :
+    (∀ s, e.recipient = some s → a.owner = some s ∨ s ∈ a.agents) ∧
+      (∀ u, e = .openExternal u → ∃ sc r, u = .external sc r ∧ sc ∈ allowedSchemes) := by
+  unfold appEffects at h
+  rw [render_sync_mint_no_effects, List.append_nil, List.mem_filterMap] at h
+  obtain ⟨act, _, he⟩ := h
+  exact ⟨fun s hr => prompt_reaches_only_allowed he hr,
+    fun u hu => by subst hu; exact url_scheme_allowed he⟩
+
+end LuaApps
 
 end SurfaceModel
