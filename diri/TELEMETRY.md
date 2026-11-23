@@ -227,7 +227,8 @@ recorded by the Engine, not the Holder.
 
 | kind | sev | fields | catches |
 |---|---|---|---|
-| `holder.manager_start` | info | `guard` | manager (re)starts; `guard: false` means crash cleanup is unavailable |
+| `holder.manager_start` | info | `guard`, `session` | manager (re)starts; `guard: false` means crash cleanup is unavailable; `session` (macOS) is its launchd session: `aqua` is the GUI, `none` means its Agents cannot open a browser or use the pasteboard |
+| `holder.manager_retired` | info | `pid` | macOS: a live manager that was not a launchd job stopped taking new sessions while launchd works; it keeps its sessions until they end |
 | `holder.manager_exit` | info | `ok` | idle retirement vs. accept failure |
 | `holder.manager_failed` | incident | `kind` | the manager exiting with an error |
 | `holder.session_failed` | error | `session, kind` | a session Holder that failed to run |
