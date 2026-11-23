@@ -97,13 +97,61 @@ pub(crate) struct TrustedTranscript {
     file: File,
 }
 
+#[derive(PartialEq, Eq)]
+struct TranscriptStamp {
+    len: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
+    #[cfg(not(unix))]
+    created: std::time::SystemTime,
+}
+
+pub(crate) struct ClaudeTitleCacheEntry {
+    stamp: TranscriptStamp,
+    title: Option<String>,
+}
+
 impl TrustedTranscript {
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
     pub(crate) fn latest_claude_title(&mut self) -> Option<String> {
-        latest_claude_title_from(&mut self.file)
+        latest_claude_title_from(&mut self.file).ok().flatten()
+    }
+
+    /// Check the already-validated descriptor. Replacing a transcript at the
+    /// same path must invalidate its title even when its length is unchanged.
+    pub(crate) fn cached_claude_title(
+        &mut self,
+        previous: Option<ClaudeTitleCacheEntry>,
+    ) -> (Option<String>, Option<ClaudeTitleCacheEntry>) {
+        let stamp = self.file.metadata().ok().and_then(|meta| {
+            #[cfg(unix)]
+            use std::os::unix::fs::MetadataExt;
+            Some(TranscriptStamp {
+                modified: meta.modified().ok()?,
+                len: meta.len(),
+                #[cfg(unix)]
+                identity: (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec()),
+                #[cfg(not(unix))]
+                created: meta.created().ok()?,
+            })
+        });
+        if let Some(entry) = previous
+            && Some(&entry.stamp) == stamp.as_ref()
+        {
+            return (entry.title.clone(), Some(entry));
+        }
+        let Ok(title) = latest_claude_title_from(&mut self.file) else {
+            return (None, None);
+        };
+        let entry = stamp.map(|stamp| ClaudeTitleCacheEntry {
+            stamp,
+            title: title.clone(),
+        });
+        (title, entry)
     }
 
     pub(crate) fn is_codex_subagent(&mut self) -> bool {
@@ -663,20 +711,19 @@ fn read_claude_head(path: &Path) -> Vec<String> {
 /// tail. A `/rename` `custom-title` wins over any generated `ai-title`.
 pub(crate) fn latest_claude_title(path: &Path) -> Option<String> {
     let mut handle = open_regular_readonly(path)?;
-    latest_claude_title_from(&mut handle)
+    latest_claude_title_from(&mut handle).ok().flatten()
 }
 
-fn latest_claude_title_from(handle: &mut File) -> Option<String> {
-    let end = handle.seek(SeekFrom::End(0)).ok()?;
+fn latest_claude_title_from(handle: &mut File) -> std::io::Result<Option<String>> {
+    let end = handle.seek(SeekFrom::End(0))?;
     let start = end.saturating_sub(CLAUDE_TAIL_BYTES as u64);
-    handle.seek(SeekFrom::Start(start)).ok()?;
+    handle.seek(SeekFrom::Start(start))?;
 
     let mut data = Vec::new();
     handle
         .by_ref()
         .take((CLAUDE_TAIL_BYTES + (4 << 10)) as u64)
-        .read_to_end(&mut data)
-        .ok()?;
+        .read_to_end(&mut data)?;
 
     let mut newest_ai = None;
     let mut newest_custom = None;
@@ -709,7 +756,7 @@ fn latest_claude_title_from(handle: &mut File) -> Option<String> {
             _ => {}
         }
     }
-    newest_custom.or(newest_ai)
+    Ok(newest_custom.or(newest_ai))
 }
 
 /// Cursor conversation identity plus the generated title Cursor writes to
@@ -2071,6 +2118,35 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn claude_title_cache_skips_tail_reads_and_detects_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.jsonl");
+        let write = |path: &Path, title: &str| {
+            std::fs::write(
+                path,
+                format!(r#"{{"type":"ai-title","aiTitle":"{title}"}}"#),
+            )
+            .unwrap();
+        };
+        let open = || TrustedTranscript {
+            path: path.clone(),
+            file: File::open(&path).unwrap(),
+        };
+        write(&path, "one");
+        let (title, first) = open().cached_claude_title(None);
+        assert_eq!(title.as_deref(), Some("one"));
+        let mut trusted = open();
+        let (title, reused) = trusted.cached_claude_title(first);
+        assert_eq!(title.as_deref(), Some("one"));
+        assert_eq!(trusted.file.stream_position().unwrap(), 0);
+        let replacement = dir.path().join("replacement");
+        write(&replacement, "two");
+        std::fs::rename(replacement, &path).unwrap();
+        let (title, _) = open().cached_claude_title(reused);
+        assert_eq!(title.as_deref(), Some("two"));
+    }
+
     #[test]
     fn trusted_transcript_reads_the_validated_inode_after_path_replacement() {
         use std::os::unix::fs::symlink;

@@ -400,13 +400,14 @@ fn main() {
         Arc::new(AtomicBool::new(false)),
     );
     let pr_monitor_wake = server.pr_monitor_wake();
+    let (_governor_shutdown, governor_stop) = std::sync::mpsc::channel();
     let _governor = diri_engine::governor::spawn_governor(
         Arc::clone(&registry),
         server.events(),
         server.attach_hub(),
         pr_monitor_wake.clone(),
         server.governor_config(),
-        Arc::new(AtomicBool::new(false)),
+        governor_stop,
     );
     let _pr_monitor = diri_engine::pr_monitor::spawn_pr_monitor(
         Arc::clone(&registry),

@@ -41,6 +41,30 @@ const CARRY_BYTES: usize = 3;
 const DISK_KEEP_DIVISOR: usize = 8;
 const SYNC_INTERVAL: Duration = Duration::from_secs(2);
 
+/// A periodic streaming flush gives dirty bytes to the filesystem. The
+/// explicit final flush still asks the drive to commit them to media.
+#[cfg(target_os = "macos")]
+fn sync_stream_data(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // Darwin maps Rust's File::sync_data to F_FULLFSYNC too. POSIX fsync
+    // writes out dirty content without asking the device to drain its cache.
+    loop {
+        // SAFETY: the borrowed File owns the descriptor throughout the call.
+        if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sync_stream_data(file: &File) -> std::io::Result<()> {
+    file.sync_data()
+}
+
 /// Default in-memory window: 4 MiB.
 pub const DEFAULT_RING_CAPACITY: usize = 4 << 20;
 /// Default spill-file cap per session: 8 MiB, matching `SessionLogStorage`.
@@ -487,7 +511,7 @@ impl OutputLog {
         );
 
         if self.last_sync.elapsed() > SYNC_INTERVAL {
-            handle.sync_all()?;
+            sync_stream_data(handle)?;
             self.last_sync = Instant::now();
         }
 

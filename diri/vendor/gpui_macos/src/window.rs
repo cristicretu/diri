@@ -969,7 +969,7 @@ impl MacWindow {
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
-                frame_source: None,
+                frame_source: Some(WindowFrameSource::new(native_view.cast(), step)),
                 last_present: None,
                 refresh_interval: DEFAULT_REFRESH_INTERVAL,
                 renderer: renderer::new_renderer(
@@ -1862,6 +1862,20 @@ impl PlatformWindow for MacWindow {
         let mut this = self.0.lock();
         this.renderer.draw(scene);
         this.last_present = Some(std::time::Instant::now());
+    }
+
+    fn idle_frame_waker(&self) -> Option<std::rc::Rc<dyn Fn()>> {
+        self.0
+            .lock()
+            .frame_source
+            .as_ref()
+            .map(WindowFrameSource::idle_waker)
+    }
+
+    fn frame_demand(&self, active: bool) {
+        if let Some(source) = self.0.lock().frame_source.as_mut() {
+            source.frame_demand(active);
+        }
     }
 
     fn request_immediate_frame(&self) {
@@ -2905,6 +2919,13 @@ extern "C" fn step(view: *mut c_void) {
     let window_state = unsafe { get_window_state(&*view) };
     let mut lock = window_state.lock();
 
+    if !lock
+        .frame_source
+        .as_mut()
+        .is_some_and(WindowFrameSource::accept_frame)
+    {
+        return;
+    }
     if let Some(mut callback) = lock.request_frame_callback.take() {
         drop(lock);
         callback(Default::default());
