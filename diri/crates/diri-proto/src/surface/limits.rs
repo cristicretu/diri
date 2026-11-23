@@ -307,8 +307,14 @@ fn check_node(checker: &mut Checker, node: &Node, path: &str) -> Result<(), Surf
             value,
             max,
             label: l,
+            track,
             ..
         } => {
+            if let Some(track) = track
+                && !is_valid_id(track)
+            {
+                return Err(SurfaceError::new("invalid_id", "track names a checklist id", path));
+            }
             if !value.is_finite() || !max.is_finite() || *max <= 0.0 || *value < 0.0 {
                 return Err(SurfaceError::new(
                     "invalid_value",

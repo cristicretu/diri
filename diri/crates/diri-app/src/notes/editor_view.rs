@@ -47,7 +47,7 @@ use block_handle::{BLOCK_MENU, BlockDrag, BlockMenu};
 mod find_bar;
 use find_bar::{FIND_EDITOR_CONTEXT, FindBar};
 #[path = "diagram.rs"]
-mod diagram;
+pub(crate) mod diagram;
 use diagram::{Diagrams, Drawing, Look};
 use super::web_image::WebImage;
 

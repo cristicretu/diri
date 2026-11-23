@@ -64,6 +64,7 @@ regex.workspace = true
 diri-client.workspace = true
 diri-proto.workspace = true
 diri-notes.workspace = true
+diri-surfaces.workspace = true
 diri-telemetry.workspace = true
 diri-term.workspace = true
 diri-ui.workspace = true

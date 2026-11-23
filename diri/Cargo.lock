@@ -1642,6 +1642,7 @@ dependencies = [
  "diri-proto",
  "diri-pty",
  "diri-script",
+ "diri-surfaces",
  "diri-telemetry",
  "diri-term",
  "diri-terminal-state",

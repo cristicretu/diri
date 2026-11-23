@@ -160,8 +160,9 @@ pub fn whats_for_today(id: &str, scope: Scope, sessions: &[String]) -> SurfaceDo
                     NodeKind::Progress {
                         value: 1.0,
                         max: 5.0,
-                        label: Some("1 of 5 done".into()),
+                        label: None,
                         tone: Some(Tone::Success),
+                        track: Some("today".into()),
                     },
                 ),
             ],

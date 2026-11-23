@@ -285,6 +285,17 @@ impl SurfaceDoc {
         self.state.selects.get(id).map(String::as_str).or(default)
     }
 
+    /// `(done, total)` of one checklist.
+    pub fn checklist_counts(&self, checklist: &str) -> Option<(usize, usize)> {
+        match node::find(&self.root, checklist).map(|node| &node.kind) {
+            Some(NodeKind::Checklist { items, .. }) => Some((
+                items.iter().filter(|item| self.is_checked(checklist, item)).count(),
+                items.len(),
+            )),
+            _ => None,
+        }
+    }
+
     /// `(done, total)` across every checklist.
     pub fn checklist_progress(&self) -> (usize, usize) {
         let mut done = 0;

@@ -310,6 +310,10 @@ pub enum NodeKind {
         label: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tone: Option<Tone>,
+        /// A checklist id: the bar follows its ticks live and `value`/`max`
+        /// are only the fallback.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        track: Option<String>,
     },
     Table {
         columns: Vec<String>,

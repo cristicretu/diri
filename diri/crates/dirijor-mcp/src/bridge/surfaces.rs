@@ -45,7 +45,7 @@ Layout: stack{children,gap} row{children,gap,wrap} grid{columns 1-6,children}
   card{title,subtitle,tone,children} section{title,detail,children} divider
   tabs{tabs:[{id,label,children}]}
 Content: heading{text,level 1-3} text{text,tone,mono} markdown{text} badge{label,tone}
-  metric{label,value,delta,trend:up|down|flat,caption} progress{value,max,label,tone}
+  metric{label,value,delta,trend:up|down|flat,caption} progress{value,max,label,tone,track: checklist id to follow live}
   table{columns:[..],rows:[[cell|{text,link,tone}]]} kv_list{items:[{key,value,link,tone}]}
   mermaid{source} image{src: https URL or assets/<file>, alt, height}
 Interactive: checklist{id,title,items:[{id,text,checked,link,detail}],notify}

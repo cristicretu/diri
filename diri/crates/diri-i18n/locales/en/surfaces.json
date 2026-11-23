@@ -1,0 +1,20 @@
+{
+  "panel.surface.live": "Surface",
+  "surfaces.ask_refresh": "Ask agent to refresh",
+  "surfaces.asked": "Sent to the agent",
+  "surfaces.days_ago": "{count}d ago",
+  "surfaces.done": "{done} of {total} done",
+  "surfaces.empty": "No surface yet",
+  "surfaces.empty_hint": "Ask an agent to build one. It can show your priorities, live sessions, checklists and links, and keep them current.",
+  "surfaces.hours_ago": "{count}h ago",
+  "surfaces.just_now": "just now",
+  "surfaces.minutes_ago": "{count}m ago",
+  "surfaces.read_only": "This surface was made by a newer Diri. Update Diri to change it.",
+  "surfaces.save": "Save",
+  "surfaces.saved": "Saved “{title}” to the sidebar",
+  "surfaces.sent": "Sent to the agent",
+  "surfaces.session_gone": "Closed",
+  "surfaces.sidebar": "Surfaces",
+  "surfaces.unsupported": "This component needs a newer Diri",
+  "surfaces.updated": "Updated {when}"
+}

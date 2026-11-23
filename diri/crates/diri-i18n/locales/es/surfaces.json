@@ -1,0 +1,20 @@
+{
+  "panel.surface.live": "Superficie",
+  "surfaces.ask_refresh": "Pedir al agente que actualice",
+  "surfaces.asked": "Enviado al agente",
+  "surfaces.days_ago": "hace {count} d",
+  "surfaces.done": "{done} de {total} hechas",
+  "surfaces.empty": "Todavía no hay superficie",
+  "surfaces.empty_hint": "Pide a un agente que cree una. Puede mostrar tus prioridades, sesiones en vivo, listas y enlaces, y mantenerlos al día.",
+  "surfaces.hours_ago": "hace {count} h",
+  "surfaces.just_now": "ahora mismo",
+  "surfaces.minutes_ago": "hace {count} min",
+  "surfaces.read_only": "Esta superficie la creó un Diri más reciente. Actualiza Diri para cambiarla.",
+  "surfaces.save": "Guardar",
+  "surfaces.saved": "«{title}» guardada en la barra lateral",
+  "surfaces.sent": "Enviado al agente",
+  "surfaces.session_gone": "Cerrada",
+  "surfaces.sidebar": "Superficies",
+  "surfaces.unsupported": "Este componente necesita un Diri más reciente",
+  "surfaces.updated": "Actualizada {when}"
+}
