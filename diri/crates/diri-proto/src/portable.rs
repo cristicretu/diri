@@ -251,3 +251,117 @@ pub struct MigrateImportPlan {
 pub const PENDING_PREFS_FILE_NAME: &str = "prefs.pending-import.json";
 /// Extension of a migration bundle.
 pub const BUNDLE_EXTENSION: &str = "diribundle";
+
+/// The `prefs.json` keys that travel. Everything else (window placement,
+/// update channel, login item, phone access, voice commands that may carry a
+/// key, machine limits, telemetry overlays) stays on the Mac that set it.
+/// The Engine exports only these keys and the app applies only these keys.
+pub const PORTABLE_PREF_KEYS: &[&str] = &[
+    "agentsNameSessions",
+    "attentionRoutes",
+    "autoBalancePanes",
+    "conversationTitles",
+    "defaultAgent",
+    "dockBadge",
+    "followSystemTheme",
+    "globalShortcutKeyCode",
+    "hibernateAfterMinutes",
+    "interfaceStyle",
+    "launchRecipes",
+    "mutedNotificationSessions",
+    "newAgentStart",
+    "paneDensity",
+    "reduceMotion",
+    "shortcutOverrides",
+    "sidebarCollapsedProjects",
+    "sidebarGrouping",
+    "sidebarLineageHighlights",
+    "sidebarOrdering",
+    "sidebarPinnedProjects",
+    "sidebarPinnedSessions",
+    "sidebarProjectOrder",
+    "sidebarSessionOrder",
+    "sidebarUsageIndicator",
+    "statusNotifications",
+    "statusSounds",
+    "tabOrientation",
+    "talkAnswer",
+    "talkExceptions",
+    "talkReadsByDefault",
+    "talkVoice",
+    "talkWithAgent",
+    "terminalBoldWeight",
+    "terminalCellWidth",
+    "terminalCopyOnSelect",
+    "terminalCursorBlink",
+    "terminalCursorFollowsPrograms",
+    "terminalCursorShape",
+    "terminalFileEditor",
+    "terminalFollowsLastDirectory",
+    "terminalFontFamily",
+    "terminalFontSize",
+    "terminalFontSmoothing",
+    "terminalFontThicken",
+    "terminalFontWeight",
+    "terminalHidePointer",
+    "terminalItalicWeight",
+    "terminalLigatures",
+    "terminalLineHeight",
+    "terminalOpenLinksOnClick",
+    "terminalOptionAsMeta",
+    "terminalPasteProtection",
+    "terminalShellIntegration",
+    "terminalTheme",
+    "terminalThemeDark",
+    "terminalThemeLight",
+    "terminalTrustedLinkSchemes",
+    "uiLanguage",
+    "warnOnSessionClose",
+    "windowMaterial",
+    "windowTransparency",
+];
+
+/// Overlays the portable keys of `incoming` onto `current` (both
+/// `prefs.json` objects). Keys outside [`PORTABLE_PREF_KEYS`] are ignored
+/// whatever `incoming` carries. Returns whether anything changed.
+pub fn overlay_portable_prefs(
+    current: &mut serde_json::Map<String, serde_json::Value>,
+    incoming: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    let mut changed = false;
+    for key in PORTABLE_PREF_KEYS {
+        if let Some(value) = incoming.get(*key)
+            && current.get(*key) != Some(value)
+        {
+            current.insert((*key).to_owned(), value.clone());
+            changed = true;
+        }
+    }
+    changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlay_ignores_keys_that_do_not_travel() {
+        let mut current = serde_json::json!({"terminalTheme": "a", "windowPlacement": 1});
+        let incoming = serde_json::json!({
+            "terminalTheme": "b",
+            "windowPlacement": 2,
+            "talkVoiceCommand": "curl -H 'Authorization: x'",
+        });
+        let current = current.as_object_mut().unwrap();
+        assert!(overlay_portable_prefs(current, incoming.as_object().unwrap()));
+        assert_eq!(current["terminalTheme"], "b");
+        assert_eq!(current["windowPlacement"], 1);
+        assert!(!current.contains_key("talkVoiceCommand"));
+        assert!(!overlay_portable_prefs(current, incoming.as_object().unwrap()));
+    }
+
+    #[test]
+    fn portable_keys_are_sorted_and_unique() {
+        assert!(PORTABLE_PREF_KEYS.windows(2).all(|w| w[0] < w[1]));
+    }
+}
