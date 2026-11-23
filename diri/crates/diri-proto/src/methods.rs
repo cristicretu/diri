@@ -148,6 +148,13 @@ impl Method {
     pub const ACCOUNT_CLAUDE_LOGIN: &'static str = "account.claude.login";
     pub const ACCOUNT_CLAUDE_CAPTURE: &'static str = "account.claude.capture";
     pub const ACCOUNT_SWITCH_ALL: &'static str = "account.switch_all";
+    /// Portable profile sync (`portable::SyncStatus`).
+    pub const SYNC_STATUS: &'static str = "sync.status";
+    pub const SYNC_CONFIGURE: &'static str = "sync.configure";
+    pub const SYNC_NOW: &'static str = "sync.now";
+    /// Mac-to-Mac migration bundle (`portable::MigrateExportParams`).
+    pub const MIGRATE_EXPORT: &'static str = "migrate.export";
+    pub const MIGRATE_IMPORT: &'static str = "migrate.import";
     pub const ACCOUNT_OVERVIEW: &'static str = "account.overview";
     pub const ACCOUNT_ADOPT: &'static str = "account.adopt";
     pub const ACCOUNT_ADD: &'static str = "account.add";
@@ -286,6 +293,11 @@ impl Method {
         Self::ACCOUNT_CLAUDE_LOGIN,
         Self::ACCOUNT_CLAUDE_CAPTURE,
         Self::ACCOUNT_SWITCH_ALL,
+        Self::SYNC_STATUS,
+        Self::SYNC_CONFIGURE,
+        Self::SYNC_NOW,
+        Self::MIGRATE_EXPORT,
+        Self::MIGRATE_IMPORT,
         Self::ACCOUNT_OVERVIEW,
         Self::ACCOUNT_ADOPT,
         Self::ACCOUNT_ADD,

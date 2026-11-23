@@ -33,6 +33,7 @@ pub mod model;
 pub mod net;
 pub mod node;
 pub mod paths;
+pub mod portable;
 pub mod preview;
 pub mod preview_set;
 pub mod recovery;

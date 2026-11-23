@@ -187,6 +187,8 @@ diri.account = {}
 diri.account.profiles = {}
 diri.account.codex = {}
 diri.account.claude = {}
+diri.sync = {}
+diri.migrate = {}
 diri.voice = {}
 diri.test = {}
 diri.browser = {}
@@ -723,6 +725,36 @@ function diri.account.claude.capture(params, opts) end
 ---@param opts? {timeout?: number}
 ---@return table # SwitchAccountResult
 function diri.account.switch_all(params, opts) end
+
+---Portable profile sync: location, last sync and its outcome.
+---@param params? table
+---@param opts? {timeout?: number}
+---@return table # SyncStatus
+function diri.sync.status(params, opts) end
+
+---Point profile sync at a Git repository or a synced folder, or turn it off.
+---@param params? {config?: any}
+---@param opts? {timeout?: number}
+---@return table # SyncStatus
+function diri.sync.configure(params, opts) end
+
+---Sync the portable profile now (two-way, never credentials).
+---@param params? table
+---@param opts? {timeout?: number}
+---@return table # SyncStatus
+function diri.sync.now(params, opts) end
+
+---Write a migration bundle: profile, sessions and their transcripts.
+---@param params {path: string, passphrase?: string, skipTranscripts?: boolean}
+---@param opts? {timeout?: number}
+---@return table # MigrateExportResult
+function diri.migrate.export(params, opts) end
+
+---Import a migration bundle, remapping paths; dryRun only plans.
+---@param params {path: string, passphrase?: string, dryRun?: boolean, maps?: any[]}
+---@param opts? {timeout?: number}
+---@return table # MigrateImportPlan
+function diri.migrate.import(params, opts) end
 
 ---Accounts in use and limits.
 ---@param params? table

@@ -29,6 +29,7 @@ mod account_settings;
 mod import_settings;
 mod computer_settings;
 mod privacy_settings;
+mod sync_settings;
 mod voice_settings;
 use crate::sidebar::DraggedSidebarItem;
 use crate::store::{Prefs, SessionStore, StoreRuntime, WindowMaterial};
@@ -79,6 +80,9 @@ enum SettingsField {
     Roots,
     VoiceCommand,
     PrivacyName,
+    SyncLocation,
+    SyncExportPassphrase,
+    SyncImportPassphrase,
 }
 
 impl SettingsField {
@@ -716,6 +720,7 @@ pub struct UtilitySurfaces {
     activity: String,
     diagnostics_report: Option<String>,
     privacy: privacy_settings::PrivacyState,
+    sync: sync_settings::SyncSettingsState,
     voice_fields: voice_settings::VoiceFieldsState,
     computer_guide: computer_settings::ComputerGuide,
     _update_changes: Task<()>,
@@ -779,6 +784,7 @@ impl UtilitySurfaces {
             Some("terminal") => SettingsTab::Terminal,
             Some("voice") => SettingsTab::Voice,
             Some("privacy") => SettingsTab::Privacy,
+            Some("sync") => SettingsTab::Sync,
             Some("whats-new" | "what's-new") => SettingsTab::WhatsNew,
             Some("agents") => SettingsTab::Agents,
             Some("skills") => SettingsTab::Skills,
@@ -955,6 +961,7 @@ impl UtilitySurfaces {
             activity: "Connected client · shared daemon remains untouched".to_owned(),
             diagnostics_report,
             privacy: Default::default(),
+            sync: Default::default(),
             voice_fields: Default::default(),
             computer_guide: Default::default(),
             _update_changes: update_changes,
@@ -2213,6 +2220,9 @@ impl UtilitySurfaces {
         self.reload_include_editor();
         self.reload_roots_editor();
         self.reload_privacy();
+        if self.settings_tab == SettingsTab::Sync {
+            self.refresh_sync_status(cx);
+        }
         if self.settings_tab == SettingsTab::Skills {
             self.refresh_skills(cx);
         }
@@ -2322,6 +2332,12 @@ impl UtilitySurfaces {
         }
         if tab == SettingsTab::Accounts {
             self.refresh_accounts(cx);
+        }
+        if tab == SettingsTab::Sync {
+            self.refresh_sync_status(cx);
+        }
+        if tab != SettingsTab::Sync {
+            self.release_sync_fields();
         }
         if tab == SettingsTab::General {
             let mut store = self.store.write().expect("session store lock poisoned");
@@ -3019,6 +3035,7 @@ impl UtilitySurfaces {
         }
         if self.handle_account_key(event, cx)
             || self.handle_privacy_name_key(event, cx)
+            || self.handle_sync_field_key(event, cx)
             || self.handle_voice_fields_key(event, cx)
             || self.handle_include_key(event, cx)
             || self.handle_roots_key(event, cx)
@@ -3515,6 +3532,7 @@ impl UtilitySurfaces {
             SettingsTab::Terminal => self.terminal_settings(cx).into_any_element(),
             SettingsTab::Voice => self.voice_settings(cx).into_any_element(),
             SettingsTab::Privacy => self.privacy_page(cx).into_any_element(),
+            SettingsTab::Sync => self.sync_settings(cx).into_any_element(),
             SettingsTab::Worktrees => self.worktree_settings(cx).into_any_element(),
             SettingsTab::Resources => self.resource_settings(cx).into_any_element(),
             SettingsTab::Remote => self.remote_settings(cx).into_any_element(),
@@ -9831,6 +9849,7 @@ fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
         SettingsTab::Terminal => "settings.keywords.terminal",
         SettingsTab::Voice => "settings.keywords.voice",
         SettingsTab::Privacy => "settings.keywords.privacy",
+        SettingsTab::Sync => "settings.keywords.sync",
         SettingsTab::Usage => "settings.keywords.usage",
         SettingsTab::Worktrees => "settings.keywords.worktrees",
         SettingsTab::Resources => "settings.keywords.resources",
@@ -10842,6 +10861,7 @@ mod tests {
             Ok("terminal") => SettingsTab::Terminal,
             Ok("voice") => SettingsTab::Voice,
             Ok("privacy") => SettingsTab::Privacy,
+            Ok("sync") => SettingsTab::Sync,
             Ok("worktrees") => SettingsTab::Worktrees,
             Ok("resources") => SettingsTab::Resources,
             Ok("usage") => SettingsTab::Usage,
@@ -12586,6 +12606,10 @@ mod tests {
                         surfaces.worktrees.entries.clear();
                         surfaces.worktrees.error = Some("Couldn't connect to the engine. Refresh to retry.".into());
                     }
+                }
+                // `DIRI_VISUAL_SYNC_PLAN=1` adds an import's dry run.
+                if tab == SettingsTab::Sync {
+                    surfaces.seed_sync_preview(std::env::var_os("DIRI_VISUAL_SYNC_PLAN").is_some());
                 }
                 if tab == SettingsTab::Schedules {
                     surfaces.schedules.update(cx, |schedules, _| {

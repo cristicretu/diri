@@ -8,6 +8,8 @@ mod lua;
 mod notes;
 #[path = "dirijor/organization.rs"]
 mod organization;
+#[path = "dirijor/portable.rs"]
+mod portable;
 #[path = "dirijor/script.rs"]
 mod script;
 #[path = "dirijor/spec.rs"]
@@ -118,6 +120,8 @@ fn run(arguments: &[String]) -> Result<(), CliError> {
         "events" => events(arguments.get(1..).unwrap_or_default()),
         "ports" => ports(arguments.get(1..).unwrap_or_default()),
         "note" | "notes" => notes::run(arguments.get(1..).unwrap_or_default()),
+        "sync" => portable::sync(arguments.get(1..).unwrap_or_default()),
+        "migrate" => portable::migrate(arguments.get(1..).unwrap_or_default()),
         "doctor" => doctor(),
         "actions" => api::actions(arguments.get(1..).unwrap_or_default()),
         "do" => api::perform(arguments.get(1..).unwrap_or_default()),
@@ -154,11 +158,15 @@ fn print_help() {
          {}\n\n\
          {}\n\n\
          {}\n\n\
-         Notes (Markdown files; new notes appear in the sidebar when Diri is running):\n  {}",
+         Notes (Markdown files; new notes appear in the sidebar when Diri is running):\n  {}\n\n\
+         Profile sync (zero server: a private Git repository or a synced folder):\n  {}\n\n\
+         Move to another Mac:\n  {}",
         script::HELP,
         api::HELP,
         lua::HELP,
-        notes::HELP
+        notes::HELP,
+        portable::SYNC_HELP,
+        portable::MIGRATE_HELP
     );
 }
 

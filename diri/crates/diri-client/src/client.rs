@@ -32,6 +32,9 @@ const EVENT_CHANNEL_CAPACITY: usize = 4096;
 // instant.
 const AGENT_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_AGENT_CATALOG_TIMEOUT: Duration = Duration::from_secs(240);
+/// Exports and imports read and write every transcript; a Git sync fetches
+/// and pushes. Bounded so a hung remote cannot pin the request forever.
+const PORTABLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Errors surfaced by daemon requests and the reconnecting transport.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1294,6 +1297,48 @@ impl DaemonClient {
         params: WorktreeListParams,
     ) -> Result<Vec<WorktreeInfo>, ClientError> {
         self.typed(Method::WORKTREE_LIST, &params).await
+    }
+
+    pub async fn sync_status(&self) -> Result<diri_proto::portable::SyncStatus, ClientError> {
+        self.no_params(Method::SYNC_STATUS).await
+    }
+
+    pub async fn sync_configure(
+        &self,
+        config: Option<diri_proto::portable::SyncConfig>,
+    ) -> Result<diri_proto::portable::SyncStatus, ClientError> {
+        let params = diri_proto::portable::SyncConfigureParams { config };
+        self.core
+            .request_typed(
+                Method::SYNC_CONFIGURE,
+                Some(&params),
+                Some(PORTABLE_TIMEOUT),
+            )
+            .await
+    }
+
+    pub async fn sync_now(&self) -> Result<diri_proto::portable::SyncStatus, ClientError> {
+        self.core
+            .request_typed::<EmptyParams, _>(Method::SYNC_NOW, None, Some(PORTABLE_TIMEOUT))
+            .await
+    }
+
+    pub async fn migrate_export(
+        &self,
+        params: &diri_proto::portable::MigrateExportParams,
+    ) -> Result<diri_proto::portable::MigrateExportResult, ClientError> {
+        self.core
+            .request_typed(Method::MIGRATE_EXPORT, Some(params), Some(PORTABLE_TIMEOUT))
+            .await
+    }
+
+    pub async fn migrate_import(
+        &self,
+        params: &diri_proto::portable::MigrateImportParams,
+    ) -> Result<diri_proto::portable::MigrateImportPlan, ClientError> {
+        self.core
+            .request_typed(Method::MIGRATE_IMPORT, Some(params), Some(PORTABLE_TIMEOUT))
+            .await
     }
 
     pub async fn schedules(

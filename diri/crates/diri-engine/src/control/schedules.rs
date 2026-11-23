@@ -668,6 +668,7 @@ impl super::ControlServer {
             .name("diri-scheduler".into())
             .spawn(move || server.run_scheduler());
         self.spawn_file_triggers();
+        self.spawn_profile_sync();
     }
 
     fn run_scheduler(self: Arc<Self>) {
@@ -1149,6 +1150,79 @@ impl super::ControlServer {
             Err(error) if error.code == "not_found" => {}
             Err(error) => eprintln!("diri-scheduler: record {id} failed: {}", error.message),
         }
+    }
+}
+
+/// Schedules for profile sync and migration, which keep a schedule's id
+/// across Macs so a re-import or the next sync recognises it.
+impl super::ControlServer {
+    pub(super) fn portable_schedules(&self) -> Result<Vec<ScheduleRecord>, ControlError> {
+        load_all(&database(&self.schedules_path())?)
+    }
+
+    /// Creates `id` with `spec`, or replaces its spec when it differs.
+    /// Returns whether anything changed. Run history stays with the Mac.
+    pub(super) fn put_portable_schedule(
+        &self,
+        id: &str,
+        mut spec: ScheduleSpec,
+    ) -> Result<bool, ControlError> {
+        if id.is_empty()
+            || id.len() > 64
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(ControlError::bad_request("invalid schedule id"));
+        }
+        let now = now_ms();
+        let next_due = validate(&mut spec, now)?;
+        let db = database(&self.schedules_path())?;
+        let record = match load(&db, id) {
+            Ok(existing) if existing.spec == spec => return Ok(false),
+            Ok(mut existing) => {
+                existing.spec = spec;
+                existing.revision += 1;
+                existing.next_due = next_due.map(|due| DateMillis(due as f64));
+                existing
+            }
+            Err(_) => {
+                let count: i64 = db
+                    .query_row("SELECT COUNT(*) FROM schedules_v1", [], |row| row.get(0))
+                    .map_err(storage_error)?;
+                if count >= MAX_SCHEDULES {
+                    return Err(ControlError::new(
+                        "schedule_storage_full",
+                        "too many schedules; delete one first",
+                    ));
+                }
+                ScheduleRecord {
+                    id: id.to_owned(),
+                    spec,
+                    created_at: DateMillis(now as f64),
+                    revision: 0,
+                    next_due: next_due.map(|due| DateMillis(due as f64)),
+                    runs: Vec::new(),
+                }
+            }
+        };
+        if let Some(baseline) = files::baseline(&record.spec.when)? {
+            files::save_handled(&db, &record.id, &baseline)?;
+        }
+        save(&db, &record)?;
+        self.publish_schedule(id);
+        self.scheduler.poke();
+        Ok(true)
+    }
+
+    pub(super) fn remove_portable_schedule(&self, id: &str) -> Result<(), ControlError> {
+        let db = database(&self.schedules_path())?;
+        db.execute("DELETE FROM schedules_v1 WHERE id=?1", [id])
+            .map_err(storage_error)?;
+        files::forget_handled(&db, id)?;
+        self.publish_schedule(id);
+        self.scheduler.poke();
+        Ok(())
     }
 }
 

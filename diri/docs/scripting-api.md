@@ -115,6 +115,11 @@ Call one as `diri.call("session.list")` or through its generated function, `diri
 | `diri.account.claude.login` | `id` | `AgentAccountLogin` | Start a Claude sign-in for a profile. |
 | `diri.account.claude.capture` | `id` | `AgentAccountCatalog` | Save the signed-in Claude account. |
 | `diri.account.switch_all` | `accountProfileId` | `SwitchAccountResult` | Switch every open tab of an Agent to a saved account. |
+| `diri.sync.status` |  | `SyncStatus` | Portable profile sync: location, last sync and its outcome. |
+| `diri.sync.configure` | `config?` | `SyncStatus` | Point profile sync at a Git repository or a synced folder, or turn it off. |
+| `diri.sync.now` |  | `SyncStatus` | Sync the portable profile now (two-way, never credentials). |
+| `diri.migrate.export` | `path, passphrase?, skipTranscripts?` | `MigrateExportResult` | Write a migration bundle: profile, sessions and their transcripts. |
+| `diri.migrate.import` | `path, passphrase?, dryRun?, maps?` | `MigrateImportPlan` | Import a migration bundle, remapping paths; dryRun only plans. |
 | `diri.account.overview` |  | `AgentAccountOverview` | Accounts in use and limits. |
 | `diri.account.adopt` | `agent` | `AgentAccountCatalog` | Save the Agent's current login as a profile. |
 | `diri.account.add` | `agent` | `AgentAccountLogin` | Add another account for an Agent. |
