@@ -58,7 +58,7 @@ background-app = false
 diri-platform.workspace = true
 base64.workspace = true
 diri-web = { path = "../diri-web" }
-qrcode = { version = "0.14", default-features = false }
+qrcode = { version = "0.15", default-features = false }
 raw-window-handle.workspace = true
 regex.workspace = true
 diri-client.workspace = true
