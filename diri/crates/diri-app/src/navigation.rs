@@ -141,6 +141,48 @@ struct PageState {
 
 impl gpui::EventEmitter<crate::palette_workspace::WorkspaceCommand> for NavigationOverlay {}
 impl gpui::EventEmitter<crate::sidebar::AccountRequest> for NavigationOverlay {}
+impl gpui::EventEmitter<SurfaceOpened> for NavigationOverlay {}
+
+/// ⌘K chose a saved Live Surface: the window shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SurfaceOpened(pub String);
+
+/// Saved surfaces ⌘K offers while typing, at most this many.
+const PALETTE_SURFACE_LIMIT: usize = 3;
+
+impl NavigationOverlay {
+    /// Saved Live Surfaces whose title has every word typed, above the
+    /// commands like notes are.
+    fn palette_surface_actions(&self) -> Vec<palette::Ranked<palette::PaletteAction>> {
+        let query = self.query.text().trim().to_lowercase();
+        if query.is_empty() {
+            return Vec::new();
+        }
+        crate::surfaces::saved_titles()
+            .into_iter()
+            .filter(|(_, title)| {
+                let title = title.to_lowercase();
+                query.split_whitespace().all(|word| title.contains(word))
+            })
+            .take(PALETTE_SURFACE_LIMIT)
+            .map(|(id, title)| palette::Ranked {
+                item: palette::PaletteAction {
+                    id: format!("surface:{id}"),
+                    title,
+                    system_image: "square.grid.2x2",
+                    shortcut: None,
+                    detail: Some(crate::i18n::t("surfaces.palette_detail").into()),
+                    enabled: true,
+                    is_default: false,
+                    command: PaletteCommand::OpenSurface { id },
+                    keywords: String::new(),
+                },
+                title_matches: Vec::new(),
+                score: 0,
+            })
+            .collect()
+    }
+}
 
 pub struct NavigationOverlay {
     active_workspace: Option<diri_proto::workspace::WorkspaceId>,
@@ -1203,6 +1245,10 @@ impl NavigationOverlay {
             PaletteCommand::OpenNote { note_id, block } => {
                 self.open_note(note_id, block, window, cx)
             }
+            PaletteCommand::OpenSurface { id } => {
+                self.close_overlay(window, cx);
+                cx.emit(SurfaceOpened(id));
+            }
             PaletteCommand::Action(CommandId::OpenSettings) => {
                 self.push_page(Overlay::Settings, window, cx)
             }
@@ -1310,6 +1356,8 @@ impl NavigationOverlay {
         // live and matched by title) are already in the chat rows.
         let notes = self.palette_note_actions(&self.ranked_sessions.clone());
         self.ranked_actions.splice(0..0, notes);
+        let surfaces = self.palette_surface_actions();
+        self.ranked_actions.splice(0..0, surfaces);
     }
 
     /// Every command the palette offers in this window right now, the

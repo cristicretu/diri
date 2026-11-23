@@ -1,0 +1,49 @@
+{
+ "queue": [
+  {
+   "title": "But what is a neural network?",
+   "channel": "3Blue1Brown",
+   "length": "18:40",
+   "url": "https://www.youtube.com/watch?v=aircAruvnKk",
+   "thumb": "https://i.ytimg.com/vi/aircAruvnKk/mqdefault.jpg"
+  },
+  {
+   "title": "Gradient descent, how neural networks learn",
+   "channel": "3Blue1Brown",
+   "length": "20:33",
+   "url": "https://www.youtube.com/watch?v=IHZwWFHWa-w",
+   "thumb": "https://i.ytimg.com/vi/IHZwWFHWa-w/mqdefault.jpg"
+  },
+  {
+   "title": "Intro to Large Language Models",
+   "channel": "Andrej Karpathy",
+   "length": "59:48",
+   "url": "https://www.youtube.com/watch?v=zjkBMFhNj_g",
+   "thumb": "https://i.ytimg.com/vi/zjkBMFhNj_g/mqdefault.jpg"
+  },
+  {
+   "title": "Let's build GPT: from scratch, in code, spelled out",
+   "channel": "Andrej Karpathy",
+   "length": "1:56:20",
+   "url": "https://www.youtube.com/watch?v=kCc8FmEb1nY",
+   "thumb": "https://i.ytimg.com/vi/kCc8FmEb1nY/mqdefault.jpg"
+  },
+  {
+   "title": "Algorithms and Computation",
+   "channel": "MIT OpenCourseWare",
+   "length": "52:16",
+   "url": "https://www.youtube.com/watch?v=ZA-tUyM_y7s",
+   "thumb": "https://i.ytimg.com/vi/ZA-tUyM_y7s/mqdefault.jpg"
+  }
+ ],
+ "watched": 0.62,
+ "minutes": [
+  22,
+  48,
+  0,
+  35,
+  61,
+  40,
+  74
+ ]
+}

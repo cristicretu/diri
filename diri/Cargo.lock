@@ -1642,6 +1642,7 @@ dependencies = [
  "diri-proto",
  "diri-pty",
  "diri-script",
+ "diri-surfaces",
  "diri-telemetry",
  "diri-term",
  "diri-terminal-state",
@@ -1834,6 +1835,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "diri-surfaces"
+version = "0.1.0"
+dependencies = [
+ "diri-platform",
+ "diri-proto",
+ "getrandom 0.4.3",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "diri-telemetry"
 version = "0.1.0"
 dependencies = [
@@ -1941,6 +1954,7 @@ dependencies = [
  "diri-platform",
  "diri-proto",
  "diri-script",
+ "diri-surfaces",
  "libc",
  "serde",
  "serde_json",

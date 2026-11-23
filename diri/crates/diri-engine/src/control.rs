@@ -551,6 +551,7 @@ impl ControlServer {
                     | crate::inject::MCP_TOKEN_ENV
                     | diri_proto::paths::ENV_SESSION_RECOVERY_DIR
                     | diri_proto::paths::ENV_NOTES_DIR
+                    | diri_proto::paths::ENV_SURFACES_DIR
             )
         });
         let Some(injection) = &self.injection else {
@@ -577,6 +578,12 @@ impl ControlServer {
             ));
         }
         if let Some(dir) = self.resolved_notes_dir() {
+            if let Some(surfaces) = surfaces_dir_beside(&dir) {
+                env.push((
+                    diri_proto::paths::ENV_SURFACES_DIR.into(),
+                    surfaces.to_string_lossy().into_owned(),
+                ));
+            }
             env.push((
                 diri_proto::paths::ENV_NOTES_DIR.into(),
                 dir.to_string_lossy().into_owned(),
@@ -6229,6 +6236,18 @@ fn note_author(parent: Option<&diri_proto::SessionId>) -> diri_notes::history::A
     parent.map_or(diri_notes::history::Author::User, |parent| {
         diri_notes::history::Author::Session(parent.0.clone())
     })
+}
+
+/// Live Surfaces live beside the notes (`<app support>/surfaces`), unless
+/// the Engine itself was told otherwise. Exported to Agents so their
+/// `dirijor surface` and MCP writes reach the surfaces this app draws.
+fn surfaces_dir_beside(notes_dir: &Path) -> Option<PathBuf> {
+    if let Some(dir) =
+        std::env::var_os(diri_proto::paths::ENV_SURFACES_DIR).filter(|dir| !dir.is_empty())
+    {
+        return Some(PathBuf::from(dir));
+    }
+    Some(notes_dir.parent()?.join("surfaces"))
 }
 
 /// The note Session showing `note_id`, if any.

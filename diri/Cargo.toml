@@ -6,6 +6,7 @@ members = [
     "crates/diri-i18n",
     "crates/diri-node",
     "crates/diri-notes",
+    "crates/diri-surfaces",
     "crates/dirijor-mcp",
     "crates/diri-proto",
     "crates/diri-platform",
@@ -36,6 +37,7 @@ diri-engine = { path = "crates/diri-engine" }
 diri-i18n = { path = "crates/diri-i18n" }
 diri-node = { path = "crates/diri-node" }
 diri-notes = { path = "crates/diri-notes" }
+diri-surfaces = { path = "crates/diri-surfaces" }
 diri-proto = { path = "crates/diri-proto" }
 diri-platform = { path = "crates/diri-platform" }
 diri-pty = { path = "crates/diri-pty" }

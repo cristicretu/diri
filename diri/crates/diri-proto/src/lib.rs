@@ -42,6 +42,7 @@ pub mod schedules;
 pub mod search;
 pub mod session_naming;
 pub mod skills;
+pub mod surface;
 pub use remote_connection::{RemoteConnection, RemoteConnectionState};
 pub mod process;
 pub mod process_facts;

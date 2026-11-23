@@ -618,3 +618,34 @@ How one Diri note connects to the others. links: the notes it links to. backlink
 | `note` | string | **Required.** |
 | `depth` | integer |  |
 | `unlinked` | boolean |  |
+
+### `surface`
+
+Diri Apps: native apps you write in Lua (app.lua: render(state, data, ctx) builds GPUI components with ui.row/ui.text/ui.canvas/ui.media/ui.button...; on_event handles clicks; sync(ctx) refreshes data without you), drawn inside Diri with your own title, icon, accent and layout. op schema returns the full reference; read it before your first create. Ops: create, update (lua, data, identity), write_file, read_file, files, data, check (dry-run render), get, list, events, history, restore, promote, delete. A session app (the default) opens in your session's right panel; scope global or project puts it in the sidebar.
+
+| Argument | Type | Notes |
+| --- | --- | --- |
+| `op` | `schema`, `create`, `update`, `write_file`, `read_file`, `files`, `data`, `check`, `get`, `list`, `events`, `history`, `restore`, `promote`, `delete` | **Required.** |
+| `accent` | string |  |
+| `after` | integer |  |
+| `agents` | string array |  |
+| `app` | object,null |  |
+| `content` | string |  |
+| `data` | any |  |
+| `expected_revision` | integer |  |
+| `format` | `json`, `outline` |  |
+| `icon` | any |  |
+| `limit` | integer |  |
+| `lua` | string |  |
+| `ops` | array of objects |  |
+| `path` | string |  |
+| `pinned` | boolean |  |
+| `project` | string |  |
+| `revision` | integer |  |
+| `root` | array of objects |  |
+| `scope` | `session`, `global`, `project`, `saved`, `all`, `mine` |  |
+| `session` | string |  |
+| `style` | object |  |
+| `subtitle` | string |  |
+| `surface` | string |  |
+| `title` | string |  |

@@ -90,3 +90,34 @@ cargo test -p diri-remote --lib controller_epoch_model_rejects_old_claims_and_ex
 `ReceiptTraces.lean` enumerates all 25 pairs of confirmed, rejected-before-write, interrupted-before-write, interrupted-after-write and uncertain actions, with app and Engine restart between attempts. Rust drives the real message and spawn receipt functions and compares the persisted outcome and number of effect callbacks against the generated table. Reopening the database represents an Engine restart at the storage boundary. A dropped invocation has no volatile ownership on retry. The companion task table enumerates 27 three-action traces combining acknowledgement, completion and cancellation. Rust reads each fresh journal view and verifies the acknowledgement history, terminal classification and immutability of an already terminal record.
 
 The Holder test uses a real PTY and authenticated connections, starting at zero and two epochs below the maximum. After each attempted attach it exercises the input path of every prior connection, including the lease kept when the next epoch cannot be represented.
+
+## Live Surfaces
+
+Run `PATH="$HOME/.elan/bin:$PATH" lake build` in this directory. `SurfaceModel.lean` uses only the standard library, and `#print axioms` on its theorems reports just `propext`, `Classical.choice` and `Quot.sound`.
+
+| Lean | Rust counterpart |
+| --- | --- |
+| `Node`, `sizeList`, `depthList`, `idsList`, `bounded` | `surface::node::Node` and `limits::validate_tree`: node count (`MAX_NODES`), nesting (`MAX_DEPTH`) and ids unique across the surface. |
+| `replaceList`, `removeList`, `insertList`, `Op`, `applyOps` | `patch::PatchOp` `replace`, `remove`, `insert` (containers only) and `set` (the component keeps its id), applied in order to a copy. A missing target fails the whole patch. |
+| `apply`, `commit` | `patch::apply`: ops, then `SurfaceDoc::validate`, then prune state and bump the revision once. `SurfaceStore::write_tree` writes only an accepted result. |
+| `prune`, `statefulList` | `SurfaceState::pruned_to` and `limits::state_keys`. |
+| `Authority`, `Authority.target`, `authorize` | `action::Authority`, `Authority::target` and `action::authorize`. |
+| `Prog`, `runFrom`, `run`, `stepsUsed` | One call into an app's Lua (`diri_script::app::{render, handle_event, sync}`), each in a fresh sandbox with an instruction budget, off the UI thread. Running out of budget is an error, never a hang. |
+| `renderApp` | `diri_script::app::render`, then `limits::validate_tree`: a Lua `render` result is drawn only if it is within the same bounds as any surface. |
+| `mayExec` | `SurfaceStore::approve` and `is_approved`, keyed by surface id and `diri_script::app::digest` (SHA-256 of `app.lua`). `ctx.exec` and `ctx.fetch` refuse unless the current text is approved. |
+| `Ev`, `Sched`, `stepSched`, `runs` | `SurfaceView` poll scheduling: a draw of a visible app that is due starts `sync` and schedules the next one. A hidden view is not drawn, so nothing is rescheduled. |
+| `appEffects` | `SurfacesModel::app_event`: actions `on_event` returns for a click pass `authorize` as the person's gesture; `render` and `sync` results pass it as programmatic. |
+
+* `apply_bounded`: every accepted patch, from any surface, yields a bounded tree. `applyAll_bounded` extends this to any sequence of accepted and refused patches.
+* `apply_atomic`, `apply_deterministic`: a refused patch commits the old surface unchanged, and `apply` is a function of the surface and the patch.
+* `apply_preserves_state`: a stateful component that is still present after the patch keeps the person's value. `apply_state_live`: state names only stateful components of the new tree. `apply_revision`: each accepted patch bumps the revision by exactly 1.
+* `authorize_requires_gesture`: nothing runs without the person's gesture. `prompt_reaches_only_allowed`: prompts, app skills and events reach only the owner or a listed agent. `url_scheme_allowed`: external links carry an allowed scheme.
+* `apply_keeps_authority`, `patched_effects_gated`: patches never change who a surface may reach, so a patched surface cannot gain an effect the original gate would refuse.
+* `run_bounded_steps`, `run_no_fuel`: an app call takes at most its budget of steps; with none left it returns nothing. `render_result_bounded`, `render_no_fuel`: whatever `render` returns is drawn only if it is bounded.
+* `no_approval_no_exec`, `edit_invalidates_approval`: without an approval nothing runs; with a collision-free digest (a premise, not an axiom), any edit to `app.lua` voids the approval.
+* `runs_only_while_visible`, `hidden_schedules_nothing`, `hide_then_nothing`: every sync run happens while the app is visible, and once it is hidden no run happens until it is shown again, whatever time passes.
+* `render_sync_mint_no_effects`, `event_effects_gated`: `render` and `sync` produce no effects; actions from `on_event` reach only the owner or a listed agent, or open an external link with an allowed scheme.
+
+The Rust tests `random_patches_preserve_invariants`, `failed_patches_change_nothing` and `actions_need_a_gesture_and_an_allowed_target` (in `diri-proto`'s `surface::tests`) exercise the same properties on the production code.
+
+The model leaves out serde decoding and unknown-component handling, and abstracts field-level validation (string lengths, table shapes, URL syntax, image sources, select defaults) as part of the `bounded` gate. It also leaves out the `title` and `root` ops and `expected_revision`, `RunAppSkill`, and how URLs are classified into `diri://` targets. Persistence (locking, atomic rename, history) and GPUI rendering are outside the model too. Agent writes to `owner` and `agents` are checked separately, by the MCP bridge against the Engine's prompt policy. For Lua apps the model leaves out Lua's semantics themselves (a program is any step function), the granularity of the budget (mlua's hook checks it every 1000 instructions, so a call may overrun by up to that many), and memory: the limit is enforced by mlua, not modelled. SHA-256 collision resistance enters only as the injectivity premise of `edit_invalidates_approval`.

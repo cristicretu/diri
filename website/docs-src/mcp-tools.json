@@ -1726,6 +1726,146 @@
       "name": "note_history"
     },
     {
+      "description": "Diri Apps: native apps you write in Lua (app.lua: render(state, data, ctx) builds GPUI components with ui.row/ui.text/ui.canvas/ui.media/ui.button...; on_event handles clicks; sync(ctx) refreshes data without you), drawn inside Diri with your own title, icon, accent and layout. op schema returns the full reference; read it before your first create. Ops: create, update (lua, data, identity), write_file, read_file, files, data, check (dry-run render), get, list, events, history, restore, promote, delete. A session app (the default) opens in your session's right panel; scope global or project puts it in the sidebar.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "accent": {
+            "pattern": "^#[0-9a-fA-F]{6}$",
+            "type": "string"
+          },
+          "after": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "agents": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 32,
+            "type": "array"
+          },
+          "app": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "content": {
+            "maxLength": 2097152,
+            "type": "string"
+          },
+          "data": {},
+          "expected_revision": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "format": {
+            "enum": [
+              "json",
+              "outline"
+            ],
+            "type": "string"
+          },
+          "icon": {},
+          "limit": {
+            "maximum": 200,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "lua": {
+            "maxLength": 2097152,
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "schema",
+              "create",
+              "update",
+              "write_file",
+              "read_file",
+              "files",
+              "data",
+              "check",
+              "get",
+              "list",
+              "events",
+              "history",
+              "restore",
+              "promote",
+              "delete"
+            ],
+            "type": "string"
+          },
+          "ops": {
+            "items": {
+              "type": "object"
+            },
+            "maxItems": 200,
+            "type": "array"
+          },
+          "path": {
+            "maxLength": 200,
+            "minLength": 1,
+            "type": "string"
+          },
+          "pinned": {
+            "type": "boolean"
+          },
+          "project": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "revision": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "root": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "scope": {
+            "enum": [
+              "session",
+              "global",
+              "project",
+              "saved",
+              "all",
+              "mine"
+            ],
+            "type": "string"
+          },
+          "session": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "style": {
+            "type": "object"
+          },
+          "subtitle": {
+            "maxLength": 512,
+            "type": "string"
+          },
+          "surface": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": {
+            "maxLength": 512,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "op"
+        ],
+        "type": "object"
+      },
+      "name": "surface"
+    },
+    {
       "description": "List the sessions spawned by this one, optionally including the whole descendant tree.",
       "inputSchema": {
         "additionalProperties": false,

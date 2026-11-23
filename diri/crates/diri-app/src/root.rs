@@ -351,6 +351,9 @@ pub struct RootView {
     todos_open: bool,
     pending_live_note_block: Option<(SessionId, String, usize)>,
     todos_page: Option<Entity<crate::notes::todos::TodosPage>>,
+    /// A saved Live Surface shown over the main pane. It shares the To-dos
+    /// page's slot: `todos_open` is "a page covers the terminal".
+    surface_page: Option<Entity<crate::surfaces::view::SurfaceView>>,
     auxiliary_id: Option<SessionId>,
     auxiliary_parent: Option<SessionId>,
     auxiliary_spawn_parent: Option<SessionId>,
@@ -587,6 +590,12 @@ impl RootView {
         if !preview {
             let todos = crate::notes::todos::TodosModel::global(&services.store, cx);
             sidebar.update(cx, |sidebar, cx| sidebar.set_todos(todos, cx));
+            let surfaces = crate::surfaces::SurfacesModel::global(&services.store, cx);
+            sidebar.update(cx, |sidebar, cx| sidebar.set_surfaces(surfaces.clone(), cx));
+            cx.subscribe_in(&surfaces, window, |this, _, event, window, cx| {
+                this.on_surfaces_event(event, window, cx);
+            })
+            .detach();
         }
         let window_store = if preview {
             crate::store::WindowStore::from_canonical(services.store.store.clone())
@@ -721,6 +730,14 @@ impl RootView {
                 },
             )
             .detach();
+            cx.subscribe_in(
+                navigation,
+                window,
+                |this, _, opened: &crate::navigation::SurfaceOpened, window, cx| {
+                    this.open_surface_page(opened.0.clone(), window, cx);
+                },
+            )
+            .detach();
         }
         cx.observe(&sidebar, |_, sidebar, cx| {
             if sidebar.read(cx).project_picker_active() {
@@ -807,6 +824,9 @@ impl RootView {
             }
             if matches!(event, SidebarEvent::OpenTodos) {
                 this.open_todos(window, cx);
+            }
+            if let SidebarEvent::OpenSurface(id) = event {
+                this.open_surface_page(id.clone(), window, cx);
             }
             if matches!(event, SidebarEvent::SessionActivated) {
                 this.close_todos(cx);
@@ -1568,6 +1588,7 @@ impl RootView {
             todos_open: false,
             pending_live_note_block: None,
             todos_page: None,
+            surface_page: None,
             auxiliary_id: None,
             auxiliary_parent: None,
             auxiliary_spawn_parent: None,
@@ -2767,7 +2788,7 @@ impl RootView {
                 if let Some(navigation) = &self.navigation {
                     navigation.update(cx, |navigation, cx| navigation.dismiss(cx));
                 }
-                if self.todos_open {
+                if self.todos_open && self.surface_page.is_none() {
                     self.close_todos(cx);
                     self.focus_active_terminal(window, cx);
                 } else {
@@ -3333,8 +3354,11 @@ impl RootView {
             self.todos_page = Some(page);
         }
         self.todos_open = true;
-        self.sidebar
-            .update(cx, |sidebar, cx| sidebar.set_todos_active(true, cx));
+        self.surface_page = None;
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_surface_active(None, cx);
+            sidebar.set_todos_active(true, cx);
+        });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -3397,9 +3421,101 @@ impl RootView {
             return;
         }
         self.todos_open = false;
-        self.sidebar
-            .update(cx, |sidebar, cx| sidebar.set_todos_active(false, cx));
+        self.surface_page = None;
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_todos_active(false, cx);
+            sidebar.set_surface_active(None, cx);
+        });
         cx.notify();
+    }
+
+    /// Shows a saved Live Surface over the main pane, in the To-dos page's
+    /// slot, and marks its sidebar row.
+    fn open_surface_page(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let target = crate::surfaces::view::Target::Surface(id.clone());
+        match &self.surface_page {
+            Some(page) => page.update(cx, |page, cx| page.set_target(target, cx)),
+            None => {
+                let runtime = Arc::clone(&self.services.store);
+                let model = crate::surfaces::SurfacesModel::global(&runtime, cx);
+                self.surface_page = Some(cx.new(|cx| {
+                    crate::surfaces::view::SurfaceView::new(
+                        runtime,
+                        model,
+                        crate::surfaces::view::Mode::Page,
+                        target,
+                        cx,
+                    )
+                }));
+            }
+        }
+        self.todos_open = true;
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_todos_active(false, cx);
+            sidebar.set_surface_active(Some(id), cx);
+        });
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    fn on_surfaces_event(
+        &mut self,
+        event: &crate::surfaces::SurfacesEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::surfaces::{Navigate, SurfacesEvent};
+        match event {
+            SurfacesEvent::SessionSurfaceCreated { session, .. } => {
+                let shown = self.inspector.clone().is_some_and(|inspector| {
+                    inspector.update(cx, |inspector, cx| inspector.open_live_surface(session, cx))
+                });
+                if shown {
+                    self.reveal_inspector(cx);
+                }
+            }
+            SurfacesEvent::Navigate(Navigate::Session(session)) => {
+                self.close_todos(cx);
+                self.show_from_todos(session.clone(), None, cx);
+            }
+            SurfacesEvent::Navigate(Navigate::Note(note_id)) => {
+                let session = {
+                    let store = self.window_store.read().expect("session store lock poisoned");
+                    store
+                        .sessions()
+                        .values()
+                        .find(|record| record.note_id.as_deref() == Some(note_id.as_str()))
+                        .map(|record| record.id.clone())
+                };
+                self.close_todos(cx);
+                match session {
+                    Some(session) => self.show_from_todos(session, None, cx),
+                    None => {
+                        self.window_store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .open_note_file(note_id.clone());
+                    }
+                }
+            }
+            SurfacesEvent::Navigate(Navigate::Surface(id)) => {
+                let saved = crate::surfaces::SurfacesModel::global(&self.services.store, cx)
+                    .read(cx)
+                    .get(id)
+                    .is_some_and(|surface| surface.doc.scope.is_saved());
+                if saved {
+                    self.open_surface_page(id.clone(), window, cx);
+                }
+            }
+            SurfacesEvent::Feedback { message, error } => {
+                let toast = if *error {
+                    Toast::warning(message.clone())
+                } else {
+                    Toast::success(message.clone())
+                };
+                self.show_feedback("surface", toast, cx);
+            }
+        }
     }
 
     fn focus_active_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5095,7 +5211,9 @@ impl RootView {
             .when(!islands || card_island, |body| {
                 body.bg(terminal.work_surface_nested())
             });
-        if let Some(page) = self.todos_page.clone().filter(|_| self.todos_open) {
+        if let Some(page) = self.surface_page.clone().filter(|_| self.todos_open) {
+            body = body.child(page);
+        } else if let Some(page) = self.todos_page.clone().filter(|_| self.todos_open) {
             body = body.child(page);
         } else if self.active_workspace.is_some() {
             let tab = self.workspace_tab_to_show(window, cx);
@@ -8797,6 +8915,69 @@ mod tests {
                     .unwrap(),
             ),
         })
+    }
+
+    #[gpui::test]
+    fn saved_surfaces_open_as_a_page_and_close_with_the_to_dos_slot(cx: &mut gpui::TestAppContext) {
+        use diri_proto::surface::{Scope, fixtures};
+        let services = test_services();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(diri_surfaces::SurfaceStore::open(dir.path().join("surfaces")).unwrap());
+        let doc = store
+            .create(
+                fixtures::whats_for_today("", Scope::Global, &[]),
+                &diri_surfaces::Author::User,
+            )
+            .unwrap();
+        let runtime = Arc::clone(&services.store);
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            let model = cx.new(|cx| {
+                crate::surfaces::SurfacesModel::with_store(runtime, Some(store), false, cx)
+            });
+            crate::surfaces::SurfacesModel::install(model, cx);
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.run_until_parked();
+        let id = doc.id.clone();
+        root.update(cx, |root, cx| {
+            root.sidebar
+                .update(cx, |_, cx| cx.emit(SidebarEvent::OpenSurface(id.clone())));
+        });
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            assert!(root.todos_open, "the page covers the terminal");
+            let page = root.surface_page.as_ref().expect("surface page");
+            assert_eq!(page.read(cx).shown_surface(cx).unwrap().id, doc.id);
+        });
+        // A click's feedback reaches the window's toast.
+        root.update(cx, |_, cx| {
+            let model = crate::surfaces::SurfacesModel::global(&test_services().store, cx);
+            model.update(cx, |_, cx| {
+                cx.emit(crate::surfaces::SurfacesEvent::Feedback {
+                    message: "Sent to the agent".into(),
+                    error: false,
+                })
+            });
+        });
+        cx.run_until_parked();
+        root.read_with(cx, |root, _| {
+            assert_eq!(root.toast.current().unwrap().message, "Sent to the agent");
+        });
+        // ⌃⌘T while a surface is open goes to To-dos, not away.
+        root.update_in(cx, |root, window, cx| root.run_command(CommandId::ShowTodos, window, cx));
+        root.read_with(cx, |root, _| {
+            assert!(root.todos_open && root.surface_page.is_none());
+        });
+        root.update_in(cx, |root, window, cx| {
+            root.open_surface_page(doc.id.clone(), window, cx)
+        });
+        // Picking a session leaves the page.
+        root.update(cx, |root, cx| {
+            root.sidebar
+                .update(cx, |_, cx| cx.emit(SidebarEvent::SessionActivated));
+        });
+        cx.run_until_parked();
+        root.read_with(cx, |root, _| assert!(!root.todos_open && root.surface_page.is_none()));
     }
 
     #[gpui::test]
@@ -12983,15 +13164,25 @@ mod tests {
             let mut store = services.store.store.write().unwrap();
             store.hydrate(fixture.list);
             store.select(SessionId::new("s_note_plan"));
+            let surface_shot = std::env::var_os("DIRI_VISUAL_SURFACE").is_some();
+            if surface_shot {
+                // A connected Engine and an opaque window, so the shot shows
+                // the surface rather than the reconnect notice over glass.
+                store.mark_connected_for_test();
+            }
             store
                 .update_preferences(|prefs| {
                     prefs.sidebar_visible = true;
                     prefs.terminal_theme = std::env::var("DIRI_VISUAL_THEME")
                         .unwrap_or_else(|_| "dirijor-light".into());
+                    if surface_shot {
+                        prefs.window_material = crate::store::WindowMaterial::Opaque;
+                    }
                 })
                 .unwrap();
         }
         let runtime = Arc::clone(&services.store);
+        let services_store = Arc::clone(&services.store);
         cx.update(|cx| {
             let model = cx.new(|cx| {
                 crate::notes::todos::TodosModel::with_store(
@@ -13003,9 +13194,77 @@ mod tests {
             });
             crate::notes::todos::TodosModel::install(model, cx);
         });
+        // `DIRI_VISUAL_SURFACE=1` pins "What's for Today" in the sidebar and
+        // opens it over the main pane.
+        let surface_dir = tempfile::tempdir().unwrap();
+        let panel_shot = std::env::var("DIRI_VISUAL_SURFACE").is_ok_and(|v| v == "panel");
+        // Two agent-written Lua apps, pinned in the sidebar: Focus Ledger
+        // opens over the main pane, or (`=panel`) Study Queue opens in an
+        // agent's right panel.
+        let surface_id = std::env::var_os("DIRI_VISUAL_SURFACE").map(|_| {
+            use diri_proto::surface::Scope;
+            let store = Arc::new(
+                diri_surfaces::SurfaceStore::open(surface_dir.path().join("surfaces")).unwrap(),
+            );
+            let mut sessions: Vec<String> = runtime
+                .store
+                .read()
+                .unwrap()
+                .sessions()
+                .values()
+                .filter(|record| !record.is_note() && !record.is_archived())
+                .map(|record| record.id.0.clone())
+                .collect();
+            sessions.sort();
+            let focus = crate::surfaces::tests::example_app(&store, "focus-ledger", Scope::Global, true);
+            let queue_scope = if panel_shot {
+                Scope::Session { session: sessions[0].clone() }
+            } else {
+                Scope::Global
+            };
+            let queue = crate::surfaces::tests::example_app(&store, "study-queue", queue_scope, true);
+            if panel_shot {
+                // Saved too, so the sidebar shows both apps' own icons.
+                crate::surfaces::tests::example_app(&store, "study-queue", Scope::Global, true);
+            }
+            let model = cx.update(|cx| {
+                let model = cx.new(|cx| {
+                    crate::surfaces::SurfacesModel::with_store(
+                        Arc::clone(&runtime),
+                        Some(Arc::clone(&store)),
+                        false,
+                        cx,
+                    )
+                });
+                crate::surfaces::SurfacesModel::install(model.clone(), cx);
+                model.update(cx, |model, cx| model.sync(cx));
+                model
+            });
+            for _ in 0..50 {
+                cx.run_until_parked();
+                if cx.update(|cx| model.read(cx).get(&queue).is_some()) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let synced = diri_surfaces::now_ms() - 120_000;
+            cx.update(|cx| {
+                model.update(cx, |model, cx| {
+                    for id in [&focus, &queue] {
+                        model.set_synced_for_test(id, synced, cx);
+                    }
+                })
+            });
+            if panel_shot { queue } else { focus }
+        });
         let note_pane = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let window_size = if surface_id.is_some() {
+            size(px(1440.0), px(900.0))
+        } else {
+            size(px(1240.0), px(780.0))
+        };
         let window = cx
-            .open_window(size(px(1240.0), px(780.0)), {
+            .open_window(window_size, {
                 let note_pane = note_pane.clone();
                 move |window, cx| {
                     cx.new(|cx| {
@@ -13025,6 +13284,73 @@ mod tests {
             })
             .unwrap();
         cx.run_until_parked();
+        if let Some(id) = surface_id.clone() {
+            cx.update_window(window.into(), |root, _, cx| {
+                let root = root.downcast::<RootView>().unwrap();
+                root.update(cx, |root, cx| {
+                    let model =
+                        crate::surfaces::SurfacesModel::global(&root.services.store, cx);
+                    model.update(cx, |model, cx| model.sync(cx));
+                });
+            })
+            .unwrap();
+            cx.run_until_parked();
+            let session = panel_shot.then(|| {
+                let store = services_store.store.read().unwrap();
+                let mut ids: Vec<_> = store
+                    .sessions()
+                    .values()
+                    .filter(|record| !record.is_note() && !record.is_archived())
+                    .map(|record| record.id.clone())
+                    .collect();
+                ids.sort_by(|a, b| a.0.cmp(&b.0));
+                ids[0].clone()
+            });
+            if let Some(session) = &session {
+                cx.update_window(window.into(), |root, window, cx| {
+                    let root = root.downcast::<RootView>().unwrap();
+                    root.update(cx, |root, cx| {
+                        root.window_store.write().unwrap().select(session.clone());
+                        root.services.store.store.write().unwrap().select(session.clone());
+                        root.set_inspector_open(true, cx);
+                        // The fixture pins the main pane to the note; the
+                        // panel follows the agent the surface belongs to.
+                        if let Some(inspector) = &root.inspector {
+                            inspector.update(cx, |inspector, cx| {
+                                inspector.set_session_context(Some(Some(session.clone())), cx)
+                            });
+                        }
+                    });
+                    window.refresh();
+                })
+                .unwrap();
+                for _ in 0..3 {
+                    cx.run_until_parked();
+                    cx.update_window(window.into(), |_, window, _| window.refresh())
+                        .unwrap();
+                }
+            }
+            cx.update_window(window.into(), |root, window, cx| {
+                let root = root.downcast::<RootView>().unwrap();
+                root.update(cx, |root, cx| match &session {
+                    Some(session) => {
+                        root.on_surfaces_event(
+                            &crate::surfaces::SurfacesEvent::SessionSurfaceCreated {
+                                session: session.clone(),
+                                surface: id.clone(),
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                    None => root.open_surface_page(id, window, cx),
+                });
+            })
+            .unwrap();
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(400));
+            cx.run_until_parked();
+        }
         // `DIRI_VISUAL_TODOS=1` opens the To-dos page from the sidebar row.
         if std::env::var_os("DIRI_VISUAL_TODOS").is_some() {
             cx.update_window(window.into(), |root, window, cx| {

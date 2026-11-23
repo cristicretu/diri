@@ -39,6 +39,9 @@ pub const ENV_SESSION_RECOVERY_DIR: &str = "DIRIJOR_SESSION_RECOVERY_DIR";
 /// the MCP bridge and CLI read and write the notes the Engine serves, not a
 /// directory they reconstruct from their own environment.
 pub const ENV_NOTES_DIR: &str = "DIRI_NOTES_DIR";
+/// The Live Surfaces directory, exported beside [`ENV_NOTES_DIR`] for the same
+/// reason: agents write the surfaces the app draws.
+pub const ENV_SURFACES_DIR: &str = "DIRI_SURFACES_DIR";
 
 /// Passed by a launcher that spawns the Engine detached and expects to ask it
 /// to leave when it quits. With it, an Engine left with no live session and no

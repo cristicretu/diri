@@ -171,15 +171,18 @@ pub enum WorkspaceSurface {
     Review,
     /// HTTP requests (`crate::api_client`).
     Api,
+    /// The session's Live Surfaces (`crate::surfaces`).
+    Live,
 }
 
 impl WorkspaceSurface {
-    const CATALOG: [Self; 6] = [
+    const CATALOG: [Self; 7] = [
         Self::Browser,
         Self::Terminal,
         Self::Files,
         Self::Review,
         Self::Api,
+        Self::Live,
         Self::Details,
     ];
 
@@ -191,6 +194,7 @@ impl WorkspaceSurface {
             Self::Files => "panel.surface.files",
             Self::Review => "panel.tab.review",
             Self::Api => "panel.surface.api",
+            Self::Live => "panel.surface.live",
         })
     }
 
@@ -202,6 +206,7 @@ impl WorkspaceSurface {
             Self::Files => "folder",
             Self::Review => "checklist",
             Self::Api => "server.rack",
+            Self::Live => "square.grid.2x2",
         }
     }
 }
@@ -345,6 +350,9 @@ const INSPECTOR_COMPARISON_MENU: crate::floating::Target<WorkbenchInspector> =
     };
 
 pub struct WorkbenchInspector {
+    /// The Live Surface tab's view, made on first use and pointed at the
+    /// session in front.
+    live_surface: Option<Entity<crate::surfaces::view::SurfaceView>>,
     runtime: Arc<StoreRuntime>,
     _tokio_owner: Arc<tokio::runtime::Runtime>,
     tokio: tokio::runtime::Handle,
@@ -511,6 +519,7 @@ impl WorkbenchInspector {
             tokio,
             code_viewer,
             terminal_surface: None,
+            live_surface: None,
             markdown_cache: HashMap::new(),
             focus,
             visible: false,
@@ -1330,7 +1339,10 @@ impl WorkbenchInspector {
             WorkspaceSurface::Files => Some(InspectorTab::Code),
             WorkspaceSurface::Review => Some(InspectorTab::Changes),
             WorkspaceSurface::Details => Some(self.details_tab),
-            WorkspaceSurface::Browser | WorkspaceSurface::Terminal | WorkspaceSurface::Api => None,
+            WorkspaceSurface::Browser
+            | WorkspaceSurface::Terminal
+            | WorkspaceSurface::Api
+            | WorkspaceSurface::Live => None,
         };
         if let Some(tab) = preference_tab {
             self.selected_tab = tab;
@@ -2533,11 +2545,19 @@ impl WorkbenchInspector {
             .items_center()
             .gap(px(2.0));
 
+        // The Surface tab wears the app's own title and icon.
+        let live = self
+            .live_surface
+            .as_ref()
+            .and_then(|view| view.read(cx).shown_surface(cx));
         for tab in &self.workspace_tabs {
             let surface = tab.surface;
             let id = tab.id;
             let active = selected == Some(id);
-            let label = if surface == WorkspaceSurface::Browser {
+            let live_doc = live.as_ref().filter(|_| surface == WorkspaceSurface::Live);
+            let label = if let Some(doc) = live_doc {
+                doc.title.clone()
+            } else if surface == WorkspaceSurface::Browser {
                 (if active {
                     &self.browser_state
                 } else {
@@ -2595,6 +2615,10 @@ impl WorkbenchInspector {
                         .flex_none()
                         .with_fallback(move || sf_symbol("network", 10.5, tint))
                         .into_any_element()
+                } else if let Some(doc) = live_doc
+                    && let Some(icon) = &doc.icon
+                {
+                    crate::surfaces::view::icon_element(icon, 12.0, crate::surfaces::render::accent_of(doc.accent.as_deref()), None)
                 } else {
                     sf_symbol(surface.icon(), 10.5, tint)
                 }
@@ -5920,6 +5944,74 @@ fn should_show_blocking_git_loading(context_changed: bool, state: &LoadState) ->
     context_changed || matches!(state, LoadState::NoSession)
 }
 
+/// The Live Surface tab: the session's surfaces, drawn by
+/// `crate::surfaces::view::SurfaceView`.
+impl WorkbenchInspector {
+    fn render_live(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let session = self
+            .workspace_session
+            .clone()
+            .unwrap_or_else(|| SessionId::new(""));
+        let target = crate::surfaces::view::Target::Session(session);
+        let view = match &self.live_surface {
+            Some(view) => {
+                view.update(cx, |view, cx| view.set_target(target, cx));
+                view.clone()
+            }
+            None => {
+                let runtime = Arc::clone(&self.runtime);
+                let model = crate::surfaces::SurfacesModel::global(&runtime, cx);
+                let view = cx.new(|cx| {
+                    crate::surfaces::view::SurfaceView::new(
+                        runtime,
+                        model,
+                        crate::surfaces::view::Mode::Panel,
+                        target,
+                        cx,
+                    )
+                });
+                self.live_surface = Some(view.clone());
+                view
+            }
+        };
+        div()
+            .id("workspace-live-surface")
+            .size_full()
+            .child(view)
+            .into_any_element()
+    }
+
+    /// An agent made a surface for `session`: for the session in front,
+    /// show it in a Surface tab and ask the window to open the panel
+    /// (returns true). Other sessions find it under + when they come up.
+    pub(crate) fn open_live_surface(&mut self, session: &SessionId, cx: &mut Context<Self>) -> bool {
+        self.sync_workspace_session(cx);
+        if self.workspace_session.as_ref() != Some(session) {
+            return false;
+        }
+        let id = match self
+            .workspace_tabs
+            .iter()
+            .find(|tab| tab.surface == WorkspaceSurface::Live)
+        {
+            Some(tab) => tab.id,
+            None => {
+                let id = self.next_workspace_id;
+                self.next_workspace_id += 1;
+                self.workspace_tabs
+                    .push(WorkspaceTab::new(id, WorkspaceSurface::Live));
+                id
+            }
+        };
+        if self.workspace_active == Some(id) {
+            cx.notify();
+        } else if let Some(surface) = self.load_workspace(id, cx) {
+            cx.emit(InspectorEvent::WorkspaceRestored(surface));
+        }
+        true
+    }
+}
+
 /// The API surface (`crate::api_client`): tab creation, rendering, and the
 /// `open_api_request` MCP path.
 impl WorkbenchInspector {
@@ -6123,6 +6215,7 @@ impl Render for WorkbenchInspector {
                 div().size_full().into_any_element()
             }
             Some(WorkspaceSurface::Api) => self.render_api(colors),
+            Some(WorkspaceSurface::Live) => self.render_live(cx),
             None => self.render_surface_chooser(colors, cx),
         };
         let transition_id = SharedString::from(format!(
