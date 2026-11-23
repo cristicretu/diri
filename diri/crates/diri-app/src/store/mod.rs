@@ -612,6 +612,10 @@ impl SessionStore {
         let path = path.into();
         let prefs = Prefs::load(&path)?;
         let (mut store, receiver) = Self::with_path(prefs, Some(path));
+        // Preferences a sync or import brought while diri was not running.
+        if let Err(error) = store.apply_pending_portable_prefs() {
+            eprintln!("diri: synced preferences could not be applied ({error})");
+        }
         store.reload_hosts();
         Ok((store, receiver))
     }
@@ -1671,6 +1675,31 @@ impl SessionStore {
             self.emit(StoreEffect::ConfigureTerminal(self.terminal_settings()));
         }
         Ok(())
+    }
+
+    /// Merges the portable preferences a profile sync or migration import
+    /// left beside `prefs.json` (the Engine never writes `prefs.json`
+    /// itself), saves them the normal way and deletes the pending file.
+    /// Returns whether any preference changed.
+    pub fn apply_pending_portable_prefs(&mut self) -> io::Result<bool> {
+        let Some(path) = self.prefs_path.clone() else {
+            return Ok(false);
+        };
+        let pending = path.with_file_name(diri_proto::portable::PENDING_PREFS_FILE_NAME);
+        let bytes = match std::fs::read(&pending) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let next = prefs::apply_pending_portable_prefs(&self.prefs, &bytes);
+        let changed = next.is_some();
+        if let Some(next) = next {
+            self.update_preferences(|prefs| *prefs = next)?;
+        }
+        match std::fs::remove_file(&pending) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+            _ => Ok(changed),
+        }
     }
 
     pub fn zoom_terminal(&mut self, delta: f32) -> io::Result<()> {

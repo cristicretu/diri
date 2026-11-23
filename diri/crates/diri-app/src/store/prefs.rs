@@ -1391,6 +1391,50 @@ impl Prefs {
     }
 }
 
+/// The preferences after a sync or migration import: the portable keys of
+/// `pending` (a `prefs.json` object the Engine left beside the real one) laid
+/// over `prefs`. Keys outside [`diri_proto::portable::PORTABLE_PREF_KEYS`]
+/// are ignored, and a portable value this build cannot read keeps the
+/// current one. `None` when nothing changes or `pending` is not an object.
+pub fn apply_pending_portable_prefs(prefs: &Prefs, pending: &[u8]) -> Option<Prefs> {
+    use diri_proto::portable::overlay_portable_prefs;
+    use serde_json::{Map, Value};
+
+    let Ok(Value::Object(incoming)) = serde_json::from_slice::<Value>(pending) else {
+        return None;
+    };
+    let Ok(Value::Object(current)) = serde_json::to_value(prefs) else {
+        return None;
+    };
+    let read = |fields: &Map<String, Value>| {
+        serde_json::from_value::<Prefs>(Value::Object(fields.clone())).ok()
+    };
+    let mut merged = current.clone();
+    if !overlay_portable_prefs(&mut merged, &incoming) {
+        return None;
+    }
+    let mut next = match read(&merged) {
+        Some(next) => next,
+        // Some value does not read here (written by a newer Diri, or the
+        // wrong type): take the incoming keys one at a time and keep the
+        // current value of each one that fails.
+        None => {
+            let mut merged = current;
+            for (key, value) in &incoming {
+                let mut single = Map::new();
+                single.insert(key.clone(), value.clone());
+                let mut candidate = merged.clone();
+                if overlay_portable_prefs(&mut candidate, &single) && read(&candidate).is_some() {
+                    merged = candidate;
+                }
+            }
+            read(&merged)?
+        }
+    };
+    next.normalize();
+    (next != *prefs).then_some(next)
+}
+
 /// Renames an unreadable preferences file to `<name>.corrupt-<unix seconds>`
 /// beside it, so the user's settings survive for inspection while defaults
 /// load, and returns the new path.
@@ -1409,6 +1453,45 @@ fn set_aside_corrupt(path: &Path) -> io::Result<PathBuf> {
 mod tests {
     use super::*;
     use crate::launch_recipe::{LaunchRecipe, RecipeProject};
+
+    #[test]
+    fn pending_portable_prefs_apply_only_keys_that_travel() {
+        let prefs = Prefs::default();
+        let pending = serde_json::json!({
+            "terminalTheme": "dirijor-light",
+            "terminalFontSize": 15.0,
+            // Stays on the Mac that set it.
+            "talkVoiceCommand": "curl -H 'Authorization: x'",
+            "updateChannel": "nightly",
+        });
+        let next = apply_pending_portable_prefs(&prefs, pending.to_string().as_bytes())
+            .expect("theme and font size change");
+        assert_eq!(next.terminal_theme, "dirijor-light");
+        assert_eq!(next.terminal_font_size, 15.0);
+        assert_eq!(next.talk_voice_command, prefs.talk_voice_command);
+        assert_eq!(next.update_channel, prefs.update_channel);
+        // Applying the same file again changes nothing.
+        assert_eq!(
+            apply_pending_portable_prefs(&next, pending.to_string().as_bytes()),
+            None
+        );
+    }
+
+    #[test]
+    fn pending_portable_prefs_keep_current_values_that_do_not_read() {
+        let prefs = Prefs::default();
+        let pending = serde_json::json!({
+            "terminalTheme": "dirijor-light",
+            "terminalFontSize": "huge",
+        });
+        let next = apply_pending_portable_prefs(&prefs, pending.to_string().as_bytes())
+            .expect("theme changes");
+        assert_eq!(next.terminal_theme, "dirijor-light");
+        assert_eq!(next.terminal_font_size, prefs.terminal_font_size);
+        assert_eq!(apply_pending_portable_prefs(&prefs, b"not json"), None);
+        assert_eq!(apply_pending_portable_prefs(&prefs, b"[1, 2]"), None);
+        assert_eq!(apply_pending_portable_prefs(&prefs, b"{}"), None);
+    }
 
     #[test]
     fn only_a_waiting_session_bounces_the_dock_by_default_and_saved_routes_keep_it() {
