@@ -1860,27 +1860,33 @@ How one Diri note connects to the others. links: the notes it links to. backlink
 
 ### `surface`
 
-Diri Live Surfaces: native dashboards and mini-apps you build from JSON components (cards, metrics, checklists, tables, rich links to Slack/GitHub/Linear/sessions, buttons), drawn inside Diri and kept live. op schema returns the full component and patch reference; read it before your first create. Ops: create, update (patch components by id; the person's ticks are kept), get, list, events (what the person ticked or clicked), history, restore, promote (save a session surface to the sidebar), delete. A session surface (the default) shows in your session's right panel; scope global or project makes a saved surface in the sidebar that any agent or schedule may update.
+Diri Apps: native apps you write in Lua (app.lua: render(state, data, ctx) builds GPUI components with ui.row/ui.text/ui.canvas/ui.media/ui.button...; on_event handles clicks; sync(ctx) refreshes data without you), drawn inside Diri with your own title, icon, accent and layout. op schema returns the full reference; read it before your first create. Ops: create, update (lua, data, identity), write_file, read_file, files, data, check (dry-run render), get, list, events, history, restore, promote, delete. A session app (the default) opens in your session's right panel; scope global or project puts it in the sidebar.
 
 | Argument | Type | Notes |
 | --- | --- | --- |
-| `op` | `schema`, `create`, `update`, `get`, `list`, `events`, `history`, `restore`, `promote`, `delete` | **Required.** |
+| `op` | `schema`, `create`, `update`, `write_file`, `read_file`, `files`, `data`, `check`, `get`, `list`, `events`, `history`, `restore`, `promote`, `delete` | **Required.** |
+| `accent` | string |  |
 | `after` | integer |  |
 | `agents` | string array |  |
+| `app` | object,null |  |
+| `content` | string |  |
+| `data` | any |  |
 | `expected_revision` | integer |  |
 | `format` | `json`, `outline` |  |
+| `icon` | any |  |
 | `limit` | integer |  |
+| `lua` | string |  |
 | `ops` | array of objects |  |
+| `path` | string |  |
 | `pinned` | boolean |  |
 | `project` | string |  |
 | `revision` | integer |  |
 | `root` | array of objects |  |
 | `scope` | `session`, `global`, `project`, `saved`, `all`, `mine` |  |
 | `session` | string |  |
-| `sessions` | string array |  |
+| `style` | object |  |
 | `subtitle` | string |  |
 | `surface` | string |  |
-| `template` | `today`, `blank` |  |
 | `title` | string |  |
 
 
