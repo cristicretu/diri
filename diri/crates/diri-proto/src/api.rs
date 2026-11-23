@@ -793,6 +793,36 @@ mod catalog {
                 "Switch every open tab of an Agent to a saved account."
             ),
             entry!(
+                Method::SYNC_STATUS,
+                EmptyParams,
+                "SyncStatus",
+                "Portable profile sync: location, last sync and its outcome."
+            ),
+            entry!(
+                Method::SYNC_CONFIGURE,
+                crate::portable::SyncConfigureParams,
+                "SyncStatus",
+                "Point profile sync at a Git repository or a synced folder, or turn it off."
+            ),
+            entry!(
+                Method::SYNC_NOW,
+                EmptyParams,
+                "SyncStatus",
+                "Sync the portable profile now (two-way, never credentials)."
+            ),
+            entry!(
+                Method::MIGRATE_EXPORT,
+                crate::portable::MigrateExportParams,
+                "MigrateExportResult",
+                "Write a migration bundle: profile, sessions and their transcripts."
+            ),
+            entry!(
+                Method::MIGRATE_IMPORT,
+                crate::portable::MigrateImportParams,
+                "MigrateImportPlan",
+                "Import a migration bundle, remapping paths; dryRun only plans."
+            ),
+            entry!(
                 Method::ACCOUNT_OVERVIEW,
                 EmptyParams,
                 "AgentAccountOverview",
