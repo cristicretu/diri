@@ -175,11 +175,24 @@ fn user_text(text: &str, images: Vec<ThreadImage>, out: &mut Vec<ThreadBody>) {
         });
         return;
     }
-    if trimmed.starts_with("<local-command-stdout>")
-        || trimmed.starts_with("<local-command-stderr>")
-        || trimmed.starts_with("<local-command-caveat>")
-        || trimmed.starts_with("<command-message>")
-    {
+    for (tag, is_error) in [
+        ("local-command-stdout", false),
+        ("local-command-stderr", true),
+    ] {
+        let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
+        if trimmed.starts_with(&open) {
+            let body = between(trimmed, &open, &close).unwrap_or_default();
+            let text = strip_ansi(body.trim());
+            if !text.trim().is_empty() {
+                out.push(ThreadBody::CommandOutput {
+                    text: bounded(text.trim(), MAX_TEXT_BYTES),
+                    is_error,
+                });
+            }
+            return;
+        }
+    }
+    if trimmed.starts_with("<local-command-caveat>") || trimmed.starts_with("<command-message>") {
         return;
     }
     if trimmed.starts_with("[Request interrupted by user") {
@@ -563,6 +576,39 @@ fn compact_json(value: &Value) -> String {
 
 /// Normalizes line endings, replaces control characters (escape sequences
 /// never reach the GUI), and clips at a character boundary.
+/// Drops terminal escape sequences (colors in `/cost`, `/status` output).
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                while let Some(c) = chars.next() {
+                    if c == '\u{7}' || (c == '\u{1b}' && chars.peek() == Some(&'\\')) {
+                        if c == '\u{1b}' {
+                            chars.next();
+                        }
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 pub fn bounded(text: &str, limit: usize) -> String {
     let mut out = String::with_capacity(text.len().min(limit));
     let mut chars = text.chars().peekable();
@@ -659,6 +705,58 @@ mod tests {
             .collect()
     }
 
+    /// Records as Claude Code 2.1 writes a `/model opus` run from the TUI.
+    #[test]
+    fn local_command_output_reaches_the_thread_without_its_caveat() {
+        let user = |content: &str| json!({"type": "user", "message": {"role": "user", "content": content}});
+        let caveat = json!({"type": "user", "isMeta": true, "message": {"role": "user",
+            "content": "<local-command-caveat>The command below was run directly in Claude Code</local-command-caveat>"}});
+        assert!(items(Provider::Claude, caveat).is_empty());
+        assert_eq!(
+            items(
+                Provider::Claude,
+                user(
+                    "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>opus</command-args>"
+                )
+            ),
+            vec![ThreadBody::Command {
+                name: "/model".into(),
+                args: "opus".into()
+            }]
+        );
+        assert_eq!(
+            items(
+                Provider::Claude,
+                user(
+                    "<local-command-stdout>Set model to `Opus 5.5` and saved as your default for new sessions</local-command-stdout>"
+                )
+            ),
+            vec![ThreadBody::CommandOutput {
+                text: "Set model to `Opus 5.5` and saved as your default for new sessions".into(),
+                is_error: false,
+            }]
+        );
+        assert_eq!(
+            items(
+                Provider::Claude,
+                user(
+                    "<local-command-stdout>\u{1b}[1mTotal cost:\u{1b}[22m $0.42</local-command-stdout>"
+                )
+            ),
+            vec![ThreadBody::CommandOutput {
+                text: "Total cost: $0.42".into(),
+                is_error: false
+            }]
+        );
+        assert!(
+            items(
+                Provider::Claude,
+                user("<local-command-stdout>  </local-command-stdout>")
+            )
+            .is_empty()
+        );
+    }
+
     #[test]
     fn rfc3339_parses_utc_fractions_and_offsets() {
         assert_eq!(parse_rfc3339_ms("1970-01-01T00:00:00Z"), Some(0));
@@ -719,7 +817,7 @@ mod tests {
             )
             .is_empty()
         );
-        assert!(items(Provider::Claude, json!({"type":"user","message":{"content":"<local-command-stdout>ok</local-command-stdout>"}})).is_empty());
+        assert!(items(Provider::Claude, json!({"type":"user","message":{"content":"<local-command-caveat>x</local-command-caveat>"}})).is_empty());
         assert_eq!(
             items(
                 Provider::Claude,

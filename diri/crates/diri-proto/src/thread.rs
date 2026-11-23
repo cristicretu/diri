@@ -196,6 +196,13 @@ pub enum ThreadBody {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ThreadImage>,
     },
+    /// What a CLI-local command (`/model`, `/cost`, `/status`) printed for
+    /// the user. Claude records it beside the command; the model never saw it.
+    CommandOutput {
+        text: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        is_error: bool,
+    },
     /// Provider accounting for one request; folded into warmth, not drawn.
     Usage(TurnUsage),
     /// Context compaction, an interrupted turn, a model change.

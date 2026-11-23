@@ -144,6 +144,31 @@ impl ThreadWatches {
         );
     }
 
+    /// Re-announces `session_id`'s leased transcripts, whether or not the
+    /// kernel reported a change. Agent hooks (tool start/finish, stop,
+    /// notification, prompt submit) call this, so an open lens re-reads at
+    /// every turn boundary even when FSEvents coalesced or missed a write.
+    /// Without a live lease (no lens open) it costs one map scan.
+    pub fn poke(&self, session_id: &str) {
+        let targets: Vec<PathBuf> = {
+            let Ok(leases) = self.leases.lock() else {
+                return;
+            };
+            let now = Instant::now();
+            leases
+                .iter()
+                .filter(|(_, lease)| {
+                    lease.session_id == session_id && now.duration_since(lease.renewed) < LEASE
+                })
+                .map(|(path, _)| path.clone())
+                .collect()
+        };
+        for path in targets {
+            let length = std::fs::symlink_metadata(&path).map_or(0, |m| m.len());
+            (self.notify)(session_id, length);
+        }
+    }
+
     /// Drops every lease of `session_id` (the session was removed).
     pub fn release(&self, session_id: &str) {
         let mut watching = self.watching.lock().expect("thread watches");
@@ -210,6 +235,29 @@ mod tests {
         assert_eq!(watches.watching.lock().unwrap().dirs.get(&root), Some(&1));
         watches.release("s-2");
         assert!(watches.watching.lock().unwrap().dirs.is_empty());
+    }
+
+    /// The `cool it's fine. /model` reply that never reached the lens: a
+    /// hook boundary must announce the transcript even with no kernel event.
+    #[test]
+    fn a_hook_poke_announces_only_the_leased_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = diri_platform::canonicalize(dir.path()).unwrap();
+        let path = root.join("t.jsonl");
+        std::fs::write(&path, b"{\"type\":\"user\"}\n").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let watches = ThreadWatches::new(Arc::new(move |session: &str, length| {
+            let _ = tx.lock().unwrap().send((session.to_owned(), length));
+        }));
+        watches.poke("s-1");
+        assert!(rx.try_recv().is_err(), "no lens open, nothing to announce");
+        watches.lease("s-1", &path);
+        watches.poke("s-2");
+        watches.poke("s-1");
+        let announced: Vec<_> = rx.try_iter().filter(|(s, _)| s == "s-1").collect();
+        assert!(announced.contains(&("s-1".to_owned(), 16)), "{announced:?}");
+        watches.release("s-1");
     }
 
     /// Live kernel events. FSEvents starts its stream asynchronously and, in

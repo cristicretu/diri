@@ -1248,6 +1248,29 @@ impl TerminalElement {
         read_lock(&self.buffer).generation()
     }
 
+    /// The live screen's rows as text, top to bottom (scrollback excluded).
+    /// The GUI Lens reads it to notice an interactive picker the Agent drew
+    /// that its transcript will never record.
+    #[must_use]
+    pub fn live_screen_text(&self) -> Vec<String> {
+        let buffer = read_lock(&self.buffer);
+        (0..usize::from(buffer.rows))
+            .map(|row| {
+                buffer
+                    .row_text_with_columns(row)
+                    .map(|(text, _)| text)
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// Where the grid was last painted: window-space origin of row 0 and the
+    /// row height. `None` before the first paint.
+    #[must_use]
+    pub fn painted_geometry(&self) -> Option<AccessibilityGeometry> {
+        *mutex_lock(&self.shared.accessibility_geometry)
+    }
+
     /// Rows in the mirrored screen. The daemon owns this number, so it trails
     /// the pane for as long as a resize takes to round-trip; the pane reads it
     /// to place the grid rather than assuming the two already agree.

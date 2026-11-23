@@ -4423,6 +4423,9 @@ impl ControlServer {
         let Some((signal, meta)) = parsed else {
             return Ok(false);
         };
+        // Every hook is a turn or tool boundary: an open GUI Lens re-reads
+        // the transcript now instead of trusting the file watch alone.
+        self.thread_watches.poke(&session_id.0);
         let session_end = p.kind == "claude-hook" && p.event.as_deref() == Some("SessionEnd");
         // Never wait on the Registry here: the Agent is blocked on this reply.
         self.hook_reports
