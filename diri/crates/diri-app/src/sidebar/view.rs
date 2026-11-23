@@ -249,6 +249,8 @@ pub(crate) enum SidebarEvent {
     SessionActivated,
     /// The To-dos row: RootView shows every open to-do across notes.
     OpenTodos,
+    /// A pinned Live Surface's row: RootView shows it over the main pane.
+    OpenSurface(String),
     ProjectLayoutUnavailable,
     /// Escape left keyboard-navigation mode without changing the active
     /// session. Root owns the terminal entity, so it completes the handoff.
@@ -672,6 +674,9 @@ pub struct Sidebar {
     /// only while some note has one.
     todos: Option<Entity<crate::notes::todos::TodosModel>>,
     todos_active: bool,
+    surfaces: Option<Entity<crate::surfaces::SurfacesModel>>,
+    /// The surface whose page is open, marked like a selected row.
+    surface_active: Option<String>,
     workspace_nav: workspaces::WorkspaceNavigation,
     project_picker: project_picker::ProjectPicker,
     strip_menu: tabs::StripMenu,
@@ -983,6 +988,8 @@ impl Sidebar {
             store,
             todos: None,
             todos_active: false,
+            surfaces: None,
+            surface_active: None,
             _preview_effects: preview_effects,
             _store_changes: store_changes,
             ui,
@@ -2080,6 +2087,82 @@ impl Sidebar {
         cx.observe(&model, |_, _, cx| cx.notify()).detach();
         self.todos = Some(model);
         cx.notify();
+    }
+
+    pub(crate) fn set_surfaces(
+        &mut self,
+        model: Entity<crate::surfaces::SurfacesModel>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.observe(&model, |_, _, cx| cx.notify()).detach();
+        self.surfaces = Some(model);
+        cx.notify();
+    }
+
+    pub(crate) fn set_surface_active(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        if self.surface_active != id {
+            self.surface_active = id;
+            cx.notify();
+        }
+    }
+
+    /// One row per pinned saved Live Surface, under To-dos: the surfaces the
+    /// person keeps coming back to ("What's for Today"). A checklist count
+    /// trails each, like To-dos' count.
+    fn surface_rows(&mut self, colors: SemanticColors, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(model) = self.surfaces.clone() else {
+            return Vec::new();
+        };
+        model.update(cx, |model, cx| model.sync(cx));
+        let pinned = model.read(cx).pinned();
+        pinned
+            .into_iter()
+            .map(|doc| {
+                let active = self.surface_active.as_deref() == Some(doc.id.as_str());
+                let (done, total) = doc.checklist_progress();
+                let open = total - done;
+                let id = doc.id.clone();
+                div()
+                    .id(SharedString::from(format!("surface-row-{}", doc.id)))
+                    .debug_selector(|| format!("surface-row-{}", doc.id))
+                    .mx(px(Space::INSET))
+                    .px(px(Space::ROW_H))
+                    .h(px(SIDEBAR_NAV_ROW_HEIGHT))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .rounded(px(SIDEBAR_ROW_RADIUS))
+                    .when(active, |row| row.bg(Fill::selected(colors, true)))
+                    .when(!active, |row| row.hover(move |row| row.bg(Fill::hover(colors, true))))
+                    .cursor_pointer()
+                    .text_size(px(Typo::ROW.size))
+                    .text_color(colors.text(diri_ui::TextTone::Label))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.commit_rename();
+                        cx.emit(SidebarEvent::OpenSurface(id.clone()));
+                    }))
+                    .child(
+                        div()
+                            .size(px(18.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(sf_symbol("square.grid.2x2", 13.0, colors.secondary)),
+                    )
+                    .child(div().min_w(px(0.0)).flex_1().truncate().child(doc.title.clone()))
+                    .when(open > 0, |row| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(Typo::META.size))
+                                .text_color(colors.tertiary)
+                                .child(open.to_string()),
+                        )
+                    })
+                    .into_any_element()
+            })
+            .collect()
     }
 
     pub(crate) fn set_todos_active(&mut self, active: bool, cx: &mut Context<Self>) {
@@ -9205,7 +9288,8 @@ impl Sidebar {
                 .flex()
                 .flex_col()
                 .child(self.new_agent_row(crate::held_hints::opacity(window, cx), colors, cx))
-                .children(self.todos_row(colors, cx));
+                .children(self.todos_row(colors, cx))
+                .children(self.surface_rows(colors, cx));
             if projection.projects.is_empty() && self.filtering() {
                 body = body.child(
                     div()

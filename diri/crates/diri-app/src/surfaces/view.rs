@@ -114,10 +114,6 @@ impl SurfaceView {
         }
     }
 
-    pub(crate) fn target(&self) -> &Target {
-        &self.target
-    }
-
     pub(crate) fn set_target(&mut self, target: Target, cx: &mut Context<Self>) {
         if self.target != target {
             self.target = target;

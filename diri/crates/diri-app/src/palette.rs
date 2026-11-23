@@ -53,6 +53,10 @@ pub enum PaletteCommand {
         note_id: String,
         block: Option<usize>,
     },
+    /// Show a saved Live Surface over the main pane.
+    OpenSurface {
+        id: String,
+    },
     /// Flip the power mode easter egg.
     TogglePowerMode,
     /// A command `init.lua` added with `diri.command`, by id.

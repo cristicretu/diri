@@ -9,12 +9,12 @@
   "surfaces.hours_ago": "hace {count} h",
   "surfaces.just_now": "ahora mismo",
   "surfaces.minutes_ago": "hace {count} min",
+  "surfaces.palette_detail": "Superficie",
   "surfaces.read_only": "Esta superficie la creó un Diri más reciente. Actualiza Diri para cambiarla.",
   "surfaces.save": "Guardar",
   "surfaces.saved": "«{title}» guardada en la barra lateral",
   "surfaces.sent": "Enviado al agente",
   "surfaces.session_gone": "Cerrada",
-  "surfaces.sidebar": "Superficies",
   "surfaces.unsupported": "Este componente necesita un Diri más reciente",
   "surfaces.updated": "Actualizada {when}"
 }

@@ -9,12 +9,12 @@
   "surfaces.hours_ago": "{count} 小时前",
   "surfaces.just_now": "刚刚",
   "surfaces.minutes_ago": "{count} 分钟前",
+  "surfaces.palette_detail": "面板",
   "surfaces.read_only": "此面板由更新版本的 Diri 创建。请更新 Diri 后再修改。",
   "surfaces.save": "保存",
   "surfaces.saved": "已将“{title}”保存到侧边栏",
   "surfaces.sent": "已发送给智能体",
   "surfaces.session_gone": "已关闭",
-  "surfaces.sidebar": "面板",
   "surfaces.unsupported": "此组件需要更新版本的 Diri",
   "surfaces.updated": "更新于{when}"
 }

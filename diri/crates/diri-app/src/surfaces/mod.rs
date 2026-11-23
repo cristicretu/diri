@@ -30,6 +30,14 @@ use crate::store::StoreRuntime;
 
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(120);
 
+/// Saved surfaces' ids and titles, newest first, for code that has no GPUI
+/// context (⌘K ranks its rows synchronously). Written by the model.
+static SAVED_TITLES: std::sync::RwLock<Vec<(String, String)>> = std::sync::RwLock::new(Vec::new());
+
+pub(crate) fn saved_titles() -> Vec<(String, String)> {
+    SAVED_TITLES.read().map(|titles| titles.clone()).unwrap_or_default()
+}
+
 /// One surface as the app holds it.
 #[derive(Clone, Debug)]
 pub(crate) struct Surface {
@@ -138,6 +146,7 @@ impl SurfacesModel {
         self.store.as_ref()
     }
 
+    #[cfg(test)]
     pub(crate) fn is_ready(&self) -> bool {
         self.ready || self.store.is_none()
     }
@@ -226,21 +235,13 @@ impl SurfacesModel {
         }
         self.surfaces = next;
         self.ready = true;
-        cx.notify();
-    }
-
-    /// Fixtures and tests put surfaces in directly.
-    #[cfg(test)]
-    pub(crate) fn insert_for_test(&mut self, doc: SurfaceDoc, cx: &mut Context<Self>) {
-        self.seen.insert(doc.id.clone());
-        self.surfaces.insert(
-            doc.id.clone(),
-            Surface {
-                doc: Arc::new(doc),
-                read_only: false,
-            },
-        );
-        self.ready = true;
+        if let Ok(mut titles) = SAVED_TITLES.write() {
+            *titles = self
+                .saved()
+                .iter()
+                .map(|doc| (doc.id.clone(), doc.title.clone()))
+                .collect();
+        }
         cx.notify();
     }
 

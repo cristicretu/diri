@@ -9,12 +9,12 @@
   "surfaces.hours_ago": "{count}h ago",
   "surfaces.just_now": "just now",
   "surfaces.minutes_ago": "{count}m ago",
+  "surfaces.palette_detail": "Surface",
   "surfaces.read_only": "This surface was made by a newer Diri. Update Diri to change it.",
   "surfaces.save": "Save",
   "surfaces.saved": "Saved “{title}” to the sidebar",
   "surfaces.sent": "Sent to the agent",
   "surfaces.session_gone": "Closed",
-  "surfaces.sidebar": "Surfaces",
   "surfaces.unsupported": "This component needs a newer Diri",
   "surfaces.updated": "Updated {when}"
 }
