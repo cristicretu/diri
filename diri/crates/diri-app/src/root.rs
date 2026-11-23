@@ -3763,7 +3763,7 @@ impl RootView {
 
             if let Some(terminal) = &self.auxiliary_terminal {
                 let id = session.id.clone();
-                terminal.update(cx, |terminal, cx| terminal.show_session(id, window, cx));
+                terminal.update(cx, |terminal, cx| terminal.show_session(id, cx));
                 let should_focus = self.auxiliary_spawn_parent.as_ref() == Some(&parent);
                 self.auxiliary_id = Some(session.id.clone());
                 self.auxiliary_parent = Some(parent);

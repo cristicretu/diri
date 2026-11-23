@@ -397,7 +397,12 @@ fn main() {
             .map(|p| p.into_os_string())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
+        let startup = Arc::clone(&store_runtime);
         tokio.spawn(async move {
+            // Empty windows and windows opened directly to usage still need
+            // data even when there is no terminal to attach.
+            let _ = tokio::time::timeout(Duration::from_secs(3), startup.first_terminal_grid.acquire()).await;
+            drop(startup);
             run_usage_updates(
                 UsageStore::new(),
                 usage_tx,

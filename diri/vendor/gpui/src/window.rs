@@ -137,12 +137,14 @@ struct FrameDirtyAccumulator {
 
 #[derive(Clone)]
 pub(crate) struct WindowInvalidator {
+    wake: Option<Rc<dyn Fn()>>,
     inner: Rc<RefCell<WindowInvalidatorInner>>,
 }
 
 impl WindowInvalidator {
-    pub fn new() -> Self {
+    pub fn new(wake: Option<Rc<dyn Fn()>>) -> Self {
         WindowInvalidator {
+            wake,
             inner: Rc::new(RefCell::new(WindowInvalidatorInner {
                 dirty: true,
                 draw_phase: DrawPhase::None,
@@ -153,11 +155,18 @@ impl WindowInvalidator {
         }
     }
 
+    fn wake(&self) {
+        if let Some(wake) = &self.wake {
+            wake();
+        }
+    }
+
     pub fn invalidate_view(&self, entity: EntityId, cx: &mut App) -> bool {
         let mut inner = self.inner.borrow_mut();
         inner.update_count += 1;
         inner.dirty_views.insert(entity);
         if inner.draw_phase == DrawPhase::None {
+            self.wake();
             Self::record_frame_dirty(&mut inner);
             inner.dirty = true;
             cx.push_effect(Effect::Notify { emitter: entity });
@@ -175,6 +184,7 @@ impl WindowInvalidator {
         let mut inner = self.inner.borrow_mut();
         inner.dirty = dirty;
         if dirty {
+            self.wake();
             inner.update_count += 1;
             Self::record_frame_dirty(&mut inner);
         }
@@ -1498,7 +1508,7 @@ impl Window {
         let scale_factor = platform_window.scale_factor();
         let appearance = platform_window.appearance();
         let text_system = Arc::new(WindowTextSystem::new(cx.text_system().clone()));
-        let invalidator = WindowInvalidator::new();
+        let invalidator = WindowInvalidator::new(platform_window.idle_frame_waker());
         let active = Rc::new(Cell::new(platform_window.is_active()));
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
@@ -1660,11 +1670,11 @@ impl Window {
                 }
                 last_frame_time.set(Some(now));
 
-                let next_frame_callbacks = next_frame_callbacks.take();
-                if !next_frame_callbacks.is_empty() {
+                let callbacks = next_frame_callbacks.take();
+                if !callbacks.is_empty() {
                     handle
                         .update(&mut cx, |_, window, cx| {
-                            for callback in next_frame_callbacks {
+                            for callback in callbacks {
                                 callback(window, cx);
                             }
                         })
@@ -1679,7 +1689,8 @@ impl Window {
                     || ((active.get() || interacting)
                         && input_rate_tracker.borrow_mut().is_high_rate());
 
-                if invalidator.is_dirty() || request_frame_options.force_render {
+                let drew = invalidator.is_dirty() || request_frame_options.force_render;
+                if drew {
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
@@ -1714,6 +1725,12 @@ impl Window {
                 handle
                     .update(&mut cx, |_, window, _| {
                         window.complete_frame();
+                        window.platform_window.frame_demand(
+                            drew || needs_present
+                                || invalidator.is_dirty()
+                                || window.sprite_animations.is_live()
+                                || !next_frame_callbacks.borrow().is_empty(),
+                        );
                     })
                     .log_err();
             }
@@ -1786,7 +1803,10 @@ impl Window {
             let mut cx = cx.to_async();
             Box::new(move |event| {
                 handle
-                    .update(&mut cx, |_, window, cx| window.dispatch_event(event, cx))
+                    .update(&mut cx, |_, window, cx| {
+                        window.invalidator.wake();
+                        window.dispatch_event(event, cx)
+                    })
                     .log_err()
                     .unwrap_or(DispatchEventResult::default())
             })
@@ -2403,6 +2423,7 @@ impl Window {
     /// Schedule the given closure to be run directly after the current frame is rendered.
     pub fn on_next_frame(&self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
         RefCell::borrow_mut(&self.next_frame_callbacks).push(Box::new(callback));
+        self.invalidator.wake();
     }
 
     /// Schedule a frame to be drawn on the next animation frame.
@@ -3039,6 +3060,7 @@ impl Window {
             self.refresh();
         }
         self.needs_present.set(true);
+        self.invalidator.wake();
         self.last_frame_stats = self.frame_stats.snapshot(Instant::now());
         if let Some(observer) = observer {
             observer(crate::FrameStage::DrawEnd, Instant::now());

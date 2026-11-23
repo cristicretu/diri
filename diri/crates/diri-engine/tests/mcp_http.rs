@@ -95,11 +95,10 @@ impl Reply {
 }
 
 fn post(url: &str, token: Option<&str>, body: &Value) -> Reply {
-    let address = url
+    let (address, path) = url
         .strip_prefix("http://")
         .unwrap()
-        .split('/')
-        .next()
+        .split_once('/')
         .unwrap();
     let mut stream = TcpStream::connect(address).unwrap();
     stream
@@ -111,7 +110,7 @@ fn post(url: &str, token: Option<&str>, body: &Value) -> Reply {
         .unwrap_or_default();
     write!(
         stream,
-        "POST /mcp HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\n{auth}Content-Length: {}\r\n\r\n{body}",
+        "POST /{path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\n{auth}Content-Length: {}\r\n\r\n{body}",
         body.len()
     )
     .unwrap();
@@ -133,6 +132,69 @@ fn call(url: &str, token: &str, id: u64, tool: &str, arguments: Value) -> Value 
     );
     assert_eq!(reply.status, 200, "{}", reply.head);
     reply.message()
+}
+
+#[test]
+fn compact_profile_lists_two_tools_and_resolves_actions_as_the_authenticated_caller() {
+    let engine = start();
+    let cwd = tempfile::tempdir().unwrap();
+    let session = spawn_session(&engine, cwd.path());
+    let token = engine.server.mcp_http_token(&session).unwrap();
+    let url = format!("{}/skills-v1", engine.url);
+    let list = json!({"jsonrpc":"2.0","id":1,"method":"tools/list"});
+    assert_eq!(post(&url, None, &list).status, 401);
+    let tools = post(&url, Some(&token), &list).message();
+    assert_eq!(
+        tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["get_skill", "act"]
+    );
+    let full = post(&engine.url, Some(&token), &list).message();
+    let names = call(&url, &token, 2, "get_skill", json!({}));
+    assert_eq!(
+        names["result"]["structuredContent"]["actions"],
+        json!(
+            full["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| &t["name"])
+                .collect::<Vec<_>>()
+        )
+    );
+    let schema = call(
+        &url,
+        &token,
+        3,
+        "get_skill",
+        json!({"action":"name_session"}),
+    );
+    assert_eq!(
+        schema["result"]["structuredContent"]["name"],
+        "name_session"
+    );
+    let named = call(
+        &url,
+        &token,
+        4,
+        "act",
+        json!({"action":"name_session","arguments":{"name":"compact-session"}}),
+    );
+    assert_eq!(named["result"]["structuredContent"]["applied"], true);
+    assert_eq!(
+        engine
+            .registry
+            .lock()
+            .unwrap()
+            .record(&session)
+            .unwrap()
+            .title,
+        "compact-session"
+    );
 }
 
 #[test]
@@ -218,7 +280,10 @@ fn an_agent_reaches_its_own_session_over_http() {
         std::fs::read_to_string(engine._temp.path().join("inject/claude-mcp-http.json")).unwrap();
     let config: Value = serde_json::from_str(&config).unwrap();
     assert_eq!(config["mcpServers"]["dirijor"]["type"], "http");
-    assert_eq!(config["mcpServers"]["dirijor"]["url"], engine.url);
+    assert_eq!(
+        config["mcpServers"]["dirijor"]["url"],
+        format!("{}/skills-v1", engine.url)
+    );
     assert_eq!(
         config["mcpServers"]["dirijor"]["headers"]["Authorization"],
         "Bearer ${DIRIJOR_MCP_TOKEN}"
@@ -378,7 +443,13 @@ fn fake_cli(dir: &Path, name: &str, version_line: &str, out: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn launch(engine: &Engine, cli: &str, cwd: &Path, out: &Path) -> Vec<String> {
+fn observe_launch<T>(
+    engine: &Engine,
+    cli: &str,
+    cwd: &Path,
+    out: &Path,
+    observe: impl FnOnce(&str, Vec<String>) -> T,
+) -> T {
     let bridge = dirijor_mcp::Bridge::new(engine.server.socket_path().to_owned(), None);
     bridge
         .request(
@@ -401,13 +472,18 @@ fn launch(engine: &Engine, cli: &str, cwd: &Path, out: &Path) -> Vec<String> {
         std::thread::sleep(Duration::from_millis(50));
     }
     let recorded = std::fs::read_to_string(&file).expect("the fake CLI ran");
+    let observed = observe(&id, recorded.lines().map(str::to_owned).collect());
     engine
         .registry
         .lock()
         .unwrap()
         .terminate(&id, Duration::from_secs(2))
         .unwrap();
-    recorded.lines().map(str::to_owned).collect()
+    observed
+}
+
+fn launch(engine: &Engine, cli: &str, cwd: &Path, out: &Path) -> Vec<String> {
+    observe_launch(engine, cli, cwd, out, |_, argv| argv)
 }
 
 fn mcp_config(argv: &[String]) -> &str {
@@ -446,4 +522,77 @@ fn only_a_verified_cli_release_is_pointed_at_the_endpoint() {
     };
     assert_eq!(mcp_config(&argv), "claude-mcp-http.json", "{argv:?}");
     assert_eq!(argv.last().unwrap(), "TOKEN=set", "{argv:?}");
+}
+
+/// Compare the files and server discovery Claude consumes, under two different
+/// live leases. A new conversation UUID must still reach the CLI on every spawn.
+#[test]
+fn fresh_claude_spawns_share_prompt_visible_injection() {
+    let engine = start();
+    let work = tempfile::tempdir().unwrap();
+    let out = work.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    let cli = fake_cli(work.path(), "claude", "2.1.303 (Claude Code)", &out);
+    let spawn = || {
+        observe_launch(&engine, &cli, work.path(), &out, |id, mut argv| {
+            let value = |flag: &str| {
+                let i = argv.iter().position(|a| a == flag).unwrap();
+                Path::new(&argv[i + 1])
+            };
+            let hooks = std::fs::read(value("--settings")).unwrap();
+            let mcp_config = std::fs::read(value("--mcp-config")).unwrap();
+            let config: Value = serde_json::from_slice(&mcp_config).unwrap();
+            let endpoint = config["mcpServers"]["dirijor"]["url"].as_str()?;
+            let plugin = value("--plugin-dir");
+            let manifest = std::fs::read(plugin.join(".claude-plugin/plugin.json")).unwrap();
+            let skills: std::collections::BTreeMap<_, _> = std::fs::read_dir(plugin.join("skills"))
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (
+                        entry.file_name(),
+                        std::fs::read(entry.path().join("SKILL.md")).unwrap(),
+                    )
+                })
+                .collect();
+            let token = engine.server.mcp_http_token(id).unwrap();
+            let discovery = [
+                (
+                    "initialize",
+                    json!({"protocolVersion":"2025-06-18","capabilities":{},
+                    "clientInfo":{"name":"test","version":"1"}}),
+                ),
+                ("tools/list", json!({})),
+            ]
+            .map(|(method, params)| {
+                let reply = post(
+                    endpoint,
+                    Some(&token),
+                    &json!({
+                        "jsonrpc": "2.0", "id": 1, "method": method, "params": params
+                    }),
+                );
+                assert_eq!(reply.status, 200);
+                assert!(reply.message()["result"].is_object());
+                reply.body
+            });
+            let index = argv.iter().position(|arg| arg == "--session-id").unwrap();
+            let uuid = argv.remove(index + 1);
+            Some((uuid, (argv, hooks, mcp_config, manifest, skills, discovery)))
+        })
+    };
+    // The first spawn may use stdio while the CLI version probe runs.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let first = loop {
+        if let Some(observed) = spawn() {
+            break observed;
+        }
+        assert!(Instant::now() < deadline, "Claude version probe timed out");
+    };
+    let second = spawn().expect("verified Claude uses HTTP");
+    assert_ne!(first.0, second.0);
+    assert!(
+        first.1 == second.1,
+        "Claude injection changed between fresh sessions"
+    );
 }

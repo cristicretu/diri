@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -181,7 +181,7 @@ pub fn should_scan_ports(enabled: bool, attached: bool, tick: u64) -> bool {
     enabled && attached && tick.is_multiple_of(4)
 }
 
-/// Runs sweeps until `stop`. The shared config is read fresh each sweep, so
+/// Runs sweeps until the shutdown sender sends or disconnects. The shared config is read fresh each sweep, so
 /// `governor.configure` applies on the next tick.
 pub fn spawn_governor(
     registry: Arc<Mutex<Registry>>,
@@ -189,23 +189,19 @@ pub fn spawn_governor(
     attach: AttachHub,
     pr_monitor_wake: crate::pr_monitor::PrMonitorWake,
     config: Arc<Mutex<GovernorConfig>>,
-    stop: Arc<AtomicBool>,
+    stop: Receiver<()>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("diri-governor".into())
         .spawn(move || {
             let mut tick: u64 = 0;
             let mut liveness = Liveness::default();
-            while !stop.load(Ordering::SeqCst) {
+            loop {
                 // Sleep first: a fresh daemon's startup work should settle
                 // before the first sweep.
                 let interval = config.lock().expect("config").scan_interval;
-                let waited = std::time::Instant::now();
-                while waited.elapsed() < interval {
-                    if stop.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(250));
+                if stop.recv_timeout(interval) != Err(RecvTimeoutError::Timeout) {
+                    return;
                 }
                 tick += 1;
                 sweep(

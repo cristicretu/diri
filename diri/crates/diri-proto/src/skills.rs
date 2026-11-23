@@ -33,31 +33,31 @@ fn yaml_string(text: &str) -> String {
 
 pub const SCHEDULING: Skill = Skill {
     name: "scheduling",
-    description: "Inside Diri, use this for ANY request to run something later, at a set time, or repeatedly (every weekday at 9, tomorrow morning, in 2 hours), including waking a sleeping Mac for it. Use it instead of the built-in schedule skill, CronCreate, /loop, or reminders: those die with this session or run in the cloud without this Mac's checkout.",
+    description: "Run agents later, repeatedly, or on file arrival.",
     markdown: include_str!("../skills/scheduling.md"),
 };
 
 pub const NOTES: Skill = Skill {
     name: "notes",
-    description: "Work started from a Diri note, or writing to Diri notes: read the brief, record findings and results, tick to-dos, never delete the person's writing.",
+    description: "Read or write Diri notes and linked briefs.",
     markdown: include_str!("../skills/notes.md"),
 };
 
 pub const ORCHESTRATION: Skill = Skill {
     name: "orchestration",
-    description: "Spawn and coordinate other Diri agents: parallel subtasks in worktrees, tracked tasks you assign or receive, waiting, retries, and reviewing their work.",
+    description: "Coordinate Diri agents, worktrees, tasks and waits.",
     markdown: include_str!("../skills/orchestration.md"),
 };
 
 pub const API: Skill = Skill {
     name: "api",
-    description: "Building, running or debugging an HTTP API or dev server inside Diri: open the endpoint, prefilled, in the person's API tab with open_api_request (GET can auto-send; other methods wait for Send).",
+    description: "Show an HTTP endpoint in the API tab.",
     markdown: include_str!("../skills/api.md"),
 };
 
 pub const APP_SKILLS: Skill = Skill {
     name: "app-skills",
-    description: "Doing a task in a Mac app with Diri's computer tool, especially one you'll repeat: check app_skills for a saved skill first; teach one (learn, trace, save), replay it with args or args_list, and repair it when a run breaks.",
+    description: "Record or replay a Mac app workflow.",
     markdown: include_str!("../skills/app-skills.md"),
 };
 
@@ -101,7 +101,7 @@ mod tests {
         assert_eq!(parts.next(), Some(""));
         let front = parts.next().unwrap();
         assert!(front.contains("name: scheduling\n"));
-        assert!(front.contains("description: \"Inside Diri, use this"));
+        assert!(front.contains("description: \"Run agents later"));
         assert!(
             parts
                 .next()

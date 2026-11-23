@@ -106,6 +106,44 @@ impl ScrollbackRequest {
     }
 }
 
+/// One reply decoded before the UI handles it. Even a malformed page keeps
+/// its offset so completion can retire the corresponding in-flight request.
+pub struct ScrollbackPage {
+    result: ReadScrollbackCellsResult,
+    rows: Result<Vec<Vec<GridCell>>, ScrollbackApplyError>,
+}
+
+impl ScrollbackPage {
+    pub fn decode(mut result: ReadScrollbackCellsResult) -> Self {
+        let rows = Self::decode_rows(&result);
+        result.payload = Vec::new();
+        Self { result, rows }
+    }
+
+    fn decode_rows(
+        result: &ReadScrollbackCellsResult,
+    ) -> Result<Vec<Vec<GridCell>>, ScrollbackApplyError> {
+        let row_count = usize::try_from(result.row_count)
+            .map_err(|_| ScrollbackApplyError::NegativeRowCount(result.row_count))?;
+        let decoded = GridRowCodec::decode_rows(&result.payload, row_count)?;
+        if decoded.len() != row_count {
+            return Err(ScrollbackApplyError::RowCountMismatch {
+                declared: row_count,
+                decoded: decoded.len(),
+            });
+        }
+        if (!result.metadata.is_empty() && result.metadata.len() != row_count)
+            || result
+                .metadata
+                .iter()
+                .any(|meta| !meta.validate(result.cols.max(0) as usize))
+        {
+            return Err(ScrollbackApplyError::Codec(GridCodecError::InvalidMetadata));
+        }
+        Ok(decoded)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ScrollbackApplyError {
     NegativeRowCount(i64),
@@ -933,6 +971,15 @@ impl ScrollbackViewport {
         result: ReadScrollbackCellsResult,
         visible_rows: usize,
     ) -> Result<(), ScrollbackApplyError> {
+        self.complete_page(ScrollbackPage::decode(result), visible_rows)
+    }
+
+    pub fn complete_page(
+        &mut self,
+        page: ScrollbackPage,
+        visible_rows: usize,
+    ) -> Result<(), ScrollbackApplyError> {
+        let result = page.result;
         self.finish_in_flight(result.first_row);
         if self.find_source().is_some() {
             return Ok(());
@@ -947,26 +994,10 @@ impl ScrollbackViewport {
             }
             ViewPin::None | ViewPin::Find(_) => false,
         };
-        let row_count = usize::try_from(result.row_count)
-            .map_err(|_| ScrollbackApplyError::NegativeRowCount(result.row_count))?;
-        let decoded = GridRowCodec::decode_rows(&result.payload, row_count)?;
-        if decoded.len() != row_count {
-            return Err(ScrollbackApplyError::RowCountMismatch {
-                declared: row_count,
-                decoded: decoded.len(),
-            });
-        }
+        let decoded = page.rows?;
         if relocation_reply {
             self.continue_relocation(decoded, result, visible_rows);
             return Ok(());
-        }
-        if (!result.metadata.is_empty() && result.metadata.len() != row_count)
-            || result
-                .metadata
-                .iter()
-                .any(|meta| !meta.validate(result.cols.max(0) as usize))
-        {
-            return Err(ScrollbackApplyError::Codec(GridCodecError::InvalidMetadata));
         }
         let existing: std::collections::BTreeSet<_> = self.cache.keys().copied().collect();
         self.apply_rows(
@@ -1834,6 +1865,55 @@ mod tests {
         let mut viewport = ScrollbackViewport::default();
         viewport.note_history_rows(0);
         assert_eq!(viewport.indicator_max_offset(40), 40);
+    }
+
+    #[test]
+    #[ignore = "measures the UI portion of history page completion"]
+    fn scrollback_page_ui_time() {
+        // Four 50-row screens of varied text, at the 160-column geometry
+        // used by the reading-view benchmarks.
+        let cells: Vec<GridCell> = (0..160)
+            .map(|col| GridCell {
+                scalar: 32 + col % 90,
+                ..GridCell::BLANK
+            })
+            .collect();
+        let reply = ReadScrollbackCellsResult {
+            metadata: Vec::new(),
+            payload: GridRowCodec::encode_rows(&vec![cells; 200]).unwrap(),
+            first_row: 1000,
+            row_count: 200,
+            total_rows: 2050,
+            live_start_row: 2000,
+            cols: 160,
+            content_seq: 1,
+        };
+        for prepared in [false, true] {
+            let mut times = Vec::new();
+            for _ in 0..100 {
+                let mut viewport = ScrollbackViewport::default();
+                viewport.apply_geometry(2000, 2050, 1, 50);
+                viewport.set_view_offset(950, 50);
+                let result = reply.clone();
+                let start = if prepared {
+                    let page = ScrollbackPage::decode(result);
+                    let start = std::time::Instant::now();
+                    viewport.complete_page(page, 50).unwrap();
+                    start
+                } else {
+                    let start = std::time::Instant::now();
+                    viewport.complete_fetch(result, 50).unwrap();
+                    start
+                };
+                times.push(start.elapsed());
+                assert_eq!(viewport.cached_row_count(), 200);
+            }
+            times.sort_unstable();
+            println!(
+                "prepared={prepared} UI apply p50 {:?}, p95 {:?}",
+                times[49], times[94]
+            );
+        }
     }
 
     #[test]

@@ -1639,6 +1639,7 @@ struct AttemptOutcome {
 }
 
 async fn run_lifecycle(core: Arc<ClientCore>) {
+    let mut startup = Some(tokio::time::Instant::now());
     let mut backoff = INITIAL_BACKOFF;
     let mut shutdown = core.shutdown_tx.subscribe();
     let mut retries = core.retry_tx.subscribe();
@@ -1660,10 +1661,20 @@ async fn run_lifecycle(core: Arc<ClientCore>) {
             break;
         }
         if outcome.established {
+            startup = None;
             backoff = INITIAL_BACKOFF;
         }
+        // A freshly launched Engine may still be preparing its control socket.
+        // Only the first second of transport failures gets this cadence.
+        let starting = matches!(outcome.error, ClientError::Io(_))
+            && startup.is_some_and(|at| at.elapsed() < Duration::from_secs(1));
+        let delay = if starting {
+            Duration::from_millis(15)
+        } else {
+            backoff
+        };
         tokio::select! {
-            () = tokio::time::sleep(backoff) => {}
+            () = tokio::time::sleep(delay) => {}
             result = retries.changed() => {
                 if result.is_err() {
                     break;
@@ -1675,7 +1686,9 @@ async fn run_lifecycle(core: Arc<ClientCore>) {
                 }
             }
         }
-        backoff = backoff.saturating_mul(2).min(MAX_BACKOFF);
+        if !starting {
+            backoff = backoff.saturating_mul(2).min(MAX_BACKOFF);
+        }
     }
 }
 
@@ -1850,7 +1863,10 @@ mod tests {
 
     impl FakeEngine {
         fn start(instance: Option<&str>, events: u64) -> Self {
-            let temp = tempfile::tempdir().expect("temp dir");
+            Self::start_in(tempfile::tempdir().expect("temp dir"), instance, events)
+        }
+
+        fn start_in(temp: tempfile::TempDir, instance: Option<&str>, events: u64) -> Self {
             let socket = temp.path().join("daemon.sock");
             let listener =
                 diri_platform::ipc::asynchronous::UnixListener::bind(&socket).expect("bind");
@@ -1979,6 +1995,25 @@ mod tests {
             .expect("a subscription within five seconds")
             .expect("server alive")
         }
+    }
+
+    #[tokio::test]
+    async fn connects_to_a_daemon_bound_after_client_start() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let client = DaemonClient::with_socket_path(temp.path().join("daemon.sock"));
+        let start = std::time::Instant::now();
+        client.connect();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let _engine = FakeEngine::start_in(temp, Some("late-engine"), 0);
+        client
+            .wait_until_connected(Duration::from_secs(2))
+            .await
+            .expect("hello");
+        eprintln!("client start to verified hello: {:?}", start.elapsed());
+        assert!(
+            start.elapsed() < INITIAL_BACKOFF,
+            "first retry used outage backoff"
+        );
     }
 
     async fn connect_with_events(

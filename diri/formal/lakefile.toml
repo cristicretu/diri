@@ -1,6 +1,9 @@
-name = "diri-formal"
+name = "DiriFormal"
 version = "0.1.0"
-defaultTargets = ["Reliability"]
+defaultTargets = ["PromptCache", "Reliability"]
+
+[[lean_lib]]
+name = "PromptCache"
 
 [[lean_lib]]
 name = "Reliability"

@@ -53,19 +53,29 @@ pub(crate) struct AppActionHub {
 /// Forgets the performer when its connection closes. Held by the connection
 /// loop for its whole life.
 pub(crate) struct PerformerGuard {
+    registry: Arc<Mutex<crate::registry::Registry>>,
     hub: Arc<AppActionHub>,
     writer: Writer,
 }
 
 impl Drop for PerformerGuard {
     fn drop(&mut self) {
-        self.hub.disconnected(&self.writer);
+        if self.hub.disconnected(&self.writer)
+            && let Ok(registry) = self.registry.lock()
+        {
+            registry.page_out_on_app_disconnect();
+        }
     }
 }
 
 impl AppActionHub {
-    pub(crate) fn guard(self: &Arc<Self>, writer: &Writer) -> PerformerGuard {
+    pub(crate) fn guard(
+        self: &Arc<Self>,
+        writer: &Writer,
+        registry: &Arc<Mutex<crate::registry::Registry>>,
+    ) -> PerformerGuard {
         PerformerGuard {
+            registry: Arc::clone(registry),
             hub: Arc::clone(self),
             writer: Arc::clone(writer),
         }
@@ -94,13 +104,15 @@ impl AppActionHub {
         Ok(json!({ "registered": count }))
     }
 
-    fn disconnected(&self, writer: &Writer) {
+    fn disconnected(&self, writer: &Writer) -> bool {
+        let mut was_performer = false;
         if let Ok(mut performer) = self.performer.lock()
             && performer
                 .as_ref()
                 .is_some_and(|performer| Arc::ptr_eq(&performer.writer, writer))
         {
             *performer = None;
+            was_performer = true;
         }
         // Nobody will answer what this connection still owes: say so now
         // rather than at each request's timeout.
@@ -114,6 +126,7 @@ impl AppActionHub {
                 }
             });
         }
+        was_performer
     }
 
     pub(crate) fn list(&self) -> AppActionsListResult {

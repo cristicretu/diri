@@ -25,8 +25,9 @@ use crate::inline_images::{DrawGrid, ImageDraw, InlineImageCache, append_row_dra
 use crate::metrics::CellMetrics;
 use crate::power_mode::{PowerKey, PowerMode, PowerShape};
 use crate::scrollback::{
-    HistoryFollow, HistoryStep, ScrollRouter, ScrollbackApplyError, ScrollbackRequest,
-    ScrollbackViewport, ScrolledState, TerminalModes, WheelDelta, WheelEvent, WheelRoute,
+    HistoryFollow, HistoryStep, ScrollRouter, ScrollbackApplyError, ScrollbackPage,
+    ScrollbackRequest, ScrollbackViewport, ScrolledState, TerminalModes, WheelDelta, WheelEvent,
+    WheelRoute,
 };
 use crate::selection::{SelectionPoint, TerminalSelection};
 use crate::selection_shimmer::SelectionShimmer;
@@ -909,7 +910,13 @@ fn digest_cells(cells: &[GridCell]) -> u64 {
 fn digest_row(cells: &[GridCell], graphemes: &[(u16, String)], tints: &[Tint]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    cells.hash(&mut hasher);
+    cells.len().hash(&mut hasher);
+    for cell in cells {
+        // Feed whole words. The derived hash makes separate short writes
+        // for each color discriminant, channel, style and scalar.
+        hasher.write_u64((u64::from(cell.fg.packed()) << 32) | u64::from(cell.bg.packed()));
+        hasher.write_u64((u64::from(cell.scalar) << 16) | u64::from(cell.style.bits()));
+    }
     graphemes.hash(&mut hasher);
     for tint in tints {
         (tint.start, tint.end).hash(&mut hasher);
@@ -1185,6 +1192,14 @@ impl TerminalElement {
             cursor_hidden: false,
             padding_extend: Edges::default(),
         }
+    }
+
+    /// Drop derived paint data when this view leaves the recent tab cache.
+    /// Both live and history rows can be shaped from the retained viewport
+    /// on the first frame back, even before the Engine attach completes.
+    pub fn release_parked_shapes(&self) {
+        *mutex_lock(&self.shared.row_cache) = Vec::new();
+        mutex_lock(&self.shared.history_lines).release();
     }
 
     /// This terminal's inline-image cache, for the host to install a
@@ -1973,6 +1988,14 @@ impl TerminalElement {
         visible_rows: usize,
     ) -> Result<(), ScrollbackApplyError> {
         mutex_lock(&self.shared.viewport).complete_fetch(result, visible_rows)
+    }
+
+    pub fn complete_scrollback_page(
+        &self,
+        page: ScrollbackPage,
+        visible_rows: usize,
+    ) -> Result<(), ScrollbackApplyError> {
+        mutex_lock(&self.shared.viewport).complete_page(page, visible_rows)
     }
 
     pub fn fail_scrollback_fetch(&self) {
@@ -3312,10 +3335,8 @@ impl Element for TerminalElement {
         }
 
         if viewport.is_reading() {
-            // History browsing composes owned rows per frame; quads are cheap
-            // arithmetic, but shaping is not, so shaped lines are reused from
-            // the absolute-row cache. Returning live still forces one complete
-            // live-cache re-seed.
+            // Reading reuses shaped lines across scroll frames. Returning
+            // live forces a complete live-cache re-seed.
             *mutex_lock(&self.shared.render_context) = None;
             let buffer = read_lock(&self.buffer);
             cursor = buffer.cursor;
@@ -3330,14 +3351,22 @@ impl Element for TerminalElement {
             let mut history = mutex_lock(&self.shared.history_lines);
             history.validate(key, viewport.absolute_row(0));
             let mut hits = 0u64;
-            let mut cells = Vec::with_capacity(usize::from(grid_cols));
+            let mut padded = Vec::new();
             for (row_index, tints) in row_tints.iter().enumerate() {
                 let absolute = viewport.absolute_row(row_index);
-                viewport.window_row_into(&buffer, row_index, &mut cells);
-                cells.truncate(visible_cols);
+                let stored = viewport.stored_row(&buffer, absolute).unwrap_or_default();
+                let cells = if let Some(row) = stored.get(..visible_cols) {
+                    row
+                } else {
+                    // A missing row, or history from a narrower terminal.
+                    padded.clear();
+                    padded.extend_from_slice(stored);
+                    padded.resize(visible_cols, GridCell::BLANK);
+                    &padded
+                };
                 let styles = viewport.row_styles(&buffer, absolute);
                 append_row_quads(
-                    &cells,
+                    cells,
                     row_index as u16,
                     grid,
                     self.theme,
@@ -3348,7 +3377,7 @@ impl Element for TerminalElement {
                     &mut sprite_shapes,
                 );
                 let graphemes = viewport.row_graphemes(&buffer, absolute);
-                let digest = digest_row(&cells, graphemes, tints);
+                let digest = digest_row(cells, graphemes, tints);
                 if history.get(absolute, digest).is_some() {
                     hits += 1;
                 } else {
@@ -3358,7 +3387,7 @@ impl Element for TerminalElement {
                     // the fetch lands. The same holds for the held live rows
                     // under the history, which used to be reshaped and copied
                     // every frame.
-                    let line = self.shape_row(&cells, graphemes, tints, metrics, window);
+                    let line = self.shape_row(cells, graphemes, tints, metrics, window);
                     history.insert(absolute, digest, line);
                 }
                 lines.push((row_index as u16, absolute));
@@ -6193,6 +6222,45 @@ mod history_cache_tests {
     use gpui::{FontId, ShapedLine};
 
     use super::{HistoryLineCache, HistoryShapeKey, digest_cells, digest_row};
+
+    #[test]
+    fn parking_releases_derived_shapes_and_retains_the_grid() {
+        use std::sync::{Arc, RwLock};
+
+        let mut grid = crate::buffer::GridBuffer::new(120, 40);
+        grid.cells[0].scalar = '界' as u32;
+        let element = super::TerminalElement::new(Arc::new(RwLock::new(grid)));
+        let before = {
+            let mut history = element.shared.history_lines.lock().unwrap();
+            for row in 0..512 {
+                history.insert(row, 1, ShapedLine::default());
+            }
+            history.lines.len() * std::mem::size_of::<(i64, (u64, ShapedLine))>()
+        };
+        element
+            .shared
+            .row_cache
+            .lock()
+            .unwrap()
+            .resize_with(40, || None);
+        element.release_parked_shapes();
+        assert_eq!(
+            element
+                .shared
+                .history_lines
+                .lock()
+                .unwrap()
+                .lines
+                .capacity(),
+            0
+        );
+        assert_eq!(element.shared.row_cache.lock().unwrap().capacity(), 0);
+        assert_eq!(
+            element.buffer().read().unwrap().cells[0].scalar,
+            '界' as u32
+        );
+        println!("512 history shapes: {before} inline entry bytes before parking, 0 after");
+    }
 
     #[test]
     fn combining_only_changes_invalidate_history_shapes() {
