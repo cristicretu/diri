@@ -95,11 +95,10 @@ impl Reply {
 }
 
 fn post(url: &str, token: Option<&str>, body: &Value) -> Reply {
-    let address = url
+    let (address, path) = url
         .strip_prefix("http://")
         .unwrap()
-        .split('/')
-        .next()
+        .split_once('/')
         .unwrap();
     let mut stream = TcpStream::connect(address).unwrap();
     stream
@@ -111,7 +110,7 @@ fn post(url: &str, token: Option<&str>, body: &Value) -> Reply {
         .unwrap_or_default();
     write!(
         stream,
-        "POST /mcp HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\n{auth}Content-Length: {}\r\n\r\n{body}",
+        "POST /{path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\n{auth}Content-Length: {}\r\n\r\n{body}",
         body.len()
     )
     .unwrap();
@@ -133,6 +132,69 @@ fn call(url: &str, token: &str, id: u64, tool: &str, arguments: Value) -> Value 
     );
     assert_eq!(reply.status, 200, "{}", reply.head);
     reply.message()
+}
+
+#[test]
+fn compact_profile_lists_two_tools_and_resolves_actions_as_the_authenticated_caller() {
+    let engine = start();
+    let cwd = tempfile::tempdir().unwrap();
+    let session = spawn_session(&engine, cwd.path());
+    let token = engine.server.mcp_http_token(&session).unwrap();
+    let url = format!("{}/skills-v1", engine.url);
+    let list = json!({"jsonrpc":"2.0","id":1,"method":"tools/list"});
+    assert_eq!(post(&url, None, &list).status, 401);
+    let tools = post(&url, Some(&token), &list).message();
+    assert_eq!(
+        tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["get_skill", "act"]
+    );
+    let full = post(&engine.url, Some(&token), &list).message();
+    let names = call(&url, &token, 2, "get_skill", json!({}));
+    assert_eq!(
+        names["result"]["structuredContent"]["actions"],
+        json!(
+            full["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| &t["name"])
+                .collect::<Vec<_>>()
+        )
+    );
+    let schema = call(
+        &url,
+        &token,
+        3,
+        "get_skill",
+        json!({"action":"name_session"}),
+    );
+    assert_eq!(
+        schema["result"]["structuredContent"]["name"],
+        "name_session"
+    );
+    let named = call(
+        &url,
+        &token,
+        4,
+        "act",
+        json!({"action":"name_session","arguments":{"name":"compact-session"}}),
+    );
+    assert_eq!(named["result"]["structuredContent"]["applied"], true);
+    assert_eq!(
+        engine
+            .registry
+            .lock()
+            .unwrap()
+            .record(&session)
+            .unwrap()
+            .title,
+        "compact-session"
+    );
 }
 
 #[test]
@@ -218,7 +280,10 @@ fn an_agent_reaches_its_own_session_over_http() {
         std::fs::read_to_string(engine._temp.path().join("inject/claude-mcp-http.json")).unwrap();
     let config: Value = serde_json::from_str(&config).unwrap();
     assert_eq!(config["mcpServers"]["dirijor"]["type"], "http");
-    assert_eq!(config["mcpServers"]["dirijor"]["url"], engine.url);
+    assert_eq!(
+        config["mcpServers"]["dirijor"]["url"],
+        format!("{}/skills-v1", engine.url)
+    );
     assert_eq!(
         config["mcpServers"]["dirijor"]["headers"]["Authorization"],
         "Bearer ${DIRIJOR_MCP_TOKEN}"

@@ -131,6 +131,10 @@ fn instructions(browser: &str, names_sessions: bool) -> String {
 }
 
 pub fn initialize(params: &Value) -> Value {
+    initialize_profile(params, false)
+}
+
+fn initialize_profile(params: &Value, compact: bool) -> Value {
     let version = params
         .get("protocolVersion")
         .and_then(Value::as_str)
@@ -141,20 +145,97 @@ pub fn initialize(params: &Value) -> Value {
     } else {
         ""
     };
+    let naming = diri_proto::session_naming::enabled_for_current_user();
+    let instructions = if compact {
+        let mut text = String::from(
+            "Diri agents, notes, schedules and apps: get_skill for guidance; act to execute.",
+        );
+        if naming {
+            text.push(' ');
+            text.push_str(diri_proto::session_naming::ACTION_INSTRUCTION);
+        }
+        text
+    } else {
+        instructions(browser, naming)
+    };
     json!({
         "protocolVersion": version,
         "capabilities": {"tools":{}},
         "serverInfo": {"name":"dirijor","version":"0.1.0"},
         // "Let agents name sessions", read as the Agent starts: changing it
         // reaches the next Agent session, never one already running.
-        "instructions": instructions(
-            browser,
-            diri_proto::session_naming::enabled_for_current_user(),
-        ),
+        "instructions": instructions,
     })
 }
 
 pub fn handle_message(message: Value, backend: &mut impl ToolBackend) -> Option<Value> {
+    handle_profile(message, backend, false)
+}
+
+/// Unwrap before transport dispatch so waits remain cancellable reads and
+/// mutations retain ordering, progress and the Engine’s caller checks.
+pub fn expand_action(message: &mut Value) {
+    if message["method"] == "tools/call" && message["params"]["name"] == "act" {
+        let mut args = message["params"]["arguments"].take();
+        let params = &mut message["params"];
+        params["name"] = args
+            .get_mut("action")
+            .map(Value::take)
+            .unwrap_or(Value::Null);
+        params["arguments"] = args
+            .get_mut("arguments")
+            .map(Value::take)
+            .unwrap_or_else(|| json!({}));
+    }
+}
+
+fn compact_list() -> Value {
+    json!({"tools": [
+        {
+            "name": "get_skill",
+            "description": "Read a Diri skill by name, an action schema by action, or list both.",
+            "inputSchema": {"type": "object", "properties": {
+                "name": {"type": "string"},
+                "action": {"type": "string"}
+            }}
+        },
+        {
+            "name": "act",
+            "description": "Run a Diri action with its named JSON arguments. Use get_skill for schemas and guidance.",
+            "inputSchema": {"type": "object", "properties": {
+                "action": {"type": "string"},
+                "arguments": {"type": "object"}
+            }, "required": ["action"]}
+        }
+    ]})
+}
+
+fn discover(backend: &mut impl ToolBackend, args: &Value) -> Result<Value, String> {
+    if args.get("name").is_some() {
+        if args.get("action").is_some() {
+            return Err("choose a skill name or an action".into());
+        }
+        return backend.call("get_skill", args);
+    }
+    let result = backend.tools()?;
+    let tools = result["tools"].as_array().ok_or("invalid tool catalog")?;
+    match args.get("action") {
+        None => Ok(
+            json!({"skills":diri_proto::skills::ALL.map(|skill|skill.name),"actions":tools.iter().map(|t| &t["name"]).collect::<Vec<_>>()}),
+        ),
+        Some(name) => tools
+            .iter()
+            .find(|t| t["name"] == *name)
+            .cloned()
+            .ok_or_else(|| format!("unknown action {name}")),
+    }
+}
+
+pub fn handle_profile(
+    message: Value,
+    backend: &mut impl ToolBackend,
+    compact: bool,
+) -> Option<Value> {
     let object = match message.as_object() {
         Some(object) => object,
         None => return Some(error(Value::Null, -32600, "Invalid Request")),
@@ -184,7 +265,8 @@ pub fn handle_message(message: Value, backend: &mut impl ToolBackend) -> Option<
     }
 
     match method {
-        "initialize" => id.map(|id| success(id, initialize(&params))),
+        "initialize" => id.map(|id| success(id, initialize_profile(&params, compact))),
+        "tools/list" if compact => id.map(|id| success(id, compact_list())),
         "ping" => id.map(|id| success(id, json!({}))),
         "tools/list" => id.map(|id| match backend.tools() {
             Ok(tools) => success(id, tools),
@@ -201,7 +283,12 @@ pub fn handle_message(message: Value, backend: &mut impl ToolBackend) -> Option<
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            success(id, tool_content(backend.call(name, &arguments)))
+            let result = if compact && name == "get_skill" {
+                discover(backend, &arguments)
+            } else {
+                backend.call(name, &arguments)
+            };
+            success(id, tool_content(result))
         }),
         _ if id.is_none() => None,
         _ => Some(error(
