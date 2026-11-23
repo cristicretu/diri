@@ -2091,8 +2091,10 @@ impl TerminalPane {
                 if !self.attachment_is_current(&id, generation) {
                     return;
                 }
-                if let Some(resident) = self.residents.get_mut(&id) {
+                if let Some(resident) = self.residents.get_mut(&id)
+                    && resident.trace.first_grid.get().is_none() {
                     resident.trace.first_grid.get_or_init(Instant::now);
+                    self.runtime.first_terminal_grid.close();
                 }
                 let now = self.started_at.elapsed();
                 let schedule = self.residents.get_mut(&id).is_some_and(|resident| {
