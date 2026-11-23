@@ -522,6 +522,37 @@ fn next_notification_id() -> u64 {
 /// app never subscribes to it; [`crate::control::ControlServer`] relaunches.
 pub const RELAUNCH_REQUESTED: &str = "session.relaunch_requested";
 
+/// A coalesced notification shared by the Registry and its live sessions.
+/// Keep the pending bit through a scan and across watcher restarts. A burst
+/// on different pumps takes the waiter's mutex only on its first change.
+#[derive(Default)]
+pub(crate) struct StateWake {
+    pending: AtomicBool,
+    wait_lock: Mutex<()>,
+    ready: Condvar,
+}
+
+impl StateWake {
+    pub(crate) fn notify(&self) {
+        if !self.pending.swap(true, Ordering::Release) {
+            // Serialize with the waiter's predicate check and entry to wait.
+            let guard = self.wait_lock.lock().expect("state wake");
+            self.ready.notify_one();
+            drop(guard);
+        }
+    }
+
+    fn wait(&self, timeout: Duration) {
+        let guard = self.wait_lock.lock().expect("state wake");
+        let (_guard, _) = self
+            .ready
+            .wait_timeout_while(guard, timeout, |_| {
+                !self.pending.swap(false, Ordering::AcqRel)
+            })
+            .expect("state wake");
+    }
+}
+
 pub fn spawn_registry_watcher(
     registry: Arc<Mutex<crate::registry::Registry>>,
     events: EventBus,
@@ -535,8 +566,11 @@ pub fn spawn_registry_watcher(
             // integer compare per live session — the previous implementation
             // cloned and JSON-serialized every record (live and archived) on
             // every pass, all under the registry lock.
+            let wake = registry.lock().expect("registry").state_wake();
+            let mut title_cache = HashMap::new();
             let mut published: HashMap<String, u64> = HashMap::new();
             while !stop.load(Ordering::SeqCst) {
+                let pass_started = std::time::Instant::now();
                 let (
                     mut changed,
                     cursor_requests,
@@ -594,8 +628,9 @@ pub fn spawn_registry_watcher(
                     }
                 }
                 let cursor_refreshes = crate::registry::scan_cursor_refreshes(cursor_requests);
-                let native_title_refreshes =
-                    crate::registry::scan_native_title_refreshes(native_title_requests);
+                let native_title_refreshes = native_title_requests.map(|requests|
+                    crate::registry::scan_native_title_refreshes(requests, &mut title_cache)
+                ).unwrap_or_default();
                 if !cursor_refreshes.is_empty() || !native_title_refreshes.is_empty() {
                     let Ok(mut registry) = registry.lock() else {
                         break;
@@ -660,7 +695,13 @@ pub fn spawn_registry_watcher(
                         );
                     }
                 }
-                std::thread::sleep(Duration::from_millis(150));
+                // Provider files can change independently of the PTY and are
+                // sampled once per second. Session changes and bells wake us
+                // sooner. Keep the existing coalescing interval under load.
+                wake.wait(Duration::from_secs(1));
+                if let Some(remaining) = Duration::from_millis(150).checked_sub(pass_started.elapsed()) {
+                    std::thread::sleep(remaining);
+                }
             }
         })
         .expect("spawn watcher")

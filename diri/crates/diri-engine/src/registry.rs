@@ -218,7 +218,7 @@ pub(crate) struct PersistBatch {
 }
 
 impl PersistBatch {
-    fn commit(self) -> std::io::Result<()> {
+    pub(crate) fn commit(self) -> std::io::Result<()> {
         self.file
             .commit_sections("registry", self.sequence, self.sections)
     }
@@ -270,6 +270,7 @@ pub struct Registry {
     /// not be additive, so this build serves what it read but never writes
     /// the file: every persist fails with `ErrorKind::Unsupported`.
     newer_state_version: Option<i64>,
+    state_watcher: Option<Arc<crate::events::StateWake>>,
     cursor_title_refresh_at: Option<std::time::Instant>,
     native_title_refresh_at: Option<std::time::Instant>,
     /// Attach connections showing a completed run's retained terminal, by
@@ -395,6 +396,7 @@ impl Registry {
             record_residue: HashMap::new(),
             newer_state_version: None,
             completed_views: HashMap::new(),
+            state_watcher: None,
             cursor_title_refresh_at: None,
             native_title_refresh_at: None,
             last_client_size: None,
@@ -624,6 +626,20 @@ impl Registry {
         self.dirty = true;
     }
 
+    /// Take a due write for an ordinary spawn. Commit it after dropping the
+    /// registry lock. The section sequence rejects stale writes if a later
+    /// mutation reaches disk first.
+    pub(crate) fn take_spawn_persist(&mut self) -> Option<PersistBatch> {
+        self.dirty = true;
+        if self
+            .last_persist
+            .is_some_and(|last| last.elapsed() < PERSIST_DEBOUNCE)
+        {
+            return None;
+        }
+        self.take_dirty_batch()
+    }
+
     /// Writes out a deferred persist, if one is pending.
     pub fn flush_dirty(&mut self) -> std::io::Result<()> {
         if !self.dirty {
@@ -774,7 +790,7 @@ impl Registry {
             }
         };
         self.records.insert(id.clone(), record);
-        self.sessions.insert(id.clone(), session.into());
+        self.insert_session(id.clone(), session);
         self.close_completed_views(&id);
         self.bind_completed_run(&id);
         Ok(id)
@@ -991,7 +1007,7 @@ impl Registry {
         } else if let Some(record) = self.records.get_mut(&id) {
             record.mark_starting(DateMillis::from(std::time::SystemTime::now()));
         }
-        self.sessions.insert(id.clone(), session.into());
+        self.insert_session(id.clone(), session);
         self.close_completed_views(&id);
         Ok(())
     }
@@ -1073,7 +1089,7 @@ impl Registry {
             Arc::clone(&self.engine),
             initial_status,
         )?;
-        self.sessions.insert(id.clone(), session.into());
+        self.insert_session(id.clone(), session);
         self.close_completed_views(&id);
         Ok(id)
     }
@@ -1266,7 +1282,7 @@ impl Registry {
                     if was_hibernated {
                         let _ = session.set_hibernated(true);
                     }
-                    self.sessions.insert(session_id.clone(), session.into());
+                    self.insert_session(session_id.clone(), session);
                     self.close_completed_views(&session_id);
                     self.bind_completed_run(&session_id);
                     if let Ok(Some(seed)) = self.recovery_store(&session_id).read_activity()
@@ -1341,6 +1357,12 @@ impl Registry {
             ));
         }
         session.restart_failed_remote(Arc::clone(&self.engine), inspected)
+    }
+
+    pub(crate) fn page_out_on_app_disconnect(&self) {
+        for session in self.sessions.values() {
+            session.request_idle_history_page_out();
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<&Session> {
@@ -1419,11 +1441,25 @@ impl Registry {
         fold_record_lifecycle(&self.engine, record);
     }
 
-    /// Diffs live sessions' state versions against `published` (updating it in
-    /// place) and returns folded records for just the sessions that changed.
-    /// The steady-state cost — the events watcher polls this several times a
-    /// second — is one integer compare per live session: no clones, no
-    /// serialization.
+    pub(crate) fn state_wake(&mut self) -> Arc<crate::events::StateWake> {
+        Arc::clone(self.state_watcher.get_or_insert_with(|| {
+            let wake = Arc::new(crate::events::StateWake::default());
+            for session in self.sessions.values() {
+                session.set_state_watcher(&wake);
+            }
+            wake
+        }))
+    }
+
+    fn insert_session(&mut self, id: String, session: impl Into<RegisteredSession>) {
+        let session = session.into();
+        if let Some(watcher) = &self.state_watcher {
+            session.set_state_watcher(watcher);
+            watcher.notify();
+        }
+        self.sessions.insert(id, session);
+    }
+
     pub fn take_notifications(&self, id: &str) -> Vec<diri_terminal_state::TerminalNotification> {
         self.sessions
             .get(id)
@@ -1622,37 +1658,41 @@ impl Registry {
     /// Captures live local Claude/Codex sessions due for a native title read.
     /// The one-second bound mirrors provider title-generation cadence while
     /// keeping transcript/database I/O off the 150 ms state watcher path.
-    pub(crate) fn native_title_refresh_requests(&mut self) -> Vec<NativeTitleRefreshRequest> {
+    pub(crate) fn native_title_refresh_requests(
+        &mut self,
+    ) -> Option<Vec<NativeTitleRefreshRequest>> {
         let now = std::time::Instant::now();
         if self.native_title_refresh_at.is_some_and(|previous| {
             now.duration_since(previous) < std::time::Duration::from_secs(1)
         }) {
-            return Vec::new();
+            return None;
         }
         self.native_title_refresh_at = Some(now);
-        self.sessions
-            .keys()
-            .filter_map(|id| {
-                let record = self.records.get(id)?;
-                if record.host.is_some()
-                    || !matches!(
-                        record.kind.id(),
-                        AgentKind::CLAUDE_CODE_ID | AgentKind::CODEX_ID
-                    )
-                    || !accepts_native_title(record.title_source)
-                {
-                    return None;
-                }
-                Some(NativeTitleRefreshRequest {
-                    account_profile: record.account_profile.clone(),
-                    id: id.clone(),
-                    kind: record.kind.clone(),
-                    cwd: record.cwd.clone(),
-                    agent_session_id: record.agent_session_id.clone()?,
-                    transcript_path: record.transcript_path.clone(),
+        Some(
+            self.sessions
+                .keys()
+                .filter_map(|id| {
+                    let record = self.records.get(id)?;
+                    if record.host.is_some()
+                        || !matches!(
+                            record.kind.id(),
+                            AgentKind::CLAUDE_CODE_ID | AgentKind::CODEX_ID
+                        )
+                        || !accepts_native_title(record.title_source)
+                    {
+                        return None;
+                    }
+                    Some(NativeTitleRefreshRequest {
+                        account_profile: record.account_profile.clone(),
+                        id: id.clone(),
+                        kind: record.kind.clone(),
+                        cwd: record.cwd.clone(),
+                        agent_session_id: record.agent_session_id.clone()?,
+                        transcript_path: record.transcript_path.clone(),
+                    })
                 })
-            })
-            .collect()
+                .collect(),
+        )
     }
 
     /// Applies a title only if the request still describes the same live
@@ -1705,7 +1745,7 @@ impl Registry {
             Err(error) => {
                 // A failed stop must not orphan a surviving Holder or let a replacement
                 // launch under the same identity (including account continuation).
-                self.sessions.insert(id.to_owned(), session);
+                self.insert_session(id.to_owned(), session);
                 return Err(error);
             }
         };
@@ -1853,7 +1893,7 @@ impl Registry {
             self.write_recovery_capsule(record)?;
         }
         let session = Session::spawn(spec, Arc::clone(&self.engine))?;
-        self.sessions.insert(id.clone(), session.into());
+        self.insert_session(id.clone(), session);
         self.close_completed_views(&id);
         let record = self.records.get_mut(&id).expect("checked above");
         record.mark_starting(DateMillis::from(std::time::SystemTime::now()));
@@ -2597,6 +2637,13 @@ impl Registry {
         self.sessions.contains_key(id)
     }
 
+    #[cfg(unix)]
+    pub fn has_resumable_local_session(&self) -> bool {
+        self.records
+            .values()
+            .any(|r| r.host.is_none() && !r.is_archived() && r.can_resume())
+    }
+
     pub fn record_count(&self) -> usize {
         self.records.len()
     }
@@ -2801,7 +2848,12 @@ pub(crate) fn scan_cursor_refreshes(
 
 pub(crate) fn scan_native_title_refreshes(
     requests: Vec<NativeTitleRefreshRequest>,
+    cache: &mut HashMap<PathBuf, crate::history::ClaudeTitleCacheEntry>,
 ) -> Vec<NativeTitleRefreshResult> {
+    if requests.is_empty() {
+        cache.clear();
+        return Vec::new();
+    }
     let Some(home) = user_home() else {
         return Vec::new();
     };
@@ -2836,6 +2888,9 @@ pub(crate) fn scan_native_title_refreshes(
             }
         }
     }
+    // Retain only the current live set. Each path is validated anew before
+    // consulting the previous scan's metadata, including its provider root.
+    let mut previous = std::mem::take(cache);
     requests
         .into_iter()
         .map(|request| {
@@ -2853,7 +2908,14 @@ pub(crate) fn scan_native_title_refreshes(
                             Path::new(path),
                         )
                     })
-                    .and_then(|mut transcript| transcript.latest_claude_title())
+                    .and_then(|mut transcript| {
+                        let path = transcript.path().to_owned();
+                        let (title, entry) = transcript.cached_claude_title(previous.remove(&path));
+                        if let Some(entry) = entry {
+                            cache.insert(path, entry);
+                        }
+                        title
+                    })
                     .map(crate::history::ProviderTitle::named),
                 AgentKind::CODEX_ID => codex_titles.remove(&request.id),
                 _ => None,
@@ -3681,7 +3743,7 @@ mod tests {
                 });
             }
         }
-        let refreshed = scan_native_title_refreshes(requests);
+        let refreshed = scan_native_title_refreshes(requests, &mut HashMap::new());
         assert_eq!(refreshed.len(), 4);
         for result in refreshed {
             assert_eq!(
@@ -5782,10 +5844,12 @@ mod tests {
             // Exercise the refresh and watcher independently, without waiting
             // on their production timers. Both publish session.updated.
             registry.native_title_refresh_at = None;
-            let requests = registry.native_title_refresh_requests();
+            let requests = registry.native_title_refresh_requests().unwrap();
             assert_eq!(requests.len(), 1);
-            let refreshed =
-                registry.apply_native_title_refreshes(scan_native_title_refreshes(requests));
+            let refreshed = registry.apply_native_title_refreshes(scan_native_title_refreshes(
+                requests,
+                &mut HashMap::new(),
+            ));
             assert_eq!(refreshed.len(), usize::from(pass == 0));
             for (_, record) in &refreshed {
                 assert_eq!(record.title, original);

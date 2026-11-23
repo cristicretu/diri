@@ -180,6 +180,17 @@ mod tests {
                 }
                 assert_eq!(current_native_key_code(key), None);
             }
+            // ADEMark delivers independent Unicode strings on virtual key zero.
+            let mut typed = String::new();
+            for characters in ["a", "d", "e", "m", "a", "r", "k", "q", "z", ":", "é", "👩‍💻"] {
+                let text = NSString::alloc(nil).init_str(characters);
+                let native = <id as NSEvent>::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode_(nil, NSEventType::NSKeyDown, NSPoint::new(0.0, 0.0), NSEventModifierFlags::empty(), 0.0, 0, nil, text, text, NO, 0);
+                let Some(PlatformInput::KeyDown(key)) = crate::events::platform_input_from_native(native, None) else {
+                    panic!("key event");
+                };
+                typed.push_str(key.keystroke.key_char.as_deref().unwrap_or(""));
+            }
+            assert_eq!(typed, "ademarkqz:é👩‍💻");
             pool.drain();
         }
     }

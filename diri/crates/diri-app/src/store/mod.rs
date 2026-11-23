@@ -4158,6 +4158,8 @@ fn now_millis() -> DateMillis {
 
 /// Running daemon bridge. It owns only tasks and shared channels; UI state remains in `SessionStore`.
 pub struct StoreRuntime {
+    /// Closed when a terminal has received its first grid.
+    pub(crate) first_terminal_grid: tokio::sync::Semaphore,
     pub store: Arc<RwLock<SessionStore>>,
     client: Arc<DaemonClient>,
     detach_tx: broadcast::Sender<SessionId>,
@@ -4251,6 +4253,7 @@ impl StoreRuntime {
             snapshot_tx,
             action_tx,
             refit_tx,
+            first_terminal_grid: tokio::sync::Semaphore::new(0),
             tasks: Mutex::new(Vec::new()),
         }
     }
@@ -4598,6 +4601,7 @@ impl StoreRuntime {
             snapshot_tx,
             action_tx,
             refit_tx,
+            first_terminal_grid: tokio::sync::Semaphore::new(0),
             tasks: Mutex::new(tasks),
         }
     }

@@ -1,5 +1,7 @@
 # Working with other Diri sessions
 
+When the client lists `act`, pass the action names below to Diri’s `act` tool with an `arguments` object. Use `get_skill` with `action` for its schema, or with no arguments to list actions and guides. In a Diri terminal, `"$DIRIJOR_CLI" mcp-tools` prints the CLI catalog.
+
 ## Parallel work
 
 Prefer `spawn_agents` with one entry per subtask (`worktree: true`, `prompt`, `task: true`), then `wait_any(task_ids)`. For each ready task: read its result (`read_output` with `mode: "last_message"` for detail), `answer_task` if it is blocked, `get_diff` to review, `integrate` to bring its branch into your checkout. Call `wait_any` again with the pending ids, and `release_agent` when done. `wait_any` returns as soon as **any** target needs you; do not wait for all of them at once.

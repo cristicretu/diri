@@ -1,5 +1,7 @@
 //! GPUI rendering and event routing for T13 navigation surfaces.
 //!
+#[cfg(test)]
+use gpui::Entity;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -16,7 +18,7 @@ use diri_ui::{
     StatusState,
 };
 use gpui::{
-    AnyElement, BoxShadow, ClickEvent, Context, Entity, FocusHandle, FontWeight, KeyDownEvent,
+    AnyElement, BoxShadow, ClickEvent, Context, FocusHandle, FontWeight, KeyDownEvent,
     KeyUpEvent, ModifiersChangedEvent, MouseButton, Render, ScrollHandle, SharedString, Task,
     Window, div, point, prelude::*, px, rgba,
 };
@@ -66,7 +68,6 @@ pub struct SessionSurfaces {
     store: crate::store::WindowStore,
     focus_handle: FocusHandle,
     resident_previews: HashMap<SessionId, TerminalElement>,
-    status_glyphs: HashMap<(SessionId, u16, diri_ui::AgentKind), Entity<StatusGlyph>>,
     overview_grid_scroll: ScrollHandle,
     client: Arc<diri_client::DaemonClient>,
     tokio: Option<tokio::runtime::Handle>,
@@ -186,7 +187,6 @@ impl SessionSurfaces {
             store: crate::store::WindowStore::from_canonical(Arc::clone(&runtime.store)),
             focus_handle: cx.focus_handle(),
             resident_previews: HashMap::new(),
-            status_glyphs: HashMap::new(),
             overview_grid_scroll: ScrollHandle::new(),
             client: Arc::clone(runtime.client()),
             tokio,
@@ -316,14 +316,6 @@ impl Render for SessionSurfaces {
             self.overview_list_scroll.scroll_to_item(0);
         }
         self.overview_was_visible = overview_visible;
-        if overview_visible || switcher_visible {
-            let session_ids: HashSet<_> = {
-                let store = self.store.read().expect("session store lock poisoned");
-                store.sessions().keys().cloned().collect()
-            };
-            self.status_glyphs
-                .retain(|(id, _, _), _| session_ids.contains(id));
-        }
         let root = div()
             .id("session-surfaces")
             .absolute()
@@ -494,7 +486,7 @@ impl SessionSurfaces {
         }
     }
 
-    fn render_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_switcher(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let (state, sessions) = {
             let store = self.store.read().expect("session store lock poisoned");
             let state = store.switcher_state().clone();
@@ -514,7 +506,7 @@ impl SessionSurfaces {
         );
         let footer = highlighted.as_ref().map(|session| {
             let kind = ui_agent_kind(session.effective_kind());
-            let status = self.status_glyph(session, 22.0, colors, window, cx);
+            let status = Self::status_glyph(session, 22.0, colors);
             let mut details = div().flex().flex_col().min_w_0().gap(px(2.0)).child(
                 div()
                     .text_size(px(13.0))
@@ -1209,7 +1201,7 @@ impl SessionSurfaces {
         session: &SessionRecord,
         state: &crate::switcher::SessionOverviewState,
         colors: SemanticColors,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let selected = state.selection().contains(&session.id);
@@ -1217,7 +1209,7 @@ impl SessionSurfaces {
         let has_selection = !state.selection().is_empty();
         let id = session.id.clone();
         let close_id = id.clone();
-        let status = self.status_glyph(session, 14.0, colors, window, cx);
+        let status = Self::status_glyph(session, 14.0, colors);
         let preview = self.overview_preview(session, colors, cx);
 
         let mut thumbnail = div()
@@ -1404,14 +1396,14 @@ impl SessionSurfaces {
         session: &SessionRecord,
         state: &crate::switcher::SessionOverviewState,
         colors: SemanticColors,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let selected = state.selection().contains(&session.id);
         let focused = state.focused() == Some(&session.id);
         let id = session.id.clone();
         let close_id = id.clone();
-        let status = self.status_glyph(session, 16.0, colors, window, cx);
+        let status = Self::status_glyph(session, 16.0, colors);
         div()
             .id(SharedString::from(format!("overview-row-{}", id.0)))
             .flex()
@@ -1843,27 +1835,8 @@ impl SessionSurfaces {
         }
     }
 
-    fn status_glyph(
-        &mut self,
-        session: &SessionRecord,
-        size: f32,
-        colors: SemanticColors,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<StatusGlyph> {
-        let state = ui_status_state(session);
-        let kind = ui_agent_kind(session.effective_kind());
-        let key = (session.id.clone(), (size * 10.0).round() as u16, kind);
-        let glyph = self
-            .status_glyphs
-            .entry(key)
-            .or_insert_with(|| StatusGlyph::entity(kind, state, size, colors, cx))
-            .clone();
-        glyph.update(cx, |glyph, cx| {
-            glyph.set_state(state, window, cx);
-            glyph.set_colors(colors, cx);
-        });
-        glyph
+    fn status_glyph(session: &SessionRecord, size: f32, colors: SemanticColors) -> AnyElement {
+        StatusGlyph::new(ui_agent_kind(session.effective_kind()), ui_status_state(session), size, colors).sized_mark(None)
     }
 }
 

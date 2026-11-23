@@ -397,6 +397,7 @@ pub fn tool_summary(payload: &Value) -> (Option<String>, Option<String>) {
         return (tool, None);
     };
     let summary = match tool.as_deref() {
+        Some("mcp__dirijor__act") => input.get("action").and_then(Value::as_str),
         Some("Bash") => input.get("command").and_then(Value::as_str),
         Some("Edit") | Some("Write") | Some("Read") | Some("NotebookEdit") => {
             input.get("file_path").and_then(Value::as_str)
@@ -418,6 +419,10 @@ pub fn permission_summary(tool: Option<&str>, input_summary: Option<&str>) -> St
         Some("Bash") => format!("wants to run `{}`", input_summary.unwrap_or("a command")),
         Some("Edit") | Some("Write") => format!("wants to edit {}", short_path(input_summary)),
         Some("WebFetch") => format!("wants to fetch {}", input_summary.unwrap_or("a URL")),
+        Some("mcp__dirijor__act") => match input_summary {
+            Some(action) => format!("wants to use dirijor:{action}"),
+            None => "wants to use dirijor:act".to_owned(),
+        },
         // MCP tools arrive as `mcp__server__tool`; show `server:tool`.
         Some(name) if name.starts_with("mcp__") => {
             format!("wants to use {}", name[5..].replace("__", ":"))

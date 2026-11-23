@@ -31,6 +31,9 @@ pub const INSTRUCTION: &str = "Name this session: while handling the first reque
      hyphenated words naming it, e.g. fix-login-redirect. Keep a name that still fits; rename \
      when the task changes. If it fails, carry on.";
 
+/// Naming hint for clients with the compact MCP action catalog.
+pub const ACTION_INSTRUCTION: &str = "On the first task use Diri act(name_session) with a 2-4 word hyphenated name. Rename on task change.";
+
 /// Whether the app's preferences allow it. A missing key, file, or a file
 /// that does not parse means on, the default.
 pub fn enabled(prefs: &[u8]) -> bool {

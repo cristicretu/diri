@@ -471,6 +471,7 @@ struct Shared {
     /// registry watcher compares this instead of cloning and JSON-serializing
     /// every record on every poll.
     state_version: AtomicU64,
+    state_watcher: std::sync::OnceLock<Arc<crate::events::StateWake>>,
     /// Seconds since UNIX_EPOCH of the last attach-pump poll or input write.
     /// Keeps interactive sessions on the fast quiet-tick.
     last_hot: AtomicU64,
@@ -555,6 +556,7 @@ struct Shared {
     /// This session's idle history swap, made at its first page-out (see
     /// [`crate::history_swap`]) and kept so later page-outs add to it.
     history_swap: Mutex<Option<Arc<crate::history_swap::SwapFile>>>,
+    page_out_requested: AtomicBool,
     /// Set while a held pump runs or is parked; see [`HeldPumpLatch`].
     held_pump: HeldPumpLatch,
     /// What the last foreground sample of a shell found: 0 unknown, 1 the
@@ -838,6 +840,13 @@ impl Shared {
 
     fn bump_state_version(&self) {
         self.state_version.fetch_add(1, Ordering::SeqCst);
+        self.wake_state_watcher();
+    }
+
+    fn wake_state_watcher(&self) {
+        if let Some(watcher) = self.state_watcher.get() {
+            watcher.notify();
+        }
     }
 
     fn note_hot(&self) {
@@ -2863,7 +2872,7 @@ impl Session {
 
     /// Whether a program rang the bell since the last call.
     pub fn take_bell(&self) -> bool {
-        self.shared.bell.swap(false, Ordering::Relaxed)
+        self.shared.bell.swap(false, Ordering::Acquire)
     }
 
     /// The newest OSC 52 clipboard write since the last call, decoded.
@@ -2875,6 +2884,12 @@ impl Session {
             .expect("screen")
             .take_clipboard()?;
         decode_clipboard(&data)
+    }
+
+    pub(crate) fn set_state_watcher(&self, watcher: &Arc<crate::events::StateWake>) {
+        self.shared
+            .state_watcher
+            .get_or_init(|| Arc::clone(watcher));
     }
 
     pub fn state_version(&self) -> u64 {
@@ -3508,6 +3523,17 @@ impl Session {
                     record_returned_to_shell(&shared, false, "session_end_hook");
                 }
             });
+    }
+
+    /// Expedite the normal encrypted history page-out once this pump parks.
+    /// The pump keeps draining a streaming child before doing any cold work.
+    pub fn request_idle_history_page_out(&self) {
+        if self.is_held() && crate::history_swap::page_out_idle().is_some() {
+            self.shared
+                .page_out_requested
+                .store(true, Ordering::Release);
+            self.shared.pump_wake.ring();
+        }
     }
 
     /// Whether a local Holder owns this session's PTY.
@@ -4264,6 +4290,7 @@ fn new_shared(
         exited: AtomicBool::new(false),
         stop: AtomicBool::new(false),
         state_version: AtomicU64::new(0),
+        state_watcher: Default::default(),
         last_hot: AtomicU64::new(unix_secs()),
         last_interaction: AtomicU64::new(0),
         artifacts: Mutex::new(Vec::new()),
@@ -4299,6 +4326,7 @@ fn new_shared(
         echo_request: Mutex::new(None),
         pump_wake: PumpWake::default(),
         history_swap: Mutex::new(None),
+        page_out_requested: AtomicBool::new(false),
         held_pump: HeldPumpLatch::default(),
         foreground_job: std::sync::atomic::AtomicU8::new(0),
         foreground: Mutex::new(ForegroundProgram::default()),
@@ -4344,8 +4372,9 @@ fn child_record_stat(paths: &HolderPaths, floor: u64) -> Option<HolderStat> {
     (record.epoch_offset == floor && record.child_identity.is_some()).then(|| record.as_stat())
 }
 
-/// Waits for a freshly launched holder and returns the exit-marker floor:
-/// 250 × 20ms.
+/// Waits for a freshly launched holder and returns the exit-marker floor.
+/// A directory event wakes the next probe when the control socket appears.
+/// Keep the bounded timer for older holders and platforms without kqueue.
 ///
 /// Any stat answer attaches — `alive: false` just means the child already
 /// exited, and the pump will find its marker. A child so short-lived that the
@@ -4359,6 +4388,10 @@ fn wait_for_holder(
     pre_spawn_tail: u64,
 ) -> Result<(u64, Option<HolderStat>), crate::holder::HolderError> {
     let deadline = Instant::now() + HOLDER_READY_TIMEOUT;
+    let mut directory = client
+        .socket_path
+        .parent()
+        .and_then(log_watch::LogWatcher::new);
     for delay in crate::holder::readiness_delays() {
         if Instant::now() >= deadline {
             break;
@@ -4372,7 +4405,11 @@ fn wait_for_holder(
                 return Ok((pre_spawn_tail, None));
             }
         }
-        std::thread::sleep(delay);
+        if let Some(watch) = directory.as_mut() {
+            watch.wait(delay);
+        } else {
+            std::thread::sleep(delay);
+        }
     }
     Err(crate::holder::HolderError::Launch(
         "holder did not become ready".into(),
@@ -4893,7 +4930,10 @@ fn idle_work_pending(
     last_scan_at: Option<Instant>,
     last_scan_seq: u64,
 ) -> bool {
-    if shared.wants_fast_tick() || shared.reducer.lock().expect("reducer").wants_tick() {
+    // The streaming subscription and the input doorbell wake a parked
+    // reader. Its caller already allows the PTY facts settle after activity;
+    // recent interaction alone needs no further 100 ms timer.
+    if shared.reducer.lock().expect("reducer").wants_tick() {
         return true;
     }
     let sampling = if manifest_id == "shell" {
@@ -4928,6 +4968,7 @@ fn page_out_idle_history(
     checkpoint_path: &Path,
     quiet: &mut Option<(Instant, u64)>,
     paged: &mut bool,
+    expedite: bool,
 ) -> Duration {
     let Some(idle) = crate::history_swap::page_out_idle() else {
         *paged = true;
@@ -4947,7 +4988,7 @@ fn page_out_idle_history(
         *seen = reads;
     }
     let quiet_for = now.saturating_duration_since(*since);
-    if quiet_for < idle {
+    if !expedite && quiet_for < idle {
         return idle - quiet_for;
     }
     *paged = true;
@@ -5660,7 +5701,8 @@ fn apply_remote_output(
             shared.bump_state_version();
         }
         if screen.take_bell() {
-            shared.bell.store(true, Ordering::Relaxed);
+            shared.bell.store(true, Ordering::Release);
+            shared.wake_state_watcher();
         }
         // The Holder answers its program's queries from its own emulator;
         // this mirror's would otherwise pile up unread for the session's
@@ -6411,7 +6453,8 @@ fn feed_output_batch(
                 shared.bump_state_version();
             }
             if screen.take_bell() {
-                shared.bell.store(true, Ordering::Relaxed);
+                shared.bell.store(true, Ordering::Release);
+                shared.wake_state_watcher();
             }
             if let Some(status) = screen.take_agent_exit() {
                 note_agent_exit(shared, status, &mut screen);
@@ -7538,14 +7581,27 @@ fn held_turn(state: Box<HeldPump>, mut resumed: bool, may_park: bool) -> HeldTur
                 // decoded or allocated before sleeping. Cheap when there is
                 // nothing to give back, and parks are rare.
                 shared.screen.lock().expect("screen").compact_idle();
+                let expedite = shared.page_out_requested.swap(false, Ordering::AcqRel);
                 if !history_paged {
                     park_for = page_out_idle_history(
                         &shared,
                         &checkpoint_path,
                         &mut history_quiet,
                         &mut history_paged,
+                        expedite,
                     )
                     .min(IDLE_PARK);
+                }
+                #[cfg(target_os = "macos")]
+                if expedite {
+                    unsafe extern "C" {
+                        fn malloc_zone_pressure_relief(
+                            zone: *mut std::ffi::c_void,
+                            goal: usize,
+                        ) -> usize;
+                    }
+                    // SAFETY: a null zone and zero goal release unused pages from all zones.
+                    unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
                 }
                 if !park_next {
                     // Output just went quiet: its buffers are not needed
@@ -7663,7 +7719,8 @@ fn held_turn(state: Box<HeldPump>, mut resumed: bool, may_park: bool) -> HeldTur
                     shared.bump_state_version();
                 }
                 if screen.take_bell() {
-                    shared.bell.store(true, Ordering::Relaxed);
+                    shared.bell.store(true, Ordering::Release);
+                    shared.wake_state_watcher();
                 }
                 if let Some(status) = screen.take_agent_exit() {
                     note_agent_exit(&shared, status, &mut screen);
@@ -8767,6 +8824,20 @@ mod quiet_tick_tests {
         // Input or an attach makes it interactive again at once.
         shared.note_hot();
         assert_eq!(shared.quiet_tick(), TICK_INTERVAL);
+
+        // A local streaming shell whose foreground and reducer are settled
+        // can park on its input/output descriptors even during that window.
+        assert!(
+            shared
+                .reducer
+                .lock()
+                .unwrap()
+                .seed(&SessionStatus::Idle, None)
+        );
+        shared.foreground_job.store(1, Ordering::SeqCst);
+        assert!(!idle_work_pending(&shared, "shell", None, 0));
+        shared.foreground_job.store(0, Ordering::SeqCst);
+        assert!(idle_work_pending(&shared, "shell", None, 0));
     }
 }
 

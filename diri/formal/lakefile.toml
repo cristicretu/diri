@@ -1,0 +1,6 @@
+name = "DiriFormal"
+version = "0.1.0"
+defaultTargets = ["PromptCache"]
+
+[[lean_lib]]
+name = "PromptCache"

@@ -694,13 +694,13 @@ impl SessionSurfaces {
         backdrop: Option<AnyElement>,
         theme: diri_term::theme::TermTheme,
         colors: SemanticColors,
-        window: &mut Window,
-        cx: &mut Context<Self>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
     ) -> gpui::Div {
         let dark = colors.appearance == diri_ui::Appearance::Dark;
         let chrome = chrome.clamp(0.0, 1.0);
         let veiled = backdrop.is_some();
-        let glyph = self.status_glyph(session, 12.0, colors, window, cx);
+        let glyph = Self::status_glyph(session, 12.0, colors);
         let title = div()
             .min_w_0()
             .overflow_hidden()
@@ -805,7 +805,7 @@ impl SessionSurfaces {
         let dark = colors.appearance == diri_ui::Appearance::Dark;
         let focused = state.focused() == Some(&session.id);
         let id = session.id.clone();
-        let glyph = self.status_glyph(session, 12.0, colors, window, cx);
+        let glyph = Self::status_glyph(session, 12.0, colors);
         let (mini, mini_height) =
             self.calm_miniature(session, card_width, pane, font, theme, window, cx);
         let title = div()
