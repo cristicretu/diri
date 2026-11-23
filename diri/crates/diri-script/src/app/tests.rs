@@ -478,3 +478,36 @@ fn focus_ledger_syncs_from_a_real_git_log_once_approved() {
             .root,
     );
 }
+
+#[test]
+fn json_null_is_lua_nil() {
+    let (dir, source) = app(
+        "function render(state, data) return ui.text(tostring(data == nil) .. ' ' .. tostring((data or {}).n)) end",
+    );
+    let rendered = render(
+        App {
+            source: &source,
+            dir: dir.path(),
+        },
+        &Value::Null,
+        &Value::Null,
+        &ctx(),
+        INTERACTIVE,
+    )
+    .unwrap();
+    assert_eq!(rendered.root[0]["text"], "true nil");
+    let (dir, source) =
+        app("function render(state, data) return ui.text(tostring(data.a == nil)) end");
+    let rendered = render(
+        App {
+            source: &source,
+            dir: dir.path(),
+        },
+        &Value::Null,
+        &json!({"a": null}),
+        &ctx(),
+        INTERACTIVE,
+    )
+    .unwrap();
+    assert_eq!(rendered.root[0]["text"], "true");
+}

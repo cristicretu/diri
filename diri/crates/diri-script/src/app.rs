@@ -233,8 +233,13 @@ fn function(lua: &Lua, name: &str) -> Result<Option<Function>, AppError> {
     }
 }
 
+/// JSON into Lua, with `null` as `nil` (not mlua's null sentinel), so
+/// `data or {}` and `if x then` read as any Lua author expects.
 fn to_lua(lua: &Lua, value: &Value) -> Result<LuaValue, AppError> {
-    lua.to_value(value).map_err(lua_error)
+    let options = mlua::prelude::LuaSerializeOptions::new()
+        .serialize_none_to_null(false)
+        .serialize_unit_to_null(false);
+    lua.to_value_with(value, options).map_err(lua_error)
 }
 
 fn from_lua(lua: &Lua, value: LuaValue) -> Result<Value, AppError> {
