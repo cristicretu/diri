@@ -9,6 +9,7 @@ members = [
     "crates/dirijor-mcp",
     "crates/diri-proto",
     "crates/diri-platform",
+    "crates/diri-portable",
     "crates/diri-pty",
     "crates/diri-remote",
     "crates/diri-script",
@@ -38,6 +39,7 @@ diri-node = { path = "crates/diri-node" }
 diri-notes = { path = "crates/diri-notes" }
 diri-proto = { path = "crates/diri-proto" }
 diri-platform = { path = "crates/diri-platform" }
+diri-portable = { path = "crates/diri-portable" }
 diri-pty = { path = "crates/diri-pty" }
 diri-script = { path = "crates/diri-script" }
 diri-telemetry = { path = "crates/diri-telemetry" }

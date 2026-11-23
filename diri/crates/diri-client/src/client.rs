@@ -1309,7 +1309,11 @@ impl DaemonClient {
     ) -> Result<diri_proto::portable::SyncStatus, ClientError> {
         let params = diri_proto::portable::SyncConfigureParams { config };
         self.core
-            .request_typed(Method::SYNC_CONFIGURE, Some(&params), Some(PORTABLE_TIMEOUT))
+            .request_typed(
+                Method::SYNC_CONFIGURE,
+                Some(&params),
+                Some(PORTABLE_TIMEOUT),
+            )
             .await
     }
 

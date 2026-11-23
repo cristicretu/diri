@@ -90,3 +90,17 @@ cargo test -p diri-remote --lib controller_epoch_model_rejects_old_claims_and_ex
 `ReceiptTraces.lean` enumerates all 25 pairs of confirmed, rejected-before-write, interrupted-before-write, interrupted-after-write and uncertain actions, with app and Engine restart between attempts. Rust drives the real message and spawn receipt functions and compares the persisted outcome and number of effect callbacks against the generated table. Reopening the database represents an Engine restart at the storage boundary. A dropped invocation has no volatile ownership on retry. The companion task table enumerates 27 three-action traces combining acknowledgement, completion and cancellation. Rust reads each fresh journal view and verifies the acknowledgement history, terminal classification and immutability of an already terminal record.
 
 The Holder test uses a real PTY and authenticated connections, starting at zero and two epochs below the maximum. After each attempted attach it exercises the input path of every prior connection, including the lease kept when the next epoch cannot be represented.
+
+## Portable sync and migration
+
+`MigrationSync.lean` models the `diri-portable` rules from the design brief: the artifact allowlist, field redaction, session merge, cwd remap and write-if-absent file placement. Run `lake build` in this directory.
+
+| Lean | Rust counterpart |
+| --- | --- |
+| `ArtifactClass`, `secret`, `profileAllowed`, `migrationAllowed` | `diri_portable::classify::{ArtifactClass, profile_allowed, migration_allowed}`. `profile_allowed_not_secret`, `migration_allowed_not_secret` and `profile_subset_migration` check every class. |
+| `redact`, `exportWith` | `classify::redact_secret_fields` applied after the allowlist. `profile_export_no_secret`, `migration_export_no_secret` and `export_no_secret_field` hold for any key predicate. `export_idempotent` shows a second export changes nothing. |
+| `merge`, `mergeOne`, `pick` | `diri_portable::sessions::merge_sessions`. `merge_idempotent` covers importing a bundle twice. `merge_monotone`, `merge_keeps_live`, `merge_wellKeyed` and `merge_imports_not_live` cover local ids, `updatedAt`, live records, one record per id and the non-live imported status. |
+| `remap`, `remapPrefix`, `lineage` | `diri_portable::pathmap::PathMap::remap`. `remap_preserves`, `remap_lineage`, `remap_resumable` and `merge_remap_idempotent` show only `cwd` changes. `remapPrefix_hit` and `remapPrefix_miss` cover one `OLD=NEW` rule. |
+| `writeIfAbsent` | `diri_portable::files::write_if_absent`. `writeIfAbsent_keeps` shows existing content is never overwritten. `writeIfAbsent_idempotent` shows a second write with any content changes nothing. |
+
+The store is modelled as a function from session id to record, so it holds at most one record per id. A bundle with repeated ids still merges idempotently. The model abstracts JSON documents to flat key/value pairs and paths to component lists. It does not model rule ordering by prefix length, encryption, the bundle container or the sync three-way merge.

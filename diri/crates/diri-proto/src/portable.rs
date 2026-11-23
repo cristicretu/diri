@@ -353,11 +353,17 @@ mod tests {
             "talkVoiceCommand": "curl -H 'Authorization: x'",
         });
         let current = current.as_object_mut().unwrap();
-        assert!(overlay_portable_prefs(current, incoming.as_object().unwrap()));
+        assert!(overlay_portable_prefs(
+            current,
+            incoming.as_object().unwrap()
+        ));
         assert_eq!(current["terminalTheme"], "b");
         assert_eq!(current["windowPlacement"], 1);
         assert!(!current.contains_key("talkVoiceCommand"));
-        assert!(!overlay_portable_prefs(current, incoming.as_object().unwrap()));
+        assert!(!overlay_portable_prefs(
+            current,
+            incoming.as_object().unwrap()
+        ));
     }
 
     #[test]
