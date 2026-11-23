@@ -38,6 +38,7 @@ mod hook_queue;
 mod message_delivery;
 mod operations;
 mod orchestration;
+mod portable;
 mod schedules;
 mod tasks;
 mod workspaces;
@@ -268,6 +269,8 @@ pub struct ControlServer {
     /// notes directory (tests pin a temporary one).
     notes_dir: Option<PathBuf>,
     scheduler: Arc<schedules::Scheduler>,
+    /// Profile sync and migration (`sync.*`, `migrate.*`).
+    portable: portable::PortableState,
     /// The connected app's exported actions and the requests waiting on it.
     app_actions: Arc<app_actions::AppActionHub>,
 }
@@ -419,6 +422,7 @@ impl ControlServer {
             phone_reads_aloud: std::sync::atomic::AtomicBool::new(false),
             notes_dir: None,
             scheduler: Arc::new(schedules::Scheduler::default()),
+            portable: portable::PortableState::default(),
             app_actions: Arc::default(),
         }
     }
@@ -670,6 +674,15 @@ impl ControlServer {
     /// receipts.
     pub fn with_state_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.state_dir = dir.into();
+        self
+    }
+
+    /// Profile sync and migration read and write under this home instead of
+    /// the user's, with app support, prefs and config in the config dir and
+    /// cheap bundle key derivation. Fixture homes only.
+    #[doc(hidden)]
+    pub fn with_portable_home(mut self, home: impl Into<PathBuf>) -> Self {
+        self.portable = portable::PortableState::with_home(home.into());
         self
     }
 
@@ -1435,6 +1448,11 @@ impl ControlServer {
             Method::SCHEDULE_UPDATE => self.schedule_update(params),
             Method::SCHEDULE_DELETE => self.schedule_delete(params),
             Method::SCHEDULE_LIST => self.schedule_list(),
+            Method::SYNC_STATUS => self.sync_status(),
+            Method::SYNC_CONFIGURE => self.sync_configure(params),
+            Method::SYNC_NOW => self.sync_now(),
+            Method::MIGRATE_EXPORT => self.migrate_export(params),
+            Method::MIGRATE_IMPORT => self.migrate_import(params),
             Method::SCHEDULE_RUN_NOW => self.schedule_run_now(params),
             Method::SESSION_LIST | Method::STATE_SNAPSHOT => self.session_list(),
             Method::SESSION_DELIVER_MESSAGE => self.session_deliver_message(params),

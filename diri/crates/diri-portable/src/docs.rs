@@ -200,6 +200,74 @@ pub fn import_prefs(
     pending
 }
 
+/// Preferences after a sync. Unlike a migration, the merged recipe list is
+/// authoritative (it already holds both Macs' edits and deletions), so it
+/// replaces this Mac's book instead of being added to it.
+pub fn sync_prefs(
+    portable: &Value,
+    recipes: Option<&Value>,
+    current: &Map<String, Value>,
+    map: &PathMap,
+    project_id: &dyn Fn(&str) -> String,
+) -> Map<String, Value> {
+    let mut pending = import_prefs(portable, None, current, map, project_id);
+    if let Some(recipes) = recipes {
+        let mut book = current
+            .get("launchRecipes")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        book.entry("version").or_insert(json!(1));
+        let items: Vec<Value> = recipes
+            .get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|recipe| tracked_recipe(recipe.clone(), map, project_id))
+            .collect();
+        let highest = items
+            .iter()
+            .filter_map(|item| {
+                item.get("id")?
+                    .as_str()?
+                    .strip_prefix("recipe-")?
+                    .parse::<u64>()
+                    .ok()
+            })
+            .max()
+            .unwrap_or(0);
+        let next = book
+            .get("nextId")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .max(highest + 1);
+        book.insert("nextId".into(), json!(next));
+        book.insert("items".into(), Value::Array(items));
+        pending.insert("launchRecipes".into(), Value::Object(book));
+    }
+    pending
+}
+
+/// A portable recipe (`project.path`) as this Mac's tracked recipe.
+fn tracked_recipe(mut recipe: Value, map: &PathMap, project_id: &dyn Fn(&str) -> String) -> Value {
+    if let Some(project) = recipe
+        .as_object_mut()
+        .and_then(|object| object.get_mut("project"))
+        .and_then(Value::as_object_mut)
+    {
+        let root = project
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|root| map.remap(root))
+            .unwrap_or_default();
+        project.clear();
+        project.insert("kind".into(), json!("tracked"));
+        project.insert("id".into(), json!(project_id(&root)));
+        project.insert("last_known_root".into(), json!(root));
+    }
+    recipe
+}
+
 fn recipe_fingerprint(recipe: &Value) -> Value {
     let mut recipe = recipe.clone();
     if let Some(object) = recipe.as_object_mut() {
@@ -238,21 +306,7 @@ fn merge_recipe_book(
         .into_iter()
         .flatten()
     {
-        let mut recipe = recipe.clone();
-        let Some(object) = recipe.as_object_mut() else {
-            continue;
-        };
-        if let Some(project) = object.get_mut("project").and_then(Value::as_object_mut) {
-            let root = project
-                .get("path")
-                .and_then(Value::as_str)
-                .map(|root| map.remap(root))
-                .unwrap_or_default();
-            project.clear();
-            project.insert("kind".into(), json!("tracked"));
-            project.insert("id".into(), json!(project_id(&root)));
-            project.insert("last_known_root".into(), json!(root));
-        }
+        let mut recipe = tracked_recipe(recipe.clone(), map, project_id);
         let fingerprint = recipe_fingerprint(&recipe);
         if items
             .iter()

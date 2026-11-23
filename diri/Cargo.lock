@@ -1731,6 +1731,7 @@ dependencies = [
  "base64 0.23.1",
  "diri-notes",
  "diri-platform",
+ "diri-portable",
  "diri-proto",
  "diri-pty",
  "diri-telemetry",

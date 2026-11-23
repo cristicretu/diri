@@ -287,12 +287,21 @@ pub fn plan(local: &Snapshot, remote: &Snapshot, base: &SyncBase, stamp: &str) -
             let parse = |bytes: Option<&Vec<u8>>| {
                 bytes.and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
             };
-            let (value, conflicts) = merge3(
-                kind,
-                base.docs.get(rel),
-                parse(l).as_ref(),
-                parse(r).as_ref(),
-            );
+            let (value, conflicts) = if base.hashes.is_empty() && r.is_some() {
+                // This Mac's first sync with a copy that already has a
+                // profile: a fresh Mac's defaults must not override the
+                // settings it came to fetch. Both sides' members are kept;
+                // the synced copy wins where they differ.
+                let (value, _) = merge3(kind, None, parse(r).as_ref(), parse(l).as_ref());
+                (value, Vec::new())
+            } else {
+                merge3(
+                    kind,
+                    base.docs.get(rel),
+                    parse(l).as_ref(),
+                    parse(r).as_ref(),
+                )
+            };
             out.conflicts.extend(
                 conflicts
                     .into_iter()
@@ -657,6 +666,22 @@ mod tests {
         assert_eq!(
             plan.conflict_copies.get("conflicts/notes/c.md.mac-x"),
             Some(&b"c-remote".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_fresh_mac_takes_the_synced_preferences() {
+        let local = snap(&[(
+            "prefs.json",
+            r#"{"terminalTheme":"Default","reduceMotion":false}"#,
+        )]);
+        let remote = snap(&[("prefs.json", r#"{"terminalTheme":"Dusk"}"#)]);
+        let first = plan(&local, &remote, &SyncBase::default(), "s");
+        let merged: Value =
+            serde_json::from_slice(first.to_local["prefs.json"].as_ref().unwrap()).unwrap();
+        assert_eq!(
+            merged,
+            serde_json::json!({"terminalTheme": "Dusk", "reduceMotion": false})
         );
     }
 

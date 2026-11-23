@@ -18,6 +18,8 @@ diri-notes.workspace = true
 diri-pty.workspace = true
 diri-telemetry.workspace = true
 diri-terminal-state.workspace = true
+# Profile sync and migration bundles (src/control/portable.rs).
+diri-portable.workspace = true
 # The Engine serves the `dirijor` MCP tools over loopback HTTP with the same
 # message handling as the stdio frontend (see src/mcp_http.rs).
 dirijor-mcp = { path = "../dirijor-mcp" }
