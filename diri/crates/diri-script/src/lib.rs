@@ -16,6 +16,7 @@
 //! Design and the full API: `diri/docs/scripting.md`.
 
 pub mod api;
+pub mod app;
 pub mod driver;
 pub mod engine;
 pub mod events;

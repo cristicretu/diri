@@ -20,21 +20,21 @@ use std::time::{Duration, Instant};
 use super::Waker;
 
 /// What a script keeps of one stream; past this it is cut and `truncated`.
-pub(super) const MAX_OUTPUT: usize = 1024 * 1024;
+pub(crate) const MAX_OUTPUT: usize = 1024 * 1024;
 /// A line longer than this reaches `on_output` in pieces.
 const MAX_LINE: usize = 64 * 1024;
 /// Processes one script may run at once.
-pub(super) const MAX_RUNNING: usize = 16;
+pub(crate) const MAX_RUNNING: usize = 16;
 const READ_CHUNK: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Stream {
+pub(crate) enum Stream {
     Stdout,
     Stderr,
 }
 
 impl Stream {
-    pub(super) fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Stdout => "stdout",
             Self::Stderr => "stderr",
@@ -42,7 +42,7 @@ impl Stream {
     }
 }
 
-pub(super) enum Event {
+pub(crate) enum Event {
     Output {
         id: u64,
         stream: Stream,
@@ -56,17 +56,20 @@ pub(super) enum Event {
     },
 }
 
-pub(super) struct Spec {
+pub(crate) struct Spec {
     pub argv: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub env: Vec<(String, String)>,
     pub stdin: Option<Vec<u8>>,
     pub timeout: Duration,
+    /// Start from an empty environment (then `env`): a Diri App's process
+    /// gets no session, socket or token from the app it runs under.
+    pub clear_env: bool,
 }
 
 /// How a process ended, with what it printed.
 #[derive(Debug, Default)]
-pub(super) struct Finished {
+pub(crate) struct Finished {
     pub code: Option<i32>,
     pub signal: Option<i32>,
     pub error: Option<String>,
@@ -100,7 +103,7 @@ impl Running {
     }
 }
 
-pub(super) struct Execs {
+pub(crate) struct Execs {
     next: u64,
     running: HashMap<u64, Running>,
     tx: SyncSender<Event>,
@@ -110,7 +113,7 @@ pub(super) struct Execs {
 }
 
 impl Execs {
-    pub(super) fn new(waker: Option<Waker>) -> Self {
+    pub(crate) fn new(waker: Option<Waker>) -> Self {
         let (tx, rx) = mpsc::sync_channel(256);
         Self {
             next: 0,
@@ -122,15 +125,15 @@ impl Execs {
         }
     }
 
-    pub(super) fn can_wake(&self) -> bool {
+    pub(crate) fn can_wake(&self) -> bool {
         self.waker.is_some()
     }
 
-    pub(super) fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.running.is_empty()
     }
 
-    pub(super) fn next_deadline(&self) -> Option<Instant> {
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
         self.running
             .values()
             .filter(|running| !running.done && !running.result.timed_out)
@@ -139,7 +142,7 @@ impl Execs {
     }
 
     /// Kills the processes past their deadline.
-    pub(super) fn expire(&mut self, now: Instant) {
+    pub(crate) fn expire(&mut self, now: Instant) {
         for running in self.running.values_mut() {
             if !running.done && !running.result.timed_out && running.deadline <= now {
                 running.result.timed_out = true;
@@ -148,7 +151,7 @@ impl Execs {
         }
     }
 
-    pub(super) fn spawn(&mut self, spec: Spec) -> Result<u64, String> {
+    pub(crate) fn spawn(&mut self, spec: Spec) -> Result<u64, String> {
         if self.running.len() >= MAX_RUNNING {
             return Err(format!(
                 "a script can run at most {MAX_RUNNING} processes at once"
@@ -167,6 +170,9 @@ impl Execs {
             .stderr(std::process::Stdio::piped());
         if let Some(cwd) = &spec.cwd {
             command.current_dir(cwd);
+        }
+        if spec.clear_env {
+            command.env_clear();
         }
         for (key, value) in &spec.env {
             command.env(key, value);
@@ -238,20 +244,20 @@ impl Execs {
 
     /// Takes every event that has arrived. Clears the wake flag first, so an
     /// event sent meanwhile wakes the driver again.
-    pub(super) fn drain(&mut self) -> Vec<Event> {
+    pub(crate) fn drain(&mut self) -> Vec<Event> {
         self.pending.store(false, Ordering::SeqCst);
         self.rx.try_iter().collect()
     }
 
     /// Waits up to `timeout` for the next event, for a script that called
     /// `diri.exec` outside a coroutine.
-    pub(super) fn recv(&self, timeout: Duration) -> Option<Event> {
+    pub(crate) fn recv(&self, timeout: Duration) -> Option<Event> {
         self.rx.recv_timeout(timeout).ok()
     }
 
     /// Records one event. Answers the complete lines it carried, for
     /// `on_output`, and whether it ended the process.
-    pub(super) fn record(&mut self, event: Event) -> (u64, Vec<(Stream, String)>, bool) {
+    pub(crate) fn record(&mut self, event: Event) -> (u64, Vec<(Stream, String)>, bool) {
         match event {
             Event::Output { id, stream, data } => {
                 let Some(running) = self.running.get_mut(&id) else {
@@ -297,14 +303,14 @@ impl Execs {
     }
 
     /// The result of a process that ended, removing it.
-    pub(super) fn take(&mut self, id: u64) -> Option<Finished> {
+    pub(crate) fn take(&mut self, id: u64) -> Option<Finished> {
         if !self.running.get(&id)?.done {
             return None;
         }
         self.running.remove(&id).map(|running| running.result)
     }
 
-    pub(super) fn finished(&self) -> Vec<u64> {
+    pub(crate) fn finished(&self) -> Vec<u64> {
         self.running
             .iter()
             .filter(|(_, running)| running.done)
@@ -312,11 +318,11 @@ impl Execs {
             .collect()
     }
 
-    pub(super) fn deadline(&self, id: u64) -> Option<Instant> {
+    pub(crate) fn deadline(&self, id: u64) -> Option<Instant> {
         self.running.get(&id).map(|running| running.deadline)
     }
 
-    pub(super) fn kill(&mut self, id: u64) {
+    pub(crate) fn kill(&mut self, id: u64) {
         if let Some(running) = self.running.get_mut(&id)
             && !running.done
         {
@@ -462,5 +468,27 @@ mod tests {
         let rest = split_lines(Stream::Stdout, &mut partial, true);
         assert_eq!(rest[0].1, "three");
         assert!(partial.is_empty());
+    }
+}
+
+/// Runs one process to its end (or its deadline), for a caller that has no
+/// event loop: a Lua app's `sync` on its worker thread. Same limits as
+/// `diri.exec`: bounded output, the whole process group killed on timeout.
+pub(crate) fn run_blocking(spec: Spec) -> Result<Finished, String> {
+    let mut execs = Execs::new(None);
+    let id = execs.spawn(spec)?;
+    loop {
+        let wait = execs.deadline(id).map_or(Duration::from_millis(50), |deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .clamp(Duration::from_millis(1), Duration::from_millis(50))
+        });
+        if let Some(event) = execs.recv(wait) {
+            execs.record(event);
+        }
+        execs.expire(Instant::now());
+        if let Some(finished) = execs.take(id) {
+            return Ok(finished);
+        }
     }
 }

@@ -33,7 +33,7 @@ use serde_json::{Value, json};
 
 use crate::{api, events, keys};
 
-mod exec;
+pub(crate) mod exec;
 
 /// How a notice reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2086,6 +2086,7 @@ fn exec_spec(
             env,
             stdin,
             timeout,
+            clear_env: false,
         },
         output,
     ))

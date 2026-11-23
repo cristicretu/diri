@@ -18,18 +18,27 @@ use super::action::Action;
 pub struct Node {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// Box styling any component may carry: padding, fill, border, size,
+    /// alignment. The agent's own look, on top of the theme.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<BoxStyle>,
     #[serde(flatten)]
     pub kind: NodeKind,
 }
 
 impl Node {
     pub fn new(kind: NodeKind) -> Self {
-        Self { id: None, kind }
+        Self {
+            id: None,
+            style: None,
+            kind,
+        }
     }
 
     pub fn with_id(id: impl Into<String>, kind: NodeKind) -> Self {
         Self {
             id: Some(id.into()),
+            style: None,
             kind,
         }
     }
@@ -42,7 +51,9 @@ impl Node {
             | NodeKind::Row { children, .. }
             | NodeKind::Grid { children, .. }
             | NodeKind::Card { children, .. }
-            | NodeKind::Section { children, .. } => vec![children],
+            | NodeKind::Section { children, .. }
+            | NodeKind::Box { children, .. }
+            | NodeKind::Scroll { children, .. } => vec![children],
             NodeKind::Tabs { tabs } => tabs.iter().map(|tab| &tab.children).collect(),
             _ => Vec::new(),
         }
@@ -54,7 +65,9 @@ impl Node {
             | NodeKind::Row { children, .. }
             | NodeKind::Grid { children, .. }
             | NodeKind::Card { children, .. }
-            | NodeKind::Section { children, .. } => vec![children],
+            | NodeKind::Section { children, .. }
+            | NodeKind::Box { children, .. }
+            | NodeKind::Scroll { children, .. } => vec![children],
             NodeKind::Tabs { tabs } => tabs.iter_mut().map(|tab| &mut tab.children).collect(),
             _ => Vec::new(),
         }
@@ -69,6 +82,8 @@ impl Node {
                 | NodeKind::Grid { .. }
                 | NodeKind::Card { .. }
                 | NodeKind::Section { .. }
+                | NodeKind::Box { .. }
+                | NodeKind::Scroll { .. }
         )
     }
 
@@ -101,6 +116,188 @@ pub enum Trend {
     Flat,
 }
 
+/// A color: a theme token (`primary`, `secondary`, `tertiary`, `accent`,
+/// `success`, `warning`, `danger`, `info`, `background`, `surface`, `fill`,
+/// `border`) or `#rrggbb` / `#rrggbbaa`. Tokens follow light and dark.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct Color(pub String);
+
+pub const COLOR_TOKENS: &[&str] = &[
+    "primary",
+    "secondary",
+    "tertiary",
+    "accent",
+    "success",
+    "warning",
+    "danger",
+    "info",
+    "background",
+    "surface",
+    "fill",
+    "border",
+];
+
+impl Color {
+    /// `(r, g, b, a)` for a hex color; `None` for a token.
+    pub fn hex(&self) -> Option<(u8, u8, u8, u8)> {
+        let hex = self.0.strip_prefix('#')?;
+        if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+        match hex.len() {
+            6 => Some((byte(0)?, byte(2)?, byte(4)?, 255)),
+            8 => Some((byte(0)?, byte(2)?, byte(4)?, byte(6)?)),
+            _ => None,
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        COLOR_TOKENS.contains(&self.0.as_str()) || self.hex().is_some()
+    }
+}
+
+/// A width or height: points, or `"fill"`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum Length {
+    Points(f32),
+    Keyword(String),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Align {
+    Start,
+    Center,
+    End,
+    Stretch,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Justify {
+    Start,
+    Center,
+    End,
+    Between,
+    Around,
+}
+
+/// Free styling for any component's box.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct BoxStyle {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub padding: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub padding_x: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub padding_y: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg: Option<Color>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border: Option<Color>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border_width: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radius: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<Length>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<Length>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_width: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_width: Option<f32>,
+    /// Share of the free space along the parent's axis (flex-grow).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grow: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub align: Option<Align>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub justify: Option<Justify>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f32>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Weight {
+    #[default]
+    Regular,
+    Medium,
+    Semibold,
+    Bold,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    Row,
+    #[default]
+    Column,
+}
+
+/// One vector shape on a `canvas`, in the canvas's own points, origin
+/// top-left.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "shape", rename_all = "snake_case")]
+pub enum Shape {
+    Rect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<Color>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        radius: Option<f32>,
+    },
+    Circle {
+        x: f32,
+        y: f32,
+        r: f32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<Color>,
+    },
+    /// A polyline through `points` (`[[x, y], ...]`).
+    Line {
+        points: Vec<[f32; 2]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<Color>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<f32>,
+    },
+    /// A filled polygon through `points`: the area under a line, a wedge.
+    Area {
+        points: Vec<[f32; 2]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<Color>,
+    },
+}
+
+impl Shape {
+    /// Points it costs to lay out and paint.
+    pub fn cost(&self) -> usize {
+        match self {
+            Self::Line { points, .. } | Self::Area { points, .. } => 1 + points.len() / 8,
+            _ => 1,
+        }
+    }
+
+    pub fn color(&self) -> Option<&Color> {
+        match self {
+            Self::Rect { color, .. }
+            | Self::Circle { color, .. }
+            | Self::Line { color, .. }
+            | Self::Area { color, .. } => color.as_ref(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ButtonStyle {
@@ -123,6 +320,12 @@ pub struct Tab {
 pub struct ChecklistItem {
     pub id: String,
     pub text: String,
+    /// The glyph on the item's link chip, as the agent picks it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<super::identity::Icon>,
+    /// The words on the link chip; the link's host when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_label: Option<String>,
     /// The tick a fresh surface starts with. Once the person ticks it, the
     /// surface's state ([`super::SurfaceState::checks`]) wins.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -277,6 +480,17 @@ pub enum NodeKind {
         mono: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bind: Option<Binding>,
+        /// Point size (9-64).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        weight: Option<Weight>,
+        /// Overrides `tone`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<Color>,
+        /// One line, cut with an ellipsis.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncate: bool,
     },
     Markdown {
         text: String,
@@ -348,12 +562,20 @@ pub enum NodeKind {
         label: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+        /// The agent's glyph for it; a generic link glyph otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon: Option<super::identity::Icon>,
+        /// A short word after the label ("PR", "Thread"), as the agent says.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        badge: Option<String>,
     },
     Button {
         label: String,
         action: Action,
         #[serde(default)]
-        style: ButtonStyle,
+        variant: ButtonStyle,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon: Option<super::identity::Icon>,
     },
     Toggle {
         label: String,
@@ -361,6 +583,10 @@ pub enum NodeKind {
         default: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         notify: bool,
+        /// A Lua app's current value (the app owns its state); `default` and
+        /// the surface's state otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<bool>,
     },
     Select {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -370,6 +596,65 @@ pub enum NodeKind {
         default: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         notify: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<String>,
+    },
+    /// A tick box with a label, for a Lua app's own state.
+    Checkbox {
+        label: String,
+        #[serde(default)]
+        value: bool,
+    },
+    /// A one-line text field; Enter sends its text to the app.
+    Input {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        placeholder: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<String>,
+    },
+    /// A flex box: the general layout primitive (`style` does the rest).
+    Box {
+        #[serde(default)]
+        direction: Direction,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        wrap: bool,
+        #[serde(default)]
+        children: Vec<Node>,
+    },
+    /// A vertically scrolling region of fixed `height`.
+    Scroll {
+        height: f32,
+        #[serde(default)]
+        children: Vec<Node>,
+    },
+    /// Takes the free space along its parent's axis.
+    Spacer,
+    Code {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
+    },
+    /// Vector drawing: bars, sparklines, rings, any list of shapes.
+    Canvas {
+        width: f32,
+        height: f32,
+        shapes: Vec<Shape>,
+    },
+    /// A media card: thumbnail, title and details, opening `url` on click.
+    Media {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image: Option<String>,
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subtitle: Option<String>,
+        /// Corner badge on the thumbnail ("12:04", "LIVE").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        badge: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        /// Thumbnail width / height; 16:9 by default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        aspect: Option<f32>,
     },
     /// A live row for one Diri session: icon, title and status, kept current
     /// by the app; clicking it opens the session.
@@ -417,6 +702,14 @@ impl NodeKind {
             Self::Toggle { .. } => "toggle",
             Self::Select { .. } => "select",
             Self::Session { .. } => "session",
+            Self::Checkbox { .. } => "checkbox",
+            Self::Input { .. } => "input",
+            Self::Box { .. } => "box",
+            Self::Scroll { .. } => "scroll",
+            Self::Spacer => "spacer",
+            Self::Code { .. } => "code",
+            Self::Canvas { .. } => "canvas",
+            Self::Media { .. } => "media",
             Self::Unsupported => "unsupported",
         }
     }
@@ -425,7 +718,11 @@ impl NodeKind {
     pub fn is_stateful(&self) -> bool {
         matches!(
             self,
-            Self::Checklist { .. } | Self::Toggle { .. } | Self::Select { .. }
+            Self::Checklist { .. }
+                | Self::Toggle { .. }
+                | Self::Select { .. }
+                | Self::Checkbox { .. }
+                | Self::Input { .. }
         )
     }
 
@@ -464,6 +761,14 @@ pub const NODE_TYPES: &[&str] = &[
     "toggle",
     "select",
     "session",
+    "checkbox",
+    "input",
+    "box",
+    "scroll",
+    "spacer",
+    "code",
+    "canvas",
+    "media",
 ];
 
 /// Depth-first walk over `nodes` and everything under them, with each

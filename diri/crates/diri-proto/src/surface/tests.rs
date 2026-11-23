@@ -7,7 +7,7 @@ use super::patch::{Patch, apply, replace_all};
 use super::*;
 
 fn today() -> SurfaceDoc {
-    template::whats_for_today("today", Scope::Global, &["sess-1".into()])
+    fixtures::whats_for_today("today", Scope::Global, &["sess-1".into()])
 }
 
 fn parse(value: serde_json::Value) -> Node {
@@ -141,57 +141,33 @@ fn unsafe_links_and_images_are_refused() {
 }
 
 #[test]
-fn links_are_classified_for_badges() {
+fn links_are_generic() {
+    // No vendor is special: any https link is a web link to its host, and
+    // its glyph and badge come from the component, as the agent wrote them.
     assert_eq!(
         classify("https://github.com/acme/web/pull/812"),
-        LinkKind::GithubPull {
-            repo: "acme/web".into(),
-            number: 812
-        }
+        LinkKind::Web { host: "github.com".into() }
     );
-    assert_eq!(
-        classify("https://github.com/acme/web/issues/9#c"),
-        LinkKind::GithubIssue {
-            repo: "acme/web".into(),
-            number: 9
-        }
-    );
-    assert_eq!(
-        classify("https://linear.app/acme/issue/eng-142/title"),
-        LinkKind::Linear {
-            key: Some("ENG-142".into())
-        }
-    );
-    assert_eq!(
-        classify("https://acme.slack.com/archives/C1/p2"),
-        LinkKind::Slack
-    );
-    assert_eq!(classify("https://www.notion.so/x"), LinkKind::Notion);
-    assert_eq!(
-        classify("diri://session/abc-1"),
-        LinkKind::DiriSession {
-            session: "abc-1".into()
-        }
-    );
-    assert_eq!(
-        classify("diri://note/n1"),
-        LinkKind::DiriNote { note: "n1".into() }
-    );
-    assert!(!is_allowed("diri://session/../x"));
     assert_eq!(
         classify("https://user:pw@www.example.com:8080/a"),
-        LinkKind::Web {
-            host: "example.com".into()
-        }
+        LinkKind::Web { host: "example.com".into() }
     );
     assert_eq!(
-        LinkKind::GithubPull {
-            repo: "a/b".into(),
-            number: 1
-        }
-        .default_label(),
-        "a/b#1"
+        classify("diri://session/abc-1"),
+        LinkKind::DiriSession { session: "abc-1".into() }
     );
+    assert_eq!(classify("diri://note/n1"), LinkKind::DiriNote { note: "n1".into() });
+    assert_eq!(classify("mailto:a@b.c"), LinkKind::Mail);
+    assert!(!is_allowed("diri://session/../x"));
+    // App-private schemes are not links a surface may open.
+    for private in ["slack://channel?id=C1", "linear://issue/1", "notion://x", "figma://f"] {
+        assert!(!is_allowed(private), "{private}");
+    }
+    let node = parse(json!({"type": "link", "id": "l", "url": "https://x.dev/pr/1",
+        "icon": {"symbol": "arrow.triangle.pull"}, "badge": "PR"}));
+    let mut doc = SurfaceDoc::new("s", "T", Scope::Global);
+    doc.root = vec![node];
+    doc.validate().expect("agent-chosen glyph and badge");
 }
 
 #[test]
@@ -429,7 +405,7 @@ fn actions_need_a_gesture_and_an_allowed_target() {
 
 #[test]
 fn promotion_copies_tree_and_state() {
-    let mut doc = template::whats_for_today(
+    let mut doc = fixtures::whats_for_today(
         "s1",
         Scope::Session {
             session: "sess".into(),
@@ -560,4 +536,62 @@ fn event_prompt_is_one_line_then_json() {
     let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
     assert_eq!(parsed["event"]["event"], "interaction");
     assert_eq!(parsed["event"]["kind"], "check");
+}
+
+#[test]
+fn free_layout_and_media_primitives_validate() {
+    let node = parse(json!({
+        "type": "box", "direction": "row", "style": {"padding": 16, "gap": 12, "bg": "#1d1b2aee",
+            "radius": 14, "border": "accent", "width": "fill", "align": "center", "justify": "between"},
+        "children": [
+            {"type": "text", "text": "Deep work", "size": 28, "weight": "bold", "color": "#f5d0fe"},
+            {"type": "spacer"},
+            {"type": "canvas", "width": 120, "height": 32, "shapes": [
+                {"shape": "line", "points": [[0, 30], [40, 12], [80, 20], [120, 4]], "color": "accent", "width": 2},
+                {"shape": "area", "points": [[0, 32], [0, 30], [120, 4], [120, 32]], "color": "#a78bfa33"},
+                {"shape": "rect", "x": 0, "y": 0, "w": 8, "h": 32, "radius": 2},
+                {"shape": "circle", "x": 120, "y": 4, "r": 3, "color": "success"}
+            ]},
+            {"type": "media", "image": "https://i.ytimg.com/vi/abc/hqdefault.jpg", "title": "Lecture 4",
+             "badge": "41:07", "url": "https://www.youtube.com/watch?v=abc"},
+            {"type": "scroll", "height": 200, "children": [{"type": "code", "text": "fn main() {}", "language": "rust"}]},
+            {"type": "checkbox", "id": "c", "label": "Done", "value": true},
+            {"type": "input", "id": "q", "placeholder": "Add a video URL"},
+            {"type": "button", "id": "b", "label": "Next", "variant": "primary",
+             "action": {"kind": "app", "name": "next", "payload": {"step": 1}}}
+        ]
+    }));
+    let mut doc = SurfaceDoc::new("s", "T", Scope::Global);
+    doc.icon = Some(Icon::Emoji("🎧".into()));
+    doc.accent = Some("#a78bfa".into());
+    doc.root = vec![node];
+    doc.validate().expect("free layout validates");
+}
+
+#[test]
+fn free_primitives_are_bounded() {
+    let refuse = |value: serde_json::Value| {
+        let mut doc = SurfaceDoc::new("s", "T", Scope::Global);
+        doc.root = vec![parse(value)];
+        doc.validate().unwrap_err().code
+    };
+    assert_eq!(refuse(json!({"type": "text", "text": "x", "color": "hotpink"})), "invalid_color");
+    assert_eq!(refuse(json!({"type": "text", "text": "x", "size": 400})), "invalid_value");
+    assert_eq!(refuse(json!({"type": "box", "style": {"padding": -3}})), "invalid_value");
+    assert_eq!(refuse(json!({"type": "box", "style": {"width": "100vw"}})), "invalid_value");
+    let points: Vec<[f32; 2]> = (0..limits::MAX_SHAPE_POINTS + 1).map(|i| [i as f32, 0.0]).collect();
+    assert_eq!(
+        refuse(json!({"type": "canvas", "width": 10, "height": 10, "shapes": [{"shape": "line", "points": points}]})),
+        "invalid_value"
+    );
+    assert_eq!(
+        refuse(json!({"type": "canvas", "width": 10, "height": 10, "shapes": [{"shape": "circle", "x": 1e30, "y": 0, "r": 1}]})),
+        "invalid_value"
+    );
+    assert_eq!(refuse(json!({"type": "media", "title": "x", "image": "file:///etc/x.png"})), "invalid_url");
+    assert_eq!(refuse(json!({"type": "media", "title": "x", "image": "http://x.dev/a.png"})), "invalid_url", "remote images are https only");
+    assert_eq!(refuse(json!({"type": "input"})), "missing_id");
+    let mut doc = SurfaceDoc::new("s", "T", Scope::Global);
+    doc.accent = Some("purple".into());
+    assert_eq!(doc.validate().unwrap_err().code, "invalid_value");
 }

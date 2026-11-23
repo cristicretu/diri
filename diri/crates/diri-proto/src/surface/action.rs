@@ -48,6 +48,14 @@ pub enum Action {
     },
     /// Ask the owning agent to bring the surface up to date.
     Refresh,
+    /// A Lua app's own handler: `on_event(state, {type = "action", name,
+    /// payload}, data, ctx)`. Stays inside the app; whatever the handler asks
+    /// for in return passes this gate again.
+    App {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<Value>,
+    },
 }
 
 impl Action {
@@ -60,6 +68,7 @@ impl Action {
             Self::RunAppSkill { .. } => "run_app_skill",
             Self::Event { .. } => "event",
             Self::Refresh => "refresh",
+            Self::App { .. } => "app",
         }
     }
 }
@@ -110,6 +119,11 @@ pub enum Effect {
     /// Record `name` in the event log and tell `session` about it.
     Deliver {
         session: String,
+        name: String,
+        payload: Option<Value>,
+    },
+    /// Run the app's `on_event` with this action.
+    AppEvent {
         name: String,
         payload: Option<Value>,
     },
@@ -180,6 +194,10 @@ pub fn authorize(
             name: "refresh".into(),
             payload: None,
         }),
+        Action::App { name, payload } => Ok(Effect::AppEvent {
+            name: name.clone(),
+            payload: payload.clone(),
+        }),
     }
 }
 
@@ -216,7 +234,7 @@ pub fn check_static(action: &Action) -> Result<(), Denied> {
                 return Err(Denied::InvalidName);
             }
         }
-        Action::Event { name, payload } => {
+        Action::Event { name, payload } | Action::App { name, payload } => {
             if !limits::is_valid_id(name) {
                 return Err(Denied::InvalidName);
             }

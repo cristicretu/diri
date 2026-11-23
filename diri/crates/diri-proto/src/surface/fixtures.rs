@@ -1,23 +1,14 @@
-//! Built-in starting points. `dirijor surface create --template today`
-//! writes one; the app's preview fixture draws one.
+//! Example surfaces for tests and screenshots, as an agent might write them.
+//! Compiled only for tests and the `fixtures` feature: Diri ships no
+//! built-in surface, and nothing here is a preset an agent can ask for.
 
 use super::action::Action;
+use super::identity::Icon;
 use super::node::{
     Binding, ButtonStyle, Cell, ChecklistItem, KvItem, Node, NodeKind, SelectOption, Tab, Tone,
     Trend,
 };
 use super::{Scope, SurfaceDoc};
-
-/// Template names `create --template` accepts.
-pub const NAMES: &[&str] = &["today", "blank"];
-
-pub fn by_name(name: &str, id: &str, scope: Scope, sessions: &[String]) -> Option<SurfaceDoc> {
-    match name {
-        "today" | "whats-for-today" => Some(whats_for_today(id, scope, sessions)),
-        "blank" => Some(SurfaceDoc::new(id, "Untitled surface", scope)),
-        _ => None,
-    }
-}
 
 fn text(t: &str) -> NodeKind {
     NodeKind::Text {
@@ -25,26 +16,35 @@ fn text(t: &str) -> NodeKind {
         tone: None,
         mono: false,
         bind: None,
+        size: None,
+        weight: None,
+        color: None,
+        truncate: false,
     }
 }
 
-fn item(id: &str, t: &str, link: Option<&str>, checked: bool) -> ChecklistItem {
+/// The agent picks each chip's glyph and words; Diri knows no vendor.
+fn item(id: &str, t: &str, link: Option<(&str, &str, &str)>, checked: bool) -> ChecklistItem {
     ChecklistItem {
         id: id.into(),
         text: t.into(),
+        icon: link.map(|(_, icon, _)| Icon::Symbol(icon.into())),
+        link_label: link.map(|(_, _, label)| label.into()),
         checked,
-        link: link.map(str::to_owned),
+        link: link.map(|(url, _, _)| url.to_owned()),
         detail: None,
     }
 }
 
-fn link(id: &str, url: &str, label: &str, detail: Option<&str>) -> Node {
+fn link(id: &str, url: &str, label: &str, detail: Option<&str>, icon: &str, badge: &str) -> Node {
     Node::with_id(
         id,
         NodeKind::Link {
             url: url.into(),
             label: Some(label.into()),
             detail: detail.map(str::to_owned),
+            icon: Some(Icon::Symbol(icon.into())),
+            badge: Some(badge.into()),
         },
     )
 }
@@ -129,25 +129,25 @@ pub fn whats_for_today(id: &str, scope: Scope, sessions: &[String]) -> SurfaceDo
                             item(
                                 "standup",
                                 "Post standup notes",
-                                Some("https://acme.slack.com/archives/C024BE91L/p1700000000000100"),
+                                Some(("https://acme.slack.com/archives/C024BE91L/p1700000000000100", "slack", "Thread")),
                                 true,
                             ),
                             item(
                                 "review-812",
                                 "Review the checkout retry PR",
-                                Some("https://github.com/acme/web/pull/812"),
+                                Some(("https://github.com/acme/web/pull/812", "arrow.triangle.pull", "web#812")),
                                 false,
                             ),
                             item(
                                 "eng-142",
                                 "Unblock ENG-142 rate limiter rollout",
-                                Some("https://linear.app/acme/issue/ENG-142/rate-limiter-rollout"),
+                                Some(("https://linear.app/acme/issue/ENG-142/rate-limiter-rollout", "linear", "ENG-142")),
                                 false,
                             ),
                             item(
                                 "spec",
                                 "Read the Q4 onboarding spec",
-                                Some("https://www.notion.so/acme/Q4-onboarding-spec-0a1b2c"),
+                                Some(("https://www.notion.so/acme/Q4-onboarding-spec-0a1b2c", "notion", "Spec")),
                                 false,
                             ),
                             item("release", "Cut 2.4 release notes", None, false),
@@ -191,6 +191,10 @@ pub fn whats_for_today(id: &str, scope: Scope, sessions: &[String]) -> SurfaceDo
                 tone: Some(Tone::Muted),
                 mono: false,
                 bind: None,
+                size: None,
+                weight: None,
+                color: None,
+                truncate: false,
             },
         ));
     }
@@ -216,24 +220,32 @@ pub fn whats_for_today(id: &str, scope: Scope, sessions: &[String]) -> SurfaceDo
                     "https://acme.slack.com/archives/C024BE91L/p1700000000000200",
                     "#launch: pricing page copy",
                     Some("3 new replies"),
+                    "slack",
+                    "Thread",
                 ),
                 link(
                     "l-pr",
                     "https://github.com/acme/web/pull/812",
                     "Retry failed checkouts with backoff",
                     Some("Checks passing · 2 approvals"),
+                    "arrow.triangle.pull",
+                    "PR",
                 ),
                 link(
                     "l-linear",
                     "https://linear.app/acme/issue/ENG-142/rate-limiter-rollout",
                     "Rate limiter rollout",
                     Some("In progress · due today"),
+                    "linear",
+                    "Issue",
                 ),
                 link(
                     "l-notion",
                     "https://www.notion.so/acme/Q4-onboarding-spec-0a1b2c",
                     "Q4 onboarding spec",
                     None,
+                    "notion",
+                    "Doc",
                 ),
             ],
         },
@@ -322,7 +334,8 @@ pub fn whats_for_today(id: &str, scope: Scope, sessions: &[String]) -> SurfaceDo
                             session: None,
                             text: "Look at what's left on my What's for Today surface and draft tomorrow's priorities in it.".into(),
                         },
-                        style: ButtonStyle::Primary,
+                        variant: ButtonStyle::Primary,
+                        icon: None,
                     },
                 ),
                 Node::with_id(
@@ -333,7 +346,8 @@ pub fn whats_for_today(id: &str, scope: Scope, sessions: &[String]) -> SurfaceDo
                             name: "triage".into(),
                             payload: None,
                         },
-                        style: ButtonStyle::Secondary,
+                        variant: ButtonStyle::Secondary,
+                        icon: None,
                     },
                 ),
                 Node::with_id(
@@ -347,6 +361,7 @@ pub fn whats_for_today(id: &str, scope: Scope, sessions: &[String]) -> SurfaceDo
                         ],
                         default: Some("ship".into()),
                         notify: true,
+                        value: None,
                     },
                 ),
                 Node::with_id(
@@ -355,6 +370,7 @@ pub fn whats_for_today(id: &str, scope: Scope, sessions: &[String]) -> SurfaceDo
                         label: "Hold pings until 2pm".into(),
                         default: false,
                         notify: true,
+                        value: None,
                     },
                 ),
             ],

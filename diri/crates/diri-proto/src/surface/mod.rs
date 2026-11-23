@@ -12,11 +12,13 @@
 //! in its right panel until it is saved ([`SurfaceDoc::promoted`]).
 
 pub mod action;
+#[cfg(any(test, feature = "fixtures"))]
+pub mod fixtures;
+pub mod identity;
 pub mod limits;
 pub mod link;
 pub mod node;
 pub mod patch;
-pub mod template;
 #[cfg(test)]
 mod tests;
 
@@ -26,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use action::{Action, Authority, Denied, Effect, Gesture, authorize};
+pub use identity::{AppSpec, Icon, Style, SyncSpec};
 pub use node::{Binding, Node, NodeKind, Tone};
 pub use patch::{Patch, PatchOp};
 
@@ -70,11 +73,15 @@ pub struct SurfaceState {
     pub toggles: BTreeMap<String, bool>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub selects: BTreeMap<String, String>,
+    /// A Lua app's own state: what `on_event` returns, kept between events
+    /// and across edits of `app.lua`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<Value>,
 }
 
 impl SurfaceState {
     pub fn len(&self) -> usize {
-        self.checks.len() + self.toggles.len() + self.selects.len()
+        self.checks.len() + self.toggles.len() + self.selects.len() + usize::from(self.app.is_some())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -103,6 +110,7 @@ impl SurfaceState {
                 .filter(|(key, _)| selects.contains(*key))
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            app: self.app.clone(),
         }
     }
 }
@@ -120,6 +128,18 @@ pub struct SurfaceDoc {
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitle: Option<String>,
+    /// The glyph in the sidebar, the panel tab, ⌘K and the header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<Icon>,
+    /// `#rrggbb`: tints the header glyph, primary buttons, ticks, progress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accent: Option<String>,
+    #[serde(default, skip_serializing_if = "is_default_style")]
+    pub style: Style,
+    /// Present for a native Lua app (`app.lua` in the surface folder):
+    /// `root` is then whatever its `render` last returned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<AppSpec>,
     #[serde(default)]
     pub scope: Scope,
     /// Shown as a sidebar row (saved surfaces only).
@@ -154,6 +174,10 @@ impl SurfaceDoc {
             id: id.into(),
             title: title.into(),
             subtitle: None,
+            icon: None,
+            accent: None,
+            style: Style::default(),
+            app: None,
             scope,
             pinned: false,
             owner: None,
@@ -201,6 +225,15 @@ impl SurfaceDoc {
                 "subtitle",
             ));
         }
+        if let Some(icon) = &self.icon {
+            icon.validate("icon")?;
+        }
+        identity::validate_accent(self.accent.as_deref())?;
+        self.style.validate()?;
+        if let Some(app) = &self.app {
+            app.validate()?;
+        }
+        identity::validate_app_state(self.state.app.as_ref())?;
         match &self.scope {
             Scope::Global => {}
             Scope::Project { project } => {
@@ -390,6 +423,10 @@ impl SurfaceDoc {
     }
 }
 
+fn is_default_style(style: &Style) -> bool {
+    *style == Style::default()
+}
+
 fn first_line(text: &str) -> &str {
     let line = text.lines().next().unwrap_or_default();
     match line.char_indices().nth(80) {
@@ -412,6 +449,11 @@ pub enum Interaction {
         on: bool,
     },
     Select {
+        id: String,
+        value: String,
+    },
+    /// Text entered in an `input` (sent on Enter).
+    Text {
         id: String,
         value: String,
     },
@@ -444,12 +486,24 @@ impl SurfaceDoc {
             }
             Interaction::Toggle { id, on } => {
                 let node = node::find(&self.root, id).ok_or_else(|| not_found(id))?;
-                let NodeKind::Toggle { notify, .. } = &node.kind else {
-                    return Err(not_found(id));
+                let notify = match &node.kind {
+                    NodeKind::Toggle { notify, .. } => *notify,
+                    NodeKind::Checkbox { .. } => false,
+                    _ => return Err(not_found(id)),
                 };
-                let notify = *notify;
                 self.state.toggles.insert(id.clone(), *on);
                 Ok(notify)
+            }
+            Interaction::Text { id, value } => {
+                let node = node::find(&self.root, id).ok_or_else(|| not_found(id))?;
+                if !matches!(node.kind, NodeKind::Input { .. }) {
+                    return Err(not_found(id));
+                }
+                if value.len() > limits::MAX_LABEL_BYTES * 2 {
+                    return Err(SurfaceError::new("text_too_long", "input text is too long", id));
+                }
+                self.state.selects.insert(id.clone(), value.clone());
+                Ok(false)
             }
             Interaction::Select { id, value } => {
                 let node = node::find(&self.root, id).ok_or_else(|| not_found(id))?;

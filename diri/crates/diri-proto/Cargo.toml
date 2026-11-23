@@ -17,6 +17,9 @@ schemars = { workspace = true, optional = true }
 
 [features]
 schema = ["dep:schemars"]
+# Example surfaces for tests and screenshots in other crates. Never part of a
+# shipped build: Diri has no built-in surfaces.
+fixtures = []
 
 [dev-dependencies]
 tempfile.workspace = true

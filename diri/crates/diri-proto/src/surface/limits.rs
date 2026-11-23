@@ -8,7 +8,8 @@ use std::collections::HashSet;
 
 use super::action;
 use super::link;
-use super::node::{Node, NodeKind, walk};
+use super::identity::Icon;
+use super::node::{BoxStyle, Color, Length, Node, NodeKind, Shape, walk};
 use super::{SurfaceError, SurfaceState};
 
 /// Nesting levels below the surface itself (top-level nodes are depth 1).
@@ -39,6 +40,11 @@ pub const MAX_AGENTS: usize = 32;
 pub const MAX_STATE_ENTRIES: usize = 4000;
 pub const MAX_GAP: f32 = 48.0;
 pub const MAX_IMAGE_HEIGHT: f32 = 800.0;
+/// Widths, heights, radii and canvas sizes, in points.
+pub const MAX_EXTENT: f32 = 4000.0;
+/// Shapes on one canvas, and points in one line or area.
+pub const MAX_SHAPES: usize = 2000;
+pub const MAX_SHAPE_POINTS: usize = 2000;
 
 /// Node and item ids: `[A-Za-z0-9_.-]`, 1-64 bytes, not starting with `.`.
 pub fn is_valid_id(id: &str) -> bool {
@@ -228,7 +234,73 @@ fn check_list(
     Ok(())
 }
 
+fn check_color(path: &str, color: Option<&Color>) -> Result<(), SurfaceError> {
+    match color {
+        Some(color) if !color.is_valid() => Err(SurfaceError::new(
+            "invalid_color",
+            format!("{:?} is not a theme color or #rrggbb[aa]", color.0),
+            path,
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn in_range(path: &str, field: &str, value: Option<f32>, range: std::ops::RangeInclusive<f32>) -> Result<(), SurfaceError> {
+    match value {
+        Some(value) if !value.is_finite() || !range.contains(&value) => Err(SurfaceError::new(
+            "invalid_value",
+            format!("{field} is {}-{}", range.start(), range.end()),
+            path,
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn check_length(path: &str, field: &str, length: Option<&Length>) -> Result<(), SurfaceError> {
+    match length {
+        Some(Length::Points(points)) => in_range(path, field, Some(*points), 0.0..=MAX_EXTENT),
+        Some(Length::Keyword(word)) if word != "fill" => Err(SurfaceError::new(
+            "invalid_value",
+            format!("{field} is points or \"fill\""),
+            path,
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn check_style(path: &str, style: &BoxStyle) -> Result<(), SurfaceError> {
+    for (field, value) in [
+        ("padding", style.padding),
+        ("padding_x", style.padding_x),
+        ("padding_y", style.padding_y),
+        ("gap", style.gap),
+    ] {
+        in_range(path, field, value, 0.0..=MAX_GAP * 2.0)?;
+    }
+    in_range(path, "border_width", style.border_width, 0.0..=8.0)?;
+    in_range(path, "radius", style.radius, 0.0..=MAX_EXTENT)?;
+    in_range(path, "min_width", style.min_width, 0.0..=MAX_EXTENT)?;
+    in_range(path, "max_width", style.max_width, 0.0..=MAX_EXTENT)?;
+    in_range(path, "grow", style.grow, 0.0..=100.0)?;
+    in_range(path, "opacity", style.opacity, 0.0..=1.0)?;
+    check_length(path, "width", style.width.as_ref())?;
+    check_length(path, "height", style.height.as_ref())?;
+    check_color(path, style.bg.as_ref())?;
+    check_color(path, style.border.as_ref())?;
+    Ok(())
+}
+
+fn check_icon(path: &str, icon: Option<&Icon>) -> Result<(), SurfaceError> {
+    match icon {
+        Some(icon) => icon.validate(path),
+        None => Ok(()),
+    }
+}
+
 fn check_node(checker: &mut Checker, node: &Node, path: &str) -> Result<(), SurfaceError> {
+    if let Some(style) = &node.style {
+        check_style(path, style)?;
+    }
     match &node.kind {
         NodeKind::Stack { gap, .. } | NodeKind::Row { gap, .. } => {
             if gap.is_some_and(|gap| !(0.0..=MAX_GAP).contains(&gap)) {
@@ -275,9 +347,17 @@ fn check_node(checker: &mut Checker, node: &Node, path: &str) -> Result<(), Surf
                 ));
             }
         }
-        NodeKind::Text { text: t, bind, .. } => {
+        NodeKind::Text {
+            text: t,
+            bind,
+            size,
+            color,
+            ..
+        } => {
             text(path, "text", t, MAX_TEXT_BYTES)?;
             check_binding(path, bind.as_ref())?;
+            in_range(path, "size", *size, 9.0..=64.0)?;
+            check_color(path, color.as_ref())?;
         }
         NodeKind::Markdown { text: t } => text(path, "text", t, MAX_TEXT_BYTES)?,
         NodeKind::Mermaid { source } => text(path, "source", source, MAX_TEXT_BYTES)?,
@@ -420,14 +500,24 @@ fn check_node(checker: &mut Checker, node: &Node, path: &str) -> Result<(), Surf
                 if let Some(link) = &item.link {
                     url(path, link)?;
                 }
+                check_icon(path, item.icon.as_ref())?;
+                if let Some(link_label) = &item.link_label {
+                    label(path, "link label", link_label)?;
+                }
             }
         }
         NodeKind::Link {
             url: u,
             label: l,
             detail,
+            icon,
+            badge,
         } => {
             url(path, u)?;
+            check_icon(path, icon.as_ref())?;
+            if let Some(badge) = badge {
+                label(path, "badge", badge)?;
+            }
             if let Some(l) = l {
                 label(path, "label", l)?;
             }
@@ -436,9 +526,13 @@ fn check_node(checker: &mut Checker, node: &Node, path: &str) -> Result<(), Surf
             }
         }
         NodeKind::Button {
-            label: l, action, ..
+            label: l,
+            action,
+            icon,
+            ..
         } => {
             require_id(path, node)?;
+            check_icon(path, icon.as_ref())?;
             label(path, "label", l)?;
             action::check_static(action)
                 .map_err(|denied| SurfaceError::new("invalid_action", denied.to_string(), path))?;
@@ -451,6 +545,7 @@ fn check_node(checker: &mut Checker, node: &Node, path: &str) -> Result<(), Surf
             label: l,
             options,
             default,
+            value,
             ..
         } => {
             require_id(path, node)?;
@@ -469,7 +564,7 @@ fn check_node(checker: &mut Checker, node: &Node, path: &str) -> Result<(), Surf
                 label(path, "option value", &option.value)?;
                 label(path, "option label", &option.label)?;
             }
-            if let Some(default) = default
+            if let Some(default) = default.as_ref().or(value.as_ref())
                 && !options.iter().any(|option| &option.value == default)
             {
                 return Err(SurfaceError::new(
@@ -485,8 +580,98 @@ fn check_node(checker: &mut Checker, node: &Node, path: &str) -> Result<(), Surf
                 label(path, "label", l)?;
             }
         }
+        NodeKind::Checkbox { label: l, .. } => {
+            require_id(path, node)?;
+            label(path, "label", l)?;
+        }
+        NodeKind::Input { placeholder, value } => {
+            require_id(path, node)?;
+            if let Some(placeholder) = placeholder {
+                label(path, "placeholder", placeholder)?;
+            }
+            if let Some(value) = value {
+                text(path, "value", value, MAX_LABEL_BYTES * 2)?;
+            }
+        }
+        NodeKind::Box { .. } | NodeKind::Spacer => {}
+        NodeKind::Scroll { height, .. } => in_range(path, "height", Some(*height), 40.0..=MAX_EXTENT)?,
+        NodeKind::Code { text: t, language } => {
+            text(path, "text", t, MAX_TEXT_BYTES)?;
+            if let Some(language) = language {
+                label(path, "language", language)?;
+            }
+        }
+        NodeKind::Canvas {
+            width,
+            height,
+            shapes,
+        } => {
+            in_range(path, "width", Some(*width), 1.0..=MAX_EXTENT)?;
+            in_range(path, "height", Some(*height), 1.0..=MAX_EXTENT)?;
+            if shapes.len() > MAX_SHAPES {
+                return Err(SurfaceError::new(
+                    "too_many_children",
+                    format!("a canvas holds at most {MAX_SHAPES} shapes"),
+                    path,
+                ));
+            }
+            let mut cost = 0;
+            for shape in shapes {
+                check_shape(path, shape)?;
+                cost += shape.cost();
+            }
+            checker.count(path, cost / 8)?;
+        }
+        NodeKind::Media {
+            image,
+            title,
+            subtitle,
+            badge,
+            url: u,
+            aspect,
+        } => {
+            label(path, "title", title)?;
+            if let Some(image) = image {
+                image_src(path, image)?;
+            }
+            for (field, value) in [("subtitle", subtitle), ("badge", badge)] {
+                if let Some(value) = value {
+                    label(path, field, value)?;
+                }
+            }
+            if let Some(u) = u {
+                url(path, u)?;
+            }
+            in_range(path, "aspect", *aspect, 0.2..=5.0)?;
+        }
     }
     Ok(())
+}
+
+fn check_shape(path: &str, shape: &Shape) -> Result<(), SurfaceError> {
+    let finite = |values: &[f32]| values.iter().all(|v| v.is_finite() && v.abs() <= MAX_EXTENT * 4.0);
+    let ok = match shape {
+        Shape::Rect { x, y, w, h, radius, .. } => {
+            finite(&[*x, *y, *w, *h, radius.unwrap_or(0.0)]) && *w >= 0.0 && *h >= 0.0
+        }
+        Shape::Circle { x, y, r, .. } => finite(&[*x, *y, *r]) && *r >= 0.0,
+        Shape::Line { points, width, .. } => {
+            points.len() <= MAX_SHAPE_POINTS
+                && points.iter().all(|p| finite(p))
+                && width.is_none_or(|w| (0.0..=32.0).contains(&w))
+        }
+        Shape::Area { points, .. } => {
+            points.len() <= MAX_SHAPE_POINTS && points.iter().all(|p| finite(p))
+        }
+    };
+    if !ok {
+        return Err(SurfaceError::new(
+            "invalid_value",
+            format!("a canvas shape has a non-finite or out-of-range number, or more than {MAX_SHAPE_POINTS} points"),
+            path,
+        ));
+    }
+    check_color(path, shape.color())
 }
 
 fn check_binding(path: &str, bind: Option<&super::node::Binding>) -> Result<(), SurfaceError> {
@@ -504,17 +689,17 @@ fn check_binding(path: &str, bind: Option<&super::node::Binding>) -> Result<(), 
 /// Images are web pictures or files kept beside the surfaces
 /// (`assets/<name>`), never an arbitrary path on disk.
 fn image_src(path: &str, src: &str) -> Result<(), SurfaceError> {
-    let web =
-        matches!(link::scheme(src).as_deref(), Some("https" | "http")) && link::is_allowed(src);
-    let asset = src
-        .strip_prefix("assets/")
-        .is_some_and(|name| is_valid_ref(name) && !name.contains('/'));
+    let web = matches!(link::scheme(src).as_deref(), Some("https")) && link::is_allowed(src);
+    let asset = super::identity::is_valid_app_path(src)
+        && super::identity::IMAGE_EXTENSIONS
+            .iter()
+            .any(|ext| src.to_ascii_lowercase().ends_with(&format!(".{ext}")));
     if web || asset {
         Ok(())
     } else {
         Err(SurfaceError::new(
             "invalid_url",
-            "an image is an http(s) URL or assets/<file> beside the surfaces",
+            "an image is an https URL or an image file in the surface's folder",
             path,
         ))
     }
@@ -550,10 +735,10 @@ pub fn state_keys(root: &[Node]) -> (HashSet<String>, HashSet<String>, HashSet<S
                     checks.insert(super::check_key(id, &item.id));
                 }
             }
-            NodeKind::Toggle { .. } => {
+            NodeKind::Toggle { .. } | NodeKind::Checkbox { .. } => {
                 toggles.insert(id.clone());
             }
-            NodeKind::Select { .. } => {
+            NodeKind::Select { .. } | NodeKind::Input { .. } => {
                 selects.insert(id.clone());
             }
             _ => {}
