@@ -322,6 +322,14 @@
     "hash": "4c9bc17f79d23e17"
   },
   {
+    "key": "whats-new-0-11-6",
+    "url": "/whats-new/0.11.6/",
+    "eyebrow": "Release · November 19, 2026",
+    "title": "diri 0.11.6",
+    "subtitle": "App Skills for computer use",
+    "hash": "f8b6e3cffd0128b9"
+  },
+  {
     "key": "whats-new-0-11-5",
     "url": "/whats-new/0.11.5/",
     "eyebrow": "Release · November 9, 2026",
@@ -365,9 +373,9 @@
     "key": "whats-new",
     "url": "/whats-new/",
     "eyebrow": "What's new",
-    "title": "diri 0.11.5",
-    "subtitle": "Mermaid diagrams in notes",
-    "hash": "d9c946523f6a12c7"
+    "title": "diri 0.11.6",
+    "subtitle": "App Skills for computer use",
+    "hash": "6513ca3dfe45c4d8"
   },
   {
     "key": "guides-agent-teams",
