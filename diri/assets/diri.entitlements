@@ -5,5 +5,9 @@
     <!-- Talk with your agent: diri-voice listens for the end of a spoken answer. -->
     <key>com.apple.security.device.audio-input</key>
     <true/>
+    <!-- Capture Context: read the front browser tab's URL and title with
+         fixed AppleScript (Settings › Privacy › Automation, per browser). -->
+    <key>com.apple.security.automation.apple-events</key>
+    <true/>
 </dict>
 </plist>

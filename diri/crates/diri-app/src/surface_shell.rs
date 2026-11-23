@@ -2442,24 +2442,22 @@ impl UtilitySurfaces {
             .preferences()
             .clone();
         #[cfg(target_os = "macos")]
-        let native_key_code = if command == CommandId::ShowApp {
-            next_overrides
-                .get(stable_id)
-                .and_then(Option::as_ref)
-                .and_then(|_| {
-                    self.shortcut_editor
-                        .as_ref()
-                        .and_then(|editor| editor.native_key_code)
-                })
-        } else {
-            previous.global_shortcut_key_code
-        };
+        let hotkey = crate::macos::global_shortcut::Hotkey::for_command(command);
         #[cfg(target_os = "macos")]
-        if command == CommandId::ShowApp {
+        let native_key_code = next_overrides
+            .get(stable_id)
+            .and_then(Option::as_ref)
+            .and_then(|_| {
+                self.shortcut_editor
+                    .as_ref()
+                    .and_then(|editor| editor.native_key_code)
+            });
+        #[cfg(target_os = "macos")]
+        if let Some(hotkey) = hotkey {
             let mut next = previous.clone();
-            next.global_shortcut_key_code = native_key_code;
+            hotkey.set_key_code(&mut next, native_key_code);
             next.shortcut_overrides = next_overrides.clone();
-            if let Err(error) = crate::macos::global_shortcut::configure(&next) {
+            if let Err(error) = crate::macos::global_shortcut::configure(hotkey, &next) {
                 if let Some(editor) = &mut self.shortcut_editor {
                     editor.error = Some(t(error).to_owned());
                 }
@@ -2470,14 +2468,14 @@ impl UtilitySurfaces {
         let saved = next_overrides.clone();
         if !self.update_prefs(move |prefs| {
             #[cfg(target_os = "macos")]
-            if command == CommandId::ShowApp {
-                prefs.global_shortcut_key_code = native_key_code;
+            if let Some(hotkey) = hotkey {
+                hotkey.set_key_code(prefs, native_key_code);
             }
             prefs.shortcut_overrides = saved;
         }) {
             #[cfg(target_os = "macos")]
-            if command == CommandId::ShowApp {
-                let _ = crate::macos::global_shortcut::configure(&previous);
+            if let Some(hotkey) = hotkey {
+                let _ = crate::macos::global_shortcut::configure(hotkey, &previous);
             }
             return false;
         }
@@ -2571,9 +2569,10 @@ impl UtilitySurfaces {
         if self.update_prefs(|prefs| {
             prefs.shortcut_overrides.clear();
             prefs.global_shortcut_key_code = None;
+            prefs.capture_shortcut_key_code = None;
         }) {
             #[cfg(target_os = "macos")]
-            let _ = crate::macos::global_shortcut::configure(&self.prefs);
+            crate::macos::global_shortcut::configure_all(&self.prefs);
             crate::commands::rebind_keys(cx, &self.prefs.shortcut_overrides);
             crate::refresh_app_menus(cx);
             self.shortcut_editor = None;
@@ -9393,9 +9392,8 @@ fn shortcut_row(
         .and_then(|editor| editor.error.as_deref());
     #[cfg(target_os = "macos")]
     let error = error.or_else(|| {
-        (command.id == CommandId::ShowApp)
-            .then(crate::macos::global_shortcut::error)
-            .flatten()
+        crate::macos::global_shortcut::Hotkey::for_command(command.id)
+            .and_then(crate::macos::global_shortcut::error)
             .map(t)
     });
     let assignment = command.shortcut_label_for(overrides);
@@ -9531,7 +9529,7 @@ fn shortcut_row(
     }
     let binding = chips;
     // A command with a key can take another; the global hotkey is one key.
-    let can_add = !keys.is_empty() && command.id != CommandId::ShowApp && !editing;
+    let can_add = !keys.is_empty() && !command.id.is_global() && !editing;
     let row_group = SharedString::from(format!("shortcut-row-group-{}", command.stable_id));
 
     let mut actions = div()

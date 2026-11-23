@@ -52,6 +52,8 @@ pub fn exposure(id: CommandId) -> Exposure {
         ImportTerminalSetup => Exposure::Hidden,
         // Bringing Diri forward or hiding it moves the person's focus.
         HideApp | ShowApp => Exposure::Hidden,
+        // Captures the person's screen: only the person starts it.
+        CaptureContext | SendLatestClip => Exposure::Hidden,
         Quit | CloseWindow | CloseSession | ArchiveSelectedSession | DeleteNote | RemoveFocusedPane
         | CheckForUpdates | ClearScrollback | ResetTerminal => Exposure::Destructive,
         NewWindow | ReopenSession | NewDefaultSession | NewTerminal

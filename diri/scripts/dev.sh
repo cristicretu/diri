@@ -217,6 +217,7 @@ cat > "${contents}/Info.plist" <<PLIST
     <key>LSMinimumSystemVersion</key><string>15.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSPrincipalClass</key><string>NSApplication</string>
+    <key>NSAppleEventsUsageDescription</key><string>diri reads the front browser tab's address and title when you use Capture Context, so the agent knows which page you captured.</string>
     <key>NSMicrophoneUsageDescription</key><string>diri listens for the end of your spoken answer to an agent, on this Mac, when Talk with your agent is on.</string>
     <key>NSSpeechRecognitionUsageDescription</key><string>diri recognizes “send to agent” on this Mac to end and send a spoken answer.</string>
 </dict>

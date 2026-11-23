@@ -531,6 +531,9 @@ pub struct SessionStore {
     /// The session whose repo the popover preserves (selected at open time).
     repo_target_session: Option<SessionId>,
     directory_request_seq: u64,
+    /// Capture requests from the Engine (`clip.capture_requested`), true for
+    /// window mode, until the app takes them.
+    capture_requests: Vec<bool>,
     directory_listing: Option<DirectoryListing>,
     prefs: Prefs,
     theme_preview: Option<String>,
@@ -662,6 +665,7 @@ impl SessionStore {
                 window_targets: HashMap::new(),
                 repo_target_session: None,
                 directory_request_seq: 0,
+                capture_requests: Vec::new(),
                 directory_listing: None,
                 prefs,
                 theme_preview: None,
@@ -983,6 +987,11 @@ impl SessionStore {
             self.mark_notifications_read(&id);
             self.emit(StoreEffect::MarkSeen(id));
         }
+    }
+
+    /// The oldest pending capture request (true for window mode).
+    pub fn take_capture_request(&mut self) -> Option<bool> {
+        (!self.capture_requests.is_empty()).then(|| self.capture_requests.remove(0))
     }
 
     /// Like marking a chat unread: the last completed turn reads "done ·
@@ -2202,6 +2211,11 @@ impl SessionStore {
                 if let Ok(p) = serde_json::from_value::<diri_proto::SessionIdParams>(event.params) {
                     self.select(p.session_id);
                 }
+                return StoreEventChange::Model;
+            }
+            EventName::CLIP_CAPTURE_REQUESTED => {
+                let window = event.params.get("mode").and_then(|m| m.as_str()) == Some("window");
+                self.capture_requests.push(window);
                 return StoreEventChange::Model;
             }
             EventName::SESSION_API_REQUEST => {

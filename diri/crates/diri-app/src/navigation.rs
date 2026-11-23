@@ -920,7 +920,7 @@ impl NavigationOverlay {
             .ranked_actions
             .get(self.highlight.checked_sub(self.ranked_sessions.len())?)?;
         match ranked.item.command {
-            PaletteCommand::Action(id) if id != CommandId::ShowApp => Some(id),
+            PaletteCommand::Action(id) if !id.is_global() => Some(id),
             _ => None,
         }
     }
