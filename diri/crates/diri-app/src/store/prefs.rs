@@ -944,6 +944,10 @@ pub struct Prefs {
     /// herdr panes and conversations already brought over, so importing
     /// again only offers what is new. See `crate::herdr_import`.
     pub herdr_imported: std::collections::BTreeSet<String>,
+    /// The first-launch conversation import was answered (imported, "Start
+    /// fresh", or sessions already existed), so it never offers itself
+    /// again. File › Import Conversations… still opens it.
+    pub conversation_import_done: bool,
     /// The newest release whose What's New highlights were shown or
     /// dismissed. A new install starts at the running version, so it never
     /// sees highlights; a file written before this field existed reads as
@@ -1068,6 +1072,7 @@ impl Default for Prefs {
             global_shortcut_key_code: None,
             last_selected_session: None,
             herdr_imported: Default::default(),
+            conversation_import_done: false,
             whats_new_seen_version: crate::updates::CURRENT_VERSION.to_owned(),
             new_agent_start: BTreeMap::new(),
             perf_overlay: false,

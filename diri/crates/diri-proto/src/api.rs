@@ -511,6 +511,18 @@ mod catalog {
                 "Open a session resuming a past conversation."
             ),
             entry!(
+                Method::HISTORY_IMPORT_CANDIDATES,
+                EmptyParams,
+                "HistoryImportCandidatesResult",
+                "Recent local Claude Code and Codex conversations worth importing."
+            ),
+            entry!(
+                Method::SESSION_IMPORT_HISTORY,
+                SessionImportHistoryParams,
+                "SessionImportHistoryResult",
+                "Add past conversations as resumable sessions without starting them."
+            ),
+            entry!(
                 Method::SESSION_CONTINUE_ACCOUNT,
                 ContinueAccountParams,
                 "SessionRecord",

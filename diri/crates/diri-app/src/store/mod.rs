@@ -2,6 +2,10 @@
 
 mod computer;
 pub use computer::foreground_toast;
+pub use conversation_import::{ConversationImportState, folder_name};
+#[cfg(test)]
+pub(crate) use conversation_import::preview_scan as conversation_import_preview_scan;
+mod conversation_import;
 mod herdr;
 mod terminal_setup;
 mod prefs;
@@ -218,6 +222,10 @@ pub enum StoreEffect {
     },
     /// Open every planned herdr pane as a Diri session, in herdr's order.
     ImportHerdr(Vec<herdr::ImportStep>),
+    /// Ask the Engine which local conversations are worth importing.
+    ScanConversations,
+    /// Add these conversations as resumable sessions, starting none.
+    ImportConversations(Vec<diri_proto::HistoryEntry>),
     /// Read other terminals' configs off the main thread.
     ScanTerminalSetup,
     /// Resume every session a restart ended, a few at a time.
@@ -585,6 +593,7 @@ pub struct SessionStore {
     agent_install: Option<AgentKind>,
     computer: computer::ComputerSetupState,
     herdr: herdr::HerdrState,
+    conversation_import: conversation_import::ConversationImportState,
     terminal_setup: terminal_setup::TerminalSetupState,
     /// Attention states serving out their settle window, newest arming wins.
     /// Drained by the settle task in `StoreHandle`, which is what turns one of
@@ -694,6 +703,7 @@ impl SessionStore {
                 agent_install: None,
                 computer: computer::ComputerSetupState::default(),
                 herdr: herdr::HerdrState::default(),
+                conversation_import: Default::default(),
                 terminal_setup: terminal_setup::TerminalSetupState::default(),
                 notification_feed,
                 attention_wake: Arc::new(Notify::new()),
@@ -3139,9 +3149,12 @@ impl SessionStore {
         let eligible = self.sessions.get(id).is_some_and(|session| {
             !session.is_archived()
                 && session.can_resume()
+                // An imported conversation has never run here: opening it
+                // is how it starts, exactly as a restart-ended one resumes.
                 && matches!(
                     &session.status,
-                    SessionStatus::Exited(info) if info.ended_by_interruption()
+                    SessionStatus::Exited(info)
+                        if info.ended_by_interruption() || info.is_imported()
                 )
         });
         if !eligible || !self.auto_resume_attempted.insert(id.clone()) {
@@ -3975,7 +3988,7 @@ impl SessionStore {
         }
         let first = self
             .sidebar_projection()
-            .first_active()
+            .first_auto_selectable()
             .map(|session| session.id.clone());
         self.set_selected_survivor(first);
     }
@@ -4481,6 +4494,7 @@ impl StoreRuntime {
                                     state_store.write().expect("session store lock poisoned");
                                 store.hydrate_stamped(list);
                                 store.request_herdr_scan();
+                                store.request_first_launch_import();
                                 // Only a first run shows the welcome that
                                 // offers it; Settings asks on its own.
                                 if store.sessions().is_empty() {
@@ -5086,6 +5100,24 @@ async fn run_effects(
                 ));
                 Ok(())
             }
+            StoreEffect::ScanConversations => {
+                tokio::spawn(conversation_import::scan(
+                    Arc::clone(&client),
+                    Arc::clone(&store),
+                    change_tx.clone(),
+                ));
+                Ok(())
+            }
+            StoreEffect::ImportConversations(entries) => {
+                tokio::spawn(conversation_import::import(
+                    entries,
+                    Arc::clone(&client),
+                    Arc::clone(&store),
+                    change_tx.clone(),
+                    status_tx.clone(),
+                ));
+                Ok(())
+            }
             StoreEffect::ImportHerdr(steps) => {
                 tokio::spawn(herdr::import(
                     steps,
@@ -5362,7 +5394,10 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         | StoreEffect::RevokeComputerForeground(_) => return None,
         StoreEffect::AnswerComputerForeground(_) => ("Answer to computer use failed", None),
         // Import outcomes, failures included, arrive as one summary banner.
-        StoreEffect::ScanHerdr { .. } | StoreEffect::ImportHerdr(_) => return None,
+        StoreEffect::ScanHerdr { .. }
+        | StoreEffect::ImportHerdr(_)
+        | StoreEffect::ScanConversations
+        | StoreEffect::ImportConversations(_) => return None,
         // Applying happens in the store; the scan only reads.
         StoreEffect::ScanTerminalSetup => return None,
         // So does a "Resume all" batch.

@@ -57,6 +57,7 @@ pub fn exit_reason_name(reason: ExitReason) -> &'static str {
         ExitReason::DaemonRestart => "daemon_restart",
         ExitReason::External => "external",
         ExitReason::Archived => "archived",
+        ExitReason::Imported => "imported",
         ExitReason::Unknown => "unknown",
     }
 }

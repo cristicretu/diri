@@ -1392,6 +1392,26 @@ impl DaemonClient {
         .await
     }
 
+    /// Recent local conversations worth importing. Read-only on the Engine
+    /// side: nothing is written to any Agent's files.
+    pub async fn import_candidates(
+        &self,
+    ) -> Result<diri_proto::HistoryImportCandidatesResult, ClientError> {
+        self.no_params(Method::HISTORY_IMPORT_CANDIDATES).await
+    }
+
+    /// Adds conversations as resumable sessions without starting any.
+    pub async fn import_history(
+        &self,
+        entries: Vec<HistoryEntry>,
+    ) -> Result<diri_proto::SessionImportHistoryResult, ClientError> {
+        self.typed(
+            Method::SESSION_IMPORT_HISTORY,
+            &diri_proto::SessionImportHistoryParams { entries },
+        )
+        .await
+    }
+
     pub async fn reopen_last(&self) -> Result<SessionRecord, ClientError> {
         self.no_params(Method::SESSION_REOPEN_LAST).await
     }

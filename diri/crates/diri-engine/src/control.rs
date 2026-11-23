@@ -267,6 +267,8 @@ pub struct ControlServer {
     /// Where note Sessions keep their files; `None` resolves the standard
     /// notes directory (tests pin a temporary one).
     notes_dir: Option<PathBuf>,
+    /// Whose Agent history import reads; `None` is `$HOME`.
+    history_home: Option<PathBuf>,
     scheduler: Arc<schedules::Scheduler>,
     /// The connected app's exported actions and the requests waiting on it.
     app_actions: Arc<app_actions::AppActionHub>,
@@ -418,6 +420,7 @@ impl ControlServer {
             spoken: Mutex::new(SpokenSummaries::default()),
             phone_reads_aloud: std::sync::atomic::AtomicBool::new(false),
             notes_dir: None,
+            history_home: None,
             scheduler: Arc::new(schedules::Scheduler::default()),
             app_actions: Arc::default(),
         }
@@ -626,6 +629,20 @@ impl ControlServer {
     pub fn with_notes_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.notes_dir = Some(dir.into());
         self
+    }
+
+    /// The home whose `.claude` and `.codex` stores conversation import
+    /// reads. Tests point it at a fixture home.
+    pub fn with_history_home(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.history_home = Some(dir.into());
+        self
+    }
+
+    fn history_home(&self) -> Result<PathBuf, ControlError> {
+        self.history_home
+            .clone()
+            .or_else(diri_platform::home_dir)
+            .ok_or_else(|| ControlError::internal("HOME is not set"))
     }
 
     pub fn with_logs_dir(mut self, logs_dir: impl Into<PathBuf>) -> Self {
@@ -1460,6 +1477,8 @@ impl ControlServer {
             Method::SESSION_ARCHIVE => self.session_archive(params),
             Method::SESSION_UNARCHIVE => self.session_unarchive(params),
             Method::SESSION_HISTORY => self.session_history(),
+            Method::HISTORY_IMPORT_CANDIDATES => self.history_import_candidates(),
+            Method::SESSION_IMPORT_HISTORY => self.session_import_history(params),
             Method::ACTIVITY_LIST => self.activity_list(params),
             Method::WORKTREE_CREATE => self.worktree_create(params),
             Method::WORKTREE_LIST => self.worktree_list(params),
@@ -5977,6 +5996,100 @@ impl ControlServer {
         encode(&diri_proto::SessionHistoryResult { entries })
     }
 
+    /// Recent local conversations worth importing: a bounded, read-only scan
+    /// run without the Registry lock, so a slow disk cannot stall sessions.
+    fn history_import_candidates(&self) -> Result<JsonValue, ControlError> {
+        let tracked: std::collections::HashSet<String> = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            registry.tracked_agent_session_ids().into_iter().collect()
+        };
+        let home = self.history_home()?;
+        let started = Instant::now();
+        let found = crate::onboarding_import::discover(&home, &tracked);
+        diri_telemetry::event!(
+            "history.import_candidates",
+            suggested = found.suggested.len(),
+            more = found.more.len(),
+            truncated = found.truncated,
+            ms = started.elapsed().as_millis() as u64,
+        );
+        let wire = |candidate: crate::onboarding_import::Candidate| diri_proto::ImportCandidate {
+            entry: history_entry_to_wire(candidate.entry),
+            preview: candidate.preview,
+        };
+        encode(&diri_proto::HistoryImportCandidatesResult {
+            suggested: found.suggested.into_iter().map(wire).collect(),
+            more: found.more.into_iter().map(wire).collect(),
+            more_truncated: found.truncated,
+        })
+    }
+
+    /// Adds past conversations as resumable records. Nothing launches: no
+    /// Holder, PTY or Agent process exists until one is opened, which resumes
+    /// it through `session.resume`. Conversations Diri already tracks, or
+    /// repeated in the request, are skipped, so importing again is a no-op.
+    fn session_import_history(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::SessionImportHistoryParams = decode(params)?;
+        if p.entries.len()
+            > crate::onboarding_import::SUGGESTED + crate::onboarding_import::MAX_MORE
+        {
+            return Err(ControlError::bad_request(
+                "too many conversations in one import",
+            ));
+        }
+        let home = self.history_home()?;
+        // Validation reads transcripts, so it runs before taking the lock;
+        // the tracked set is checked again under it.
+        let mut seen: std::collections::HashSet<String> = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            registry.tracked_agent_session_ids().into_iter().collect()
+        };
+        let mut valid = Vec::new();
+        let mut skipped = Vec::new();
+        for wire in &p.entries {
+            match crate::onboarding_import::validate_import(&home, wire, &seen) {
+                Ok(()) => {
+                    seen.insert(wire.id.clone());
+                    valid.push(wire.clone());
+                }
+                Err(_) => skipped.push(wire.id.clone()),
+            }
+        }
+        let mut registry = self.registry.lock().map_err(poisoned)?;
+        let tracked: std::collections::HashSet<String> =
+            registry.tracked_agent_session_ids().into_iter().collect();
+        let mut ids = Vec::new();
+        for entry in valid {
+            if tracked.contains(&entry.id) {
+                skipped.push(entry.id);
+                continue;
+            }
+            let id = next_session_id();
+            self.ensure_published_project(&mut registry, &entry.cwd, None);
+            let project = crate::registry::session_project_id(&entry.cwd, None);
+            registry.insert_record(crate::onboarding_import::imported_record(
+                &id, &entry, project,
+            ));
+            ids.push(id);
+        }
+        if !ids.is_empty() {
+            registry
+                .persist()
+                .map_err(|error| ControlError::internal(error.to_string()))?;
+        }
+        for id in &ids {
+            self.publish_updated(&registry, id);
+        }
+        let sessions = ids.iter().filter_map(|id| registry.record(id)).collect();
+        drop(registry);
+        diri_telemetry::event!(
+            "session.import_history",
+            imported = ids.len(),
+            skipped = skipped.len(),
+        );
+        encode(&diri_proto::SessionImportHistoryResult { sessions, skipped })
+    }
+
     fn worktree_create(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::WorktreeCreateParams = decode(params)?;
         let info = crate::git::create_worktree(
@@ -6784,7 +6897,9 @@ fn agent_unavailable(kind: &str, host: Option<&str>, detail: Option<&str>) -> Co
     )
 }
 
-fn history_entry_to_wire(entry: crate::history::HistoryEntry) -> diri_proto::HistoryEntry {
+pub(crate) fn history_entry_to_wire(
+    entry: crate::history::HistoryEntry,
+) -> diri_proto::HistoryEntry {
     diri_proto::HistoryEntry {
         id: entry.id,
         kind: match entry.kind {
@@ -8258,6 +8373,8 @@ mod tests {
     mod agent_relaunch_tests;
     #[cfg(unix)]
     mod find_capture_tests;
+    #[cfg(unix)]
+    mod import_history_tests;
     #[cfg(unix)]
     mod launch_gate_tests;
     #[cfg(unix)]

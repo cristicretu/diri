@@ -40,6 +40,7 @@ mod gpui_view_cache_tests;
 mod haptics;
 mod held_hints;
 mod herdr_import;
+mod import_onboarding;
 pub mod history;
 mod i18n;
 mod icons;
@@ -225,6 +226,8 @@ pub(crate) fn refresh_app_menus(cx: &mut App) {
         Menu::new(t("menu.file")).items([
             MenuItem::action(t("menu.new_session"), NewDefaultSession),
             MenuItem::action(t("menu.new_window"), commands::NewWindow),
+            MenuItem::separator(),
+            MenuItem::action(t("menu.import_conversations"), commands::ImportConversations),
         ]),
         Menu::new(t("menu.edit")).items([
             MenuItem::os_action(t("menu.copy"), CopySelection, OsAction::Copy),

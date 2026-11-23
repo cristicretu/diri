@@ -134,6 +134,7 @@ actions!(
         CheckForUpdates,
         ShowWhatsNew,
         ImportTerminalSetup,
+        ImportConversations,
         ToggleReadAloud,
         ToggleReadThisTab,
         ReadOnlyThisTab,
@@ -264,6 +265,7 @@ pub enum CommandId {
     CheckForUpdates,
     ShowWhatsNew,
     ImportTerminalSetup,
+    ImportConversations,
     ToggleReadAloud,
     ToggleReadThisTab,
     ReadOnlyThisTab,
@@ -1119,6 +1121,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         "import ghostty iterm iterm2 wezterm kitty alacritty terminal font theme cursor setup migrate"
     ),
     spec!(
+        ImportConversations,
+        "import-conversations",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "command.import_conversations.palette_title",
+        "arrow.down",
+        "import conversations history claude code codex resume onboarding migrate sessions"
+    ),
+    spec!(
         ToggleReadAloud,
         "toggle-read-aloud",
         Some("cmd-alt-s"),
@@ -1749,6 +1761,7 @@ impl CommandSpec {
             CommandId::CheckForUpdates => KeyBinding::new(key, CheckForUpdates, context),
             CommandId::ShowWhatsNew => KeyBinding::new(key, ShowWhatsNew, context),
             CommandId::ImportTerminalSetup => KeyBinding::new(key, ImportTerminalSetup, context),
+            CommandId::ImportConversations => KeyBinding::new(key, ImportConversations, context),
             CommandId::ToggleReadAloud => KeyBinding::new(key, ToggleReadAloud, context),
             CommandId::ToggleReadThisTab => KeyBinding::new(key, ToggleReadThisTab, context),
             CommandId::ReadOnlyThisTab => KeyBinding::new(key, ReadOnlyThisTab, context),
@@ -2714,6 +2727,11 @@ impl CommandId {
                 description: t("command.import_terminal_setup.description"),
                 category: Application,
             },
+            Self::ImportConversations => ShortcutMetadata {
+                title: t("command.import_conversations.title"),
+                description: t("command.import_conversations.description"),
+                category: Application,
+            },
             Self::ToggleReadThisTab
             | Self::ReadOnlyThisTab
             | Self::ReadAllExceptThisTab
@@ -2858,6 +2876,7 @@ impl CommandId {
             Self::CheckForUpdates => Box::new(CheckForUpdates),
             Self::ShowWhatsNew => Box::new(ShowWhatsNew),
             Self::ImportTerminalSetup => Box::new(ImportTerminalSetup),
+            Self::ImportConversations => Box::new(ImportConversations),
             Self::ToggleReadAloud => Box::new(ToggleReadAloud),
             Self::ToggleReadThisTab => Box::new(ToggleReadThisTab),
             Self::ReadOnlyThisTab => Box::new(ReadOnlyThisTab),

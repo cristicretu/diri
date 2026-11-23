@@ -2966,6 +2966,16 @@ impl RootView {
             CommandId::CheckForUpdates => self.services.updates.check(true),
             CommandId::ShowWhatsNew => self.open_whats_new_at(0, window, cx),
             CommandId::ImportTerminalSetup => self.open_terminal_import(window, cx),
+            CommandId::ImportConversations => {
+                self.services
+                    .store
+                    .store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .open_conversation_import();
+                cx.notify();
+                cx.refresh_windows();
+            }
             CommandId::ToggleReadAloud => self.toggle_read_aloud(cx),
             CommandId::ToggleReadThisTab => {
                 self.set_read_aloud(crate::store::ReadAloudChoice::Toggle, cx)
@@ -6566,6 +6576,9 @@ impl Render for RootView {
             }))
             .on_action(cx.listener(|this, _: &CheckForUpdates, window, cx| {
                 this.run_command(CommandId::CheckForUpdates, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::commands::ImportConversations, window, cx| {
+                this.run_command(CommandId::ImportConversations, window, cx);
             }))
             .on_action(cx.listener(|this, _: &crate::commands::ImportTerminalSetup, window, cx| {
                 this.run_command(CommandId::ImportTerminalSetup, window, cx);
@@ -13409,6 +13422,118 @@ mod tests {
             cx.update_window(window.into(), |_, window, _| window.remove_window())
                 .unwrap();
             cx.run_until_parked();
+        }
+    }
+
+    /// The first-launch conversation import inside the real window: the
+    /// five suggestions, the browse list, the zero-history page, and the
+    /// page opened from the File menu over existing sessions.
+    /// `DIRI_IMPORT_SCREENSHOTS=<dir>`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes conversation import previews to DIRI_IMPORT_SCREENSHOTS"]
+    fn render_conversation_import_screenshots() {
+        use gpui::{AppContext as _, HeadlessAppContext};
+        let output = std::env::var("DIRI_IMPORT_SCREENSHOTS").expect("DIRI_IMPORT_SCREENSHOTS");
+        std::fs::create_dir_all(&output).unwrap();
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let now = crate::import_onboarding::now_ms();
+        // The first window of a process shows a "Connecting…" notice while
+        // the fixture's absent Engine is tried; let a throwaway window take it.
+        let warm_up = cx
+            .open_window(size(px(400.0), px(300.0)), |window, cx| {
+                cx.new(|cx| RootView::new(test_services(), false, PreviewScenario::Empty, window, cx))
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(warm_up.into(), |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        for light in [false, true] {
+            // `welcome`: no scan has answered, so the unchanged welcome
+            // renders, which is what main shows on a first launch.
+            for page in ["welcome", "import", "browse", "search", "fresh", "menu"] {
+                let services = test_services();
+                {
+                    let mut store = services.store.store.write().unwrap();
+                    if page == "menu" {
+                        store.hydrate(SidebarPreviewFixture::make(PreviewScenario::Typical).list);
+                    }
+                    store.set_agent_catalog(crate::agent_setup::bundled_catalog(&[
+                        "claude-code",
+                        "codex",
+                    ]));
+                    let scan = if page == "fresh" {
+                        diri_proto::HistoryImportCandidatesResult::default()
+                    } else {
+                        crate::store::conversation_import_preview_scan(now, 14)
+                    };
+                    if page != "welcome" {
+                        store.set_conversation_import_scan(scan);
+                    }
+                    match page {
+                        "browse" => {
+                            store.set_conversation_browsing(true);
+                            let id = store.conversation_import().more()[1].entry.id.clone();
+                            store.toggle_conversation(&id);
+                        }
+                        "search" => {
+                            store.set_conversation_browsing(true);
+                            store
+                                .conversation_query_mut()
+                                .apply(crate::query_editor::LocalEdit::Insert("flaky".into()));
+                            store.move_conversation_focus(true);
+                        }
+                        "menu" => store.open_conversation_import(),
+                        _ => {}
+                    }
+                    if page == "import" {
+                        // Untick one so the count reads as live, and show the
+                        // second row's last message.
+                        let suggested = store.conversation_import().suggested();
+                        let (unticked, focused) =
+                            (suggested[3].entry.id.clone(), suggested[1].entry.id.clone());
+                        store.toggle_conversation(&unticked);
+                        store.focus_conversation(&focused);
+                    }
+                    store
+                        .update_preferences(|prefs| {
+                            prefs.sidebar_visible = true;
+                            prefs.terminal_theme = if light {
+                                "dirijor-light"
+                            } else {
+                                "dirijor-dark"
+                            }
+                            .into()
+                        })
+                        .unwrap();
+                }
+                let window = cx
+                    .open_window(size(px(1100.0), px(720.0)), |window, cx| {
+                        cx.new(|cx| {
+                            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+                        })
+                    })
+                    .unwrap();
+                cx.run_until_parked();
+                let theme = if light { "light" } else { "dark" };
+                cx.capture_screenshot(window.into())
+                    .unwrap()
+                    .save(std::path::Path::new(&output).join(format!("{page}-{theme}.png")))
+                    .unwrap();
+                cx.update_window(window.into(), |_, window, _| window.remove_window())
+                    .unwrap();
+                cx.run_until_parked();
+            }
         }
     }
 

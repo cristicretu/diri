@@ -41,6 +41,11 @@ pub(crate) struct EmptyWorkbench {
     pub importing_herdr: bool,
     /// Another terminal whose setup this Mac could bring over ("Ghostty").
     pub terminal_setup: Option<&'static str>,
+    /// Recent conversations to bring in: the first-launch import page, or
+    /// the same page opened from File › Import Conversations….
+    pub import: Option<crate::import_onboarding::ImportView>,
+    /// A first launch that looked and found no history to import.
+    pub fresh: bool,
 }
 
 pub(crate) struct EmptyWorkbenchActions {
@@ -52,16 +57,37 @@ pub(crate) struct EmptyWorkbenchActions {
     pub import_herdr: ActionHandler,
     /// Open one particular installed Agent in the home folder.
     pub start_agent: AgentHandler,
+    pub import: Option<crate::import_onboarding::ImportActions>,
+    pub moving: ActionHandler,
 }
 
 pub(crate) type AgentHandler = Rc<dyn Fn(&AgentKind, &mut Window, &mut App)>;
 
 pub(crate) fn render(
-    state: EmptyWorkbench,
-    actions: EmptyWorkbenchActions,
+    mut state: EmptyWorkbench,
+    mut actions: EmptyWorkbenchActions,
     colors: SemanticColors,
 ) -> impl IntoElement {
-    let column = if state.has_sessions {
+    let ready_agents = match &state.agents {
+        AgentSetupState::Ready(ready) => ready
+            .iter()
+            .filter(|option| !option.kind.is_terminal())
+            .map(|option| (option.kind.clone(), SharedString::from(option.display_name.clone())))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let column = if let Some((view, import)) = state.import.take().zip(actions.import.take()) {
+        crate::import_onboarding::render(view, import, colors)
+    } else if state.fresh && !state.has_sessions && !ready_agents.is_empty() {
+        crate::import_onboarding::render_fresh(
+            &ready_agents,
+            crate::import_onboarding::FreshActions {
+                open_folder: Rc::clone(&actions.start_in_folder),
+                moving: Rc::clone(&actions.moving),
+            },
+            colors,
+        )
+    } else if state.has_sessions {
         resting(&actions, colors)
     } else {
         welcome(&state, &actions, colors)

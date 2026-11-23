@@ -90,6 +90,17 @@ impl SidebarProjection {
         self.projects.iter().find_map(|group| group.active.first())
     }
 
+    /// The first active row worth selecting on its own. An imported
+    /// conversation that has not run yet is left for the person to open:
+    /// selecting it starts its Agent, and an import must start nothing.
+    pub fn first_auto_selectable(&self) -> Option<&Arc<SessionRecord>> {
+        self.projects.iter().find_map(|group| {
+            group.active.iter().find(|session| {
+                !matches!(&session.status, diri_proto::SessionStatus::Exited(info) if info.is_imported())
+            })
+        })
+    }
+
     /// Every session ⌘K can switch to, in sidebar order: each project's
     /// active rows whether or not a fold hides them, and an archived row only
     /// while it is selected, as in `ordered_sessions`.

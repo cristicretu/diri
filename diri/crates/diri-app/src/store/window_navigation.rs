@@ -674,7 +674,7 @@ impl WindowWrite<'_> {
         {
             let next = self.navigation.mru_order.first().cloned().or_else(|| {
                 self.sidebar_projection()
-                    .first_active()
+                    .first_auto_selectable()
                     .map(|session| session.id.clone())
             });
             self.set_selected_survivor(next);

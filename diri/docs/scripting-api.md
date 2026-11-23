@@ -95,6 +95,8 @@ Call one as `diri.call("session.list")` or through its generated function, `diri
 | `diri.session.history` |  | `SessionHistoryResult` | Past Agent conversations that can be resumed. |
 | `diri.activity.list` | `limit?` | `ActivityListResult` | Recent session activity, newest first. |
 | `diri.session.resume_from_history` | `entry, initialPrompt?` | `SessionRecord` | Open a session resuming a past conversation. |
+| `diri.history.import_candidates` |  | `HistoryImportCandidatesResult` | Recent local Claude Code and Codex conversations worth importing. |
+| `diri.session.import_history` | `entries` | `SessionImportHistoryResult` | Add past conversations as resumable sessions without starting them. |
 | `diri.worktree.create` | `repoPath, branch?, base?` | `WorktreeInfo` | Create a git worktree. |
 | `diri.worktree.list` | `repoPath` | `WorktreeListResult` | A repository's worktrees. |
 | `diri.worktree.cleanup` | `repoPath, worktreePath, expectedHead` | `WorktreeCleanupResult` | Remove finished worktrees. |

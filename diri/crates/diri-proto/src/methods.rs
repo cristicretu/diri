@@ -127,6 +127,8 @@ impl Method {
     pub const SESSION_HISTORY: &'static str = "session.history";
     pub const ACTIVITY_LIST: &'static str = "activity.list";
     pub const SESSION_RESUME_FROM_HISTORY: &'static str = "session.resume_from_history";
+    pub const HISTORY_IMPORT_CANDIDATES: &'static str = "history.import_candidates";
+    pub const SESSION_IMPORT_HISTORY: &'static str = "session.import_history";
     pub const WORKTREE_CREATE: &'static str = "worktree.create";
     pub const WORKTREE_LIST: &'static str = "worktree.list";
     pub const WORKTREE_CLEANUP: &'static str = "worktree.cleanup";
@@ -265,6 +267,8 @@ impl Method {
         Self::SESSION_HISTORY,
         Self::ACTIVITY_LIST,
         Self::SESSION_RESUME_FROM_HISTORY,
+        Self::HISTORY_IMPORT_CANDIDATES,
+        Self::SESSION_IMPORT_HISTORY,
         Self::WORKTREE_CREATE,
         Self::WORKTREE_LIST,
         Self::WORKTREE_CLEANUP,
@@ -977,6 +981,55 @@ pub struct ResumeFromHistoryParams {
 }
 
 pub type ResumeFromHistoryResult = SessionRecord;
+
+/// A past conversation offered for import, with the last thing said in it
+/// so the person recognises the chat without opening it.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ImportCandidate {
+    pub entry: HistoryEntry,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
+
+/// What a read-only scan of the local Agents' transcript stores found worth
+/// bringing into Diri: at most five suggestions, newest first, then the rest
+/// of the bounded scan for browsing. Junk (subagents, empty chats, scratch
+/// folders, deleted folders) and conversations Diri already tracks are gone.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct HistoryImportCandidatesResult {
+    pub suggested: Vec<ImportCandidate>,
+    #[serde(default)]
+    pub more: Vec<ImportCandidate>,
+    /// The scan stopped at its bound, so older conversations exist beyond
+    /// `more`; the full history palette still reaches them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub more_truncated: bool,
+}
+
+pub type HistoryImportCandidatesParams = EmptyParams;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SessionImportHistoryParams {
+    pub entries: Vec<HistoryEntry>,
+}
+
+/// Imported conversations become resumable records that start nothing: no
+/// Holder, no PTY, no Agent process until one is opened.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionImportHistoryResult {
+    pub sessions: Vec<SessionRecord>,
+    /// Conversation ids left out: already in Diri, repeated in the request,
+    /// or no longer valid (transcript or folder gone).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<String>,
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
