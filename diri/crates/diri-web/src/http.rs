@@ -317,7 +317,7 @@ const SECURITY_HEADERS: &str = concat!(
     "Referrer-Policy: no-referrer\r\n",
     "X-Frame-Options: DENY\r\n",
     "Content-Security-Policy: default-src 'none'; ",
-    "script-src 'unsafe-inline'; style-src 'unsafe-inline'; ",
+    "script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; ",
     // `manifest-src` has no fallback to anything but `default-src`, so
     // omitting it blocks the web-app manifest and silently costs the page its
     // add-to-home-screen identity.

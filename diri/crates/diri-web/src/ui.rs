@@ -7,6 +7,8 @@
 pub const INDEX_HTML: &str = include_str!("ui/index.html");
 pub const MANIFEST: &str = include_str!("ui/manifest.webmanifest");
 pub const ICON_SVG: &str = include_str!("ui/icon.svg");
+/// The terminal view: renders the grid stream, sends input, pages history.
+pub const TERMINAL_JS: &str = include_str!("ui/term.js");
 
 #[cfg(test)]
 mod tests {
@@ -18,6 +20,8 @@ mod tests {
     fn the_page_loads_nothing_from_another_origin() {
         assert!(!INDEX_HTML.contains("https://"), "external URL in the page");
         assert!(!INDEX_HTML.contains("http://"), "external URL in the page");
+        assert!(!TERMINAL_JS.contains("https://"), "external URL in term.js");
+        assert!(!TERMINAL_JS.contains("http://"), "external URL in term.js");
     }
 
     #[test]

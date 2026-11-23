@@ -24,6 +24,13 @@ final class TerminalSession {
     private(set) var exited = false
     /// A keystroke batch did not reach the gateway. Cleared by the chrome.
     var inputFailed = false
+    /// No frame for 2 s after the stream dropped: the screen is dimmed.
+    private(set) var stale = false
+    /// Opening frames, for tests: full snapshots and row-only resumes.
+    private(set) var snapshots = 0
+    private(set) var resumes = 0
+    /// Rows the last resume carried.
+    private(set) var resumedRows = 0
     /// Mirrors of buffer facts the chrome reads.
     private(set) var bracketedPaste = false
     private(set) var appCursor = false
@@ -34,8 +41,12 @@ final class TerminalSession {
     /// The view's repaint hook. Called on the main actor, coalesced per change.
     @ObservationIgnored var onChange: ((TerminalBuffer.Change) -> Void)?
 
-    @ObservationIgnored private let client: DiriClient
+    @ObservationIgnored let client: DiriClient
     @ObservationIgnored private var streamTask: Task<Void, Never>?
+    @ObservationIgnored private var current: Task<DiriClient.StreamOutcome, Never>?
+    @ObservationIgnored private var staleTimer: Task<Void, Never>?
+    @ObservationIgnored private var immediate = false
+    @ObservationIgnored private var skipResume = false
     @ObservationIgnored private var fetches = 0
     @ObservationIgnored private var wanted: [Int] = []
     @ObservationIgnored private var outbox: [UInt8] = []
@@ -66,17 +77,27 @@ final class TerminalSession {
     func stop() {
         streamTask?.cancel()
         streamTask = nil
+        // The network task is unstructured: cancelling the loop alone would
+        // leave the socket open until the next frame arrived.
+        current?.cancel()
+        current = nil
+        staleTimer?.cancel()
     }
 
     private func run() async {
         var failures = 0
         while !Task.isCancelled {
-            let (events, outcome) = await client.terminalStream(sessionID: sessionID)
+            let resume = skipResume ? nil : buffer.resumeToken
+            skipResume = false
+            let (events, outcome) = await client.terminalStream(sessionID: sessionID, resume: resume)
+            current = outcome
             for await event in events {
                 if Task.isCancelled { outcome.cancel(); return }
                 failures = 0
                 handle(event)
             }
+            current = nil
+            if Task.isCancelled { outcome.cancel(); return }
             switch await outcome.value {
             case .unsupported:
                 await pollLegacy()
@@ -87,17 +108,77 @@ final class TerminalSession {
                 if !exited { link = .reconnecting("Reconnecting…") }
             }
             if Task.isCancelled || exited { return }
+            markStaleSoon()
+            if immediate {
+                // Asked to reconnect now (the network changed): no backoff.
+                immediate = false
+                failures = 0
+                continue
+            }
             failures += 1
-            try? await Task.sleep(for: .milliseconds(min(4000, 250 * (1 << min(failures, 4)))))
+            // Backoff with jitter, so a fleet of phones does not reconnect in
+            // lockstep after a gateway restart: 0.25 s doubling to 4 s.
+            let base = min(4000, 250 * (1 << min(failures - 1, 4)))
+            let delay = Duration.milliseconds(base / 2 + Int.random(in: 0 ... base / 2))
+            await wait(delay)
         }
+    }
+
+    /// Sleeps for `delay`, cut short by `reconnectNow()`.
+    private func wait(_ delay: Duration) async {
+        let deadline = ContinuousClock.now + delay
+        while !Task.isCancelled, !immediate, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+    }
+
+    /// Drops the current stream and reconnects at once, resuming from what is
+    /// on screen. For a network change: the old socket may be open but dead,
+    /// and waiting for the stall timeout would freeze the screen for 45 s.
+    func reconnectNow() {
+        guard streamTask != nil, !exited, link != .legacy else { return }
+        immediate = true
+        current?.cancel()
+    }
+
+    /// The screen dims when no frame has arrived 2 s after a drop. It keeps
+    /// showing what it had: stale text beats a blank screen.
+    private func markStaleSoon() {
+        staleTimer?.cancel()
+        staleTimer = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled, let self, self.link != .live, !self.exited else { return }
+            self.stale = true
+        }
+    }
+
+    private func becameLive() {
+        link = .live
+        staleTimer?.cancel()
+        stale = false
     }
 
     private func handle(_ event: DiriClient.TerminalEvent) {
         switch event {
         case let .snapshot(snapshot):
             let change = buffer.apply(snapshot)
-            link = .live
+            snapshots += 1
+            becameLive()
             publish(change)
+            warm()
+        case let .resume(frame):
+            guard let change = buffer.resume(frame) else {
+                // It does not fit what is on screen: ask for a snapshot.
+                skipResume = true
+                immediate = true
+                current?.cancel()
+                return
+            }
+            resumes += 1
+            resumedRows = frame.lines.count
+            becameLive()
+            publish(change)
+            prefetch(around: lastFocus, lookahead: 0)
             warm()
         case let .diff(diff):
             switch buffer.apply(diff) {
@@ -109,6 +190,8 @@ final class TerminalSession {
             }
         case .exit:
             exited = true
+            staleTimer?.cancel()
+            stale = false
         }
     }
 
