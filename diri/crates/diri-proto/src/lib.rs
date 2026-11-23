@@ -47,6 +47,7 @@ pub mod process;
 pub mod process_facts;
 pub mod tasks;
 pub mod terminal;
+pub mod thread;
 pub mod terminal_input;
 pub mod voice;
 pub mod workspace;

@@ -965,6 +965,31 @@ impl DaemonClient {
         .await
     }
 
+    /// Structured thread items after `params.from`; see
+    /// `Method::SESSION_THREAD_READ`.
+    pub async fn thread_read(
+        &self,
+        params: &diri_proto::thread::ThreadReadParams,
+    ) -> Result<diri_proto::thread::ThreadReadResult, ClientError> {
+        self.typed(Method::SESSION_THREAD_READ, params).await
+    }
+
+    /// Answers the permission prompt the caller saw, only if it is still
+    /// live; `blocker_changed` otherwise.
+    pub async fn answer_blocker(
+        &self,
+        params: &diri_proto::thread::AnswerBlockerParams,
+    ) -> Result<(), ClientError> {
+        self.empty(Method::SESSION_ANSWER_BLOCKER, params).await
+    }
+
+    pub async fn handoff_capsule(
+        &self,
+        params: &diri_proto::thread::HandoffCapsuleParams,
+    ) -> Result<diri_proto::thread::HandoffCapsuleResult, ClientError> {
+        self.typed(Method::SESSION_HANDOFF_CAPSULE, params).await
+    }
+
     /// A wheel over the session's terminal; see `Method::SESSION_SCROLL`.
     pub async fn scroll(
         &self,

@@ -270,6 +270,8 @@ pub struct ControlServer {
     scheduler: Arc<schedules::Scheduler>,
     /// The connected app's exported actions and the requests waiting on it.
     app_actions: Arc<app_actions::AppActionHub>,
+    /// Kernel file watches for open GUI Lenses (`session.thread_read`).
+    thread_watches: Arc<crate::thread::watch::ThreadWatches>,
 }
 
 /// Where injection files live and which CLI they point at. Present, spawns
@@ -375,6 +377,7 @@ impl ControlServer {
         if let Err(error) = events.enable_activity_log(activity_path) {
             eprintln!("diri-engine: activity history unavailable: {error}");
         }
+        let thread_events = events.clone();
         let computer = crate::computer::ComputerUse::default();
         computer.set_events(events.clone());
         computer.set_life(computer_life(Arc::clone(&registry)));
@@ -420,6 +423,21 @@ impl ControlServer {
             notes_dir: None,
             scheduler: Arc::new(schedules::Scheduler::default()),
             app_actions: Arc::default(),
+            thread_watches: {
+                let events = thread_events;
+                Arc::new(crate::thread::watch::ThreadWatches::new(Arc::new(
+                    move |session_id: &str, length: u64| {
+                        events.publish_encoded(
+                            diri_proto::EventName::SESSION_THREAD_APPENDED,
+                            &diri_proto::thread::ThreadAppendedEvent {
+                                session_id: diri_proto::SessionId(session_id.to_owned()),
+                                length,
+                            },
+                            Some(session_id),
+                        );
+                    },
+                )))
+            },
         }
     }
 
@@ -1527,6 +1545,9 @@ impl ControlServer {
             Method::SESSION_READ_DIFF => self.session_read_diff(params),
             Method::SESSION_READ_IMAGE => self.session_read_image(params),
             Method::SESSION_READ_TRANSCRIPT => self.session_read_transcript(params),
+            Method::SESSION_THREAD_READ => self.session_thread_read(params),
+            Method::SESSION_ANSWER_BLOCKER => self.session_answer_blocker(params),
+            Method::SESSION_HANDOFF_CAPSULE => self.session_handoff_capsule(params),
             Method::WORKTREE_INTEGRATE => self.worktree_integrate(params),
             Method::SESSION_HIBERNATE => self.session_hibernate(params),
             Method::SESSION_WAKE => self.session_wake(params),
@@ -3404,6 +3425,153 @@ impl ControlServer {
             .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
         session
             .send_text(&p.text, p.submit)
+            .map_err(|error| ControlError::internal(error.to_string()))?;
+        Ok(json!({}))
+    }
+
+    fn session_thread_read(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::thread::ThreadReadParams = decode(params)?;
+        let record = self.record_for(&p.session_id.0)?;
+        let home = diri_platform::home_dir()
+            .map(|path| PathBuf::from(path.into_os_string()))
+            .ok_or_else(|| ControlError::internal("HOME is unset"))?;
+        let segments = crate::thread::segments::SegmentStore::new(&self.state_dir).chain(&record);
+        let (result, watched) = crate::thread::read(
+            &record,
+            &p,
+            crate::thread::ReadContext {
+                home: &home,
+                segments,
+            },
+        );
+        if p.watch
+            && let Some(path) = watched
+        {
+            self.thread_watches.lease(&record.id.0, &path);
+        }
+        encode(&result)
+    }
+
+    /// Reads the whole thread (bounded windows) and the working diff, and
+    /// renders the capsule. Nothing is written to any Agent.
+    fn session_handoff_capsule(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::thread::HandoffCapsuleParams = decode(params)?;
+        let record = self.record_for(&p.session_id.0)?;
+        let home = diri_platform::home_dir()
+            .map(|path| PathBuf::from(path.into_os_string()))
+            .ok_or_else(|| ControlError::internal("HOME is unset"))?;
+        let mut items = Vec::new();
+        let mut cursor = diri_proto::thread::ThreadCursor::default();
+        // 64 MiB of transcript at most; the capsule keeps only the tail anyway.
+        for _ in 0..8 {
+            let (page, _) = crate::thread::read(
+                &record,
+                &diri_proto::thread::ThreadReadParams {
+                    session_id: record.id.clone(),
+                    from: cursor.clone(),
+                    max_bytes: Some(diri_proto::thread::THREAD_READ_MAX_BYTES),
+                    watch: false,
+                },
+                crate::thread::ReadContext {
+                    home: &home,
+                    segments: Vec::new(),
+                },
+            );
+            if !page.structured {
+                return Err(ControlError::bad_request(
+                    page.reason
+                        .unwrap_or_else(|| "This session has no structured thread".into()),
+                ));
+            }
+            if page.reset {
+                items.clear();
+            }
+            items.extend(page.items);
+            cursor = page.next;
+            if !page.more {
+                break;
+            }
+        }
+        let diff = if record.host.is_none() {
+            crate::git::working_diff(Path::new(&record.cwd), None).ok()
+        } else {
+            None
+        };
+        let patch = diff
+            .as_ref()
+            .map(|diff| String::from_utf8_lossy(&diff.patch).into_owned())
+            .unwrap_or_default();
+        let stat = crate::thread::capsule::diff_stat(&patch);
+        let branch = crate::git::branch(Path::new(&record.cwd)).or(record.git_branch.clone());
+        let from = record.effective_kind().id().to_owned();
+        let capsule = crate::thread::capsule::build(
+            &items,
+            &crate::thread::capsule::CapsuleInputs {
+                goal: p.goal.as_deref(),
+                branch: branch.as_deref(),
+                diff_stat: &stat,
+                diff: &patch,
+                from_agent: match from.as_str() {
+                    "claude-code" => "Claude Code",
+                    "codex" => "Codex",
+                    other => other,
+                },
+            },
+        );
+        encode(&diri_proto::thread::HandoffCapsuleResult {
+            capsule: capsule.render(),
+            touched_files: capsule.touched_files,
+        })
+    }
+
+    /// Writes the manifest's approve/deny keys only while the prompt the
+    /// caller saw is still the live one. The check and the write happen
+    /// under one Registry lock, so a prompt that changes between the click
+    /// and this request is never answered by mistake.
+    fn session_answer_blocker(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::thread::AnswerBlockerParams = decode(params)?;
+        let registry = self.registry.lock().map_err(poisoned)?;
+        let record = registry
+            .record(&p.session_id.0)
+            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+        let live = record.needs_input.as_ref().filter(|detail| {
+            detail.kind == diri_proto::NeedsInputKind::Permission
+                && !detail.secret
+                && detail.occurred_at.0 == p.occurred_at
+        });
+        if live.is_none() {
+            return Err(ControlError::new(
+                "blocker_changed",
+                "That prompt is no longer showing. Look at the session before answering.",
+            ));
+        }
+        let descriptor = registry
+            .engine()
+            .raw_agent(record.effective_kind().id())
+            .cloned()
+            .and_then(|value| serde_json::from_value::<diri_proto::AgentDescriptor>(value).ok());
+        let answer = match p.choice {
+            diri_proto::thread::BlockerChoice::Approve => descriptor
+                .as_ref()
+                .and_then(|descriptor| descriptor.approve.clone()),
+            diri_proto::thread::BlockerChoice::Deny => Some(
+                descriptor
+                    .as_ref()
+                    .and_then(|descriptor| descriptor.deny.clone())
+                    .unwrap_or(diri_proto::AgentKeystroke {
+                        text: "\u{1b}".to_owned(),
+                        submit: false,
+                    }),
+            ),
+        }
+        .ok_or_else(|| {
+            ControlError::bad_request("This agent's permission prompt has no verified answer key")
+        })?;
+        let session = registry
+            .get(&p.session_id.0)
+            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+        session
+            .send_text(&answer.text, answer.submit)
             .map_err(|error| ControlError::internal(error.to_string()))?;
         Ok(json!({}))
     }

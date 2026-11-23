@@ -213,6 +213,23 @@ impl ControlServer {
                 .record(&source.id.0)
                 .ok_or_else(|| ControlError::not_found("Session no longer exists"))?;
             ensure_same_source(&source, &stopped)?;
+            // The copied transcript is byte-identical up to here, so the GUI
+            // Lens keeps every item key and draws one divider at this offset.
+            let boundary = diri_proto::thread::ThreadSegment {
+                index: 0,
+                kind: stopped.effective_kind().clone(),
+                session_id: stopped.id.clone(),
+                model: None,
+                account: Some(profile.label.clone()),
+                start_offset: final_bytes.len() as u64,
+                started_at_ms: diri_proto::DateMillis::from(std::time::SystemTime::now()).0 as i64,
+                cause: diri_proto::thread::SegmentCause::Account,
+            };
+            if let Err(error) = crate::thread::segments::SegmentStore::new(&self.state_dir)
+                .append(&stopped, boundary)
+            {
+                eprintln!("diri-engine: thread segment not recorded: {error}");
+            }
             let mut target = stopped.clone();
             target.account_profile = Some(profile);
             target.transcript_path = Some(target_location.path().to_string_lossy().into_owned());

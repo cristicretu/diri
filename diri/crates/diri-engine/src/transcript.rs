@@ -79,28 +79,7 @@ pub fn load(
             },
         }));
     }
-    validate_provider_path(home, path, kind, agent_id)?;
-
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    let mut file = options.open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "transcript is not a regular file",
-        ));
-    }
-    #[cfg(unix)]
-    if metadata.uid() != unsafe { libc::geteuid() } {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "transcript is not owned by this user",
-        ));
-    }
-    validate_opened_identity(&mut file, kind, agent_id, cwd)?;
+    let (mut file, metadata) = open_validated(home, path, kind, agent_id, cwd)?;
 
     let version = TranscriptVersion {
         length: metadata.len(),
@@ -174,8 +153,60 @@ pub fn load(
     }))
 }
 
-fn validate_provider_path(
+/// Opens a provider transcript under the same rules as [`load`]: inside the
+/// provider store, final component not followed, a regular file owned by
+/// this user, and (for Codex) carrying the session's identity. The file is
+/// left at an unspecified position.
+pub(crate) fn open_validated(
     home: &Path,
+    path: &Path,
+    kind: &AgentKind,
+    agent_id: &str,
+    cwd: &str,
+) -> io::Result<(File, std::fs::Metadata)> {
+    let root = match kind.id() {
+        AgentKind::CLAUDE_CODE_ID => home.join(".claude/projects"),
+        AgentKind::CODEX_ID => home.join(".codex/sessions"),
+        _ => home.to_path_buf(),
+    };
+    open_validated_in(&root, path, kind, agent_id, cwd)
+}
+
+/// [`open_validated`] against an explicit provider store, for an account
+/// profile whose Claude home is not `~/.claude`.
+pub(crate) fn open_validated_in(
+    root: &Path,
+    path: &Path,
+    kind: &AgentKind,
+    agent_id: &str,
+    cwd: &str,
+) -> io::Result<(File, std::fs::Metadata)> {
+    validate_in_root(root, path, kind, agent_id)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "transcript is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "transcript is not owned by this user",
+        ));
+    }
+    validate_opened_identity(&mut file, kind, agent_id, cwd)?;
+    Ok((file, metadata))
+}
+
+fn validate_in_root(
+    root: &Path,
     path: &Path,
     kind: &AgentKind,
     agent_id: &str,
@@ -191,11 +222,9 @@ fn validate_provider_path(
             "invalid provider session identity",
         ));
     }
-    let root = match kind.id() {
-        AgentKind::CLAUDE_CODE_ID => home.join(".claude/projects"),
-        AgentKind::CODEX_ID => home.join(".codex/sessions"),
-        _ => return Ok(()),
-    };
+    if !matches!(kind.id(), AgentKind::CLAUDE_CODE_ID | AgentKind::CODEX_ID) {
+        return Ok(());
+    }
     let canonical_root = diri_platform::canonicalize(root)?;
     let canonical_path = diri_platform::canonicalize(path)?;
     if !canonical_path.starts_with(&canonical_root) {

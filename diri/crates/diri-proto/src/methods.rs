@@ -78,6 +78,17 @@ impl Method {
     /// keys, evicted images and older Holders answer `image_not_found`.
     pub const SESSION_READ_IMAGE: &'static str = "session.read_image";
     pub const SESSION_READ_TRANSCRIPT: &'static str = "session.read_transcript";
+    /// Structured thread items after a byte cursor in the Agent's own
+    /// transcript ([`crate::thread::ThreadReadParams`] →
+    /// [`crate::thread::ThreadReadResult`]); the Dual-Lens GUI's source.
+    pub const SESSION_THREAD_READ: &'static str = "session.thread_read";
+    /// Approve or deny the permission prompt the caller saw, only while it
+    /// is still the live one ([`crate::thread::AnswerBlockerParams`]).
+    pub const SESSION_ANSWER_BLOCKER: &'static str = "session.answer_blocker";
+    /// The Handoff Capsule another Agent would continue this thread from
+    /// ([`crate::thread::HandoffCapsuleParams`] →
+    /// [`crate::thread::HandoffCapsuleResult`]). Read-only.
+    pub const SESSION_HANDOFF_CAPSULE: &'static str = "session.handoff_capsule";
     pub const SESSION_MARK_SEEN: &'static str = "session.mark_seen";
     /// Returns a completed turn to "done · unseen", like marking a chat
     /// unread. A no-op for a session with no completed turn.
@@ -221,6 +232,9 @@ impl Method {
         Self::SESSION_DELIVER_MESSAGE,
         Self::SESSION_SEND_KEY,
         Self::SESSION_SEND_TEXT,
+        Self::SESSION_THREAD_READ,
+        Self::SESSION_ANSWER_BLOCKER,
+        Self::SESSION_HANDOFF_CAPSULE,
         Self::SESSION_RESIZE,
         Self::SESSION_SCROLL,
         Self::SESSION_READ_SCREEN,
@@ -328,6 +342,8 @@ impl EventName {
     /// ask for it by name receive it.
     pub const SESSION_BELL: &'static str = "session.bell";
     pub const SESSION_UPDATED: &'static str = "session.updated";
+    /// A watched transcript grew ([`crate::thread::ThreadAppendedEvent`]).
+    pub const SESSION_THREAD_APPENDED: &'static str = "session.thread_appended";
     /// Coverage-gap marker: the Engine evicted events this subscriber never
     /// saw. Sequence zero; `dropped`, `fromSeq`, `toSeq` in the params.
     pub const EVENTS_DROPPED: &'static str = "events.dropped";

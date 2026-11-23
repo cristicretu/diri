@@ -90,3 +90,28 @@ cargo test -p diri-remote --lib controller_epoch_model_rejects_old_claims_and_ex
 `ReceiptTraces.lean` enumerates all 25 pairs of confirmed, rejected-before-write, interrupted-before-write, interrupted-after-write and uncertain actions, with app and Engine restart between attempts. Rust drives the real message and spawn receipt functions and compares the persisted outcome and number of effect callbacks against the generated table. Reopening the database represents an Engine restart at the storage boundary. A dropped invocation has no volatile ownership on retry. The companion task table enumerates 27 three-action traces combining acknowledgement, completion and cancellation. Rust reads each fresh journal view and verifies the acknowledgement history, terminal classification and immutability of an already terminal record.
 
 The Holder test uses a real PTY and authenticated connections, starting at zero and two epochs below the maximum. After each attempted attach it exercises the input path of every prior connection, including the lease kept when the next epoch cannot be represented.
+
+## Dual-Lens thread observation
+
+`DualLens.lean` models how the GUI Lens follows an Agent's append-only JSONL transcript. A file is a list of bytes and byte 10 ends a record. `read f o` emits every complete line from byte `o` keyed by its start offset and returns the offset just past the last newline it consumed. A trailing partial line stays unread.
+
+| Lean | Rust counterpart |
+| --- | --- |
+| `read`, `step`, `scan` | `diri_engine::thread::tail::read_window` reads from the cursor to EOF and emits each newline-terminated line under its starting byte offset. |
+| `Boundary`, `isBoundary`, `serve` | `diri_engine::thread::tail::cursor_is_boundary`. The Engine accepts a `ThreadCursor` that is 0 or follows a newline and restarts any other cursor at 0. |
+| `merge`, `insertKey`, `ingest` | `diri-app/src/thread_lens/model.rs` `ThreadModel::ingest` inserts by key in sorted order and keeps the existing item on a clash. |
+| `Lens`, `flip`, `Client` | The `TerminalPane` lens flag. The client state holds items, cursor and lens. The PTY is outside it, so a flip cannot write there. |
+
+What the proofs cover:
+
+* `read_monotone` and `read_le_length` bound the returned cursor between the input cursor and the file length. `read_boundary` and `read_preserves_boundary` show the returned cursor is a record boundary.
+* `read_append` proves chunk independence for an append-only file from any starting offset within the old file. `read_append_split` is the form starting at 0. `tail_chunking` and `tail_chunking_matches_one_read` extend this to any sequence of appends interleaved with reads.
+* `read_keys` and `read_keys_nodup` show keys strictly increase and are at least the cursor.
+* `merge_sorted`, `merge_self` and `merge_extend` cover the client merge. `replay_idempotent` proves that after the file grows, reconnecting from the saved cursor, any older cursor, 0, or a non-boundary cursor the Engine rejects leaves the client with exactly one full read and the same next cursor. `synced_reconnect` states this as an invariant of a client state.
+* `lens_flip_commutes`, `flip_preserves` and `flips_never_drift` show GUI and TUI flips commute with ingests and never change items or cursor.
+
+`PromptCache.lean` adds two results. `observation_independent` holds by construction, because `inject` takes no segment chain, lens or thread cursor. `parked_prefix_preserved` shows that Claude's last request before a handoff is a prefix of its first request after returning, for any capsule summarizer and any work on the other Agent. `claude_append_only` and `model_switch_prefix` show the same for any event trace and a Tier 1 model switch. The prompt cache is per model, so after a switch the proof claims a message prefix and no cache hit.
+
+The model treats lines as bytes and leaves out JSON parsing, file truncation or rotation, and concurrent writers. It assumes the transcript only grows by appends.
+
+Rust conformance checks: `tail_chunking_matches_one_read` and `stale_cursor_replay_is_idempotent`.

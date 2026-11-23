@@ -14,7 +14,7 @@ const DEFAULT_TURNS: u32 = 1;
 const MAX_TURNS: u32 = 100;
 
 impl super::ControlServer {
-    fn record_for(&self, id: &str) -> Result<SessionRecord, ControlError> {
+    pub(super) fn record_for(&self, id: &str) -> Result<SessionRecord, ControlError> {
         self.registry
             .lock()
             .map_err(poisoned)?

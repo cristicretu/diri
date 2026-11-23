@@ -421,6 +421,24 @@ mod catalog {
                 "The latest conversation turns of an Agent."
             ),
             entry!(
+                Method::SESSION_THREAD_READ,
+                crate::thread::ThreadReadParams,
+                "ThreadReadResult",
+                "Structured thread items after a cursor in the Agent's transcript."
+            ),
+            entry!(
+                Method::SESSION_ANSWER_BLOCKER,
+                crate::thread::AnswerBlockerParams,
+                "{}",
+                "Approve or deny the permission prompt that is still showing."
+            ),
+            entry!(
+                Method::SESSION_HANDOFF_CAPSULE,
+                crate::thread::HandoffCapsuleParams,
+                "HandoffCapsuleResult",
+                "The deterministic capsule another Agent would continue this thread from."
+            ),
+            entry!(
                 Method::SESSION_MARK_SEEN,
                 SessionIdParams,
                 "{}",
