@@ -62,6 +62,9 @@ pub struct SandboxesPage {
     poll: Option<Task<()>>,
     /// Preview fixtures never poll.
     seeded: bool,
+    /// Session titles for the screenshot fixture, which has no store.
+    #[cfg(test)]
+    preview_owners: HashMap<String, String>,
     _events: Task<()>,
 }
 
@@ -102,6 +105,8 @@ impl SandboxesPage {
             watched_until: Instant::now(),
             poll: None,
             seeded: false,
+            #[cfg(test)]
+            preview_owners: HashMap::new(),
             _events: events_task,
         }
     }
@@ -385,6 +390,10 @@ impl SandboxesPage {
         let Some(owner) = &info.owner else {
             return t("settings.sandboxes.person").into();
         };
+        #[cfg(test)]
+        if let Some(title) = self.preview_owners.get(&owner.0) {
+            return title.clone();
+        }
         self.store
             .read()
             .expect("session store lock poisoned")
@@ -414,7 +423,9 @@ impl SandboxesPage {
             .enumerate()
             .map(|(index, (title, url))| SandboxInfo {
                 id: format!("g{}", index + 1),
-                owner: None,
+                // The person took over one an agent started; the others
+                // belong to the agents testing them.
+                owner: (index != 0).then(|| diri_proto::SessionId(format!("s{index}"))),
                 label: Some((*title).into()),
                 backend: SandboxBackendKind::Ghost,
                 url: (*url).into(),
@@ -433,6 +444,13 @@ impl SandboxesPage {
                 sleeping: index == 3,
             })
             .collect();
+        for (index, owner) in ["fix-signup-validation", "dashboard-charts", "docs-search"]
+            .into_iter()
+            .enumerate()
+        {
+            self.preview_owners
+                .insert(format!("s{}", index + 1), owner.into());
+        }
         for (sandbox, jpeg) in sandboxes.iter().zip(frames) {
             if let Some(image) = decode_jpeg(&jpeg) {
                 self.tiles.insert(sandbox.id.clone(), Tile { seq: 1, image });
@@ -539,8 +557,8 @@ impl SandboxesPage {
             tf("settings.sandboxes.disk", &[("disk", &bytes(usage.disk_bytes))]),
             tf("settings.sandboxes.processes", &[("count", &usage.processes)]),
             tf("settings.sandboxes.ready_in", &[("ms", &info.spin_up_ms)]),
-        ]
-        .join(" · ");
+        ];
+        let last = readout.len().saturating_sub(1);
         let name = info
             .label
             .clone()
@@ -585,8 +603,20 @@ impl SandboxesPage {
                                 div()
                                     .text_size(px(Typo::META.size))
                                     .text_color(colors.tertiary)
-                                    .whitespace_normal()
-                                    .child(readout),
+                                    // Wrap between facts, never inside
+                                    // one ("169 / ms").
+                                    .flex()
+                                    .flex_wrap()
+                                    .children(readout.into_iter().enumerate().map(
+                                        |(index, fact)| {
+                                            let fact = if index < last {
+                                                format!("{fact} ·\u{a0}")
+                                            } else {
+                                                fact
+                                            };
+                                            div().whitespace_nowrap().child(fact)
+                                        },
+                                    )),
                             ),
                     )
                     .child(
