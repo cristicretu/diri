@@ -18,31 +18,45 @@ use diri_proto::clip::{
     ClipRecord, ClipTarget, ClipTargetReason, ClipTargetsResult, ConversationPreview,
 };
 use diri_proto::{AgentKind, Method, SessionStatus};
-use diri_ui::{Fill, Glass, Palette, Radius, SemanticColors, Typo};
+use diri_ui::{AgentLogo, Fill, Glass, Palette, Radius, SemanticColors};
 use gpui::{
-    App, AppContext as _, Context, StyledImage as _, Div, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
-    ParentElement, Render, Styled, Window, div, prelude::FluentBuilder,
-    px,
+    AnyElement, App, AppContext as _, Context, Div, FocusHandle, InteractiveElement, IntoElement,
+    KeyDownEvent, ParentElement, Render, Styled, StyledImage as _, Window, div,
+    prelude::FluentBuilder, px,
 };
 
 use crate::i18n::{t, tf};
+use crate::navigation::{PALETTE_RADIUS, PALETTE_ROW_INSET, palette_selection, row_ink};
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
 
-pub(crate) const HUD_WIDTH: f32 = 560.0;
-pub(crate) const HUD_HEIGHT: f32 = 468.0;
-const THUMB_W: f32 = 132.0;
-const THUMB_H: f32 = 84.0;
+/// The ⌘K palette's width, so the two read as one family.
+pub(crate) const HUD_WIDTH: f32 = 460.0;
+/// The tallest the HUD gets; it is sized to its rows below that.
+pub(crate) const HUD_MAX_HEIGHT: f32 =
+    HEADER_HEIGHT + FILTER_HEIGHT + 2.0 * PALETTE_ROW_INSET + LIST_MAX + FOOTER_HEIGHT;
+const THUMB_W: f32 = 44.0;
+const THUMB_H: f32 = 34.0;
+/// Thumbnail plus 12 pt above and below, then the hairline.
+const HEADER_HEIGHT: f32 = THUMB_H + 24.0 + 1.0;
+const FILTER_HEIGHT: f32 = PALETTE_ROW_INSET + 30.0;
+const ROW_HEIGHT: f32 = 32.0;
+/// What the highlighted Session's one-line preview adds under its title:
+/// an 18 pt line tucked 6 pt up into the title's row.
+const PREVIEW_HEIGHT: f32 = 12.0;
+const PREVIEW_LINE: f32 = 18.0;
+const FOOTER_HEIGHT: f32 = 28.0;
 /// Rows shown at once; the list scrolls past them with the highlight.
-const VISIBLE_ROWS: usize = 5;
+const VISIBLE_ROWS: usize = 6;
+const LIST_MAX: f32 = ROW_HEIGHT * VISIBLE_ROWS as f32 + PREVIEW_HEIGHT;
 /// Agents offered for a new Session, the person's default first.
 const NEW_AGENT_KINDS: [&str; 2] = [AgentKind::CLAUDE_CODE_ID, AgentKind::CODEX_ID];
 
-/// Where ↩ sends the clip.
+/// Where ↩ sends the clip. With no row (nothing to send to), ↩ keeps the
+/// prompt with the clip in the ring.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Row {
     Target(usize),
     NewSession,
-    Ring,
 }
 
 /// Which field typing goes to.
@@ -124,20 +138,20 @@ impl HudModel {
         if self.new_cwd.is_some() {
             rows.push(Row::NewSession);
         }
-        rows.push(Row::Ring);
         rows
     }
 
-    pub(crate) fn highlighted(&self) -> Row {
+    pub(crate) fn highlighted(&self) -> Option<Row> {
         let rows = self.rows();
-        rows.get(self.highlight.min(rows.len() - 1))
-            .cloned()
-            .unwrap_or(Row::Ring)
+        let last = rows.len().checked_sub(1)?;
+        rows.get(self.highlight.min(last)).cloned()
     }
 
     pub(crate) fn move_highlight(&mut self, delta: isize) {
         let count = self.rows().len() as isize;
-        self.highlight = (self.highlight as isize + delta).rem_euclid(count) as usize;
+        if count > 0 {
+            self.highlight = (self.highlight as isize + delta).rem_euclid(count) as usize;
+        }
     }
 
     pub(crate) fn new_kind(&self) -> AgentKind {
@@ -149,20 +163,54 @@ impl HudModel {
         self.new_kind = (self.new_kind as isize + delta).rem_euclid(count) as usize;
     }
 
-    /// The `clip.dispatch` destination for the highlighted row.
-    pub(crate) fn destination(&self) -> serde_json::Value {
-        match self.highlighted() {
-            Row::Target(index) => serde_json::json!({
+    /// The `clip.dispatch` destination for the highlighted row, or the ring
+    /// when `ring` (⌘↩) or there is nowhere else.
+    pub(crate) fn destination(&self, ring: bool) -> serde_json::Value {
+        match self.highlighted().filter(|_| !ring) {
+            Some(Row::Target(index)) => serde_json::json!({
                 "type": "session",
                 "sessionID": self.targets[index].session_id.0,
             }),
-            Row::NewSession => serde_json::json!({
+            Some(Row::NewSession) => serde_json::json!({
                 "type": "new",
                 "kind": self.new_kind(),
                 "cwd": self.new_cwd.as_ref().map(|(cwd, _)| cwd.clone()).unwrap_or_default(),
             }),
-            Row::Ring => serde_json::json!({"type": "ring"}),
+            None => serde_json::json!({"type": "ring"}),
         }
+    }
+
+    /// Whether the find field is on screen: while typing in it, or while it
+    /// still narrows the list.
+    fn filtering(&self) -> bool {
+        self.field == Field::Filter || !self.filter.is_empty()
+    }
+
+    /// Project names only tell Sessions apart when there is more than one.
+    fn spans_projects(&self) -> bool {
+        let mut projects = self.targets.iter().filter_map(|t| t.project.as_deref());
+        projects
+            .next()
+            .is_some_and(|first| projects.any(|other| other != first))
+    }
+
+    /// The panel's height for what it shows now: no empty space under the
+    /// last row.
+    pub(crate) fn height(&self) -> f32 {
+        let rows = self.rows();
+        let shown = rows.len().clamp(1, VISIBLE_ROWS);
+        let preview = match self.highlighted() {
+            Some(Row::Target(index)) if preview_text(&self.targets[index].preview).is_some() => {
+                PREVIEW_HEIGHT
+            }
+            _ => 0.0,
+        };
+        HEADER_HEIGHT
+            + if self.filtering() { FILTER_HEIGHT } else { 0.0 }
+            + 2.0 * PALETTE_ROW_INSET
+            + ROW_HEIGHT * shown as f32
+            + preview
+            + FOOTER_HEIGHT
     }
 }
 
@@ -177,29 +225,62 @@ pub(crate) fn kind_label(kind: &AgentKind) -> String {
     }
 }
 
-fn status_label(status: &SessionStatus) -> &'static str {
-    match status {
-        SessionStatus::Starting => t("context_hud.status.starting"),
-        SessionStatus::Idle => t("context_hud.status.idle"),
-        SessionStatus::Working => t("context_hud.status.working"),
-        SessionStatus::NeedsInput(_) => t("context_hud.status.needs_input"),
-        SessionStatus::Exited(_) => t("context_hud.status.exited"),
-        SessionStatus::Unknown => "",
+/// Where the clip came from, as a person names it: `Slack`, `github.com`,
+/// `localhost:3000`, or the app. Never ids, paths or sizes.
+pub(crate) fn source_label(clip: &ClipRecord) -> (String, &'static str) {
+    let source = &clip.source;
+    if let Some(url) = source.url.as_deref() {
+        let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+        let authority = authority.rsplit('@').next().unwrap_or(authority);
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => (host, Some(port)),
+            _ => (authority, None),
+        };
+        let host = host.to_lowercase();
+        if matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]" | "0.0.0.0")
+            || host.ends_with(".localhost")
+        {
+            let label = match port {
+                Some(port) => format!("localhost:{port}"),
+                None => "localhost".to_owned(),
+            };
+            return (label, "chevron.left.forwardslash.chevron.right");
+        }
+        let host = host.strip_prefix("www.").unwrap_or(&host);
+        let named = [
+            ("slack.com", "Slack"),
+            ("github.com", "GitHub"),
+            ("linear.app", "Linear"),
+            ("figma.com", "Figma"),
+            ("docs.google.com", "Google Docs"),
+            ("notion.so", "Notion"),
+            ("vercel.com", "Vercel"),
+        ]
+        .into_iter()
+        .find(|(domain, _)| host == *domain || host.ends_with(&format!(".{domain}")));
+        if let Some((_, name)) = named {
+            return (name.to_owned(), "network");
+        }
+        if !host.is_empty() {
+            return (host.to_owned(), "network");
+        }
     }
+    let app = source
+        .app_name
+        .clone()
+        .or_else(|| source.browser.clone())
+        .unwrap_or_default();
+    (app, "rectangle")
 }
 
-fn reason_label(reason: ClipTargetReason) -> Option<&'static str> {
-    match reason {
-        ClipTargetReason::Remembered => Some(t("context_hud.reason.remembered")),
-        ClipTargetReason::ServesPort => Some(t("context_hud.reason.serves_port")),
-        ClipTargetReason::Recent => None,
-    }
-}
-
-fn host_and_path(url: &str) -> String {
-    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
-    crate::context_hud::ellipsize(rest.trim_end_matches('/'), 64)
+/// The latest word in the conversation: the agent's reply, else the prompt.
+fn preview_text(preview: &ConversationPreview) -> Option<&str> {
+    preview
+        .agent
+        .as_deref()
+        .or(preview.user.as_deref())
+        .filter(|text| !text.trim().is_empty())
 }
 
 pub(crate) fn ellipsize(text: &str, max: usize) -> String {
@@ -213,59 +294,57 @@ pub(crate) fn ellipsize(text: &str, max: usize) -> String {
     cut
 }
 
-fn key_cap(label: &str, colors: SemanticColors) -> Div {
-    div()
-        .px(px(5.0))
-        .py(px(1.0))
-        .rounded(px(Radius::CHIP))
-        .bg(Fill::subtle(colors))
-        .text_size(px(Typo::META.size))
-        .text_color(colors.secondary)
-        .child(label.to_owned())
+fn agent_mark(kind: &AgentKind, colors: SemanticColors) -> AnyElement {
+    AgentLogo::new(crate::session_presentation::ui_agent_kind(kind), 16.0, colors)
+        .badged(false)
+        .inset(0.08)
+        .into_any_element()
 }
 
-fn hint(keys: &str, label: &str, colors: SemanticColors) -> Div {
-    div()
-        .flex()
-        .items_center()
-        .gap(px(5.0))
-        .child(key_cap(keys, colors))
-        .child(
-            div()
-                .text_size(px(Typo::META.size))
-                .text_color(colors.secondary)
-                .child(label.to_owned()),
-        )
-}
-
+/// The clip, quietly: its thumbnail, the prompt as the focal line, and
+/// where it came from underneath.
 fn header(model: &HudModel, colors: SemanticColors) -> Div {
     let clip = &model.clip;
     let thumbnail = match clip.png_path.as_deref() {
         Some(path) => gpui::img(std::path::PathBuf::from(path))
-            .w(px(THUMB_W))
-            .h(px(THUMB_H))
+            .size_full()
             .object_fit(gpui::ObjectFit::Cover)
             .into_any_element(),
         None => div().into_any_element(),
     };
-    let subtitle = clip
-        .source
-        .url
-        .as_deref()
-        .map(host_and_path)
-        .or_else(|| clip.source.window_title.clone())
-        .unwrap_or_default();
-    let excerpt = clip.text.as_deref().map(|text| ellipsize(text, 150));
+    let (source, icon) = source_label(clip);
+    let editor = &model.prompt;
+    let active = model.field == Field::Prompt;
+    let prompt = if editor.is_empty() {
+        div()
+            .flex()
+            .items_center()
+            .text_color(colors.tertiary)
+            .when(active, |d| {
+                d.child(div().w(px(1.5)).h(px(17.0)).mr(px(1.0)).bg(Palette::CLAY))
+            })
+            .child(t("context_hud.prompt_placeholder").to_owned())
+            .into_any_element()
+    } else if active {
+        crate::navigation::query_label(editor)
+    } else {
+        div().child(editor.text().to_owned()).into_any_element()
+    };
     div()
+        .flex_none()
+        .h(px(HEADER_HEIGHT))
         .flex()
+        .items_center()
         .gap(px(12.0))
-        .p(px(12.0))
+        .px(px(PALETTE_ROW_INSET + 10.0))
+        .border_b_1()
+        .border_color(colors.primary.alpha(0.06))
         .child(
             div()
                 .flex_none()
                 .w(px(THUMB_W))
                 .h(px(THUMB_H))
-                .rounded(px(Radius::ROW))
+                .rounded(px(Radius::CHIP))
                 .overflow_hidden()
                 .border_1()
                 .border_color(colors.floating_stroke())
@@ -278,359 +357,306 @@ fn header(model: &HudModel, colors: SemanticColors) -> Div {
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .gap(px(4.0))
+                .gap(px(1.0))
                 .child(
-                    div().flex().child(
-                        div()
-                            .px(px(8.0))
-                            .py(px(2.0))
-                            .rounded(px(Radius::BADGE))
-                            .bg(Palette::CLAY.alpha(0.16))
-                            .text_color(colors.primary)
-                            .text_size(px(Typo::META.size))
-                            .font_weight(Typo::TITLE.weight)
-                            .child(clip.summary()),
-                    ),
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_size(px(15.0))
+                        .text_color(colors.primary)
+                        .child(prompt),
                 )
-                .when(!subtitle.is_empty(), |d| {
-                    d.child(
-                        div()
-                            .text_size(px(Typo::META.size))
-                            .text_color(colors.secondary)
-                            .truncate()
-                            .child(subtitle),
-                    )
-                })
-                .when_some(excerpt, |d, excerpt| {
-                    d.child(
-                        div()
-                            .text_size(px(Typo::META.size))
-                            .text_color(colors.tertiary)
-                            .line_clamp(2)
-                            .child(excerpt),
-                    )
-                }),
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .text_size(px(11.5))
+                        .text_color(colors.tertiary)
+                        .child(crate::icons::sf_symbol(icon, 10.0, colors.tertiary))
+                        .child(div().truncate().child(source)),
+                ),
         )
 }
 
-fn field(
-    editor: &QueryEditor,
-    placeholder: &str,
-    icon: &'static str,
-    active: bool,
-    colors: SemanticColors,
-) -> Div {
+/// The find field, palette-style: an inset pill, only while finding.
+fn filter_field(model: &HudModel, colors: SemanticColors) -> Div {
+    let editor = &model.filter;
+    let active = model.field == Field::Filter;
     div()
+        .flex_none()
+        .mt(px(PALETTE_ROW_INSET))
+        .mx(px(PALETTE_ROW_INSET))
+        .h(px(FILTER_HEIGHT - PALETTE_ROW_INSET))
+        .px(px(10.0))
+        .rounded(px(Radius::inner(PALETTE_RADIUS, PALETTE_ROW_INSET)))
+        .bg(Fill::subtle(colors))
         .flex()
         .items_center()
         .gap(px(8.0))
-        .px(px(12.0))
-        .h(px(36.0))
-        .child(crate::icons::sf_symbol(icon, 13.0, colors.secondary))
+        .text_size(px(13.0))
+        .child(crate::icons::sf_symbol(
+            "magnifyingglass",
+            12.0,
+            colors.tertiary,
+        ))
         .child(
             div()
                 .flex_1()
                 .min_w_0()
                 .overflow_hidden()
-                .text_size(px(14.0))
                 .text_color(if editor.is_empty() {
                     colors.tertiary
                 } else {
                     colors.primary
                 })
                 .child(if editor.is_empty() {
-                    if active {
-                        div()
-                            .flex()
-                            .child(div().w(px(1.5)).h(px(16.0)).bg(Palette::CLAY))
-                            .child(div().pl(px(2.0)).child(placeholder.to_owned()))
-                            .into_any_element()
-                    } else {
-                        div().child(placeholder.to_owned()).into_any_element()
-                    }
+                    t("context_hud.filter_placeholder").to_owned().into_any_element()
                 } else if active {
                     crate::navigation::query_label(editor)
                 } else {
-                    div().child(editor.text().to_owned()).into_any_element()
+                    editor.text().to_owned().into_any_element()
                 }),
         )
 }
 
-fn preview_lines(preview: &ConversationPreview, colors: SemanticColors) -> Div {
-    let line = |who: &str, text: &str| {
-        div()
-            .flex()
-            .gap(px(6.0))
-            .text_size(px(Typo::META.size))
-            .child(
-                div()
-                    .flex_none()
-                    .text_color(colors.tertiary)
-                    .child(who.to_owned()),
-            )
-            .child(
-                div()
-                    .min_w_0()
-                    .text_color(colors.secondary)
-                    .truncate()
-                    .child(text.to_owned()),
-            )
-    };
+/// A palette row: leading glyph, title, at most one quiet cue.
+fn row(
+    leading: AnyElement,
+    title: String,
+    cue: Option<(String, gpui::Rgba)>,
+    preview: Option<&str>,
+    highlighted: bool,
+    colors: SemanticColors,
+) -> Div {
+    let ink = row_ink(colors, highlighted);
     div()
-        .flex()
-        .flex_col()
-        .gap(px(2.0))
-        .pl(px(18.0))
-        .pt(px(3.0))
-        .when_some(preview.user.as_deref(), |d, text| {
-            d.child(line(t("context_hud.preview.you"), text))
-        })
-        .when_some(preview.agent.as_deref(), |d, text| {
-            d.child(line(t("context_hud.preview.agent"), text))
-        })
-}
-
-fn row_shell(selected: bool, colors: SemanticColors) -> Div {
-    div()
-        .mx(px(6.0))
-        .px(px(8.0))
-        .py(px(6.0))
-        .rounded(px(Radius::ROW))
-        .when(selected, |d| d.bg(Fill::selected(colors, true)))
-}
-
-fn target_row(target: &ClipTarget, selected: bool, colors: SemanticColors) -> Div {
-    let remembered = reason_label(target.reason);
-    let mut meta: Vec<String> = vec![kind_label(&target.kind)];
-    let status = status_label(&target.status);
-    if !status.is_empty() {
-        meta.push(status.to_owned());
-    }
-    let dot = match target.status {
-        SessionStatus::Working => Palette::CLAY,
-        SessionStatus::NeedsInput(_) => colors.primary,
-        _ => colors.tertiary,
-    };
-    row_shell(selected, colors)
+        .flex_none()
+        .mx(px(PALETTE_ROW_INSET))
+        .px(px(10.0))
+        .rounded(px(Radius::inner(PALETTE_RADIUS, PALETTE_ROW_INSET)))
+        .when(highlighted, |d| d.bg(palette_selection()))
+        .text_color(ink.primary)
         .child(
             div()
+                .h(px(ROW_HEIGHT))
                 .flex()
                 .items_center()
                 .gap(px(8.0))
-                .child(div().flex_none().size(px(7.0)).rounded_full().bg(dot))
+                .text_size(px(13.0))
                 .child(
                     div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(px(Typo::ROW.size))
-                        .font_weight(if selected {
-                            Typo::ROW_EMPHASIZED.weight
-                        } else {
-                            Typo::ROW.weight
-                        })
-                        .child(ellipsize(&target.title, 48)),
+                        .w(px(16.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(leading),
                 )
-                .when_some(target.project.clone(), |d, project| {
+                .child(div().flex_1().min_w_0().truncate().child(title))
+                .when_some(cue, |d, (cue, color)| {
+                    let color = if highlighted { ink.secondary } else { color };
                     d.child(
                         div()
                             .flex_none()
-                            .text_size(px(Typo::META.size))
-                            .text_color(colors.tertiary)
-                            .child(project),
+                            .text_size(px(12.0))
+                            .text_color(color)
+                            .child(cue),
                     )
-                })
-                .child(
-                    div()
-                        .flex_none()
-                        .flex()
-                        .gap(px(4.0))
-                        .text_size(px(Typo::META.size))
-                        .text_color(colors.secondary)
-                        .when_some(remembered, |d, reason| {
-                            let color = if target.reason == ClipTargetReason::Remembered {
-                                Palette::CLAY
-                            } else {
-                                colors.secondary
-                            };
-                            d.child(div().text_color(color).child(reason.to_owned()))
-                                .child("·")
-                        })
-                        .child(meta.join(" · ")),
-                ),
+                }),
         )
-        .when(selected && !target.preview.is_empty(), |d| {
-            d.child(preview_lines(&target.preview, colors))
+        .when_some(preview, |d, text| {
+            d.child(
+                div()
+                    .h(px(PREVIEW_LINE))
+                    .mt(px(PREVIEW_HEIGHT - PREVIEW_LINE))
+                    .pl(px(24.0))
+                    .text_size(px(11.5))
+                    .text_color(ink.tertiary)
+                    .truncate()
+                    .child(ellipsize(text, 90)),
+            )
         })
 }
 
-fn action_row(icon: &'static str, label: String, extra: Option<String>, selected: bool, colors: SemanticColors) -> Div {
-    row_shell(selected, colors).child(
-        div()
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .child(crate::icons::sf_symbol(icon, 12.0, colors.secondary))
-            .child(
+fn target_row(
+    target: &ClipTarget,
+    spans_projects: bool,
+    highlighted: bool,
+    colors: SemanticColors,
+) -> Div {
+    let ink = row_ink(colors, highlighted);
+    // The agent's mark, with a dot only while it is busy or waiting: an idle
+    // Session needs no badge.
+    let dot = match target.status {
+        SessionStatus::Working => Some(Palette::CLAY),
+        SessionStatus::NeedsInput(_) => Some(ink.primary),
+        _ => None,
+    };
+    let leading = div()
+        .relative()
+        .size(px(16.0))
+        .child(agent_mark(&target.kind, ink))
+        .when_some(dot, |d, dot| {
+            d.child(
                 div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(Typo::ROW.size))
-                    .child(label),
+                    .absolute()
+                    .right(px(-2.0))
+                    .bottom(px(-2.0))
+                    .size(px(7.0))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(if highlighted {
+                        palette_selection()
+                    } else {
+                        colors.floating_surface()
+                    })
+                    .bg(dot),
             )
-            .when_some(extra, |d, extra| {
-                d.child(
-                    div()
-                        .flex_none()
-                        .text_size(px(Typo::META.size))
-                        .text_color(colors.tertiary)
-                        .child(extra),
-                )
-            }),
+        })
+        .into_any_element();
+    let cue = match target.reason {
+        ClipTargetReason::Remembered => {
+            Some((t("context_hud.reason.remembered").to_owned(), Palette::CLAY))
+        }
+        ClipTargetReason::ServesPort => {
+            Some((t("context_hud.reason.serves_port").to_owned(), colors.tertiary))
+        }
+        ClipTargetReason::Recent => target
+            .project
+            .clone()
+            .filter(|_| spans_projects)
+            .map(|project| (project, colors.tertiary)),
+    };
+    let preview = highlighted
+        .then(|| preview_text(&target.preview))
+        .flatten();
+    row(
+        leading,
+        ellipsize(&target.title, 60),
+        cue,
+        preview,
+        highlighted,
+        colors,
     )
-}
-
-fn divider(colors: SemanticColors) -> Div {
-    div().h(px(1.0)).w_full().bg(colors.floating_stroke())
 }
 
 /// The whole HUD for `model` in `colors`.
 pub(crate) fn hud_view(model: &HudModel, colors: SemanticColors) -> Div {
     let rows = model.rows();
     let highlight = model.highlight.min(rows.len().saturating_sub(1));
+    let spans_projects = model.spans_projects();
     // Keep the highlight in view: a window of VISIBLE_ROWS around it.
     let first = highlight.saturating_sub(VISIBLE_ROWS - 1);
-    let list = rows
+    let mut list = rows
         .iter()
         .enumerate()
         .skip(first)
         .take(VISIBLE_ROWS)
-        .map(|(index, row)| {
-            let selected = index == highlight;
-            match row {
-                Row::Target(target) => target_row(&model.targets[*target], selected, colors),
+        .map(|(index, row_kind)| {
+            let highlighted = index == highlight;
+            match row_kind {
+                Row::Target(target) => {
+                    target_row(&model.targets[*target], spans_projects, highlighted, colors)
+                }
                 Row::NewSession => {
+                    let ink = row_ink(colors, highlighted);
                     let project = model
                         .new_cwd
                         .as_ref()
                         .map(|(_, name)| name.as_str())
                         .unwrap_or_default();
-                    action_row(
-                        "plus",
-                        tf(
-                            "context_hud.new_session",
-                            &[("agent", &kind_label(&model.new_kind())), ("project", &project)],
-                        ),
-                        selected.then(|| t("context_hud.new_session_cycle").to_owned()),
-                        selected,
+                    row(
+                        crate::icons::sf_symbol("plus", 12.0, ink.secondary),
+                        tf("context_hud.new_session", &[("project", &project)]),
+                        highlighted.then(|| (kind_label(&model.new_kind()), colors.tertiary)),
+                        None,
+                        highlighted,
                         colors,
                     )
                 }
-                Row::Ring => action_row(
-                    "archivebox",
-                    t("context_hud.save_to_ring").to_owned(),
-                    None,
-                    selected,
-                    colors,
-                ),
             }
         })
         .collect::<Vec<_>>();
+    if list.is_empty() {
+        let note = if model.loading {
+            t("context_hud.loading")
+        } else {
+            t("context_hud.no_sessions")
+        };
+        list.push(
+            div()
+                .h(px(ROW_HEIGHT))
+                .px(px(PALETTE_ROW_INSET + 10.0))
+                .flex()
+                .items_center()
+                .text_size(px(13.0))
+                .text_color(colors.tertiary)
+                .child(note.to_owned()),
+        );
+    }
     let status: Option<(String, gpui::Rgba)> = match &model.phase {
-        Phase::Ready if model.loading => Some((t("context_hud.loading").to_owned(), colors.tertiary)),
         Phase::Ready => None,
         Phase::Sending => Some((t("context_hud.sending").to_owned(), colors.secondary)),
         Phase::Sent(to) => Some((tf("context_hud.sent", &[("target", to)]), Palette::CLAY)),
         Phase::Failed(error) => Some((error.clone(), colors.primary)),
     };
+    let hint = |label: &str, key: &str| {
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .px(px(6.0))
+            .child(div().text_color(colors.secondary).child(label.to_owned()))
+            .child(div().text_color(colors.tertiary).child(key.to_owned()))
+    };
     div()
         .w(px(HUD_WIDTH))
-        .h(px(HUD_HEIGHT))
+        .h(px(model.height()))
         .flex()
         .flex_col()
-        .rounded(px(Radius::FLOATING_MENU))
+        .rounded(px(PALETTE_RADIUS))
         .overflow_hidden()
         .text_color(colors.primary)
-        .text_size(px(Typo::ROW.size))
         .bg(Glass::panel_fill(colors))
         .border_1()
         .border_color(colors.floating_stroke())
         .child(header(model, colors))
-        .child(divider(colors))
-        .child(field(
-            &model.prompt,
-            t("context_hud.prompt_placeholder"),
-            "pencil",
-            model.field == Field::Prompt,
-            colors,
-        ))
-        .child(divider(colors))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .px(px(14.0))
-                .pt(px(8.0))
-                .pb(px(4.0))
-                .child(
-                    div()
-                        .text_size(px(Typo::SECTION_HEADER.size))
-                        .font_weight(Typo::SECTION_HEADER.weight)
-                        .text_color(colors.tertiary)
-                        .child(t("context_hud.send_to").to_owned()),
-                )
-                .child(
-                    div()
-                        .w(px(200.0))
-                        .rounded(px(Radius::CHIP))
-                        .when(model.field == Field::Filter, |d| d.bg(Fill::subtle(colors)))
-                        .child(
-                            field(
-                                &model.filter,
-                                t("context_hud.filter_placeholder"),
-                                "magnifyingglass",
-                                model.field == Field::Filter,
-                                colors,
-                            )
-                            .h(px(24.0))
-                            .px(px(6.0)),
-                        ),
-                ),
-        )
+        .when(model.filtering(), |d| d.child(filter_field(model, colors)))
         .child(
             div()
                 .flex_1()
                 .min_h_0()
                 .overflow_hidden()
+                .py(px(PALETTE_ROW_INSET))
                 .flex()
                 .flex_col()
-                .gap(px(1.0))
                 .children(list),
         )
-        .child(divider(colors))
         .child(
             div()
+                .flex_none()
+                .h(px(FOOTER_HEIGHT))
                 .flex()
                 .items_center()
-                .gap(px(14.0))
-                .px(px(14.0))
-                .h(px(34.0))
-                .child(hint("↩", t("context_hud.hint.send"), colors))
-                .child(hint("⌘↩", t("context_hud.hint.save"), colors))
-                .child(hint("⇥", t("context_hud.hint.find"), colors))
-                .child(hint("esc", t("context_hud.hint.close"), colors))
-                .child(div().flex_1())
-                .when_some(status, |d, (text, color)| {
-                    d.child(
-                        div()
-                            .text_size(px(Typo::META.size))
-                            .text_color(color)
-                            .truncate()
-                            .child(text),
-                    )
-                }),
+                .gap(px(2.0))
+                .pl(px(PALETTE_ROW_INSET + 10.0))
+                .pr(px(PALETTE_ROW_INSET + 4.0))
+                .border_t_1()
+                .border_color(colors.primary.alpha(0.06))
+                .text_size(px(11.5))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .when_some(status, |d, (text, color)| d.text_color(color).child(text)),
+                )
+                .child(hint(t("context_hud.hint.send"), "↩"))
+                .child(hint(t("context_hud.hint.find"), "⇥"))
+                .child(hint(t("context_hud.hint.close"), "esc")),
         )
 }
 
@@ -640,6 +666,8 @@ pub(crate) struct ContextHud {
     colors: SemanticColors,
     focus: FocusHandle,
     services: Option<HudServices>,
+    /// The height the panel was last sized to.
+    height: f32,
 }
 
 #[derive(Clone)]
@@ -656,6 +684,7 @@ impl ContextHud {
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
+            height: model.height(),
             model,
             colors,
             focus: cx.focus_handle(),
@@ -701,16 +730,12 @@ impl ContextHud {
             "p" if modifiers.control => self.model.move_highlight(-1),
             "n" if modifiers.control => self.model.move_highlight(1),
             "left" | "right"
-                if self.model.highlighted() == Row::NewSession && self.editor().is_empty() =>
+                if self.model.highlighted() == Some(Row::NewSession) && self.editor().is_empty() =>
             {
                 self.model
                     .cycle_new_kind(if event.keystroke.key == "left" { -1 } else { 1 });
             }
-            "enter" if modifiers.platform => {
-                self.model.highlight = self.model.rows().len() - 1;
-                self.dispatch(window, cx);
-            }
-            "enter" => self.dispatch(window, cx),
+            "enter" => self.dispatch(modifiers.platform, window, cx),
             _ => {
                 if let Some(edit) = query_editor::edit_for(&event.keystroke) {
                     let filter = self.model.field == Field::Filter;
@@ -738,19 +763,21 @@ impl ContextHud {
         cx.notify();
     }
 
-    fn dispatch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Sends to the highlighted row, or with `ring` (⌘↩) only keeps the
+    /// prompt with the clip in the ring.
+    fn dispatch(&mut self, ring: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(services) = self.services.clone() else {
             return;
         };
-        let target = match self.model.highlighted() {
-            Row::Target(index) => self.model.targets[index].title.clone(),
-            Row::NewSession => kind_label(&self.model.new_kind()),
-            Row::Ring => t("context_hud.ring_name").to_owned(),
+        let target = match self.model.highlighted().filter(|_| !ring) {
+            Some(Row::Target(index)) => self.model.targets[index].title.clone(),
+            Some(Row::NewSession) => kind_label(&self.model.new_kind()),
+            None => t("context_hud.ring_name").to_owned(),
         };
         let params = serde_json::json!({
             "id": self.model.clip.id,
             "prompt": self.model.prompt.text(),
-            "destination": self.model.destination(),
+            "destination": self.model.destination(ring),
         });
         self.model.phase = Phase::Sending;
         cx.notify();
@@ -821,7 +848,17 @@ impl ContextHud {
 }
 
 impl Render for ContextHud {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Rows arrive after the panel opens and the find field comes and
+        // goes: keep the panel exactly as tall as what it shows.
+        let height = self.model.height();
+        if (height - self.height).abs() > 0.5 {
+            self.height = height;
+            #[cfg(target_os = "macos")]
+            crate::macos::context_hud_panel::fit_height(window, height, cx.foreground_executor());
+            #[cfg(not(target_os = "macos"))]
+            window.resize(gpui::size(px(HUD_WIDTH), px(height)));
+        }
         div()
             .id("context-hud")
             .track_focus(&self.focus)
@@ -866,7 +903,7 @@ pub(crate) fn open(clip: ClipRecord, services: HudServices, cx: &mut App) {
         model.new_kind = index;
     }
     #[cfg(target_os = "macos")]
-    let bounds = crate::macos::context_hud_panel::frame(HUD_WIDTH, HUD_HEIGHT);
+    let bounds = crate::macos::context_hud_panel::frame(HUD_WIDTH, model.height(), HUD_MAX_HEIGHT);
     #[cfg(not(target_os = "macos"))]
     let bounds = None;
     let options = gpui::WindowOptions {
@@ -1094,33 +1131,30 @@ mod tests {
     #[test]
     fn the_remembered_session_is_preselected() {
         let model = model();
-        assert_eq!(model.highlighted(), Row::Target(0));
+        assert_eq!(model.highlighted(), Some(Row::Target(0)));
         assert_eq!(
-            model.destination(),
+            model.destination(false),
             serde_json::json!({"type": "session", "sessionID": "s1"})
         );
+        assert_eq!(model.destination(true), serde_json::json!({"type": "ring"}));
     }
 
     #[test]
-    fn rows_end_with_new_session_and_ring_and_wrap() {
+    fn rows_end_with_new_session_and_wrap() {
         let mut model = model();
         assert_eq!(
             model.rows(),
-            [Row::Target(0), Row::Target(1), Row::Target(2), Row::NewSession, Row::Ring]
+            [Row::Target(0), Row::Target(1), Row::Target(2), Row::NewSession]
         );
         model.move_highlight(-1);
-        assert_eq!(model.highlighted(), Row::Ring);
-        assert_eq!(model.destination(), serde_json::json!({"type": "ring"}));
-        model.move_highlight(-1);
-        assert_eq!(model.highlighted(), Row::NewSession);
-        assert_eq!(model.destination()["type"], "new");
+        assert_eq!(model.highlighted(), Some(Row::NewSession));
+        assert_eq!(model.destination(false)["type"], "new");
         assert_eq!(model.new_kind().id(), AgentKind::CLAUDE_CODE_ID);
         model.cycle_new_kind(1);
         assert_eq!(model.new_kind().id(), AgentKind::CODEX_ID);
-        assert_eq!(model.destination()["cwd"], "/tmp/checkout");
+        assert_eq!(model.destination(false)["cwd"], "/tmp/checkout");
         model.move_highlight(1);
-        model.move_highlight(1);
-        assert_eq!(model.highlighted(), Row::Target(0));
+        assert_eq!(model.highlighted(), Some(Row::Target(0)));
     }
 
     #[test]
@@ -1136,15 +1170,51 @@ mod tests {
         assert_eq!(model.visible_targets(), [2]);
         model.filter.clear();
         model.filter.insert("nothing matches");
-        assert_eq!(model.rows(), [Row::NewSession, Row::Ring]);
+        assert_eq!(model.rows(), [Row::NewSession]);
     }
 
     #[test]
-    fn without_a_project_there_is_no_new_session_row() {
+    fn with_nowhere_to_send_the_prompt_stays_with_the_clip() {
         let mut model = HudModel::new(sample_clip(None), None);
         model.set_targets(Vec::new());
-        assert_eq!(model.rows(), [Row::Ring]);
-        assert_eq!(model.highlighted(), Row::Ring);
+        assert!(model.rows().is_empty());
+        assert_eq!(model.highlighted(), None);
+        model.move_highlight(1);
+        assert_eq!(model.destination(false), serde_json::json!({"type": "ring"}));
+    }
+
+    #[test]
+    fn the_panel_is_as_tall_as_its_rows() {
+        let mut model = model();
+        let with_preview = model.height();
+        model.move_highlight(1);
+        // The second Session has no conversation yet, so no preview line.
+        assert_eq!(model.height(), with_preview - PREVIEW_HEIGHT);
+        model.field = Field::Filter;
+        assert_eq!(model.height(), with_preview - PREVIEW_HEIGHT + FILTER_HEIGHT);
+        model.filter.insert("nothing matches");
+        model.new_cwd = None;
+        // One quiet "No sessions" line, never a collapsed panel.
+        assert_eq!(
+            model.height(),
+            HEADER_HEIGHT + FILTER_HEIGHT + 2.0 * PALETTE_ROW_INSET + ROW_HEIGHT + FOOTER_HEIGHT
+        );
+        assert!(with_preview <= HUD_MAX_HEIGHT);
+    }
+
+    #[test]
+    fn sources_read_as_people_name_them() {
+        let mut clip = sample_clip(None);
+        assert_eq!(source_label(&clip).0, "Slack");
+        clip.source.url = Some("http://127.0.0.1:3000/settings?tab=2".into());
+        assert_eq!(source_label(&clip).0, "localhost:3000");
+        clip.source.url = Some("https://www.example.com/a/b".into());
+        assert_eq!(source_label(&clip).0, "example.com");
+        clip.source.url = Some("https://user:secret@github.com/o/r/pull/1".into());
+        assert_eq!(source_label(&clip).0, "GitHub");
+        clip.source.url = None;
+        clip.source.app_name = Some("Figma".into());
+        assert_eq!(source_label(&clip).0, "Figma");
     }
 
     /// Renders the HUD in light and dark to `DIRI_VISUAL_OUTPUT` (a
@@ -1194,7 +1264,7 @@ mod tests {
                 }
             }
             let window = cx
-                .open_window(size(px(HUD_WIDTH + 80.0), px(HUD_HEIGHT + 80.0)), |_, cx| {
+                .open_window(size(px(HUD_WIDTH + 80.0), px(HUD_MAX_HEIGHT + 40.0)), |_, cx| {
                     cx.new(|_| Backdrop(model, colors))
                 })
                 .unwrap();

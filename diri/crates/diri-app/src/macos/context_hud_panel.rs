@@ -27,9 +27,11 @@ fn ns_window(window: &Window) -> Option<Retained<NSWindow>> {
     view.window()
 }
 
-/// Centred horizontally on the screen under the pointer, a third of the
-/// way down its visible area, in GPUI's top-left global coordinates.
-pub(crate) fn frame(width: f32, height: f32) -> Option<Bounds<Pixels>> {
+/// Centred horizontally on the screen under the pointer, with its top where
+/// a `max_height` panel would sit a third of the way down the visible area,
+/// in GPUI's top-left global coordinates. The panel then grows and shrinks
+/// downward from that top edge.
+pub(crate) fn frame(width: f32, height: f32, max_height: f32) -> Option<Bounds<Pixels>> {
     let mtm = MainThreadMarker::new()?;
     let pointer = NSEvent::mouseLocation();
     let screens = NSScreen::screens(mtm);
@@ -48,7 +50,7 @@ pub(crate) fn frame(width: f32, height: f32) -> Option<Bounds<Pixels>> {
     let primary_height = primary.frame().size.height;
     let x = visible.origin.x + (visible.size.width - f64::from(width)) / 2.0;
     let top_appkit = visible.origin.y + visible.size.height
-        - (visible.size.height - f64::from(height)) / 3.0;
+        - (visible.size.height - f64::from(max_height)) / 3.0;
     // AppKit's origin is bottom-left of the primary screen; GPUI's is top-left.
     let y = primary_height - top_appkit;
     Some(Bounds {
@@ -91,6 +93,24 @@ pub(crate) fn prepare(window: &Window, radius: f32) {
         }
     }
     ns_window.makeKeyAndOrderFront(None);
+}
+
+/// Resizes the panel to `height`, keeping its top edge where it is. Deferred
+/// to the next turn of the run loop: AppKit must not resize a window from
+/// inside its own draw.
+pub(crate) fn fit_height(window: &Window, height: f32, executor: &gpui::ForegroundExecutor) {
+    let Some(ns_window) = ns_window(window) else {
+        return;
+    };
+    executor
+        .spawn(async move {
+            let mut rect = ns_window.frame();
+            let top = rect.origin.y + rect.size.height;
+            rect.size.height = f64::from(height);
+            rect.origin.y = top - rect.size.height;
+            ns_window.setFrame_display(rect, true);
+        })
+        .detach();
 }
 
 /// Screen Recording is off: macOS has already shown its own prompt once, so
