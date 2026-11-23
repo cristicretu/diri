@@ -50,6 +50,8 @@ actions!(
         Quit,
         HideApp,
         ShowApp,
+        CaptureContext,
+        SendLatestClip,
         NewWindow,
         CloseWindow,
         ReportProblem
@@ -192,6 +194,8 @@ pub enum CommandId {
     Quit,
     HideApp,
     ShowApp,
+    CaptureContext,
+    SendLatestClip,
     CloseWindow,
     NewWindow,
     CloseSession,
@@ -423,6 +427,30 @@ pub const COMMANDS: &[CommandSpec] = &[
     spec!(HideApp, "hide-app", Some("cmd-h"), Some("⌘H"), None),
     #[cfg(target_os = "macos")]
     spec!(ShowApp, "show-app", None, None, None),
+    // ⇧⌘2 sits beside macOS's own ⇧⌘3/4/5 screenshot keys, which it leaves
+    // alone, and no Diri command uses it.
+    #[cfg(target_os = "macos")]
+    spec!(
+        CaptureContext,
+        "capture-context",
+        Some("cmd-shift-2"),
+        Some("⇧⌘2"),
+        None,
+        "command.capture_context.palette_title",
+        "square.and.arrow.up",
+        "screenshot capture clip context ring browser slack ocr send feedback"
+    ),
+    #[cfg(target_os = "macos")]
+    spec!(
+        SendLatestClip,
+        "send-latest-clip",
+        None,
+        None,
+        None,
+        "command.send_latest_clip.palette_title",
+        "archivebox",
+        "clip context ring attach screenshot latest resend reattach @clip"
+    ),
     spec!(
         NewWindow,
         "new-window",
@@ -1537,8 +1565,8 @@ fn set_active_shortcut_overrides(overrides: &ShortcutOverrides) {
 
 impl CommandSpec {
     fn key_bindings(&self, overrides: &ShortcutOverrides) -> Vec<KeyBinding> {
-        // The system owns this binding, including while Diri is inactive.
-        if self.id == CommandId::ShowApp {
+        // The system owns these bindings, including while Diri is inactive.
+        if self.id.is_global() {
             return Vec::new();
         }
         self.effective_keystrokes(overrides)
@@ -1601,8 +1629,8 @@ impl CommandSpec {
     /// keys, or the one the user recorded) and then any keys added to it.
     pub fn effective_keystrokes(&self, overrides: &ShortcutOverrides) -> Vec<String> {
         let mut keys = self.primary_keystrokes(overrides);
-        // The global hotkey is registered with the system by one physical key.
-        if self.id == CommandId::ShowApp {
+        // A global hotkey is registered with the system by one physical key.
+        if self.id.is_global() {
             return keys;
         }
         for extra in extra_keys(overrides, self.stable_id) {
@@ -1664,6 +1692,8 @@ impl CommandSpec {
             CommandId::Quit => KeyBinding::new(key, Quit, context),
             CommandId::HideApp => KeyBinding::new(key, HideApp, context),
             CommandId::ShowApp => KeyBinding::new(key, ShowApp, context),
+            CommandId::CaptureContext => KeyBinding::new(key, CaptureContext, context),
+            CommandId::SendLatestClip => KeyBinding::new(key, SendLatestClip, context),
             CommandId::CloseWindow => KeyBinding::new(key, CloseWindow, context),
             CommandId::NewWindow => KeyBinding::new(key, NewWindow, context),
             CommandId::CloseSession => KeyBinding::new(key, CloseSession, context),
@@ -2089,10 +2119,8 @@ pub fn assign_shortcut(
         let clash = ShortcutClash {
             binding: binding.to_owned(),
             holder: holder.id,
-            can_replace: holder.id != CommandId::ShowApp,
-            can_swap: holder.id != CommandId::ShowApp
-                && id != CommandId::ShowApp
-                && !previous.is_empty(),
+            can_replace: !holder.id.is_global(),
+            can_swap: !holder.id.is_global() && !id.is_global() && !previous.is_empty(),
         };
         next = match resolution {
             Some(ShortcutResolution::Replace) if clash.can_replace => {
@@ -2137,7 +2165,7 @@ pub fn add_shortcut(
 ) -> Result<ShortcutOverrides, ShortcutClash> {
     let mut keys = command(id).effective_keystrokes(overrides);
     let only_key = in_place_of.is_some() && keys.len() <= 1;
-    if keys.is_empty() || only_key || id == CommandId::ShowApp {
+    if keys.is_empty() || only_key || id.is_global() {
         return assign_shortcut(overrides, id, binding, resolution);
     }
     let mut next = overrides.clone();
@@ -2145,7 +2173,7 @@ pub fn add_shortcut(
         let clash = ShortcutClash {
             binding: binding.to_owned(),
             holder: holder.id,
-            can_replace: holder.id != CommandId::ShowApp,
+            can_replace: !holder.id.is_global(),
             can_swap: false,
         };
         match resolution {
@@ -2762,6 +2790,16 @@ impl CommandId {
                 description: t("command.show_app.description"),
                 category: Application,
             },
+            Self::CaptureContext => ShortcutMetadata {
+                title: t("command.capture_context.title"),
+                description: t("command.capture_context.description"),
+                category: Application,
+            },
+            Self::SendLatestClip => ShortcutMetadata {
+                title: t("command.send_latest_clip.title"),
+                description: t("command.send_latest_clip.description"),
+                category: Application,
+            },
             Self::Quit => ShortcutMetadata {
                 title: crate::platform::quit_label(),
                 description: t("command.quit.description"),
@@ -2780,11 +2818,19 @@ fn session_slot_metadata(title: &'static str, description: &'static str) -> Shor
 }
 
 impl CommandId {
+    /// Registered with macOS as a system-wide hotkey rather than bound in
+    /// Diri's keymap, so it works while another app is in front.
+    pub fn is_global(self) -> bool {
+        matches!(self, Self::ShowApp | Self::CaptureContext)
+    }
+
     pub fn action(self) -> Box<dyn Action> {
         match self {
             Self::Quit => Box::new(Quit),
             Self::HideApp => Box::new(HideApp),
             Self::ShowApp => Box::new(ShowApp),
+            Self::CaptureContext => Box::new(CaptureContext),
+            Self::SendLatestClip => Box::new(SendLatestClip),
             Self::CloseWindow => Box::new(CloseWindow),
             Self::NewWindow => Box::new(NewWindow),
             Self::CloseSession => Box::new(CloseSession),
@@ -3541,8 +3587,10 @@ mod tests {
             .iter()
             .map(|command| command.key_bindings(&ShortcutOverrides::new()).len())
             .sum();
+        // Global hotkeys are registered with macOS, not the keymap.
         let expected: usize = COMMANDS
             .iter()
+            .filter(|command| !command.id.is_global())
             .map(|command| {
                 command
                     .effective_keystrokes(&ShortcutOverrides::new())

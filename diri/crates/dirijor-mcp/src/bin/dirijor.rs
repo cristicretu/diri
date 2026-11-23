@@ -117,6 +117,7 @@ fn run(arguments: &[String]) -> Result<(), CliError> {
         "artifacts" => artifacts(arguments.get(1..).unwrap_or_default()),
         "events" => events(arguments.get(1..).unwrap_or_default()),
         "ports" => ports(arguments.get(1..).unwrap_or_default()),
+        "clip" | "clips" => clip(arguments.get(1..).unwrap_or_default()),
         "note" | "notes" => notes::run(arguments.get(1..).unwrap_or_default()),
         "doctor" => doctor(),
         "actions" => api::actions(arguments.get(1..).unwrap_or_default()),
@@ -136,7 +137,7 @@ fn print_help() {
         "dirijor — Diri automation CLI\n\n\
          Usage:\n  dirijor status [--json]\n  dirijor activity [--limit N] [--json]\n  dirijor session <list|get|process|terminal-title|reset-terminal|read|send|key|wait|spawn|run|fork|reconnect|release|archive> ...\n  \
          dirijor worktree <list|create|remove> ...\n  dirijor artifacts <session> [--json]\n  \
-         dirijor events <subscribe|wait> ...\n  dirijor ports [--json]\n  dirijor doctor\n  \
+         dirijor events <subscribe|wait> ...\n  dirijor ports [--json]\n  dirijor clip <list|get|capture|send|delete> ...\n  dirijor doctor\n  \
          dirijor hook <event>\n  dirijor notify <json>\n  dirijor notify --title TEXT --body TEXT\n  dirijor mcp-tools\n  \
          dirijor mcp-call --tool <name> < input.json\n\n\
          dirijor workspace list | create NAME | rename ID NAME | remove ID | move ID INDEX\n  \
@@ -1374,6 +1375,147 @@ fn artifacts(arguments: &[String]) -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+/// `dirijor clip list|get|capture|send|delete`: the Context Ring.
+fn clip(arguments: &[String]) -> Result<(), CliError> {
+    let (action, rest) = arguments
+        .split_first()
+        .map_or(("list", &[][..]), |(action, rest)| (action.as_str(), rest));
+    let json = has_flag(rest, "--json");
+    match action {
+        "list" | "ls" => {
+            let limit = option_value(rest, "--limit")
+                .map(|n| {
+                    n.parse::<u32>()
+                        .map_err(|_| CliError::failure("--limit takes a number"))
+                })
+                .transpose()?
+                .unwrap_or(20);
+            let result = request(
+                Method::CLIP_LIST,
+                json!({"limit": limit}),
+                Duration::from_secs(5),
+            )?;
+            if json {
+                print_json(&result);
+                return Ok(());
+            }
+            let clips = result["clips"].as_array().cloned().unwrap_or_default();
+            if clips.is_empty() {
+                println!(
+                    "No clips. Capture one with Diri's capture shortcut or `dirijor clip capture`."
+                );
+            }
+            for clip in clips {
+                println!(
+                    "{}  {}  {}",
+                    clip["id"].as_str().unwrap_or_default(),
+                    clip_age(clip["createdAtMs"].as_u64().unwrap_or_default()),
+                    clip["summary"].as_str().unwrap_or_default(),
+                );
+            }
+            Ok(())
+        }
+        "get" | "show" => {
+            let id = positional(rest, 0).unwrap_or_else(|| "latest".into());
+            let clip = request(Method::CLIP_GET, json!({"id": id}), Duration::from_secs(5))
+                .map_err(|e| clip_not_found(e, &id))?;
+            if json {
+                print_json(&clip);
+                return Ok(());
+            }
+            println!("id:      {}", clip["id"].as_str().unwrap_or_default());
+            for (label, key) in [
+                ("app", "appName"),
+                ("url", "url"),
+                ("title", "pageTitle"),
+                ("window", "windowTitle"),
+            ] {
+                if let Some(value) = clip["source"][key].as_str() {
+                    println!("{label:<8} {value}");
+                }
+            }
+            if let Some(path) = clip["pngPath"].as_str() {
+                println!("png:     {path} ({}x{})", clip["width"], clip["height"]);
+            }
+            if let Some(text) = clip["text"].as_str() {
+                println!("\n{text}");
+            }
+            Ok(())
+        }
+        "capture" => {
+            let mut params = json!({});
+            if let Some(mode) = option_value(rest, "--mode") {
+                params["mode"] = json!(mode);
+            }
+            request(Method::CLIP_CAPTURE, params, Duration::from_secs(5))?;
+            println!("Asked Diri to open the capture overlay.");
+            Ok(())
+        }
+        "send" => {
+            let target = positional(rest, 0)
+                .ok_or_else(|| CliError::failure("clip send requires a session"))?;
+            let sessions = sessions()?;
+            let record = resolve_session(&target, &sessions)?;
+            let id = option_value(rest, "--id").unwrap_or_else(|| "latest".into());
+            let result = request(
+                Method::CLIP_DISPATCH,
+                json!({
+                    "id": id,
+                    "prompt": option_value(rest, "--prompt").unwrap_or_default(),
+                    "destination": {"type": "session", "sessionID": record.id.0},
+                }),
+                Duration::from_secs(30),
+            )
+            .map_err(|e| clip_not_found(e, &id))?;
+            if json {
+                print_json(&result);
+            } else {
+                println!(
+                    "Sent clip {} to {}.",
+                    result["clipId"].as_str().unwrap_or_default(),
+                    record.id.0
+                );
+            }
+            Ok(())
+        }
+        "delete" | "rm" => {
+            let id = positional(rest, 0)
+                .ok_or_else(|| CliError::failure("clip delete requires a clip id"))?;
+            request(
+                Method::CLIP_DELETE,
+                json!({"id": id}),
+                Duration::from_secs(5),
+            )
+            .map_err(|e| clip_not_found(e, &id))?;
+            Ok(())
+        }
+        other => Err(CliError::failure(format!(
+            "unknown clip command: {other} (list, get, capture, send, delete)"
+        ))),
+    }
+}
+
+fn clip_not_found(error: CliError, id: &str) -> CliError {
+    if error.code == EXIT_NOT_FOUND {
+        CliError::not_found(format!("no clip {id}"))
+    } else {
+        error
+    }
+}
+
+fn clip_age(created_at_ms: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let seconds = now.saturating_sub(created_at_ms) / 1000;
+    match seconds {
+        0..60 => format!("{seconds:>3}s"),
+        60..3600 => format!("{:>3}m", seconds / 60),
+        3600..86_400 => format!("{:>3}h", seconds / 3600),
+        _ => format!("{:>3}d", seconds / 86_400),
+    }
 }
 
 fn events(arguments: &[String]) -> Result<(), CliError> {

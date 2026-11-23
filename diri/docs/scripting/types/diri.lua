@@ -175,6 +175,7 @@ diri.session = {}
 diri.task = {}
 diri.schedule = {}
 diri.search = {}
+diri.clip = {}
 diri.computer = {}
 diri.host = {}
 diri.activity = {}
@@ -501,6 +502,48 @@ function diri.session.reveal(params, opts) end
 ---@param opts? {timeout?: number}
 ---@return table # {}
 function diri.session.open_api_request(params, opts) end
+
+---Add a capture (screenshot path, text, source page) to the Context Ring.
+---@param params? {source?: any, text?: string, textOrigin?: any, pngPath?: string, width?: integer, height?: integer}
+---@param opts? {timeout?: number}
+---@return table # ClipRecord
+function diri.clip.save(params, opts) end
+
+---Recent Context Ring clips, newest first, without text bodies.
+---@param params? {limit?: integer}
+---@param opts? {timeout?: number}
+---@return table # ClipListResult
+function diri.clip.list(params, opts) end
+
+---One clip with its extracted text, by id or latest.
+---@param params {id: string}
+---@param opts? {timeout?: number}
+---@return table # ClipRecord
+function diri.clip.get(params, opts) end
+
+---Remove a clip and its screenshot from the ring.
+---@param params {id: string}
+---@param opts? {timeout?: number}
+---@return table # {}
+function diri.clip.delete(params, opts) end
+
+---Sessions a clip can go to: the one this page was sent to last first, each with its latest exchange.
+---@param params {id: string}
+---@param opts? {timeout?: number}
+---@return table # ClipTargetsResult
+function diri.clip.targets(params, opts) end
+
+---Send a clip with a prompt to a Session or a new Agent, or keep it in the ring; remembers the page's Session.
+---@param params {id: string, prompt?: string, destination: any}
+---@param opts? {timeout?: number}
+---@return table # ClipDispatchResult
+function diri.clip.dispatch(params, opts) end
+
+---Ask the app to open the capture overlay.
+---@param params? {mode?: string}
+---@param opts? {timeout?: number}
+---@return table # {}
+function diri.clip.capture(params, opts) end
 
 ---One Cua Driver step under the caller's own cursor.
 ---@param params {sessionID: string, tool: string, args?: any}

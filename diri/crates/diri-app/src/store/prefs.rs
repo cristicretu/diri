@@ -939,6 +939,10 @@ pub struct Prefs {
     /// Physical macOS key code recorded with the global Show App binding.
     /// Keeping the native code avoids assuming a US keyboard layout.
     pub global_shortcut_key_code: Option<u16>,
+    /// Physical macOS key code recorded with Capture Context's global
+    /// binding. `None` while the default ⇧⌘2 is in use.
+    #[serde(default)]
+    pub capture_shortcut_key_code: Option<u16>,
     /// Session that should regain focus after the daemon's initial hydrate.
     pub last_selected_session: Option<SessionId>,
     /// herdr panes and conversations already brought over, so importing
@@ -1066,6 +1070,7 @@ impl Default for Prefs {
             launch_recipes: LaunchRecipeBook::default(),
             shortcut_overrides: BTreeMap::new(),
             global_shortcut_key_code: None,
+            capture_shortcut_key_code: None,
             last_selected_session: None,
             herdr_imported: Default::default(),
             whats_new_seen_version: crate::updates::CURRENT_VERSION.to_owned(),

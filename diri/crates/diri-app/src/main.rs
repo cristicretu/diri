@@ -14,6 +14,7 @@ mod code_editor;
 mod code_intelligence;
 mod code_viewer;
 mod commands;
+mod context_hud;
 mod daemon_launch;
 mod default_terminal;
 mod delegation;
@@ -628,6 +629,28 @@ fn main() {
                 .clone();
             macos::global_shortcut::install(cx, &prefs);
         }
+        let capture_services = context_hud::HudServices {
+            store: Arc::clone(&services.store),
+            tokio: Arc::clone(&services.tokio),
+        };
+        {
+            let capture_services = capture_services.clone();
+            cx.on_action(move |_: &commands::CaptureContext, cx| {
+                let services = capture_services.clone();
+                // Action dispatch may hold a window borrow; capture after it.
+                cx.defer(move |cx| context_hud::start_capture(services, false, cx));
+            });
+        }
+        {
+            let capture_services = capture_services.clone();
+            cx.on_action(move |_: &commands::SendLatestClip, cx| {
+                let services = capture_services.clone();
+                cx.defer(move |cx| context_hud::open_latest(services, cx));
+            });
+        }
+        // `dirijor clip capture` and Agents ask through the Engine; the
+        // request arrives as a store change, so nothing polls.
+        context_hud::watch_capture_requests(capture_services, cx);
         let window_services = services.clone();
         cx.on_action(move |_: &commands::NewWindow, cx| {
             let context = cx.active_window().and_then(|handle| {

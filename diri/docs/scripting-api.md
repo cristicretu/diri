@@ -78,6 +78,13 @@ Call one as `diri.call("session.list")` or through its generated function, `diri
 | `diri.session.delete_note` | `sessionID` | `{}` | Close a note's tab and move its file to the notes trash. |
 | `diri.session.reveal` | `sessionID` | `{}` | Ask the app to show a session without taking focus. |
 | `diri.session.open_api_request` | `sessionID, request` | `{}` | Open a prefilled HTTP request in a session's API tab. |
+| `diri.clip.save` | `source?, text?, textOrigin?, pngPath?, width?, height?` | `ClipRecord` | Add a capture (screenshot path, text, source page) to the Context Ring. |
+| `diri.clip.list` | `limit?` | `ClipListResult` | Recent Context Ring clips, newest first, without text bodies. |
+| `diri.clip.get` | `id` | `ClipRecord` | One clip with its extracted text, by id or latest. |
+| `diri.clip.delete` | `id` | `{}` | Remove a clip and its screenshot from the ring. |
+| `diri.clip.targets` | `id` | `ClipTargetsResult` | Sessions a clip can go to: the one this page was sent to last first, each with its latest exchange. |
+| `diri.clip.dispatch` | `id, destination, prompt?` | `ClipDispatchResult` | Send a clip with a prompt to a Session or a new Agent, or keep it in the ring; remembers the page's Session. |
+| `diri.clip.capture` | `mode?` | `{}` | Ask the app to open the capture overlay. |
 | `diri.computer.act` | `sessionID, tool, args?` | `Value` | One Cua Driver step under the caller's own cursor. |
 | `diri.computer.status` | `probe?` | `ComputerStatus` | Whether computer use is installed and allowed. |
 | `diri.computer.setup` | `action` | `ComputerStatus` | Install or restart computer use. |

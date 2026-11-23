@@ -82,7 +82,9 @@ impl super::ControlServer {
 
 /// Only local Claude Code and Codex sessions keep a transcript Diri can
 /// validate. Everything else reports why, so callers fall back to the screen.
-fn transcript_turns(record: &SessionRecord) -> Result<Vec<TranscriptTurnRecord>, String> {
+pub(super) fn transcript_turns(
+    record: &SessionRecord,
+) -> Result<Vec<TranscriptTurnRecord>, String> {
     if record.host.is_some() {
         return Err("remote session transcripts are not readable locally".into());
     }

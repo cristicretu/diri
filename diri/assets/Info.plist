@@ -71,6 +71,8 @@
     <true/>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>diri reads the front browser tab's address and title when you use Capture Context, so the agent knows which page you captured.</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>diri listens for the end of your spoken answer to an agent, on this Mac, when Talk with your agent is on.</string>
     <key>NSSpeechRecognitionUsageDescription</key>

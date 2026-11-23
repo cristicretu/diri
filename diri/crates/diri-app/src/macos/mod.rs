@@ -2,6 +2,8 @@ pub mod brand_raster;
 pub mod browser;
 pub mod dock_menu;
 pub(crate) mod floating_panel;
+pub(crate) mod context_capture;
+pub(crate) mod context_hud_panel;
 pub(crate) mod global_shortcut;
 pub(crate) mod key_release;
 pub(crate) mod shortcut_capture;

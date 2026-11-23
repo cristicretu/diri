@@ -780,6 +780,56 @@ pub(super) const ROOT: Command = Command {
             Complete::Nothing,
             &[JSON],
         ),
+        group(
+            "clip",
+            "Context Ring: recent screen and browser captures",
+            &[
+                cmd(
+                    "list",
+                    "",
+                    "Recent clips, newest first",
+                    Complete::Nothing,
+                    &[option("--limit", "N", "How many (default 20)"), JSON],
+                ),
+                cmd(
+                    "get",
+                    "[ID]",
+                    "One clip with its text (default latest)",
+                    Complete::Nothing,
+                    &[JSON],
+                ),
+                cmd(
+                    "capture",
+                    "",
+                    "Open Diri's capture overlay",
+                    Complete::Nothing,
+                    &[choice(
+                        "--mode",
+                        "MODE",
+                        &["region", "window"],
+                        "Region (default) or window",
+                    )],
+                ),
+                cmd(
+                    "send",
+                    "TARGET",
+                    "Send a clip with a prompt to a session",
+                    Complete::Target,
+                    &[
+                        option("--id", "ID", "Clip (default latest)"),
+                        option("--prompt", "TEXT", "What to do with it"),
+                        JSON,
+                    ],
+                ),
+                cmd(
+                    "delete",
+                    "ID",
+                    "Remove a clip and its screenshot",
+                    Complete::Nothing,
+                    &[],
+                ),
+            ],
+        ),
         alias(
             group(
                 "note",

@@ -38,6 +38,7 @@ pub mod boot;
 pub mod browser;
 pub mod checkpoint;
 pub mod cli_version;
+pub mod clip;
 pub mod completed_terminal;
 pub mod computer;
 pub mod control;

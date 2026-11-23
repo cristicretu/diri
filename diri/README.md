@@ -157,6 +157,33 @@ Removing the file leaves the app in local-only mode. Tailscale IPv4 addresses
 and MagicDNS names work like any other SSH destination when OpenSSH can resolve
 them; Diri neither requires nor configures Tailscale for Remote Holder sessions.
 
+## Capture Context and the Context Ring
+
+**⇧⌘2** (Settings › Shortcuts › Capture context globally; macOS) opens macOS's
+own selection overlay from any app: drag a region, or press Space and click a
+window. Diri keeps the cropped PNG together with the front app and window, the
+browser tab's URL and title (Chrome, Arc, Dia, Brave, Edge, Vivaldi, Opera
+and Safari through their AppleScript dictionaries; Firefox and Zen give their
+window title), and the text in the region: the selection when there is one,
+otherwise on-device Vision OCR. A floating panel then sends it with a prompt to
+a session, a new Claude Code or Codex session, or just the ring, without
+bringing Diri forward. The session that feedback from the same page went to
+last is preselected (a Slack thread falls back to its channel, a `localhost`
+path to its dev server), and the session serving a captured `localhost` port is
+offered next. **Send Latest Clip…** in ⌘K reopens the panel on the newest clip.
+
+Clips live only on this Mac, in the Engine's state directory under `clips/`
+(`0700`, files `0600`), at most 64 clips, 256 MiB and 7 days, applied whenever
+the ring is read or written. Captured pixels, text and URLs never reach logs
+or telemetry. The first capture asks for Screen Recording; reading browser
+tabs asks for Automation once per browser.
+
+Agents reach the ring through the Diri MCP actions `list_clips`, `get_clip`,
+`capture_clip` and `send_clip`. They are not in `tools/list`; agents discover
+them with `get_skill` and run them with `act`, so they add nothing to the
+prompt (`formal/ContextRing.lean`). From a shell: `dirijor clip
+list|get|capture|send|delete`.
+
 ## Skills
 
 **Settings → Skills** lists skills found in shared and provider skill directories

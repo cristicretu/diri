@@ -137,6 +137,11 @@ Every command people type, with its options. `dirijor help COMMAND` prints the s
 | `events wait` | `-s, --session TARGET`, `--until STATUS`, `--kind NAME`, `--timeout SECONDS`, `--json` | Wait for one status or event |
 | `artifacts TARGET` | `--json` | Links, pull requests and ports of a session |
 | `ports` | `--json` | Listening ports across sessions |
+| `clip list` | `--limit N`, `--json` | Recent clips, newest first |
+| `clip get [ID]` | `--json` | One clip with its text (default latest) |
+| `clip capture` | `--mode MODE` | Open Diri's capture overlay |
+| `clip send TARGET` | `--id ID`, `--prompt TEXT`, `--json` | Send a clip with a prompt to a session |
+| `clip delete ID` |  | Remove a clip and its screenshot |
 | `notify` | `--title TEXT`, `--body TEXT` | Post a notification from a terminal |
 | `doctor` |  | Check the Engine, agents and state file |
 | `mcp-tools` |  | Print the MCP tool definitions |

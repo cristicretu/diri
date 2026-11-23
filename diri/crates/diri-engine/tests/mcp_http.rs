@@ -155,16 +155,21 @@ fn compact_profile_lists_two_tools_and_resolves_actions_as_the_authenticated_cal
     );
     let full = post(&engine.url, Some(&token), &list).message();
     let names = call(&url, &token, 2, "get_skill", json!({}));
+    // Every listed tool, then the deferred Context Ring actions, which are
+    // discoverable here but never in either tools/list.
+    let mut expected: Vec<Value> = full["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].clone())
+        .collect();
+    for deferred in ["list_clips", "get_clip", "capture_clip", "send_clip"] {
+        assert!(!expected.contains(&json!(deferred)), "{deferred} is listed");
+        expected.push(json!(deferred));
+    }
     assert_eq!(
         names["result"]["structuredContent"]["actions"],
-        json!(
-            full["result"]["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|t| &t["name"])
-                .collect::<Vec<_>>()
-        )
+        json!(expected)
     );
     let schema = call(
         &url,
