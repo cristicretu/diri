@@ -1920,11 +1920,12 @@ impl ControlServer {
                 registry.other_live_agent(&id),
             );
         }
-        if tracked {
+        let batch = if tracked {
             registry.persist_for_shutdown().map_err(io_control_error)?;
+            None
         } else {
-            let _ = registry.persist();
-        }
+            registry.take_spawn_persist()
+        };
         self.publish_updated(&registry, &id);
 
         // An initial prompt is typed once the TUI can actually receive input,
@@ -1939,6 +1940,11 @@ impl ControlServer {
             .record(&id)
             .ok_or_else(|| ControlError::internal("the new session vanished"))?;
         drop(registry);
+        if let Some(batch) = batch
+            && batch.commit().is_err()
+        {
+            self.registry.lock().map_err(poisoned)?.persist_deferred();
+        }
 
         // A supplied prompt is part of the spawn contract: do not acknowledge
         // the request until delivery is confirmed. With no prompt, Claude's
