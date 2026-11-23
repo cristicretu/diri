@@ -1726,6 +1726,127 @@
       "name": "note_history"
     },
     {
+      "description": "Diri Live Surfaces: native dashboards and mini-apps you build from JSON components (cards, metrics, checklists, tables, rich links to Slack/GitHub/Linear/sessions, buttons), drawn inside Diri and kept live. op schema returns the full component and patch reference; read it before your first create. Ops: create, update (patch components by id; the person's ticks are kept), get, list, events (what the person ticked or clicked), history, restore, promote (save a session surface to the sidebar), delete. A session surface (the default) shows in your session's right panel; scope global or project makes a saved surface in the sidebar that any agent or schedule may update.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "after": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "agents": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 32,
+            "type": "array"
+          },
+          "expected_revision": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "format": {
+            "enum": [
+              "json",
+              "outline"
+            ],
+            "type": "string"
+          },
+          "limit": {
+            "maximum": 200,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "op": {
+            "enum": [
+              "schema",
+              "create",
+              "update",
+              "get",
+              "list",
+              "events",
+              "history",
+              "restore",
+              "promote",
+              "delete"
+            ],
+            "type": "string"
+          },
+          "ops": {
+            "items": {
+              "type": "object"
+            },
+            "maxItems": 200,
+            "type": "array"
+          },
+          "pinned": {
+            "type": "boolean"
+          },
+          "project": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "revision": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "root": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "scope": {
+            "enum": [
+              "session",
+              "global",
+              "project",
+              "saved",
+              "all",
+              "mine"
+            ],
+            "type": "string"
+          },
+          "session": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "sessions": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 4,
+            "type": "array"
+          },
+          "subtitle": {
+            "maxLength": 512,
+            "type": "string"
+          },
+          "surface": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "template": {
+            "enum": [
+              "today",
+              "blank"
+            ],
+            "type": "string"
+          },
+          "title": {
+            "maxLength": 512,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "op"
+        ],
+        "type": "object"
+      },
+      "name": "surface"
+    },
+    {
       "description": "List the sessions spawned by this one, optionally including the whole descendant tree.",
       "inputSchema": {
         "additionalProperties": false,

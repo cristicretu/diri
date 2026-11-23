@@ -17,6 +17,7 @@ path = "src/bin/dirijor.rs"
 diri-platform.workspace = true
 diri-proto.workspace = true
 diri-notes.workspace = true
+diri-surfaces.workspace = true
 # `dirijor script`: the same Lua runtime as the app's init.lua.
 diri-script.workspace = true
 serde.workspace = true

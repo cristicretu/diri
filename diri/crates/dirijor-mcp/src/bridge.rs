@@ -24,6 +24,7 @@ pub use notes::NoteSpawn;
 mod orchestration;
 mod policy;
 mod schedules;
+mod surfaces;
 mod tasks;
 
 use policy::{McpPolicy, WRITE_POLICY, WriteAction};
@@ -220,6 +221,7 @@ impl Bridge {
             "create_note" => self.create_note(arguments),
             "start_from_note" => self.start_from_note(arguments),
             "note_history" => self.note_history(arguments),
+            "surface" => self.surface(arguments),
             diri_proto::voice::SPEAK_TOOL => self.speak(arguments),
             other => Err(format!("unknown tool: {other}")),
         }

@@ -1953,6 +1953,7 @@ dependencies = [
  "diri-platform",
  "diri-proto",
  "diri-script",
+ "diri-surfaces",
  "libc",
  "serde",
  "serde_json",

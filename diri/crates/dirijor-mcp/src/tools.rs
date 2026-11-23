@@ -486,6 +486,11 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
             json!({"type":"object","properties":{"note":{"type":"string","minLength":1},"version":{"type":"integer","minimum":0}},"required":["note"]}),
         ),
         ToolDefinition::new(
+            "surface",
+            "Diri Live Surfaces: native dashboards and mini-apps you build from JSON components (cards, metrics, checklists, tables, rich links to Slack/GitHub/Linear/sessions, buttons), drawn inside Diri and kept live. op schema returns the full component and patch reference; read it before your first create. Ops: create, update (patch components by id; the person's ticks are kept), get, list, events (what the person ticked or clicked), history, restore, promote (save a session surface to the sidebar), delete. A session surface (the default) shows in your session's right panel; scope global or project makes a saved surface in the sidebar that any agent or schedule may update.",
+            json!({"type":"object","properties":{"op":{"type":"string","enum":["schema","create","update","get","list","events","history","restore","promote","delete"]},"surface":{"type":"string","minLength":1},"title":{"type":"string","minLength":1,"maxLength":512},"subtitle":{"type":"string","maxLength":512},"scope":{"type":"string","enum":["session","global","project","saved","all","mine"]},"project":{"type":"string","minLength":1},"session":{"type":"string","minLength":1},"template":{"type":"string","enum":["today","blank"]},"sessions":{"type":"array","items":{"type":"string"},"maxItems":4},"root":{"type":"array","items":{"type":"object"}},"ops":{"type":"array","items":{"type":"object"},"maxItems":200},"expected_revision":{"type":"integer","minimum":0},"pinned":{"type":"boolean"},"agents":{"type":"array","items":{"type":"string"},"maxItems":32},"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":200},"revision":{"type":"integer","minimum":0},"format":{"type":"string","enum":["json","outline"]}},"required":["op"]}),
+        ),
+        ToolDefinition::new(
             "list_children",
             "List the sessions spawned by this one, optionally including the whole descendant tree.",
             json!({

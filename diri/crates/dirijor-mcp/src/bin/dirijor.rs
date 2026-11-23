@@ -12,6 +12,8 @@ mod organization;
 mod script;
 #[path = "dirijor/spec.rs"]
 mod spec;
+#[path = "dirijor/surfaces.rs"]
+mod surfaces;
 #[path = "dirijor/verbs.rs"]
 mod verbs;
 
@@ -118,6 +120,7 @@ fn run(arguments: &[String]) -> Result<(), CliError> {
         "events" => events(arguments.get(1..).unwrap_or_default()),
         "ports" => ports(arguments.get(1..).unwrap_or_default()),
         "note" | "notes" => notes::run(arguments.get(1..).unwrap_or_default()),
+        "surface" | "surfaces" => surfaces::run(arguments.get(1..).unwrap_or_default()),
         "doctor" => doctor(),
         "actions" => api::actions(arguments.get(1..).unwrap_or_default()),
         "do" => api::perform(arguments.get(1..).unwrap_or_default()),
@@ -154,11 +157,13 @@ fn print_help() {
          {}\n\n\
          {}\n\n\
          {}\n\n\
-         Notes (Markdown files; new notes appear in the sidebar when Diri is running):\n  {}",
+         Notes (Markdown files; new notes appear in the sidebar when Diri is running):\n  {}\n\n\
+         Live Surfaces (native dashboards agents build; saved ones are sidebar rows):\n  {}",
         script::HELP,
         api::HELP,
         lua::HELP,
-        notes::HELP
+        notes::HELP,
+        surfaces::HELP
     );
 }
 
