@@ -23,10 +23,12 @@ mod notes;
 pub use notes::NoteSpawn;
 mod orchestration;
 mod policy;
+pub mod sandbox;
 mod schedules;
 mod tasks;
 
 use policy::{McpPolicy, WRITE_POLICY, WriteAction};
+use sandbox::{sandbox_request, sandbox_snapshot_result};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3);
 // The Engine may wait through a first-run trust/login wall before it can
@@ -197,6 +199,7 @@ impl Bridge {
             "test_run" => self.test_run(arguments),
             "browser" => self.browser(arguments),
             "computer" => self.computer(arguments),
+            "sandbox" => self.sandbox(arguments),
             "app_skills" => self.app_skills(arguments),
             "open_api_request" => self.open_api_request(arguments),
             "list_actions" => self.list_actions(arguments),
@@ -708,6 +711,26 @@ impl Bridge {
             // up to a minute for the person to allow a foreground action.
             Duration::from_secs(190),
         )
+    }
+
+    /// Ghost Desktops: the Engine's bounded pool of isolated browser
+    /// surfaces, each leased to the session that started it.
+    fn sandbox(&self, arguments: &Value) -> Result<Value, String> {
+        let snapshot = self.snapshot()?;
+        McpPolicy::new(
+            &snapshot.sessions,
+            &snapshot.projects,
+            self.caller.as_deref(),
+        )?
+        .authorize(WriteAction::TestRun)?;
+        let caller = self.caller.as_ref().expect("policy requires a caller");
+        let (method, params, timeout) = sandbox_request(Some(caller), arguments)?;
+        let result = self.request(method, params, timeout)?;
+        Ok(if method == Method::SANDBOX_SNAPSHOT {
+            sandbox_snapshot_result(result)
+        } else {
+            result
+        })
     }
 
     /// App Skills: learned app tasks, replayed by the Engine through the

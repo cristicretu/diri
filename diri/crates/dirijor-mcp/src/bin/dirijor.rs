@@ -8,6 +8,8 @@ mod lua;
 mod notes;
 #[path = "dirijor/organization.rs"]
 mod organization;
+#[path = "dirijor/sandbox.rs"]
+mod sandbox;
 #[path = "dirijor/script.rs"]
 mod script;
 #[path = "dirijor/spec.rs"]
@@ -117,6 +119,7 @@ fn run(arguments: &[String]) -> Result<(), CliError> {
         "artifacts" => artifacts(arguments.get(1..).unwrap_or_default()),
         "events" => events(arguments.get(1..).unwrap_or_default()),
         "ports" => ports(arguments.get(1..).unwrap_or_default()),
+        "sandbox" => sandbox::run(arguments.get(1..).unwrap_or_default()),
         "note" | "notes" => notes::run(arguments.get(1..).unwrap_or_default()),
         "doctor" => doctor(),
         "actions" => api::actions(arguments.get(1..).unwrap_or_default()),

@@ -112,6 +112,19 @@ impl Method {
     pub const COMPUTER_FOREGROUND_REVOKE: &'static str = "computer.foreground_revoke";
     /// App Skills: learned, replayable app tasks (`ComputerSkillsParams`).
     pub const COMPUTER_SKILLS: &'static str = "computer.skills";
+    /// Ghost Desktops: start one in the bounded pool, leased to the caller
+    /// (`SandboxStartParams`); answers its `SandboxInfo`.
+    pub const SANDBOX_START: &'static str = "sandbox.start";
+    /// One action inside a sandbox the caller holds (`SandboxActParams`).
+    pub const SANDBOX_ACT: &'static str = "sandbox.act";
+    /// A PNG of a sandbox for before/after proof (`SandboxSnapshotParams`).
+    pub const SANDBOX_SNAPSHOT: &'static str = "sandbox.snapshot";
+    /// Stop a sandbox and reclaim everything it made (`SandboxStopParams`).
+    pub const SANDBOX_STOP: &'static str = "sandbox.stop";
+    /// Every sandbox with measured memory and disk (`SandboxListParams`).
+    pub const SANDBOX_LIST: &'static str = "sandbox.list";
+    /// The latest live preview frame (`SandboxFrameParams`).
+    pub const SANDBOX_FRAME: &'static str = "sandbox.frame";
     pub const SESSION_MIGRATE: &'static str = "session.migrate";
     pub const SESSION_REPARENT_WORKTREE: &'static str = "session.reparent_worktree";
     /// Files a session (and the sessions it spawned) under another project on
@@ -253,6 +266,12 @@ impl Method {
         Self::COMPUTER_FOREGROUND_ANSWER,
         Self::COMPUTER_FOREGROUND_REVOKE,
         Self::COMPUTER_SKILLS,
+        Self::SANDBOX_START,
+        Self::SANDBOX_ACT,
+        Self::SANDBOX_SNAPSHOT,
+        Self::SANDBOX_STOP,
+        Self::SANDBOX_LIST,
+        Self::SANDBOX_FRAME,
         Self::SESSION_MIGRATE,
         Self::SESSION_REPARENT_WORKTREE,
         Self::SESSION_SET_PROJECT,
@@ -347,6 +366,9 @@ impl EventName {
     /// An Agent called `computer` before setup was finished
     /// (`ComputerSetupNeededEvent`). The app offers to finish it.
     pub const COMPUTER_SETUP_NEEDED: &'static str = "computer.setup_needed";
+    /// A Ghost Desktop started or stopped (`{"occupied"}`); the app's
+    /// sandbox view re-reads `sandbox.list`.
+    pub const SANDBOX_CHANGED: &'static str = "sandbox.changed";
     /// An Agent's first foreground action waits for the person
     /// (`ComputerForegroundRequestedEvent`).
     pub const COMPUTER_FOREGROUND_REQUESTED: &'static str = "computer.foreground_requested";

@@ -631,6 +631,47 @@ mod catalog {
                 "App Skills: list, learn, trace, save, run, forget, history, rollback."
             ),
             entry!(
+                Method::SANDBOX_START,
+                crate::sandbox::SandboxStartParams,
+                "SandboxInfo",
+                "Start a Ghost Desktop leased to the caller, in the bounded pool.",
+                || json!({"sessionID": "<sessionID>", "url": "http://localhost:3000"})
+            ),
+            entry!(
+                Method::SANDBOX_ACT,
+                crate::sandbox::SandboxActParams,
+                "Value",
+                "Navigate, click, type, press, scroll, eval or wait inside a sandbox the caller holds.",
+                || json!({"sessionID": "<sessionID>", "sandboxID": "g1", "action": "navigate", "url": "http://localhost:3000"})
+            ),
+            entry!(
+                Method::SANDBOX_SNAPSHOT,
+                crate::sandbox::SandboxSnapshotParams,
+                "SandboxSnapshot",
+                "Save a PNG of a sandbox for before/after proof.",
+                || json!({"sessionID": "<sessionID>", "sandboxID": "g1", "label": "before"})
+            ),
+            entry!(
+                Method::SANDBOX_STOP,
+                crate::sandbox::SandboxStopParams,
+                "{}",
+                "Stop a sandbox and reclaim its processes and files.",
+                || json!({"sessionID": "<sessionID>", "sandboxID": "g1"})
+            ),
+            entry!(
+                Method::SANDBOX_LIST,
+                crate::sandbox::SandboxListParams,
+                "SandboxListResult",
+                "Every sandbox, its owner and measured memory and disk."
+            ),
+            entry!(
+                Method::SANDBOX_FRAME,
+                crate::sandbox::SandboxFrameParams,
+                "SandboxFrame",
+                "The latest live preview frame of a sandbox.",
+                || json!({"sandboxID": "g1"})
+            ),
+            entry!(
                 Method::HOST_SYNC_PREFS,
                 HostSyncPrefsParams,
                 "PrefsSyncReport",

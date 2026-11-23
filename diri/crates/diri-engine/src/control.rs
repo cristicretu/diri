@@ -38,6 +38,7 @@ mod hook_queue;
 mod message_delivery;
 mod operations;
 mod orchestration;
+mod sandbox;
 mod schedules;
 mod tasks;
 mod workspaces;
@@ -240,6 +241,8 @@ pub struct ControlServer {
     governor: std::sync::Arc<Mutex<crate::governor::GovernorConfig>>,
     browser: std::sync::OnceLock<crate::browser::BrowserPool>,
     computer: crate::computer::ComputerUse,
+    /// Ghost Desktops, created on the first `sandbox.*` call.
+    sandbox: std::sync::OnceLock<crate::sandbox::SandboxPool>,
     active_connections: Arc<AtomicUsize>,
     background_requests: Arc<AtomicUsize>,
     worktree_scan: crate::worktree_scan::ScanStore,
@@ -402,6 +405,7 @@ impl ControlServer {
             governor: std::sync::Arc::new(Mutex::new(crate::governor::GovernorConfig::default())),
             browser: std::sync::OnceLock::new(),
             computer,
+            sandbox: std::sync::OnceLock::new(),
             active_connections: Arc::new(AtomicUsize::new(0)),
             background_requests: Arc::new(AtomicUsize::new(0)),
             worktree_scan: Default::default(),
@@ -1134,6 +1138,12 @@ impl ControlServer {
                         | Method::COMPUTER_STATUS
                         | Method::COMPUTER_SETUP
                         | Method::APP_PERFORM
+                        | Method::SANDBOX_START
+                        | Method::SANDBOX_ACT
+                        | Method::SANDBOX_SNAPSHOT
+                        | Method::SANDBOX_STOP
+                        | Method::SANDBOX_LIST
+                        | Method::SANDBOX_FRAME
                 ) || ((method == Method::AGENT_READINESS
                     || method == Method::AGENT_CONFIGURE)
                     && params
@@ -1470,6 +1480,12 @@ impl ControlServer {
             Method::TEST_RUN => self.browser_call("run", params),
             Method::BROWSER_ACT => self.browser_call("browser", params),
             Method::COMPUTER_ACT => self.computer_act(params),
+            Method::SANDBOX_START
+            | Method::SANDBOX_ACT
+            | Method::SANDBOX_SNAPSHOT
+            | Method::SANDBOX_STOP
+            | Method::SANDBOX_LIST
+            | Method::SANDBOX_FRAME => self.sandbox_call(method, params),
             Method::COMPUTER_STATUS => {
                 let p: diri_proto::ComputerStatusParams = decode(params)?;
                 encode(&self.computer_status(p.probe)?)
@@ -4022,6 +4038,7 @@ impl ControlServer {
         // back, the way closed chats stay in conversation search.
         drop(registry);
         self.computer.forget_foreground(&p.session_id.0);
+        self.release_session_sandboxes(&p.session_id.0);
         self.events.record_removed(&removed);
         self.events.publish(
             diri_proto::EventName::SESSION_REMOVED,

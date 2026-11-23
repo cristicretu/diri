@@ -780,6 +780,52 @@ pub(super) const ROOT: Command = Command {
             Complete::Nothing,
             &[JSON],
         ),
+        group(
+            "sandbox",
+            "Ghost Desktops: isolated windowless browsers (dirijor sandbox --help)",
+            &[
+                cmd(
+                    "start",
+                    "[URL]",
+                    "Start one, leased to this session",
+                    Complete::Nothing,
+                    &[
+                        option("--width", "PX", "Viewport width"),
+                        option("--height", "PX", "Viewport height"),
+                        option("--label", "TEXT", "Tile name"),
+                        JSON,
+                    ],
+                ),
+                cmd(
+                    "act",
+                    "ID ACTION [KEY=VALUE...]",
+                    "navigate url=… | click selector=… | type text=… | press key=… | eval expression=…",
+                    Complete::Nothing,
+                    &[JSON],
+                ),
+                cmd(
+                    "snapshot",
+                    "ID [LABEL]",
+                    "Save a PNG for before/after proof",
+                    Complete::Nothing,
+                    &[JSON],
+                ),
+                cmd(
+                    "stop",
+                    "ID",
+                    "Stop one and reclaim it",
+                    Complete::Nothing,
+                    &[],
+                ),
+                cmd(
+                    "list",
+                    "",
+                    "Every sandbox with measured RAM and disk",
+                    Complete::Nothing,
+                    &[JSON],
+                ),
+            ],
+        ),
         alias(
             group(
                 "note",

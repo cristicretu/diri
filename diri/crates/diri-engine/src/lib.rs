@@ -72,6 +72,7 @@ pub mod pty;
 pub mod recognition;
 pub mod registry;
 pub mod remote;
+pub mod sandbox;
 pub mod schedule;
 pub mod screen;
 pub mod session;

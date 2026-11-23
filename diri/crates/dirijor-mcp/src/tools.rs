@@ -339,6 +339,7 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
                 "required": ["tool"]
             }),
         ),
+        ToolDefinition::new("sandbox", SANDBOX_DESCRIPTION, sandbox_schema()),
         ToolDefinition::new(
             "app_skills",
             APP_SKILLS_DESCRIPTION,
@@ -649,6 +650,41 @@ to: an app another agent is driving returns computer_app_busy. computer_unavaila
 computer_permissions means only the person can finish setup (Diri Settings › Agents › Computer use): \
 tell them, and don't try to install or grant anything yourself. tool \"tools\" lists every tool. \
 A task you'll repeat: check app_skills, which replays learned app tasks without a model.";
+
+const SANDBOX_DESCRIPTION: &str = "Ghost Desktops: your own isolated, windowless browser surface for \
+testing web apps, in parallel with other agents (4 slots on this Mac). It never touches the person's \
+screen, cursor, keyboard focus or windows, and has its own empty profile (no cookies or logins). \
+start {url?, width?, height?, label?} returns sandbox_id; act {sandbox_id, action: navigate {url} | \
+click {selector or x,y} | type {text} | press {key} | scroll {dy, x?, y?} | eval {expression} | \
+wait_for {selector, timeout_ms?} | wait {ms} | resize {width, height}}; snapshot {sandbox_id, label} \
+saves a PNG (path + sha256; equal hashes mean nothing changed) and shows it to you: take one before and \
+one after a change as proof; stop {sandbox_id} when done (it is also stopped when your session ends or \
+after 10 idle minutes); list shows every sandbox with measured RAM and disk. sandbox_pool_full: stop \
+one of yours or wait. sandbox_human_control: the person clicked into it; retry in a few seconds. Use \
+computer instead for native Mac apps.";
+
+fn sandbox_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["start", "act", "snapshot", "stop", "list"]},
+            "sandbox_id": {"type": "string", "description": "From start; required for act, snapshot and stop."},
+            "url": {"type": "string", "description": "start: opened once up. act navigate: the URL."},
+            "width": {"type": "integer", "minimum": 200, "maximum": 3840},
+            "height": {"type": "integer", "minimum": 200, "maximum": 3840},
+            "label": {"type": "string", "description": "start: tile name. snapshot: file name part, e.g. before/after."},
+            "step": {
+                "type": "object",
+                "description": "act: one step, e.g. {\"action\":\"click\",\"selector\":\"#save\"}, {\"action\":\"type\",\"text\":\"hi\"}, {\"action\":\"press\",\"key\":\"Enter\"}, {\"action\":\"eval\",\"expression\":\"document.title\"}.",
+                "properties": {
+                    "action": {"type": "string", "enum": ["navigate", "click", "type", "press", "scroll", "eval", "wait_for", "wait", "resize"]}
+                },
+                "required": ["action"]
+            }
+        },
+        "required": ["action"]
+    })
+}
 
 fn browser_schema() -> Value {
     json!({

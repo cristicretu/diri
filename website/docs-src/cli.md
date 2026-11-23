@@ -137,6 +137,11 @@ Every command people type, with its options. `dirijor help COMMAND` prints the s
 | `events wait` | `-s, --session TARGET`, `--until STATUS`, `--kind NAME`, `--timeout SECONDS`, `--json` | Wait for one status or event |
 | `artifacts TARGET` | `--json` | Links, pull requests and ports of a session |
 | `ports` | `--json` | Listening ports across sessions |
+| `sandbox start [URL]` | `--width PX`, `--height PX`, `--label TEXT`, `--json` | Start one, leased to this session |
+| `sandbox act ID ACTION [KEY=VALUE...]` | `--json` | navigate url=… \| click selector=… \| type text=… \| press key=… \| eval expression=… |
+| `sandbox snapshot ID [LABEL]` | `--json` | Save a PNG for before/after proof |
+| `sandbox stop ID` |  | Stop one and reclaim it |
+| `sandbox list` | `--json` | Every sandbox with measured RAM and disk |
 | `notify` | `--title TEXT`, `--body TEXT` | Post a notification from a terminal |
 | `doctor` |  | Check the Engine, agents and state file |
 | `mcp-tools` |  | Print the MCP tool definitions |

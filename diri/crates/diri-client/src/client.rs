@@ -140,7 +140,7 @@ impl ClientCore {
     /// IF YOU ADD AN EVENT KIND THAT DIRI NEEDS, ADD IT HERE TOO. Server-side
     /// filtering means an unlisted kind never reaches `route_message`, and the
     /// symptom is silence, not an error.
-    const EVENT_KINDS: [&'static str; 14] = [
+    const EVENT_KINDS: [&'static str; 15] = [
         EventName::SESSION_UPDATED,
         // `dirijor note open` / `start_from_note` ask every window to show a
         // Session; without it the app's reveal handler never runs.
@@ -157,6 +157,7 @@ impl ClientCore {
         EventName::PROJECT_UPDATED,
         EventName::WORKSPACE_UPDATED,
         EventName::SCHEDULE_UPDATED,
+        EventName::SANDBOX_CHANGED,
     ];
 
     async fn request<P: Serialize + ?Sized>(

@@ -38,6 +38,7 @@ pub mod preview_set;
 pub mod recovery;
 pub mod remote_connection;
 pub mod remote_pty;
+pub mod sandbox;
 pub mod schedules;
 pub mod search;
 pub mod session_naming;
