@@ -71,7 +71,7 @@ diri-updater.workspace = true
 diri-usage.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
-image = { workspace = true, features = ["ico", "png", "webp"] }
+image = { workspace = true, features = ["ico", "jpeg", "png", "webp"] }
 libc = "0.2"
 # Mermaid diagrams in notes: a pure-Rust parser/layout that emits SVG, which
 # gpui already rasterizes with resvg. No browser, Node.js or network.

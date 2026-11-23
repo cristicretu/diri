@@ -1,0 +1,16 @@
+{
+  "settings.sandboxes.asleep": "休眠中",
+  "settings.sandboxes.capacity": "已用 {used}/{total}",
+  "settings.sandboxes.disk": "磁盘 {disk}",
+  "settings.sandboxes.empty": "没有正在运行的 Ghost Desktop。智能体会用 sandbox 工具启动，也可以运行 dirijor sandbox start URL。",
+  "settings.sandboxes.intro": "智能体并行测试网页应用的无窗口浏览器。它们不会触碰你的屏幕、光标、键盘焦点或窗口。点按预览可接管 3 秒，接管期间可以输入。",
+  "settings.sandboxes.memory": "内存 {memory}",
+  "settings.sandboxes.person": "由你启动",
+  "settings.sandboxes.processes": "{count} 个进程",
+  "settings.sandboxes.ready_in": "{ms} 毫秒就绪",
+  "settings.sandboxes.running": "运行中",
+  "settings.sandboxes.stop": "停止",
+  "settings.sandboxes.total": "合计：内存 {memory} · 磁盘 {disk}",
+  "settings.sandboxes.unavailable": "不可用：{detail}",
+  "settings.sandboxes.you": "由你控制"
+}

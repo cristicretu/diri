@@ -1142,8 +1142,6 @@ impl ControlServer {
                         | Method::SANDBOX_ACT
                         | Method::SANDBOX_SNAPSHOT
                         | Method::SANDBOX_STOP
-                        | Method::SANDBOX_LIST
-                        | Method::SANDBOX_FRAME
                 ) || ((method == Method::AGENT_READINESS
                     || method == Method::AGENT_CONFIGURE)
                     && params

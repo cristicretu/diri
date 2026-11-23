@@ -176,6 +176,7 @@ diri.task = {}
 diri.schedule = {}
 diri.search = {}
 diri.computer = {}
+diri.sandbox = {}
 diri.host = {}
 diri.activity = {}
 diri.worktree = {}
@@ -531,6 +532,42 @@ function diri.computer.foreground_revoke(params, opts) end
 ---@param opts? {timeout?: number}
 ---@return table # Value
 function diri.computer.skills(params, opts) end
+
+---Start a Ghost Desktop leased to the caller, in the bounded pool.
+---@param params? {sessionID?: string, backend?: any, url?: string, width?: integer, height?: integer, label?: string}
+---@param opts? {timeout?: number}
+---@return table # SandboxInfo
+function diri.sandbox.start(params, opts) end
+
+---Navigate, click, type, press, scroll, eval or wait inside a sandbox the caller holds.
+---@param params {sessionID?: string, sandboxID: string}
+---@param opts? {timeout?: number}
+---@return table # Value
+function diri.sandbox.act(params, opts) end
+
+---Save a PNG of a sandbox for before/after proof.
+---@param params {sessionID?: string, sandboxID: string, label?: string, inline?: boolean}
+---@param opts? {timeout?: number}
+---@return table # SandboxSnapshot
+function diri.sandbox.snapshot(params, opts) end
+
+---Stop a sandbox and reclaim its processes and files.
+---@param params {sessionID?: string, sandboxID: string}
+---@param opts? {timeout?: number}
+---@return table # {}
+function diri.sandbox.stop(params, opts) end
+
+---Every sandbox, its owner and measured memory and disk.
+---@param params? {sessionID?: string}
+---@param opts? {timeout?: number}
+---@return table # SandboxListResult
+function diri.sandbox.list(params, opts) end
+
+---The latest live preview frame of a sandbox.
+---@param params {sandboxID: string, afterSeq?: integer}
+---@param opts? {timeout?: number}
+---@return table # SandboxFrame
+function diri.sandbox.frame(params, opts) end
 
 ---Move a Claude session between this Mac and a host.
 ---@param params {sessionID: string, targetHost?: string}

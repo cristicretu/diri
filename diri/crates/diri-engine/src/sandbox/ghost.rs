@@ -678,8 +678,8 @@ impl GhostInstance {
     }
 }
 
-impl SandboxInstance for GhostInstance {
-    fn act(&mut self, action: &SandboxAction) -> Result<Value, SandboxError> {
+impl GhostInstance {
+    fn step(&mut self, action: &SandboxAction) -> Result<Value, SandboxError> {
         match action {
             SandboxAction::Navigate { url } => self.navigate(url),
             SandboxAction::Click { x, y, selector } => {
@@ -746,6 +746,25 @@ impl SandboxInstance for GhostInstance {
             }
         }
     }
+}
+
+impl SandboxInstance for GhostInstance {
+    fn act(&mut self, action: &SandboxAction) -> Result<Value, SandboxError> {
+        let result = self.step(action);
+        // A click or key can navigate; keep the listing's location current
+        // so `location` never has to ask the page.
+        if result.is_ok()
+            && matches!(
+                action,
+                SandboxAction::Click { .. }
+                    | SandboxAction::Press { .. }
+                    | SandboxAction::Eval { .. }
+            )
+        {
+            self.refresh_location();
+        }
+        result
+    }
 
     fn screenshot_png(&mut self) -> Result<Vec<u8>, SandboxError> {
         self.capture("png", None)
@@ -760,7 +779,7 @@ impl SandboxInstance for GhostInstance {
     }
 
     fn location(&mut self) -> (String, String) {
-        self.refresh_location()
+        (self.url.clone(), self.title.clone())
     }
 
     fn pid(&self) -> Option<u32> {

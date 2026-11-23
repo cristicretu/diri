@@ -603,6 +603,7 @@ pub struct UtilitySurfaces {
     talk_voices: Vec<crate::voice::VoiceOption>,
     skills: gpui::Entity<crate::skills_page::SkillsPage>,
     schedules: gpui::Entity<crate::schedules_page::SchedulesPage>,
+    sandboxes: gpui::Entity<crate::sandboxes_page::SandboxesPage>,
     accounts: AccountsState,
     phone_access: Option<crate::phone_access::PhoneAccess>,
     /// The in-flight gateway start, so a stop while it runs makes its
@@ -783,6 +784,7 @@ impl UtilitySurfaces {
             Some("agents") => SettingsTab::Agents,
             Some("skills") => SettingsTab::Skills,
             Some("schedules") => SettingsTab::Schedules,
+            Some("sandboxes" | "ghost-desktops") => SettingsTab::Sandboxes,
             Some("accounts") => SettingsTab::Accounts,
             Some("shortcuts") => SettingsTab::Shortcuts,
             Some("worktrees") => SettingsTab::Worktrees,
@@ -862,10 +864,21 @@ impl UtilitySurfaces {
         if settings_tab == SettingsTab::Schedules {
             schedules.update(cx, |schedules, cx| schedules.open(cx));
         }
+        let sandboxes = cx.new(|cx| {
+            crate::sandboxes_page::SandboxesPage::new(
+                Arc::clone(&store_runtime),
+                Arc::clone(&runtime),
+                cx,
+            )
+        });
+        if settings_tab == SettingsTab::Sandboxes {
+            sandboxes.update(cx, |sandboxes, cx| sandboxes.open(cx));
+        }
         let mut this = Self {
             focus,
             skills,
             schedules,
+            sandboxes,
             accounts: AccountsState::default(),
             phone_access: None,
             phone_start: crate::phone_access::PhoneStartSlot::default(),
@@ -2320,6 +2333,10 @@ impl UtilitySurfaces {
             self.schedules
                 .update(cx, |schedules, cx| schedules.open(cx));
         }
+        if tab == SettingsTab::Sandboxes {
+            self.sandboxes
+                .update(cx, |sandboxes, cx| sandboxes.open(cx));
+        }
         if tab == SettingsTab::Accounts {
             self.refresh_accounts(cx);
         }
@@ -3028,6 +3045,16 @@ impl UtilitySurfaces {
         {
             return;
         }
+        // Keys typed into a Ghost Desktop the person took over go there,
+        // not to the settings search.
+        if self.surface == Surface::Settings
+            && self.settings_tab == SettingsTab::Sandboxes
+            && self
+                .sandboxes
+                .update(cx, |sandboxes, cx| sandboxes.handle_key(event, cx))
+        {
+            return;
+        }
         if self.handle_theme_search_key(event, cx) || self.handle_settings_search_key(event, cx) {
             cx.stop_propagation();
             return;
@@ -3509,6 +3536,7 @@ impl UtilitySurfaces {
             SettingsTab::Agents => self.agents_settings(cx).into_any_element(),
             SettingsTab::Skills => self.skills.clone().into_any_element(),
             SettingsTab::Schedules => self.schedules.clone().into_any_element(),
+            SettingsTab::Sandboxes => self.sandboxes.clone().into_any_element(),
             SettingsTab::Accounts => self.accounts_settings(cx).into_any_element(),
             SettingsTab::Shortcuts => self.shortcuts_settings(cx).into_any_element(),
             SettingsTab::Appearance => self.appearance_settings(cx).into_any_element(),
@@ -9825,6 +9853,7 @@ fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
         SettingsTab::Agents => "settings.keywords.agents",
         SettingsTab::Skills => "settings.keywords.skills",
         SettingsTab::Schedules => "settings.keywords.schedules",
+        SettingsTab::Sandboxes => "settings.keywords.sandboxes",
         SettingsTab::Accounts => "settings.keywords.accounts",
         SettingsTab::Shortcuts => "settings.keywords.shortcuts",
         SettingsTab::Appearance => "settings.keywords.appearance",
@@ -10837,6 +10866,7 @@ mod tests {
             Ok("agents") => SettingsTab::Agents,
             Ok("skills") => SettingsTab::Skills,
             Ok("schedules") => SettingsTab::Schedules,
+            Ok("sandboxes") => SettingsTab::Sandboxes,
             Ok("accounts") => SettingsTab::Accounts,
             Ok("appearance") => SettingsTab::Appearance,
             Ok("terminal") => SettingsTab::Terminal,
@@ -12597,6 +12627,19 @@ mod tests {
                             Err(_) => schedules.seed_preview(now, false),
                         }
                     });
+                }
+                if tab == SettingsTab::Sandboxes {
+                    // DIRI_VISUAL_SANDBOX_FRAMES: a folder of real preview
+                    // JPEGs (1.jpg..4.jpg) captured from running sandboxes.
+                    let frames: Vec<Vec<u8>> = std::env::var_os("DIRI_VISUAL_SANDBOX_FRAMES")
+                        .map(PathBuf::from)
+                        .map(|dir| {
+                            (1..=4)
+                                .filter_map(|n| std::fs::read(dir.join(format!("{n}.jpg"))).ok())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    surfaces.sandboxes.update(cx, |sandboxes, _| sandboxes.seed_preview(frames));
                 }
                 if tab == SettingsTab::Skills {
                     surfaces.skills.update(cx, |skills, _| {

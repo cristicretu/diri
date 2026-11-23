@@ -1,5 +1,75 @@
 # diri performance record
 
+## Ghost Desktops: four isolated test surfaces for 260 MB (2026-11-23)
+
+`sandbox.*` gives each Agent its own surface to test a web app in, four at a
+time, without touching the person's screen, cursor, focus or windows.
+
+**Design choice, from first principles.** Three mechanisms were weighed:
+
+| Mechanism | Disk per instance | RAM per instance | Spin-up | Parallel limit | Focus |
+| --- | --- | --- | --- | --- | --- |
+| macOS guest (Virtualization.framework) | 20–30 GB image | 4+ GB | tens of s | 2 (EULA) | isolated |
+| `CGVirtualDisplay` + real app windows | 0 | app's own | <50 ms | display count | **not isolated**: adds a display to the person's arrangement (windows reflow, the cursor can wander onto it), apps launched there still activate |
+| Linux micro-VM (kernel + CoW rootfs) | ~100 MB shared + CoW | 128–256 MB + guest apps | ~0.4 s | none | isolated |
+| **Windowless Chromium per sandbox (shipped)** | **1.1 MB** | **65 MB** | **~0.2 s** | pool of 4 (configurable) | **isolated by construction** |
+
+The rows above the shipped one are not measured here; they are the documented
+costs that ruled them out. A windowless browser registers no window, display
+or Dock icon (LaunchServices type `UIElement`), and input is synthesised inside
+the renderer over DevTools, so it cannot reach the person's devices. The
+micro-VM backend needs a signed Virtualization.framework helper plus a kernel
+and root filesystem that diri doesn't ship. Downloading them on first use
+would break zero-setup, so it is listed and fails closed
+(`sandbox_backend_unavailable`). The `SandboxBackend` trait is where it plugs
+in.
+
+**Measured** (`cargo test -p diri-engine --test sandbox_ghost four_parallel_benchmark -- --ignored --nocapture`,
+M4 Max, macOS 27.0.1, Playwright `chrome-headless-shell` 153, debug Engine
+build, the binary warm in the page cache; three runs):
+
+| | run 1 | run 2 | run 3 |
+| --- | ---: | ---: | ---: |
+| all four ready, parallel start + first page load | 244 ms | 193 ms | 207 ms |
+| per-instance spin-up | 227–242 ms | 190 ms | 175–205 ms |
+| RAM per instance after load (phys_footprint, 4-process tree) | 47–52 MB | 47 MB | 47–47.6 MB |
+| RAM per instance after 50 clicks, settled | 65 MB | 65 MB | 64.6–65.1 MB |
+| RAM, all four settled | 260.1 MB | 260.1 MB | 259.3 MB |
+| private disk per instance (profile, blocks) | 1.9 MB | 1.1 MB | 1.1 MB |
+| 200 clicks across four in parallel, p50 / p95 / max | 16.7 / 20.1 / 33.0 ms | 16.7 / 19.7 / 24.9 ms | 16.7 / 19.0 / 19.8 ms |
+| 1280×800 PNG snapshot p50 | 34 ms | 30 ms | 33 ms |
+| stop all four | 66 ms | 66 ms | 76 ms |
+| processes / bytes left after stop | 0 / 0 | 0 / 0 | 0 / 0 |
+| frontmost app changed | no | no | no |
+
+A click's ~16.7 ms is one 60 Hz frame: `Input.dispatchMouseEvent` answers
+once the renderer has handled the event. Four sandboxes clicking at once see
+the same latency as one.
+
+Same benchmark, other browsers:
+
+| Browser | RAM, four settled | Spin-up | Disk each | Processes |
+| --- | ---: | ---: | ---: | ---: |
+| `chrome-headless-shell` (default) | 260 MB | ~0.2 s | 1.1 MB | 16 |
+| Chrome.app `--headless=new` (fallback) | 1,379 MB | ~0.7 s | 8.7 MB | 41 |
+| headless shell `--single-process` (`DIRI_SANDBOX_SINGLE_PROCESS=1`) | 176 MB | ~0.23 s | 1.1 MB | 4 |
+
+`--single-process` saves another third but runs pages in the browser process,
+without Chromium's renderer sandbox. It stays an opt-in for trusted pages.
+
+**Idle cost.** No Engine thread runs until the first `sandbox.start`. While
+sandboxes exist, a reaper wakes once a second and exits when the pool empties.
+Preview frames are produced only while the app's Ghost Desktops page asks
+(a 2 s linger after the last `sandbox.frame`), and `afterSeq` skips unchanged
+frames. After 30 s without an action a sandbox is trimmed (memory-pressure
+signal plus GC). That only frees ~1 MB on these small pages (65 → 64 MB); it
+matters for heavy apps. After 10 min idle the sandbox is stopped.
+
+**Crash cleanup.** `an_engine_crash_leaks_no_browser` SIGKILLs a helper that
+owns a sandbox. The browser tree (4 processes) was gone 12–25 ms later: its
+DevTools pipe closed and it exits on EOF. The dead Engine's profile directory
+is the only remnant, and the next pool's `sweep_stale_state` removes it.
+
 ## Holder PTY drain: blocking reads while output streams (2026-10-28)
 
 After the parser work, a 100 MB `cat` spent most of the Holder's time in

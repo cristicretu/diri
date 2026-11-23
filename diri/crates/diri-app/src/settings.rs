@@ -58,13 +58,14 @@ pub enum SettingsTab {
     Usage,
     Worktrees,
     Resources,
+    Sandboxes,
     Remote,
     Phone,
 }
 
 impl SettingsTab {
     /// Navigation order: grouped by [`SettingsSection`], most used first.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::General,
         Self::Appearance,
         Self::Terminal,
@@ -79,6 +80,7 @@ impl SettingsTab {
         Self::Usage,
         Self::Worktrees,
         Self::Resources,
+        Self::Sandboxes,
         Self::Remote,
         Self::Phone,
     ];
@@ -104,6 +106,7 @@ impl SettingsTab {
             Self::Usage => "settings.tab.usage",
             Self::Worktrees => "settings.tab.worktrees",
             Self::Resources => "settings.tab.resources",
+            Self::Sandboxes => "settings.tab.sandboxes",
             Self::Remote => "settings.tab.remote",
             Self::Phone => "settings.tab.phone",
         })
@@ -125,6 +128,7 @@ impl SettingsTab {
             Self::Usage => "settings.subtitle.usage",
             Self::Worktrees => "settings.subtitle.worktrees",
             Self::Resources => "settings.subtitle.resources",
+            Self::Sandboxes => "settings.subtitle.sandboxes",
             Self::Remote => "settings.subtitle.remote",
             Self::Phone => "settings.subtitle.phone",
         })
@@ -144,7 +148,7 @@ impl SettingsTab {
             Self::Agents | Self::Accounts | Self::Skills | Self::Schedules | Self::Usage => {
                 SettingsSection::Agents
             }
-            Self::Worktrees | Self::Resources | Self::Remote | Self::Phone => {
+            Self::Worktrees | Self::Resources | Self::Sandboxes | Self::Remote | Self::Phone => {
                 SettingsSection::Machines
             }
         }
@@ -166,6 +170,7 @@ impl SettingsTab {
             Self::Usage => "chart.bar.xaxis",
             Self::Worktrees => "arrow.branch",
             Self::Resources => "server.rack",
+            Self::Sandboxes => "square.grid.2x2",
             Self::Remote => "network",
             Self::Phone => "iphone",
         }

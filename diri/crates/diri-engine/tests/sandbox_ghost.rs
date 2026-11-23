@@ -547,3 +547,66 @@ fn the_reaper_reclaims_an_ended_owner() {
     std::thread::sleep(Duration::from_millis(100));
     assert!(tree.iter().all(|pid| !alive(*pid)));
 }
+
+/// Writes one live preview frame from each of four parallel sandboxes to
+/// `$DIRI_SANDBOX_FRAMES_OUT/{1..4}.jpg`, for the app's settings screenshot
+/// fixture (`DIRI_VISUAL_SANDBOX_FRAMES`).
+#[test]
+#[ignore = "writes preview fixtures; needs a Chromium"]
+fn capture_preview_frames() {
+    use base64::Engine as _;
+    let Some(out) = std::env::var_os("DIRI_SANDBOX_FRAMES_OUT") else {
+        eprintln!("set DIRI_SANDBOX_FRAMES_OUT");
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let Some(pool) = pool(root.path(), 4) else {
+        return;
+    };
+    let style = "body{font:15px -apple-system,system-ui;margin:0;color:#1d1d1f;background:#fafafa}\
+                 header{padding:14px 28px;background:#fff;border-bottom:1px solid #e5e5e5;font-weight:600}\
+                 main{padding:28px;max-width:720px}button{font:inherit;padding:9px 18px;border-radius:8px;border:0;background:#0a7cff;color:#fff}\
+                 input{font:inherit;padding:9px 12px;border:1px solid #ccc;border-radius:8px;width:280px;margin:6px 0}\
+                 .card{background:#fff;border:1px solid #e5e5e5;border-radius:12px;padding:18px;margin:12px 0}";
+    let pages = [
+        format!("<meta charset=utf-8><style>{style}</style><header>Acme Store · Checkout</header><main><h2>Order summary</h2><div class=card>Wireless headphones <b style=float:right>$129.00</b></div><div class=card>Shipping <b style=float:right>$4.99</b></div><button>Pay $133.99</button></main>"),
+        format!("<meta charset=utf-8><style>{style}</style><header>Create your account</header><main><h2>Sign up</h2><input placeholder=Email value=ada@example.com><br><input type=password value=secret12><br><label><input type=checkbox checked style=width:auto> Accept terms</label><br><br><button>Create account</button></main>"),
+        format!("<meta charset=utf-8><style>{style}</style><header>Metrics</header><main><h2>Weekly active users</h2><div class=card style=height:150px;display:flex;align-items:flex-end;gap:10px>{}</div><div class=card>Retention 41% · Churn 3.2%</div></main>",
+            [40, 65, 52, 80, 95, 70, 110].iter().map(|h| format!("<div style='width:36px;height:{h}px;background:#0a7cff;border-radius:6px'></div>")).collect::<String>()),
+        format!("<meta charset=utf-8><style>{style}</style><header>Docs</header><main><input value='sandbox' style=width:420px><div class=card><b>sandbox.start</b><br>Start a Ghost Desktop leased to the caller.</div><div class=card><b>sandbox.snapshot</b><br>Save a PNG for before/after proof.</div></main>"),
+    ];
+    let ids: Vec<String> = pages
+        .iter()
+        .map(|html| {
+            let url = format!(
+                "data:text/html;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(html)
+            );
+            pool.start(
+                Caller::Person,
+                &SandboxStartParams {
+                    url: Some(url),
+                    ..SandboxStartParams::default()
+                },
+            )
+            .unwrap()
+            .id
+        })
+        .collect();
+    std::fs::create_dir_all(&out).unwrap();
+    for (index, id) in ids.iter().enumerate() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let jpeg = loop {
+            if let Some(jpeg) = pool.frame(id, None).unwrap().jpeg {
+                break jpeg;
+            }
+            assert!(Instant::now() < deadline, "no frame from {id}");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(jpeg)
+            .unwrap();
+        std::fs::write(Path::new(&out).join(format!("{}.jpg", index + 1)), bytes).unwrap();
+    }
+    pool.shutdown();
+}

@@ -85,6 +85,7 @@ mod recovery;
 pub mod review_prompt;
 mod right_panel;
 pub mod root;
+mod sandboxes_page;
 mod schedules_page;
 pub mod seam;
 mod secure_input;

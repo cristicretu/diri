@@ -83,6 +83,12 @@ Call one as `diri.call("session.list")` or through its generated function, `diri
 | `diri.computer.setup` | `action` | `ComputerStatus` | Install or restart computer use. |
 | `diri.computer.foreground_revoke` | `sessionID?` | `ComputerStatus` | Stop a session, or all, bringing windows forward. |
 | `diri.computer.skills` | `action, sessionID?, args?` | `Value` | App Skills: list, learn, trace, save, run, forget, history, rollback. |
+| `diri.sandbox.start` | `sessionID?, backend?, url?, width?, height?, label?` | `SandboxInfo` | Start a Ghost Desktop leased to the caller, in the bounded pool. |
+| `diri.sandbox.act` | `sandboxID, sessionID?` | `Value` | Navigate, click, type, press, scroll, eval or wait inside a sandbox the caller holds. |
+| `diri.sandbox.snapshot` | `sandboxID, sessionID?, label?, inline?` | `SandboxSnapshot` | Save a PNG of a sandbox for before/after proof. |
+| `diri.sandbox.stop` | `sandboxID, sessionID?` | `{}` | Stop a sandbox and reclaim its processes and files. |
+| `diri.sandbox.list` | `sessionID?` | `SandboxListResult` | Every sandbox, its owner and measured memory and disk. |
+| `diri.sandbox.frame` | `sandboxID, afterSeq?` | `SandboxFrame` | The latest live preview frame of a sandbox. |
 | `diri.session.migrate` | `sessionID, targetHost?` | `SessionRecord` | Move a Claude session between this Mac and a host. |
 | `diri.session.reparent_worktree` | `sessionID, projectRoot, worktreePath` | `SessionRecord` | Record that a session now works in another worktree. |
 | `diri.session.set_project` | `sessionID, projectID?, projectRoot?` | `SessionRecord` | File a session and its children under another project. |

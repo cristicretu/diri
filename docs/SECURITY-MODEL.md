@@ -28,6 +28,21 @@ Use separate worktrees to avoid accidental edit collisions, not as a security
 boundary. For untrusted code, use a dedicated OS account, VM, or container and
 restrict credentials and network access there.
 
+### Ghost Desktops
+
+`sandbox.*` runs windowless Chromium instances for Agents to test web apps in.
+Each one gets a fresh, owner-only profile directory (no cookies, storage or
+logins shared with the person's browser or another sandbox), speaks DevTools
+over a private pipe rather than a TCP port, and synthesises input inside the
+page, so it never reaches the person's cursor, keyboard focus or windows. A
+sandbox is leased to the session that started it; other sessions are refused.
+
+This isolates browser state and the person's input devices, not the operating
+system: the browser runs as the macOS user with Chromium's own renderer
+sandbox, and pages can reach the network and loopback services. The micro-VM
+backend that would add kernel, filesystem and network isolation is not shipped
+and reports itself unavailable.
+
 ### Remote nodes
 
 Remote sessions cross the SSH boundary and run under the configured remote

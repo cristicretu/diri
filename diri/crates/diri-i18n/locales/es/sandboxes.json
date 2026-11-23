@@ -1,0 +1,16 @@
+{
+  "settings.sandboxes.asleep": "En reposo",
+  "settings.sandboxes.capacity": "{used} de {total} en uso",
+  "settings.sandboxes.disk": "{disk} en disco",
+  "settings.sandboxes.empty": "No hay Ghost Desktops en marcha. Los agentes los inician con la herramienta sandbox, o ejecuta dirijor sandbox start URL.",
+  "settings.sandboxes.intro": "Navegadores sin ventana en los que los agentes prueban apps web en paralelo. Nunca tocan tu pantalla, tu cursor, el foco del teclado ni tus ventanas. Haz clic en una vista previa para tomar el control 3 segundos y escribe mientras es tuya.",
+  "settings.sandboxes.memory": "{memory} de RAM",
+  "settings.sandboxes.person": "Iniciado por ti",
+  "settings.sandboxes.processes": "{count} procesos",
+  "settings.sandboxes.ready_in": "listo en {ms} ms",
+  "settings.sandboxes.running": "En marcha",
+  "settings.sandboxes.stop": "Detener",
+  "settings.sandboxes.total": "Total: {memory} de RAM · {disk} en disco",
+  "settings.sandboxes.unavailable": "No disponible: {detail}",
+  "settings.sandboxes.you": "Tienes el control"
+}

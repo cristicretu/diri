@@ -1,0 +1,16 @@
+{
+  "settings.sandboxes.asleep": "Asleep",
+  "settings.sandboxes.capacity": "{used} of {total} in use",
+  "settings.sandboxes.disk": "{disk} disk",
+  "settings.sandboxes.empty": "No Ghost Desktops are running. Agents start them with the sandbox tool, or run dirijor sandbox start URL.",
+  "settings.sandboxes.intro": "Windowless browsers that agents test web apps in, side by side. They never touch your screen, cursor, keyboard focus or windows. Click a preview to take over for 3 seconds, and type while it's yours.",
+  "settings.sandboxes.memory": "{memory} RAM",
+  "settings.sandboxes.person": "Started by you",
+  "settings.sandboxes.processes": "{count} processes",
+  "settings.sandboxes.ready_in": "ready in {ms} ms",
+  "settings.sandboxes.running": "Running",
+  "settings.sandboxes.stop": "Stop",
+  "settings.sandboxes.total": "Total: {memory} RAM · {disk} disk",
+  "settings.sandboxes.unavailable": "Unavailable: {detail}",
+  "settings.sandboxes.you": "You have control"
+}
