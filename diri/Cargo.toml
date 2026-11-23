@@ -66,7 +66,7 @@ serde_json = "1"
 schemars = "1.2"
 regex = "1"
 raw-window-handle = "0.6.2"
-rusqlite = { version = "0.41.0", features = ["bundled"] }
+rusqlite = { version = "0.43.0", features = ["bundled"] }
 sha2 = "0.11"
 tempfile = "3"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
