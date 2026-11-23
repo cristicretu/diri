@@ -33,7 +33,7 @@ getrandom.workspace = true
 memchr = "2.8"
 # The terminal parser already builds parking_lot. Its owned read guard lets
 # attach I/O pin a run without holding Registry or hand-rolling a lifetime gate.
-parking_lot = { version = "0.12", features = ["arc_lock"] }
+parking_lot = { version = "0.13", features = ["arc_lock"] }
 # File-triggered schedules (src/control/schedule_files.rs) watch folders with
 # FSEvents on macOS and inotify on Linux. Already in the workspace graph for
 # the app's code viewer; no polling fallback is used.
