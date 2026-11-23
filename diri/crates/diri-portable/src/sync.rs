@@ -269,7 +269,7 @@ pub fn plan(local: &Snapshot, remote: &Snapshot, base: &SyncBase, stamp: &str) -
         Some(
             serde_json::from_slice::<Value>(bytes)
                 .ok()
-                .and_then(|value| serde_json::to_vec_pretty(&value).ok())
+                .map(|value| canonical_bytes(&value))
                 .unwrap_or_else(|| bytes.clone()),
         )
     };
@@ -307,7 +307,7 @@ pub fn plan(local: &Snapshot, remote: &Snapshot, base: &SyncBase, stamp: &str) -
                     .into_iter()
                     .map(|member| format!("{rel}: {member}")),
             );
-            Some(serde_json::to_vec_pretty(&value).unwrap_or_default())
+            Some(canonical_bytes(&value))
         } else if hl == hb {
             r.cloned()
         } else if hr == hb {
@@ -344,6 +344,28 @@ pub fn plan(local: &Snapshot, remote: &Snapshot, base: &SyncBase, stamp: &str) -
         }
     }
     out
+}
+
+/// A document's bytes with object members sorted at every depth, so two
+/// equal documents always hash alike (whether or not `serde_json` keeps
+/// insertion order in this build).
+pub fn canonical_bytes(value: &Value) -> Vec<u8> {
+    fn sorted(value: &Value) -> Value {
+        match value {
+            Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                Value::Object(
+                    keys.into_iter()
+                        .map(|k| (k.clone(), sorted(&map[k])))
+                        .collect(),
+                )
+            }
+            Value::Array(items) => Value::Array(items.iter().map(sorted).collect()),
+            other => other.clone(),
+        }
+    }
+    serde_json::to_vec_pretty(&sorted(value)).unwrap_or_default()
 }
 
 /// One finished sync.

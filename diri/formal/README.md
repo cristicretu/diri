@@ -93,7 +93,7 @@ The Holder test uses a real PTY and authenticated connections, starting at zero 
 
 ## Portable sync and migration
 
-`MigrationSync.lean` models the `diri-portable` rules from the design brief: the artifact allowlist, field redaction, session merge, cwd remap and write-if-absent file placement. Run `lake build` in this directory.
+`MigrationSync.lean` models the `diri-portable` rules: the artifact allowlist, field redaction, session merge, cwd remap and write-if-absent file placement. Run `lake build` in this directory.
 
 | Lean | Rust counterpart |
 | --- | --- |

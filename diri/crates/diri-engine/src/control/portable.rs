@@ -845,7 +845,7 @@ mod tests {
             json!({"path": bundle, "passphrase": "pw"}),
         );
         assert_eq!(again["added"]["sessions"], 0);
-        assert_eq!(again["kept"].as_u64().unwrap() >= 1, true);
+        assert!(again["kept"].as_u64().unwrap() >= 1);
         assert_eq!(b.server.registry.lock().unwrap().records().len(), 1);
     }
 
