@@ -194,16 +194,21 @@ impl HudModel {
             .is_some_and(|first| projects.any(|other| other != first))
     }
 
-    /// The panel's height for what it shows now: no empty space under the
-    /// last row.
+    /// The panel's height: set by every Session there is, not by the ones
+    /// a search leaves or the row that happens to be highlighted, so it
+    /// holds still while arrowing and typing. Only the find field, opened
+    /// with ⇥, adds to it.
     pub(crate) fn height(&self) -> f32 {
-        let rows = self.rows();
-        let shown = rows.len().clamp(1, VISIBLE_ROWS);
-        let preview = match self.highlighted() {
-            Some(Row::Target(index)) if preview_text(&self.targets[index].preview).is_some() => {
-                PREVIEW_HEIGHT
-            }
-            _ => 0.0,
+        let rows = self.targets.len() + usize::from(self.new_cwd.is_some());
+        let shown = rows.clamp(1, VISIBLE_ROWS);
+        let preview = if self
+            .targets
+            .iter()
+            .any(|target| preview_text(&target.preview).is_some())
+        {
+            PREVIEW_HEIGHT
+        } else {
+            0.0
         };
         HEADER_HEIGHT
             + if self.filtering() { FILTER_HEIGHT } else { 0.0 }
@@ -668,6 +673,9 @@ pub(crate) struct ContextHud {
     services: Option<HudServices>,
     /// The height the panel was last sized to.
     height: f32,
+    /// Closes the panel when another app comes to the front.
+    #[cfg(target_os = "macos")]
+    _app_switch: Option<crate::macos::context_hud_panel::AppSwitchWatch>,
 }
 
 #[derive(Clone)]
@@ -689,6 +697,8 @@ impl ContextHud {
             colors,
             focus: cx.focus_handle(),
             services,
+            #[cfg(target_os = "macos")]
+            _app_switch: None,
         }
     }
 
@@ -815,42 +825,12 @@ impl ContextHud {
         })
         .detach();
     }
-
-    /// Loads ranked targets with previews for the clip.
-    pub(crate) fn load_targets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(services) = self.services.clone() else {
-            return;
-        };
-        let client = Arc::clone(services.store.client());
-        let params = serde_json::json!({"id": self.model.clip.id});
-        cx.spawn_in(window, async move |this, cx| {
-            let result = services
-                .tokio
-                .spawn(async move {
-                    client
-                        .request(Method::CLIP_TARGETS, Some(&params), Some(Duration::from_secs(10)))
-                        .await
-                })
-                .await;
-            let targets = result
-                .ok()
-                .and_then(Result::ok)
-                .and_then(|value| serde_json::from_value::<ClipTargetsResult>(value).ok())
-                .map(|result| result.targets)
-                .unwrap_or_default();
-            let _ = this.update(cx, |hud, cx| {
-                hud.model.set_targets(targets);
-                cx.notify();
-            });
-        })
-        .detach();
-    }
 }
 
 impl Render for ContextHud {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Rows arrive after the panel opens and the find field comes and
-        // goes: keep the panel exactly as tall as what it shows.
+        // The find field comes and goes: keep the panel exactly as tall as
+        // what it shows, growing down from a fixed top edge.
         let height = self.model.height();
         if (height - self.height).abs() > 0.5 {
             self.height = height;
@@ -868,9 +848,41 @@ impl Render for ContextHud {
     }
 }
 
+thread_local! {
+    /// The panel on screen, if any: a new capture replaces it.
+    static OPEN: std::cell::Cell<Option<gpui::AnyWindowHandle>> = const { std::cell::Cell::new(None) };
+}
+
 /// Opens the HUD for a saved clip, centred in the upper part of the screen
-/// under the pointer.
+/// under the pointer. The Sessions are fetched first (a local request, a
+/// few milliseconds), so the panel appears complete and at its final size
+/// instead of growing under the pointer.
 pub(crate) fn open(clip: ClipRecord, services: HudServices, cx: &mut App) {
+    let client = Arc::clone(services.store.client());
+    let tokio = Arc::clone(&services.tokio);
+    let params = serde_json::json!({"id": clip.id});
+    cx.spawn(async move |cx| {
+        let targets = tokio
+            .spawn(async move {
+                client
+                    .request(Method::CLIP_TARGETS, Some(&params), Some(Duration::from_secs(2)))
+                    .await
+            })
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .and_then(|value| serde_json::from_value::<ClipTargetsResult>(value).ok())
+            .map(|result| result.targets)
+            .unwrap_or_default();
+        cx.update(|cx| show(clip, targets, services, cx));
+    })
+    .detach();
+}
+
+fn show(clip: ClipRecord, targets: Vec<ClipTarget>, services: HudServices, cx: &mut App) {
+    if let Some(previous) = OPEN.with(std::cell::Cell::take) {
+        let _ = previous.update(cx, |_, window, _| window.remove_window());
+    }
     let (colors, new_cwd) = {
         let store = services.store.store.read().expect("session store lock poisoned");
         let colors = crate::app_theme::colors_in(&store);
@@ -902,6 +914,7 @@ pub(crate) fn open(clip: ClipRecord, services: HudServices, cx: &mut App) {
     if let Some(index) = NEW_AGENT_KINDS.iter().position(|id| *id == default_agent.id()) {
         model.new_kind = index;
     }
+    model.set_targets(targets);
     #[cfg(target_os = "macos")]
     let bounds = crate::macos::context_hud_panel::frame(HUD_WIDTH, model.height(), HUD_MAX_HEIGHT);
     #[cfg(not(target_os = "macos"))]
@@ -918,13 +931,34 @@ pub(crate) fn open(clip: ClipRecord, services: HudServices, cx: &mut App) {
         window_background: gpui::WindowBackgroundAppearance::Blurred,
         ..Default::default()
     };
-    let _ = cx.open_window(options, move |window, cx| {
+    let opened = cx.open_window(options, move |window, cx| {
         #[cfg(target_os = "macos")]
         crate::macos::context_hud_panel::prepare(window, Radius::FLOATING_MENU);
         let hud = cx.new(|cx| ContextHud::new(model, colors, Some(services), cx));
         hud.update(cx, |hud, cx| {
             window.focus(hud.focus_handle(), cx);
-            hud.load_targets(window, cx);
+            #[cfg(target_os = "macos")]
+            {
+                let handle = window.window_handle();
+                let async_cx = cx.to_async();
+                hud._app_switch = Some(crate::macos::context_hud_panel::AppSwitchWatch::new(
+                    move || {
+                        // Deferred: AppKit is mid-notification here.
+                        let handle = handle;
+                        let cx = async_cx.clone();
+                        cx.foreground_executor()
+                            .spawn({
+                                let cx = cx.clone();
+                                async move {
+                                    let _ = handle.update(&mut cx.clone(), |_, window, _| {
+                                        window.remove_window()
+                                    });
+                                }
+                            })
+                            .detach();
+                    },
+                ));
+            }
             // Clicking away closes it; the clip stays in the ring. Opening
             // reports key status off and on again (the style change in
             // `prepare`, then `makeKeyAndOrderFront`), and the notifications
@@ -949,6 +983,9 @@ pub(crate) fn open(clip: ClipRecord, services: HudServices, cx: &mut App) {
         });
         hud
     });
+    if let Ok(handle) = opened {
+        OPEN.with(|open| open.set(Some(handle.into())));
+    }
 }
 
 /// Reopens the HUD on the newest clip in the ring, to send it again or
@@ -1198,22 +1235,24 @@ mod tests {
     }
 
     #[test]
-    fn the_panel_is_as_tall_as_its_rows() {
+    fn the_panel_holds_its_height_while_arrowing_and_searching() {
         let mut model = model();
-        let with_preview = model.height();
+        let resting = model.height();
         model.move_highlight(1);
-        // The second Session has no conversation yet, so no preview line.
-        assert_eq!(model.height(), with_preview - PREVIEW_HEIGHT);
+        // The second Session has no preview; the panel keeps its room.
+        assert_eq!(model.height(), resting);
         model.field = Field::Filter;
-        assert_eq!(model.height(), with_preview - PREVIEW_HEIGHT + FILTER_HEIGHT);
+        assert_eq!(model.height(), resting + FILTER_HEIGHT);
         model.filter.insert("nothing matches");
-        model.new_cwd = None;
-        // One quiet "No sessions" line, never a collapsed panel.
+        assert_eq!(model.height(), resting + FILTER_HEIGHT);
+        assert!(resting + FILTER_HEIGHT <= HUD_MAX_HEIGHT);
+        // With nothing at all, one quiet line, never a collapsed panel.
+        let mut empty = HudModel::new(sample_clip(None), None);
+        empty.set_targets(Vec::new());
         assert_eq!(
-            model.height(),
-            HEADER_HEIGHT + FILTER_HEIGHT + 2.0 * PALETTE_ROW_INSET + ROW_HEIGHT + FOOTER_HEIGHT
+            empty.height(),
+            HEADER_HEIGHT + 2.0 * PALETTE_ROW_INSET + ROW_HEIGHT + FOOTER_HEIGHT
         );
-        assert!(with_preview <= HUD_MAX_HEIGHT);
     }
 
     #[test]

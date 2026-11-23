@@ -139,3 +139,56 @@ pub(crate) fn guide_screen_recording() {
         Box::new(|| {}),
     );
 }
+
+/// Watches for another app coming to the front, which a non-activating
+/// panel never hears about as a loss of key status (⌘-Tab, a Dock click,
+/// a notification opening its app). Stops watching when dropped.
+pub(crate) struct AppSwitchWatch {
+    observer: Retained<objc2::runtime::ProtocolObject<dyn objc2::runtime::NSObjectProtocol>>,
+}
+
+impl AppSwitchWatch {
+    /// `switched` runs on the main thread when an app other than the one in
+    /// front now comes forward. The one in front is ignored: macOS hands it
+    /// activation back as the screenshot overlay ends.
+    pub(crate) fn new(switched: impl Fn() + 'static) -> Self {
+        let front = || {
+            objc2_app_kit::NSWorkspace::sharedWorkspace()
+                .frontmostApplication()
+                // SAFETY: an `int` property getter on NSRunningApplication.
+                .map(|app| unsafe { msg_send![&*app, processIdentifier] }) as Option<i32>
+        };
+        let original = front();
+        let handler = block2::RcBlock::new(
+            move |_: std::ptr::NonNull<objc2_foundation::NSNotification>| {
+                if front() != original {
+                    switched();
+                }
+            },
+        );
+        // SAFETY: the block is retained by the center until removal and runs
+        // on the main queue.
+        let observer = unsafe {
+            objc2_app_kit::NSWorkspace::sharedWorkspace()
+                .notificationCenter()
+                .addObserverForName_object_queue_usingBlock(
+                    Some(objc2_app_kit::NSWorkspaceDidActivateApplicationNotification),
+                    None,
+                    Some(&objc2_foundation::NSOperationQueue::mainQueue()),
+                    &handler,
+                )
+        };
+        Self { observer }
+    }
+}
+
+impl Drop for AppSwitchWatch {
+    fn drop(&mut self) {
+        // SAFETY: the observer came from this notification center.
+        unsafe {
+            objc2_app_kit::NSWorkspace::sharedWorkspace()
+                .notificationCenter()
+                .removeObserver(AsRef::<AnyObject>::as_ref(&*self.observer));
+        }
+    }
+}
