@@ -184,6 +184,7 @@ actions!(
         CopyLastCommandOutput,
         ClearScrollback,
         ResetTerminal,
+        ToggleLens,
     ]
 );
 
@@ -303,6 +304,7 @@ pub enum CommandId {
     CopyLastCommandOutput,
     ClearScrollback,
     ResetTerminal,
+    ToggleLens,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1449,6 +1451,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         "arrow.counterclockwise",
         "terminal reset garbled broken modes emulator stty sane"
     ),
+    spec!(
+        ToggleLens,
+        "toggle-lens",
+        Some("cmd-alt-l"),
+        Some("⌥⌘L"),
+        Some(TERMINAL_CONTEXT),
+        "command.toggle_lens.palette_title",
+        "text.bubble",
+        "lens gui tui thread conversation conductor pilot terminal view switch"
+    ),
 ];
 
 pub fn command(id: CommandId) -> &'static CommandSpec {
@@ -1796,6 +1808,7 @@ impl CommandSpec {
             }
             CommandId::ClearScrollback => KeyBinding::new(key, ClearScrollback, context),
             CommandId::ResetTerminal => KeyBinding::new(key, ResetTerminal, context),
+            CommandId::ToggleLens => KeyBinding::new(key, ToggleLens, context),
         }
     }
 }
@@ -1823,6 +1836,10 @@ fn linux_keystroke(id: CommandId, key: &str) -> Option<String> {
     // Cmd-Ctrl-T would land on New Tab's Ctrl-Shift-T.
     if id == CommandId::ShowTodos {
         return Some("ctrl-alt-shift-t".to_owned());
+    }
+    // Ctrl-Alt-L is Focus Pane Right (vim's l) on Linux.
+    if id == CommandId::ToggleLens {
+        return Some("ctrl-alt-shift-l".to_owned());
     }
     // Ctrl-[ is Escape in a terminal; the pane cycle stays in the palette.
     if matches!(id, CommandId::FocusPreviousPane | CommandId::FocusNextPane) {
@@ -2689,6 +2706,11 @@ impl CommandId {
                 description: t("command.reset_terminal.description"),
                 category: ShortcutCategory::Terminal,
             },
+            Self::ToggleLens => ShortcutMetadata {
+                title: t("command.toggle_lens.title"),
+                description: t("command.toggle_lens.description"),
+                category: ShortcutCategory::Terminal,
+            },
             Self::CopySelection => ShortcutMetadata {
                 title: t("command.copy_selection.title"),
                 description: t("command.copy_selection.description"),
@@ -2897,6 +2919,7 @@ impl CommandId {
             Self::CopyLastCommandOutput => Box::new(CopyLastCommandOutput),
             Self::ClearScrollback => Box::new(ClearScrollback),
             Self::ResetTerminal => Box::new(ResetTerminal),
+            Self::ToggleLens => Box::new(ToggleLens),
         }
     }
 }

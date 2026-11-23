@@ -3564,3 +3564,29 @@ IDLE_FILE=styled-100k.txt DIRI_HOLDER_BIN=$CARGO_TARGET_DIR/release/diri-holder 
 # with IDLE_TRACE=1 for the footprint every 10 s, DIRI_HISTORY_SWAP=0 for resident reads
 cargo test --release -p diri-engine --lib record_load_cost -- --ignored --nocapture
 ```
+
+## Dual-Lens GUI (2026-11-23, `feat/dual-lens-gui`)
+
+Release builds on the development Mac (Apple silicon, other work running). See `DUAL_LENS.md`.
+
+| Measure | Result |
+| --- | --- |
+| Engine tail, cold read of a 16 MiB Claude transcript (100,000 items) | 88.9 ms (180 MiB/s) |
+| Engine tail, one appended record read and normalized, p50 / p95 | 52 / 147 µs |
+| Lens model, 6,200 items → 2,400 rows, cold ingest | 8.8–12.3 ms |
+| Lens model, one appended item, p50 / p95 | 3.0 / 3.6 µs |
+| Markdown parses for 800 assistant turns | 800 (each once) |
+| Lens frame over 2,400 rows while scrolling, headless draw + texture readback, p50 / p90 / p99 | 4.39 / 4.77 / 5.34 ms |
+| Same capture path on an empty window of the same size, p50 | 3.74 ms |
+| Lens cost above that baseline, p50 / p90 | 0.64 / 1.03 ms |
+
+Commands:
+
+```sh
+cargo test -p diri-engine --release --lib thread::bench -- --ignored --nocapture
+cargo test -p diri-app --release --bin diri bench_thread_lens -- --ignored --nocapture
+```
+
+The headless frame includes GPU readback for every frame. The empty-window row measures that capture path, and the lens is charged only for the difference. An earlier run on a busier machine measured 9.75 ms p50 including readback, without a baseline. Typing in the composer does not touch the PTY until submit, so the terminal's keystroke-to-PTY path is unchanged. The GUI Lens schedules nothing while idle. The Work Strip's breathing dot animates only while the session's status is working.
+
+Not measured: on-screen frame pacing in the shipped app, the ADEMark typing probe with the GUI Lens open, and memory of very long threads. The model keeps all items of a thread, and only visible rows hold shaped text.

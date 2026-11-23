@@ -31,7 +31,6 @@ const MIN_SHARED_SHARE: f32 = 0.20;
 
 /// The changed byte ranges of `old` and `new`, or `None` when the two lines
 /// are too different (or too long) for word emphasis to help.
-#[cfg(test)]
 #[must_use]
 pub(crate) fn changed_words(old: &str, new: &str) -> Option<ChangedWords> {
     let mut budget = MAX_PAIR_CELLS;

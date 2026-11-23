@@ -53,6 +53,9 @@ Call one as `diri.call("session.list")` or through its generated function, `diri
 | `diri.session.deliver_message` | `sessionID, senderID, messageID, text, submit` | `DeliverMessageResult` | Deliver a message to an Agent with at-most-once identity. |
 | `diri.session.send_key` | `sessionID, key, modifiers?, action?` | `{}` | Press one named key in a session's terminal. |
 | `diri.session.send_text` | `sessionID, text, submit` | `{}` | Type text into a session's terminal, optionally pressing Return. |
+| `diri.session.thread_read` | `sessionID, from?, maxBytes?, watch?` | `ThreadReadResult` | Structured thread items after a cursor in the Agent's transcript. |
+| `diri.session.answer_blocker` | `sessionID, occurredAt, choice` | `{}` | Approve or deny the permission prompt that is still showing. |
+| `diri.session.handoff_capsule` | `sessionID, goal?` | `HandoffCapsuleResult` | The deterministic capsule another Agent would continue this thread from. |
 | `diri.session.resize` | `sessionID, cols, rows` | `{}` | Resize a session's terminal. |
 | `diri.session.scroll` | `sessionID, up, lines, col, row` | `{}` | Turn the mouse wheel over a session's terminal. |
 | `diri.session.read_screen` | `sessionID` | `ReadScreenResult` | The visible screen as text. |
@@ -260,6 +263,7 @@ Run one with `diri.action("split-pane-right")` or `diri.actions.split_pane_right
 | `terminal-next-prompt` |  | ⌘⇧↓ | Jump to the following sent Agent message or marked shell prompt |
 | `terminal-clear-scrollback` |  | ⇧⌘K | Erase this terminal's history and screen, keeping the line you are typing on **Destructive.** |
 | `terminal-reset` |  |  | Blank a garbled terminal and restore its default modes; the program keeps running **Destructive.** |
+| `toggle-lens` |  | ⌥⌘L | Switch a Claude Code or Codex tab between its conversation and its terminal, on the same live session |
 | `select-tab` | `index` |  | Show the tab at this position in the sidebar: 1 is the first, -1 the last. |
 | `show-session` | `session_id` |  | Select a session's tab in the window, without bringing Diri to the front. |
 | `set-theme` | `theme` |  | Use this terminal color theme and stop following the system appearance. |

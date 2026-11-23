@@ -387,6 +387,7 @@ fn append_management_actions(
                             | CommandId::ReloadScripts
                             | CommandId::ClearScrollback
                             | CommandId::ResetTerminal
+                            | CommandId::ToggleLens
                     )
             )
         }),
@@ -653,6 +654,14 @@ pub fn actions_for_default_host(
     {
         result.push(registered_action(CommandId::ClearScrollback));
         result.push(registered_action(CommandId::ResetTerminal));
+        if session.host.is_none()
+            && matches!(
+                session.kind.id(),
+                diri_proto::AgentKind::CLAUDE_CODE_ID | diri_proto::AgentKind::CODEX_ID
+            )
+        {
+            result.push(registered_action(CommandId::ToggleLens));
+        }
     }
 
     // Session handoff: move the SELECTED Claude session across hosts (v1 is

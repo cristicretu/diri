@@ -352,6 +352,24 @@ function diri.session.send_key(params, opts) end
 ---@return table # {}
 function diri.session.send_text(params, opts) end
 
+---Structured thread items after a cursor in the Agent's transcript.
+---@param params {sessionID: string, from?: any, maxBytes?: integer, watch?: boolean}
+---@param opts? {timeout?: number}
+---@return table # ThreadReadResult
+function diri.session.thread_read(params, opts) end
+
+---Approve or deny the permission prompt that is still showing.
+---@param params {sessionID: string, occurredAt: number, choice: any}
+---@param opts? {timeout?: number}
+---@return table # {}
+function diri.session.answer_blocker(params, opts) end
+
+---The deterministic capsule another Agent would continue this thread from.
+---@param params {sessionID: string, goal?: string}
+---@param opts? {timeout?: number}
+---@return table # HandoffCapsuleResult
+function diri.session.handoff_capsule(params, opts) end
+
 ---Resize a session's terminal.
 ---@param params {sessionID: string, cols: integer, rows: integer}
 ---@param opts? {timeout?: number}
@@ -1255,6 +1273,10 @@ function diri.actions.terminal_clear_scrollback(args) end
 ---Blank a garbled terminal and restore its default modes; the program keeps running
 ---@param args? table
 function diri.actions.terminal_reset(args) end
+
+---Switch a Claude Code or Codex tab between its conversation and its terminal, on the same live session
+---@param args? table
+function diri.actions.toggle_lens(args) end
 
 ---Show the tab at this position in the sidebar: 1 is the first, -1 the last.
 ---@param args {index: integer}

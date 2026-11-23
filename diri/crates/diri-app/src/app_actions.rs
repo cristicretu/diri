@@ -57,7 +57,7 @@ pub fn exposure(id: CommandId) -> Exposure {
         NewWindow | ReopenSession | NewDefaultSession | NewTerminal
         | NewCodexSession | ToggleCommandPalette | ToggleQuickOpen | ToggleHistory
         | GlobalSearch
-        | ToggleNotifications | ToggleOverview | ToggleTabPeek
+        | ToggleNotifications | ToggleOverview | ToggleTabPeek | ToggleLens
         | FocusPaneLeft | FocusPaneRight | FocusPaneUp | FocusPaneDown | SplitPaneRight
         | SplitPaneBelow | FocusPreviousPane | FocusNextPane | EqualizePanes
         | TogglePaneZoom | PaneGrowWidth | PaneShrinkWidth | PaneGrowHeight

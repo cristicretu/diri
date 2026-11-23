@@ -1073,6 +1073,11 @@ pub struct TerminalPane {
     _store_changes: Task<()>,
     _refits: Task<()>,
     _telemetry: crate::telemetry::Live,
+    /// The GUI Lens of each session that has shown one. Kept while the pane
+    /// lives so flipping back is instant and loses no scroll or draft.
+    lenses: HashMap<SessionId, (Entity<crate::thread_lens::ThreadLens>, gpui::Subscription)>,
+    /// Which lens each session shows; absent means the TUI Lens.
+    lens_modes: HashMap<SessionId, crate::thread_lens::Lens>,
 }
 
 impl EventEmitter<TerminalPaneEvent> for TerminalPane {}
@@ -1353,6 +1358,8 @@ impl TerminalPane {
             _window_owner: window_owner,
             _pane_events: pane_events,
             _store_changes: store_changes,
+            lenses: HashMap::new(),
+            lens_modes: HashMap::new(),
             _refits: refits,
             _telemetry: crate::telemetry::Live::pane(),
         };
@@ -1746,8 +1753,112 @@ impl TerminalPane {
         if window.is_window_active() {
             self.claim_selected_control();
         }
+        if let Some(lens) = self.shown_lens() {
+            let handle = gpui::Focusable::focus_handle(lens.read(cx), cx);
+            window.focus(&handle, cx);
+            cx.notify();
+            return;
+        }
         window.focus(&self.focus, cx);
         cx.notify();
+    }
+
+    /// The GUI Lens entity when the selected session shows it.
+    fn shown_lens(&self) -> Option<Entity<crate::thread_lens::ThreadLens>> {
+        let id = self.selected_id()?;
+        (self.lens_modes.get(&id) == Some(&crate::thread_lens::Lens::Gui))
+            .then(|| self.lenses.get(&id).map(|(lens, _)| lens.clone()))
+            .flatten()
+    }
+
+    /// Whether a session can show the GUI Lens: a local Claude Code or Codex
+    /// Agent Diri launched (its transcript identity is Diri's to trust).
+    fn lens_capable(session: &SessionRecord) -> bool {
+        session.host.is_none()
+            && !session.is_note()
+            && session.effective_kind() == &session.kind
+            && matches!(
+                session.kind.id(),
+                diri_proto::AgentKind::CLAUDE_CODE_ID | diri_proto::AgentKind::CODEX_ID
+            )
+    }
+
+    /// Flips the selected session between the GUI Lens and the TUI Lens.
+    /// The Holder, attachment and terminal grid are untouched either way:
+    /// the grid keeps receiving diffs while hidden, so flipping back paints
+    /// the current screen on the next frame with no reconnect.
+    pub(crate) fn toggle_lens(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = self.selected_session() else {
+            return;
+        };
+        if !Self::lens_capable(&session) {
+            self.show_terminal_feedback(t("thread_lens.terminal_only"), window, cx);
+            return;
+        }
+        let mode = self.lens_modes.get(&session.id).copied().unwrap_or_default().flipped();
+        self.set_lens(&session.id, mode, window, cx);
+    }
+
+    fn set_lens(
+        &mut self,
+        id: &SessionId,
+        mode: crate::thread_lens::Lens,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.lens_modes.insert(id.clone(), mode);
+        if mode == crate::thread_lens::Lens::Gui {
+            let lens = self.ensure_lens(id, window, cx);
+            let handle = gpui::Focusable::focus_handle(lens.read(cx), cx);
+            window.focus(&handle, cx);
+        } else {
+            window.focus(&self.focus, cx);
+        }
+        diri_telemetry::event!("lens.toggle", gui = mode == crate::thread_lens::Lens::Gui);
+        cx.notify();
+    }
+
+    fn ensure_lens(
+        &mut self,
+        id: &SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<crate::thread_lens::ThreadLens> {
+        if let Some((lens, _)) = self.lenses.get(id) {
+            return lens.clone();
+        }
+        // Lenses of sessions that are gone release their event tasks.
+        {
+            let store = self.runtime.store.read().expect("store");
+            let sessions = store.sessions();
+            self.lenses.retain(|session, _| sessions.contains_key(session));
+            self.lens_modes.retain(|session, _| sessions.contains_key(session));
+        }
+        let runtime = Arc::clone(&self.runtime);
+        let tokio = self.tokio.clone();
+        let session_id = id.clone();
+        let lens = cx.new(|cx| crate::thread_lens::ThreadLens::new(session_id, runtime, tokio, cx));
+        let subscription = cx.subscribe_in(&lens, window, |this, lens, event, window, cx| {
+            use crate::thread_lens::ThreadLensEvent;
+            match event {
+                ThreadLensEvent::OpenReference(reference) => {
+                    this.open_reference(TerminalReference::File(reference.clone()), window, cx);
+                }
+                ThreadLensEvent::ContinueAccount => {
+                    let id = lens.read(cx).session_id().clone();
+                    cx.emit(TerminalPaneEvent::ContinueAccount(id));
+                }
+                ThreadLensEvent::FocusTerminal => {
+                    window.focus(&this.focus, cx);
+                    cx.notify();
+                }
+                ThreadLensEvent::PasteIntoTerminal => {
+                    this.paste(&Paste, window, cx);
+                }
+            }
+        });
+        self.lenses.insert(id.clone(), (lens.clone(), subscription));
+        lens
     }
 
     /// A split workbench explicitly assigns one visible owner per SessionId.
@@ -5137,6 +5248,11 @@ impl TerminalPane {
                     .items_center()
                     .gap(px(Metrics::TOOLBAR_ITEM_GAP))
                     .opacity(self.title_opacity)
+                    .children(
+                        (header_width >= 360.0)
+                            .then(|| self.render_lens_toggle(session, colors, cx))
+                            .flatten(),
+                    )
                     .when(shell_controls, |trailing| {
                         trailing
                             .children(self.render_inspector_toggle(colors, self.held_hint))
@@ -5294,6 +5410,123 @@ impl TerminalPane {
                         .child(self.render_session_links_trigger(&session, colors, cx))
                 })
                 .children(self.render_inspector_toggle(colors, held_hint))
+                .into_any_element(),
+        )
+    }
+
+    /// The selected session's surface: the GUI Lens (with the real terminal
+    /// surfacing inline when the Agent asks something only it can answer),
+    /// or the terminal grid. The grid is not laid out under the GUI Lens,
+    /// but its attachment and buffer keep running, so flipping back paints
+    /// the live screen at once.
+    fn render_lens_or_grid(
+        &mut self,
+        session: &SessionRecord,
+        theme: TermTheme,
+        colors: SemanticColors,
+        typeface: &TerminalType,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let gui = self.lens_modes.get(&session.id) == Some(&crate::thread_lens::Lens::Gui)
+            && Self::lens_capable(session);
+        if !gui {
+            return self.render_grid_and_overlays(session, theme, colors, typeface, window, cx);
+        }
+        let lens = self.ensure_lens(&session.id, window, cx);
+        let portal = crate::thread_lens::needs_portal(session).then(|| {
+            // The grid keeps the pane's full size (so the PTY is never
+            // resized), clipped to its bottom rows where prompts sit.
+            let full = self
+                .viewport
+                .map_or(480.0, |viewport| viewport.height - self.header_height())
+                .max(160.0);
+            let height = (full * 0.42).clamp(150.0, 320.0);
+            let grid = self.render_grid_and_overlays(session, theme, colors, typeface, window, cx);
+            div()
+                .id("lens-pty-portal")
+                .mx(px(24.0))
+                .mb(px(10.0))
+                .flex()
+                .flex_col()
+                .rounded(px(Radius::PANEL))
+                .border_1()
+                .border_color(Ink::ATTENTION.alpha(0.45))
+                .overflow_hidden()
+                .bg(colors.terminal_surface())
+                .child(
+                    div()
+                        .h(px(26.0))
+                        .px(px(10.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .text_size(px(11.0))
+                        .text_color(colors.secondary)
+                        .child(div().size(px(6.0)).rounded_full().bg(Ink::ATTENTION))
+                        .child(t("thread_lens.portal_title")),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .h(px(height))
+                        .overflow_hidden()
+                        .child(div().absolute().left_0().right_0().bottom_0().h(px(full)).child(grid)),
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    window.focus(&this.focus, cx);
+                    cx.notify();
+                }))
+                .into_any_element()
+        });
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(div().flex_1().min_h(px(0.0)).child(lens))
+            .children(portal)
+            .into_any_element()
+    }
+
+    /// The header's segmented Conversation | Terminal control.
+    fn render_lens_toggle(&self, session: &SessionRecord, colors: SemanticColors, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !Self::lens_capable(session) {
+            return None;
+        }
+        let gui = self.lens_modes.get(&session.id) == Some(&crate::thread_lens::Lens::Gui);
+        let segment = |id: &'static str, label: &'static str, active: bool, mode: crate::thread_lens::Lens| {
+            let session_id = session.id.clone();
+            div()
+                .id(id)
+                .h(px(20.0))
+                .px(px(8.0))
+                .flex()
+                .items_center()
+                .rounded(px(Radius::CHIP))
+                .text_size(px(11.0))
+                .font_weight(if active { gpui::FontWeight::MEDIUM } else { gpui::FontWeight::NORMAL })
+                .text_color(if active { colors.primary } else { colors.tertiary })
+                .when(active, |segment| segment.bg(colors.primary.alpha(0.1)))
+                .when(!active, |segment| segment.hover(|s| s.text_color(colors.secondary)))
+                .cursor_pointer()
+                .child(t(label))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.set_lens(&session_id, mode, window, cx);
+                    cx.stop_propagation();
+                }))
+        };
+        Some(
+            div()
+                .id("lens-toggle")
+                .flex_none()
+                .p(px(2.0))
+                .flex()
+                .gap(px(1.0))
+                .rounded(px(Radius::BADGE))
+                .bg(colors.primary.alpha(0.05))
+                .child(segment("lens-toggle-gui", "thread_lens.toggle_conversation", gui, crate::thread_lens::Lens::Gui))
+                .child(segment("lens-toggle-tui", "thread_lens.toggle_terminal", !gui, crate::thread_lens::Lens::Tui))
+                .shortcut_tooltip(t("command.toggle_lens.title"), Some(crate::commands::CommandId::ToggleLens), colors)
                 .into_any_element(),
         )
     }
@@ -6155,9 +6388,7 @@ impl TerminalPane {
                 })
                 .overflow_hidden()
                 .bg(colors.work_surface_nested())
-                .child(
-                    self.render_grid_and_overlays(&session, theme, colors, &typeface, window, cx),
-                );
+                .child(self.render_lens_or_grid(&session, theme, colors, &typeface, window, cx));
             if let Some(find) = self.render_find_bar(&session, colors, cx) {
                 terminal_surface = terminal_surface.child(find);
             }
@@ -6245,6 +6476,12 @@ impl TerminalPane {
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::reset_zoom))
             .on_action(cx.listener(Self::paste))
+            .on_action(
+                cx.listener(|this, _: &crate::commands::ToggleLens, window, cx| {
+                    this.toggle_lens(window, cx);
+                    cx.stop_propagation();
+                }),
+            )
             .on_action(cx.listener(Self::copy_selection))
             .on_action(
                 cx.listener(|this, _: &crate::commands::EnterCopyMode, window, cx| {
@@ -8585,6 +8822,10 @@ mod tests {
             session.cwd = root.path().display().to_string();
             root
         });
+        if scene.starts_with("lens-") {
+            session.kind = diri_proto::AgentKind::CLAUDE_CODE;
+            session.title = "Fix the dropped last chunk".into();
+        }
         if scene.starts_with("insert-path-remote") {
             session.host = Some("forge".into());
             session.cwd = "/home/cristi/work/replay-web".into();
@@ -8976,6 +9217,52 @@ mod tests {
                                 pane.path_picker_query_for_test(&query);
                             }
                         }
+                        // One Codex session, TUI Lens then GUI Lens; the
+                        // header's Conversation | Terminal control flips them.
+                        "lens-tui" | "lens-gui" => {
+                            let mut grid = grid_frame(120, true);
+                            grid.rows = 40;
+                            for (y, text) in [
+                                (1u16, "✳ Claude Code  ·  Sonnet 5.5  ·  ~/work/diri"),
+                                (3, "⏺ Fixed. A record split across two reads now waits for its newline instead"),
+                                (4, "  of being skipped, and close_mid_record pins it."),
+                                (6, "> /model sonnet"),
+                                (7, "  ⎿  Set model to Sonnet 5.5"),
+                                (9, "> Now tighten the docs on `read_window`."),
+                                (11, "⏺ Update(crates/diri-engine/src/thread/tail.rs)"),
+                                (12, "  ⎿  Updated crates/diri-engine/src/thread/tail.rs with 1 addition and 1 removal"),
+                                (13, "     52 -  /// Reads complete lines from `offset`."),
+                                (14, "     52 +  /// Reads complete lines from `offset` (a boundary) up to `len`."),
+                                (16, "  ⎿  Context compacted"),
+                                (18, "⏺ Picked up on the Work account with the same conversation. Docs on"),
+                                (19, "  read_window now say the cursor must be a record boundary."),
+                                (33, "──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"),
+                                (34, "> Ship it — then open a PR with before/after screenshots"),
+                                (35, "──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"),
+                                (36, "  ⏵⏵ accept edits on (shift+tab to cycle)                    Work · Sonnet 5.5"),
+                            ] {
+                                let mut cells = vec![GridCell::BLANK; 120];
+                                for (cell, ch) in cells.iter_mut().zip(text.chars()) {
+                                    cell.scalar = ch as u32;
+                                }
+                                grid.changed_rows.push(ChangedRow::new(y, cells));
+                            }
+                            grid.cursor_row = 34;
+                            grid.cursor_col = 57;
+                            pane.residents.get_mut(&id).unwrap().element.apply_damage(grid);
+                            if scene == "lens-gui" {
+                                pane.set_lens(&id, crate::thread_lens::Lens::Gui, window, cx);
+                                let lens = pane.ensure_lens(&id, window, cx);
+                                let now_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_millis() as i64;
+                                lens.update(cx, |lens, cx| {
+                                    lens.ingest_for_test(crate::thread_lens::fixture::page(now_ms), cx);
+                                    lens.type_for_test("Ship it — then open a PR with before/after screenshots", cx);
+                                });
+                            }
+                        }
                         _ => (),
                     }
                     pane
@@ -8983,6 +9270,15 @@ mod tests {
             })
             .expect("preview window");
         cx.run_until_parked();
+        if scene.starts_with("lens-") {
+            // Mermaid draws on the background executor.
+            for _ in 0..3 {
+                cx.update_window(window.into(), |_, window, _| window.refresh())
+                    .unwrap();
+                std::thread::sleep(Duration::from_millis(150));
+                cx.run_until_parked();
+            }
+        }
         if scene == "secret" {
             // The fixture's own attachment has reported Live by now; a mode
             // set any earlier is dropped with the state that preceded it.

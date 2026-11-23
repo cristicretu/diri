@@ -20,7 +20,7 @@ const MAX_SOURCE: usize = 32 * 1024;
 
 /// A diagram drawn to a picture, with its natural size in points.
 #[derive(Clone)]
-pub(super) struct Drawing {
+pub(crate) struct Drawing {
     pub image: Arc<Image>,
     pub width: f32,
     pub height: f32,
@@ -28,7 +28,7 @@ pub(super) struct Drawing {
 
 /// What a diagram block shows this frame.
 #[derive(Clone)]
-pub(super) enum Look {
+pub(crate) enum Look {
     /// Not drawn yet, and nothing earlier to stand in.
     Pending,
     Drawn(Drawing),
@@ -47,7 +47,7 @@ struct Entry {
 
 /// Each diagram block's drawing, by block id.
 #[derive(Default)]
-pub(super) struct Diagrams {
+pub(crate) struct Diagrams {
     entries: HashMap<u64, Entry>,
     /// Pictures no block shows any more, whose rasters gpui still caches
     /// until the view releases them ([`Self::take_retired`]).
@@ -174,7 +174,7 @@ fn key(source: &str, dark: bool) -> u64 {
 /// first call in the process loads the system fonts the renderer measures
 /// labels with (one shared database behind a lock, so draws run one at a
 /// time).
-pub(super) fn draw(source: &str, dark: bool) -> Result<Drawing, SharedString> {
+pub(crate) fn draw(source: &str, dark: bool) -> Result<Drawing, SharedString> {
     if source.trim().is_empty() {
         return Err(crate::i18n::t("notes.diagram.empty").into());
     }

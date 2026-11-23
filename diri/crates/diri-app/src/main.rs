@@ -107,6 +107,7 @@ mod tab_preview;
 mod telemetry;
 mod terminal_import;
 pub mod terminal_pane;
+pub mod thread_lens;
 mod text_input;
 mod scripting;
 mod toast;
