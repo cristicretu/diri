@@ -7,8 +7,8 @@
 use std::collections::HashSet;
 
 use super::action;
-use super::link;
 use super::identity::Icon;
+use super::link;
 use super::node::{BoxStyle, Color, Length, Node, NodeKind, Shape, walk};
 use super::{SurfaceError, SurfaceState};
 
@@ -245,7 +245,12 @@ fn check_color(path: &str, color: Option<&Color>) -> Result<(), SurfaceError> {
     }
 }
 
-fn in_range(path: &str, field: &str, value: Option<f32>, range: std::ops::RangeInclusive<f32>) -> Result<(), SurfaceError> {
+fn in_range(
+    path: &str,
+    field: &str,
+    value: Option<f32>,
+    range: std::ops::RangeInclusive<f32>,
+) -> Result<(), SurfaceError> {
     match value {
         Some(value) if !value.is_finite() || !range.contains(&value) => Err(SurfaceError::new(
             "invalid_value",
@@ -594,7 +599,9 @@ fn check_node(checker: &mut Checker, node: &Node, path: &str) -> Result<(), Surf
             }
         }
         NodeKind::Box { .. } | NodeKind::Spacer => {}
-        NodeKind::Scroll { height, .. } => in_range(path, "height", Some(*height), 40.0..=MAX_EXTENT)?,
+        NodeKind::Scroll { height, .. } => {
+            in_range(path, "height", Some(*height), 40.0..=MAX_EXTENT)?
+        }
         NodeKind::Code { text: t, language } => {
             text(path, "text", t, MAX_TEXT_BYTES)?;
             if let Some(language) = language {
@@ -649,11 +656,15 @@ fn check_node(checker: &mut Checker, node: &Node, path: &str) -> Result<(), Surf
 }
 
 fn check_shape(path: &str, shape: &Shape) -> Result<(), SurfaceError> {
-    let finite = |values: &[f32]| values.iter().all(|v| v.is_finite() && v.abs() <= MAX_EXTENT * 4.0);
+    let finite = |values: &[f32]| {
+        values
+            .iter()
+            .all(|v| v.is_finite() && v.abs() <= MAX_EXTENT * 4.0)
+    };
     let ok = match shape {
-        Shape::Rect { x, y, w, h, radius, .. } => {
-            finite(&[*x, *y, *w, *h, radius.unwrap_or(0.0)]) && *w >= 0.0 && *h >= 0.0
-        }
+        Shape::Rect {
+            x, y, w, h, radius, ..
+        } => finite(&[*x, *y, *w, *h, radius.unwrap_or(0.0)]) && *w >= 0.0 && *h >= 0.0,
         Shape::Circle { x, y, r, .. } => finite(&[*x, *y, *r]) && *r >= 0.0,
         Shape::Line { points, width, .. } => {
             points.len() <= MAX_SHAPE_POINTS
@@ -667,7 +678,9 @@ fn check_shape(path: &str, shape: &Shape) -> Result<(), SurfaceError> {
     if !ok {
         return Err(SurfaceError::new(
             "invalid_value",
-            format!("a canvas shape has a non-finite or out-of-range number, or more than {MAX_SHAPE_POINTS} points"),
+            format!(
+                "a canvas shape has a non-finite or out-of-range number, or more than {MAX_SHAPE_POINTS} points"
+            ),
             path,
         ));
     }

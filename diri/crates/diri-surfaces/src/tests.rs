@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use diri_proto::surface::{Interaction, Scope, SurfaceDoc, template};
+use diri_proto::surface::{Interaction, Scope, SurfaceDoc, fixtures};
 use serde_json::json;
 
 use super::*;
@@ -12,7 +12,7 @@ fn store() -> (tempfile::TempDir, SurfaceStore) {
 }
 
 fn today(store: &SurfaceStore) -> SurfaceDoc {
-    let doc = template::whats_for_today("", Scope::Global, &[]);
+    let doc = fixtures::whats_for_today("", Scope::Global, &[]);
     store.create(doc, &Author::Agent("owner-1".into())).unwrap()
 }
 
@@ -171,7 +171,7 @@ fn events_are_bounded_and_sequenced() {
 #[test]
 fn promote_copies_a_session_surface() {
     let (_dir, store) = store();
-    let mut doc = template::whats_for_today(
+    let mut doc = fixtures::whats_for_today(
         "",
         Scope::Session {
             session: "s1".into(),
@@ -326,4 +326,154 @@ fn concurrent_writers_never_lose_updates() {
     let doc = store.load(&id).unwrap().doc;
     assert_eq!(doc.revision, 41);
     assert_eq!(doc.checklist_progress(), (5, 5));
+}
+
+#[test]
+fn apps_live_in_their_own_folder() {
+    let (_dir, store) = store();
+    let doc = store
+        .create(
+            SurfaceDoc::new("", "Focus", Scope::Global),
+            &Author::Agent("a".into()),
+        )
+        .unwrap();
+    let folder = store.folder_for(&doc.id).unwrap();
+    assert!(folder.join("manifest.json").is_file());
+    store
+        .write_file(
+            &doc.id,
+            "app.lua",
+            b"function render() return ui.text('hi') end",
+        )
+        .unwrap();
+    store
+        .write_file(&doc.id, "assets/icon.svg", b"<svg/>")
+        .unwrap();
+    assert_eq!(
+        store
+            .list_files(&doc.id)
+            .unwrap()
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["app.lua", "assets/icon.svg"]
+    );
+    assert!(
+        store
+            .app_source(&doc.id)
+            .unwrap()
+            .unwrap()
+            .contains("render")
+    );
+    for bad in [
+        "../escape.lua",
+        "manifest.json",
+        ".hidden.lua",
+        "x.html",
+        "data.json",
+    ] {
+        assert!(store.write_file(&doc.id, bad, b"x").is_err(), "{bad}");
+    }
+    assert!(
+        store
+            .write_file(&doc.id, "big.txt", &vec![b'x'; 3 * 1024 * 1024])
+            .is_err()
+    );
+    // The watcher maps any file in the folder to its surface, and nothing else.
+    assert_eq!(
+        surface_id(store.dir(), &folder.join("app.lua")),
+        Some(doc.id.clone())
+    );
+    assert_eq!(
+        surface_id(store.dir(), &folder.join(".manifest.ab.tmp")),
+        None
+    );
+    assert_eq!(
+        surface_id(store.dir(), &store.dir().join(".approvals.json")),
+        None
+    );
+}
+
+#[test]
+fn data_is_written_apart_from_the_manifest() {
+    let (_dir, store) = store();
+    let doc = today(&store);
+    assert_eq!(store.read_data(&doc.id).unwrap(), serde_json::Value::Null);
+    let manifest = fs::read(store.path_for(&doc.id).unwrap()).unwrap();
+    store
+        .write_data(&doc.id, &json!({"videos": [1, 2]}))
+        .unwrap();
+    assert_eq!(store.read_data(&doc.id).unwrap(), json!({"videos": [1, 2]}));
+    assert_eq!(
+        fs::read(store.path_for(&doc.id).unwrap()).unwrap(),
+        manifest,
+        "a sync never rewrites the manifest"
+    );
+    let huge = json!({"x": "y".repeat(2 * 1024 * 1024)});
+    assert_eq!(
+        store.write_data(&doc.id, &huge).unwrap_err().code(),
+        "too_large"
+    );
+}
+
+#[test]
+fn approval_is_bound_to_the_source_digest() {
+    let (_dir, store) = store();
+    let doc = today(&store);
+    assert!(!store.is_approved(&doc.id, "d1"));
+    store.approve(&doc.id, "d1").unwrap();
+    assert!(store.is_approved(&doc.id, "d1"));
+    assert!(
+        !store.is_approved(&doc.id, "d2"),
+        "an edited app is a new digest"
+    );
+    store.revoke(&doc.id).unwrap();
+    assert!(!store.is_approved(&doc.id, "d1"));
+    store.approve(&doc.id, "d1").unwrap();
+    store.delete(&doc.id).unwrap();
+    assert!(
+        !store.is_approved(&doc.id, "d1"),
+        "deleting forgets the approval"
+    );
+}
+
+#[test]
+fn app_state_does_not_move_the_revision() {
+    let (_dir, store) = store();
+    let doc = today(&store);
+    store
+        .set_app_state(&doc.id, &json!({"playing": 2}))
+        .unwrap();
+    let loaded = store.load(&doc.id).unwrap().doc;
+    assert_eq!(loaded.revision, doc.revision);
+    assert_eq!(loaded.state.app, Some(json!({"playing": 2})));
+    assert!(
+        store.set_app_state(&doc.id, &json!([1])).is_err(),
+        "state is an object"
+    );
+}
+
+#[test]
+fn promote_copies_the_app() {
+    let (_dir, store) = store();
+    let doc = store
+        .create(
+            SurfaceDoc::new(
+                "",
+                "Queue",
+                Scope::Session {
+                    session: "s".into(),
+                },
+            ),
+            &Author::Agent("s".into()),
+        )
+        .unwrap();
+    store
+        .write_file(&doc.id, "app.lua", b"function render() end")
+        .unwrap();
+    store.write_data(&doc.id, &json!({"n": 1})).unwrap();
+    let saved = store
+        .promote(&doc.id, Scope::Global, &Author::User)
+        .unwrap();
+    assert!(store.app_source(&saved.id).unwrap().is_some());
 }

@@ -157,26 +157,36 @@ fn sandbox(limits: Limits) -> Result<Lua, AppError> {
         limits,
     });
     let hook = std::rc::Rc::clone(&budget);
-    lua.set_global_hook(HookTriggers::new().every_nth_instruction(1000), move |_, _| {
-        let left = hook.remaining.get();
-        if left == 0 {
-            return Err(mlua::Error::runtime(format!(
-                "budget: stopped after {} instructions",
-                hook.limits.instructions
-            )));
-        }
-        hook.remaining.set(left - 1);
-        if Instant::now() > hook.deadline {
-            return Err(mlua::Error::runtime(format!(
-                "budget: stopped after {} ms",
-                hook.limits.time.as_millis()
-            )));
-        }
-        Ok(VmState::Continue)
-    })
+    lua.set_global_hook(
+        HookTriggers::new().every_nth_instruction(1000),
+        move |_, _| {
+            let left = hook.remaining.get();
+            if left == 0 {
+                return Err(mlua::Error::runtime(format!(
+                    "budget: stopped after {} instructions",
+                    hook.limits.instructions
+                )));
+            }
+            hook.remaining.set(left - 1);
+            if Instant::now() > hook.deadline {
+                return Err(mlua::Error::runtime(format!(
+                    "budget: stopped after {} ms",
+                    hook.limits.time.as_millis()
+                )));
+            }
+            Ok(VmState::Continue)
+        },
+    )
     .map_err(lua_error)?;
     let globals = lua.globals();
-    for name in ["dofile", "loadfile", "load", "require", "collectgarbage", "print"] {
+    for name in [
+        "dofile",
+        "loadfile",
+        "load",
+        "require",
+        "collectgarbage",
+        "print",
+    ] {
         globals.raw_set(name, LuaValue::Nil).map_err(lua_error)?;
     }
     let string: Table = globals.get("string").map_err(lua_error)?;
@@ -303,7 +313,12 @@ pub fn render(
         Value::Array(_) => tree,
         Value::Object(_) => Value::Array(vec![tree]),
         Value::Null => Value::Array(Vec::new()),
-        _ => return Err(AppError::new("output", "render returns a component or a list")),
+        _ => {
+            return Err(AppError::new(
+                "output",
+                "render returns a component or a list",
+            ));
+        }
     };
     Ok(Rendered {
         root,
@@ -341,7 +356,12 @@ pub fn handle_event(
         });
     };
     let returned: MultiValue = handler
-        .call((state.clone(), to_lua(&lua, event)?, to_lua(&lua, data)?, ctx))
+        .call((
+            state.clone(),
+            to_lua(&lua, event)?,
+            to_lua(&lua, data)?,
+            ctx,
+        ))
         .map_err(lua_error)?;
     let mut values = returned.into_iter();
     let next = match values.next() {
@@ -354,7 +374,12 @@ pub fn handle_event(
             Value::Array(actions) => actions,
             Value::Object(map) if map.is_empty() => Vec::new(),
             action @ Value::Object(_) => vec![action],
-            _ => return Err(AppError::new("output", "on_event's second result is a list of actions")),
+            _ => {
+                return Err(AppError::new(
+                    "output",
+                    "on_event's second result is a list of actions",
+                ));
+            }
         },
     };
     let state = from_lua(&lua, next)?;
@@ -366,12 +391,7 @@ pub fn handle_event(
 
 /// Runs `sync(ctx)`. `ctx` carries `data`, `now` and `sessions`; this adds
 /// `ctx.read`, `ctx.log`, and the approval-gated `ctx.exec` and `ctx.fetch`.
-pub fn sync(
-    app: App<'_>,
-    ctx: &Value,
-    caps: SyncCaps,
-    limits: Limits,
-) -> Result<Synced, AppError> {
+pub fn sync(app: App<'_>, ctx: &Value, caps: SyncCaps, limits: Limits) -> Result<Synced, AppError> {
     let lua = sandbox(limits)?;
     load(&lua, app)?;
     let Some(sync) = function(&lua, "sync")? else {
@@ -395,7 +415,9 @@ pub fn sync(
         "read",
         lua.create_function(move |_, path: String| {
             if !diri_proto::surface::identity::is_valid_app_path(&path) {
-                return Err(mlua::Error::runtime(format!("read: {path:?} is not a file in this app's folder")));
+                return Err(mlua::Error::runtime(format!(
+                    "read: {path:?} is not a file in this app's folder"
+                )));
             }
             let file = read_dir.join(&path);
             match std::fs::metadata(&file) {
@@ -457,7 +479,9 @@ pub fn sync(
                     "approval_required: ctx.fetch runs only after the person approves this app",
                 ));
             }
-            if !url.starts_with("https://") || url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            if !url.starts_with("https://")
+                || url.chars().any(|c| c.is_control() || c.is_whitespace())
+            {
                 return Err(mlua::Error::runtime("fetch: https URLs only"));
             }
             let mut argv = vec![
@@ -495,7 +519,8 @@ pub fn sync(
             table.raw_set("status", status.trim().parse::<i64>().unwrap_or(0))?;
             table.raw_set("body", body)?;
             if let Some(error) = result.error.or_else(|| {
-                (!result.stderr.is_empty()).then(|| String::from_utf8_lossy(&result.stderr).into_owned())
+                (!result.stderr.is_empty())
+                    .then(|| String::from_utf8_lossy(&result.stderr).into_owned())
             }) {
                 table.raw_set("error", error)?;
             }

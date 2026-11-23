@@ -478,11 +478,13 @@ pub(crate) fn run_blocking(spec: Spec) -> Result<Finished, String> {
     let mut execs = Execs::new(None);
     let id = execs.spawn(spec)?;
     loop {
-        let wait = execs.deadline(id).map_or(Duration::from_millis(50), |deadline| {
-            deadline
-                .saturating_duration_since(Instant::now())
-                .clamp(Duration::from_millis(1), Duration::from_millis(50))
-        });
+        let wait = execs
+            .deadline(id)
+            .map_or(Duration::from_millis(50), |deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .clamp(Duration::from_millis(1), Duration::from_millis(50))
+            });
         if let Some(event) = execs.recv(wait) {
             execs.record(event);
         }

@@ -129,25 +129,41 @@ pub fn whats_for_today(id: &str, scope: Scope, sessions: &[String]) -> SurfaceDo
                             item(
                                 "standup",
                                 "Post standup notes",
-                                Some(("https://acme.slack.com/archives/C024BE91L/p1700000000000100", "slack", "Thread")),
+                                Some((
+                                    "https://acme.slack.com/archives/C024BE91L/p1700000000000100",
+                                    "slack",
+                                    "Thread",
+                                )),
                                 true,
                             ),
                             item(
                                 "review-812",
                                 "Review the checkout retry PR",
-                                Some(("https://github.com/acme/web/pull/812", "arrow.triangle.pull", "web#812")),
+                                Some((
+                                    "https://github.com/acme/web/pull/812",
+                                    "arrow.triangle.pull",
+                                    "web#812",
+                                )),
                                 false,
                             ),
                             item(
                                 "eng-142",
                                 "Unblock ENG-142 rate limiter rollout",
-                                Some(("https://linear.app/acme/issue/ENG-142/rate-limiter-rollout", "linear", "ENG-142")),
+                                Some((
+                                    "https://linear.app/acme/issue/ENG-142/rate-limiter-rollout",
+                                    "linear",
+                                    "ENG-142",
+                                )),
                                 false,
                             ),
                             item(
                                 "spec",
                                 "Read the Q4 onboarding spec",
-                                Some(("https://www.notion.so/acme/Q4-onboarding-spec-0a1b2c", "notion", "Spec")),
+                                Some((
+                                    "https://www.notion.so/acme/Q4-onboarding-spec-0a1b2c",
+                                    "notion",
+                                    "Spec",
+                                )),
                                 false,
                             ),
                             item("release", "Cut 2.4 release notes", None, false),

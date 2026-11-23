@@ -30,7 +30,10 @@ impl Icon {
                 if text.trim().is_empty() || text.len() > 32 || text.chars().count() > 8 {
                     return bad("an emoji icon is one emoji (at most 8 characters)");
                 }
-                if text.chars().any(|c| c.is_ascii_alphanumeric() || c.is_control()) {
+                if text
+                    .chars()
+                    .any(|c| c.is_ascii_alphanumeric() || c.is_control())
+                {
                     return bad("an emoji icon holds no letters or digits; use symbol");
                 }
             }
@@ -45,9 +48,12 @@ impl Icon {
                 }
             }
             Self::Asset(file) => {
-                if !is_valid_app_path(file) || !IMAGE_EXTENSIONS.iter().any(|ext| has_ext(file, ext))
+                if !is_valid_app_path(file)
+                    || !IMAGE_EXTENSIONS.iter().any(|ext| has_ext(file, ext))
                 {
-                    return bad("an asset icon is a png, svg, jpg or webp file in the surface folder");
+                    return bad(
+                        "an asset icon is a png, svg, jpg or webp file in the surface folder",
+                    );
                 }
             }
         }
@@ -102,7 +108,11 @@ pub struct Style {
 impl Style {
     pub fn validate(&self) -> Result<(), SurfaceError> {
         if self.radius.is_some_and(|r| !(0.0..=24.0).contains(&r)) {
-            return Err(SurfaceError::new("invalid_value", "radius is 0-24", "style"));
+            return Err(SurfaceError::new(
+                "invalid_value",
+                "radius is 0-24",
+                "style",
+            ));
         }
         Ok(())
     }
@@ -251,7 +261,11 @@ pub(super) fn validate_accent(accent: Option<&str>) -> Result<(), SurfaceError> 
 pub(super) fn validate_app_state(state: Option<&serde_json::Value>) -> Result<(), SurfaceError> {
     let Some(state) = state else { return Ok(()) };
     if !state.is_object() {
-        return Err(SurfaceError::new("invalid_value", "app state is a JSON object", "state.app"));
+        return Err(SurfaceError::new(
+            "invalid_value",
+            "app state is a JSON object",
+            "state.app",
+        ));
     }
     let size = serde_json::to_vec(state).map_or(usize::MAX, |bytes| bytes.len());
     if size > MAX_APP_STATE_BYTES {
@@ -284,7 +298,18 @@ mod tests {
         for ok in ["app.lua", "lib/chart.lua", "assets/img/a.png", "data.json"] {
             assert!(is_valid_app_path(ok), "{ok}");
         }
-        for bad in ["../x.lua", "a/../b.lua", ".env", "a/.git/x.lua", "manifest.json", "x.exe", "/abs.lua", "a/b/c/d.lua", "index.html", "x.js"] {
+        for bad in [
+            "../x.lua",
+            "a/../b.lua",
+            ".env",
+            "a/.git/x.lua",
+            "manifest.json",
+            "x.exe",
+            "/abs.lua",
+            "a/b/c/d.lua",
+            "index.html",
+            "x.js",
+        ] {
             assert!(!is_valid_app_path(bad), "{bad}");
         }
     }
@@ -297,7 +322,10 @@ mod tests {
             timeout_s,
         };
         assert!(sync(Some(60), 30).validate().is_ok());
-        assert!(sync(Some(1), 30).validate().is_err(), "polling is never faster than 15 s");
+        assert!(
+            sync(Some(1), 30).validate().is_err(),
+            "polling is never faster than 15 s"
+        );
         assert!(sync(None, 0).validate().is_err());
         assert!(sync(None, 999).validate().is_err());
     }

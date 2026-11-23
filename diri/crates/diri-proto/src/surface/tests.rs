@@ -146,25 +146,41 @@ fn links_are_generic() {
     // its glyph and badge come from the component, as the agent wrote them.
     assert_eq!(
         classify("https://github.com/acme/web/pull/812"),
-        LinkKind::Web { host: "github.com".into() }
+        LinkKind::Web {
+            host: "github.com".into()
+        }
     );
     assert_eq!(
         classify("https://user:pw@www.example.com:8080/a"),
-        LinkKind::Web { host: "example.com".into() }
+        LinkKind::Web {
+            host: "example.com".into()
+        }
     );
     assert_eq!(
         classify("diri://session/abc-1"),
-        LinkKind::DiriSession { session: "abc-1".into() }
+        LinkKind::DiriSession {
+            session: "abc-1".into()
+        }
     );
-    assert_eq!(classify("diri://note/n1"), LinkKind::DiriNote { note: "n1".into() });
+    assert_eq!(
+        classify("diri://note/n1"),
+        LinkKind::DiriNote { note: "n1".into() }
+    );
     assert_eq!(classify("mailto:a@b.c"), LinkKind::Mail);
     assert!(!is_allowed("diri://session/../x"));
     // App-private schemes are not links a surface may open.
-    for private in ["slack://channel?id=C1", "linear://issue/1", "notion://x", "figma://f"] {
+    for private in [
+        "slack://channel?id=C1",
+        "linear://issue/1",
+        "notion://x",
+        "figma://f",
+    ] {
         assert!(!is_allowed(private), "{private}");
     }
-    let node = parse(json!({"type": "link", "id": "l", "url": "https://x.dev/pr/1",
-        "icon": {"symbol": "arrow.triangle.pull"}, "badge": "PR"}));
+    let node = parse(
+        json!({"type": "link", "id": "l", "url": "https://x.dev/pr/1",
+        "icon": {"symbol": "arrow.triangle.pull"}, "badge": "PR"}),
+    );
     let mut doc = SurfaceDoc::new("s", "T", Scope::Global);
     doc.root = vec![node];
     doc.validate().expect("agent-chosen glyph and badge");
@@ -575,21 +591,46 @@ fn free_primitives_are_bounded() {
         doc.root = vec![parse(value)];
         doc.validate().unwrap_err().code
     };
-    assert_eq!(refuse(json!({"type": "text", "text": "x", "color": "hotpink"})), "invalid_color");
-    assert_eq!(refuse(json!({"type": "text", "text": "x", "size": 400})), "invalid_value");
-    assert_eq!(refuse(json!({"type": "box", "style": {"padding": -3}})), "invalid_value");
-    assert_eq!(refuse(json!({"type": "box", "style": {"width": "100vw"}})), "invalid_value");
-    let points: Vec<[f32; 2]> = (0..limits::MAX_SHAPE_POINTS + 1).map(|i| [i as f32, 0.0]).collect();
     assert_eq!(
-        refuse(json!({"type": "canvas", "width": 10, "height": 10, "shapes": [{"shape": "line", "points": points}]})),
+        refuse(json!({"type": "text", "text": "x", "color": "hotpink"})),
+        "invalid_color"
+    );
+    assert_eq!(
+        refuse(json!({"type": "text", "text": "x", "size": 400})),
         "invalid_value"
     );
     assert_eq!(
-        refuse(json!({"type": "canvas", "width": 10, "height": 10, "shapes": [{"shape": "circle", "x": 1e30, "y": 0, "r": 1}]})),
+        refuse(json!({"type": "box", "style": {"padding": -3}})),
         "invalid_value"
     );
-    assert_eq!(refuse(json!({"type": "media", "title": "x", "image": "file:///etc/x.png"})), "invalid_url");
-    assert_eq!(refuse(json!({"type": "media", "title": "x", "image": "http://x.dev/a.png"})), "invalid_url", "remote images are https only");
+    assert_eq!(
+        refuse(json!({"type": "box", "style": {"width": "100vw"}})),
+        "invalid_value"
+    );
+    let points: Vec<[f32; 2]> = (0..limits::MAX_SHAPE_POINTS + 1)
+        .map(|i| [i as f32, 0.0])
+        .collect();
+    assert_eq!(
+        refuse(
+            json!({"type": "canvas", "width": 10, "height": 10, "shapes": [{"shape": "line", "points": points}]})
+        ),
+        "invalid_value"
+    );
+    assert_eq!(
+        refuse(
+            json!({"type": "canvas", "width": 10, "height": 10, "shapes": [{"shape": "circle", "x": 1e30, "y": 0, "r": 1}]})
+        ),
+        "invalid_value"
+    );
+    assert_eq!(
+        refuse(json!({"type": "media", "title": "x", "image": "file:///etc/x.png"})),
+        "invalid_url"
+    );
+    assert_eq!(
+        refuse(json!({"type": "media", "title": "x", "image": "http://x.dev/a.png"})),
+        "invalid_url",
+        "remote images are https only"
+    );
     assert_eq!(refuse(json!({"type": "input"})), "missing_id");
     let mut doc = SurfaceDoc::new("s", "T", Scope::Global);
     doc.accent = Some("purple".into());

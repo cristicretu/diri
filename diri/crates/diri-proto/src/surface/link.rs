@@ -46,7 +46,10 @@ impl LinkKind {
 pub fn scheme(url: &str) -> Option<String> {
     let (scheme, _) = url.split_once(':')?;
     let valid = !scheme.is_empty()
-        && scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
         && scheme
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
@@ -97,7 +100,9 @@ fn diri_target(url: &str) -> Option<LinkKind> {
         "session" => Some(LinkKind::DiriSession {
             session: id.to_owned(),
         }),
-        "note" => Some(LinkKind::DiriNote { note: id.to_owned() }),
+        "note" => Some(LinkKind::DiriNote {
+            note: id.to_owned(),
+        }),
         "surface" => Some(LinkKind::DiriSurface {
             surface: id.to_owned(),
         }),

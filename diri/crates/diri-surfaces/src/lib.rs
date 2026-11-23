@@ -19,7 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use diri_proto::surface::patch::{self, Applied, Patch};
 use diri_proto::surface::{
     EventKind, Interaction, Node, SCHEMA_VERSION, Scope, SurfaceDoc, SurfaceError, SurfaceEvent,
-    limits,
+    identity, limits,
 };
 use serde::Serialize;
 
@@ -29,6 +29,9 @@ const LOCK_FILE: &str = ".lock";
 const HISTORY_DIR: &str = ".history";
 const EVENTS_DIR: &str = ".events";
 const TRASH_DIR: &str = ".trash";
+const MANIFEST: &str = "manifest.json";
+const DATA_FILE: &str = "data.json";
+const APPROVALS_FILE: &str = ".approvals.json";
 /// Tree versions kept per surface.
 pub const MAX_VERSIONS: usize = 50;
 /// Events kept per surface; the log is compacted to half when it overflows.
@@ -114,6 +117,13 @@ impl From<SurfaceError> for StoreError {
 
 pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 
+/// One file of an app's folder.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AppFile {
+    pub path: String,
+    pub bytes: u64,
+}
+
 /// What lists and the sidebar show without drawing the surface.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SurfaceMeta {
@@ -123,6 +133,12 @@ pub struct SurfaceMeta {
     pub subtitle: Option<String>,
     pub scope: Scope,
     pub pinned: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<surface::Icon>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accent: Option<String>,
+    /// A native Lua app (`app.lua`).
+    pub app: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
     pub revision: u64,
@@ -143,6 +159,9 @@ impl SurfaceMeta {
             subtitle: doc.subtitle.clone(),
             scope: doc.scope.clone(),
             pinned: doc.pinned,
+            icon: doc.icon.clone(),
+            accent: doc.accent.clone(),
+            app: doc.app.is_some(),
             owner: doc.owner.clone(),
             revision: doc.revision,
             updated_ms: doc.updated_ms,
@@ -223,7 +242,18 @@ impl SurfaceStore {
             )
             .into());
         }
-        Ok(self.dir.join(format!("{id}.json")))
+        Ok(self.folder(id).join(MANIFEST))
+    }
+
+    /// `<dir>/<id>/`: the manifest, `app.lua`, `data.json`, assets.
+    fn folder(&self, id: &str) -> PathBuf {
+        self.dir.join(id)
+    }
+
+    /// The surface folder, for reading its files (`app.lua`, assets).
+    pub fn folder_for(&self, id: &str) -> Result<PathBuf> {
+        self.path_for(id)?;
+        Ok(self.folder(id))
     }
 
     /// Every readable surface, most recently updated first.
@@ -231,10 +261,15 @@ impl SurfaceStore {
         let mut out = Vec::new();
         for entry in fs::read_dir(&self.dir)? {
             let Ok(entry) = entry else { continue };
-            let path = entry.path();
-            let Some(id) = surface_id(&path) else {
+            let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
+            if id.starts_with('.')
+                || !limits::is_valid_ref(&id)
+                || !entry.path().join(MANIFEST).is_file()
+            {
+                continue;
+            }
             if let Ok(loaded) = self.load(&id) {
                 out.push(SurfaceMeta::from_doc(&loaded.doc, loaded.read_only));
             }
@@ -543,7 +578,16 @@ impl SurfaceStore {
         }
         let mut saved = source.doc.promoted(String::new(), scope, now_ms());
         saved.id = String::new();
-        self.create(saved, author)
+        let saved = self.create(saved, author)?;
+        // The app comes along: its code, data and assets.
+        for file in self.list_files(id)? {
+            if file.path == DATA_FILE {
+                self.write_data(&saved.id, &self.read_data(id)?)?;
+            } else if let Ok(bytes) = fs::read(self.folder(id).join(&file.path)) {
+                self.write_file(&saved.id, &file.path, &bytes)?;
+            }
+        }
+        Ok(saved)
     }
 
     /// Moves a surface to `.trash/` (with its history and events), so a
@@ -556,11 +600,234 @@ impl SurfaceStore {
         }
         let trash = self.dir.join(TRASH_DIR);
         diri_platform::private::create_dir_all(&trash)?;
-        let target = trash.join(format!("{id}.{}.json", now_ms()));
-        fs::rename(&path, &target)?;
+        let target = trash.join(format!("{id}.{}", now_ms()));
+        fs::rename(self.folder(id), &target)?;
+        let _ = self.set_approval(id, None);
         let _ = fs::remove_dir_all(self.history_dir(id));
         let _ = fs::remove_file(self.events_path(id));
         Ok(target)
+    }
+
+    // -- App files --------------------------------------------------------
+
+    /// Writes one file of a surface's app (`app.lua`, an asset), atomically.
+    /// Paths stay inside the folder, types and sizes are bounded, and the
+    /// manifest and data have their own calls.
+    pub fn write_file(&self, id: &str, path: &str, bytes: &[u8]) -> Result<()> {
+        let _lock = self.lock()?;
+        self.path_for(id)?;
+        if !identity::is_valid_app_path(path) || path == DATA_FILE {
+            return Err(SurfaceError::new(
+                "invalid_path",
+                format!(
+                    "{path:?} is not an app file (lua, json, images, txt, md; at most 3 levels)"
+                ),
+                "path",
+            )
+            .into());
+        }
+        if bytes.len() > identity::MAX_APP_FILE_BYTES {
+            return Err(
+                SurfaceError::new("too_large", "an app file is at most 2 MiB", path).into(),
+            );
+        }
+        if path.ends_with(".lua") && std::str::from_utf8(bytes).is_err() {
+            return Err(
+                SurfaceError::new("invalid_value", "Lua source must be UTF-8 text", path).into(),
+            );
+        }
+        let files = self.list_files(id)?;
+        let replaced = files.iter().find(|f| f.path == path).map_or(0, |f| f.bytes);
+        let total: u64 = files.iter().map(|f| f.bytes).sum::<u64>() - replaced + bytes.len() as u64;
+        if total as usize > identity::MAX_APP_BYTES
+            || (replaced == 0 && files.len() >= identity::MAX_APP_FILES)
+        {
+            return Err(SurfaceError::new(
+                "too_large",
+                "an app holds at most 128 files and 16 MiB",
+                path,
+            )
+            .into());
+        }
+        let target = self.folder(id).join(path);
+        if let Some(parent) = target.parent() {
+            diri_platform::private::create_dir_all(parent)?;
+        }
+        let tmp = self.folder(id).join(format!(".file.{}.tmp", nonce()));
+        diri_platform::private::replace_via(&tmp, &target, bytes)?;
+        Ok(())
+    }
+
+    pub fn read_file(&self, id: &str, path: &str) -> Result<Vec<u8>> {
+        self.path_for(id)?;
+        if !identity::is_valid_app_path(path) {
+            return Err(SurfaceError::new(
+                "invalid_path",
+                format!("{path:?} is not an app file"),
+                "path",
+            )
+            .into());
+        }
+        fs::read(self.folder(id).join(path)).map_err(|error| match error.kind() {
+            io::ErrorKind::NotFound => StoreError::NotFound(format!("{id}/{path}")),
+            _ => StoreError::Io(error),
+        })
+    }
+
+    pub fn remove_file(&self, id: &str, path: &str) -> Result<()> {
+        let _lock = self.lock()?;
+        self.path_for(id)?;
+        if !identity::is_valid_app_path(path) {
+            return Err(SurfaceError::new(
+                "invalid_path",
+                format!("{path:?} is not an app file"),
+                "path",
+            )
+            .into());
+        }
+        fs::remove_file(self.folder(id).join(path)).map_err(StoreError::Io)
+    }
+
+    /// The app's files (not the manifest), sorted.
+    pub fn list_files(&self, id: &str) -> Result<Vec<AppFile>> {
+        let root = self.folder_for(id)?;
+        let mut out = Vec::new();
+        fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<AppFile>) {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(meta) = entry.metadata() else { continue };
+                let Ok(relative) = path.strip_prefix(root) else {
+                    continue;
+                };
+                let Some(relative) = relative.to_str() else {
+                    continue;
+                };
+                if meta.is_dir() && depth < 3 {
+                    walk(root, &path, depth + 1, out);
+                } else if meta.is_file() && identity::is_valid_app_path(relative) {
+                    out.push(AppFile {
+                        path: relative.to_owned(),
+                        bytes: meta.len(),
+                    });
+                }
+            }
+        }
+        walk(&root, &root, 1, &mut out);
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(out)
+    }
+
+    /// `app.lua`, when the surface is a Lua app and has one.
+    pub fn app_source(&self, id: &str) -> Result<Option<String>> {
+        match self.read_file(id, identity::APP_ENTRY) {
+            Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
+            Err(StoreError::NotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    // -- Data ------------------------------------------------------------
+
+    /// `data.json`: what `sync` or an agent last wrote; `null` before.
+    pub fn read_data(&self, id: &str) -> Result<serde_json::Value> {
+        let path = self.folder_for(id)?.join(DATA_FILE);
+        match fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| SurfaceError::new("corrupt", format!("data.json: {e}"), "").into()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(serde_json::Value::Null),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Replaces `data.json` atomically. Bounded; the manifest is untouched,
+    /// so a sync never races an agent's edit of the tree.
+    pub fn write_data(&self, id: &str, data: &serde_json::Value) -> Result<()> {
+        let _lock = self.lock()?;
+        let folder = self.folder_for(id)?;
+        if !folder.join(MANIFEST).is_file() {
+            return Err(StoreError::NotFound(id.to_owned()));
+        }
+        let bytes = serde_json::to_vec(data)
+            .map_err(|e| SurfaceError::new("invalid_value", e.to_string(), ""))?;
+        if bytes.len() > identity::MAX_DATA_BYTES {
+            return Err(SurfaceError::new(
+                "too_large",
+                format!(
+                    "data is {} bytes; the limit is {}",
+                    bytes.len(),
+                    identity::MAX_DATA_BYTES
+                ),
+                "data",
+            )
+            .into());
+        }
+        let tmp = folder.join(format!(".data.{}.tmp", nonce()));
+        diri_platform::private::replace_via(&tmp, &folder.join(DATA_FILE), bytes)?;
+        Ok(())
+    }
+
+    /// Keeps a Lua app's own state (what `on_event` returned). Like a
+    /// tick, it is not a tree change: the revision does not move.
+    pub fn set_app_state(&self, id: &str, state: &serde_json::Value) -> Result<()> {
+        let _lock = self.lock()?;
+        let loaded = self.load(id)?;
+        if loaded.read_only {
+            return Err(read_only_error(&loaded.doc).into());
+        }
+        let mut doc = loaded.doc;
+        doc.state.app = Some(state.clone());
+        doc.validate()?;
+        self.write(&doc)
+    }
+
+    // -- Approvals -------------------------------------------------------
+
+    /// Records that the person approved `ctx.exec`/`ctx.fetch` for the app
+    /// whose `app.lua` has `digest`. Only the app UI calls this; agents
+    /// have no tool for it. An edit changes the digest, which then no
+    /// longer matches.
+    pub fn approve(&self, id: &str, digest: &str) -> Result<()> {
+        self.path_for(id)?;
+        self.set_approval(id, Some(digest))
+    }
+
+    pub fn revoke(&self, id: &str) -> Result<()> {
+        self.path_for(id)?;
+        self.set_approval(id, None)
+    }
+
+    /// Whether the person approved exactly this source.
+    pub fn is_approved(&self, id: &str, digest: &str) -> bool {
+        self.approvals()
+            .get(id)
+            .is_some_and(|approved| approved == digest)
+    }
+
+    fn approvals(&self) -> std::collections::BTreeMap<String, String> {
+        fs::read(self.dir.join(APPROVALS_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    fn set_approval(&self, id: &str, digest: Option<&str>) -> Result<()> {
+        let mut approvals = self.approvals();
+        match digest {
+            Some(digest) => {
+                approvals.insert(id.to_owned(), digest.to_owned());
+            }
+            None => {
+                approvals.remove(id);
+            }
+        }
+        let bytes = serde_json::to_vec_pretty(&approvals)
+            .map_err(|e| SurfaceError::new("invalid_value", e.to_string(), ""))?;
+        let tmp = self.dir.join(format!(".approvals.{}.tmp", nonce()));
+        diri_platform::private::replace_via(&tmp, &self.dir.join(APPROVALS_FILE), bytes)?;
+        Ok(())
     }
 
     fn lock(&self) -> io::Result<fs::File> {
@@ -576,9 +843,12 @@ impl SurfaceStore {
 
     fn write(&self, doc: &SurfaceDoc) -> Result<()> {
         let path = self.path_for(&doc.id)?;
+        diri_platform::private::create_dir_all(&self.folder(&doc.id))?;
         let bytes = serde_json::to_vec_pretty(doc)
             .map_err(|e| SurfaceError::new("invalid_value", e.to_string(), ""))?;
-        let tmp = self.dir.join(format!(".{}.{}.tmp", doc.id, nonce()));
+        let tmp = self
+            .folder(&doc.id)
+            .join(format!(".manifest.{}.tmp", nonce()));
         diri_platform::private::replace_via(&tmp, &path, bytes)?;
         Ok(())
     }
@@ -688,14 +958,15 @@ fn read_only_error(doc: &SurfaceDoc) -> SurfaceError {
     )
 }
 
-/// The surface id of `<id>.json`; dotfiles, temp files and history are not
-/// surfaces.
-pub fn surface_id(path: &Path) -> Option<String> {
-    if path.extension()? != "json" {
-        return None;
-    }
-    let stem = path.file_stem()?.to_str()?;
-    (limits::is_valid_ref(stem) && !stem.starts_with('.')).then(|| stem.to_owned())
+/// The surface a changed path belongs to: the folder under `dir` it sits
+/// in. Temp files, history, events and approvals belong to none.
+pub fn surface_id(dir: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(dir).ok()?;
+    let mut parts = relative.components();
+    let id = parts.next()?.as_os_str().to_str()?;
+    let file = path.file_name()?.to_str()?;
+    let ok = limits::is_valid_ref(id) && !id.starts_with('.') && !file.starts_with('.');
+    ok.then(|| id.to_owned())
 }
 
 /// `whats-for-today-3f2a`: a readable slug of the title plus a nonce.

@@ -81,7 +81,10 @@ pub struct SurfaceState {
 
 impl SurfaceState {
     pub fn len(&self) -> usize {
-        self.checks.len() + self.toggles.len() + self.selects.len() + usize::from(self.app.is_some())
+        self.checks.len()
+            + self.toggles.len()
+            + self.selects.len()
+            + usize::from(self.app.is_some())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -500,7 +503,11 @@ impl SurfaceDoc {
                     return Err(not_found(id));
                 }
                 if value.len() > limits::MAX_LABEL_BYTES * 2 {
-                    return Err(SurfaceError::new("text_too_long", "input text is too long", id));
+                    return Err(SurfaceError::new(
+                        "text_too_long",
+                        "input text is too long",
+                        id,
+                    ));
                 }
                 self.state.selects.insert(id.clone(), value.clone());
                 Ok(false)

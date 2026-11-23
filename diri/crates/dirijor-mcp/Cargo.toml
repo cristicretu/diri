@@ -28,5 +28,6 @@ sha2.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
+diri-proto = { workspace = true, features = ["fixtures"] }
 diri-engine.workspace = true
 tempfile.workspace = true

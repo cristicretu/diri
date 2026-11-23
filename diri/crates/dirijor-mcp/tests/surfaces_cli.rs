@@ -104,17 +104,43 @@ fn cli_builds_updates_and_promotes_a_surface() {
 }
 
 #[test]
-fn cli_template_and_schema() {
+fn cli_writes_a_lua_app_and_its_data() {
     let dir = tempfile::tempdir().unwrap();
     let surfaces = dir.path().join("surfaces");
     let created = json_out(&dirijor(
         &surfaces,
-        &["surface", "create", "--template", "today", "--global"],
-        None,
+        &[
+            "surface",
+            "create",
+            "Tally",
+            "--global",
+            "--icon",
+            "chart.bar",
+            "--accent",
+            "#16a34a",
+            "--lua",
+            "-",
+        ],
+        Some("function render(s, d) return ui.text('n=' .. ((d or {}).n or 0)) end"),
     ));
-    assert_eq!(created["title"], "What's for Today");
+    assert_eq!(created["check"]["ok"], true, "{created}");
+    let id = created["surface"].as_str().unwrap().to_owned();
+    json_out(&dirijor(
+        &surfaces,
+        &["surface", "data", &id, "-"],
+        Some(r#"{"n": 4}"#),
+    ));
+    let data = json_out(&dirijor(&surfaces, &["surface", "data", &id], None));
+    assert_eq!(data["data"]["n"], 4);
+    let written = json_out(&dirijor(
+        &surfaces,
+        &["surface", "write", &id, "app.lua", "-"],
+        Some("function render() return ui.row{ ui.text('a'), ui.text('b') } end"),
+    ));
+    assert_eq!(written["check"]["nodes"], 3);
     let schema = dirijor(&surfaces, &["surface", "schema"], None);
-    assert!(String::from_utf8_lossy(&schema.stdout).contains("## Patch ops"));
+    let guide = String::from_utf8_lossy(&schema.stdout);
+    assert!(guide.contains("## app.lua") && guide.contains("ui.sparkline"));
 }
 
 /// Tools come from the static catalog: no Engine is running here.
@@ -192,7 +218,8 @@ fn compact_profile_serves_surfaces_on_demand() {
         &mut backend,
         4,
         "tools/call",
-        json!({"name": "act", "arguments": {"action": "surface", "arguments": {"op": "create", "template": "today"}}}),
+        json!({"name": "act", "arguments": {"action": "surface", "arguments": {"op": "create", "title": "Board",
+            "root": [{"type": "metric", "id": "m-review", "label": "Open reviews", "value": "4"}]}}}),
     ));
     assert_eq!(created["scope"]["session"], "s-agent");
     let id = created["surface"].as_str().unwrap();

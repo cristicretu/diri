@@ -40,7 +40,10 @@ end
 #[test]
 fn render_builds_a_valid_tree_and_reads_meta() {
     let (dir, source) = app(COUNTER);
-    let app = App { source: &source, dir: dir.path() };
+    let app = App {
+        source: &source,
+        dir: dir.path(),
+    };
     let rendered = render(app, &Value::Null, &json!({}), &ctx(), INTERACTIVE).unwrap();
     let meta = rendered.meta.unwrap();
     assert_eq!(meta["title"], "Counter");
@@ -50,7 +53,10 @@ fn render_builds_a_valid_tree_and_reads_meta() {
     assert_eq!(root[0]["direction"], "column");
     assert_eq!(root[0]["style"]["padding"], 12);
     assert_eq!(root[0]["children"][0]["text"], "Count 0");
-    assert_eq!(root[0]["children"][1]["children"][0]["action"]["kind"], "app");
+    assert_eq!(
+        root[0]["children"][1]["children"][0]["action"]["kind"],
+        "app"
+    );
     assert_eq!(root[0]["children"][2]["type"], "canvas");
     // The JSON is exactly the surface format: it parses and validates.
     let nodes: Vec<diri_proto::surface::Node> = serde_json::from_value(root.clone()).unwrap();
@@ -62,19 +68,36 @@ fn render_builds_a_valid_tree_and_reads_meta() {
 #[test]
 fn events_update_state_and_may_ask_for_gated_actions() {
     let (dir, source) = app(COUNTER);
-    let app = App { source: &source, dir: dir.path() };
+    let app = App {
+        source: &source,
+        dir: dir.path(),
+    };
     let event = json!({"type": "action", "name": "inc"});
-    let one = handle_event(app, &json!({"count": 0}), &event, &json!({}), &ctx(), INTERACTIVE).unwrap();
+    let one = handle_event(
+        app,
+        &json!({"count": 0}),
+        &event,
+        &json!({}),
+        &ctx(),
+        INTERACTIVE,
+    )
+    .unwrap();
     assert_eq!(one.state, json!({"count": 1}));
     assert!(one.actions.is_empty());
     let two = handle_event(app, &one.state, &event, &json!({}), &ctx(), INTERACTIVE).unwrap();
-    assert_eq!(two.actions, vec![json!({"kind": "open_url", "url": "https://example.com/two"})]);
+    assert_eq!(
+        two.actions,
+        vec![json!({"kind": "open_url", "url": "https://example.com/two"})]
+    );
 }
 
 #[test]
 fn empty_lists_stay_lists() {
     let (dir, source) = app("function render() return ui.row{} end");
-    let app = App { source: &source, dir: dir.path() };
+    let app = App {
+        source: &source,
+        dir: dir.path(),
+    };
     let rendered = render(app, &Value::Null, &json!({}), &ctx(), INTERACTIVE).unwrap();
     assert_eq!(rendered.root[0]["children"], json!([]));
 }
@@ -89,7 +112,10 @@ fn a_looping_app_stops_within_its_budget() {
         let (dir, source) = app(source);
         let started = Instant::now();
         let error = render(
-            App { source: &source, dir: dir.path() },
+            App {
+                source: &source,
+                dir: dir.path(),
+            },
             &Value::Null,
             &json!({}),
             &ctx(),
@@ -97,7 +123,11 @@ fn a_looping_app_stops_within_its_budget() {
         )
         .unwrap_err();
         assert!(matches!(error.code, "budget" | "memory"), "{error}");
-        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }
 
@@ -107,7 +137,10 @@ fn memory_is_capped() {
         "function render() local t = {} for i = 1, 1e9 do t[i] = string.rep('x', 1024) end end",
     );
     let error = render(
-        App { source: &source, dir: dir.path() },
+        App {
+            source: &source,
+            dir: dir.path(),
+        },
         &Value::Null,
         &json!({}),
         &ctx(),
@@ -134,10 +167,15 @@ fn the_sandbox_has_no_way_out() {
         "return package",
         "return collectgarbage",
     ] {
-        let source = format!("function render() local x = (function() {probe} end)() return ui.text(tostring(x)) end");
+        let source = format!(
+            "function render() local x = (function() {probe} end)() return ui.text(tostring(x)) end"
+        );
         let (dir, source) = app(&source);
         let rendered = render(
-            App { source: &source, dir: dir.path() },
+            App {
+                source: &source,
+                dir: dir.path(),
+            },
             &Value::Null,
             &json!({}),
             &ctx(),
@@ -157,11 +195,26 @@ function sync(ctx)
 end
 "#;
     let (dir, source) = app(source);
-    let app = App { source: &source, dir: dir.path() };
-    let refused = sync(app, &ctx(), SyncCaps { approved: false }, sync_limits(Duration::from_secs(5))).unwrap();
+    let app = App {
+        source: &source,
+        dir: dir.path(),
+    };
+    let refused = sync(
+        app,
+        &ctx(),
+        SyncCaps { approved: false },
+        sync_limits(Duration::from_secs(5)),
+    )
+    .unwrap();
     assert!(refused.needs_approval);
     assert_eq!(refused.data, None, "nothing changes without approval");
-    let allowed = sync(app, &ctx(), SyncCaps { approved: true }, sync_limits(Duration::from_secs(5))).unwrap();
+    let allowed = sync(
+        app,
+        &ctx(),
+        SyncCaps { approved: true },
+        sync_limits(Duration::from_secs(5)),
+    )
+    .unwrap();
     assert!(!allowed.needs_approval);
     assert_eq!(allowed.data, Some(json!({"said": "hello\n"})));
 }
@@ -177,7 +230,10 @@ end
     unsafe { std::env::set_var("DIRIJOR_SESSION_ID", "leak-me") };
     let (dir, source) = app(source);
     let synced = sync(
-        App { source: &source, dir: dir.path() },
+        App {
+            source: &source,
+            dir: dir.path(),
+        },
         &ctx(),
         SyncCaps { approved: true },
         sync_limits(Duration::from_secs(5)),
@@ -199,7 +255,10 @@ end
     let (dir, source) = app(source);
     std::fs::write(dir.path().join("notes.txt"), "mine").unwrap();
     let synced = sync(
-        App { source: &source, dir: dir.path() },
+        App {
+            source: &source,
+            dir: dir.path(),
+        },
         &ctx(),
         SyncCaps { approved: false },
         sync_limits(Duration::from_secs(5)),
@@ -222,7 +281,10 @@ end
 "#;
     let (dir, source) = app(source);
     let synced = sync(
-        App { source: &source, dir: dir.path() },
+        App {
+            source: &source,
+            dir: dir.path(),
+        },
         &ctx(),
         SyncCaps { approved: true },
         sync_limits(Duration::from_secs(5)),
@@ -242,12 +304,19 @@ end
     let (dir, source) = app(source);
     let started = Instant::now();
     let synced = sync(
-        App { source: &source, dir: dir.path() },
+        App {
+            source: &source,
+            dir: dir.path(),
+        },
         &ctx(),
         SyncCaps { approved: true },
         sync_limits(Duration::from_millis(300)),
     );
-    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
     match synced {
         Ok(synced) => assert_eq!(synced.data, Some(json!({"timed_out": true}))),
         Err(error) => assert_eq!(error.code, "budget", "{error}"),
@@ -265,7 +334,10 @@ fn digest_binds_approval_to_the_exact_source() {
 fn errors_name_the_line() {
     let (dir, source) = app("function render()\n  return nil + 1\nend");
     let error = render(
-        App { source: &source, dir: dir.path() },
+        App {
+            source: &source,
+            dir: dir.path(),
+        },
         &Value::Null,
         &json!({}),
         &ctx(),

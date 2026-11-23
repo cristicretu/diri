@@ -13,4 +13,5 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+diri-proto = { workspace = true, features = ["fixtures"] }
 tempfile.workspace = true

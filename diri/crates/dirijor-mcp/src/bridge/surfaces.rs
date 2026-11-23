@@ -7,7 +7,7 @@
 //! (`op: "schema"`), never in a prompt.
 
 use diri_proto::surface::patch::Patch;
-use diri_proto::surface::{Node, Scope, SurfaceDoc, template};
+use diri_proto::surface::{AppSpec, Icon, Node, Scope, Style, SurfaceDoc, identity};
 use diri_surfaces::{Author, StoreError, SurfaceStore};
 use serde_json::{Value, json};
 
@@ -17,59 +17,7 @@ const DEFAULT_EVENTS: usize = 50;
 const MAX_EVENTS: usize = 200;
 
 /// The reference `op: "schema"` returns.
-pub const GUIDE: &str = r#"# Diri Live Surfaces
-
-A surface is a native dashboard Diri draws from JSON: no HTML, no server. Saved
-surfaces (scope global/project) are sidebar rows; a session surface shows in that
-session's right panel. The person's ticks, toggles and choices persist across your
-updates as long as component ids stay the same.
-
-## Ops
-- create {title, scope: session|global|project, project?, session?, template?: today|blank, root?, pinned?, agents?}
-  scope defaults to your session. Returns {surface, revision}.
-- update {surface, ops?: [patch ops], root?, title?, subtitle?, pinned?, agents?, expected_revision?}
-  Prefer ops for live changes: nothing flickers, state is kept.
-- get {surface, format?: json|outline}   list {scope?: saved|session|all}
-- events {surface, after?: seq}: what the person ticked/clicked since you last looked.
-- history {surface, revision?}   restore {surface, revision}   promote {surface, scope?: global|project}
-- delete {surface}
-
-## Patch ops (applied all-or-nothing)
-{"op":"set","id":"m1","fields":{"value":"12","delta":"+3"}}   change some fields
-{"op":"replace","id":"x","node":{...}}   {"op":"remove","id":"x"}
-{"op":"insert","parent":"card-id|tab-id","index":0,"node":{...}}  (no parent = top level)
-{"op":"title","title":"..."}   {"op":"root","root":[...]}
-
-## Components ("type"; "id" required for interactive ones, unique per surface)
-Layout: stack{children,gap} row{children,gap,wrap} grid{columns 1-6,children}
-  card{title,subtitle,tone,children} section{title,detail,children} divider
-  tabs{tabs:[{id,label,children}]}
-Content: heading{text,level 1-3} text{text,tone,mono} markdown{text} badge{label,tone}
-  metric{label,value,delta,trend:up|down|flat,caption} progress{value,max,label,tone,track: checklist id to follow live}
-  table{columns:[..],rows:[[cell|{text,link,tone}]]} kv_list{items:[{key,value,link,tone}]}
-  mermaid{source} image{src: https URL or assets/<file>, alt, height}
-Interactive: checklist{id,title,items:[{id,text,checked,link,detail}],notify}
-  link{url,label,detail}: Slack, GitHub PR/issue, Linear, Notion and diri://session/<id>,
-    diri://note/<id> links get badges automatically.
-  button{id,label,style:primary|secondary|danger,action}
-  toggle{id,label,default,notify} select{id,label,options:[{value,label}],default,notify}
-  session{session: id}: a live row with the session's status.
-Tones: neutral muted info success warning danger accent.
-Live bindings (no agent needed to stay current): add "bind" to text/badge/metric:
-  {"source":"session_status","session":ID} session_title working_count needs_input_count
-  unread_count {"source":"note_todos","note":ID} {"source":"pr_checks","session":ID}
-
-## Button actions (run only when the person clicks)
-{"kind":"open_url","url":...} {"kind":"open_session","session":ID} {"kind":"open_note","note":ID}
-{"kind":"send_prompt","text":...,"session"?: ID} {"kind":"run_app_skill","name":...}
-{"kind":"event","name":"triage","payload"?:{}} {"kind":"refresh"}
-Prompts, app skills and events go to the surface's owner (its creator) or a session in
-"agents". With notify:true, ticks and choices are delivered to the owner as a
-"[Diri Live Surface event]" message; read them any time with op events.
-
-Limits: 12 levels, 1500 components, 200 children, 16 KiB per text, 1 MiB per surface.
-Links: https http diri slack linear notion figma mailto only.
-"#;
+pub const GUIDE: &str = include_str!("surfaces_guide.md");
 
 impl Bridge {
     fn surface_store(&self) -> Result<SurfaceStore, String> {
@@ -122,9 +70,14 @@ impl Bridge {
             "history" => self.surface_history(args),
             "restore" => self.surface_restore(args),
             "promote" | "save" => self.surface_promote(args),
+            "write_file" => self.surface_write_file(args),
+            "read_file" => self.surface_read_file(args),
+            "files" => self.surface_files(args),
+            "data" => self.surface_data(args),
+            "check" => self.surface_check(args),
             "delete" => self.surface_delete(args),
             other => Err(format!(
-                "unknown op {other:?}; use schema, list, get, create, update, events, history, restore, promote or delete"
+                "unknown op {other:?}; use schema, create, update, write_file, read_file, files, data, check, get, list, events, history, restore, promote or delete"
             )),
         }
     }
@@ -186,25 +139,12 @@ impl Bridge {
     fn surface_create(&self, args: &Value) -> Result<Value, String> {
         let store = self.surface_store()?;
         let scope = scope_from(args, self.caller.as_deref())?;
-        let title = optional_string(args, "title");
-        let sessions: Vec<String> = string_list(args, "sessions")?;
-        let mut doc = match optional_string(args, "template") {
-            Some(name) => {
-                template::by_name(&name, "", scope.clone(), &sessions).ok_or_else(|| {
-                    format!(
-                        "unknown template {name:?}; use {}",
-                        template::NAMES.join(" or ")
-                    )
-                })?
-            }
-            None => SurfaceDoc::new(
-                "",
-                title.clone().ok_or("missing required argument: title")?,
-                scope.clone(),
-            ),
-        };
-        if let Some(title) = title {
-            doc.title = title;
+        let title = optional_string(args, "title").ok_or("missing required argument: title")?;
+        let mut doc = SurfaceDoc::new("", title, scope.clone());
+        apply_identity(&mut doc, args)?;
+        let lua = optional_string(args, "lua");
+        if lua.is_some() && doc.app.is_none() {
+            doc.app = Some(AppSpec::default());
         }
         if let Some(subtitle) = optional_string(args, "subtitle") {
             doc.subtitle = Some(subtitle);
@@ -224,12 +164,25 @@ impl Bridge {
         doc.agents = agents;
         doc.owner = self.caller.clone();
         let doc = store.create(doc, &self.surface_author()).map_err(render)?;
+        if let Some(data) = args.get("data").filter(|data| !data.is_null()) {
+            store.write_data(&doc.id, data).map_err(render)?;
+        }
+        let check = match &lua {
+            Some(lua) => {
+                store
+                    .write_file(&doc.id, identity::APP_ENTRY, lua.as_bytes())
+                    .map_err(render)?;
+                Some(check_app(&store, &doc.id))
+            }
+            None => None,
+        };
         Ok(json!({
             "surface": doc.id,
             "revision": doc.revision,
             "title": doc.title,
             "scope": doc.scope,
             "url": format!("diri://surface/{}", doc.id),
+            "check": check,
             "note": if doc.scope.is_saved() {
                 "Saved surface: it is a row in Diri's sidebar."
             } else {
@@ -269,11 +222,48 @@ impl Bridge {
         if let Some(agents) = &agents {
             self.check_surface_reach(agents)?;
         }
-        let meta_change =
-            pinned.is_some() || subtitle.is_some() || agents.is_some() || title.is_some();
+        let identity_change = ["icon", "accent", "style", "app"]
+            .iter()
+            .any(|key| args.get(*key).is_some());
+        let mut identity_doc = SurfaceDoc::new("x", "x", Scope::Global);
+        apply_identity(&mut identity_doc, args)?;
+        let lua = optional_string(args, "lua");
+        if let Some(data) = args.get("data").filter(|data| !data.is_null()) {
+            store.write_data(&id, data).map_err(render)?;
+        }
+        let check = match &lua {
+            Some(lua) => {
+                store
+                    .write_file(&id, identity::APP_ENTRY, lua.as_bytes())
+                    .map_err(render)?;
+                Some(check_app(&store, &id))
+            }
+            None => None,
+        };
+        let meta_change = pinned.is_some()
+            || subtitle.is_some()
+            || agents.is_some()
+            || title.is_some()
+            || identity_change
+            || lua.is_some();
         let doc = if meta_change {
             store
                 .update_meta(&id, &author, |doc| {
+                    if args.get("icon").is_some() {
+                        doc.icon = identity_doc.icon.clone();
+                    }
+                    if args.get("accent").is_some() {
+                        doc.accent = identity_doc.accent.clone();
+                    }
+                    if args.get("style").is_some() {
+                        doc.style = identity_doc.style;
+                    }
+                    if args.get("app").is_some() {
+                        doc.app = identity_doc.app.clone();
+                    }
+                    if lua.is_some() && doc.app.is_none() {
+                        doc.app = Some(AppSpec::default());
+                    }
                     if let Some(pinned) = pinned {
                         doc.pinned = pinned && doc.scope.is_saved();
                     }
@@ -290,9 +280,11 @@ impl Bridge {
                 .map_err(render)?
         } else if let Some((doc, _)) = &result {
             doc.clone()
+        } else if args.get("data").is_some() {
+            store.load(&id).map_err(render)?.doc
         } else {
             return Err(
-                "nothing to update: pass ops, root, title, subtitle, pinned or agents".into(),
+                "nothing to update: pass lua, data, ops, root, title, subtitle, icon, accent, style, app, pinned or agents".into(),
             );
         };
         Ok(json!({
@@ -300,7 +292,56 @@ impl Bridge {
             "revision": doc.revision,
             "nodes": result.as_ref().map(|(_, applied)| applied.nodes),
             "ops": result.as_ref().map(|(_, applied)| applied.ops),
+            "check": check,
         }))
+    }
+
+    fn surface_write_file(&self, args: &Value) -> Result<Value, String> {
+        let store = self.surface_store()?;
+        let id = self.surface_id(&store, args)?;
+        let path = optional_string(args, "path").ok_or("missing required argument: path")?;
+        let content = args
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or("missing required argument: content (text)")?;
+        store
+            .write_file(&id, &path, content.as_bytes())
+            .map_err(render)?;
+        let check =
+            (path == identity::APP_ENTRY || path.ends_with(".lua")).then(|| check_app(&store, &id));
+        Ok(json!({"surface": id, "path": path, "bytes": content.len(), "check": check}))
+    }
+
+    fn surface_read_file(&self, args: &Value) -> Result<Value, String> {
+        let store = self.surface_store()?;
+        let id = self.surface_id(&store, args)?;
+        let path = optional_string(args, "path").unwrap_or_else(|| identity::APP_ENTRY.into());
+        let bytes = store.read_file(&id, &path).map_err(render)?;
+        Ok(json!({"surface": id, "path": path, "content": String::from_utf8_lossy(&bytes)}))
+    }
+
+    fn surface_files(&self, args: &Value) -> Result<Value, String> {
+        let store = self.surface_store()?;
+        let id = self.surface_id(&store, args)?;
+        Ok(json!({"surface": id, "files": store.list_files(&id).map_err(render)?}))
+    }
+
+    fn surface_data(&self, args: &Value) -> Result<Value, String> {
+        let store = self.surface_store()?;
+        let id = self.surface_id(&store, args)?;
+        match args.get("data") {
+            Some(data) if !data.is_null() => {
+                store.write_data(&id, data).map_err(render)?;
+                Ok(json!({"surface": id, "written": true}))
+            }
+            _ => Ok(json!({"surface": id, "data": store.read_data(&id).map_err(render)?})),
+        }
+    }
+
+    fn surface_check(&self, args: &Value) -> Result<Value, String> {
+        let store = self.surface_store()?;
+        let id = self.surface_id(&store, args)?;
+        Ok(json!({"surface": id, "check": check_app(&store, &id)}))
     }
 
     fn surface_events(&self, args: &Value) -> Result<Value, String> {
@@ -385,6 +426,105 @@ fn render(error: StoreError) -> String {
     error.to_string()
 }
 
+/// Sets icon, accent, style and app from the arguments that carry them.
+fn apply_identity(doc: &mut SurfaceDoc, args: &Value) -> Result<(), String> {
+    if let Some(icon) = args.get("icon") {
+        doc.icon = match icon {
+            Value::Null => None,
+            Value::String(text) => Some(icon_shorthand(text)),
+            other => Some(
+                serde_json::from_value::<Icon>(other.clone())
+                    .map_err(|e| format!("invalid icon: {e}"))?,
+            ),
+        };
+    }
+    if let Some(accent) = args.get("accent") {
+        doc.accent = accent.as_str().map(str::to_owned).filter(|a| !a.is_empty());
+    }
+    if let Some(style) = args.get("style").filter(|style| !style.is_null()) {
+        doc.style = serde_json::from_value::<Style>(style.clone())
+            .map_err(|e| format!("invalid style: {e}"))?;
+    }
+    if let Some(app) = args.get("app") {
+        doc.app = match app {
+            Value::Null => None,
+            other => Some(
+                serde_json::from_value::<AppSpec>(other.clone())
+                    .map_err(|e| format!("invalid app: {e}"))?,
+            ),
+        };
+    }
+    Ok(())
+}
+
+/// `"🎧"` is an emoji, `"chart.bar"` a built-in icon, `"icon.svg"` an asset.
+fn icon_shorthand(text: &str) -> Icon {
+    let lower = text.to_ascii_lowercase();
+    if identity::IMAGE_EXTENSIONS
+        .iter()
+        .any(|ext| lower.ends_with(&format!(".{ext}")))
+    {
+        Icon::Asset(text.to_owned())
+    } else if !text.is_empty()
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.')
+    {
+        Icon::Symbol(text.to_owned())
+    } else {
+        Icon::Emoji(text.to_owned())
+    }
+}
+
+/// Dry-runs the app's `render` with its saved state and data, and checks
+/// the result against the surface bounds, so the agent sees a Lua or shape
+/// error at once instead of a blank app.
+fn check_app(store: &SurfaceStore, id: &str) -> Value {
+    let source = match store.app_source(id) {
+        Ok(Some(source)) => source,
+        Ok(None) => return json!({"ok": false, "error": "no app.lua"}),
+        Err(error) => return json!({"ok": false, "error": error.to_string()}),
+    };
+    let doc = match store.load(id) {
+        Ok(loaded) => loaded.doc,
+        Err(error) => return json!({"ok": false, "error": error.to_string()}),
+    };
+    let data = store.read_data(id).unwrap_or(Value::Null);
+    let state = doc.state.app.clone().unwrap_or(Value::Null);
+    let folder = match store.folder_for(id) {
+        Ok(folder) => folder,
+        Err(error) => return json!({"ok": false, "error": error.to_string()}),
+    };
+    let app = diri_script::app::App {
+        source: &source,
+        dir: &folder,
+    };
+    let started = std::time::Instant::now();
+    let rendered = match diri_script::app::render(
+        app,
+        &state,
+        &data,
+        &diri_script::app::plain_context(diri_surfaces::now_ms()),
+        diri_script::app::INTERACTIVE,
+    ) {
+        Ok(rendered) => rendered,
+        Err(error) => return json!({"ok": false, "error": error.to_string()}),
+    };
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let root: Vec<Node> = match serde_json::from_value(rendered.root) {
+        Ok(root) => root,
+        Err(error) => return json!({"ok": false, "error": format!("render output: {error}")}),
+    };
+    let mut probe = doc;
+    probe.root = root;
+    match probe.validate() {
+        Ok(nodes) => {
+            json!({"ok": true, "nodes": nodes, "render_ms": (elapsed_ms * 100.0).round() / 100.0, "digest": diri_script::app::digest(&source)})
+        }
+        Err(error) => json!({"ok": false, "error": error.to_string()}),
+    }
+}
+
 fn nodes(value: &Value) -> Result<Vec<Node>, String> {
     serde_json::from_value(value.clone()).map_err(|e| format!("invalid root: {e}"))
 }
@@ -446,7 +586,8 @@ mod tests {
         let created = agent
             .call(
                 "surface",
-                &json!({"op": "create", "template": "today", "scope": "global"}),
+                &json!({"op": "create", "title": "Today", "scope": "global",
+                        "root": serde_json::to_value(&diri_proto::surface::fixtures::whats_for_today("", Scope::Global, &[]).root).unwrap()}),
             )
             .unwrap();
         let id = created["surface"].as_str().unwrap().to_owned();
@@ -482,7 +623,7 @@ mod tests {
         let outline = agent
             .call(
                 "surface",
-                &json!({"op": "get", "surface": "today", "format": "outline"}),
+                &json!({"op": "get", "surface": "Today", "format": "outline"}),
             )
             .unwrap();
         assert!(
@@ -600,5 +741,68 @@ mod tests {
         owner
             .call("surface", &json!({"op": "delete", "surface": id}))
             .unwrap();
+    }
+
+    #[test]
+    fn lua_apps_are_checked_as_they_are_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = bridge(dir.path(), Some("s-agent"));
+        let created = agent
+            .call(
+                "surface",
+                &json!({"op": "create", "title": "Queue", "icon": "🎧", "accent": "#f97316",
+                        "data": {"n": 3},
+                        "lua": "function render(state, data) return ui.text('items ' .. data.n, {size = 20}) end"}),
+            )
+            .unwrap();
+        assert_eq!(created["check"]["ok"], true, "{created}");
+        let id = created["surface"].as_str().unwrap();
+        let got = agent
+            .call("surface", &json!({"op": "get", "surface": id}))
+            .unwrap();
+        assert_eq!(got["surface"]["icon"], json!({"emoji": "🎧"}));
+        assert_eq!(got["surface"]["app"], json!({}));
+        // A broken edit is stored (the agent fixes it next) but reported now.
+        let broken = agent
+            .call("surface", &json!({"op": "update", "surface": id, "lua": "function render() return nil + 1 end"}))
+            .unwrap();
+        assert_eq!(broken["check"]["ok"], false);
+        assert!(
+            broken["check"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("app.lua:1"),
+            "{broken}"
+        );
+        let looping = agent
+            .call("surface", &json!({"op": "write_file", "surface": id, "path": "app.lua", "content": "function render() while true do end end"}))
+            .unwrap();
+        assert!(
+            looping["check"]["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("budget"),
+            "{looping}"
+        );
+        let files = agent
+            .call("surface", &json!({"op": "files", "surface": id}))
+            .unwrap();
+        assert_eq!(files["files"][0]["path"], "app.lua");
+        let escape = agent
+            .call(
+                "surface",
+                &json!({"op": "write_file", "surface": id, "path": "../x.lua", "content": "x"}),
+            )
+            .unwrap_err();
+        assert!(escape.starts_with("invalid_path"), "{escape}");
+        // Agents have no op that approves exec: only the person, in the app.
+        assert!(
+            agent
+                .call("surface", &json!({"op": "approve", "surface": id}))
+                .is_err()
+        );
+        let store = agent.surface_store().unwrap();
+        let source = store.app_source(id).unwrap().unwrap();
+        assert!(!store.is_approved(id, &diri_script::app::digest(&source)));
     }
 }

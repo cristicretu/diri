@@ -9,7 +9,11 @@ use serde_json::{Value, json};
 use super::CliError;
 
 pub(crate) const HELP: &str = "dirijor surface list [--saved | --session] [--json]\n  \
-dirijor surface create TITLE [--template today|blank] [--global | --project [DIR] | --session ID] [--pin]\n                                        [--root FILE|-]   (component JSON array; reads stdin when piped)\n  \
+dirijor surface create TITLE [--lua FILE|-] [--icon 🎧|chart.bar|icon.svg] [--accent #rrggbb] [--data FILE]\n                                        [--global | --project [DIR] | --session ID] [--pin] [--root FILE|-]\n  \
+dirijor surface write SURFACE PATH [FILE|-]   write app.lua or another app file (Lua is dry-run checked)\n  \
+dirijor surface data SURFACE [FILE|-]  print data.json, or replace it\n  \
+dirijor surface check SURFACE          dry-run the app's render and report errors\n  \
+dirijor surface files SURFACE          list the app's files\n  \
 dirijor surface update SURFACE [--ops FILE|-] [--root FILE|-] [--title T] [--expect REVISION] [--pin | --unpin]\n                                        --ops takes a JSON array of patch ops: set, replace, remove, insert, title, root\n  \
 dirijor surface get SURFACE [--outline] \n  \
 dirijor surface events SURFACE [--after SEQ]   what the person ticked or clicked\n  \
@@ -21,7 +25,10 @@ dirijor surface schema                 print the component and patch reference\n
 dirijor surface path                   print the folder where surfaces are kept";
 
 const VALUED: &[&str] = &[
-    "--template",
+    "--lua",
+    "--icon",
+    "--accent",
+    "--data",
     "--project",
     "--session",
     "--root",
@@ -151,8 +158,17 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), CliError> {
             if let Some(title) = args.positional.first() {
                 request["title"] = json!(title);
             }
-            if let Some(template) = args.value("--template") {
-                request["template"] = json!(template);
+            if let Some(lua) = read_text(&args, "--lua")? {
+                request["lua"] = json!(lua);
+            }
+            if let Some(icon) = args.value("--icon") {
+                request["icon"] = json!(icon);
+            }
+            if let Some(accent) = args.value("--accent") {
+                request["accent"] = json!(accent);
+            }
+            if let Some(data) = read_json(&args, "--data")? {
+                request["data"] = data;
             }
             if args.flag("--global") {
                 request["scope"] = json!("global");
@@ -259,6 +275,37 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), CliError> {
             request
         }
         "delete" | "rm" => json!({"op": "delete", "surface": args.surface()?}),
+        "write" => {
+            let path = args
+                .positional
+                .get(1)
+                .ok_or_else(|| CliError::failure("write SURFACE PATH [FILE|-]"))?
+                .clone();
+            let content = match args.positional.get(2).map(String::as_str) {
+                Some("-") | None => read_stdin()?,
+                Some(file) => std::fs::read_to_string(file)
+                    .map_err(|e| CliError::failure(format!("cannot read {file}: {e}")))?,
+            };
+            json!({"op": "write_file", "surface": args.surface()?, "path": path, "content": content})
+        }
+        "data" => {
+            let mut request = json!({"op": "data", "surface": args.surface()?});
+            let text = match args.positional.get(1).map(String::as_str) {
+                Some("-") => Some(read_stdin()?),
+                Some(file) => Some(
+                    std::fs::read_to_string(file)
+                        .map_err(|e| CliError::failure(format!("cannot read {file}: {e}")))?,
+                ),
+                None => None,
+            };
+            if let Some(text) = text {
+                request["data"] = serde_json::from_str(&text)
+                    .map_err(|e| CliError::failure(format!("data: invalid JSON: {e}")))?;
+            }
+            request
+        }
+        "check" => json!({"op": "check", "surface": args.surface()?}),
+        "files" => json!({"op": "files", "surface": args.surface()?}),
         other => {
             return Err(CliError::failure(format!(
                 "unknown surface verb {other:?}\n  {HELP}"
@@ -283,6 +330,31 @@ fn parse_revision(text: &str) -> Result<u64, CliError> {
     text.trim_start_matches('r')
         .parse()
         .map_err(|_| CliError::failure(format!("{text:?} is not a revision number")))
+}
+
+fn read_stdin() -> Result<String, CliError> {
+    if std::io::stdin().is_terminal() {
+        return Err(CliError::failure("pipe the content in, or name a file"));
+    }
+    let mut text = String::new();
+    std::io::stdin()
+        .take(diri_proto::surface::identity::MAX_APP_FILE_BYTES as u64 + 1)
+        .read_to_string(&mut text)
+        .map_err(|e| CliError::failure(format!("cannot read stdin: {e}")))?;
+    Ok(text)
+}
+
+/// Text from `--flag FILE` or `--flag -`.
+fn read_text(args: &Args, flag: &str) -> Result<Option<String>, CliError> {
+    if !args.has(flag) {
+        return Ok(None);
+    }
+    match args.value(flag).as_deref() {
+        Some("-") | None => read_stdin().map(Some),
+        Some(path) => std::fs::read_to_string(path)
+            .map(Some)
+            .map_err(|e| CliError::failure(format!("cannot read {path}: {e}"))),
+    }
 }
 
 /// JSON from `--flag FILE`, `--flag -` (stdin), or piped stdin when the
@@ -323,13 +395,7 @@ mod tests {
 
     #[test]
     fn flags_and_values_parse() {
-        let args = Args::parse(&strings(&[
-            "Today",
-            "--project",
-            "--pin",
-            "--template",
-            "today",
-        ]));
+        let args = Args::parse(&strings(&["Today", "--project", "--pin", "--icon", "🎧"]));
         assert_eq!(args.positional, vec!["Today"]);
         assert!(args.has("--project"));
         assert_eq!(
@@ -338,7 +404,7 @@ mod tests {
             "a following flag is not a value"
         );
         assert!(args.flag("--pin"));
-        assert_eq!(args.value("--template").as_deref(), Some("today"));
+        assert_eq!(args.value("--icon").as_deref(), Some("🎧"));
         let args = Args::parse(&strings(&["x", "--ops", "-"]));
         assert_eq!(args.value("--ops").as_deref(), Some("-"));
     }
