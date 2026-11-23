@@ -815,7 +815,7 @@ impl UtilitySurfaces {
         // This view is `.cached()` in RootView, so ambient window redraws no
         // longer reach it: store changes must notify it directly.
         let store_changes = {
-            let mut changes = store_runtime.changes();
+            let mut changes = store_runtime.changes_without_memory();
             cx.spawn(async move |this, cx| {
                 loop {
                     match changes.recv().await {

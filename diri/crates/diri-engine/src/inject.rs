@@ -54,6 +54,15 @@ pub fn uuid_v4() -> String {
 /// Commands read `$DIRIJOR_CLI` / `$DIRIJOR_SOCKET` from the PTY env, so the
 /// file content is identical for all sessions and safe to write once.
 pub fn write_claude_hooks_file(inject_dir: &Path) -> io::Result<()> {
+    write_hook_settings(inject_dir, None)
+}
+
+/// A separate file keeps live sessions on older Claude versions compatible.
+pub fn write_claude_exec_hooks_file(inject_dir: &Path, cli: &Path) -> io::Result<()> {
+    write_hook_settings(inject_dir, Some(cli))
+}
+
+fn write_hook_settings(inject_dir: &Path, cli: Option<&Path>) -> io::Result<()> {
     const EVENTS: [&str; 11] = [
         "SessionStart",
         "UserPromptSubmit",
@@ -69,19 +78,23 @@ pub fn write_claude_hooks_file(inject_dir: &Path) -> io::Result<()> {
     ];
     let mut hooks = serde_json::Map::new();
     for event in EVENTS {
-        hooks.insert(
-            event.to_string(),
-            json!([{
-                "hooks": [{
-                    "type": "command",
-                    "command": format!("\"${CLI_ENV}\" hook {event}"),
-                    "timeout": 10,
-                }]
-            }]),
-        );
+        let command = match cli {
+            Some(cli) => {
+                json!({"type": "command", "command": cli, "args": ["hook", event], "timeout": 10})
+            }
+            None => {
+                json!({"type": "command", "command": format!("\"${CLI_ENV}\" hook {event}"), "timeout": 10})
+            }
+        };
+        hooks.insert(event.into(), json!([{"hooks": [command]}]));
     }
+    let name = if cli.is_some() {
+        "claude-exec-hooks.json"
+    } else {
+        "claude-hooks.json"
+    };
     write_atomic(
-        &inject_dir.join("claude-hooks.json"),
+        &inject_dir.join(name),
         &serde_json::to_vec(&json!({ "hooks": hooks }))?,
     )
 }
@@ -256,7 +269,14 @@ pub fn injection_args_full(
     let mut argv = Vec::new();
     let mut mcp_http = false;
     if injection.claude_hooks {
-        let hooks = inject_dir.join("claude-hooks.json");
+        // A Claude launch allowed to use HTTP MCP has already passed the
+        // Engine's 2.1.289 version gate, which also supports exec-form hooks.
+        let exec = inject_dir.join("claude-exec-hooks.json");
+        let hooks = if mcp_http_url.is_some() && exec.is_file() {
+            exec
+        } else {
+            inject_dir.join("claude-hooks.json")
+        };
         if hooks.exists() {
             argv.push("--settings".into());
             argv.push(hooks.to_string_lossy().into_owned());
@@ -711,6 +731,32 @@ mod tests {
                 .any(|arg| arg.starts_with("mcp_servers.dirijor.command=")),
             "{args:?}"
         );
+    }
+
+    #[test]
+    fn verified_claude_executes_each_hook_without_shell_parsing() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = temp.path().join("a path with spaces/dirijor");
+        write_claude_hooks_file(temp.path()).unwrap();
+        write_claude_exec_hooks_file(temp.path(), &cli).unwrap();
+        let spec = InjectionSpec {
+            claude_hooks: true,
+            ..Default::default()
+        };
+        let config = |url| {
+            let injected = injection_args_full(&spec, temp.path(), &cli, None, url);
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&injected.argv[1]).unwrap())
+                .unwrap()
+        };
+        let direct = config(Some("http://localhost/mcp"));
+        let shell = config(None);
+        let hooks = direct["hooks"].as_object().unwrap();
+        assert_eq!(hooks.len(), 11);
+        for (event, groups) in hooks {
+            assert_eq!(groups[0]["hooks"][0]["command"], cli.to_str().unwrap());
+            assert_eq!(groups[0]["hooks"][0]["args"], json!(["hook", event]));
+            assert!(shell["hooks"][event][0]["hooks"][0]["args"].is_null());
+        }
     }
 
     #[test]

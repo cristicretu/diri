@@ -1239,7 +1239,7 @@ impl TerminalPane {
             }
         });
 
-        let mut changes = runtime.changes();
+        let mut changes = runtime.changes_without_memory();
         let store_changes = cx.spawn_in(window, async move |this, cx| {
             loop {
                 match changes.recv().await {

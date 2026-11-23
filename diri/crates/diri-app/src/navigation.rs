@@ -274,7 +274,7 @@ impl NavigationOverlay {
             .detach();
         let focus_handle = cx.focus_handle();
         let _ = window;
-        let mut changes = runtime.changes();
+        let mut changes = runtime.changes_without_memory();
         let store_changes = cx.spawn(async move |this, cx| {
             loop {
                 match changes.recv().await {

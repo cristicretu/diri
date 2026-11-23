@@ -182,6 +182,19 @@ fn a_hook_records_its_safe_seed_before_unreachable_daemon_delivery() {
 /// Answers Hello like the Engine, then returns the one `hook.report` params
 /// the CLI delivered.
 fn deliver_hook(event: &str, payload: &[u8]) -> (serde_json::Value, HookActivitySeed) {
+    deliver(&["hook", event], payload, b"{}\n")
+}
+
+fn deliver(args: &[&str], payload: &[u8], stdout: &[u8]) -> (serde_json::Value, HookActivitySeed) {
+    deliver_with_protocol(args, payload, stdout, false)
+}
+
+fn deliver_with_protocol(
+    args: &[&str],
+    payload: &[u8],
+    stdout: &[u8],
+    reserved: bool,
+) -> (serde_json::Value, HookActivitySeed) {
     use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixListener;
 
@@ -198,9 +211,24 @@ fn deliver_hook(event: &str, payload: &[u8]) -> (serde_json::Value, HookActivity
             reader.read_line(&mut line).unwrap();
             let request: serde_json::Value = serde_json::from_str(&line).unwrap();
             let result = if request["method"] == "hello" {
-                serde_json::json!({"proto": diri_proto::WIRE_VERSION, "engineKind": diri_proto::RUST_ENGINE_KIND})
+                let mut hello = serde_json::json!({"proto": diri_proto::WIRE_VERSION, "engineKind": diri_proto::RUST_ENGINE_KIND});
+                if reserved {
+                    assert_eq!(request["params"]["reserveHook"]["sessionID"], "s_hook");
+                    hello["hookReservation"] = serde_json::json!({"sequence": 73, "response": {"additionalContext": "speak now"}});
+                }
+                hello
             } else {
                 delivered = Some(request["params"].clone());
+                if reserved {
+                    assert_eq!(request["method"], "hook.commit");
+                    assert_eq!(request["id"], 73);
+                    // Wait for the CLI to close without replying. A synchronous
+                    // client would time out and lose the current-turn context.
+                    line.clear();
+                    assert_eq!(reader.read_line(&mut line).unwrap(), 0);
+                    break;
+                }
+                assert_eq!(request["method"], "hook.report");
                 serde_json::json!({})
             };
             let response = serde_json::json!({"id": request["id"], "ok": result});
@@ -212,7 +240,7 @@ fn deliver_hook(event: &str, payload: &[u8]) -> (serde_json::Value, HookActivity
     });
     let recovery = directory.path().join("s_hook");
     let mut child = Command::new(env!("CARGO_BIN_EXE_dirijor"))
-        .args(["hook", event])
+        .args(args)
         .env("DIRIJOR_SESSION_ID", "s_hook")
         .env("DIRIJOR_SESSION_RECOVERY_DIR", &recovery)
         .env("DIRIJOR_SOCKET", &socket)
@@ -225,12 +253,40 @@ fn deliver_hook(event: &str, payload: &[u8]) -> (serde_json::Value, HookActivity
     drop(stdin);
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
-    assert_eq!(output.stdout, b"{}\n");
+    if stdout.is_empty() {
+        assert!(output.stdout.is_empty());
+    } else {
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(stdout).unwrap()
+        );
+    }
     let seed = SessionRecoveryStore::new(recovery)
         .read_activity()
         .unwrap()
         .unwrap();
     (engine.join().unwrap(), seed)
+}
+
+#[test]
+fn codex_completion_keeps_the_identity_and_title_without_forwarding_the_answer() {
+    let original = serde_json::json!({
+        "type": "agent-turn-complete", "thread-id": "thread-1", "turn-id": "turn-4",
+        "cwd": "/repo", "input-messages": ["first prompt", "later message"],
+        "last-assistant-message": "x".repeat(32768),
+    });
+    let (report, seed) = deliver(&["notify", &original.to_string()], &[], b"");
+    let payload = &report["payload"];
+    assert!(payload.get("last-assistant-message").is_none());
+    assert_eq!(
+        payload["input-messages"],
+        serde_json::json!(["first prompt"])
+    );
+    let (_, expected) = diri_engine::hooks::parse_codex_notify(&original).unwrap();
+    let (_, actual) = diri_engine::hooks::parse_codex_notify(payload).unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(seed.native_turn_id.as_deref(), Some("turn-4"));
+    assert_eq!(seed.agent_session_id.as_deref(), Some("thread-1"));
 }
 
 #[test]
@@ -264,4 +320,16 @@ fn large_tool_payloads_are_read_whole_but_not_forwarded() {
     });
     let (delivered, _) = deliver_hook("PermissionRequest", payload.to_string().as_bytes());
     assert_eq!(delivered["payload"]["tool_input"]["command"], "cargo test");
+}
+
+#[test]
+fn reserved_submit_exits_with_current_context_before_any_commit_reply() {
+    let (report, seed) = deliver_with_protocol(
+        &["hook", "UserPromptSubmit"],
+        br#"{"session_id":"conversation","prompt":"test"}"#,
+        b"{\"hookSpecificOutput\":{\"additionalContext\":\"speak now\",\"hookEventName\":\"UserPromptSubmit\"}}\n",
+        true,
+    );
+    assert_eq!(report["event"], "UserPromptSubmit");
+    assert_eq!(seed.agent_session_id.as_deref(), Some("conversation"));
 }
