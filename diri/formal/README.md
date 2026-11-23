@@ -48,3 +48,19 @@ Run `PATH="$HOME/.elan/bin:$PATH" lake build` in this directory. Lean 4.36 check
 `permutation_drains_in_order` shows that any permutation of fully delivered reservations can drain. `final_in_order` covers all completed interleavings of receipt and handoff. `at_most_once` covers incomplete runs and repeated receipts as well. The checked increment in `reserve` supplies the unique-sequence premise. The proof compares the same event values and clock inputs. It models one session's hook stream and assumes handlers able to run eventually do. Process crashes, unrelated terminal signals, and wall-clock-dependent changes to other Engine state are outside the model.
 
 The Rust test `shuffled_commits_match_in_order_status` uses the production reservation, Claude parser and status reducer with fixed timestamps.
+
+## Ghost Desktop pool
+
+Run `PATH="$HOME/.elan/bin:$PATH" lake build` in this directory. `SandboxPool.lean` models `crates/diri-engine/src/sandbox.rs` with the standard library only.
+
+| Lean | Rust counterpart |
+| --- | --- |
+| `reserve`, `fill`, `fail` | `SandboxPool::start` takes a slot under the pool lock before the backend launches (`PoolState::reserved`). `Reservation::fill` turns it into a `Slot`; dropping the `Reservation` on any failure gives it back. |
+| `authorized`, `stop` | `check_owner`: the person may act on any sandbox, a session only on its own. `stop`, `act` and `snapshot` all go through it. |
+| `removeWhere`, `releaseOwner`, `reap` | `reclaim` shuts down exactly the removed slots' instances and deletes their state directories. `release_owner` runs on `session.remove`; `reap_once` removes slots whose owner is no longer live, whose backend died, or which sat idle past `RECLAIM_AFTER`. |
+| `resources` | The browser process group and the owner-only profile directory of each sandbox. |
+| `engineCrash` | A SIGKILLed Engine closes every CDP pipe and each browser exits on EOF; the next pool starts empty and `sweep_stale_state` removes the dead Engine's directories. |
+
+`Inv` holds initially and after every operation: live slots plus in-flight launches never exceed `capacity` (`capacity_bound`, `full_refuses`), ids are never reused, and the resources held are exactly the live slots' ids. `lease_exclusive` shows two sessions are never both authorized for one sandbox. `release_leaks_nothing` shows a session that ends leaves no sandbox and no resource behind; `reclaim_leaks_nothing` covers every other removal, and `engine_crash_leaks_nothing` the killed Engine.
+
+The model assumes a backend's `shutdown` releases what it launched, which the Rust tests check against a real browser: `cargo test -p diri-engine --test sandbox_ghost -- --ignored` (`an_engine_crash_leaks_no_browser` kills a helper Engine with SIGKILL and finds its browser tree gone within ~25 ms). The pool rules themselves are covered deterministically by `cargo test -p diri-engine --lib sandbox`.
