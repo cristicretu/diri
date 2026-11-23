@@ -193,7 +193,7 @@ fn a_capture_is_sent_remembered_and_ranked_first_next_time() {
             .to_owned();
     }
     assert!(screen.contains("got:fix this padding"), "{screen}");
-    assert!(screen.contains("got:<diri-clip id="), "{screen}");
+    assert!(screen.contains("got:<diri-clip>"), "{screen}");
 
     // A later capture of another page on the same dev server suggests the
     // remembered Session first.

@@ -925,11 +925,25 @@ pub(crate) fn open(clip: ClipRecord, services: HudServices, cx: &mut App) {
         hud.update(cx, |hud, cx| {
             window.focus(hud.focus_handle(), cx);
             hud.load_targets(window, cx);
-            // Clicking away closes it; the clip stays in the ring.
-            cx.observe_window_activation(window, |_, window, _| {
-                if !window.is_window_active() {
-                    window.remove_window();
+            // Clicking away closes it; the clip stays in the ring. Opening
+            // reports key status off and on again (the style change in
+            // `prepare`, then `makeKeyAndOrderFront`), and the notifications
+            // arrive after this subscribes: only a loss that lasts closes it.
+            cx.observe_window_activation(window, |_, window, cx| {
+                if window.is_window_active() {
+                    return;
                 }
+                cx.spawn_in(window, async move |_, cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(200))
+                        .await;
+                    let _ = cx.update(|window, _| {
+                        if !window.is_window_active() {
+                            window.remove_window();
+                        }
+                    });
+                })
+                .detach();
             })
             .detach();
         });
