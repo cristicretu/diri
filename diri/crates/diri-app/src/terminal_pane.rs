@@ -9652,7 +9652,7 @@ mod tests {
                         }
                         // One Codex session, TUI Lens then GUI Lens; the
                         // header's Conversation | Terminal control flips them.
-                        "lens-tui" | "lens-gui" | "lens-portal" => {
+                        "lens-tui" | "lens-gui" | "lens-portal" | "lens-usage" => {
                             let mut grid = grid_frame(120, true);
                             grid.rows = 40;
                             let picker: &[(u16, &str)] = &[
@@ -9687,7 +9687,18 @@ mod tests {
                                 (35, "──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"),
                                 (36, "  ⏵⏵ accept edits on (shift+tab to cycle)                    Work · Sonnet 5.5"),
                             ];
-                            for &(y, text) in if scene == "lens-portal" { picker } else { conversation } {
+                            // A real Claude Code 2.1 `/usage` frame (120 × 40).
+                            let usage: Vec<(u16, &str)> = include_str!("thread_lens/screens/claude-usage.txt")
+                                .lines()
+                                .enumerate()
+                                .map(|(y, line)| (y as u16, line))
+                                .collect();
+                            let lines: &[(u16, &str)] = match scene.as_str() {
+                                "lens-portal" => picker,
+                                "lens-usage" => &usage,
+                                _ => conversation,
+                            };
+                            for &(y, text) in lines {
                                 let mut cells = vec![GridCell::BLANK; 120];
                                 for (cell, ch) in cells.iter_mut().zip(text.chars()) {
                                     cell.scalar = ch as u32;
