@@ -79,6 +79,7 @@ pub mod session_files;
 pub mod shell_integration;
 mod state_file;
 pub mod status;
+pub mod structured;
 pub mod telemetry;
 pub mod transcript;
 pub mod wake;
