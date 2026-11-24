@@ -1547,6 +1547,7 @@ impl ControlServer {
             Method::SESSION_READ_TRANSCRIPT => self.session_read_transcript(params),
             Method::SESSION_THREAD_READ => self.session_thread_read(params),
             Method::SESSION_ANSWER_BLOCKER => self.session_answer_blocker(params),
+            Method::SESSION_HANDOFF => self.session_handoff(params),
             Method::SESSION_HANDOFF_CAPSULE => self.session_handoff_capsule(params),
             Method::WORKTREE_INTEGRATE => self.worktree_integrate(params),
             Method::SESSION_HIBERNATE => self.session_hibernate(params),
@@ -1661,7 +1662,9 @@ impl ControlServer {
         // argv keeps manifest launch behavior; an explicit malformed argv must
         // never silently drop arguments or fall back to a login shell.
         let argv = decode_launch_argv(&raw)?;
+        let model_args = decode_launch_model(&raw)?;
         let mut p: diri_proto::SessionSpawnParams = decode(Some(raw))?;
+        let model_args = model_flag(p.kind.id(), model_args);
         let command_run = command_run_for(&p, &argv)?;
         if let Some((host, cwd)) =
             crate::wsl::route_unc(&p.cwd, &crate::wsl::catalog(self.hosts_file()))
@@ -1773,6 +1776,7 @@ impl ControlServer {
         if descriptor.binary.is_some() {
             launch_args.extend(descriptor.spawn_args.iter().cloned());
             launch_args.extend(self.configured_launch_args(None, &kind)?);
+            launch_args.extend(model_args.iter().cloned());
             if let Some(injection) = &self.injection {
                 let injected = crate::inject::injection_args_full(
                     &descriptor.injection,
@@ -3523,6 +3527,60 @@ impl ControlServer {
         );
         encode(&diri_proto::thread::HandoffCapsuleResult {
             capsule: capsule.render(),
+            touched_files: capsule.touched_files,
+        })
+    }
+
+    /// Tier 3: continues a thread in another Agent. Builds the deterministic
+    /// Handoff Capsule from the source session, starts the target Agent in
+    /// the same directory on the chosen model with the capsule as its first
+    /// prompt, and records a `Handoff` segment on the new session pointing
+    /// back at the source. The source session is left as it is (parked):
+    /// its Holder and conversation stay, so returning reuses its cache.
+    fn session_handoff(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::thread::HandoffParams = decode(params)?;
+        let source = self.record_for(&p.session_id.0)?;
+        if source.host.is_some() {
+            return Err(ControlError::bad_request("Handoff is local-only for now"));
+        }
+        let capsule: diri_proto::thread::HandoffCapsuleResult = serde_json::from_value(
+            self.session_handoff_capsule(Some(json!({"sessionID": p.session_id, "goal": p.goal})))?,
+        )
+        .map_err(|error| ControlError::internal(error.to_string()))?;
+        let mut spawn = json!({
+            "kind": p.kind,
+            "cwd": source.cwd,
+            "title": source.title,
+            "initialPrompt": capsule.capsule,
+            "parent": p.session_id,
+        });
+        if let Some(model) = &p.model {
+            spawn["model"] = json!(model);
+        }
+        let spawned = self.session_spawn(Some(spawn))?;
+        let id = spawned
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| ControlError::internal("spawn returned no id"))?
+            .to_owned();
+        let target = self.record_for(&id)?;
+        let store = crate::thread::segments::SegmentStore::new(&self.state_dir);
+        let handoff = diri_proto::thread::ThreadSegment {
+            index: 0,
+            kind: source.effective_kind().clone(),
+            session_id: source.id.clone(),
+            model: p.model.clone(),
+            account: None,
+            start_offset: 0,
+            started_at_ms: diri_proto::DateMillis::from(std::time::SystemTime::now()).0 as i64,
+            cause: diri_proto::thread::SegmentCause::Handoff,
+        };
+        // The new thread opens on the divider: no Start before it.
+        if let Err(error) = store.write_chain(&target, vec![handoff]) {
+            eprintln!("diri-engine: handoff segment not recorded: {error}");
+        }
+        encode(&diri_proto::thread::HandoffResult {
+            session_id: diri_proto::SessionId::new(id),
             touched_files: capsule.touched_files,
         })
     }
@@ -6326,6 +6384,40 @@ fn command_run_for(
     }))
 }
 
+/// `session.spawn`'s optional `model`: the model an Agent starts on (a GUI
+/// Lens handoff picks one). Validated as a plain model id so it can never
+/// smuggle a flag or a shell word into the argv.
+fn decode_launch_model(params: &JsonValue) -> Result<Option<String>, ControlError> {
+    let Some(value) = params.get("model") else {
+        return Ok(None);
+    };
+    let model = value
+        .as_str()
+        .ok_or_else(|| ControlError::bad_request("model must be a string"))?;
+    let valid = !model.is_empty()
+        && model.len() <= 128
+        && !model.starts_with('-')
+        && model.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'[' | b']' | b':')
+        });
+    if !valid {
+        return Err(ControlError::bad_request("model must be a plain model id"));
+    }
+    Ok(Some(model.to_owned()))
+}
+
+/// Each CLI's own flag for its starting model.
+fn model_flag(kind: &str, model: Option<String>) -> Vec<String> {
+    let Some(model) = model else {
+        return Vec::new();
+    };
+    match kind {
+        diri_proto::AgentKind::CODEX_ID => vec!["-m".into(), model],
+        diri_proto::AgentKind::CLAUDE_CODE_ID | "antigravity" => vec!["--model".into(), model],
+        _ => Vec::new(),
+    }
+}
+
 fn decode_launch_argv(params: &JsonValue) -> Result<Vec<String>, ControlError> {
     let Some(value) = params.get("argv") else {
         return Ok(Vec::new());
@@ -8824,6 +8916,38 @@ mod tests {
     /// The GUI Lens's Approve/Deny reaches the PTY only while the very
     /// prompt the user saw is still live; a changed or cleared prompt is
     /// refused before any byte is written.
+    /// A GUI Lens handoff starts the target on the picked model with each
+    /// CLI's own flag, and nothing else can ride in on the model string.
+    #[test]
+    fn handoff_models_become_each_clis_flag_and_nothing_else() {
+        let model = |value: serde_json::Value| decode_launch_model(&json!({ "model": value }));
+        assert_eq!(
+            model(json!("claude-haiku-5-5")).unwrap().as_deref(),
+            Some("claude-haiku-5-5")
+        );
+        assert_eq!(
+            model(json!("gpt-6.2-astra")).unwrap().as_deref(),
+            Some("gpt-6.2-astra")
+        );
+        assert!(model(json!("--dangerously-skip-permissions")).is_err());
+        assert!(model(json!("opus; rm -rf ~")).is_err());
+        assert!(model(json!(7)).is_err());
+        assert_eq!(decode_launch_model(&json!({})).unwrap(), None);
+        assert_eq!(
+            model_flag("codex", Some("gpt-6.2-sol".into())),
+            ["-m", "gpt-6.2-sol"]
+        );
+        assert_eq!(
+            model_flag("claude-code", Some("haiku".into())),
+            ["--model", "haiku"]
+        );
+        assert_eq!(
+            model_flag("antigravity", Some("gemini-4-neon-high".into())),
+            ["--model", "gemini-4-neon-high"]
+        );
+        assert!(model_flag("shell", Some("x".into())).is_empty());
+    }
+
     #[test]
     fn answer_blocker_refuses_a_prompt_that_is_no_longer_live() {
         let temp = tempfile::tempdir().unwrap();

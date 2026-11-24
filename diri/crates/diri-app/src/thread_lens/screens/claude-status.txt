@@ -1,0 +1,40 @@
+  Older versions of Claude Code treat "Write(*)" as "Write", and this version will too if Anthropic turns this change
+  off.
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+  Settings  Status   Config   Usage   Stats
+
+  Version:           2.1.331
+  Session name:      /rename to add a name
+  Session ID:        00000000-0000-0000-0000-000000000000
+  Session kind:      interactive
+  Peer address:      uds:/tmp/cc-socks/1.sock
+  cwd:               /work/diri
+  Login method:      Claude Ultra account
+  Organization:      Example Organization
+  Email:             user@example.com
+  Cloud sessions:    GitHub connected
+
+  Model:             haiku (claude-haiku-5-5) · claude-sonnet-5-5 in plan mode
+  MCP servers:       11 connected, 9 need auth, 1 disabled, 2 failed · /mcp
+  Setting sources:   User settings, Enterprise managed settings (file)
+  Auto mode server:  Enabled
+
+  ←/→ to switch · Esc to close
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

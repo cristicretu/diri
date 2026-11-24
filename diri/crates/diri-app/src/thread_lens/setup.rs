@@ -140,6 +140,87 @@ fn codex(home: &Path) -> AgentSetup {
     setup
 }
 
+/// One installed Agent's section in the model picker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentModels {
+    pub kind: AgentKind,
+    pub label: &'static str,
+    pub models: Vec<ModelChoice>,
+}
+
+/// The Agents the picker offers, in this order, when installed.
+pub const PICKER_AGENTS: &[&str] = &[AgentKind::CLAUDE_CODE_ID, AgentKind::CODEX_ID, "antigravity"];
+
+pub fn agent_label(kind: &AgentKind) -> &'static str {
+    match kind.id() {
+        AgentKind::CLAUDE_CODE_ID => "Claude Code",
+        AgentKind::CODEX_ID => "Codex",
+        "antigravity" => "Antigravity",
+        _ => "Agent",
+    }
+}
+
+/// The models an installed Agent offers. Claude's list is its picker's;
+/// Codex's comes from its cached catalog; Antigravity lists its own with
+/// `agy models` (a network round trip, so callers run this off the UI
+/// thread and cache it).
+pub fn models_for(kind: &AgentKind, home: &Path, binary: Option<&Path>) -> Vec<ModelChoice> {
+    match kind.id() {
+        AgentKind::CODEX_ID => codex(home).models,
+        "antigravity" => binary.map(antigravity_models).unwrap_or_default(),
+        _ => claude(home, home).models,
+    }
+}
+
+/// `agy models` prints `id<TAB>label` per line after a status line.
+pub fn parse_antigravity_models(output: &str) -> Vec<ModelChoice> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (id, label) = line.split_once('\t')?;
+            let id = id.trim();
+            (!id.is_empty() && !id.contains(' ')).then(|| ModelChoice {
+                id: id.into(),
+                label: label.trim().into(),
+                detail: String::new(),
+            })
+        })
+        .take(40)
+        .collect()
+}
+
+fn antigravity_models(binary: &Path) -> Vec<ModelChoice> {
+    use std::io::Read as _;
+    let Ok(mut child) = std::process::Command::new(binary)
+        .arg("models")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return Vec::new();
+    };
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() < std::time::Duration::from_secs(20) => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Vec::new();
+            }
+        }
+    }
+    let mut out = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout.read_to_string(&mut out);
+    }
+    parse_antigravity_models(&out)
+}
+
 impl AgentSetup {
     /// The label for a model id, alias or full provider id.
     pub fn label_for(&self, model: &str) -> String {
@@ -230,6 +311,15 @@ mod tests {
         assert_eq!(setup.models.len(), 2);
         assert_eq!(setup.effort.as_deref(), Some("medium"));
         assert_eq!(setup.efforts, ["low", "medium", "max"]);
+    }
+
+    #[test]
+    fn antigravity_lists_its_models_from_agy_models() {
+        let output = "Fetching available models...\ngemini-4-neon-high\tGemini 4 Neon (High)\ngemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)\n";
+        let models = parse_antigravity_models(output);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "gemini-4-neon-high");
+        assert_eq!(models[1].label, "Gemini 3.8 Flash (Medium)");
     }
 
     #[test]

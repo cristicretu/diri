@@ -1904,16 +1904,16 @@ impl TerminalPane {
         cx.notify();
     }
 
-    /// The screen rows of a picker the Agent is showing, if any.
-    fn lens_picker(&self, session: &SessionRecord) -> Option<std::ops::Range<usize>> {
+    /// The interactive screen the Agent is showing, if any: a picker, a
+    /// Settings/Help panel, the alternate screen, or a prompt the hooks
+    /// reported that has no recognisable shape (its bottom rows).
+    fn lens_picker(&self, session: &SessionRecord) -> Option<crate::thread_lens::portal::Screen> {
         let resident = self.residents.get(&session.id)?;
         let rows = resident.element.live_screen_text();
-        crate::thread_lens::portal::picker_rows(&rows).or_else(|| {
-            // A prompt the hooks reported that no picker shape matched (a
-            // password, a free-text question): its bottom rows.
+        crate::thread_lens::portal::interactive(&rows, resident.element.alt_screen()).or_else(|| {
             crate::thread_lens::needs_portal(session).then(|| {
                 let end = rows.iter().rposition(|row| !row.trim().is_empty()).map_or(rows.len(), |r| r + 1);
-                end.saturating_sub(10)..end
+                crate::thread_lens::portal::Screen { rows: end.saturating_sub(10)..end, anchor_top: false }
             })
         })
     }
@@ -1954,6 +1954,27 @@ impl TerminalPane {
                 }
                 ThreadLensEvent::PasteIntoTerminal => {
                     this.paste(&Paste, window, cx);
+                }
+                ThreadLensEvent::HandedOff(target) => {
+                    // The new Agent's session opens on its Conversation lens,
+                    // once the store has its record.
+                    this.lens_modes.insert(target.clone(), crate::thread_lens::Lens::Gui);
+                    let target = target.clone();
+                    cx.spawn_in(window, async move |this, cx| {
+                        for _ in 0..60 {
+                            let known = this
+                                .update(cx, |this, _| {
+                                    this.runtime.store.read().expect("store").sessions().contains_key(&target)
+                                })
+                                .unwrap_or(true);
+                            if known {
+                                break;
+                            }
+                            cx.background_executor().timer(Duration::from_millis(50)).await;
+                        }
+                        let _ = this.update(cx, |_, cx| cx.emit(TerminalPaneEvent::RevealSession(target)));
+                    })
+                    .detach();
                 }
             }
         });
@@ -5653,7 +5674,7 @@ impl TerminalPane {
                 }
             });
         }
-        let portal = picker.map(|rows| self.render_lens_portal(session, rows, state, theme, colors, typeface, window, cx));
+        let portal = picker.map(|screen| self.render_lens_portal(session, screen, state, theme, colors, typeface, window, cx));
         // Claude's footer names the permission mode; the lens's mode pill
         // follows it the frame it changes.
         let screen_mode = self
@@ -5676,7 +5697,7 @@ impl TerminalPane {
     fn render_lens_portal(
         &mut self,
         session: &SessionRecord,
-        rows: std::ops::Range<usize>,
+        screen: crate::thread_lens::portal::Screen,
         state: LensPortal,
         theme: TermTheme,
         colors: SemanticColors,
@@ -5691,6 +5712,16 @@ impl TerminalPane {
         let full = (viewport.height - self.header_height()).max(160.0);
         let geometry = self.residents.get(&id).and_then(|r| r.element.painted_geometry());
         let line = geometry.map_or(17.0, |g| f32::from(g.line_height));
+        // At most 60% of the pane: a panel keeps its top (tab bar), a picker
+        // its bottom (hint and highlighted choice).
+        let fit = ((full * 0.6) / line).floor().max(6.0) as usize;
+        let rows = if screen.rows.len() <= fit {
+            screen.rows.clone()
+        } else if screen.anchor_top {
+            screen.rows.start..screen.rows.start + fit
+        } else {
+            screen.rows.end - fit..screen.rows.end
+        };
         let (mut offset, mut offset_x) = (state.offset, state.offset_x);
         if let (Some(geometry), Some((left, top))) = (geometry, self.lens_portal_top.get()) {
             let inner = f32::from(geometry.origin.y) - top - offset;
@@ -5742,7 +5773,31 @@ impl TerminalPane {
                             .child(div().size(px(6.0)).rounded_full().bg(Ink::ATTENTION))
                             .child(div().text_color(colors.primary).font_weight(gpui::FontWeight::MEDIUM).child(t("thread_lens.portal_title")))
                             .child(div().flex_1())
-                            .child(div().text_color(colors.tertiary).child(t("thread_lens.portal_keys"))),
+                            .child(div().text_color(colors.tertiary).child(t("thread_lens.portal_keys")))
+                            .child({
+                                let lens = self.lenses.get(&id).map(|(lens, _)| lens.downgrade());
+                                div()
+                                    .id("lens-portal-esc")
+                                    .ml(px(6.0))
+                                    .h(px(20.0))
+                                    .px(px(7.0))
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(6.0))
+                                    .border_1()
+                                    .border_color(colors.primary.alpha(0.12))
+                                    .text_size(px(10.5))
+                                    .text_color(colors.secondary)
+                                    .cursor_pointer()
+                                    .hover(|esc| esc.bg(colors.primary.alpha(0.06)))
+                                    .child(t("thread_lens.portal_close"))
+                                    .on_click(move |_, _, cx| {
+                                        if let Some(lens) = &lens {
+                                            let _ = lens.update(cx, |lens, cx| lens.send_escape(cx));
+                                        }
+                                        cx.stop_propagation();
+                                    })
+                            }),
                     )
                     .child(
                         div()
@@ -5907,10 +5962,7 @@ impl TerminalPane {
             .theme(theme)
             // The surface around the grid paints the terminal tint, so
             // the grid only adds its own fill on an opaque window.
-            .background_opacity(match colors.material() {
-                diri_ui::Material::Opaque => 1.0,
-                diri_ui::Material::Glass => 0.0,
-            })
+            .background_opacity(crate::thread_lens::view::grid_fill_opacity(colors.material()))
             .font(typeface.font.clone())
             .font_size(px(typeface.size))
             .line_height_scale(typeface.line_height)

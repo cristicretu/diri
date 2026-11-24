@@ -1,0 +1,40 @@
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ System prompt: 3.7k tokens (0.4%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ System tools: 16k tokens (2%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ MCP tools: 9.1k tokens (0.9%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ MCP server instructions: 4k tokens (0.4%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛝ ⛝ ⛝ ⛝ ⛝ ⛝ ⛝   ⛁ Memory files: 15.4k tokens (2%)
+                                               ⛁ Skills: 10k tokens (1%)
+                                               ⛁ Messages: 10 tokens (<0.1%)
+                                               ⛶ Free space: 908.8k tokens (91%)
+                                               ⛝ Autocompact buffer: 33k tokens (3%)
+
+     Auto-compact window:  1m tokens
+
+     MCP tools · /mcp (loaded on-demand)
+     └ 294 tools · 9.1k tokens
+
+     Memory files · /memory
+     └ 3 files · 15.4k tokens
+
+     Skills · /skills
+     └ 130 skills · 10k tokens
+
+     /context all to expand
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+  Help  General   Commands   Custom commands
+
+  Claude understands your codebase, makes edits with your permission, and runs commands — right from your terminal.
+
+  Shortcuts
+  ! for shell mode        esc esc to clear input             ctrl+shift+_ to undo
+  / for commands          shift+tab to cycle modes           ctrl+z to suspend
+  @ for file paths        shift+↑/↓ to change effort         ctrl+v to paste images
+  /btw for side question  ctrl+o to see full transcript      opt+p to switch model
+                          ctrl+t to toggle tasks             opt+o to toggle fast mode
+                          \ then enter for newline           ctrl+s to stash prompt
+                                                             ctrl+g to edit in $EDITOR
+                                                             /keybindings to customize
+
+  For more help: https://code.claude.com/docs/en/overview
+
+  ←/→ to switch · Esc to close

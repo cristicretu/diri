@@ -40,7 +40,7 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use super::diff::{self, DiffCard, Side};
 pub use super::model::model_display;
 use super::model::{Call, RowChange, Row, ThreadModel, WorkStrip};
-use super::setup::AgentSetup;
+use super::setup::{AgentModels, AgentSetup};
 use super::slash::{self, SlashCommand};
 use crate::code_editor::EditorPalette;
 use crate::code_editor::syntax::{self, LexState, TokenKind};
@@ -61,6 +61,8 @@ const MONO_SIZE: f32 = 12.0;
 const MONO_LEADING: f32 = 18.0;
 const ACCENT: u32 = 0xd97757;
 const LINK: u32 = 0x5b9cf0;
+/// How long a model or effort picked here shows before the CLI confirms.
+const PICK_GRACE: Duration = Duration::from_secs(20);
 /// How long a newly arrived row takes to fade in.
 const FADE_IN: Duration = Duration::from_millis(320);
 /// The composer grows with its text up to this, then scrolls.
@@ -78,11 +80,15 @@ pub enum ThreadLensEvent {
     /// ⌘V with an image on the pasteboard: the terminal's own paste path
     /// uploads it into the same PTY.
     PasteIntoTerminal,
+    /// The thread continues in another Agent's new session (Tier 3).
+    HandedOff(SessionId),
 }
 
 enum LensMessage {
     Page(Result<diri_proto::thread::ThreadReadResult, String>),
     Answered(Result<(), String>),
+    Agents(Vec<AgentModels>),
+    HandedOff(Result<SessionId, String>),
 }
 
 /// The composer's primary action, by the Agent's state and the draft.
@@ -160,8 +166,16 @@ pub struct ThreadLens {
     slash_dismissed: Option<String>,
     /// The CLI's own settings and model list, read on first use.
     setup: Option<Arc<AgentSetup>>,
-    /// The effort chosen here, until the CLI's settings catch up.
-    effort: Option<String>,
+    /// The effort and model picked here, shown until the CLI confirms (or
+    /// for 20 s, if it never does).
+    effort: Option<(String, std::time::Instant)>,
+    picked: Option<(String, std::time::Instant)>,
+    /// Installed Agents and their models, for the picker's sections.
+    agents: Option<Vec<AgentModels>>,
+    agents_loading: bool,
+    handoff_error: Option<SharedString>,
+    /// Follow-up reads after a wake-up, for a JSONL flushed just after it.
+    burst: Option<Task<()>>,
     /// The permission mode the terminal's footer shows right now.
     screen_mode: Option<&'static str>,
     /// Re-renders the working line's elapsed seconds while it shows.
@@ -232,7 +246,7 @@ impl ThreadLens {
                     }
                     _ => false,
                 };
-                if ours && this.update(cx, |this, cx| this.request_read(cx)).is_err() {
+                if ours && this.update(cx, |this, cx| this.burst_read(cx)).is_err() {
                     return;
                 }
             }
@@ -273,6 +287,11 @@ impl ThreadLens {
             fresh: HashMap::new(),
             setup: None,
             effort: None,
+            picked: None,
+            agents: None,
+            agents_loading: false,
+            handoff_error: None,
+            burst: None,
             screen_mode: None,
             ticker: None,
             dock: None,
@@ -351,8 +370,9 @@ impl ThreadLens {
     }
 
     #[cfg(test)]
-    pub(crate) fn open_model_menu_for_test(&mut self) {
+    pub(crate) fn open_model_menu_for_test(&mut self, agents: Vec<AgentModels>) {
         self.model_menu = true;
+        self.agents = Some(agents);
     }
 
     #[cfg(test)]
@@ -391,6 +411,26 @@ impl ThreadLens {
             self.portal_open = open;
             cx.notify();
         }
+    }
+
+    /// A wake-up (file watch, hook, status change): read now, then twice
+    /// more within 200 ms, so a reply whose JSONL lands a moment after the
+    /// Stop hook still clears the working line at once.
+    fn burst_read(&mut self, cx: &mut Context<Self>) {
+        self.request_read(cx);
+        self.burst = Some(cx.spawn(async move |this, cx| {
+            for delay in [60u64, 140] {
+                cx.background_executor().timer(Duration::from_millis(delay)).await;
+                if this.update(cx, |this, cx| this.request_read(cx)).is_err() {
+                    return;
+                }
+            }
+        }));
+    }
+
+    /// Esc into the PTY: closes a picker, cancels a prompt, interrupts.
+    pub fn send_escape(&mut self, cx: &mut Context<Self>) {
+        self.send("\u{1b}".into(), false, cx);
     }
 
     fn request_read(&mut self, cx: &mut Context<Self>) {
@@ -436,6 +476,20 @@ impl ThreadLens {
                     self.request_read(cx);
                 }
             }
+            LensMessage::Agents(agents) => {
+                self.agents_loading = false;
+                self.agents = Some(agents);
+                cx.notify();
+            }
+            LensMessage::HandedOff(Ok(id)) => {
+                self.handoff_error = None;
+                cx.emit(ThreadLensEvent::HandedOff(id));
+                cx.notify();
+            }
+            LensMessage::HandedOff(Err(error)) => {
+                self.handoff_error = Some(SharedString::from(error));
+                cx.notify();
+            }
             LensMessage::Answered(result) => {
                 self.answer_error = result.err().map(|error| {
                     if error.contains("blocker_changed") || error.contains("no longer showing") {
@@ -454,7 +508,9 @@ impl ThreadLens {
     fn extra_rows(&self) -> usize {
         // A running strip already says what the Agent is doing.
         let live_strip = matches!(self.model.rows.last(), Some(Row::Work(strip)) if strip.pending());
-        self.model.pending.len() + usize::from(self.busy() && !live_strip)
+        // Only while a reply is owed: the moment the reply row lands the line
+        // goes, whatever the session status still says.
+        self.model.pending.len() + usize::from(self.model.awaiting_reply() && self.busy() && !live_strip)
     }
 
     fn apply_change(&mut self, change: RowChange) {
@@ -2057,6 +2113,48 @@ impl ThreadLens {
                 .is_some_and(|at| now_ms().saturating_sub(at) < 30_000)
     }
 
+    /// The model the pill names: what was picked here until the CLI
+    /// confirms it (or 20 s pass), then what the CLI confirmed (its `/model`
+    /// output or the last request), else what its settings say it will use.
+    /// The startup default never overrides a pick or a confirmation.
+    fn model_label(&mut self, setup: &AgentSetup) -> String {
+        let confirmed = self
+            .model
+            .selected_model()
+            .map(str::to_owned)
+            .or_else(|| setup.model.as_deref().map(|id| setup.label_for(id)));
+        if self.picked.as_ref().is_some_and(|(label, at)| {
+            self.model.selected_model() == Some(label.as_str()) || at.elapsed() > PICK_GRACE
+        }) {
+            self.picked = None;
+        }
+        self.picked
+            .as_ref()
+            .map(|(label, _)| label.clone())
+            .or(confirmed)
+            .unwrap_or_else(|| setup.label_for("default"))
+    }
+
+    /// The effort the pill names, by the same rule as the model.
+    fn effort_level(&mut self, setup: &AgentSetup) -> Option<String> {
+        if self.effort.as_ref().is_some_and(|(level, at)| {
+            self.model.effort() == Some(level.as_str()) || at.elapsed() > PICK_GRACE
+        }) {
+            self.effort = None;
+        }
+        self.effort
+            .as_ref()
+            .map(|(level, _)| level.clone())
+            .or_else(|| self.model.effort().map(str::to_owned))
+            .or_else(|| setup.effort.clone())
+    }
+
+    /// A model picked in the picker, before the CLI says anything.
+    #[cfg(test)]
+    pub(crate) fn pick_for_test(&mut self, label: &str) {
+        self.picked = Some((label.to_owned(), std::time::Instant::now()));
+    }
+
     fn render_composer(&mut self, session: Option<&SessionRecord>, colors: SemanticColors, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let focused = self.focus.is_focused(window);
         self.ensure_blink(focused, cx);
@@ -2067,17 +2165,9 @@ impl ThreadLens {
         let claude = kind != AgentKind::CODEX;
         let setup = self.setup();
         let now_ms = now_ms();
-        // The model: what the last request used, else what the CLI will use.
-        let model_id = self
-            .model
-            .current_model()
-            .map(str::to_owned)
-            .or_else(|| setup.model.clone());
-        let model_label = model_id
-            .as_deref()
-            .map_or_else(|| setup.label_for("default"), |id| setup.label_for(id));
+        let model_label = self.model_label(&setup);
         let warm = matches!(self.model.warmth(now_ms), Some((_, CacheWarmth::Warm { .. })));
-        let effort = self.effort.clone().or_else(|| setup.effort.clone());
+        let effort = self.effort_level(&setup);
         let mode = self
             .screen_mode
             .map(str::to_owned)
@@ -2135,7 +2225,7 @@ impl ThreadLens {
         let model_pill = pill("lens-model-pill")
             .when(self.model_menu, |pill| pill.bg(colors.primary.alpha(0.07)).text_color(colors.primary))
             .when(warm, |pill| pill.child(div().size(px(5.0)).rounded_full().bg(Ink::FRESH)))
-            .child(SharedString::from(model_label))
+            .child(SharedString::from(model_label.clone()))
             .children(effort.as_deref().map(|effort| {
                 div()
                     .text_color(colors.tertiary)
@@ -2144,6 +2234,9 @@ impl ThreadLens {
             .child(crate::icons::sf_symbol("chevron.down", 8.0, colors.tertiary))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.model_menu = !this.model_menu;
+                if this.model_menu {
+                    this.load_agents(cx);
+                }
                 cx.notify();
             }));
         // Shift+Tab, the CLI's own mode key; the footer it redraws names
@@ -2212,7 +2305,7 @@ impl ThreadLens {
                 Animation::new(Duration::from_millis(160)).with_easing(gpui::ease_out_quint()),
                 |button, t| button.opacity(0.5 + 0.5 * t),
             );
-        let menu = self.model_menu.then(|| self.render_model_menu(claude, model_id.as_deref(), effort.as_deref(), colors, cx));
+        let menu = self.model_menu.then(|| self.render_model_menu(&kind, &model_label, effort.as_deref(), colors, cx));
         let slash_menu = self.render_slash(colors, cx);
         let border = if focused {
             colors.primary.alpha(if dark { 0.2 } else { 0.22 })
@@ -2305,105 +2398,166 @@ impl ThreadLens {
             .into_any_element()
     }
 
-    /// Models with their cache warmth, then effort, for the session's CLI.
-    /// Claude switches in place (`/model`, `/effort`); Codex switches in its
-    /// own picker, which docks here as the PTY portal.
+    /// Installed Agents and their models, read once off the UI thread: the
+    /// Engine's readiness scan says which CLIs are installed (and where),
+    /// then each lists its models (Antigravity's takes a round trip).
+    fn load_agents(&mut self, _cx: &mut Context<Self>) {
+        if self.agents.is_some() || self.agents_loading {
+            return;
+        }
+        self.agents_loading = true;
+        let client = Arc::clone(self.runtime.client());
+        let messages = self.messages.clone();
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+        self.tokio.spawn(async move {
+            let readiness = client
+                .agent_readiness(diri_proto::AgentReadinessParams::default())
+                .await
+                .ok();
+            let installed: Vec<(AgentKind, Option<std::path::PathBuf>)> = super::setup::PICKER_AGENTS
+                .iter()
+                .filter_map(|id| {
+                    let item = readiness.as_ref()?.agents.iter().find(|item| item.kind.id() == *id)?;
+                    let path = item.path.clone()?;
+                    Some((item.kind.clone(), Some(std::path::PathBuf::from(path))))
+                })
+                .collect();
+            let agents = tokio::task::spawn_blocking(move || {
+                installed
+                    .into_iter()
+                    .map(|(kind, binary)| AgentModels {
+                        label: super::setup::agent_label(&kind),
+                        models: super::setup::models_for(&kind, &home, binary.as_deref()),
+                        kind,
+                    })
+                    .filter(|agent| !agent.models.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default();
+            let _ = messages.send(LensMessage::Agents(agents));
+        });
+    }
+
+    /// Tier 3 from the picker: a model on another Agent continues this
+    /// thread there (capsule, new session on that model, Handoff divider).
+    fn handoff(&mut self, kind: AgentKind, model: String, cx: &mut Context<Self>) {
+        self.model_menu = false;
+        self.handoff_error = None;
+        let goal = (!self.composer.is_empty()).then(|| self.composer.text().trim().to_owned());
+        let params = diri_proto::thread::HandoffParams {
+            session_id: self.session_id.clone(),
+            kind,
+            model: Some(model),
+            goal,
+        };
+        let client = Arc::clone(self.runtime.client());
+        let messages = self.messages.clone();
+        self.tokio.spawn(async move {
+            let result = client
+                .handoff(&params)
+                .await
+                .map(|result| result.session_id)
+                .map_err(|error| error.to_string());
+            let _ = messages.send(LensMessage::HandedOff(result));
+        });
+        cx.notify();
+    }
+
+    /// The model picker: this session's Agent first (switches in place),
+    /// then every other installed Agent (a pick there hands the thread
+    /// off), then effort.
     fn render_model_menu(
         &mut self,
-        claude: bool,
-        current: Option<&str>,
+        kind: &AgentKind,
+        current: &str,
         effort: Option<&str>,
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let setup = self.setup();
+        let claude = kind != &AgentKind::CODEX;
         let now_ms = now_ms();
-        let section = |label: &'static str| {
+        let section = |label: SharedString, note: Option<&'static str>| {
             div()
+                .flex_none()
                 .px(px(10.0))
-                .pt(px(6.0))
+                .pt(px(8.0))
                 .pb(px(4.0))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
                 .text_size(px(10.5))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(colors.tertiary)
                 .child(label)
+                .children(note.map(|note| div().font_weight(FontWeight::NORMAL).text_color(colors.tertiary.alpha(0.7)).child(note)))
         };
-        let current_label = current.map(|id| setup.label_for(id));
-        let mut models = div().flex().flex_col().child(section(t("thread_lens.menu_model")));
-        // Models seen in this thread that the list does not name still show.
-        let mut choices = setup.models.clone();
+        // This Agent's models, plus any this thread used that the list lacks.
+        let mut own = setup.models.clone();
         for usage in self.model.usage_models() {
-            if !choices.iter().any(|c| c.label == setup.label_for(&usage)) {
-                choices.push(super::setup::ModelChoice { label: setup.label_for(&usage), id: usage, detail: String::new() });
+            if !own.iter().any(|c| c.label == setup.label_for(&usage)) {
+                own.push(super::setup::ModelChoice { label: setup.label_for(&usage), id: usage, detail: String::new() });
             }
         }
-        for choice in choices.iter().take(12) {
-            let selected = current_label.as_deref() == Some(choice.label.as_str());
-            let warmth = (choice.id != "default").then(|| {
-                let id = if claude { claude_model_id(&choice.id) } else { choice.id.clone() };
-                self.model.warmth_for(&id, now_ms)
-            });
-            let warm = matches!(warmth, Some(CacheWarmth::Warm { .. }));
+        let mut list = div()
+            .id("lens-model-list")
+            .max_h(px(380.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .child(section(
+                SharedString::from(super::setup::agent_label(kind)),
+                Some(t("thread_lens.menu_this_session")),
+            ));
+        for choice in own.iter().take(12) {
+            let selected = choice.label == current;
+            let warmth = (claude && choice.id != "default").then(|| self.model.warmth_for(&claude_model_id(&choice.id), now_ms));
             let id = choice.id.clone();
-            models = models.child(
-                div()
-                    .id(SharedString::from(format!("lens-model-{}", choice.id)))
-                    .min_h(px(32.0))
-                    .px(px(10.0))
-                    .py(px(5.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(10.0))
-                    .rounded(px(8.0))
-                    .when(selected, |row| row.bg(colors.primary.alpha(0.06)))
-                    .hover(|row| row.bg(colors.primary.alpha(0.08)))
-                    .cursor_pointer()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .flex()
-                            .flex_col()
-                            .child(div().text_size(px(13.0)).text_color(colors.primary).child(SharedString::from(choice.label.clone())))
-                            .when(!choice.detail.is_empty(), |col| {
-                                col.child(
-                                    div()
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_ellipsis()
-                                        .text_size(px(11.0))
-                                        .text_color(colors.tertiary)
-                                        .child(SharedString::from(choice.detail.clone())),
-                                )
-                            }),
-                    )
-                    .children(warmth.filter(|_| claude).map(|warmth| {
-                        div()
-                            .flex_none()
-                            .px(px(6.0))
-                            .h(px(18.0))
-                            .flex()
-                            .items_center()
-                            .rounded(px(9.0))
-                            .when(warm, |badge| badge.bg(Ink::FRESH.alpha(0.12)))
-                            .text_size(px(10.5))
-                            .text_color(if warm { Ink::FRESH } else { colors.tertiary })
-                            .child(SharedString::from(warmth_text(warmth)))
-                    }))
-                    .child(
-                        div()
-                            .w(px(14.0))
-                            .flex_none()
-                            .when(selected, |slot| slot.child(crate::icons::sf_symbol("checkmark", 11.0, colors.primary))),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
+            let label = choice.label.clone();
+            list = list.child(
+                model_row(&format!("own-{}", choice.id), choice, selected, warmth, colors).on_click(cx.listener(
+                    move |this, _, _, cx| {
                         this.model_menu = false;
                         if claude {
+                            // Shown at once; the CLI's "Set model to …" confirms it.
+                            this.picked = Some((label.clone(), std::time::Instant::now()));
                             this.send(format!("/model {id}"), true, cx);
                         } else {
+                            // Codex switches in its own picker, docked as the portal.
                             this.send("/model".into(), true, cx);
                         }
-                    })),
+                    },
+                )),
+            );
+        }
+        let others: Vec<AgentModels> = self
+            .agents
+            .iter()
+            .flatten()
+            .filter(|agent| &agent.kind != kind)
+            .cloned()
+            .collect();
+        for agent in others {
+            list = list.child(section(SharedString::from(agent.label), Some(t("thread_lens.menu_hand_off"))));
+            for choice in agent.models.iter().take(8) {
+                let target = agent.kind.clone();
+                let id = choice.id.clone();
+                list = list.child(
+                    model_row(&format!("{}-{}", agent.kind.id(), choice.id), choice, false, None, colors).on_click(
+                        cx.listener(move |this, _, _, cx| this.handoff(target.clone(), id.clone(), cx)),
+                    ),
+                );
+            }
+        }
+        if self.agents_loading {
+            list = list.child(
+                div()
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .text_size(px(11.0))
+                    .text_color(colors.tertiary)
+                    .child(t("thread_lens.menu_loading_agents")),
             );
         }
         let efforts = setup.efforts.clone();
@@ -2438,7 +2592,7 @@ impl ThreadLens {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.model_menu = false;
                         if claude {
-                            this.effort = Some(chosen.clone());
+                            this.effort = Some((chosen.clone(), std::time::Instant::now()));
                             this.send(format!("/effort {chosen}"), true, cx);
                         } else {
                             this.send("/model".into(), true, cx);
@@ -2447,7 +2601,7 @@ impl ThreadLens {
             );
         }
         div()
-            .w(px(360.0))
+            .w(px(380.0))
             .p(px(6.0))
             .rounded(px(14.0))
             .bg(menu_surface(colors))
@@ -2457,9 +2611,9 @@ impl ThreadLens {
             .flex()
             .flex_col()
             .gap(px(2.0))
-            .child(models)
+            .child(list)
             .child(div().mx(px(10.0)).my(px(6.0)).h(px(1.0)).bg(colors.primary.alpha(0.07)))
-            .child(section(t("thread_lens.menu_effort")))
+            .child(section(SharedString::from(t("thread_lens.menu_effort")), None))
             .child(segments)
             .child(div().h(px(6.0)))
             .into_any_element()
@@ -2663,7 +2817,8 @@ impl Render for ThreadLens {
             .size_full()
             .flex()
             .flex_col()
-            .bg(colors.terminal_surface())
+            // Exactly what the grid paints here, so a flip never shifts shade.
+            .when_some(lens_background(colors, &self.colors().1), |lens, fill| lens.bg(fill))
             .text_color(colors.primary)
             .font_family(crate::fonts::ui_family())
             .child(
@@ -2787,6 +2942,87 @@ fn caret_color(on: bool, colors: SemanticColors) -> Hsla {
         colors.primary.alpha(0.9).into()
     } else {
         gpui::transparent_black()
+    }
+}
+
+/// One model in the picker: its name, the provider's note, its cache
+/// warmth (Claude), and a check on the current one.
+fn model_row(
+    id: &str,
+    choice: &super::setup::ModelChoice,
+    selected: bool,
+    warmth: Option<CacheWarmth>,
+    colors: SemanticColors,
+) -> gpui::Stateful<gpui::Div> {
+    let warm = matches!(warmth, Some(CacheWarmth::Warm { .. }));
+    div()
+        .id(SharedString::from(format!("lens-model-{id}")))
+        // Rows keep their height inside the scrolling, height-capped list.
+        .flex_none()
+        .min_h(px(32.0))
+        .px(px(10.0))
+        .py(px(if choice.detail.is_empty() { 5.0 } else { 8.0 }))
+        .flex()
+        .items_center()
+        .gap(px(10.0))
+        .rounded(px(8.0))
+        .when(selected, |row| row.bg(colors.primary.alpha(0.06)))
+        .hover(|row| row.bg(colors.primary.alpha(0.08)))
+        .cursor_pointer()
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(div().text_size(px(13.0)).text_color(colors.primary).child(SharedString::from(choice.label.clone())))
+                .when(!choice.detail.is_empty(), |col| {
+                    col.child(
+                        div()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_size(px(11.0))
+                            .text_color(colors.tertiary)
+                            .child(SharedString::from(choice.detail.clone())),
+                    )
+                }),
+        )
+        .children(warmth.map(|warmth| {
+            div()
+                .flex_none()
+                .px(px(6.0))
+                .h(px(18.0))
+                .flex()
+                .items_center()
+                .rounded(px(9.0))
+                .when(warm, |badge| badge.bg(Ink::FRESH.alpha(0.12)))
+                .text_size(px(10.5))
+                .text_color(if warm { Ink::FRESH } else { colors.tertiary })
+                .child(SharedString::from(warmth_text(warmth)))
+        }))
+        .child(
+            div()
+                .w(px(14.0))
+                .flex_none()
+                .when(selected, |slot| slot.child(crate::icons::sf_symbol("checkmark", 11.0, colors.primary))),
+        )
+}
+
+/// The fill the terminal grid paints over the pane's surface: the theme's
+/// background on an opaque window, nothing under glass (the pane's own
+/// tint shows through). The lens paints exactly this, so Conversation and
+/// Terminal share one background to the byte.
+pub fn lens_background(colors: SemanticColors, theme: &diri_term::theme::TermTheme) -> Option<Rgba> {
+    (grid_fill_opacity(colors.material()) > 0.0).then_some(theme.background)
+}
+
+/// The grid's own fill opacity, which the terminal pane passes to it.
+pub fn grid_fill_opacity(material: diri_ui::Material) -> f32 {
+    match material {
+        diri_ui::Material::Opaque => 1.0,
+        diri_ui::Material::Glass => 0.0,
     }
 }
 
@@ -3207,7 +3443,11 @@ fn divider(segment: &diri_proto::thread::ThreadSegment, colors: SemanticColors) 
             Some(account) => tf("thread_lens.segment_account", &[("account", account)]),
             None => t("thread_lens.segment_account_unknown").to_owned(),
         },
-        SegmentCause::Handoff => tf("thread_lens.segment_handoff", &[("agent", &segment.kind.id())]),
+        // A handoff segment names the session the thread came from.
+        SegmentCause::Handoff => tf(
+            "thread_lens.segment_continued",
+            &[("agent", &super::setup::agent_label(&segment.kind))],
+        ),
     };
     let tint = match segment.cause {
         SegmentCause::Account => Ink::ATTENTION,
@@ -3436,5 +3676,81 @@ mod tests {
             assert!(!lens.top_anchored, "overflowing threads use the bottom-aligned list");
             assert!(lens.list.is_following_tail());
         });
+    }
+
+    fn claude_setup() -> AgentSetup {
+        AgentSetup {
+            model: Some("opus".into()),
+            effort: Some("high".into()),
+            ..super::super::setup::read(&AgentKind::CLAUDE_CODE, std::path::Path::new("/nonexistent"), std::path::Path::new("/nonexistent"))
+        }
+    }
+
+    fn output_page(offset: u64, text: &str) -> diri_proto::thread::ThreadReadResult {
+        use diri_proto::thread::{ThreadBody, ThreadCursor, ThreadItem, THREAD_WIRE_VERSION};
+        diri_proto::thread::ThreadReadResult {
+            version: THREAD_WIRE_VERSION,
+            structured: true,
+            next: ThreadCursor { generation: "g".into(), offset: offset + 1 },
+            items: vec![ThreadItem {
+                key: ItemKey { offset, part: 0 },
+                at_ms: None,
+                body: ThreadBody::CommandOutput { text: text.into(), is_error: false },
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// The user's report: Haiku 5.5 was picked and Claude switched, but the
+    /// pill and the check stayed on the startup default, Opus 5.5.
+    #[gpui::test]
+    fn a_picked_model_shows_at_once_and_the_cli_confirmation_keeps_it(cx: &mut gpui::TestAppContext) {
+        let (lens, cx) = lens_window(cx);
+        let setup = claude_setup();
+        lens.update(cx, |lens, _| {
+            assert_eq!(lens.model_label(&setup), "Opus 5.5", "the settings' default before anything happens");
+            lens.pick_for_test("Haiku 5.5");
+            assert_eq!(lens.model_label(&setup), "Haiku 5.5", "shown the moment it is picked");
+        });
+        lens.update(cx, |lens, cx| {
+            lens.ingest_for_test(output_page(0, "Set model to `Haiku 5.5` and saved as your default for new sessions"), cx);
+            lens.ingest_for_test(output_page(1, "Set effort level to medium (saved as your default for new sessions)"), cx);
+        });
+        lens.update(cx, |lens, _| {
+            assert_eq!(lens.model_label(&setup), "Haiku 5.5", "confirmed, and the default never wins back");
+            assert!(lens.picked.is_none(), "the pick is reconciled");
+            assert_eq!(lens.effort_level(&setup).as_deref(), Some("medium"));
+        });
+    }
+
+    /// Screenshot 2: Claude was done in 1 s, the lens still said Thinking.
+    /// The line goes the moment the reply row lands, even while the session
+    /// status still says working.
+    #[gpui::test]
+    fn the_working_line_clears_when_the_reply_lands_even_if_status_lags(cx: &mut gpui::TestAppContext) {
+        let (lens, cx) = lens_window(cx);
+        lens.update(cx, |lens, cx| lens.send_for_test("im testing hello there", cx));
+        lens.read_with(cx, |lens, _| assert_eq!(lens.rows_for_test(), 2, "pending + Thinking"));
+        lens.update(cx, |lens, cx| lens.ingest_for_test(user_page(0, "im testing hello there"), cx));
+        cx.run_until_parked();
+        lens.read_with(cx, |lens, _| {
+            assert!(!lens.model.awaiting_reply());
+            assert_eq!(lens.rows_for_test(), lens.model.rows.len(), "no working line after the reply");
+        });
+    }
+
+    /// Conversation and Terminal share one background to the byte: on an
+    /// opaque window both paint the theme's background, under glass neither
+    /// paints over the pane's tint.
+    #[test]
+    fn the_lens_paints_exactly_the_terminal_grid_fill() {
+        for theme in diri_term::themes::all() {
+            let opaque = diri_ui::SemanticColors::dark();
+            let grid = theme.background.alpha(grid_fill_opacity(opaque.material()));
+            assert_eq!(lens_background(opaque, &theme), Some(grid), "{}", theme.name);
+            let glass = opaque.with_material(diri_ui::Material::Glass);
+            assert_eq!(grid_fill_opacity(glass.material()), 0.0);
+            assert_eq!(lens_background(glass, &theme), None);
+        }
     }
 }

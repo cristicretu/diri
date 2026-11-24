@@ -56,6 +56,7 @@ Call one as `diri.call("session.list")` or through its generated function, `diri
 | `diri.session.thread_read` | `sessionID, from?, maxBytes?, watch?` | `ThreadReadResult` | Structured thread items after a cursor in the Agent's transcript. |
 | `diri.session.answer_blocker` | `sessionID, occurredAt, choice` | `{}` | Approve or deny the permission prompt that is still showing. |
 | `diri.session.handoff_capsule` | `sessionID, goal?` | `HandoffCapsuleResult` | The deterministic capsule another Agent would continue this thread from. |
+| `diri.session.handoff` | `sessionID, kind, model?, goal?` | `HandoffResult` | Continue this thread in another Agent: capsule, spawn on the chosen model, Handoff segment. |
 | `diri.session.resize` | `sessionID, cols, rows` | `{}` | Resize a session's terminal. |
 | `diri.session.scroll` | `sessionID, up, lines, col, row` | `{}` | Turn the mouse wheel over a session's terminal. |
 | `diri.session.read_screen` | `sessionID` | `ReadScreenResult` | The visible screen as text. |

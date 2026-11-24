@@ -1,0 +1,40 @@
+
+ ▐▛███▛█   Claude Code v2.1.331
+▝▜██████▀  Haiku 5.5 · Claude Ultra
+ ▝▝   ▝▝   ~/work/diri
+
+⚠ Allow rule "Write(*)" lets Write run without asking only in the working directories. "Write" alone allows every path.
+  Older versions of Claude Code treat "Write(*)" as "Write", and this version will too if Anthropic turns this change
+  off.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · PR #1 · ← 1 agent

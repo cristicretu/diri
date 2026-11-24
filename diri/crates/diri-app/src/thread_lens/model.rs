@@ -305,6 +305,13 @@ fn announced_model(output: &str) -> Option<String> {
     (!name.is_empty()).then(|| model_display(&name))
 }
 
+/// `Set effort level to medium (saved as your default…)` → `medium`.
+fn announced_effort(output: &str) -> Option<String> {
+    let rest = output.trim().strip_prefix("Set effort level to ")?;
+    let level: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+    (!level.is_empty()).then_some(level)
+}
+
 /// Whitespace-insensitive text identity, for matching a sent message to the
 /// transcript record it becomes.
 fn same_text(a: &str, b: &str) -> bool {
@@ -422,6 +429,11 @@ struct Builder {
     mode: Option<String>,
     /// When the latest user message was recorded.
     last_user_at: Option<i64>,
+    /// The model the CLI last confirmed (`/model` output or a request), as
+    /// people say it.
+    selected: Option<String>,
+    /// The effort the CLI last confirmed (`/effort` output).
+    effort: Option<String>,
     /// The model a `/model` divider already announced, so the next request's
     /// usage record does not draw a second divider for the same switch.
     announced: Option<String>,
@@ -459,6 +471,16 @@ impl ThreadModel {
     /// The thread ends on the user's message: the Agent owes a reply.
     pub fn awaiting_reply(&self) -> bool {
         !self.pending.is_empty() || matches!(self.rows.last(), Some(Row::User { .. }))
+    }
+
+    /// The model the CLI last confirmed, as people say it (`Haiku 5.5`).
+    pub fn selected_model(&self) -> Option<&str> {
+        self.builder.selected.as_deref()
+    }
+
+    /// The effort the CLI last confirmed.
+    pub fn effort(&self) -> Option<&str> {
+        self.builder.effort.as_deref()
     }
 
     /// The permission mode the transcript last recorded.
@@ -631,7 +653,11 @@ impl ThreadModel {
                 at
             }
             ThreadBody::CommandOutput { text, is_error } => {
+                if let Some(effort) = announced_effort(text) {
+                    self.builder.effort = Some(effort);
+                }
                 if let Some(model) = announced_model(text) {
+                    self.builder.selected = Some(model.clone());
                     self.builder.model_command = false;
                     let segment = self.model_segment(item.key.offset, item.at_ms.unwrap_or_default(), model.clone());
                     self.builder.announced = Some(model);
@@ -738,6 +764,7 @@ impl ThreadModel {
                 let mut usage = usage.clone();
                 match &usage.model {
                     Some(model) => {
+                        self.builder.selected = Some(model_display(model));
                         if let Some(previous) = self.builder.model.as_deref()
                             && !same_model(previous, model)
                             && self.builder.announced.as_deref() != Some(model_display(model).as_str())
@@ -1092,5 +1119,24 @@ mod tests {
             input: 1_000, cache_read: 99_000, context_window: Some(272_000), ..TurnUsage::default()
         }))], 41));
         assert_eq!(model.context(), Some((100_000, 272_000)));
+    }
+
+    /// The user's live run: `/effort medium`, then `/model haiku`, with no
+    /// request yet. The pill must say Haiku 5.5 · medium, not the startup
+    /// default.
+    #[test]
+    fn the_cli_confirmation_names_the_model_and_effort_before_any_request() {
+        let mut model = ThreadModel::default();
+        model.ingest(page(vec![
+            item(0, ThreadBody::Command { name: "/effort".into(), args: "medium".into() }),
+            item(1, ThreadBody::CommandOutput { text: "Set effort level to medium (saved as your default for new sessions): Balanced approach".into(), is_error: false }),
+            item(2, ThreadBody::Command { name: "/model".into(), args: "haiku".into() }),
+            item(3, ThreadBody::CommandOutput { text: "Set model to `Haiku 5.5` and saved as your default for new sessions".into(), is_error: false }),
+        ], 4));
+        assert_eq!(model.selected_model(), Some("Haiku 5.5"));
+        assert_eq!(model.effort(), Some("medium"));
+        assert_eq!(model.current_model(), None, "no request has gone to it yet");
+        model.ingest(page(vec![item(10, usage("claude-haiku-5-5", 1_000))], 11));
+        assert_eq!(model.selected_model(), Some("Haiku 5.5"));
     }
 }

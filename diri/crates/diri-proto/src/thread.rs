@@ -494,6 +494,31 @@ pub fn segment_chain(stored: &[ThreadSegment], items: &[ThreadItem]) -> Vec<Thre
     chain
 }
 
+/// `session.handoff`: continue this thread in another Agent (Tier 3).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct HandoffParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    pub kind: AgentKind,
+    /// The model the target Agent starts on; absent keeps its default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct HandoffResult {
+    /// The new session, whose thread opens on a `Handoff` divider.
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    pub touched_files: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

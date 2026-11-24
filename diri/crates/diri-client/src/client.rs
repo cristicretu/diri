@@ -983,6 +983,14 @@ impl DaemonClient {
         self.empty(Method::SESSION_ANSWER_BLOCKER, params).await
     }
 
+    /// `session.handoff`: continue the thread in another Agent.
+    pub async fn handoff(
+        &self,
+        params: &diri_proto::thread::HandoffParams,
+    ) -> Result<diri_proto::thread::HandoffResult, ClientError> {
+        self.typed(Method::SESSION_HANDOFF, params).await
+    }
+
     pub async fn handoff_capsule(
         &self,
         params: &diri_proto::thread::HandoffCapsuleParams,

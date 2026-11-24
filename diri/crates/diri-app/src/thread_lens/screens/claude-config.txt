@@ -1,0 +1,40 @@
+  Older versions of Claude Code treat "Write(*)" as "Write", and this version will too if Anthropic turns this change
+  off.
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+  Settings  Status   Config   Usage   Stats
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ⌕ Search settings…                                                                                               │
+  ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+  ❯ Auto-compact                                    on
+    Idle compaction                                 on
+    Continue automatically at usage limit           on
+    Switch models when a message is flagged         Switch automatically ›
+    Show tips                                       on
+    Claude-drafted feedback                         notify
+    Reduce motion                                   off
+    Thinking mode                                   on
+    Thinking can't be turned off for Haiku 5.5
+    Fast mode (Opus 5.5)                            off
+    Prompt suggestions                              on
+    Session recap                                   on
+    Rewind code (checkpoints)                       on
+    Dynamic workflows                               on
+    Ultracode keyword trigger                       on
+    Dynamic workflow size                           medium (default)
+    Artifacts                                       on
+    Verbose output                                  off
+    Terminal progress bar                           on
+    Show turn duration                              on
+    Precompute compaction                           on
+    Time format                                     auto ›
+    Default permission mode                         Auto
+    Worktree base ref                               fresh
+    Use auto mode during plan                       on
+    Respect .gitignore in file picker               on
+    Skip the /copy picker                           off
+    Copy on select                                  on
+    Auto-scroll                                     on
+    ↓ 22 more
+
+  ↓ to navigate · ↑ to switch tabs · Esc to go back

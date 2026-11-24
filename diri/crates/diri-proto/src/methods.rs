@@ -89,6 +89,7 @@ impl Method {
     /// ([`crate::thread::HandoffCapsuleParams`] →
     /// [`crate::thread::HandoffCapsuleResult`]). Read-only.
     pub const SESSION_HANDOFF_CAPSULE: &'static str = "session.handoff_capsule";
+    pub const SESSION_HANDOFF: &'static str = "session.handoff";
     pub const SESSION_MARK_SEEN: &'static str = "session.mark_seen";
     /// Returns a completed turn to "done · unseen", like marking a chat
     /// unread. A no-op for a session with no completed turn.
@@ -235,6 +236,7 @@ impl Method {
         Self::SESSION_THREAD_READ,
         Self::SESSION_ANSWER_BLOCKER,
         Self::SESSION_HANDOFF_CAPSULE,
+        Self::SESSION_HANDOFF,
         Self::SESSION_RESIZE,
         Self::SESSION_SCROLL,
         Self::SESSION_READ_SCREEN,

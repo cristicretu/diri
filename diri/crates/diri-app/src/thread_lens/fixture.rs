@@ -245,7 +245,11 @@ mod screenshots {
             .unwrap_or(900.0);
         let window = cx
             .open_window(size(px(1000.0), px(height)), move |_, cx| {
-                cx.new(|cx| {
+                let surface = {
+                    let store = runtime.store.read().expect("store");
+                    crate::app_theme::colors_in(&store).terminal_surface()
+                };
+                let lens = cx.new(|cx| {
                     let mut lens = ThreadLens::new(SessionId(SESSION.into()), runtime, handle, cx);
                     lens.set_setup_for_test(crate::thread_lens::setup::AgentSetup {
                         model: Some("opus".into()),
@@ -280,7 +284,26 @@ mod screenshots {
                         lens.send_for_test("hi this is me just testing", cx);
                     }
                     if menu {
-                        lens.open_model_menu_for_test();
+                        use crate::thread_lens::setup::{AgentModels, ModelChoice};
+                        let choice = |id: &str, label: &str, detail: &str| ModelChoice { id: id.into(), label: label.into(), detail: detail.into() };
+                        lens.open_model_menu_for_test(vec![
+                            AgentModels {
+                                kind: AgentKind::CODEX,
+                                label: "Codex",
+                                models: vec![
+                                    choice("gpt-6.2-sol", "GPT-6.2-Sol", "Fast, go-to model for coding and everyday work."),
+                                    choice("gpt-6.2-astra", "GPT-6.2-Astra", "Deep reasoning for long, hard tasks."),
+                                ],
+                            },
+                            AgentModels {
+                                kind: AgentKind::new("antigravity"),
+                                label: "Antigravity",
+                                models: vec![
+                                    choice("gemini-4-neon-high", "Gemini 4 Neon (High)", ""),
+                                    choice("gemini-3.8-flash-medium", "Gemini 3.8 Flash (Medium)", ""),
+                                ],
+                            },
+                        ]);
                     }
                     match &slash {
                         Some(query) => lens.type_for_test(query, cx),
@@ -288,12 +311,14 @@ mod screenshots {
                         None => {}
                     }
                     lens
-                })
+                });
+                // The pane paints this surface under the lens, as under the grid.
+                cx.new(|_| Host { lens, surface })
             })
             .expect("open lens window");
         window
-            .update(&mut cx, |lens, window, cx| {
-                let handle = gpui::Focusable::focus_handle(lens, cx);
+            .update(&mut cx, |host, window, cx| {
+                let handle = gpui::Focusable::focus_handle(host.lens.read(cx), cx);
                 window.focus(&handle, cx);
             })
             .expect("focus the composer");
@@ -313,6 +338,19 @@ mod screenshots {
         }
         screenshot.save(output).expect("save lens screenshot");
         drop(tokio);
+    }
+
+    /// The lens on the surface the terminal pane paints beneath it.
+    struct Host {
+        lens: gpui::Entity<ThreadLens>,
+        surface: gpui::Rgba,
+    }
+
+    impl gpui::Render for Host {
+        fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
+            use gpui::{ParentElement as _, Styled as _};
+            gpui::div().size_full().bg(self.surface).child(self.lens.clone())
+        }
     }
 
     fn percentile(samples: &mut [f64], p: f64) -> f64 {

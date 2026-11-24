@@ -1,0 +1,40 @@
+  Older versions of Claude Code treat "Write(*)" as "Write", and this version will too if Anthropic turns this change
+  off.
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+  Settings  Status   Config   Usage   Stats
+
+  Current week (all models)
+  █████████████████████████████████████▌             75% used
+  Resets Nov 25 at 10am (UTC)
+
+  Current week (Fable)
+                                                     0% used
+  Resets Nov 25 at 10am (UTC)
+
+  What's contributing to your usage?
+  Approximate · sessions on this computer only
+
+  Last 24h · shares overlap
+
+  87%  Start fresh when you switch tasks · run /clear
+  71%  Check which models your subagents use · share covers whole sessions, not
+       only subagents
+  38%  Run fewer sessions at once · up to 9 at once
+  32%  Review sessions active over many hours · whole sessions with requests in 8
+       or more separate hours
+  22%  Trim ~/work/AGENTS.md · 15k tokens per request
+
+  Skills                  % of usage
+  /review-pr                      2%
+  /triage              1%
+
+  Subagents               % of usage
+  fork                            8%
+  general-purpose                 7%
+  Explore                         1%
+
+  MCP servers             % of usage
+  dirijor                         4%
+  playwright                      1%
+  posthog                         1%
+                                                                                                                       ↓

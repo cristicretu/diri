@@ -370,6 +370,12 @@ function diri.session.answer_blocker(params, opts) end
 ---@return table # HandoffCapsuleResult
 function diri.session.handoff_capsule(params, opts) end
 
+---Continue this thread in another Agent: capsule, spawn on the chosen model, Handoff segment.
+---@param params {sessionID: string, kind: any, model?: string, goal?: string}
+---@param opts? {timeout?: number}
+---@return table # HandoffResult
+function diri.session.handoff(params, opts) end
+
 ---Resize a session's terminal.
 ---@param params {sessionID: string, cols: integer, rows: integer}
 ---@param opts? {timeout?: number}

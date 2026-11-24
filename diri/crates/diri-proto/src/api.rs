@@ -439,6 +439,12 @@ mod catalog {
                 "The deterministic capsule another Agent would continue this thread from."
             ),
             entry!(
+                Method::SESSION_HANDOFF,
+                crate::thread::HandoffParams,
+                "HandoffResult",
+                "Continue this thread in another Agent: capsule, spawn on the chosen model, Handoff segment."
+            ),
+            entry!(
                 Method::SESSION_MARK_SEEN,
                 SessionIdParams,
                 "{}",

@@ -82,6 +82,18 @@ impl SegmentStore {
         Ok(chain)
     }
 
+    /// Replaces `record`'s chain outright (a handoff opens a new session's
+    /// thread on its `Handoff` divider).
+    pub fn write_chain(&self, record: &SessionRecord, chain: Vec<ThreadSegment>) -> io::Result<()> {
+        let Some(path) = self.path(&record.id.0) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid session id",
+            ));
+        };
+        write_private(&self.dir, &path, &serde_json::to_vec(&chain)?)
+    }
+
     pub fn remove(&self, session_id: &str) {
         if let Some(path) = self.path(session_id) {
             let _ = fs::remove_file(path);

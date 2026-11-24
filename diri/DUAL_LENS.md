@@ -59,7 +59,9 @@ Engine ◄── kernel watch ◄── Agent's own JSONL ◄────┼─�
   - the mode pill (Claude) shows the mode Claude's footer shows (`auto mode on`, `plan mode on`, …) and sends Shift+Tab, the CLI's own key, to cycle it;
   - a context ring with the share of the window the last request filled (Codex reports its window; Claude's is 200k or 1M);
   - the primary action: **Send** (↑) when idle, **Stop** (■, Esc into the PTY) while the Agent works or owes a reply with nothing typed, **Steer** while it works and you type. Drafts live in the session's lens entity, so they survive tab switches and lens flips.
-- **Never dead after Enter.** The message shows at once; until the reply starts, a working line counts the seconds (`Thinking · 4s`) and turns into the tool in flight (`Running cargo test`), and the action is Stop, even before the hooks report the status.
+- **Background.** The lens paints exactly what the terminal grid paints over the pane's surface (`lens_background`, sharing `grid_fill_opacity` with the grid): the theme's background on an opaque window, nothing under glass. Flipping lenses never shifts the shade.
+- **Model and effort follow the CLI.** A pick shows at once; Claude's own `Set model to …` / `Set effort level to …` lines then confirm it, and the startup default never overrides either.
+- **Never dead after Enter, never stuck after the reply.** The message shows at once; while a reply is owed, a working line counts the seconds (`Thinking · 4s`) and turns into the tool in flight, and the action is Stop. The line is tied to the thread, not the status: it goes the moment the reply row lands. Every wake-up (file watch, hook, status change) reads at once and again at +60 and +200 ms, for a JSONL flushed just after the Stop hook.
 - **Anchoring.** A short thread starts under the header (top-aligned list); once it overflows, the lens switches to a bottom-aligned list that follows the tail, which on a 3,200-row thread lays out about 0.5 ms cheaper per frame than tail-following a top-aligned one.
 - **Docked slot.** A permission card and the PTY portal share one slot directly above the composer, so an interactive control never scrolls away with the thread.
 - **Tail.** The list follows the tail while streaming, stops the moment the user scrolls up, and offers a jump-to-latest control.
@@ -83,7 +85,7 @@ A Diri thread is an ordered chain of `ThreadSegment`s. Each segment records the 
 | --- | --- | --- | --- |
 | 1 · model | The composer's model pill sends `/model opus\|sonnet\|haiku` into the PTY. | Derived: consecutive usage records change model (`segment_chain`). | Per model. The pill shows `warm 4m12s` or `cold write` per model, from observed `cache_read`/`cache_creation` and the 5 m/1 h TTL tier of the latest request to that model. |
 | 2 · account | The account pill opens Diri's existing account-continuation sheet (`session.continue_with_account`). | Stored: the handoff records an `Account` segment at the copied transcript's byte length. The copy is byte-identical, so every item key survives and the lens draws one divider. | Unchanged bytes, but a different account's cache. |
-| 3 · agent | `session.handoff_capsule` renders a deterministic Handoff Capsule. | Stored `Handoff` segment (type and divider in place). | The parked Agent's conversation is untouched while parked. Returning appends to it, so its last request stays a prefix of the next one. |
+| 3 · agent | The model picker lists every installed Agent (Claude Code, Codex, Antigravity, from the Engine's readiness scan); a model on another Agent calls `session.handoff`: the Engine builds the Handoff Capsule, spawns that Agent in the same directory on that model (`--model` / `-m`) with the capsule as its first prompt, and writes a `Handoff` segment on the new session. The lens opens the new session on its Conversation view, under a *Continued from …* divider. | Stored `Handoff` segment pointing at the source session. | The source session is left running (parked): its conversation is untouched, so returning to it reuses its prefix. |
 
 The Handoff Capsule is a pure function of the thread, goal and git state. It contains:
 
@@ -93,7 +95,7 @@ The Handoff Capsule is a pure function of the thread, goal and git state. It con
 - the last 6 turns;
 - the bounded `git diff`.
 
-It carries no timestamps and no session or provider identities, so the same state always yields the same bytes. Finishing Tier 3 in the UI means spawning the target Agent with the capsule as its prompt and recording a `Handoff` segment that links both sessions. Both are additive: the wire types, divider and capsule exist already.
+It carries no timestamps and no session or provider identities, so the same state always yields the same bytes. The new session's thread starts at its own transcript; the source thread stays one click away in its own tab.
 
 Observation adds zero bytes to any prompt. Lens state, cursors and segment metadata never reach injection (`PromptCache.observation_independent`).
 

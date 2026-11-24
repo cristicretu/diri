@@ -3,9 +3,17 @@
 //! approval pickers, a trust dialog, a `fzf` list. None of them reach the
 //! transcript, so the GUI Lens would go blank while the CLI waits on a key.
 //!
-//! [`picker_rows`] reads the live screen's text and returns the rows the
-//! picker occupies, so the pane can show exactly that slice of the real grid
-//! above the composer and forward keys to it until it closes.
+//! [`interactive`] reads the live screen's text and returns the rows the
+//! screen occupies, so the pane can show exactly that slice of the real grid
+//! above the composer and forward keys to it until it closes. It recognises
+//! three shapes, each checked against real Claude Code 2.1 frames
+//! (`screens/`):
+//!
+//! - a panel under a `▔` rule (`/status`, `/config`, `/usage`, `/help`,
+//!   `/model`'s settings search) while Claude's own input box is gone;
+//! - any screen with a picker footer (`Esc to cancel`, `Enter to confirm`,
+//!   `←/→ to switch`, …) or a highlighted numbered list;
+//! - the alternate screen (`fzf`, an editor, a full-screen TUI).
 
 use std::ops::Range;
 
@@ -31,11 +39,63 @@ const HINTS: &[&str] = &[
     "arrow keys to",
     "to navigate",
     "space to toggle",
+    "←/→ to switch",
+    "to switch tabs",
+    "to search",
 ];
+
+/// An interactive screen on the live grid: its rows, and whether the top
+/// (a panel's tab bar) or the bottom (a picker's hint and highlighted
+/// choice) is what to keep when it is taller than the portal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Screen {
+    pub rows: Range<usize>,
+    pub anchor_top: bool,
+}
+
+/// The interactive screen the Agent shows, if any.
+pub fn interactive(rows: &[String], alt_screen: bool) -> Option<Screen> {
+    let end = rows.iter().rposition(|row| !is_blank(row)).map(|r| r + 1)?;
+    if alt_screen {
+        return Some(Screen { rows: 0..end, anchor_top: true });
+    }
+    // A Settings or Help panel replaces Claude's input box; the box coming
+    // back is what closing it looks like.
+    let panel = rows.iter().rposition(|row| is_panel_rule(row));
+    if let Some(top) = panel
+        && !prompt_box_after(rows, top)
+    {
+        let start = (top + 1..end).find(|&r| !is_blank(&rows[r])).unwrap_or(top + 1);
+        return Some(Screen { rows: start..end, anchor_top: true });
+    }
+    if let Some(range) = picker_rows(rows) {
+        return Some(Screen { rows: range, anchor_top: false });
+    }
+    // A screen that scrolls (`↓ 22 more`, a lone `↓`) with no input box.
+    let scrolls = rows[..end].last().is_some_and(|row| {
+        let row = row.trim();
+        row == "↓" || row == "↑" || (row.starts_with("↓ ") && row.ends_with("more"))
+    });
+    (scrolls && !prompt_box_after(rows, 0)).then_some(Screen { rows: 0..end, anchor_top: true })
+}
+
+/// Claude's input box: a `❯` row with a `─` rule directly above it.
+fn prompt_box_after(rows: &[String], from: usize) -> bool {
+    (from.max(1)..rows.len()).any(|r| {
+        let row = rows[r].trim_start();
+        (row.starts_with('❯') || row.starts_with('›')) && is_rule(&rows[r - 1])
+    })
+}
+
+/// The heavy top border Claude draws over its Settings and Help panels.
+fn is_panel_rule(row: &str) -> bool {
+    let trimmed = row.trim();
+    trimmed.chars().count() >= 12 && trimmed.chars().all(|c| c == '▔')
+}
 
 /// The visible rows of an open picker, top to bottom, or `None` when the
 /// screen is an ordinary prompt or output.
-pub fn picker_rows(rows: &[String]) -> Option<Range<usize>> {
+fn picker_rows(rows: &[String]) -> Option<Range<usize>> {
     let lowered: Vec<String> = rows.iter().map(|row| row.to_lowercase()).collect();
     let hint = lowered
         .iter()
@@ -186,5 +246,46 @@ mod tests {
         let range = picker_rows(&lines).unwrap();
         assert_eq!(range.end, lines.len());
         assert_eq!(range.len(), MAX_ROWS);
+    }
+
+    fn real(name: &str) -> Vec<String> {
+        let text = match name {
+            "idle" => include_str!("screens/claude-idle.txt"),
+            "usage" => include_str!("screens/claude-usage.txt"),
+            "usage-closed" => include_str!("screens/claude-usage-closed.txt"),
+            "status" => include_str!("screens/claude-status.txt"),
+            "config" => include_str!("screens/claude-config.txt"),
+            "help" => include_str!("screens/claude-help.txt"),
+            "model-settings" => include_str!("screens/claude-model-settings.txt"),
+            "context" => include_str!("screens/claude-context.txt"),
+            _ => unreachable!(),
+        };
+        text.lines().map(str::to_owned).collect()
+    }
+
+    /// The user was trapped in the GUI by `/usage`: a panel taller than the
+    /// screen, no footer hint, only a `↓`. Every Settings/Help panel from a
+    /// real Claude Code 2.1 run now opens the portal from its tab bar down.
+    #[test]
+    fn real_settings_panels_open_the_portal_from_their_tab_bar() {
+        for (name, rows) in [("usage", 3..40), ("status", 3..22), ("config", 3..40), ("model-settings", 3..12), ("help", 23..40)] {
+            let screen = interactive(&real(name), false).unwrap_or_else(|| panic!("{name} must open the portal"));
+            assert_eq!(screen, Screen { rows, anchor_top: true }, "{name}");
+        }
+    }
+
+    /// Esc brings the input box back: the portal closes. `/context` prints
+    /// inline and never takes the keyboard.
+    #[test]
+    fn the_idle_prompt_and_inline_output_are_not_interactive() {
+        for name in ["idle", "usage-closed", "context"] {
+            assert_eq!(interactive(&real(name), false), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_alternate_screen_is_always_interactive() {
+        let rows = screen(&["> fzf query", "  a.rs", "  b.rs", ""]);
+        assert_eq!(interactive(&rows, true), Some(Screen { rows: 0..3, anchor_top: true }));
     }
 }
