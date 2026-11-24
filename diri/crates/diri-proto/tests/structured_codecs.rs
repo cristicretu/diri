@@ -271,3 +271,120 @@ fn codex_model_catalog_keeps_efforts_and_default() {
     let luna = models.iter().find(|m| m.model == "gpt-6-luna").unwrap();
     assert!(!luna.supported_efforts.contains(&"ultra".to_owned()));
 }
+
+const CLAUDE_PERMISSION: &str = include_str!("fixtures/structured/claude-permission.jsonl");
+const CODEX_APPROVAL: &str = include_str!("fixtures/structured/codex-approval.jsonl");
+
+#[test]
+fn claude_can_use_tool_becomes_a_permission_request() {
+    let events = claude_events(CLAUDE_PERMISSION);
+    let [
+        StructuredEvent::PermissionRequested {
+            request_id,
+            tool,
+            input,
+            ..
+        },
+    ] = events.as_slice()
+    else {
+        panic!("one permission request, got {events:?}");
+    };
+    assert!(!request_id.is_empty());
+    assert_eq!(tool, "Bash");
+    assert_eq!(input["command"], "rm perm-probe-file.txt");
+
+    let allow: Value = serde_json::from_str(&diri_proto::structured::claude_permission_allow_line(
+        request_id, input,
+    ))
+    .unwrap();
+    assert_eq!(allow["type"], "control_response");
+    assert_eq!(allow["response"]["request_id"], json!(request_id));
+    assert_eq!(allow["response"]["response"]["behavior"], "allow");
+    assert_eq!(allow["response"]["response"]["updatedInput"], *input);
+
+    let deny: Value = serde_json::from_str(&diri_proto::structured::claude_permission_deny_line(
+        request_id, "no",
+    ))
+    .unwrap();
+    assert_eq!(deny["response"]["response"]["behavior"], "deny");
+}
+
+#[test]
+fn codex_command_approval_becomes_a_permission_request_and_answers_by_id() {
+    let line = CODEX_APPROVAL.lines().next().unwrap();
+    let value: Value = serde_json::from_str(line).unwrap();
+    let event = diri_proto::structured::codex_permission_request(
+        &value["id"],
+        value["method"].as_str().unwrap(),
+        &value["params"],
+    )
+    .expect("command approvals are rendered");
+    let StructuredEvent::PermissionRequested {
+        request_id,
+        tool,
+        input,
+        reason,
+    } = event
+    else {
+        panic!("expected a permission request");
+    };
+    assert_eq!(tool, "Bash");
+    assert!(
+        input["command"]
+            .as_str()
+            .unwrap()
+            .contains("codex-approve-target.txt")
+    );
+    assert!(reason.unwrap().contains("Allow deletion"));
+
+    let reply: Value = serde_json::from_str(&diri_proto::structured::codex_approval_line(
+        &value["id"],
+        "accept",
+    ))
+    .unwrap();
+    assert_eq!(reply["id"], value["id"]);
+    assert_eq!(reply["result"]["decision"], "accept");
+    assert!(!request_id.is_empty());
+}
+
+#[test]
+fn unknown_codex_server_requests_are_not_rendered() {
+    assert!(
+        diri_proto::structured::codex_permission_request(
+            &json!(1),
+            "mcpServer/elicitation/request",
+            &json!({})
+        )
+        .is_none()
+    );
+}
+
+const AGY_PROMPT: &str = include_str!("fixtures/structured/agy-prompt.jsonl");
+
+#[test]
+fn agy_prompt_streams_text_and_reports_usage_on_its_reply() {
+    use diri_proto::structured::{AcpInbound, acp_usage, parse_acp_line, parse_acp_models};
+    let mut text = String::new();
+    let mut usage = None;
+    let mut models = Vec::new();
+    for line in AGY_PROMPT.lines() {
+        match parse_acp_line(line).expect("recorded line is valid JSON") {
+            AcpInbound::Events(events) => {
+                for event in events {
+                    if let StructuredEvent::TextDelta { text: chunk, .. } = event {
+                        text.push_str(&chunk);
+                    }
+                }
+            }
+            AcpInbound::Response { id: 2, result } => models = parse_acp_models(&result),
+            AcpInbound::Response { id: 3, result } => usage = Some(acp_usage(&result)),
+            _ => {}
+        }
+    }
+    assert_eq!(text, "pong");
+    assert_eq!(models.len(), 3, "the fixture keeps the first three models");
+    assert_eq!(models[0].id, "gemini-4-neon-high");
+    let usage = usage.expect("prompt reply carries usage");
+    assert_eq!(usage.output_tokens, 20);
+    assert_eq!(usage.input_tokens, 9890);
+}

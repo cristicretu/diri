@@ -9,7 +9,7 @@
 //! driver yet and fails closed with `StructuredError::Unsupported`.
 use std::collections::{HashSet, VecDeque};
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
@@ -17,9 +17,11 @@ use std::thread;
 use std::time::Duration;
 
 use diri_proto::structured::{
-    CodexInbound, StructuredEvent, claude_user_message_line, codex_notification_line,
-    codex_request_line, codex_thread_id, codex_turn_start_params, parse_claude_line,
-    parse_codex_line,
+    AcpInbound, AgentModel, CodexInbound, CodexModel, StructuredEvent, acp_prompt_params,
+    acp_usage, claude_initialize_line, claude_permission_allow_line, claude_permission_deny_line,
+    claude_user_message_line, codex_approval_line, codex_notification_line,
+    codex_permission_request, codex_request_line, codex_thread_id, codex_turn_start_params,
+    parse_acp_line, parse_acp_models, parse_claude_line, parse_codex_line, parse_codex_models,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -31,6 +33,9 @@ use crate::inject::uuid_v4;
 const FRAME_QUEUE: usize = 1024;
 /// Codex handshake replies come back in milliseconds; this bounds a hang.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Largest stdout line the Engine keeps. A longer line (a huge tool output)
+/// is dropped with a notice and never buffered whole.
+pub const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -78,11 +83,42 @@ pub struct SequencedEvent {
 /// handshake or the turn, so they stay separate from GUI events.
 enum Frame {
     Events(Vec<StructuredEvent>),
-    Response { id: u64, result: Value },
-    Failure { id: Option<u64>, message: String },
-    ServerRequest { method: String },
+    Response {
+        id: u64,
+        result: Value,
+    },
+    Failure {
+        id: Option<u64>,
+        message: String,
+    },
+    ServerRequest {
+        id: Value,
+        method: String,
+        params: Value,
+    },
     Malformed(String),
+    /// A line over `MAX_LINE_BYTES`; the turn continues.
+    Dropped(String),
     Closed,
+}
+
+/// A prompt awaiting an answer, with what the protocol needs to reply.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingPermission {
+    pub request_id: String,
+    pub tool: String,
+    pub input: Value,
+    pub reason: Option<String>,
+    raw_id: Value,
+    harness: StructuredHarness,
+}
+
+/// The user's answer to one prompt. `Deny` ends the tool call with `message`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermissionDecision {
+    Allow,
+    AllowForSession,
+    Deny,
 }
 
 struct Worker {
@@ -123,6 +159,12 @@ pub struct StructuredConversation {
     sequence: u64,
     seen_tools: HashSet<String>,
     turn_in_flight: bool,
+    /// Models the Antigravity session offered at `session/new`.
+    available_models: Vec<AgentModel>,
+    /// The id of the in-flight `session/prompt`, whose reply ends the turn.
+    prompt_request: Option<u64>,
+    /// Prompts the Agent is waiting on, by request id.
+    pending: std::collections::BTreeMap<String, PendingPermission>,
     /// Number of child processes started; the pre-turn-1 contract is 0.
     spawns: u32,
 }
@@ -143,6 +185,9 @@ impl StructuredConversation {
             sequence: 0,
             seen_tools: HashSet::new(),
             turn_in_flight: false,
+            available_models: Vec::new(),
+            prompt_request: None,
+            pending: Default::default(),
             spawns: 0,
         }
     }
@@ -179,8 +224,62 @@ impl StructuredConversation {
         self.spawns
     }
 
+    /// Models the Antigravity session offers; empty for other harnesses.
+    pub fn available_models(&self) -> &[AgentModel] {
+        &self.available_models
+    }
+
     pub fn is_turn_in_flight(&self) -> bool {
         self.turn_in_flight
+    }
+
+    /// Prompts awaiting an answer, oldest id first.
+    pub fn pending_permissions(&self) -> Vec<PendingPermission> {
+        self.pending.values().cloned().collect()
+    }
+
+    /// Answers one prompt and resumes the Agent. Unknown ids are an error:
+    /// the Agent is no longer waiting on them.
+    pub fn answer_permission(
+        &mut self,
+        request_id: &str,
+        decision: PermissionDecision,
+        message: Option<&str>,
+    ) -> Result<(), StructuredError> {
+        let pending = self
+            .pending
+            .remove(request_id)
+            .ok_or_else(|| StructuredError::Protocol(format!("no open prompt {request_id}")))?;
+        let worker = self
+            .worker
+            .as_mut()
+            .ok_or_else(|| StructuredError::Protocol("the Agent is not running".to_owned()))?;
+        let line = match pending.harness {
+            StructuredHarness::Claude => match decision {
+                PermissionDecision::Deny => {
+                    claude_permission_deny_line(request_id, message.unwrap_or("Denied in Diri"))
+                }
+                _ => claude_permission_allow_line(request_id, &pending.input),
+            },
+            _ => {
+                let verdict = match decision {
+                    PermissionDecision::Allow => "accept",
+                    PermissionDecision::AllowForSession => "acceptForSession",
+                    PermissionDecision::Deny => "decline",
+                };
+                codex_approval_line(&pending.raw_id, verdict)
+            }
+        };
+        write_line(&mut worker.stdin, &line)
+    }
+
+    /// Ends the running Agent without forgetting the native conversation,
+    /// so the next turn resumes it. Used to park for the PTY handoff.
+    pub fn stop(&mut self) {
+        self.worker = None;
+        self.turn_in_flight = false;
+        self.prompt_request = None;
+        self.pending.clear();
     }
 
     /// Records a model/effort choice. Before turn 1 this is a field write.
@@ -248,7 +347,19 @@ impl StructuredConversation {
                     &codex_request_line(id, "turn/start", params),
                 )?;
             }
-            StructuredHarness::Antigravity => unreachable!("ensure_supported rejects it"),
+            StructuredHarness::Antigravity => {
+                let session = self.native_id.clone().ok_or_else(|| {
+                    StructuredError::Protocol("no Antigravity session".to_owned())
+                })?;
+                let id = worker.next_request_id;
+                worker.next_request_id += 1;
+                let params = acp_prompt_params(&session, text);
+                write_line(
+                    &mut worker.stdin,
+                    &codex_request_line(id, "session/prompt", params),
+                )?;
+                self.prompt_request = Some(id);
+            }
         }
         self.turn_in_flight = true;
         Ok(())
@@ -284,20 +395,78 @@ impl StructuredConversation {
                     }
                 }
             }
-            Frame::Response { .. } => {}
+            Frame::Response { id, result } => {
+                // Antigravity ends a turn with its `session/prompt` reply;
+                // Codex replies to `turn/start` carry nothing the GUI needs.
+                if self.prompt_request == Some(id) {
+                    self.prompt_request = None;
+                    let stop = result
+                        .get("stopReason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("end_turn")
+                        .to_owned();
+                    let event = StructuredEvent::TurnCompleted {
+                        is_error: stop == "refusal",
+                        subtype: stop,
+                        usage: acp_usage(&result),
+                        cost_usd: None,
+                    };
+                    if let Some(event) = self.accept(event) {
+                        self.push(event, out);
+                    }
+                }
+            }
             Frame::Failure { message, .. } => {
                 self.turn_in_flight = false;
                 self.push(StructuredEvent::Error { message }, out);
             }
-            Frame::ServerRequest { method } => {
-                // Approvals are not answered yet; the thread runs with
-                // approvalPolicy "never", so this only fails closed.
-                self.push(
-                    StructuredEvent::Error {
-                        message: format!("Agent asked for approval ({method}); not supported yet"),
-                    },
-                    out,
-                );
+            Frame::ServerRequest { id, method, params } => {
+                match codex_permission_request(&id, &method, &params) {
+                    Some(event) => {
+                        if let StructuredEvent::PermissionRequested {
+                            request_id,
+                            tool,
+                            input,
+                            reason,
+                        } = &event
+                        {
+                            self.pending.insert(
+                                request_id.clone(),
+                                PendingPermission {
+                                    request_id: request_id.clone(),
+                                    tool: tool.clone(),
+                                    input: input.clone(),
+                                    reason: reason.clone(),
+                                    raw_id: id.clone(),
+                                    harness: StructuredHarness::Codex,
+                                },
+                            );
+                        }
+                        self.push(event, out);
+                    }
+                    None => {
+                        // Refuse what we do not render, so the turn cannot stall.
+                        if let Some(worker) = self.worker.as_mut() {
+                            let refusal = json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": { "code": -32601, "message": "not supported by Diri" },
+                            });
+                            let _ = write_line(&mut worker.stdin, &refusal.to_string());
+                        }
+                        self.push(
+                            StructuredEvent::Error {
+                                message: format!(
+                                    "the Agent asked for {method}; Diri cannot answer it yet"
+                                ),
+                            },
+                            out,
+                        );
+                    }
+                }
+            }
+            Frame::Dropped(message) => {
+                self.push(StructuredEvent::Error { message }, out);
             }
             Frame::Malformed(message) => {
                 self.turn_in_flight = false;
@@ -310,6 +479,7 @@ impl StructuredConversation {
             }
             Frame::Closed => {
                 self.worker = None;
+                self.pending.clear();
                 if self.turn_in_flight {
                     self.turn_in_flight = false;
                     self.push(
@@ -343,6 +513,24 @@ impl StructuredConversation {
             StructuredEvent::TurnCompleted { .. } => {
                 self.turn_in_flight = false;
             }
+            StructuredEvent::PermissionRequested {
+                request_id,
+                tool,
+                input,
+                reason,
+            } => {
+                self.pending.insert(
+                    request_id.clone(),
+                    PendingPermission {
+                        request_id: request_id.clone(),
+                        tool: tool.clone(),
+                        input: input.clone(),
+                        reason: reason.clone(),
+                        raw_id: Value::String(request_id.clone()),
+                        harness: StructuredHarness::Claude,
+                    },
+                );
+            }
             _ => {}
         }
         Some(event)
@@ -357,15 +545,7 @@ impl StructuredConversation {
     }
 
     fn ensure_supported(&self) -> Result<(), StructuredError> {
-        match self.harness {
-            StructuredHarness::Antigravity => Err(StructuredError::Unsupported {
-                harness: self.harness,
-                reason: "the ACP driver is not built yet; `agy acp` is present on this Mac \
-                         but not driven"
-                    .to_owned(),
-            }),
-            _ => Ok(()),
-        }
+        Ok(())
     }
 
     fn start_worker(&mut self) -> Result<(), StructuredError> {
@@ -374,8 +554,45 @@ impl StructuredConversation {
         match self.harness {
             StructuredHarness::Claude => self.start_claude(),
             StructuredHarness::Codex => self.start_codex(),
-            StructuredHarness::Antigravity => unreachable!("ensure_supported rejects it"),
+            StructuredHarness::Antigravity => self.start_antigravity(),
         }
+    }
+
+    fn start_antigravity(&mut self) -> Result<(), StructuredError> {
+        let program = self.program.clone().unwrap_or_else(|| "agy".into());
+        let mut worker = spawn_child(
+            program,
+            &["acp".to_owned()],
+            &self.cwd,
+            StructuredHarness::Antigravity,
+        )?;
+        handshake_request(
+            &mut worker,
+            "initialize",
+            json!({
+                "protocolVersion": 1,
+                "clientCapabilities": {},
+            }),
+        )?;
+        let cwd = self.cwd.display().to_string();
+        let result = handshake_request(
+            &mut worker,
+            "session/new",
+            json!({
+                "cwd": cwd,
+                "mcpServers": [],
+            }),
+        )?;
+        let session = result
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                StructuredError::Handshake("session/new carried no session id".to_owned())
+            })?;
+        self.available_models = parse_acp_models(&result);
+        self.native_id = Some(session.to_owned());
+        self.worker = Some(worker);
+        Ok(())
     }
 
     fn start_claude(&mut self) -> Result<(), StructuredError> {
@@ -390,14 +607,11 @@ impl StructuredConversation {
             }
         };
         let args = claude_args(&id, resume, self.model.as_deref(), self.effort.as_deref());
-        // Claude has no handshake: the first user line in `send_turn` starts it.
         let program = self.program.clone().unwrap_or_else(|| "claude".into());
-        self.worker = Some(spawn_child(
-            program,
-            &args,
-            &self.cwd,
-            StructuredHarness::Claude,
-        )?);
+        let mut worker = spawn_child(program, &args, &self.cwd, StructuredHarness::Claude)?;
+        // Register for prompts before the first user line.
+        write_line(&mut worker.stdin, &claude_initialize_line())?;
+        self.worker = Some(worker);
         Ok(())
     }
 
@@ -419,9 +633,12 @@ impl StructuredConversation {
             }),
         )?;
         write_line(&mut worker.stdin, &codex_notification_line("initialized"))?;
+        // Ask before anything outside the sandbox, and route the question to
+        // the user, not the user's configured auto-reviewer.
         let common = json!({
             "cwd": cwd,
-            "approvalPolicy": "never",
+            "approvalPolicy": "untrusted",
+            "approvalsReviewer": "user",
             "sandbox": "workspace-write",
         });
         let result = match &self.native_id {
@@ -450,6 +667,9 @@ fn claude_args(id: &str, resume: bool, model: Option<&str>, effort: Option<&str>
         "stream-json".to_owned(),
         "--include-partial-messages".to_owned(),
         "--verbose".to_owned(),
+        // Prompts go to this host over stdio; nothing is denied silently.
+        "--permission-prompt-tool".to_owned(),
+        "stdio".to_owned(),
         if resume { "--resume" } else { "--session-id" }.to_owned(),
         id.to_owned(),
     ];
@@ -498,17 +718,22 @@ fn read_frames(
     tx: SyncSender<Frame>,
 ) {
     let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
+    let mut buffer = Vec::new();
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => {
+        let line = match read_bounded_line(&mut reader, &mut buffer) {
+            Ok(LineRead::Eof) | Err(_) => {
                 let _ = tx.send(Frame::Closed);
                 return;
             }
-            Ok(_) => {}
-        }
-        let text = line.trim_end();
+            Ok(LineRead::Oversized) => {
+                let _ = tx.send(Frame::Dropped(format!(
+                    "the Agent wrote a line over {MAX_LINE_BYTES} bytes; it was dropped"
+                )));
+                continue;
+            }
+            Ok(LineRead::Line) => String::from_utf8_lossy(&buffer).trim_end().to_owned(),
+        };
+        let text = line.as_str();
         if text.is_empty() {
             continue;
         }
@@ -521,16 +746,108 @@ fn read_frames(
                 Ok(CodexInbound::Response { id, result }) => Frame::Response { id, result },
                 Ok(CodexInbound::Failure { id, message }) => Frame::Failure { id, message },
                 Ok(CodexInbound::Events(events)) => Frame::Events(events),
-                Ok(CodexInbound::ServerRequest { method, .. }) => Frame::ServerRequest { method },
+                Ok(CodexInbound::ServerRequest { id, method, params }) => {
+                    Frame::ServerRequest { id, method, params }
+                }
                 Ok(CodexInbound::Ignored) => Frame::Events(Vec::new()),
                 Err(error) => Frame::Malformed(error.to_string()),
             },
-            StructuredHarness::Antigravity => Frame::Closed,
+            StructuredHarness::Antigravity => match parse_acp_line(text) {
+                Ok(AcpInbound::Response { id, result }) => Frame::Response { id, result },
+                Ok(AcpInbound::Failure { id, message }) => Frame::Failure { id, message },
+                Ok(AcpInbound::Events(events)) => Frame::Events(events),
+                Ok(AcpInbound::ServerRequest { id, method, params }) => {
+                    Frame::ServerRequest { id, method, params }
+                }
+                Ok(AcpInbound::Ignored) => Frame::Events(Vec::new()),
+                Err(error) => Frame::Malformed(error.to_string()),
+            },
         };
         if tx.send(frame).is_err() {
             return;
         }
     }
+}
+
+/// Lists Codex's models with a short-lived app-server: initialize, then
+/// `model/list`. The process exits before returning; no conversation shares it.
+pub fn probe_codex_models(program: OsString) -> Result<Vec<CodexModel>, StructuredError> {
+    let mut worker = spawn_child(
+        program,
+        &["app-server".to_owned()],
+        Path::new("."),
+        StructuredHarness::Codex,
+    )?;
+    handshake_request(
+        &mut worker,
+        "initialize",
+        json!({
+            "clientInfo": { "name": "diri", "title": "Diri", "version": env!("CARGO_PKG_VERSION") },
+            "capabilities": { "experimentalApi": true },
+        }),
+    )?;
+    write_line(&mut worker.stdin, &codex_notification_line("initialized"))?;
+    let result = handshake_request(&mut worker, "model/list", json!({}))?;
+    Ok(parse_codex_models(&result))
+}
+
+/// Lists Antigravity's models from `session/new`. The probe session is
+/// discarded; it is never prompted.
+pub fn probe_antigravity_models(program: OsString) -> Result<Vec<AgentModel>, StructuredError> {
+    let mut worker = spawn_child(
+        program,
+        &["acp".to_owned()],
+        Path::new("."),
+        StructuredHarness::Antigravity,
+    )?;
+    handshake_request(
+        &mut worker,
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {},
+        }),
+    )?;
+    let cwd = std::env::temp_dir().display().to_string();
+    let result = handshake_request(
+        &mut worker,
+        "session/new",
+        json!({ "cwd": cwd, "mcpServers": [] }),
+    )?;
+    Ok(parse_acp_models(&result))
+}
+
+enum LineRead {
+    Line,
+    Oversized,
+    Eof,
+}
+
+/// Reads one line into `buffer`, holding at most `MAX_LINE_BYTES` of it. An
+/// oversized line is consumed to its end and reported, never kept.
+fn read_bounded_line(reader: &mut impl BufRead, buffer: &mut Vec<u8>) -> std::io::Result<LineRead> {
+    buffer.clear();
+    let limit = MAX_LINE_BYTES as u64 + 1;
+    let read = (&mut *reader).take(limit).read_until(b'\n', buffer)?;
+    if read == 0 {
+        return Ok(LineRead::Eof);
+    }
+    if buffer.last() == Some(&b'\n') || buffer.len() <= MAX_LINE_BYTES {
+        return Ok(LineRead::Line);
+    }
+    let mut sink = Vec::new();
+    loop {
+        sink.clear();
+        let read = reader
+            .by_ref()
+            .take(64 * 1024)
+            .read_until(b'\n', &mut sink)?;
+        if read == 0 || sink.last() == Some(&b'\n') {
+            break;
+        }
+    }
+    buffer.clear();
+    Ok(LineRead::Oversized)
 }
 
 /// Sends one JSON-RPC request and waits for its reply. Notifications that

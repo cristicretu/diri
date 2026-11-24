@@ -52,6 +52,15 @@ pub enum StructuredEvent {
     Error {
         message: String,
     },
+    /// The Agent asks before running a tool. The turn waits for an answer
+    /// with `claude_permission_*_line` or `codex_response_line`. `request_id`
+    /// is the native id rendered as text; the Engine keeps the raw id.
+    PermissionRequested {
+        request_id: String,
+        tool: String,
+        input: Value,
+        reason: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,11 +196,66 @@ pub fn parse_claude_line(line: &str) -> Result<Vec<StructuredEvent>, CodecError>
                 cost_usd: value.get("total_cost_usd").and_then(Value::as_f64),
             });
         }
+        "control_request"
+            if value.pointer("/request/subtype").and_then(Value::as_str)
+                == Some("can_use_tool") =>
+        {
+            let request = value.get("request");
+            events.push(StructuredEvent::PermissionRequested {
+                request_id: str_field(&value, "request_id"),
+                tool: str_field_of(request, "tool_name"),
+                input: request
+                    .and_then(|r| r.get("input"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                reason: request
+                    .and_then(|r| r.get("description"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            });
+        }
         // hook_*, rate_limit_event, status and other diagnostics carry no
         // conversation state the GUI renders.
         _ => {}
     }
     Ok(events)
+}
+
+/// Registers the host with Claude's stream-json control channel. Must precede
+/// the first user line when permission prompts go to stdio.
+pub fn claude_initialize_line() -> String {
+    json!({
+        "type": "control_request",
+        "request_id": "diri-initialize",
+        "request": { "subtype": "initialize" },
+    })
+    .to_string()
+}
+
+/// Allows one prompted tool call, running it with `input` unchanged.
+pub fn claude_permission_allow_line(request_id: &str, input: &Value) -> String {
+    json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "response": { "behavior": "allow", "updatedInput": input },
+        },
+    })
+    .to_string()
+}
+
+/// Denies one prompted tool call; the Agent receives `message` as the reason.
+pub fn claude_permission_deny_line(request_id: &str, message: &str) -> String {
+    json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "response": { "behavior": "deny", "message": message },
+        },
+    })
+    .to_string()
 }
 
 /// One stream-json user turn for Claude's stdin. The returned line has no
@@ -418,6 +482,47 @@ pub fn codex_notification_line(method: &str) -> String {
     json!({ "jsonrpc": "2.0", "method": method }).to_string()
 }
 
+/// Maps a Codex approval request to a GUI permission. Returns `None` for
+/// server requests this build does not render; the caller must still answer
+/// them, or the turn stalls.
+pub fn codex_permission_request(
+    id: &Value,
+    method: &str,
+    params: &Value,
+) -> Option<StructuredEvent> {
+    let request_id = match id {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    let reason = params
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    match method {
+        "item/commandExecution/requestApproval" => Some(StructuredEvent::PermissionRequested {
+            request_id,
+            tool: "Bash".to_owned(),
+            input: json!({
+                "command": params.get("command").cloned().unwrap_or(Value::Null),
+                "cwd": params.get("cwd").cloned().unwrap_or(Value::Null),
+            }),
+            reason,
+        }),
+        "item/fileChange/requestApproval" => Some(StructuredEvent::PermissionRequested {
+            request_id,
+            tool: "Edit".to_owned(),
+            input: params.clone(),
+            reason,
+        }),
+        _ => None,
+    }
+}
+
+/// Answers a Codex approval: `accept`, `acceptForSession`, `decline`, or `cancel`.
+pub fn codex_approval_line(id: &Value, decision: &str) -> String {
+    codex_response_line(id, json!({ "decision": decision }))
+}
+
 /// Reply to a server-initiated request.
 pub fn codex_response_line(id: &Value, result: Value) -> String {
     json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string()
@@ -498,6 +603,141 @@ pub fn parse_codex_models(result: &Value) -> Vec<CodexModel> {
             })
         })
         .collect()
+}
+
+// ------------------------------------------------- Antigravity (`agy acp`)
+
+/// One decoded line of `agy acp` stdout. ACP is JSON-RPC 2.0 like Codex's
+/// app-server; only the `session/update` mapping and the prompt reply differ.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AcpInbound {
+    Response {
+        id: u64,
+        result: Value,
+    },
+    Failure {
+        id: Option<u64>,
+        message: String,
+    },
+    Events(Vec<StructuredEvent>),
+    /// The agent asks the client something (for example a permission). Not
+    /// rendered yet; the caller must refuse it so the prompt cannot stall.
+    ServerRequest {
+        id: Value,
+        method: String,
+        params: Value,
+    },
+    Ignored,
+}
+
+/// One model the Antigravity session offers, as `session/new` reports it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentModel {
+    pub id: String,
+    pub name: String,
+}
+
+/// Decodes one `agy acp` stdout line. Only the streams observed on
+/// agy 1.5.15 are mapped: message chunks and thought chunks. Other updates
+/// (commands, usage, titles) are ignored and tool calls are not rendered yet.
+pub fn parse_acp_line(line: &str) -> Result<AcpInbound, CodecError> {
+    let value = parse_line(line)?;
+    if let Some(method) = value.get("method").and_then(Value::as_str) {
+        if let Some(id) = value.get("id") {
+            return Ok(AcpInbound::ServerRequest {
+                id: id.clone(),
+                method: method.to_owned(),
+                params: value.get("params").cloned().unwrap_or(Value::Null),
+            });
+        }
+        if method != "session/update" {
+            return Ok(AcpInbound::Ignored);
+        }
+        let session = str_field(value.get("params").unwrap_or(&Value::Null), "sessionId");
+        let update = value.pointer("/params/update").unwrap_or(&Value::Null);
+        let kind = update
+            .get("sessionUpdate")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let text = update
+            .pointer("/content/text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let events = match kind {
+            "agent_message_chunk" => vec![StructuredEvent::TextDelta {
+                item: format!("{session}:message"),
+                text,
+            }],
+            "agent_thought_chunk" => vec![StructuredEvent::ThinkingDelta {
+                item: format!("{session}:thought"),
+                text,
+            }],
+            _ => Vec::new(),
+        };
+        return Ok(AcpInbound::Events(events));
+    }
+    if let Some(error) = value.get("error") {
+        return Ok(AcpInbound::Failure {
+            id: value.get("id").and_then(Value::as_u64),
+            message: error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("agy error")
+                .to_owned(),
+        });
+    }
+    match value.get("id").and_then(Value::as_u64) {
+        Some(id) => Ok(AcpInbound::Response {
+            id,
+            result: value.get("result").cloned().unwrap_or(Value::Null),
+        }),
+        None => Ok(AcpInbound::Ignored),
+    }
+}
+
+/// `session/prompt` params for one user message.
+pub fn acp_prompt_params(session_id: &str, text: &str) -> Value {
+    json!({
+        "sessionId": session_id,
+        "prompt": [{ "type": "text", "text": text }],
+    })
+}
+
+/// Models from a `session/new` reply.
+pub fn parse_acp_models(result: &Value) -> Vec<AgentModel> {
+    result
+        .pointer("/models/availableModels")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let id = entry.get("modelId").and_then(Value::as_str)?.to_owned();
+            let name = entry
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(&id)
+                .to_owned();
+            Some(AgentModel { id, name })
+        })
+        .collect()
+}
+
+/// Token usage from a `session/prompt` reply.
+pub fn acp_usage(result: &Value) -> TokenUsage {
+    let usage = result.get("usage");
+    let field = |name: &str| {
+        usage
+            .and_then(|u| u.get(name))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    TokenUsage {
+        input_tokens: field("inputTokens"),
+        output_tokens: field("outputTokens"),
+        cache_read_tokens: field("cachedReadTokens"),
+        cache_write_tokens: field("cachedWriteTokens"),
+    }
 }
 
 fn str_field(value: &Value, name: &str) -> String {

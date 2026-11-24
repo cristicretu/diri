@@ -1,0 +1,6 @@
+{"id": 1, "result": {"protocolVersion": 1, "agentInfo": {"name": "Antigravity ACP Server", "version": "1.5.15"}}}
+{"id": 2, "result": {"sessionId": "SESSION", "models": {"availableModels": [{"modelId": "gemini-4-neon-high", "name": "Gemini 4 Neon (High)"}, {"modelId": "gemini-4-neon-xhigh", "name": "Gemini 4 Neon (XHigh)"}, {"modelId": "gemini-4-neon-medium", "name": "Gemini 4 Neon (Medium)"}]}}}
+{"method": "session/update", "params": {"sessionId": "SESSION", "update": {"sessionUpdate": "usage_update", "used": 0, "size": 1048576}}}
+{"method": "session/update", "params": {"sessionId": "SESSION", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "pong"}}}}
+{"method": "session/update", "params": {"sessionId": "SESSION", "update": {"sessionUpdate": "usage_update", "used": 9910, "size": 1048576}}}
+{"id": 3, "result": {"stopReason": "end_turn", "usage": {"inputTokens": 9890, "outputTokens": 20, "cachedReadTokens": 0, "cachedWriteTokens": 0, "thoughtTokens": 18, "totalTokens": 9910}}}

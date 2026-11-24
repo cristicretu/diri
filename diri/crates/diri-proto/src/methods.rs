@@ -49,6 +49,17 @@ impl Method {
     pub const SESSION_DELIVER_MESSAGE: &'static str = "session.deliver_message";
     pub const SESSION_SEND_KEY: &'static str = "session.send_key";
     pub const SESSION_SEND_TEXT: &'static str = "session.send_text";
+    // Structured Agent conversations (the GUI's native protocol path).
+    pub const STRUCTURED_OPEN: &'static str = "structured.open";
+    pub const STRUCTURED_SEND: &'static str = "structured.send";
+    pub const STRUCTURED_CONFIGURE: &'static str = "structured.configure";
+    pub const STRUCTURED_POLL: &'static str = "structured.poll";
+    pub const STRUCTURED_ANSWER_PERMISSION: &'static str = "structured.answer_permission";
+    pub const STRUCTURED_STOP: &'static str = "structured.stop";
+    pub const STRUCTURED_CLOSE: &'static str = "structured.close";
+    pub const STRUCTURED_MODELS: &'static str = "structured.models";
+    pub const STRUCTURED_SWITCH_TO_PTY: &'static str = "structured.switch_to_pty";
+    pub const STRUCTURED_SWITCH_TO_GUI: &'static str = "structured.switch_to_gui";
     pub const SESSION_RESIZE: &'static str = "session.resize";
     /// A wheel over a session's terminal, for a client with no attachment
     /// (the phone). The Engine encodes it for the program's mouse mode, or

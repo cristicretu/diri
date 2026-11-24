@@ -80,6 +80,7 @@ pub mod shell_integration;
 mod state_file;
 pub mod status;
 pub mod structured;
+pub mod structured_registry;
 pub mod telemetry;
 pub mod transcript;
 pub mod wake;

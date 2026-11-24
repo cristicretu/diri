@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use diri_engine::structured::{
-    SequencedEvent, StructuredConversation, StructuredError, StructuredHarness,
+    PermissionDecision, SequencedEvent, StructuredConversation, StructuredHarness,
 };
 use diri_proto::structured::StructuredEvent;
 
@@ -225,20 +225,6 @@ fn a_second_turn_on_codex_reuses_the_thread_without_a_new_process() {
 }
 
 #[test]
-fn antigravity_fails_closed_without_spawning() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut conversation = StructuredConversation::new(StructuredHarness::Antigravity, dir.path());
-    match conversation.send_turn("hi") {
-        Err(StructuredError::Unsupported { harness, reason }) => {
-            assert_eq!(harness, StructuredHarness::Antigravity);
-            assert!(reason.contains("agy acp"));
-        }
-        other => panic!("expected Unsupported, got {other:?}"),
-    }
-    assert_eq!(conversation.spawn_count(), 0);
-}
-
-#[test]
 fn an_agent_that_exits_mid_turn_reports_an_error() {
     let dir = tempfile::tempdir().unwrap();
     let program = script(dir.path(), "claude-dies", "exit 0");
@@ -275,6 +261,249 @@ fn switching_harness_keeps_the_conversation_and_drops_the_native_id() {
     conversation.switch_harness(StructuredHarness::Codex);
     assert_eq!(conversation.harness(), StructuredHarness::Codex);
     assert_eq!(conversation.native_id(), None);
+}
+
+const CLAUDE_PERMISSION: &str =
+    include_str!("../../diri-proto/tests/fixtures/structured/claude-permission.jsonl");
+const CODEX_APPROVAL: &str =
+    include_str!("../../diri-proto/tests/fixtures/structured/codex-approval.jsonl");
+
+/// A fake Claude that asks permission once, then finishes the turn only after
+/// the host's `control_response` arrives on stdin.
+fn fake_claude_permission(dir: &Path) -> PathBuf {
+    let prompt = dir.join("prompt.jsonl");
+    fs::write(&prompt, CLAUDE_PERMISSION).unwrap();
+    let result = dir.join("result.jsonl");
+    let last = CLAUDE_TEXT.lines().last().unwrap();
+    fs::write(&result, format!("{last}\n")).unwrap();
+    script(
+        dir,
+        "claude",
+        &format!(
+            "cat '{}'\nwhile IFS= read -r l; do case \"$l\" in *control_response*) break;; esac; done\ncat '{}'\ncat > /dev/null",
+            prompt.display(),
+            result.display()
+        ),
+    )
+}
+
+/// A fake Codex that raises one command approval on `turn/start` and replays
+/// the recorded turn once the host answers with a `decision`.
+fn fake_codex_approval(dir: &Path) -> PathBuf {
+    let approval = dir.join("approval.jsonl");
+    fs::write(&approval, CODEX_APPROVAL).unwrap();
+    let notifications = dir.join("codex-notifications.jsonl");
+    let lines: String = CODEX_TURN
+        .lines()
+        .filter(|line| line.contains("\"method\""))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    fs::write(&notifications, lines).unwrap();
+    script(
+        dir,
+        "codex",
+        &format!(
+            r#"while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{{"id":1,"result":{{}}}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"thread-fake"}}}}}}' ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"turn-fake"}}}}}}'
+      cat '{approval}'
+      while IFS= read -r answer; do case "$answer" in *'"decision"'*) break;; esac; done
+      cat '{notifications}' ;;
+  esac
+done"#,
+            approval = approval.display(),
+            notifications = notifications.display()
+        ),
+    )
+}
+
+/// Polls until a permission is pending, or fails the test.
+fn wait_for_permission(conversation: &mut StructuredConversation) -> (Vec<SequencedEvent>, String) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut events = Vec::new();
+    while Instant::now() < deadline {
+        events.extend(conversation.poll());
+        if let Some(pending) = conversation.pending_permissions().first() {
+            return (events, pending.request_id.clone());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("no permission prompt; events {events:?}");
+}
+
+#[test]
+fn claude_prompt_waits_for_the_answer_before_the_turn_can_finish() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut conversation = StructuredConversation::new(StructuredHarness::Claude, dir.path())
+        .with_program(fake_claude_permission(dir.path()));
+    conversation.send_turn("delete the probe file").unwrap();
+    let (mut events, request_id) = wait_for_permission(&mut conversation);
+
+    let pending = conversation.pending_permissions();
+    assert_eq!(pending[0].tool, "Bash");
+    assert_eq!(pending[0].input["command"], "rm perm-probe-file.txt");
+    assert!(
+        conversation.is_turn_in_flight(),
+        "the turn waits on the prompt"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|item| matches!(item.event, StructuredEvent::TurnCompleted { .. }))
+    );
+
+    conversation
+        .answer_permission(&request_id, PermissionDecision::Allow, None)
+        .expect("answer delivers");
+    assert!(conversation.pending_permissions().is_empty());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while conversation.is_turn_in_flight() && Instant::now() < deadline {
+        events.extend(conversation.poll());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !conversation.is_turn_in_flight(),
+        "the answer let the turn finish"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|item| matches!(item.event, StructuredEvent::TurnCompleted { .. }))
+    );
+}
+
+#[test]
+fn codex_approval_is_answered_by_its_raw_id_and_the_turn_finishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut conversation = StructuredConversation::new(StructuredHarness::Codex, dir.path())
+        .with_program(fake_codex_approval(dir.path()));
+    conversation.send_turn("delete the file").unwrap();
+    let (_events, request_id) = wait_for_permission(&mut conversation);
+    assert_eq!(conversation.pending_permissions()[0].tool, "Bash");
+    conversation
+        .answer_permission(&request_id, PermissionDecision::Deny, None)
+        .expect("decline delivers");
+    let events = run_until_idle(&mut conversation);
+    assert_eq!(text_of(&events), "pong");
+}
+
+fn run_until_idle(conversation: &mut StructuredConversation) -> Vec<SequencedEvent> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut events = Vec::new();
+    while conversation.is_turn_in_flight() && Instant::now() < deadline {
+        events.extend(conversation.poll());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    events.extend(conversation.poll());
+    events
+}
+
+#[test]
+fn an_answer_for_an_unknown_prompt_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut conversation = StructuredConversation::new(StructuredHarness::Claude, dir.path())
+        .with_program(fake_claude(dir.path(), CLAUDE_TEXT));
+    run_turn(&mut conversation, "hi");
+    assert!(
+        conversation
+            .answer_permission("nope", PermissionDecision::Allow, None)
+            .is_err()
+    );
+}
+
+#[test]
+fn a_line_over_the_limit_is_dropped_and_the_turn_still_finishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let huge = dir.path().join("huge.txt");
+    let program = script(
+        dir.path(),
+        "claude-huge",
+        &format!(
+            "head -c {} /dev/zero | tr '\\0' a\necho\ncat '{}'\ncat > /dev/null",
+            diri_engine::structured::MAX_LINE_BYTES + 1000,
+            {
+                fs::write(&huge, CLAUDE_TEXT).unwrap();
+                huge.display()
+            }
+        ),
+    );
+    let mut conversation =
+        StructuredConversation::new(StructuredHarness::Claude, dir.path()).with_program(program);
+    let events = run_turn(&mut conversation, "hi");
+    assert!(events.iter().any(|item| matches!(
+        &item.event,
+        StructuredEvent::Error { message } if message.contains("over")
+    )));
+    assert_eq!(text_of(&events), "pong");
+}
+
+#[test]
+fn stop_parks_the_agent_and_the_next_turn_resumes_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut conversation = StructuredConversation::new(StructuredHarness::Claude, dir.path())
+        .with_program(fake_claude(dir.path(), CLAUDE_TEXT));
+    run_turn(&mut conversation, "one");
+    let native = conversation.native_id().unwrap().to_owned();
+    conversation.stop();
+    assert!(!conversation.is_turn_in_flight());
+    run_turn(&mut conversation, "two");
+    assert_eq!(conversation.spawn_count(), 2);
+    assert_eq!(conversation.native_id(), Some(native.as_str()));
+}
+
+const AGY_PROMPT: &str =
+    include_str!("../../diri-proto/tests/fixtures/structured/agy-prompt.jsonl");
+
+/// A fake `agy acp`: answers the handshake, then replays the recorded prompt
+/// stream (message chunks and the `session/prompt` reply).
+fn fake_agy(dir: &Path) -> PathBuf {
+    let prompt = dir.join("agy-prompt-stream.jsonl");
+    let lines: String = AGY_PROMPT
+        .lines()
+        .filter(|line| line.contains("session/update") || line.contains("\"id\": 3"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    fs::write(&prompt, lines).unwrap();
+    script(
+        dir,
+        "agy",
+        &format!(
+            r#"while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{{"id":1,"result":{{"protocolVersion":1}}}}' ;;
+    *'"method":"session/new"'*) printf '%s\n' '{{"id":2,"result":{{"sessionId":"sess-fake","models":{{"availableModels":[{{"modelId":"gemini-a","name":"Gemini A"}},{{"modelId":"gemini-b","name":"Gemini B"}}]}}}}}}' ;;
+    *'"method":"session/prompt"'*) cat '{}' ;;
+  esac
+done"#,
+            prompt.display()
+        ),
+    )
+}
+
+#[test]
+fn antigravity_turn_streams_text_and_ends_on_its_prompt_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut conversation = StructuredConversation::new(StructuredHarness::Antigravity, dir.path())
+        .with_program(fake_agy(dir.path()));
+    let events = run_turn(&mut conversation, "Reply with exactly: pong");
+
+    assert_eq!(text_of(&events), "pong");
+    assert_eq!(conversation.native_id(), Some("sess-fake"));
+    let models: Vec<&str> = conversation
+        .available_models()
+        .iter()
+        .map(|m| m.id.as_str())
+        .collect();
+    assert_eq!(models, ["gemini-a", "gemini-b"]);
+    assert!(events.iter().any(|item| matches!(
+        &item.event,
+        StructuredEvent::TurnCompleted { subtype, usage, .. }
+            if subtype == "end_turn" && usage.output_tokens == 20
+    )));
+    assert_eq!(conversation.spawn_count(), 1);
 }
 
 /// Opt-in: drives the installed `claude` for one turn. Costs a few tokens.

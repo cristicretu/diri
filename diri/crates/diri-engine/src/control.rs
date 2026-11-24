@@ -210,6 +210,8 @@ fn restored_terminal_directory(record: &diri_proto::SessionRecord) -> Option<Pat
 }
 
 pub struct ControlServer {
+    /// Structured Agent conversations, addressed by opaque id.
+    structured: Mutex<crate::structured_registry::StructuredRegistry>,
     engine_instance_id: String,
     registry: Arc<Mutex<Registry>>,
     socket_path: PathBuf,
@@ -408,6 +410,7 @@ impl ControlServer {
             workspaces,
             agent_catalog: Arc::new(Mutex::new(agent_catalog)),
             accounts: Mutex::new(accounts),
+            structured: Mutex::new(Default::default()),
             config_dir,
             account_gate: Default::default(),
             state_dir,
@@ -1440,6 +1443,33 @@ impl ControlServer {
             Method::SESSION_DELIVER_MESSAGE => self.session_deliver_message(params),
             Method::SESSION_SEND_KEY => self.session_send_key(params),
             Method::SESSION_SEND_TEXT => self.session_send_text(params),
+            Method::STRUCTURED_OPEN => self.structured.lock().map_err(poisoned)?.open(params),
+            Method::STRUCTURED_SEND => self.structured.lock().map_err(poisoned)?.send(params),
+            Method::STRUCTURED_CONFIGURE => {
+                self.structured.lock().map_err(poisoned)?.configure(params)
+            }
+            Method::STRUCTURED_POLL => self.structured.lock().map_err(poisoned)?.poll(params),
+            Method::STRUCTURED_ANSWER_PERMISSION => self
+                .structured
+                .lock()
+                .map_err(poisoned)?
+                .answer_permission(params),
+            Method::STRUCTURED_STOP => self.structured.lock().map_err(poisoned)?.stop(params),
+            Method::STRUCTURED_CLOSE => self.structured.lock().map_err(poisoned)?.close(params),
+            Method::STRUCTURED_MODELS => self.structured.lock().map_err(poisoned)?.models(params),
+            Method::STRUCTURED_SWITCH_TO_PTY => {
+                let command = self
+                    .structured
+                    .lock()
+                    .map_err(poisoned)?
+                    .switch_to_pty(params)?;
+                Ok(json!(command))
+            }
+            Method::STRUCTURED_SWITCH_TO_GUI => self
+                .structured
+                .lock()
+                .map_err(poisoned)?
+                .switch_to_gui(params),
             Method::SESSION_RESIZE => self.session_resize(params),
             Method::SESSION_SCROLL => self.session_scroll(params),
             Method::SESSION_READ_SCREEN => self.session_read_screen(params),

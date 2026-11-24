@@ -1,0 +1,1 @@
+{"type": "control_request", "request_id": "506c72b6-3dcb-460e-bbb7-384b11e33c0a", "request": {"subtype": "can_use_tool", "tool_name": "Bash", "input": {"command": "rm perm-probe-file.txt", "description": "Delete perm-probe-file.txt in the working directory"}, "description": "Delete perm-probe-file.txt in the working directory", "tool_use_id": "toolu_01Wrvyccf3jmoXTkwifbu1WA"}}
