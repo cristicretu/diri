@@ -654,7 +654,17 @@ pub(crate) fn assert_color_environment(env: &mut Vec<(String, String)>) {
     if !env.iter().any(|(key, _)| key == CARGO_PROGRESS_ENV) {
         env.push((CARGO_PROGRESS_ENV.into(), "true".into()));
     }
+    // Diri renders OSC 8 links, but Node TUIs (`supports-hyperlinks`, and
+    // Claude Code up to at least 2.1.312) only send them to terminals they
+    // recognise by `TERM_PROGRAM`, which is removed above. Without them,
+    // Cmd+click guesses the URL from screen text, and anything drawn over
+    // the link (Claude Code's "new message" pill) cuts it short.
+    if !env.iter().any(|(key, _)| key == FORCE_HYPERLINK_ENV) {
+        env.push((FORCE_HYPERLINK_ENV.into(), "1".into()));
+    }
 }
+
+const FORCE_HYPERLINK_ENV: &str = "FORCE_HYPERLINK";
 
 const CARGO_PROGRESS_ENV: &str = "CARGO_TERM_PROGRESS_TERM_INTEGRATION";
 
@@ -1276,6 +1286,7 @@ mod tests {
         assert_eq!(get("COLORTERM"), Some("truecolor"));
         assert_eq!(get("NO_COLOR"), None);
         assert_eq!(get(super::CARGO_PROGRESS_ENV), Some("true"));
+        assert_eq!(get(super::FORCE_HYPERLINK_ENV), Some("1"));
 
         // Started from Terminal.app: the agent must not think it runs there.
         let mut from_terminal = vec![
